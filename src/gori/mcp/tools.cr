@@ -36,8 +36,11 @@ require "./tools/import"
 require "./tools/intercept"
 require "./tools/issues"
 require "./tools/jobs"
+require "./tools/links"
 require "./tools/mine"
+require "./tools/minimize"
 require "./tools/notes"
+require "./tools/oast_providers"
 require "./tools/probe"
 require "./tools/projects"
 require "./tools/ql"
@@ -90,6 +93,13 @@ module Gori
         "send_request", "send_websocket",
         "fuzz_start", "fuzz_stop", "mine_start", "mine_stop", "sequence_start", "sequence_stop", "discover_start", "discover_stop", "stop_job",
         "create_issue", "update_issue",
+        "probe_dismiss", "probe_promote", "probe_delete",
+        "set_probe_rule_enabled", "create_probe_rule", "update_probe_rule", "delete_probe_rule", "set_probe_mode",
+        "delete_issue", "update_scope_rule", "set_sitemap_tag",
+        "delete_flow", "clear_history",
+        "add_link", "remove_link",
+        "create_oast_provider", "update_oast_provider", "set_oast_provider_enabled", "delete_oast_provider",
+        "minimize_repeater",
         "create_rule", "update_rule", "delete_rule", "set_rule_enabled",
         "create_note", "update_note", "delete_note",
         "create_repeater", "update_repeater", "delete_repeater",
@@ -494,8 +504,10 @@ module Gori
             "Distinct endpoints discovered in capture, keyed by TRANSPORT " \
             "(scheme, host, port, http_version, method, target) so the same path over " \
             "http vs https vs HTTP/2 stays separate — each with its observed status set, " \
-            "success/error counts, and first/last-seen. Pass collapse_transport:true for " \
-            "the legacy host/method/target-only view. Optional QL `query` filter." do |s|
+            "success/error counts, and first/last-seen. An entry also carries a `tag` field " \
+            "when the operator pinned a memo on that path (see set_sitemap_tag). Pass " \
+            "collapse_transport:true for the legacy host/method/target-only view. " \
+            "Optional QL `query` filter." do |s|
             s.field "query", strprop("gori QL filter")
             s.field "limit", intprop("max entries (default 200, max 5000)")
             s.field "collapse_transport", boolprop("collapse to distinct host/method/target only (legacy shape), dropping scheme/port/version + counts (default false)")
@@ -527,11 +539,56 @@ module Gori
             s.field "query", strprop("gori QL filter applied to History flows only; empty scans all (Repeater tabs are always scanned)")
             s.field "active", boolprop("also run active checks that SEND probe requests (default false = passive, request-free); requires write access + a configured scope")
             s.field "severity", strprop("only return issues at/above this level (info|low|medium|high|critical)")
-            s.field "category", strprop("only return issues in this category (#{Probe::SCAN_CATEGORIES.join("|")})")
+            s.field "category", strprop("only return issues in this category (#{Probe::FILTER_CATEGORIES.join("|")})")
             s.field "allow_unscoped", boolprop("with active:true, run even when a target host is outside — or without — a configured scope (default false)")
             s.field "unsafe", boolprop("with active:true, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data (default false)")
             s.field "aggressive", boolprop("with active:true, raise per-rule caps + use wider bypass sets (implies unsafe) — authorized targets only (default false)")
             s.field "limit", intprop("max issue groups to return (default 200, max 2000)")
+          end
+
+          tool j, "probe_issues",
+            "List PERSISTED probe findings — the rows the live scanner accumulated (what the TUI " \
+            "Probe tab shows), each with a stable `id` the probe_dismiss/probe_promote/probe_delete " \
+            "tools act on. This is triage state, unlike probe_scan's stateless rescan. Defaults to " \
+            "OPEN findings only, mirroring the TUI's default lens. Returns " \
+            "{issues, returned, offset, total, has_more} — not a bare array." do |s|
+            s.field "include_closed", boolprop("also return dismissed/confirmed/resolved findings (default false = open only)")
+            s.field "severity", strprop("only return findings at/above this level (info|low|medium|high|critical)")
+            s.field "category", strprop("only return findings in this category (#{Probe::FILTER_CATEGORIES.join("|")})")
+            s.field "host", strprop("only return findings for this exact host")
+            s.field "limit", intprop("max rows (default 100, max 500)")
+            s.field "offset", intprop("start row (default 0)")
+          end
+
+          tool j, "list_sitemap_tags",
+            "List the free-text memos the operator pinned onto sitemap paths, as " \
+            "[{host, path, tag}]. These are the same tags list_sitemap stamps onto its entries." do |s|
+            s.field "host", strprop("only list tags on this host")
+          end
+
+          tool j, "list_oast_providers",
+            "List the SAVED OAST providers (the TUI OAST tab's Providers sub-tab) — the entries " \
+            "an operator configured once and reuses, as opposed to oast_start's per-call ad-hoc " \
+            "provider/server/token. `id` is scope-qualified: p_<n> is this project's, g_<hex> is " \
+            "a global one from settings.json. Tokens are [REDACTED] unless include_sensitive." do |s|
+            s.field "include_sensitive", boolprop("return provider tokens instead of [REDACTED] (default false)")
+          end
+
+          tool j, "list_links",
+            "List the evidence pointers an Issue or Note carries — to a captured Flow, a " \
+            "Repeater tab, or a Fuzz/Miner run — each resolved to a human label and URL. " \
+            "A pointer whose target was pruned comes back with stale:true rather than being " \
+            "dropped, so you can tell \"no evidence\" from \"evidence that is gone\"." do |s|
+            s.field "owner_kind", strprop("issue|note"), required: true
+            s.field "owner_id", intprop("the issue or note id"), required: true
+          end
+
+          tool j, "list_probe_rules",
+            "List every scan rule — built-in passive, built-in active, and custom match rules — " \
+            "with whether the operator has each enabled, plus the project's current scan `mode`. " \
+            "The `id` of each row is what set_probe_rule_enabled / update_probe_rule / " \
+            "delete_probe_rule take. Both a scan here and one in the TUI honour this config." do |s|
+            s.field "kind", strprop("only list rules of this kind (passive|active|custom)")
           end
 
           tool j, "list_scope", "List the project's scope include/exclude rules, plus whether the scope lens/gate and the hard-containment sandbox are enabled." { }
@@ -943,6 +1000,7 @@ module Gori
               s.field "auto_content_length", boolprop("auto-calculate Content-Length")
               s.field "sni", strprop("TLS SNI override")
               s.field "name", strprop("custom name for the repeater tab")
+              s.field "tags", strprop("free-text tags for grouping tabs (the TUI subtab label); empty string clears them")
               s.field "ws_out_messages", arr_or_str_prop("optional array of strings (or a newline-separated string) representing outbound WebSocket messages")
             end
 
@@ -965,6 +1023,187 @@ module Gori
               s.field "notes", strprop("free-form notes (replaces existing)")
               s.field "status", strprop("open|confirmed|false-positive|resolved")
               s.field "repeater_id", intprop("optional repeater id to link to the issue")
+            end
+
+            tool j, "probe_dismiss",
+              "Mute probe findings (ids come from probe_issues). Pass exactly ONE selector: `id` " \
+              "toggles a single finding dismissed ⇄ open; `code` or `host` bulk-mutes every OPEN " \
+              "finding sharing it. Reversible — a dismissed finding still appears under " \
+              "probe_issues include_closed:true." do |s|
+              s.field "id", intprop("probe finding id to toggle")
+              s.field "code", strprop("bulk-dismiss every open finding with this check code")
+              s.field "host", strprop("bulk-dismiss every open finding on this host")
+            end
+
+            tool j, "probe_promote",
+              "Promote a probe finding (id from probe_issues) to a human-confirmed Issue in the " \
+              "Issues report, carrying its severity/host/sample evidence over. Marks the source " \
+              "finding Confirmed so a repeat call cannot mint a duplicate — a second call returns " \
+              "{promoted: false} rather than erroring." do |s|
+              s.field "id", intprop("probe finding id"), required: true
+            end
+
+            tool j, "probe_delete",
+              "Hard-delete probe findings (ids from probe_issues). Deleting ONE also SUPPRESSES " \
+              "that (code, host) pair so the next scan does not immediately re-add it — prefer " \
+              "probe_dismiss when you only want it out of the default lens. all:true is the " \
+              "OPPOSITE: it wipes every finding AND every suppression, so a rescan re-discovers " \
+              "everything; it needs confirm:true and cannot be combined with `id`." do |s|
+              s.field "id", intprop("probe finding id to delete")
+              s.field "all", boolprop("delete EVERY probe finding AND every suppression (default false)")
+              s.field "confirm", boolprop("required with all:true; without it the call is refused")
+            end
+
+            tool j, "set_probe_rule_enabled",
+              "Turn one scan rule on or off for this project (ids from list_probe_rules). " \
+              "Disabling a built-in stops NEW detections; findings it already produced stay. " \
+              "A GLOBAL custom rule lives in the user's settings.json and cannot be toggled here." do |s|
+              s.field "id", strprop("rule id from list_probe_rules"), required: true
+              s.field "enabled", boolprop("true to enable, false to disable"), required: true
+            end
+
+            tool j, "create_probe_rule",
+              "Add a PROJECT custom match rule — a string or regex tested against one region of " \
+              "each captured flow, emitting a finding on a hit. A regex PCRE rejects is refused " \
+              "rather than silently never matching." do |s|
+              s.field "title", strprop("short rule name (shown as the finding title)"), required: true
+              s.field "pattern", strprop("the string to look for, or a regex when match_kind=regex"), required: true
+              s.field "description", strprop("what the rule is for (default empty)")
+              s.field "side", strprop("request|response (default response)")
+              s.field "region", strprop("whole|header|body (default body)")
+              s.field "match_kind", strprop("string|regex (default string)")
+              s.field "severity", strprop("info|low|medium|high|critical (default info)")
+            end
+
+            tool j, "update_probe_rule",
+              "Replace a project custom rule's fields (same shape as create_probe_rule). " \
+              "Built-ins are not editable — disable them with set_probe_rule_enabled instead." do |s|
+              s.field "id", strprop("custom rule id from list_probe_rules (custom_p_…)"), required: true
+              s.field "title", strprop("short rule name"), required: true
+              s.field "pattern", strprop("the string or regex to match"), required: true
+              s.field "description", strprop("what the rule is for")
+              s.field "side", strprop("request|response (default response)")
+              s.field "region", strprop("whole|header|body (default body)")
+              s.field "match_kind", strprop("string|regex (default string)")
+              s.field "severity", strprop("info|low|medium|high|critical (default info)")
+            end
+
+            tool j, "delete_probe_rule",
+              "Delete a project custom rule. A built-in can only be DISABLED, never deleted." do |s|
+              s.field "id", strprop("custom rule id from list_probe_rules (custom_p_…)"), required: true
+            end
+
+            tool j, "delete_issue",
+              "Delete an issue outright, along with its entity links. Distinct from setting " \
+              "status resolved/false-positive, which KEEPS it in the report." do |s|
+              s.field "id", intprop("issue id"), required: true
+            end
+
+            tool j, "update_scope_rule",
+              "Edit an existing scope rule in place (ids from list_scope). Every field defaults " \
+              "to the rule's current value, so you can change just the pattern. Prefer this over " \
+              "delete + re-add, which changes the id and briefly drops the rule from the gate." do |s|
+              s.field "id", intprop("scope rule id"), required: true
+              s.field "kind", strprop("include|exclude (default: unchanged)")
+              s.field "match_type", strprop("host|string|regex (default: unchanged)")
+              s.field "pattern", strprop("new pattern (default: unchanged)")
+            end
+
+            tool j, "set_sitemap_tag",
+              "Pin a free-text memo onto one sitemap endpoint, or clear it with an empty/absent " \
+              "`tag`. Keyed by the node path exactly as the Sitemap tree stamps it — which " \
+              "INCLUDES any query string, so /search?q=1 is a different node from /search. " \
+              "Pass the `target` you saw in list_sitemap verbatim; a tag filed under a path no " \
+              "node has is silently invisible in both list_sitemap and the TUI." do |s|
+              s.field "host", strprop("host the path belongs to"), required: true
+              s.field "path", strprop("node path as list_sitemap shows it, e.g. /api/users or /search?q=1"), required: true
+              s.field "tag", strprop("the memo; empty or absent CLEARS the tag")
+            end
+
+            tool j, "create_oast_provider",
+              "Save a project OAST provider for reuse. `kind` is interactsh|custom-http|" \
+              "webhook.site|BOAST|postbin; `host` defaults to that kind's public preset when " \
+              "it has one." do |s|
+              s.field "name", strprop("display name"), required: true
+              s.field "kind", strprop("provider kind (default interactsh)")
+              s.field "host", strprop("server/base URL; required for kinds with no preset")
+              s.field "token", strprop("optional provider auth token")
+              s.field "enabled", boolprop("whether the provider is active (default true)")
+            end
+
+            tool j, "update_oast_provider",
+              "Update a project provider (same fields as create_oast_provider). " \
+              "Fields you omit keep their current value — so editing the name will not drop " \
+              "the provider's token. A GLOBAL provider (g_<hex>) belongs to settings.json and " \
+              "is not editable here." do |s|
+              s.field "id", strprop("provider id from list_oast_providers (p_<n>)"), required: true
+              s.field "name", strprop("display name (default: unchanged)")
+              s.field "kind", strprop("provider kind (default: unchanged)")
+              s.field "host", strprop("server/base URL (default: unchanged)")
+              s.field "token", strprop("provider auth token (default: unchanged — omit to KEEP the existing token)")
+              s.field "enabled", boolprop("whether the provider is active (default: unchanged)")
+            end
+
+            tool j, "set_oast_provider_enabled",
+              "Turn one saved project provider on or off without editing its other fields." do |s|
+              s.field "id", strprop("provider id from list_oast_providers (p_<n>)"), required: true
+              s.field "enabled", boolprop("true to enable, false to disable"), required: true
+            end
+
+            tool j, "delete_oast_provider",
+              "Delete a saved project OAST provider." do |s|
+              s.field "id", strprop("provider id from list_oast_providers (p_<n>)"), required: true
+            end
+
+            tool j, "minimize_repeater",
+              "Strip cosmetic headers, tracking-cookie crumbs, and unused query/body params " \
+              "from a saved repeater request while keeping the response within tolerance of a " \
+              "calibrated baseline (Caido-\"squash\"-style). ACTIVE: sends MANY real outbound " \
+              "requests (capped at 250) and is scope-gated. Returns the trimmed request plus " \
+              "what was removed; pass apply:true to also save it back to the session." do |s|
+              s.field "repeater_id", intprop("repeater database id"), required: true
+              s.field "apply", boolprop("write the minimized request back into the session (default false)")
+              s.field "allow_unscoped", boolprop("minimize even when the target host is outside — or without — a configured scope (default false)")
+            end
+
+            tool j, "add_link",
+              "Attach an evidence pointer from an Issue or Note to a Flow / Repeater tab / " \
+              "Fuzz or Miner run. Idempotent — re-linking the same pair returns " \
+              "already_linked:true rather than erroring or duplicating." do |s|
+              s.field "owner_kind", strprop("issue|note"), required: true
+              s.field "owner_id", intprop("the issue or note id"), required: true
+              s.field "ref_kind", strprop("flow|repeater|fuzz|miner"), required: true
+              s.field "ref_id", intprop("id of the linked flow/repeater/fuzz/miner"), required: true
+            end
+
+            tool j, "remove_link",
+              "Detach an evidence pointer, addressed by the same (owner, ref) pair add_link " \
+              "takes — no need to look up the link row's own id first." do |s|
+              s.field "owner_kind", strprop("issue|note"), required: true
+              s.field "owner_id", intprop("the issue or note id"), required: true
+              s.field "ref_kind", strprop("flow|repeater|fuzz|miner"), required: true
+              s.field "ref_id", intprop("id of the linked flow/repeater/fuzz/miner"), required: true
+            end
+
+            tool j, "delete_flow",
+              "Hard-delete one captured flow from History. This cannot be undone." do |s|
+              s.field "id", intprop("flow id"), required: true
+            end
+
+            tool j, "clear_history",
+              "Delete EVERY captured flow in the project. Requires confirm:true — without it " \
+              "the call is refused and reports how many flows it would have destroyed. " \
+              "This cannot be undone." do |s|
+              s.field "confirm", boolprop("must be true to actually delete; anything else refuses"), required: true
+            end
+
+            tool j, "set_probe_mode",
+              "Set the project's scan mode. off = no analysis; passive = zero-request checks on " \
+              "captured traffic (default); active = passive plus light-touch probes that SEND " \
+              "requests to scope-included targets; aggressive = active with raised caps, wider " \
+              "bypass sets, and UNSAFE methods (POST/PUT/PATCH/DELETE) — authorized targets only. " \
+              "This arms the AUTOMATIC pipeline for live captures, not just one scan." do |s|
+              s.field "mode", strprop("off|passive|active|aggressive"), required: true
             end
 
             tool j, "fuzz_start",
@@ -1284,6 +1523,11 @@ module Gori
         when "list_issues"             then list_issues(h)
         when "get_issue"               then get_issue(h)
         when "probe_scan"              then probe_scan(h)
+        when "probe_issues"            then probe_issues(h)
+        when "list_probe_rules"        then list_probe_rules(h)
+        when "list_sitemap_tags"       then list_sitemap_tags(h)
+        when "list_links"              then list_links(h)
+        when "list_oast_providers"     then list_oast_providers(h)
         when "list_scope"              then list_scope
         when "list_env"                then list_env(h)
         when "list_host_overrides"     then list_host_overrides
@@ -1312,58 +1556,78 @@ module Gori
       # works on a fresh machine. nil when `name` isn't one of them.
       private def action_tool(name : String, h) : Result?
         case name
-        when "send_request"            then gated { send_request(h) }
-        when "send_websocket"          then gated { send_websocket(h) }
-        when "oast_start"              then gated { oast_start(h) }
-        when "oast_stop"               then gated { oast_stop(h) }
-        when "intercept_forward"       then gated { intercept_forward(h) }
-        when "intercept_drop"          then gated { intercept_drop(h) }
-        when "intercept_forward_edit"  then gated { intercept_forward_edit(h) }
-        when "intercept_toggle"        then gated { intercept_toggle(h) }
-        when "intercept_set_filter"    then gated { intercept_set_filter(h) }
-        when "intercept_set_direction" then gated { intercept_set_direction(h) }
-        when "add_scope_rule"          then gated { add_scope_rule(h) }
-        when "delete_scope_rule"       then gated { delete_scope_rule(h) }
-        when "set_scope_enabled"       then gated { set_scope_enabled(h) }
-        when "set_sandbox"             then gated { set_sandbox(h) }
-        when "set_env_var"             then gated { set_env_var(h) }
-        when "delete_env_var"          then gated { delete_env_var(h) }
-        when "add_host_override"       then gated { add_host_override(h) }
-        when "update_host_override"    then gated { update_host_override(h) }
-        when "delete_host_override"    then gated { delete_host_override(h) }
-        when "import_flows"            then gated { import_flows(h) }
-        when "create_repeater"         then gated { create_repeater(h) }
-        when "update_repeater"         then gated { update_repeater(h) }
-        when "delete_repeater"         then gated { delete_repeater(h) }
-        when "create_issue"            then gated { create_issue(h) }
-        when "update_issue"            then gated { update_issue(h) }
-        when "fuzz_start"              then gated { fuzz_start(h) }
-        when "fuzz_status"             then gated { fuzz_status(h) }
-        when "fuzz_results"            then gated { fuzz_results(h) }
-        when "fuzz_stop"               then gated { fuzz_stop(h) }
-        when "mine_start"              then gated { mine_start(h) }
-        when "mine_status"             then gated { mine_status(h) }
-        when "mine_results"            then gated { mine_results(h) }
-        when "mine_stop"               then gated { mine_stop(h) }
-        when "sequence_start"          then gated { sequence_start(h) }
-        when "sequence_status"         then gated { sequence_status(h) }
-        when "sequence_results"        then gated { sequence_results(h) }
-        when "sequence_stop"           then gated { sequence_stop(h) }
-        when "discover_start"          then gated { discover_start(h) }
-        when "discover_status"         then gated { discover_status(h) }
-        when "discover_results"        then gated { discover_results(h) }
-        when "discover_stop"           then gated { discover_stop(h) }
-        when "list_jobs"               then gated { list_jobs }
-        when "get_job"                 then gated { get_job(h) }
-        when "stop_job"                then gated { stop_job(h) }
-        when "create_note"             then gated { create_note(h) }
-        when "update_note"             then gated { update_note(h) }
-        when "delete_note"             then gated { delete_note(h) }
-        when "create_rule"             then gated { create_rule(h) }
-        when "update_rule"             then gated { update_rule(h) }
-        when "preview_rule"            then gated { preview_rule(h) }
-        when "set_rule_enabled"        then gated { set_rule_enabled(h) }
-        when "delete_rule"             then gated { delete_rule(h) }
+        when "send_request"              then gated { send_request(h) }
+        when "send_websocket"            then gated { send_websocket(h) }
+        when "oast_start"                then gated { oast_start(h) }
+        when "oast_stop"                 then gated { oast_stop(h) }
+        when "intercept_forward"         then gated { intercept_forward(h) }
+        when "intercept_drop"            then gated { intercept_drop(h) }
+        when "intercept_forward_edit"    then gated { intercept_forward_edit(h) }
+        when "intercept_toggle"          then gated { intercept_toggle(h) }
+        when "intercept_set_filter"      then gated { intercept_set_filter(h) }
+        when "intercept_set_direction"   then gated { intercept_set_direction(h) }
+        when "add_scope_rule"            then gated { add_scope_rule(h) }
+        when "delete_scope_rule"         then gated { delete_scope_rule(h) }
+        when "set_scope_enabled"         then gated { set_scope_enabled(h) }
+        when "set_sandbox"               then gated { set_sandbox(h) }
+        when "set_env_var"               then gated { set_env_var(h) }
+        when "delete_env_var"            then gated { delete_env_var(h) }
+        when "add_host_override"         then gated { add_host_override(h) }
+        when "update_host_override"      then gated { update_host_override(h) }
+        when "delete_host_override"      then gated { delete_host_override(h) }
+        when "import_flows"              then gated { import_flows(h) }
+        when "create_repeater"           then gated { create_repeater(h) }
+        when "update_repeater"           then gated { update_repeater(h) }
+        when "delete_repeater"           then gated { delete_repeater(h) }
+        when "create_issue"              then gated { create_issue(h) }
+        when "update_issue"              then gated { update_issue(h) }
+        when "probe_dismiss"             then gated { probe_dismiss(h) }
+        when "probe_promote"             then gated { probe_promote(h) }
+        when "probe_delete"              then gated { probe_delete(h) }
+        when "set_probe_rule_enabled"    then gated { set_probe_rule_enabled(h) }
+        when "create_probe_rule"         then gated { create_probe_rule(h) }
+        when "update_probe_rule"         then gated { update_probe_rule(h) }
+        when "delete_probe_rule"         then gated { delete_probe_rule(h) }
+        when "set_probe_mode"            then gated { set_probe_mode(h) }
+        when "delete_issue"              then gated { delete_issue(h) }
+        when "update_scope_rule"         then gated { update_scope_rule(h) }
+        when "set_sitemap_tag"           then gated { set_sitemap_tag(h) }
+        when "delete_flow"               then gated { delete_flow(h) }
+        when "clear_history"             then gated { clear_history(h) }
+        when "add_link"                  then gated { add_entity_link(h) }
+        when "remove_link"               then gated { remove_entity_link(h) }
+        when "create_oast_provider"      then gated { create_oast_provider(h) }
+        when "update_oast_provider"      then gated { update_oast_provider(h) }
+        when "set_oast_provider_enabled" then gated { set_oast_provider_enabled(h) }
+        when "delete_oast_provider"      then gated { delete_oast_provider(h) }
+        when "minimize_repeater"         then gated { minimize_repeater(h) }
+        when "fuzz_start"                then gated { fuzz_start(h) }
+        when "fuzz_status"               then gated { fuzz_status(h) }
+        when "fuzz_results"              then gated { fuzz_results(h) }
+        when "fuzz_stop"                 then gated { fuzz_stop(h) }
+        when "mine_start"                then gated { mine_start(h) }
+        when "mine_status"               then gated { mine_status(h) }
+        when "mine_results"              then gated { mine_results(h) }
+        when "mine_stop"                 then gated { mine_stop(h) }
+        when "sequence_start"            then gated { sequence_start(h) }
+        when "sequence_status"           then gated { sequence_status(h) }
+        when "sequence_results"          then gated { sequence_results(h) }
+        when "sequence_stop"             then gated { sequence_stop(h) }
+        when "discover_start"            then gated { discover_start(h) }
+        when "discover_status"           then gated { discover_status(h) }
+        when "discover_results"          then gated { discover_results(h) }
+        when "discover_stop"             then gated { discover_stop(h) }
+        when "list_jobs"                 then gated { list_jobs }
+        when "get_job"                   then gated { get_job(h) }
+        when "stop_job"                  then gated { stop_job(h) }
+        when "create_note"               then gated { create_note(h) }
+        when "update_note"               then gated { update_note(h) }
+        when "delete_note"               then gated { delete_note(h) }
+        when "create_rule"               then gated { create_rule(h) }
+        when "update_rule"               then gated { update_rule(h) }
+        when "preview_rule"              then gated { preview_rule(h) }
+        when "set_rule_enabled"          then gated { set_rule_enabled(h) }
+        when "delete_rule"               then gated { delete_rule(h) }
           # switch is always available (selecting a DB is not a data mutation).
         when "switch_project" then switch_project(h)
           # create when unbound even under --read-only; once bound, actions-gated.

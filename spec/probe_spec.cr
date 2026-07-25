@@ -3214,3 +3214,115 @@ describe "Gori::Probe::Active::UrlRewriteBypass" do
     end
   end
 end
+
+# The headless scan orchestrator (`gori run probe` + MCP probe_scan) must honour the SAME
+# Rules sub-tab config the TUI Analyzer does — disabled built-ins stay off, custom rules run.
+# Before this, Scan called Passive.analyze/Active.analyze with neither, so a headless scan
+# silently re-reported rules the operator had turned off and never ran a custom rule at all.
+describe "Gori::Probe::Scan rules config parity" do
+  it "honours the operator's disabled built-ins in a headless passive scan" do
+    with_store do |store|
+      capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/a?token=aaaaaaaa", content_type: nil)
+      ids = Gori::Probe::Scan.flow_ids(store, nil)
+
+      before = Gori::Probe::Scan.scan_flows(store, ids, active: false)
+      before.count { |d| d.code == "secret_in_url" }.should eq(1)
+
+      store.set_probe_disabled_rules(Set{"secret_in_url"})
+      after = Gori::Probe::Scan.scan_flows(store, ids, active: false)
+      after.count { |d| d.code == "secret_in_url" }.should eq(0)
+    end
+  end
+
+  it "runs the operator's custom match rules in a headless passive scan" do
+    with_store do |store|
+      capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/a",
+        content_type: "text/html", body: "leak sk_live_abc")
+      ids = Gori::Probe::Scan.flow_ids(store, nil)
+
+      Gori::Probe::Scan.scan_flows(store, ids, active: false)
+        .any?(&.title.includes?("stripe key")).should be_false
+
+      store.insert_probe_custom_rule("stripe key", "d", "response", "body", "regex",
+        "sk_live_[a-z]+", Gori::Store::Severity::High)
+      dets = Gori::Probe::Scan.scan_flows(store, ids, active: false)
+      hit = dets.find(&.title.includes?("stripe key")).not_nil!
+      hit.severity.should eq(Gori::Store::Severity::High)
+    end
+  end
+
+  it "honours disabled built-ins for ACTIVE rules too (no probe is even planned)" do
+    with_store do |store|
+      detail = capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
+      origin = Gori::Fuzz::Origin.new(detail.row.scheme, detail.row.host, detail.row.port)
+
+      baseline = CountingBackend.new(origin)
+      Gori::Probe::Active.analyze(detail, backend: baseline)
+      baseline.sent.should be > 0
+
+      # Disabling every active rule must stop the sends at the source, not just drop findings.
+      all_ids = Gori::Probe::Active::RULES.map(&.info.id).to_set
+      muted = CountingBackend.new(origin)
+      Gori::Probe::Active.analyze(detail, backend: muted, disabled: all_ids)
+      muted.sent.should eq(0)
+    end
+  end
+
+  it "scans Repeater tabs under the same rules config as History flows" do
+    with_store do |store|
+      capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/a?token=aaaaaaaa", content_type: nil)
+      ids = Gori::Probe::Scan.flow_ids(store, nil)
+      store.set_probe_disabled_rules(Set{"secret_in_url"})
+
+      dets, _ = Gori::Probe::Scan.scan_all(store, ids, active: false)
+      dets.count { |d| d.code == "secret_in_url" }.should eq(0)
+    end
+  end
+end
+
+# Probe::Triage is the ONE promotion/dismiss implementation the TUI, `gori run probe`, and the
+# MCP probe_* tools all call — so a finding triaged from any surface lands in the same state.
+describe "Gori::Probe::Triage" do
+  it "promotes once, marking the source Confirmed so a repeat cannot duplicate" do
+    with_store do |store|
+      store.upsert_probe_issue(Gori::Probe::Detection.new(
+        code: "secret_in_url", category: "infoleak", host: "acme.test", title: "token in URL",
+        severity: Gori::Store::Severity::High, url: "https://acme.test/x", evidence: "tok"))
+      issue = store.probe_issues.first
+
+      res = Gori::Probe::Triage.promote(store, issue)
+      res.promoted?.should be_true
+      created = store.get_issue(res.issue_id.not_nil!).not_nil!
+      created.title.should eq(issue.title)
+      created.severity.should eq(Gori::Store::Severity::High)
+      store.get_probe_issue(issue.id).not_nil!.status.confirmed?.should be_true
+
+      # Re-read (the in-memory `issue` still holds the pre-promotion status). A second call
+      # reports AlreadyPromoted — distinct from Failed, which means nothing was written and
+      # a retry IS correct.
+      again = store.get_probe_issue(issue.id).not_nil!
+      second = Gori::Probe::Triage.promote(store, again)
+      second.promoted?.should be_false
+      second.outcome.already_promoted?.should be_true
+      second.issue_id.should be_nil
+      store.issues.size.should eq(1)
+    end
+  end
+
+  it "dismisses only an OPEN finding and re-opens anything else" do
+    with_store do |store|
+      store.upsert_probe_issue(Gori::Probe::Detection.new(
+        code: "secret_in_url", category: "infoleak", host: "acme.test", title: "t",
+        severity: Gori::Store::Severity::High, url: "https://acme.test/x"))
+      issue = store.probe_issues.first
+
+      Gori::Probe::Triage.toggle_dismiss(store, issue).false_positive?.should be_true
+      Gori::Probe::Triage.toggle_dismiss(store, store.get_probe_issue(issue.id).not_nil!).open?.should be_true
+
+      # A Confirmed (promoted) finding re-opens rather than being dismissed — the asymmetry
+      # the TUI's `c` has always had, now shared.
+      store.update_probe_issue_status(issue.id, Gori::Store::Status::Confirmed)
+      Gori::Probe::Triage.toggle_dismiss(store, store.get_probe_issue(issue.id).not_nil!).open?.should be_true
+    end
+  end
+end

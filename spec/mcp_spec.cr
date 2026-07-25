@@ -2038,7 +2038,6 @@ describe Gori::MCP::Serialize do
     text.valid_encoding?.should be_true
     text.should contain("A")
   end
-
 end
 
 describe Gori::MCP::RequestBuilder do
@@ -2370,6 +2369,445 @@ describe "MCP env reload (R2-3)" do
       ensure
         Gori::Settings.project_env_vars = [] of {String, String}
       end
+    end
+  end
+end
+
+# Small CRUD gaps that used to be TUI-only: issue delete, scope-rule edit-in-place,
+# sitemap tags, and repeater tags.
+private def tools_for(store) : Gori::MCP::Tools
+  Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+end
+
+private def ok_json(tools : Gori::MCP::Tools, name : String, args : String) : JSON::Any
+  r = tools.call(name, JSON.parse(args))
+  fail "tool #{name} errored: #{r.text}" if r.is_error
+  JSON.parse(r.text)
+end
+
+describe "MCP delete_issue" do
+  it "removes the issue and its entity links" do
+    with_store do |store|
+      rid = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      id = store.insert_issue("boom", Gori::Store::Severity::High, "acme.test", nil)
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, id, Gori::Store::LinkRefKind::Repeater, rid)
+      tools = tools_for(store)
+
+      ok_json(tools, "delete_issue", %({"id":#{id}}))["deleted"].as_bool.should be_true
+      store.get_issue(id).should be_nil
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, id).empty?.should be_true
+
+      tools.call("delete_issue", JSON.parse(%({"id":#{id}}))).is_error.should be_true # already gone
+    end
+  end
+end
+
+describe "MCP update_scope_rule" do
+  it "edits a rule in place, keeping its id and defaulting unspecified fields" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "old.test")
+      id = Gori::Scope.load(store).rules.first.id
+      tools = tools_for(store)
+
+      res = ok_json(tools, "update_scope_rule", %({"id":#{id},"pattern":"new.test"}))
+      res["id"].as_i64.should eq(id) # same rule, not delete + re-add
+      res["kind"].as_s.should eq("include")
+      res["match_type"].as_s.should eq("host")
+
+      rule = Gori::Scope.load(store).rules.first
+      rule.id.should eq(id)
+      rule.pattern.should eq("new.test")
+      rule.kind.should eq("include")
+    end
+  end
+
+  it "rejects an unknown id and an invalid field" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "a.test")
+      id = Gori::Scope.load(store).rules.first.id
+      tools = tools_for(store)
+      tools.call("update_scope_rule", JSON.parse(%({"id":9999,"pattern":"x"}))).is_error.should be_true
+      tools.call("update_scope_rule", JSON.parse(%({"id":#{id},"kind":"bogus"}))).is_error.should be_true
+      # An invalid regex must not land in the gate.
+      tools.call("update_scope_rule", JSON.parse(%({"id":#{id},"match_type":"regex","pattern":"[bad"}))).is_error.should be_true
+      Gori::Scope.load(store).rules.first.pattern.should eq("a.test")
+    end
+  end
+end
+
+describe "MCP sitemap tags" do
+  it "sets, lists, clears, and stamps a tag onto the matching list_sitemap entry" do
+    with_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "acme.test", port: 443,
+        method: "GET", target: "/login?a=1", http_version: "HTTP/1.1",
+        head: "GET /login?a=1 HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+      tools = tools_for(store)
+
+      res = ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login?a=1","tag":"auth entry"}))
+      res["tag"].as_s.should eq("auth entry")
+
+      tags = ok_json(tools, "list_sitemap_tags", "{}").as_a
+      tags.size.should eq(1)
+      tags.first["path"].as_s.should eq("/login?a=1")
+
+      entry = ok_json(tools, "list_sitemap", "{}").as_a.first
+      entry["tag"].as_s.should eq("auth entry")
+
+      ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login?a=1"}))["cleared"].as_bool.should be_true
+      ok_json(tools, "list_sitemap_tags", "{}").as_a.empty?.should be_true
+    end
+  end
+
+  it "keys tags on the path INCLUDING the query, matching the Sitemap tree" do
+    with_store do |store|
+      tools = tools_for(store)
+      ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login?a=1","tag":"with-query"}))
+      ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login","tag":"bare"}))
+      # Two DISTINCT nodes — stripping the query would collapse them and file the tag
+      # under a key the tree never looks up.
+      store.sitemap_tags[{"acme.test", "/login?a=1"}]?.should eq("with-query")
+      store.sitemap_tags[{"acme.test", "/login"}]?.should eq("bare")
+    end
+  end
+end
+
+describe "MCP repeater tags" do
+  it "sets and clears tags through update_repeater, and lists them back" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      tools = tools_for(store)
+
+      ok_json(tools, "update_repeater", %({"id":#{id},"tags":"auth prod"}))
+      # repeaters_mcp is the loader every listing surface reads — it must SELECT tags,
+      # or a stored tag reads back as nil everywhere but the TUI.
+      store.repeaters_mcp.first.tags.should eq("auth prod")
+
+      ok_json(tools, "update_repeater", %({"id":#{id},"tags":""}))
+      store.repeaters_mcp.first.tags.should be_nil
+    end
+  end
+end
+
+private def seed_flow(store, target = "/a") : Int64
+  id = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_i64, scheme: "https", host: "acme.test", port: 443,
+    method: "GET", target: target, http_version: "HTTP/1.1",
+    head: "GET #{target} HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice))
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+  id
+end
+
+describe "MCP flow deletion" do
+  it "deletes one flow by id" do
+    with_store do |store|
+      a = seed_flow(store, "/a")
+      b = seed_flow(store, "/b")
+      tools = tools_for(store)
+
+      ok_json(tools, "delete_flow", %({"id":#{a}}))["deleted"].as_bool.should be_true
+      store.get_flow(a).should be_nil
+      store.get_flow(b).should_not be_nil
+      tools.call("delete_flow", JSON.parse(%({"id":#{a}}))).is_error.should be_true # already gone
+    end
+  end
+
+  it "refuses clear_history without confirm:true and reports the count it would destroy" do
+    with_store do |store|
+      seed_flow(store, "/a")
+      seed_flow(store, "/b")
+      tools = tools_for(store)
+
+      r = tools.call("clear_history", JSON.parse("{}"))
+      r.is_error.should be_true
+      r.text.should contain("2")
+      store.count.should eq(2) # nothing destroyed
+
+      tools.call("clear_history", JSON.parse(%({"confirm":false}))).is_error.should be_true
+      store.count.should eq(2)
+
+      ok_json(tools, "clear_history", %({"confirm":true}))["deleted"].as_i.should eq(2)
+      store.count.should eq(0)
+    end
+  end
+
+  it "refuses both under --read-only" do
+    with_store do |store|
+      id = seed_flow(store)
+      ro = Gori::MCP::Tools.new(store, allow_actions: false, verify_upstream: false)
+      ro.call("delete_flow", JSON.parse(%({"id":#{id}}))).is_error.should be_true
+      ro.call("clear_history", JSON.parse(%({"confirm":true}))).is_error.should be_true
+      store.count.should eq(1)
+    end
+  end
+end
+
+describe "MCP entity links" do
+  it "lists an issue's evidence resolved to labels, and round-trips add/remove" do
+    with_store do |store|
+      fid = seed_flow(store, "/evidence")
+      rid = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      iid = store.insert_issue("boom", Gori::Store::Severity::High, "acme.test", nil)
+      tools = tools_for(store)
+
+      ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
+
+      res = ok_json(tools, "add_link",
+        %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}}))
+      res["already_linked"].as_bool.should be_false
+      ok_json(tools, "add_link",
+        %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"repeater","ref_id":#{rid}}))
+
+      listed = ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))
+      listed["total"].as_i.should eq(2)
+      kinds = listed["links"].as_a.map { |l| l["ref_kind"].as_s }
+      kinds.should contain("flow")
+      kinds.should contain("repeater")
+      listed["links"].as_a.each { |l| l["label"].as_s.empty?.should be_false }
+
+      ok_json(tools, "remove_link",
+        %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}}))["removed"].as_bool.should be_true
+      ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(1)
+    end
+  end
+
+  it "reports a re-link as already_linked rather than duplicating" do
+    with_store do |store|
+      fid = seed_flow(store)
+      iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
+      tools = tools_for(store)
+      args = %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}})
+
+      ok_json(tools, "add_link", args)["already_linked"].as_bool.should be_false
+      ok_json(tools, "add_link", args)["already_linked"].as_bool.should be_true
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, iid).size.should eq(1)
+    end
+  end
+
+  it "marks a link whose target vanished as stale instead of hiding it" do
+    with_store do |store|
+      rid = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
+      tools = tools_for(store)
+      ok_json(tools, "add_link", %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"repeater","ref_id":#{rid}}))
+
+      # Deleting a repeater does NOT cascade entity_links (unlike deleting a flow), so this
+      # is the path that actually leaves a dangling pointer.
+      store.delete_repeater(rid)
+      listed = ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))
+      listed["total"].as_i.should eq(1) # still reported — "gone" is not the same as "never there"
+      listed["links"].as_a.first["stale"].as_bool.should be_true
+    end
+  end
+
+  it "drops a flow link when the flow itself is deleted (delete_flow cascades entity_links)" do
+    with_store do |store|
+      fid = seed_flow(store)
+      iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
+      tools = tools_for(store)
+      ok_json(tools, "add_link", %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}}))
+
+      ok_json(tools, "delete_flow", %({"id":#{fid}}))
+      ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
+    end
+  end
+
+  it "refuses to link either end to a row that does not exist" do
+    with_store do |store|
+      fid = seed_flow(store)
+      iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
+      tools = tools_for(store)
+
+      tools.call("add_link", JSON.parse(%({"owner_kind":"issue","owner_id":9999,"ref_kind":"flow","ref_id":#{fid}}))).is_error.should be_true
+      tools.call("add_link", JSON.parse(%({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":9999}))).is_error.should be_true
+      tools.call("add_link", JSON.parse(%({"owner_kind":"bogus","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}}))).is_error.should be_true
+      tools.call("add_link", JSON.parse(%({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"bogus","ref_id":#{fid}}))).is_error.should be_true
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, iid).empty?.should be_true
+    end
+  end
+
+  it "refuses mutation under --read-only but still lists" do
+    with_store do |store|
+      fid = seed_flow(store)
+      iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, iid, Gori::Store::LinkRefKind::Flow, fid)
+      ro = Gori::MCP::Tools.new(store, allow_actions: false, verify_upstream: false)
+
+      ro.call("add_link", JSON.parse(%({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}}))).is_error.should be_true
+      ro.call("remove_link", JSON.parse(%({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":#{fid}}))).is_error.should be_true
+      ok_json(ro, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(1)
+    end
+  end
+end
+
+describe "MCP saved OAST providers" do
+  it "CRUDs a project provider and redacts its token by default" do
+    with_store do |store|
+      tools = tools_for(store)
+      ok_json(tools, "list_oast_providers", "{}")["total"].as_i.should eq(0)
+
+      created = ok_json(tools, "create_oast_provider",
+        %({"name":"private","kind":"interactsh","host":"https://oast.internal","token":"SECRET"}))
+      id = created["id"].as_s
+      id.should start_with("p_")
+
+      listed = ok_json(tools, "list_oast_providers", "{}")["providers"].as_a.first
+      listed["name"].as_s.should eq("private")
+      listed["scope"].as_s.should eq("project")
+      listed["enabled"].as_bool.should be_true
+      listed["token"].as_s.should eq("[REDACTED]") # a provider token is a credential
+
+      ok_json(tools, "list_oast_providers", %({"include_sensitive":true}))["providers"]
+        .as_a.first["token"].as_s.should eq("SECRET")
+
+      ok_json(tools, "set_oast_provider_enabled", %({"id":"#{id}","enabled":false}))
+      ok_json(tools, "list_oast_providers", "{}")["providers"].as_a.first["enabled"].as_bool.should be_false
+
+      ok_json(tools, "delete_oast_provider", %({"id":"#{id}"}))["deleted"].as_i.should eq(1)
+      store.oast_providers.empty?.should be_true
+    end
+  end
+
+  it "keeps unmentioned fields on update — editing the name must not drop the token" do
+    with_store do |store|
+      tools = tools_for(store)
+      id = ok_json(tools, "create_oast_provider",
+        %({"name":"private","host":"https://oast.internal","token":"SECRET"}))["id"].as_s
+
+      ok_json(tools, "update_oast_provider", %({"id":"#{id}","name":"renamed"}))
+      row = store.oast_providers.first
+      row.name.should eq("renamed")
+      row.token.should eq("SECRET") # survived
+      row.host.should eq("https://oast.internal")
+      row.enabled?.should be_true
+    end
+  end
+
+  it "refuses an unknown kind rather than storing one that can never fire" do
+    with_store do |store|
+      tools = tools_for(store)
+      tools.call("create_oast_provider", JSON.parse(%({"name":"x","kind":"bogus"}))).is_error.should be_true
+      store.oast_providers.empty?.should be_true
+    end
+  end
+
+  it "refuses to touch a GLOBAL provider or an unknown id" do
+    with_store do |store|
+      tools = tools_for(store)
+      tools.call("delete_oast_provider", JSON.parse(%({"id":"g_abc"}))).is_error.should be_true
+      tools.call("update_oast_provider", JSON.parse(%({"id":"p_999","name":"x"}))).is_error.should be_true
+      tools.call("delete_oast_provider", JSON.parse(%({"id":"nonsense"}))).is_error.should be_true
+    end
+  end
+
+  it "refuses mutation under --read-only but still lists" do
+    with_store do |store|
+      store.insert_oast_provider("p", "interactsh", "https://x.test", "T", true, 0)
+      ro = Gori::MCP::Tools.new(store, allow_actions: false, verify_upstream: false)
+      ro.call("create_oast_provider", JSON.parse(%({"name":"x"}))).is_error.should be_true
+      ro.call("delete_oast_provider", JSON.parse(%({"id":"p_1"}))).is_error.should be_true
+      ok_json(ro, "list_oast_providers", "{}")["total"].as_i.should eq(1)
+    end
+  end
+end
+
+describe "MCP minimize_repeater" do
+  it "refuses a WebSocket session, an unknown id, and a bad scheme" do
+    with_store do |store|
+      ws = store.insert_repeater("https://acme.test/",
+        "GET /ws HTTP/1.1\r\nHost: acme.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      bad = store.insert_repeater("ftp://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 1)
+      tools = tools_for(store)
+
+      tools.call("minimize_repeater", JSON.parse(%({"repeater_id":9999}))).is_error.should be_true
+      tools.call("minimize_repeater", JSON.parse(%({"repeater_id":#{ws}}))).is_error.should be_true
+      tools.call("minimize_repeater", JSON.parse(%({"repeater_id":#{bad}}))).is_error.should be_true
+    end
+  end
+
+  it "refuses an out-of-scope target before sending anything" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "other.test")
+      tools = tools_for(store)
+
+      r = tools.call("minimize_repeater", JSON.parse(%({"repeater_id":#{id}})))
+      r.is_error.should be_true
+      r.text.should contain("scope")
+    end
+  end
+
+  it "refuses a sandbox-blocked target even under allow_unscoped" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "other.test")
+      scope.enable_sandbox
+      tools = tools_for(store)
+
+      # allow_unscoped bypasses the include gate but NEVER the sandbox — same two-layer
+      # model the other active tools use.
+      r = tools.call("minimize_repeater", JSON.parse(%({"repeater_id":#{id},"allow_unscoped":true})))
+      r.is_error.should be_true
+      r.text.should contain("sandbox")
+    end
+  end
+
+  it "is refused under --read-only (it sends real requests)" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      ro = Gori::MCP::Tools.new(store, allow_actions: false, verify_upstream: false)
+      ro.call("minimize_repeater", JSON.parse(%({"repeater_id":#{id}}))).is_error.should be_true
+    end
+  end
+end
+
+describe "code-review follow-ups" do
+  it "refuses to minimize a repeater whose saved request holds §fuzz§ markers" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/",
+        "GET /a?id=§1§ HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, false, true, nil, 0)
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+      tools = tools_for(store)
+
+      # A marked-up template is not a request: minimizing it would send real requests full of
+      # literal § bytes, and apply:true would overwrite the user's template with the result.
+      r = tools.call("minimize_repeater", JSON.parse(%({"repeater_id":#{id}})))
+      r.is_error.should be_true
+      r.text.should contain("marker")
+      # Untouched.
+      String.new(store.get_repeater(id).not_nil!.request).should contain("§1§")
+    end
+  end
+
+  it "flags a sitemap tag whose path matches no captured endpoint" do
+    with_store do |store|
+      seed_flow(store, "/api/users")
+      tools = tools_for(store)
+
+      hit = ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/api/users","tag":"ok"}))
+      hit["matches_endpoint"].as_bool.should be_true
+      hit.as_h.has_key?("warning").should be_false
+
+      # Sitemap.add drops a trailing slash, so /api/users/ is a key no node ever has.
+      miss = ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/api/users/","tag":"typo"}))
+      miss["matches_endpoint"].as_bool.should be_false
+      miss["warning"].as_s.should contain("no captured endpoint")
     end
   end
 end

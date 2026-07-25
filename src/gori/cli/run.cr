@@ -19,6 +19,7 @@ require "../repeater/h2_engine"
 require "../repeater/ws_engine"
 require "../repeater/flow_request"
 require "../repeater/diff"
+require "../repeater/minimize"
 require "../repeater/message_lines"
 require "../fuzz"
 require "../decoder"
@@ -26,15 +27,18 @@ require "../miner"
 require "../sequencer"
 require "../discover"
 require "../discover/adapters"
+require "../oast/provider_config"
 require "../probe/passive"
 require "../probe/group"
 require "../notes"
 require "../issues_export"
+require "../links"
 require "../import"
 require "./output"
 require "./run/capture"
 require "./run/history"
 require "./run/repeater"
+require "./run/repeater_minimize"
 require "./run/compare"
 require "./run/intercept"
 require "./run/fuzz_args"
@@ -48,6 +52,7 @@ require "./run/notes"
 require "./run/sitemap"
 require "./run/import"
 require "./run/issues"
+require "./run/links"
 require "./run/jwt"
 require "./run/decoder"
 require "./run/rewriter"
@@ -120,6 +125,7 @@ module Gori
         case sub
         when "compare"   then cmd_compare(rest)
         when "intercept" then cmd_intercept(rest)
+        when "links"     then cmd_links(rest)
         else
           STDERR.puts "gori run: unknown subcommand '#{sub}'"
           print_help
@@ -133,8 +139,11 @@ module Gori
       SUBCOMMANDS = [
         {"capture", "Start the proxy and stream captured flows to STDOUT"},
         {"history (ls)", "List / QL-query captured flows"},
+        {"history delete", "Hard-delete one captured flow by id"},
+        {"history clear", "Delete ALL captured flows in the project (needs --yes)"},
         {"show <id>", "Print a flow's request/response (text, json, or raw bytes)"},
         {"repeater", "Re-send a captured flow; list/create/send (replay, incl. WebSocket) repeater sessions"},
+        {"repeater minimize", "Strip noise from a saved request, keeping the response the same"},
         {"compare <a> <b>", "Diff two flows' request or response (unified diff)"},
         {"intercept", "Inspect/drive a live TUI's paused intercept queue (list, forward, drop, edit, …)"},
         {"fuzz [<id>]", "Fuzz/intrude a request: mark §…§ positions, sweep payloads"},
@@ -142,18 +151,27 @@ module Gori
         {"sequence (seq)", "Analyze token randomness (collect via replay, or --tokens FILE)"},
         {"discover", "Spider + directory brute-force a target; findings feed the Sitemap"},
         {"oast", "Listen for out-of-band callbacks (interactsh & friends); print payload + hits"},
+        {"oast providers", "Manage saved OAST providers (list, add, update, enable/disable, delete)"},
         {"sitemap", "Print the host → path endpoint tree (text, json, paths)"},
+        {"sitemap tag", "Pin/clear/list a free-text memo on a sitemap path"},
         {"import", "Import flows from a HAR, URL list, or OpenAPI spec into History"},
         {"probe [QL]", "Passively scan captured flows for issues (zero requests)"},
+        {"probe issues", "List persisted probe findings (the TUI Probe tab's list)"},
+        {"probe dismiss", "Mute a finding by id, or bulk by --code / --host"},
+        {"probe promote", "Promote a finding to a human-confirmed Issue"},
+        {"probe delete", "Hard-delete a finding (or --all)"},
+        {"probe rules", "List/enable/disable scan rules; add or delete custom ones"},
+        {"probe mode", "Get/set the scan mode (off, passive, active, aggressive)"},
         {"notes [<n>]", "Read or write the project's notes (list, show, --all, create, delete)"},
-        {"issues", "List, export, create, or update issues (text, json, markdown)"},
+        {"issues", "List, export, create, update, or delete issues (text, json, markdown)"},
+        {"links", "List/add/remove an issue's or note's evidence links"},
         {"jwt [<token>]", "Decode, re-sign, or generate testing payloads for a JWT"},
         {"decoder <chain>", "Encode/decode/hash via the Decoder engine (base64, hex, url, gzip …)"},
         {"rewriter", "Manage Match & Replace rules (list, add, rm, enable/disable, preview)"},
         {"project [list]", "List known projects"},
         {"project create", "Create (or reopen) a project by name"},
         {"project delete", "Delete a project and everything captured in it"},
-        {"project scope", "Manage scope rules (list, add, delete, enable/disable)"},
+        {"project scope", "Manage scope rules (list, add, update, delete, enable/disable)"},
         {"project sandbox", "Get/set the hard-containment sandbox gate (status, on, off)"},
         {"project env", "Manage project env vars ($KEY substitution)"},
         {"project host-override", "Manage host overrides (list, add, update, delete)"},
