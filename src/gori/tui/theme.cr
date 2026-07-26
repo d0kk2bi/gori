@@ -2,7 +2,7 @@ require "json"
 require "../paths"
 
 module Gori::Tui
-  # The TUI colour palette. gori ships twenty-six themes — GORIDARK (the default; a
+  # The TUI colour palette. gori ships twenty-eight themes — GORIDARK (the default; a
   # monochrome palette in the spirit of Grok Build: near-black canvas, white/grey
   # text, a white highlight, hairline dividers), GORIDAY (the same relationships
   # inverted onto an off-white canvas with dark ink), LATTE (a soft, cool light
@@ -24,8 +24,10 @@ module Gori::Tui
   # maximum-contrast black/white accessibility palette after VS Code's High
   # Contrast), GITHUB_LIGHT (GitHub's Primer light palette on pure white),
   # GRUVBOX_LIGHT (GRUVBOX's warm cream light counterpart), ONE_LIGHT (the Atom One
-  # Light grey-white palette), and AYU_LIGHT (a bright light palette with Ayu's
-  # orange accent). Only HTTP status keeps functional colour.
+  # Light grey-white palette), AYU_LIGHT (a bright light palette with Ayu's orange
+  # accent), ROSEPINE (the deep-indigo dark base that ROSEPINE_DAWN inverts), and
+  # TOKYONIGHT_DAY (TOKYONIGHT's official light counterpart on a cool blue-grey
+  # canvas). Only HTTP status keeps functional colour.
   #
   # `Termisu::Color` is a value struct, so colours can't be mutated in place to
   # re-theme. Instead one Palette is active at a time (`@@active`) and every colour
@@ -785,7 +787,68 @@ module Gori::Tui
       syn_keyword: Color.from_hex("#9c3a86"),   # language keywords / auth schemes (magenta, 6.1:1)
     )
 
-    BUILTIN_THEMES = {"goridark" => GORIDARK, "goriday" => GORIDAY, "latte" => LATTE, "espresso" => ESPRESSO, "tokyonight" => TOKYONIGHT, "gruvbox" => GRUVBOX, "nord" => NORD, "dracula" => DRACULA, "solarized_light" => SOLARIZED_LIGHT, "rosepine_dawn" => ROSEPINE_DAWN, "catppuccin_mocha" => CATPPUCCIN_MOCHA, "monokai" => MONOKAI, "everforest" => EVERFOREST, "onedark" => ONEDARK, "kanagawa" => KANAGAWA, "github_dark" => GITHUB_DARK, "zenburn" => ZENBURN, "synthwave84" => SYNTHWAVE84, "cyberpunk" => CYBERPUNK, "matrix" => MATRIX, "cobalt2" => COBALT2, "high_contrast" => HIGH_CONTRAST, "github_light" => GITHUB_LIGHT, "gruvbox_light" => GRUVBOX_LIGHT, "one_light" => ONE_LIGHT, "ayu_light" => AYU_LIGHT}
+    # The Rosé Pine base palette — the dark original ROSEPINE_DAWN inverts: a deep
+    # indigo canvas with rose/gold/iris accents. The upstream hues already clear AA
+    # on the dark base and are used as-is, with two exceptions: Rosé Pine ships no
+    # green (its `pine` is a teal that sits at 3.3:1), so 2xx/strings get a sage tone
+    # in the palette's spirit, and the `muted` comment tone is lifted a step so
+    # secondary text clears our readability guard (same treatment as TOKYONIGHT).
+    ROSEPINE = Palette.new(
+      bg: Color.from_hex("#191724"),            # rosé pine base — deep indigo canvas
+      panel: Color.from_hex("#1f1d2e"),         # top bar / status / overlays (surface)
+      elevated: Color.from_hex("#26233a"),      # header band, active segment (overlay)
+      border: Color.from_hex("#403d52"),        # hairline dividers (resting) — highlight med
+      border_focus: Color.from_hex("#524f67"),  # brighter hairline for an active modal card — highlight high
+      focus_gold: Color.from_hex("#f6c177"),    # focused body pane outline (rosé pine gold, 10.8:1)
+      accent: Color.from_hex("#e0def4"),        # the highlight (rosé pine text)
+      accent_bg: Color.from_hex("#403d52"),     # selection band (focused pane, 1.69:1)
+      selection_dim: Color.from_hex("#21202e"), # selection band (unfocused pane) — highlight low
+      text: Color.from_hex("#cdc9e3"),          # body text (a step under the highlight, 11.0:1)
+      text_bright: Color.from_hex("#e0def4"),   # emphasis / active
+      muted: Color.from_hex("#908caa"),         # secondary (rosé pine subtle, 5.5:1)
+      green: Color.from_hex("#8fc7a0"),         # 2xx (sage — upstream `pine` is a 3.3:1 teal)
+      yellow: Color.from_hex("#f6c177"),        # 4xx (gold)
+      red: Color.from_hex("#eb6f92"),           # 5xx / error (love, 6.1:1)
+      orange: Color.from_hex("#ebbcba"),        # (rose)
+      syn_header: Color.from_hex("#9ccfd8"),    # header/field names, JSON keys, tag names (foam)
+      syn_string: Color.from_hex("#8fc7a0"),    # quoted strings (sage)
+      syn_number: Color.from_hex("#f6c177"),    # numbers, tag attribute names (gold)
+      syn_literal: Color.from_hex("#c4a7e7"),   # true / false / null (iris)
+      syn_comment: Color.from_hex("#7d7898"),   # comments (lifted muted, 4.2:1)
+      syn_keyword: Color.from_hex("#eb6f92"),   # language keywords / auth schemes (love)
+    )
+
+    # Tokyo Night Day — TOKYONIGHT's official light counterpart: a cool blue-grey
+    # canvas with the same blue ink. Tokyo Night Day is tuned for a lighter base than
+    # ours, so every functional hue is darkened along its own hue line until it clears
+    # WCAG AA (the upstream red sits at 3.0:1, the magenta at 3.3:1) — the same
+    # treatment GORIDAY / LATTE / AYU_LIGHT received.
+    TOKYONIGHT_DAY = Palette.new(
+      bg: Color.from_hex("#e1e2e7"),            # tokyo night day base — cool blue-grey canvas
+      panel: Color.from_hex("#d9dae1"),         # top bar / status / overlays
+      elevated: Color.from_hex("#d0d5e3"),      # header band, active segment (bg_dark)
+      border: Color.from_hex("#8990b3"),        # hairline dividers (resting) — 2.4:1, visible-but-subtle
+      border_focus: Color.from_hex("#767da0"),  # brighter hairline for an active modal card (3.1:1)
+      focus_gold: Color.from_hex("#2666bf"),    # focused body pane outline (darkened day blue, 4.4:1)
+      accent: Color.from_hex("#355cb7"),        # the highlight ink (darkened day foreground)
+      accent_bg: Color.from_hex("#bcc4da"),     # selection band (focused pane) — deepened for a visible focus band on light (1.35:1)
+      selection_dim: Color.from_hex("#d8dae2"), # selection band (unfocused pane)
+      text: Color.from_hex("#355cb7"),          # body text (blue ink, 4.8:1)
+      text_bright: Color.from_hex("#2a4a94"),   # emphasis / active (deeper blue, 6.5:1)
+      muted: Color.from_hex("#5a6289"),         # secondary — AA on canvas (4.6:1) and legible on the selection band (3.4:1)
+      green: Color.from_hex("#4e6833"),         # 2xx (darkened day green, 4.8:1)
+      yellow: Color.from_hex("#785c35"),        # 4xx (darkened day yellow, 4.8:1)
+      red: Color.from_hex("#b9204c"),           # 5xx / error (darkened day red — upstream #f52a65 is 3.0:1; 4.8:1)
+      orange: Color.from_hex("#954d00"),        # (darkened day orange, 4.9:1)
+      syn_header: Color.from_hex("#235fb1"),    # header/field names, JSON keys, tag names (darkened day blue, 4.9:1)
+      syn_string: Color.from_hex("#4e6833"),    # quoted strings (green)
+      syn_number: Color.from_hex("#954d00"),    # numbers, tag attribute names (orange)
+      syn_literal: Color.from_hex("#7746bb"),   # true / false / null (day purple, 4.8:1)
+      syn_comment: Color.from_hex("#676d8d"),   # comments (darkened day comment, 3.9:1)
+      syn_keyword: Color.from_hex("#7943c0"),   # language keywords / auth schemes (darkened day magenta, 4.8:1)
+    )
+
+    BUILTIN_THEMES = {"goridark" => GORIDARK, "goriday" => GORIDAY, "latte" => LATTE, "espresso" => ESPRESSO, "tokyonight" => TOKYONIGHT, "gruvbox" => GRUVBOX, "nord" => NORD, "dracula" => DRACULA, "solarized_light" => SOLARIZED_LIGHT, "rosepine_dawn" => ROSEPINE_DAWN, "catppuccin_mocha" => CATPPUCCIN_MOCHA, "monokai" => MONOKAI, "everforest" => EVERFOREST, "onedark" => ONEDARK, "kanagawa" => KANAGAWA, "github_dark" => GITHUB_DARK, "zenburn" => ZENBURN, "synthwave84" => SYNTHWAVE84, "cyberpunk" => CYBERPUNK, "matrix" => MATRIX, "cobalt2" => COBALT2, "high_contrast" => HIGH_CONTRAST, "github_light" => GITHUB_LIGHT, "gruvbox_light" => GRUVBOX_LIGHT, "one_light" => ONE_LIGHT, "ayu_light" => AYU_LIGHT, "rosepine" => ROSEPINE, "tokyonight_day" => TOKYONIGHT_DAY}
     DEFAULT_THEME  = "goridark"
 
     # User themes loaded from <GORI_HOME>/themes/*.json (filename stem = name), merged
