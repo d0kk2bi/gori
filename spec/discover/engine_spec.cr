@@ -14,6 +14,32 @@ private class RouteBackend < D::Backend
   end
 end
 
+# Records the HOST of every fetch, not just the target — the only way to see what would have
+# gone onto a CONNECT line (`Upstream.dial_via_proxy` builds it from this argument).
+private class HostRecordingBackend < D::Backend
+  def initialize(@hosts : Array(String), @route : String -> R)
+  end
+
+  def fetch(scheme : String, host : String, port : Int32, target : String) : R
+    @hosts << host
+    @route.call(target)
+  end
+end
+
+# Drive an engine to completion and return {terminal event kinds, error messages}. The KINDS
+# list is what distinguishes a terminal error from an error followed by a success Done.
+private def terminal_of(engine : D::Engine) : {Array(Symbol), Array(String)}
+  kinds = [] of Symbol
+  messages = [] of String
+  engine.run do |ev|
+    case ev
+    when D::ErrorEvent then kinds << :error; messages << ev.message
+    when D::DoneEvent  then kinds << :done
+    end
+  end
+  {kinds, messages}
+end
+
 private def make(status : Int32, body : String, ctype : String? = "text/html", location : String? = nil) : R
   head = String.build do |s|
     s << "HTTP/1.1 " << status << " X\r\n"
@@ -322,6 +348,133 @@ describe Gori::Discover::Engine do
     urls.should_not contain("http://t/api-internal/secret") # sibling prefix — must be excluded
   end
 
+  # Issue #395. The brute-force base came from `Url.dir_of(seed)` while the confine came from
+  # the seed's full path, and for a file-shaped seed the two disagreed: `dir_of("http://t/api")`
+  # is the origin root, which `@confine_path` of "/api" then refuses. The seed's own subtree
+  # was never probed, and with --no-spider that was the entire run.
+  describe "a file-shaped seed" do
+    it "brute-forces its own subtree rather than nothing" do
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 2, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      sent = [] of String
+      findings, _ = run_discover("http://t/api", ["admin"], cfg) do |t|
+        sent << t
+        t == "/api/admin" ? html("a real admin page under the api subtree") : notfound
+      end
+      # Calibration probes + the wordlist entry, all under /api/ — never at the origin root,
+      # which is outside what the operator typed.
+      sent.should_not be_empty
+      sent.should contain("/api/admin")
+      sent.all?(&.starts_with?("/api/")).should be_true
+      findings.map(&.url).should contain("http://t/api/admin")
+    end
+
+    it "brute-forces a seed whose path ends in a bare dot" do
+      # `/api/.` is the one dot-segment shape `Url.parse` used to leave alone, which made
+      # `@confine_path` unsatisfiable — nothing derived can equal `/api/.`, so the run went
+      # back to sending nothing. Normalizing it at parse is what keeps #395 true for this
+      # shape too.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 1, concurrency: 1, retries: 0)
+      sent = [] of String
+      run_discover("http://t/api/.", ["admin"], cfg) { |t| sent << t; notfound }
+      sent.should contain("/api/admin")
+    end
+
+    it "drops a crawled link whose HOST carries a space, before it can reach a CONNECT line" do
+      # The sweep's chain for the #394 class: `<a href="http://ac me.acme.test/x">` passes
+      # `Headers.safe_url?` (a space is not CR/LF) and `same_or_subdomain?` containment, so on
+      # the way to the wire it would have reached `Upstream.dial_via_proxy`, which writes
+      # `CONNECT ac me.acme.test:80 HTTP/1.1` with no validation of its own. `Url.parse`
+      # refusing the host is what makes that unreachable; the byte-level half is in
+      # sender_spec's "with an upstream proxy configured".
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 4, concurrency: 1,
+        retries: 0, containment: D::Containment::HostAndSubdomains)
+      hosts = [] of String
+      backend = HostRecordingBackend.new(hosts, ->(t : String) {
+        t == "/" ? html(%(<a href="http://ac me.acme.test/x">spaced host</a> <a href="http://ok.acme.test/y">ok</a>)) : html("an ordinary page")
+      })
+      D::Engine.new("http://acme.test/", [] of String, backend, cfg).run { |_ev| }
+      # The control: a sibling subdomain link on the same page WAS crawled, so this is a
+      # verdict about the host guard and not about a crawl that never happened.
+      hosts.should contain("ok.acme.test")
+      hosts.none?(&.includes?(' ')).should be_true
+    end
+
+    it "keeps the brute-force base inside the confine for a deeper path and a query seed" do
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 1, concurrency: 1, retries: 0)
+      %w[http://t/a/b http://t/api?x=1 http://t:8080/api].each do |seed|
+        sent = [] of String
+        run_discover(seed, ["admin"], cfg) do |t|
+          sent << t
+          notfound
+        end
+        base = seed.includes?("/a/b") ? "/a/b/" : "/api/"
+        sent.should_not be_empty
+        sent.all?(&.starts_with?(base)).should be_true
+      end
+    end
+
+    it "leaves a directory seed and an origin seed calibrating exactly where they did" do
+      # The control: the two rows of the issue's matrix that already worked must not move.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 1, concurrency: 1, retries: 0)
+      {"http://t/api/" => "/api/", "http://t/" => "/"}.each do |seed, base|
+        sent = [] of String
+        run_discover(seed, ["admin"], cfg) { |t| sent << t; notfound }
+        sent.should contain("#{base}admin")
+        sent.all?(&.starts_with?(base)).should be_true
+      end
+    end
+  end
+
+  # Issue #395, the general half: a run that puts nothing on the wire must say so. The
+  # condition is the SEND COUNTER, not an empty frontier — an empty frontier is only the
+  # shape #395 found.
+  describe "a run that sends nothing" do
+    it "ends in a terminal ErrorEvent when seeding enqueued nothing" do
+      # Brute-force only, with the seed's own subtree refused by Layer 2. The seed itself is
+      # allowed, so SEED_BLOCKED does not fire — yet not one request would go out.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 2, concurrency: 4, retries: 0)
+      sent = [] of String
+      backend = RouteBackend.new(->(t : String) { sent << t; notfound })
+      engine = D::Engine.new("http://t/api", ["admin"], backend, cfg,
+        DenyExact.new(Set{"http://t/api/"}))
+      kinds, messages = terminal_of(engine)
+      kinds.should eq([:error])
+      messages.first.should eq(D::Engine::NOTHING_TO_SEND)
+      sent.should be_empty
+      # The terminal event is emitted AFTER the ordinary shutdown, never by returning early:
+      # with `concurrency: 4` an early return would leave four worker fibers parked on
+      # `@jobs.receive?` forever. `engine.run` would still return (it only waits on @events),
+      # so the leak is invisible unless the closed channel is asserted directly.
+      engine.@jobs.closed?.should be_true
+    end
+
+    it "ends in a terminal ErrorEvent when the frontier had work but every send was refused" do
+      # The half an empty-frontier test cannot see, and the one that became ordinary with #396:
+      # the seed IS enqueued (its Layer-2 check at construction passes, so SEED_BLOCKED does
+      # not fire) and then every send is refused per-URL in `send_with_retries`. This is
+      # exactly the shape a mid-run EXCLUDE now produces. `SCOPE_REFUSED` is a benign error, so
+      # `errors` stays 0 too — without the send-counter condition the run is completely silent.
+      cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 1, retries: 0)
+      sent = [] of String
+      backend = RouteBackend.new(->(t : String) { sent << t; notfound })
+      engine = D::Engine.new("http://t/api", [] of String, backend, cfg, DenyAfterFirstAsk.new)
+      kinds, messages = terminal_of(engine)
+      kinds.should eq([:error])
+      messages.first.should eq(D::Engine::NOTHING_TO_SEND)
+      sent.should be_empty
+    end
+
+    it "still emits a normal Done as soon as ONE request goes out (the control)" do
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 1, concurrency: 1, retries: 0)
+      sent = [] of String
+      backend = RouteBackend.new(->(t : String) { sent << t; notfound })
+      kinds, _ = terminal_of(D::Engine.new("http://t/api", ["admin"], backend, cfg))
+      kinds.should eq([:done])
+      sent.should_not be_empty
+    end
+  end
+
   # Issue #364 / DESIGN.md §7: the seed and its two derived well-known paths waive Layer 1,
   # the containment mode and the path confine — but never Layer 2 (Sandbox + EXCLUDE).
   describe "the Layer-2 gate on the seed trio" do
@@ -437,6 +590,25 @@ describe Gori::Discover::Engine do
       sent.none?(&.includes?('\n')).should be_true
       sent.none?(&.includes?("evil.test")).should be_true
       findings.map(&.url).none?(&.includes?("evil.test")).should be_true
+    end
+
+    # Issue #394, the other half of the same octet class. A raw SPACE is NOT dropped: it is
+    # what handwritten HTML actually contains, so dropping it would silently shrink coverage
+    # and lose a real endpoint. It is percent-encoded at parse, which gives the URL one
+    # spelling for the wire, the scope question, the finding and the Sitemap row alike.
+    it "percent-encodes a crawled link carrying a raw space instead of dropping it" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 4, concurrency: 1, retries: 0)
+      sent = [] of String
+      findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        t == "/" ? html(%(<a href="/my file.pdf">doc</a> <a href="/rep ort?q=a b">q</a>)) : html("a real document body")
+      end
+      sent.should contain("/my%20file.pdf")
+      sent.should contain("/rep%20ort?q=a%20b")
+      sent.none?(&.includes?(' ')).should be_true
+      # The finding — and therefore the Sitemap row `Persist` writes from it — carries the
+      # same encoded spelling, so a byte-exact Repeater re-send reproduces a valid request.
+      findings.map(&.url).should contain("http://t/my%20file.pdf")
     end
 
     it "is dropped when the CRLF sits in the QUERY rather than the path" do

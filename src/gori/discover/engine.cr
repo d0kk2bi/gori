@@ -50,7 +50,13 @@ module Gori::Discover
     # because `Upstream.dial` always CONNECT-tunnels (`proxy/upstream.cr`) rather than
     # forwarding in absolute form. Returned as a benign error Result rather than raised: the
     # caller's contract is one Result per fetch, and one poisoned link must not end the run.
-    UNSAFE_URL = "url contains a control character"
+    #
+    # The refusal covers the whole `Codec::Http1.request_token_safe?` class, not just CR/LF: a
+    # bare SP forges the line just as effectively (`GET /a b HTTP/1.1` — a lenient origin reads
+    # target `/a`, version `b`), which is what #394 found after #390. Nothing legitimate is
+    # lost by refusing the repairable half here, because `Url.parse` has already
+    # percent-encoded it upstream — this line only ever sees a target no repair applies to.
+    UNSAFE_URL = "url contains whitespace or a control character"
 
     @header_block : String
 
@@ -65,10 +71,11 @@ module Gori::Discover
 
     def fetch(scheme : String, host : String, port : Int32, target : String) : Repeater::Result
       # The wire seam's own invariant, not a duplicate of the engine's gate: `Engine#bounded_url`
-      # drops a poisoned URL before it is ever queued, but this is the only line every send
-      # provably passes, so the guarantee "a Discover run never puts two request lines on one
-      # connection" is stated where it can actually be enforced (see UNSAFE_URL).
-      unless Headers.safe_value?(target) && Headers.safe_value?(host)
+      # drops a poisoned URL before it is ever queued and `Url.parse` repairs a spaced one, but
+      # this is the only line every send provably passes, so the guarantee "a Discover run
+      # never puts a malformed or doubled request line on a connection" is stated where it can
+      # actually be enforced (see UNSAFE_URL).
+      unless Proxy::Codec::Http1.request_token_safe?(target) && Proxy::Codec::Http1.request_token_safe?(host)
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, UNSAFE_URL)
       end
       req = build_get(scheme, host, port, target)
@@ -162,6 +169,17 @@ module Gori::Discover
     # cap: a benign Result, no network, and NOT counted as an error — a scope refusal is a
     # decision the operator asked for, not a failure of the run.
     SCOPE_REFUSED = "blocked by scope (Sandbox or an exclude rule)"
+    # The run reached its end without putting a single request on the wire, so a DoneEvent
+    # would report "0 found" — which an operator reads as "there is nothing there" rather than
+    # "gori sent nothing" (P4). Terminal for exactly the reason SEED_BLOCKED is.
+    #
+    # The condition is `@capped.sent == 0`, deliberately, and NOT "seeding enqueued nothing".
+    # An empty frontier is only the shape #395 found; a frontier whose every task is refused
+    # later by the per-URL Layer-2 gate in `send_with_retries` ends in the same silence, and
+    # that state became ordinary the moment the gate started re-reading the scope mid-run
+    # (#396). Anchoring on the send counter covers both, plus whatever comes next: if nothing
+    # went out, the run says so.
+    NOTHING_TO_SEND = "nothing to send: no crawl page or brute-force candidate survived the scope and containment gates"
 
     enum State : UInt8
       Running
@@ -336,7 +354,21 @@ module Gori::Discover
       drain_pending
       @jobs.close
       @concurrency.times { @finished.receive }
-      @events.send(DoneEvent.new(progress_snapshot, run_stats, @state == State::Stopped))
+      # A run that put nothing on the wire ends in a terminal ErrorEvent — no trailing
+      # DoneEvent, so a consumer cannot settle a "0 found" success over it, the same shape
+      # `start`'s setup-error path uses (see NOTHING_TO_SEND). Decided HERE rather than right
+      # after `seed_frontier` for two reasons: the send counter is only final once the run is,
+      # and the shutdown sequence above (close @jobs, join every worker) has to run either way
+      # or the workers park on `@jobs.receive?` forever — the fiber + socket leak the rescue
+      # clause below guards against.
+      #
+      # A run the operator STOPPED is exempt: stopping before the first send is a decision, not
+      # a failure to have anything to do.
+      if @capped.sent == 0 && @state != State::Stopped
+        @events.send(ErrorEvent.new(NOTHING_TO_SEND))
+      else
+        @events.send(DoneEvent.new(progress_snapshot, run_stats, @state == State::Stopped))
+      end
       @events.close
     rescue ex
       # ErrorEvent is terminal (no trailing DoneEvent) so consumers don't mask the error
@@ -371,7 +403,7 @@ module Gori::Discover
         enqueue_well_known("#{root}/robots.txt", Source::Robots)
         enqueue_well_known("#{root}/sitemap.xml", Source::Sitemap)
       end
-      bf_dir = Url.dir_of(@seed_parts)
+      bf_dir = bruteforce_root
       enqueue_dir(bf_dir, 0) if @config.bruteforce?
       # robots.txt/sitemap.xml are GUESSED well-known paths, not organically-linked ones — they
       # deserve the same soft-404 gate a brute-forced wordlist hit gets, not the "exists by
@@ -382,13 +414,12 @@ module Gori::Discover
       # check reuses the bf_dir calibration when that dir IS the origin. Asking @dirs rather
       # than comparing `root_dir == bf_dir` is the whole fix for #393: the old comparison
       # assumed the `enqueue_dir` above had SUCCEEDED, but it goes through `bounded_url`, which
-      # applies the path confine — and the confine refuses the seed's own directory whenever
-      # the seed path is a single segment with no trailing slash. For `http://t/api`,
-      # @confine_path is "/api" while bf_dir is "http://t/", whose path is neither "/api" nor
-      # under "/api/". No Calibrate task was queued, yet @seed_calibration_dir was set, so
-      # robots.txt and sitemap.xml were fetched for real and then parked forever waiting on a
-      # baseline that never arrived: 2 real requests sent, 0 findings recorded, not even
-      # counted in calibrated_out.
+      # can still refuse it (Layer 2, or containment). No Calibrate task would be queued, yet
+      # @seed_calibration_dir was set, so robots.txt and sitemap.xml were fetched for real and
+      # then parked forever waiting on a baseline that never arrived: 2 real requests sent, 0
+      # findings recorded, not even counted in calibrated_out. (The shape that first exposed
+      # it — a file-shaped seed whose bf_dir fell outside its own confine — is gone with #395,
+      # but the assumption it broke was never safe.)
       if @config.spider? && @config.bruteforce?
         root_dir = "#{Url.origin(@seed_parts)}/"
         # @seed_calibration_dir is set even when the Calibrate task below is refused, and that
@@ -675,6 +706,12 @@ module Gori::Discover
       # is never requested, so there is no status, length, or content type to claim one with —
       # and `Persist` would then write the poisoned string into the Sitemap as a real flow.
       # It is refused for the same reason any out-of-bounds link is, and takes the same exit.
+      #
+      # Only the FRAMING half of the octet class gets this exit. The rest of it (SP, TAB, DEL,
+      # the other C0) corrupts one request line without starting a second, and `<a href="/my
+      # file.pdf">` is ordinary handwritten HTML — so `Url.parse` has already percent-encoded
+      # those and nothing reaches here to drop (#394, and `Url.encode_unsafe` for why the two
+      # halves are answered differently).
       return nil unless Headers.safe_url?(p)
       return nil unless confined?(p)
       url = Url.normalize(p)
@@ -695,6 +732,31 @@ module Gori::Discover
     private def confined?(p : Url::Parts) : Bool
       return true unless cp = @confine_path
       p.path == cp || p.path.starts_with?("#{cp}/")
+    end
+
+    # The directory the brute-forcer starts from.
+    #
+    # `Url.dir_of` — everything up to the last '/' — is right only when the seed's path is
+    # already a directory. For a FILE-SHAPED seed it returns the seed's CONTAINING directory,
+    # which a path-confined run then refuses: on `http://t/api`, `dir_of` is `http://t/`,
+    # whose path is neither `/api` nor under `/api/`, so `enqueue_dir`'s `bounded_url` dropped
+    # it and the seed's own subtree was never probed at all. With `--no-spider` that was the
+    # whole run — zero requests, a clean DoneEvent, no reason given (#395).
+    #
+    # The two derivations have to agree, and it is `confined?` that carries the operator's
+    # intent: a seed path deeper than "/" means THE SUBTREE ROOTED HERE, so the brute-force
+    # base is that subtree's root as a directory. It is `dir_of` for a seed already ending in
+    # '/', and the seed's own path plus '/' otherwise — never anything the operator did not
+    # type. Widening `@confine_path` to "/" instead would spray the built-in wordlist
+    # (`admin`, `logout`, `.git/config`, `.env`) at the origin root of a run explicitly scoped
+    # to `/api`, which is the bypass the confine exists to prevent.
+    #
+    # `@seed_parts.path` is already dot-segment- and slash-normalized by `Url.parse`, so the
+    # rchop in `@confine_path` can only ever have removed one real trailing slash.
+    private def bruteforce_root : String
+      cp = @confine_path
+      return Url.dir_of(@seed_parts) unless cp
+      "#{Url.origin(@seed_parts)}#{cp}/"
     end
 
     # A brute-force candidate is `bl.dir` + a wordlist entry, and only the DIRECTORY was ever
@@ -826,8 +888,10 @@ module Gori::Discover
       #
       # `Url.gate_url`, not `Url.normalize`: the `dir + cand` concat is unnormalized, and the
       # scope must be asked in the port-less form every other Layer-2 consumer uses — see
-      # `Url.gate_url`. NOTE the engine holds a snapshot policy, so this does NOT pick up a
-      # scope edit made mid-run except in the TUI, where the `Scope` object is shared live.
+      # `Url.gate_url`. The policy re-reads its rules on the schedule every other sweep uses
+      # (`StoreScope#allowed?`, throttled to `Outbound::RELOAD_INTERVAL`), so a scope edit made
+      # while the run is in flight stops it here within that window — on every surface, not
+      # only in the TUI where the `Scope` object happens to be shared live (#396).
       unless @scope.allowed?(Url.gate_url(p), p.host)
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, SCOPE_REFUSED)
       end

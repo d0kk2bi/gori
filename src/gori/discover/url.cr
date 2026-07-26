@@ -1,4 +1,5 @@
 require "uri"
+require "../proxy/codec/http1"
 
 module Gori::Discover
   # URL parsing, normalization, and the TWO keys that make trap prevention work:
@@ -14,20 +15,114 @@ module Gori::Discover
     record Parts, scheme : String, host : String, port : Int32, path : String, query : String?
 
     # Parse an absolute http(s) URL into normalized Parts (host lowercased, path defaulted
-    # to "/"), or nil for a non-http / hostless / unparseable URL.
+    # to "/"), or nil for a non-http / hostless / unparseable URL — or for one whose HOST
+    # carries an octet that cannot be framed (`Codec::Http1.request_token_safe?`).
     def self.parse(url : String) : Parts?
       uri = URI.parse(url) rescue return nil
       host = uri.host
       return nil unless host && !host.empty?
+      # A host with a request-line breaker in it is refused rather than repaired: percent
+      # encoding is defined for a path, not for a reg-name, and `Import::Builder::HOST_INVALID`
+      # already states the rule that a real host never carries one (userinfo, port and the
+      # `://` all sit outside `uri.host`). `URI.parse` copies such a host in verbatim —
+      # `http://a b/x` yields `"a b"` — so this is the only line that can refuse it, and nil
+      # is the exit every unparseable URL already takes.
+      #
+      # It is also the only line that can protect the CONNECT line: with an upstream proxy
+      # configured, `Upstream.dial` writes `CONNECT #{host}:#{port} HTTP/1.1` out of this
+      # host, and that line is synthesized far below any Discover gate.
+      return nil unless Proxy::Codec::Http1.request_token_safe?(host)
       scheme = (uri.scheme || "http").downcase
       return nil unless scheme == "http" || scheme == "https"
       port = uri.port || (scheme == "https" ? 443 : 80)
-      path = uri.path
-      path = "/" if path.nil? || path.empty?
+      Parts.new(scheme, host.downcase, port, parse_path(uri.path), parse_query(uri.query))
+    end
+
+    private def self.parse_path(path : String?) : String
+      return "/" if path.nil? || path.empty?
       # Collapse dot-segments so /a/../b and /b share one visit_key (avoids a re-crawl of the
       # same resource reached via an absolute href, which resolve() returns un-normalized).
-      path = normalize_path(path) if path.includes?("..") || path.includes?("./") || path.includes?("//")
-      Parts.new(scheme, host.downcase, port, path, uri.query.presence)
+      #
+      # `ends_with?("/.")` catches a TRAILING bare dot, which the other three tests miss:
+      # `/a/..` and `/a/./` both trip them, `/a/.` trips none, so it came back un-normalized
+      # and `/a/.` and `/a/` were two visit_keys for one resource. That mattered little until
+      # `bruteforce_root` (#395) started deriving the brute-force base from the seed's path:
+      # a seed of `/api/.` produced the confine `/api/.`, which NOTHING can satisfy, since
+      # every derived URL comes back through here normalized. The run then brute-forced
+      # nothing — the exact shape #395 exists to remove.
+      if path.includes?("..") || path.includes?("./") || path.includes?("//") || path.ends_with?("/.")
+        path = normalize_path(path)
+      end
+      encode_unsafe(path)
+    end
+
+    private def self.parse_query(query : String?) : String?
+      q = query.presence
+      q ? encode_unsafe(q) : nil
+    end
+
+    PCT_HEX = "0123456789ABCDEF"
+
+    # Percent-encode the request-line breakers that a PATH or QUERY may legitimately carry.
+    #
+    # The class is `Codec::Http1.request_token_safe?`'s and is not restated here: every octet
+    # <= 0x20 or 0x7F, because `Sender#build_get` writes `GET #{target} HTTP/1.1` and those
+    # octets are unrepresentable in a request-line token. That predicate is the rule's one
+    # home (#397); this method is the only thing Discover adds to it — a REPAIR for the half
+    # of the class that has one.
+    #
+    # The two halves get different remedies because they do different things to the wire:
+    #
+    #   * CR and LF FRAME. They do not corrupt one request line, they end it and start a
+    #     second message (#390). No author writes them into an `<a href>`, so they are left
+    #     RAW here on purpose — `Headers.safe_url?` drops such a URL at every enqueue and
+    #     `Sender#fetch` refuses it at the wire, which is the disposition #390 settled.
+    #     Encoding them instead would turn a splice attempt into a real request for a URL
+    #     nobody authored.
+    #   * Everything else (SP, TAB, DEL, the remaining C0) SEPARATES fields. `<a href="/my
+    #     file.pdf">` is ordinary handwritten HTML — a browser percent-encodes it and fetches
+    #     the file — so refusing it would silently shrink a crawl's coverage, and a 400 from
+    #     a strict origin diverges from the soft-404 baseline (`Calibrate.hit?` scores
+    #     `status_div` at +0.50), making it a false-POSITIVE source too. It is repaired.
+    #
+    # Applied at PARSE rather than in `build_get`, because a URL must have exactly ONE
+    # spelling: the same string feeds `visit_key`, `template_key`, the Layer-2 gate question,
+    # the Finding, and the Sitemap row `Persist` writes. Encoding only at the wire would
+    # leave the raw octet in all five — the gate would judge a different URL than the one
+    # sent, and a byte-exact Repeater re-send of a stored finding would reproduce the
+    # corruption. It also makes discover ask the gate the already-encoded form every other
+    # Layer-2 consumer sees, since those targets arrive off the wire from a real client.
+    #
+    # Idempotent, which `#{bl.dir}#{cand}` and any re-crawled link rely on: `%` is not in the
+    # class, so an already-encoded path re-parses unchanged and never becomes `%2520`.
+    private def self.encode_unsafe(s : String) : String
+      return s unless needs_encoding?(s)
+      String.build(s.bytesize + 8) do |io|
+        s.each_byte do |b|
+          if encodable?(b)
+            io << '%' << PCT_HEX[b >> 4] << PCT_HEX[b & 0x0f]
+          else
+            io.write_byte(b)
+          end
+        end
+      end
+    end
+
+    # Membership in the repairable half, per octet. The string-level rule lives in the codec
+    # and must not be restated — but the encoder needs a per-BYTE test, and calling the
+    # codec's predicate once per octet would allocate a String per byte on a path that runs
+    # for every considered link and every brute-force candidate. So this is the one place the
+    # class is written twice, and `url_spec` pins the two against each other over all 256
+    # octets: `encodable?(b) == !request_token_safe?(b) && b is not CR/LF`, for every b.
+    private def self.encodable?(b : UInt8) : Bool
+      (b <= 0x20_u8 || b == 0x7f_u8) && b != 0x0d_u8 && b != 0x0a_u8
+    end
+
+    # `s` itself is returned for every clean URL (the overwhelming majority, and this runs
+    # once per considered link and once per brute-force candidate), so scan before building.
+    private def self.needs_encoding?(s : String) : Bool
+      s.each_byte { |b| return true if encodable?(b) }
+      false
     end
 
     def self.default_port?(scheme : String, port : Int32) : Bool

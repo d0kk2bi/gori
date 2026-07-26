@@ -49,6 +49,41 @@ private def wire_bytes(&) : String
   bytes
 end
 
+# The first line a fake UPSTREAM PROXY receives while `block` runs, or "" if nothing ever
+# connected. `Upstream.dial_via_proxy` synthesizes `CONNECT #{host}:#{port} HTTP/1.1` out of
+# the host it is handed, so this reads the second request line a Discover send can produce.
+private def connect_line(&) : String
+  proxy = TCPServer.new("127.0.0.1", 0)
+  seen = Channel(String).new(1)
+  spawn do
+    if conn = proxy.accept?
+      begin
+        conn.read_timeout = 500.milliseconds
+        seen.send(conn.gets("\r\n", chomp: true) || "")
+        conn << "HTTP/1.1 200 Connection established\r\n\r\n"
+        conn.flush
+      rescue
+        seen.send("") rescue nil
+      end
+      conn.close rescue nil
+    end
+  rescue
+  end
+  Gori::Settings.upstream_proxy = "127.0.0.1:#{proxy.local_address.port}"
+  begin
+    yield
+    select
+    when got = seen.receive
+      got
+    when timeout(2.seconds)
+      "" # never dialled
+    end
+  ensure
+    Gori::Settings.upstream_proxy = ""
+    proxy.close rescue nil
+  end
+end
+
 # Request lines on the wire: "<METHOD> <target> HTTP/1.1". The whole point of #390 is that
 # there can be more than one, so this counts them rather than parsing the first.
 private def request_lines(wire : String) : Array(String)
@@ -83,6 +118,69 @@ describe Gori::Discover::Sender do
     request_lines(wire).size.should eq(0)
     wire.should eq("")
     result.not_nil!.error.should eq(D::Sender::UNSAFE_URL)
+  end
+
+  it "sends nothing at all when the target carries a raw SPACE (request-line corruption)" do
+    # Issue #394. Space is the request line's field separator, so #390's CR/LF-only guard let
+    # this through: the issue captured `GET /my file.pdf HTTP/1.1` off a real socket, which a
+    # lenient origin reads as target `/my` + version `file.pdf`, and a strict one 400s — a 400
+    # that diverges from the soft-404 baseline and scores +0.50 in `Calibrate.hit?`.
+    #
+    # Nothing legitimate is refused by this line: `Url.parse` has already percent-encoded a
+    # spaced href upstream (see the next example), so the only target that reaches here with a
+    # raw space is one no repair applies to.
+    result = nil.as(Gori::Repeater::Result?)
+    wire = wire_bytes do |port|
+      result = D::Sender.new(verify: false, timeout: 2.seconds).fetch("http", "127.0.0.1", port, "/my file.pdf")
+    end
+    wire.should eq("")
+    result.not_nil!.error.should eq(D::Sender::UNSAFE_URL)
+  end
+
+  it "puts the encoded form of a spaced link on the wire as ONE well-formed request line" do
+    # The other half of #394, end to end at the byte level: the href a page carries
+    # (`/my file.pdf`) goes through the same `Url.parse` the engine uses, and what lands on
+    # the socket is the request a browser would have sent. A URL-string assertion could not
+    # have shown this — #390's lesson.
+    target = begin
+      p = D::Url.parse("http://127.0.0.1/my file.pdf?q=a b").not_nil!
+      "#{p.path}?#{p.query}"
+    end
+    wire = wire_bytes do |port|
+      D::Sender.new(verify: false, timeout: 2.seconds).fetch("http", "127.0.0.1", port, target)
+    end
+    request_lines(wire).should eq(["GET /my%20file.pdf?q=a%20b HTTP/1.1"])
+    wire.should match(/\AGET \/my%20file\.pdf\?q=a%20b HTTP\/1\.1\r\nHost: 127\.0\.0\.1:\d+\r\n/)
+  end
+
+  # The CONNECT line is the second request line a Discover send can synthesize, and it is
+  # built far below any Discover gate — `Upstream.dial_via_proxy` writes
+  # `CONNECT #{host}:#{port} HTTP/1.1` out of the host string it is handed
+  # (`proxy/upstream.cr`), with no validation of its own. #397 could not demonstrate a live
+  # path to it; the sweep for #394 found one that runs through Discover, since a crawled
+  # `<a href="http://ac me.acme.test/x">` passes `Headers.safe_url?` (space is not CR/LF) and
+  # `same_or_subdomain?` containment.
+  describe "with an upstream proxy configured" do
+    it "never puts a corrupt authority on the CONNECT line" do
+      result = nil.as(Gori::Repeater::Result?)
+      line = connect_line do
+        result = D::Sender.new(verify: false, timeout: 2.seconds)
+          .fetch("http", "ac me.acme.test", 80, "/x")
+      end
+      # Nothing was dialled at all: the wire-seam guard checks the HOST as well as the target,
+      # so `CONNECT ac me.acme.test:80 HTTP/1.1` — three tokens where the proxy expects two —
+      # is unreachable.
+      line.should eq("")
+      result.not_nil!.error.should eq(D::Sender::UNSAFE_URL)
+    end
+
+    it "still CONNECTs normally for an ordinary host (the control)" do
+      # Without this the example above would pass against a harness that never observes a
+      # CONNECT at all.
+      connect_line do
+        D::Sender.new(verify: false, timeout: 2.seconds).fetch("http", "acme.test", 80, "/x")
+      end.should eq("CONNECT acme.test:80 HTTP/1.1")
+    end
   end
 
   it "sends nothing when the HOST carries a raw CRLF" do
