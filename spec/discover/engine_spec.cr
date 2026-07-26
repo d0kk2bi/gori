@@ -62,6 +62,47 @@ private class DenyExact < D::ScopePolicy
   end
 end
 
+# A ScopePolicy that allows ONLY an exact URL set — the shape a `regex` include anchored with
+# `$` takes under Sandbox, and the one the issue-#391 table calls non-monotone: a directory can
+# be allowlisted while every child under it is not.
+private class AllowExact < D::ScopePolicy
+  def initialize(@allow : Set(String))
+  end
+
+  def allowed?(url : String, host : String) : Bool
+    @allow.includes?(url)
+  end
+
+  def boundary?(url : String, host : String) : Bool
+    true
+  end
+
+  def configured? : Bool
+    false
+  end
+end
+
+# Allows a URL the first time it is asked and denies it afterwards — the shape a live scope
+# takes when the operator adds an EXCLUDE mid-run (the TUI shares the Scope object with the
+# engine's policy). Every Crawl/Fetch URL is asked once at enqueue and once at send.
+private class DenyAfterFirstAsk < D::ScopePolicy
+  def initialize
+    @asked = Set(String).new
+  end
+
+  def allowed?(url : String, host : String) : Bool
+    @asked.add?(url)
+  end
+
+  def boundary?(url : String, host : String) : Bool
+    true
+  end
+
+  def configured? : Bool
+    false
+  end
+end
+
 # The bogus soft-404 probes an origin-root calibration sends: one path segment directly under
 # "/", minus the two well-known paths seed_frontier queues by name. A path-scoped run's own
 # brute-force probes are deeper (/app/…), so they never land in here.
@@ -367,5 +408,244 @@ describe Gori::Discover::Engine do
       end
       findings.select { |f| f.source.robots? || f.source.sitemap? }.should be_empty
     end
+  end
+
+  # Issue #390. `Extract::ATTR`'s `[^"]` matches CR and LF, `Url.resolve` strips only the ends,
+  # and `URI.parse` keeps an interior CR/LF verbatim in host, path AND query — so a crawled
+  # `<a href>` reached `Sender#build_get` intact and spliced a second, fully attacker-chosen
+  # request onto the connection. The byte-level proof lives in sender_spec; this pins the
+  # engine half: such a link is dropped before it is ever queued.
+  describe "a crawled link carrying a raw CRLF" do
+    it "is dropped silently and never reaches the backend" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 4, concurrency: 1, retries: 0)
+      poison = "/p\r\nX-Injected: 1\r\n\r\nGET http://evil.test/pwned HTTP/1.1\r\nHost: evil.test\r\n\r\n"
+      sent = [] of String
+      findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        case t
+        when "/"      then html(%(<a href="#{poison}">poison</a> <a href="/clean">ok</a>))
+        when "/clean" then html("an ordinary sibling link on the same page")
+        else               notfound
+        end
+      end
+      # The control: the page WAS crawled and its links WERE extracted, so "nothing poisoned
+      # went out" is a verdict about the guard and not about a crawl that never happened.
+      findings.map(&.url).should contain("http://t/clean")
+      sent.should contain("/clean")
+
+      sent.none?(&.includes?('\r')).should be_true
+      sent.none?(&.includes?('\n')).should be_true
+      sent.none?(&.includes?("evil.test")).should be_true
+      findings.map(&.url).none?(&.includes?("evil.test")).should be_true
+    end
+
+    it "is dropped when the CRLF sits in the QUERY rather than the path" do
+      # `URI.parse("http://t/a?q=1\r\nX: 1").query` keeps the CR/LF, and send_with_retries
+      # rebuilds the target as "#{path}?#{query}" — so a path-only check would miss this.
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 4, concurrency: 1, retries: 0)
+      sent = [] of String
+      run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        t == "/" ? html(%(<a href="/ok?q=1\r\nX-Injected: 1">q</a> <a href="/clean">ok</a>)) : notfound
+      end
+      sent.should contain("/clean")
+      sent.should_not contain("/ok?q=1")
+      sent.none? { |t| t.includes?('\r') || t.includes?('\n') }.should be_true
+    end
+  end
+
+  # Issue #391 / DESIGN.md §7. Brute-force and calibration probes were authorised by their
+  # DIRECTORY: one `allowed?` answer about the dir stood in for ~278 real requests under it,
+  # and the path confine never applied to them at all.
+  describe "probes are authorised per URL, not by their directory" do
+    it "skips a wordlist entry an EXCLUDE denies while its directory is allowed" do
+      # The issue's repro. `logout` is line 41 of the built-in wordlist, and an exclude on it
+      # is the canonical "do not touch destructive endpoints" rule — silently ignored, because
+      # the only question ever asked was about "http://t/".
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 2, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      sent = [] of String
+      findings, _ = run_discover("http://t/", ["logout", "admin"], cfg,
+        DenyExact.new(Set{"http://t/logout"})) do |t|
+        sent << t
+        t == "/logout" || t == "/admin" ? html("A REAL PAGE THAT WOULD BE REPORTED") : notfound
+      end
+      sent.should_not contain("/logout")
+      # The control: the sibling probe under the very same directory DID go out, so this is a
+      # verdict about the gate and not about a brute-forcer that never ran.
+      sent.should contain("/admin")
+      findings.map(&.url).should contain("http://t/admin")
+      findings.map(&.url).should_not contain("http://t/logout")
+    end
+
+    it "skips the calibration probes when the scope allows the directory but not its children" do
+      # process_calibrate builds "#{dir}#{bogus_name}" inside a WORKER at send time, so these
+      # are the sends no enqueue-time gate can ever see — only the send chokepoint can.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 3, concurrency: 1,
+        retries: 0)
+      gated = [] of String
+      backend = RouteBackend.new(->(t : String) { gated << t; notfound })
+      engine = D::Engine.new("http://t/", ["admin"], backend, cfg, AllowExact.new(Set{"http://t/"}))
+      errors = 0_i64
+      engine.run { |ev| errors = ev.progress.errors if ev.is_a?(D::DoneEvent) }
+      gated.should be_empty
+      # A refusal is a decision the operator asked for, not a failure — it must not inflate
+      # the error count every surface renders.
+      errors.should eq(0)
+
+      open = [] of String
+      run_discover("http://t/", ["admin"], cfg) do |t|
+        open << t
+        notfound
+      end
+      open.size.should eq(4) # control: 3 calibration probes + the one wordlist entry
+    end
+
+    it "keeps a traversal wordlist entry inside the seed's path confine" do
+      # `bl.dir + cand` is re-parsed by Url.parse, whose normalize_path collapses "..", so
+      # `../admin` under an /app/-confined run resolved to /admin. @confine_path lived only
+      # inside bounded_url, which probes never reached.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 2, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      sent = [] of String
+      findings, _ = run_discover("http://t/app/", ["../admin", "inner"], cfg) do |t|
+        sent << t
+        t == "/admin" || t == "/app/inner" ? html("A REAL PAGE THAT WOULD BE REPORTED") : notfound
+      end
+      sent.should_not contain("/admin")
+      sent.should contain("/app/inner") # control: an ordinary entry in the same list still probes
+      findings.map(&.url).should_not contain("http://t/admin")
+    end
+  end
+
+  # Issue #393. `enqueue_seed_only_calibration` used to be skipped whenever the origin root WAS
+  # the seed's own brute-force directory, on the assumption that `enqueue_dir` had already
+  # queued a Calibrate for it. But `enqueue_dir` goes through `bounded_url`, which applies the
+  # path confine — and the confine refuses the origin root on a single-segment seed with no
+  # trailing slash. So no baseline ever arrived, and robots.txt/sitemap.xml were fetched for
+  # real and then parked forever.
+  describe "the origin calibration that grades robots.txt/sitemap.xml" do
+    # Every seed shape from the issue's table, including the three that already worked — the
+    # bug was one shape out of four, so pinning only the broken one would not show that the fix
+    # left the others alone.
+    {"http://t/api", "http://t/api/", "http://t/", "http://t/a/b"}.each do |seed|
+      it "records both well-known findings for a seed of #{seed}" do
+        cfg = D::Config.new(spider: true, bruteforce: true, calibrate_probes: 2, concurrency: 2,
+          retries: 0)
+        fetched = [] of String
+        findings, _ = run_discover(seed, [] of String, cfg) do |t|
+          fetched << t
+          case t
+          when "/robots.txt"  then make(200, "User-agent: *\nDisallow: /admin\n", "text/plain")
+          when "/sitemap.xml" then make(200, %(<?xml version="1.0"?><urlset><url><loc>http://t/x</loc></url></urlset>), "application/xml")
+          else                     notfound
+          end
+        end
+        # Both were always SENT; what the bug lost was the recording of their outcomes.
+        fetched.count("/robots.txt").should eq(1)
+        fetched.count("/sitemap.xml").should eq(1)
+        urls = findings.map(&.url)
+        urls.should contain("http://t/robots.txt")
+        urls.should contain("http://t/sitemap.xml")
+      end
+    end
+
+    it "still brute-forces the origin when it IS the seed's own directory" do
+      # The regression guard for dropping the `unless root_dir == bf_dir` short-circuit: a
+      # seed_only Calibrate never feeds enqueue_probes, so if it displaced the ordinary one
+      # instead of deduping against it, brute-force would go silently dead at the origin.
+      cfg = D::Config.new(spider: true, bruteforce: true, calibrate_probes: 2, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      findings, _ = run_discover("http://t/", ["admin"], cfg) do |t|
+        t == "/admin" ? html("ADMIN CONTROL PANEL") : notfound
+      end
+      findings.select(&.source.bruteforced?).map(&.url).should contain("http://t/admin")
+    end
+  end
+
+  # Review findings on the four fixes above.
+  describe "the Layer-2 gate string" do
+    it "asks the scope in the port-less form every other consumer uses" do
+      # `Url.normalize` appends `:port` off the defaults, but gori's scope model has no port
+      # dimension: `Scope.request_url` is "scheme://host/target" and the proxy splits the port
+      # off before asking. So on :8080 discover asked about "http://t:8080/logout" while a rule
+      # was written against "http://t/logout", and a host-qualified string/regex EXCLUDE — the
+      # exact rule #391 is about — silently failed open.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 2, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      sent = [] of String
+      run_discover("http://t:8080/", ["logout", "admin"], cfg,
+        DenyExact.new(Set{"http://t/logout"})) do |t|
+        sent << t
+        notfound
+      end
+      sent.should_not contain("/logout")
+      sent.should contain("/admin") # control: the sibling probe on the same port still goes out
+    end
+
+    it "keeps the port on the crawled url and the finding" do
+      # Only the gate question drops the port — the resource's own identity keeps it.
+      cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 1, retries: 0)
+      findings, _ = run_discover("http://t:8080/", [] of String, cfg) do |t|
+        t == "/" ? html(%(<a href="/kept">k</a>)) : html("an ordinary page body here")
+      end
+      findings.map(&.url).should contain("http://t:8080/kept")
+    end
+  end
+
+  describe "the error count" do
+    it "does not count the max-requests cap as an error on the crawl path" do
+      # handle_probe already excluded CAP_ERROR; handle_crawl excluded nothing. With
+      # max_requests set the orchestrator fills the @jobs buffer before any worker increments
+      # @capped.sent, so every over-dispatched crawl came back CAP_ERROR and was counted —
+      # `--max-requests 5` at default concurrency reported dozens of "errors" that were the
+      # cap working as designed.
+      # The frontier must hold more jobs than the cap at the moment of dispatch: `@jobs` is
+      # buffered to `concurrency`, so the orchestrator pushes all three seed tasks (the seed
+      # crawl + robots.txt + sitemap.xml) before any worker increments `@capped.sent`. The
+      # third then comes back CAP_ERROR.
+      cfg = D::Config.new(spider: true, bruteforce: false, max_requests: 2_i64,
+        concurrency: 8, retries: 0)
+      backend = RouteBackend.new(->(_t : String) { html("an ordinary page body here") })
+      engine = D::Engine.new("http://t/", [] of String, backend, cfg)
+      errors = 0_i64
+      sent = 0_i64
+      engine.run do |ev|
+        if ev.is_a?(D::DoneEvent)
+          errors = ev.progress.errors
+          sent = ev.progress.sent
+        end
+      end
+      sent.should eq(2)
+      errors.should eq(0)
+    end
+
+    it "does not count a Layer-2 refusal as an error on the crawl path" do
+      # Every Crawl/Fetch URL is asked twice — once at enqueue, once at send. In the TUI the
+      # Scope object is shared live, so an EXCLUDE added mid-run turns queued crawls into
+      # refusals at send; those are decisions the operator asked for, not failures.
+      cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 1, retries: 0)
+      backend = RouteBackend.new(->(_t : String) { notfound })
+      engine = D::Engine.new("http://t/", [] of String, backend, cfg, DenyAfterFirstAsk.new)
+      errors = 0_i64
+      engine.run { |ev| errors = ev.progress.errors if ev.is_a?(D::DoneEvent) }
+      errors.should eq(0)
+    end
+  end
+
+  it "refuses a probe candidate carrying an interior CR from a hostile wordlist" do
+    # Wordlist.load strips only the ends of a line, so an interior lone CR survives into
+    # `bl.dir + cand`. The wire seam would catch it, but only after the candidate had been
+    # enqueued, retried and counted as an error — bounded_url refuses its equivalent, so the
+    # probe gate does too.
+    cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 1, concurrency: 1,
+      retries: 0)
+    sent = [] of String
+    run_discover("http://t/", ["ad\rmin", "clean"], cfg) do |t|
+      sent << t
+      notfound
+    end
+    sent.should contain("/clean")
+    sent.none?(&.includes?('\r')).should be_true
   end
 end
