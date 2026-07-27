@@ -52,7 +52,7 @@ module Gori
       # validate_menu_keys!/keymap_spec don't know that (see the project.copy note in
       # verbs/core.cr:124).
       r.register Verb::Definition.new(
-        "history.mark-toggle", "Mark flow", "Mark/unmark this flow and move down — the space menu then acts on every marked flow",
+        "history.mark-toggle", "Mark flow", "Mark/unmark this flow and step to the next older one — the space menu then acts on every marked flow",
         Verb::Scope::Body, [Verb::Chord.new("t")],
         available: history_selected, mnemonic: 't') { |ctx| ctx.history_mark_toggle; nil }
 

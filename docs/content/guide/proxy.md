@@ -93,7 +93,7 @@ gori run history -q 'status:5xx host:api.example.com'
 
 ## Marking flows (multi-select)
 
-Press `t` to **mark** the flow under the cursor and move down, so a run of `t` marks consecutive rows. `Shift-↑` / `Shift-↓` extend a contiguous range from where you started, `Shift-T` marks everything the current filter shows, and `Esc` clears the marks. Marked rows get a full bar in the gutter and the filter row shows a live `3 marked` count.
+Press `t` to **mark** the flow under the cursor and step to the next older one, so a run of `t` marks consecutive rows (in either list order). `Shift-↑` / `Shift-↓` extend a contiguous range from where you started, `Shift-T` marks everything the current filter shows, and `Esc` clears the marks. Marked rows get a full bar in the gutter and the filter row shows a live `3 marked` count.
 
 Marks change **what the space menu acts on**, not which actions exist:
 
