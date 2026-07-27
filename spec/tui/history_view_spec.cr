@@ -1350,7 +1350,9 @@ describe "Gori::Tui::HistoryView marks" do
       view.mark_all
       view.mark_count.should eq(3)
 
-      view.delete_ids(store, [ids[0], ids[1]])
+      # True ⇒ the write COMMITTED. A rollback returns false and leaves the marks alone, since
+      # they are the only remaining handle on the set the user asked to delete.
+      view.delete_ids(store, [ids[0], ids[1]]).should be_true
       store.count.should eq(1)
       view.mark_count.should eq(1) # deleted ids can't linger and inflate the next count
       view.marked?(ids[2]).should be_true
