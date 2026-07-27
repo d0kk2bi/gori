@@ -1675,7 +1675,10 @@ module Gori::Tui
       when :repeater
         repeater_controller.copy_as_menu
       when :history
-        @overlay.detail? ? history_controller.detail_copy_as_menu : {"COPY AS", [] of CopyMenu::Option}
+        # The list used to have no variants at all (so copy-as degraded to a plain copy);
+        # it now offers the target set's formats — one flow's single-message list, or the
+        # set-shaped urls/hosts/curl/raw for a mark set (#442).
+        @overlay.detail? ? history_controller.detail_copy_as_menu : history_controller.list_copy_as_menu(history_target_flow_ids)
       else
         {"COPY AS", [] of CopyMenu::Option}
       end
@@ -1910,13 +1913,13 @@ module Gori::Tui
     # row takes the link. The create row arms on_close rather than opening the form here,
     # because the form claims @overlay and the shell's close would tear it straight back
     # down; on_close runs after the drop, so the form is the last write (see Overlay).
-    private def link_picked_issue(ip : IssuePicker, ref : {Store::LinkRefKind, Int64}) : Bool
+    private def link_picked_issue(ip : IssuePicker, refs : Array({Store::LinkRefKind, Int64})) : Bool
       if ip.selected_create?
-        ip.on_close = -> { open_issue_form_for_link(ref) }
+        ip.on_close = -> { open_issue_form_for_link(refs) }
         return true
       end
       if f = ip.selected_issue
-        commit_link_to_owner(Store::LinkOwnerKind::Issue, f.id, ref[0], ref[1])
+        commit_links_to_owner(Store::LinkOwnerKind::Issue, f.id, refs)
       end
       true
     end
@@ -1924,35 +1927,40 @@ module Gori::Tui
     # Transition from the issue picker into the NEW ISSUE form. Ownership of the ref moves
     # INTO the form (C3's `link_ref:`), so dropping the form — esc, click-away — drops the
     # pending link with it; nothing is parked on the Runner.
-    private def open_issue_form_for_link(ref : {Store::LinkRefKind, Int64}) : Nil
+    private def open_issue_form_for_link(refs : Array({Store::LinkRefKind, Int64})) : Nil
+      ref = refs.first
+      # The form's own fields describe ONE flow (title/host/evidence); the rest of a marked
+      # set rides along as extra_flow_ids and is linked after the insert (#442).
+      extra = refs[1..].select { |kind, _| kind.flow? }.map { |_, id| id }
       if ref[0].flow?
         if row = @session.store.flow_row(ref[1])
-          open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, ref[1], link_ref: ref))
+          open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, ref[1],
+            link_ref: ref, extra_flow_ids: extra))
           return
         end
       end
-      open_issue_form(IssueForm.new(link_ref: ref))
+      open_issue_form(IssueForm.new(link_ref: ref, extra_flow_ids: extra))
     end
 
     # ↵ on the note picker: "+ New note…" creates a blank note and links to it, any
     # other row links to the note picked. Same on_close hand-off as the issue picker —
     # create_note_and_link ends on the open-vs-stay confirm, which claims @overlay.
-    private def link_picked_note(np : NotePicker, ref : {Store::LinkRefKind, Int64}) : Bool
+    private def link_picked_note(np : NotePicker, refs : Array({Store::LinkRefKind, Int64})) : Bool
       if np.selected_create?
-        np.on_close = -> { create_note_and_link(ref) }
+        np.on_close = -> { create_note_and_link(refs) }
         return true
       end
       if row = np.selected_row
-        commit_link_to_owner(Store::LinkOwnerKind::Note, row.id, ref[0], ref[1])
+        commit_links_to_owner(Store::LinkOwnerKind::Note, row.id, refs)
       end
       true
     end
 
-    # Blank note + link the workbench ref, then ask open vs stay.
-    private def create_note_and_link(ref : {Store::LinkRefKind, Int64}) : Nil
+    # Blank note + link the workbench ref(s), then ask open vs stay.
+    private def create_note_and_link(refs : Array({Store::LinkRefKind, Int64})) : Nil
       note_id = notes_controller.create_blank_note_id
-      commit_link_to_owner(Store::LinkOwnerKind::Note, note_id, ref[0], ref[1])
-      @toast = "note created and linked"
+      commit_links_to_owner(Store::LinkOwnerKind::Note, note_id, refs)
+      @toast = refs.size == 1 ? "note created and linked" : "note created · linked #{refs.size} flows"
       offer_open_created(:note, note_id)
     end
 
@@ -2012,6 +2020,34 @@ module Gori::Tui
         @toast = "already linked"
         false
       end
+    end
+
+    # Batch form (#442): attach N refs to ONE owner, after the issue/note was picked once.
+    # A single ref delegates to commit_link_to_owner so that path is byte-identical to
+    # before; N goes straight to the same store primitive, then reports once — one toast and
+    # one refresh_link_owners instead of N of each. A ref whose flow is gone (a stale mark) is
+    # skipped rather than filing an orphan link row, and counted in the summary.
+    # Returns true when at least one link was created.
+    private def commit_links_to_owner(owner_kind : Store::LinkOwnerKind, owner_id : Int64,
+                                      refs : Array({Store::LinkRefKind, Int64})) : Bool
+      return false if refs.empty?
+      return commit_link_to_owner(owner_kind, owner_id, refs.first[0], refs.first[1]) if refs.size == 1
+      linked = 0
+      dupes = 0
+      gone = 0
+      refs.each do |kind, rid|
+        if kind.flow? && @session.store.flow_row(rid).nil?
+          gone += 1
+          next
+        end
+        @session.store.add_link(owner_kind, owner_id, kind, rid) ? (linked += 1) : (dupes += 1)
+      end
+      refresh_link_owners(owner_kind, owner_id)
+      parts = ["linked #{linked}"]
+      parts << "#{dupes} already linked" if dupes > 0
+      parts << "#{gone} no longer available" if gone > 0
+      @toast = parts.join(" · ")
+      linked > 0
     end
 
     def navigate_link_ref(ref_kind : Store::LinkRefKind, ref_id : Int64) : Nil
@@ -2275,6 +2311,17 @@ module Gori::Tui
         @toast = "issue updated"
       else
         new_id = @session.store.insert_issue(title, form.severity, form.host, form.flow_id)
+        # History's marked set beyond the primary evidence flow (#442) — one issue, N flows.
+        # insert_issue already linked form.flow_id, so exclude it and never re-link. A flow the
+        # store can't resolve (a stale mark) is skipped rather than filing an orphan link row.
+        extra = form.extra_flow_ids.reject { |fid| fid == form.flow_id }
+        unless extra.empty?
+          extra.each do |fid|
+            next unless @session.store.flow_row(fid)
+            @session.store.add_link(Store::LinkOwnerKind::Issue, new_id, Store::LinkRefKind::Flow, fid)
+          end
+          refresh_link_owners(Store::LinkOwnerKind::Issue, new_id)
+        end
         if ref = form.link_ref
           # insert_issue already entity-links flow when form.flow_id matches; other
           # ref kinds (repeater/fuzz/miner) still need an explicit add_link.
@@ -2293,7 +2340,8 @@ module Gori::Tui
           @active_tab = :issues
           @focus = :body
           issues_controller.view.reload(@session.store)
-          @toast = "issue created"
+          n = extra.size + (form.flow_id ? 1 : 0)
+          @toast = n > 1 ? "issue created with #{n} flows attached" : "issue created"
         end
       end
       true
@@ -3074,7 +3122,8 @@ module Gori::Tui
     # detail → HistoryDetail, the Repeater response → Repeater, the tab bar → Sidebar.
     def open_space_menu : Nil
       scope, section = space_menu_context
-      @space_menu.open(scope, section, self) # captures the scope+section + populates entries
+      # captures the scope+section + populates entries
+      @space_menu.open(scope, section, self, banner: space_menu_banner)
       # Don't open an empty popup: some focus areas (the tab bar, an open detail)
       # have only hidden nav verbs, so the entry list is empty. Opening there would
       # trap input behind an empty box — keep space a no-op (with a hint) instead.
@@ -3623,6 +3672,42 @@ module Gori::Tui
       @overlay.detail? ? history_controller.view.detail_flow_id : history_controller.selected_flow_id
     end
 
+    # The plural of history_target_flow_id, and the ONE resolver every batch-capable
+    # History verb calls (#442): the marks if any are set, else the cursor row. An open
+    # detail still wins — it's pinned to a single flow, for the reason above — so marks are
+    # a list-scope concept exactly as the ⇧arrow bindings are.
+    #
+    # Callers must resolve each id THROUGH THE STORE (flow_row/get_flow), never through the
+    # view's `@rows`: a kept mark can outlive the visible window via a filter change,
+    # trim_window, or a follow-mode reload. Ids that no longer resolve are skipped and
+    # counted in the summary toast rather than aborting the batch.
+    def history_target_flow_ids : Array(Int64)
+      return [history_controller.view.detail_flow_id].compact if @overlay.detail?
+      history_controller.target_flow_ids
+    end
+
+    # Hard ceiling on batch verbs that spawn a sub-tab or a session per flow (Repeater,
+    # Fuzzer, Miner). ⇧T over a filtered list can mark up to HistoryView::PAGE (1000) rows,
+    # and "open 1000 sub-tabs?" is a question with no good answer — so refuse above this
+    # instead of asking. Uncapped verbs (copy URLs, delete, link, scope) stay uncapped.
+    BATCH_SUBTAB_CAP = 20
+
+    # Guard for the capped verbs: nil when the batch is refused (toast already set), else
+    # the ids to loop. `noun` names what each id would create, for the refusal message.
+    private def batch_within_cap(ids : Array(Int64), noun : String) : Array(Int64)?
+      return ids if ids.size <= BATCH_SUBTAB_CAP
+      @toast = "#{ids.size} flows marked — #{noun} is capped at #{BATCH_SUBTAB_CAP}"
+      nil
+    end
+
+    # Shared summary for a continue-and-report batch: "opened 5 · 1 gone" (#442 Q4 — a
+    # partial failure reports, it never aborts the rest).
+    private def batch_summary(verb : String, done : Int32, total : Int32) : String
+      msg = "#{verb} #{plural(done, "flow")}"
+      msg += " · #{total - done} no longer available" if done < total
+      msg
+    end
+
     def link_repeater_id : Int64?
       repeater_controller.current_session_db_id if @active_tab == :repeater
     end
@@ -3635,26 +3720,32 @@ module Gori::Tui
       miner_controller.current_session_db_id if @active_tab == :miner
     end
 
+    # Batch-capable from the History list (#442): the picker is shown ONCE and every marked
+    # flow is attached to whatever it lands on. refs is 1-element everywhere else.
     def link_to_issue : Nil
-      ref = current_link_ref
-      return (@toast = "nothing to link") unless ref
+      refs = current_link_refs
+      return (@toast = "nothing to link") if refs.empty?
       if f = issues_controller.view.detail_issue
         # An open issue detail is the implicit target — name it so it's clear which
         # issue got the link (the picker path below is explicit, so it stays "linked").
-        @toast = "linked to issue ##{f.id}: #{link_title_snip(f.title)}" if commit_link_to_owner(Store::LinkOwnerKind::Issue, f.id, ref[0], ref[1])
+        if commit_links_to_owner(Store::LinkOwnerKind::Issue, f.id, refs)
+          # commit_links_to_owner already reported the counts for a batch; only the single
+          # case gets the "which issue" flavour it would otherwise lose.
+          @toast = "linked to issue ##{f.id}: #{link_title_snip(f.title)}" if refs.size == 1
+        end
         return
       end
       ip = IssuePicker.new(@session.store.issues)
-      ip.on_commit = -> { link_picked_issue(ip, ref) }
+      ip.on_commit = -> { link_picked_issue(ip, refs) }
       open_overlay(ip)
     end
 
     def link_to_note : Nil
-      ref = current_link_ref
-      return (@toast = "nothing to link") unless ref
+      refs = current_link_refs
+      return (@toast = "nothing to link") if refs.empty?
       notes_controller.save_notes
       np = NotePicker.new(note_picker_rows)
-      np.on_commit = -> { link_picked_note(np, ref) }
+      np.on_commit = -> { link_picked_note(np, refs) }
       open_overlay(np)
     end
 
@@ -3676,6 +3767,19 @@ module Gori::Tui
       end
     end
 
+    # The plural of current_link_ref (#442): every flow the History list is targeting, so ONE
+    # trip through the issue/note picker attaches the whole marked set. Workbench refs
+    # (repeater/fuzz/miner sessions) are inherently singular and pass through as a 1-element
+    # list, which is also what History gives when nothing is marked — so every caller can
+    # treat the plural as the only case.
+    private def current_link_refs : Array({Store::LinkRefKind, Int64})
+      if @active_tab == :history
+        ids = history_target_flow_ids
+        return ids.map { |id| {Store::LinkRefKind::Flow, id} } unless ids.empty?
+      end
+      (ref = current_link_ref) ? [ref] : [] of {Store::LinkRefKind, Int64}
+    end
+
     # --- manual active scan (History list / detail, Probe findings, Repeater) ---
     # On-demand run of the Probe ACTIVE checks against one flow, regardless of the Probe mode.
     # Each source resolves a FlowDetail, then open_probe_active_overlay shows the expected
@@ -3685,16 +3789,50 @@ module Gori::Tui
     # (per-rule breakdown + total + a notification-mode cycler + an off-by-default unsafe-methods
     # opt-in). Running is deferred to start_probe_active so the operator can pick the options first.
     private def open_probe_active_overlay(detail : Store::FlowDetail, repeater_id : Int64? = nil) : Nil
-      est_safe = @session.probe.active_estimate(detail)
-      est_unsafe = @session.probe.active_estimate(detail, Probe::Active::Options.new(allow_unsafe: true))
+      open_probe_active_overlay([detail], repeater_id)
+    end
+
+    # `details` is one flow from the Probe/Repeater/detail entry points, or the whole marked
+    # set from the History list (#442). The estimate the popup shows is the SUM across the
+    # set — batching changes the request count, never the gate: run_active_now is still called
+    # per flow and each send goes through the Outbound chokepoint individually.
+    private def open_probe_active_overlay(details : Array(Store::FlowDetail), repeater_id : Int64? = nil) : Nil
+      return if details.empty?
+      est_safe = merged_active_estimate(details, Probe::Active::Options::DEFAULT)
+      est_unsafe = merged_active_estimate(details, Probe::Active::Options.new(allow_unsafe: true))
       # Nothing applies even with unsafe methods allowed — no popup to show.
       if est_unsafe.empty?
         @toast = "no active checks apply (needs a request with reflectable params, or a CORS response)"
         return
       end
-      ov = ProbeActiveOverlay.new(detail, est_safe, est_unsafe, repeater_id)
+      ov = ProbeActiveOverlay.new(details, est_safe, est_unsafe, repeater_id)
       ov.on_commit = -> { start_probe_active(ov) }
       open_overlay(ov)
+    end
+
+    # Per-rule estimate summed over N flows: a rule that applies to k of them sends k× its
+    # per-flow range, so the range scales by k and the rule appears once. Registration order
+    # is preserved (Active::RULES order), so a batch's breakdown reads like a single flow's.
+    private def merged_active_estimate(details : Array(Store::FlowDetail),
+                                       opts : Probe::Active::Options) : Array(Probe::Analyzer::ActiveEstimate)
+      # {info, per-flow range, flows it applies to}. requests_per_flow is a rule CONSTANT, so a
+      # rule hitting k flows sends exactly k× its range and appears once in the breakdown.
+      merged = {} of String => {Probe::RuleInfo, Range(Int32, Int32), Int32}
+      order = [] of String
+      details.each do |d|
+        @session.probe.active_estimate(d, opts).each do |e|
+          if prev = merged[e.info.id]?
+            merged[e.info.id] = {prev[0], prev[1], prev[2] + 1}
+          else
+            merged[e.info.id] = {e.info, e.requests, 1}
+            order << e.info.id
+          end
+        end
+      end
+      order.map do |id|
+        info, r, k = merged[id]
+        Probe::Analyzer::ActiveEstimate.new(info, (r.begin * k)..(r.end * k))
+      end
     end
 
     # Confirm the popup: run the probes in the BACKGROUND (mode-independent), persist the chosen
@@ -3711,11 +3849,17 @@ module Gori::Tui
       end
       notify = ov.notify_mode
       Settings.save_probe_active_notify(notify.token)
-      host = ov.detail.row.host
-      @session.probe.run_active_now(ov.detail, repeater_id: ov.repeater_id,
-        allow_unsafe: ov.allow_unsafe?, notify: notify)
+      # One run per flow (already background), so each target keeps its own scope decision at
+      # the Outbound chokepoint — the batch changed the count, not the gate.
+      ov.details.each do |d|
+        @session.probe.run_active_now(d, repeater_id: ov.repeater_id,
+          allow_unsafe: ov.allow_unsafe?, notify: notify)
+      end
+      hosts = ov.details.map(&.row.host).uniq!
+      dest = hosts.size == 1 ? hosts.first : "#{hosts.size} hosts"
+      scope = ov.details.size == 1 ? "" : " across #{ov.details.size} flows"
       unsafe_note = ov.allow_unsafe? ? " (incl. unsafe methods)" : ""
-      @toast = "active scan → #{host}: #{ov.total_label} sent#{unsafe_note} (see the Probe tab)"
+      @toast = "active scan → #{dest}: #{ov.total_label} sent#{scope}#{unsafe_note} (see the Probe tab)"
       true
     end
 
@@ -3748,10 +3892,20 @@ module Gori::Tui
     # Candidate start targets for the Discover popup: the path subtree first (the likely
     # intent), then the whole host — so `/notes` offers both `/notes/` and `/`.
     private def build_discover_seed(origin : String, host : String, path : String) : DiscoverSeed
-      clean = path.partition('?')[0]
+      build_discover_seed(origin, host, [path])
+    end
+
+    # `paths` is one path from the Sitemap/single-flow entry points, or every marked flow's
+    # path when the History list has a mark set on ONE host (#442) — so marking five endpoints
+    # turns the popup's start-target list into a pick among exactly those five. The host root
+    # is always offered last. Duplicates collapse; order follows the paths given.
+    private def build_discover_seed(origin : String, host : String, paths : Array(String)) : DiscoverSeed
       choices = [] of {String, String}
-      if !clean.empty? && clean != "/"
+      paths.each do |path|
+        clean = path.partition('?')[0]
+        next if clean.empty? || clean == "/"
         sub = clean.ends_with?('/') ? clean : "#{clean}/"
+        next if choices.any? { |(label, _)| label == sub }
         choices << {sub, "#{origin}#{sub}"}
       end
       choices << {"/", "#{origin}/"}
@@ -3822,7 +3976,7 @@ module Gori::Tui
 
     # --- Miner ExecContext / cross-tab mediators ---
 
-    private def open_mine_config(seed : MineSeed?) : Nil
+    private def open_mine_config(seed : MineSeed?, extra : Array(MineSeed) = [] of MineSeed) : Nil
       unless seed
         @toast = "cannot mine this request"
         return
@@ -3831,13 +3985,26 @@ module Gori::Tui
         @toast = "no mineable locations for this request"
         return
       end
-      ov = MineConfigOverlay.new(seed)
+      ov = MineConfigOverlay.new(seed, extra)
       # Start commits: require ≥1 location (keep the form up otherwise), then kick off the
-      # BACKGROUND mine and stay where we are.
+      # BACKGROUND mine and stay where we are. This popup IS the gate for the batch case —
+      # its header names the flow count, so N sessions are never a surprise (P4).
       ov.on_commit = -> {
         if ov.any_checked?
           ov.save_prefs
           miner_controller.start_session(ov.seed, ov.build_config)
+          started = 1
+          ov.extra_seeds.each do |s|
+            # Same choices, narrowed to what actually applies to THIS request — a Json
+            # location checked on the seeded POST would otherwise start an empty session
+            # on a marked GET. build_config returns a fresh Config each call.
+            cfg = ov.build_config
+            cfg.locations = cfg.locations & s.applicable
+            next if cfg.locations.empty?
+            miner_controller.start_session(s, cfg)
+            started += 1
+          end
+          @toast = "mining #{started} flows in the background" unless ov.extra_seeds.empty?
           true
         else
           @toast = "select at least one location to mine"
@@ -4091,7 +4258,71 @@ module Gori::Tui
 
     def space_menu_title(verb_id : String) : String?
       return "Copy selection" if READ_COPY_VERBS.includes?(verb_id) && read_selection_active?
-      nil
+      history_mark_menu_title(verb_id)
+    end
+
+    # The card's state label — "SPACE · 3 MARKED" while History's mark set is non-empty (#442),
+    # so opening the menu over marks announces up front that the actions below are plural.
+    # nil ⇒ the section label (or nothing at all), exactly as before.
+    private def space_menu_banner : String?
+      n = history_mark_menu_count
+      n > 0 ? "#{n} MARKED" : nil
+    end
+
+    # How many marks the History LIST menu should speak for; 0 whenever mark titles don't
+    # apply — another tab, or the flow detail (pinned to ONE flow, so marks deliberately
+    # don't reach it: see history_target_flow_ids).
+    private def history_mark_menu_count : Int32
+      return 0 if @active_tab != :history || @overlay.detail?
+      history_controller.marked_flow_count
+    end
+
+    # How the space menu names each batch-capable History verb while marks are set (#442). A
+    # table rather than a branch per verb, so this reads as THE list of batch-capable entries —
+    # the same list the availability gate (history_targets) and the per-verb handlers implement.
+    # "%s" takes the flow-count phrase ("3 flows").
+    HISTORY_BATCH_TITLES = {
+      "history.copy-as"       => "Copy %s as…",
+      "history.delete"        => "Delete %s",
+      "history.repeater"      => "Repeater %s",
+      "history.fuzz"          => "Send %s to Fuzzer",
+      "history.mine"          => "Mine %s",
+      "history.probe-active"  => "Run active scan on %s",
+      "history.discover"      => "Discover from %s",
+      "scope.add-host"        => "Add %s' hosts to scope",
+      "issue.create"          => "Add issue with %s",
+      "link.history.to-issue" => "Link %s to issue",
+      "link.history.to-note"  => "Link %s to note",
+    }
+
+    # Verbs that stay SINGLE-target even with marks set, and say so in their menu hint (AC: a
+    # single-only verb must not silently do the wrong thing). Named explicitly rather than by
+    # exclusion, so a future batch verb can't inherit a "(cursor)" it doesn't deserve. The other
+    # single-only entries (query / follow / clear / scope-toggle / oast-copy) are
+    # flow-independent, so a cursor note there would be noise.
+    HISTORY_CURSOR_ONLY = {"body.open", "history.sequence"}
+
+    # Retitle the History list's menu entries while marks are set, so the menu says what will
+    # actually happen — "Delete 3 flows". MUST return nil when nothing is marked, so every
+    # existing title stays byte-identical.
+    private def history_mark_menu_title(verb_id : String) : String?
+      n = history_mark_menu_count
+      return nil if n == 0
+      if fmt = HISTORY_BATCH_TITLES[verb_id]?
+        return fmt % plural(n, "flow")
+      end
+      return "#{@session.registry[verb_id].title} (cursor)" if HISTORY_CURSOR_ONLY.includes?(verb_id)
+      case verb_id
+      when "history.copy"       then "Copy #{plural(n, "URL")}"
+      when "history.mark-clear" then "Clear #{plural(n, "mark")}"
+        # Only meaningful at exactly 2 — otherwise leave the registered title, which IS what
+        # comparer_add_selected falls back to (the next-slot ring on the cursor row).
+      when "history.compare" then n == 2 ? "Compare the 2 marked flows" : nil
+      end
+    end
+
+    private def plural(n : Int32, noun : String) : String
+      "#{n} #{noun}#{n == 1 ? "" : "s"}"
     end
 
     def read_selection_active? : Bool

@@ -2,10 +2,17 @@
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
   # CROSS-TAB: open the config popup for History's selected flow (space → Mine params).
+  # Batch-capable (#442): ONE config popup, then a mining session per marked flow. Capped
+  # like the other session-spawning verbs. Flows with no mineable location are dropped here
+  # rather than starting an empty session.
   def mine_selected : Nil
-    id = history_target_flow_id
-    return (@toast = "select a flow first") unless id
-    open_mine_config(miner_controller.build_seed_from_flow(id))
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    return open_mine_config(miner_controller.build_seed_from_flow(ids.first)) if ids.size == 1
+    return unless targets = batch_within_cap(ids, "the Miner")
+    seeds = targets.compact_map { |id| miner_controller.build_seed_from_flow(id) }.reject(&.applicable.empty?)
+    return (@toast = "no mineable locations in the marked flows") if seeds.empty?
+    open_mine_config(seeds.first, seeds[1..])
   end
 
   # CROSS-TAB: open the config popup for the current Repeater request.

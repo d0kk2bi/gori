@@ -25,6 +25,20 @@ describe ComparerView do
     v.label.should eq("login vs register")
   end
 
+  # #442 — History's "exactly 2 marked → compare these two". add_flow rings A → B → A, so a
+  # caller that wants a specific baseline can't use it: whichever slot the ring happens to be
+  # on wins. set_pair fills both and re-arms the ring at A, so the caller decides.
+  it "fills both slots at once, re-arming the next-slot ring at A" do
+    v = ComparerView.new
+    v.add_flow(flow("GET", "/ring")) # ring now points at B
+    v.set_pair(flow("GET", "/older"), flow("POST", "/newer"))
+    v.both_set?.should be_true
+    v.@slot_a.not_nil!.row.target.should eq("/older")
+    v.@slot_b.not_nil!.row.target.should eq("/newer")
+    # Re-armed at A: the next single add replaces the baseline, not the comparison side.
+    v.add_flow(flow("GET", "/next")).should eq(:a)
+  end
+
   it "truncates a slot label by display width, not char count" do
     v = ComparerView.new
     # 12 CJK chars ≈ 24 display cols; char-count truncation (path[0,11]) would keep ~22

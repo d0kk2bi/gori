@@ -16,17 +16,54 @@ private def tmp_store(&)
   end
 end
 
-private def add_flow(store, method, target, status = nil, content_type = nil)
+private def add_flow(store, method, target, status = nil, content_type = nil, host = "h.test")
   id = store.insert_flow(Gori::Store::CapturedRequest.new(
-    created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+    created_at: 1_i64, scheme: "http", host: host, port: 80,
     method: method, target: target, http_version: "HTTP/1.1",
-    head: "#{method} #{target} HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, body: nil))
+    head: "#{method} #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice, body: nil))
   if status
     store.update_response(Gori::Store::CapturedResponse.new(
       flow_id: id, status: status, head: "HTTP/1.1 #{status} X\r\n\r\nbody".to_slice,
       body: "body".to_slice, content_type: content_type))
   end
   id
+end
+
+# Counts the two flow read paths, so a spec can prove WHICH one a code path uses. get_flow
+# pulls the full request+response bodies (2 MiB each) while flow_row is a cheap row — and the
+# multi-select copy paths run on the single-threaded render loop over up to a page of marks
+# (#442), so "rows only" is a property worth pinning rather than re-deriving by reading.
+private class CountingStore < Gori::Store
+  getter get_flow_calls = 0
+  getter flow_row_calls = 0
+
+  def reset_counts : Nil
+    @get_flow_calls = 0
+    @flow_row_calls = 0
+  end
+
+  def flow_row(id : Int64) : Gori::Store::FlowRow?
+    @flow_row_calls += 1
+    super
+  end
+
+  def get_flow(id : Int64, *, body_max : Int32? = nil) : Gori::Store::FlowDetail?
+    @get_flow_calls += 1
+    super
+  end
+end
+
+private def tmp_counting_store(&)
+  path = File.tempname("gori-hvc", ".db")
+  store = CountingStore.open(path).as(CountingStore)
+  begin
+    yield store
+  ensure
+    store.close
+    File.delete?(path)
+    File.delete?("#{path}-wal")
+    File.delete?("#{path}-shm")
+  end
 end
 
 describe Gori::Tui::HistoryView do
@@ -1052,6 +1089,300 @@ describe Gori::Tui::HistoryView do
       view.clear(store)
       view.empty?.should be_true
       store.count.should eq(0)
+    end
+  end
+end
+
+# Multi-select marks (#442) — the state the space menu's batch verbs read through
+# ExecContext#selected_flow_ids. The whole point of keying on FLOW ID rather than row index is
+# that the list reloads, re-sorts and re-filters under the user constantly, so most of these
+# assert that a mark survives exactly that.
+describe "Gori::Tui::HistoryView marks" do
+  it "starts with no marks, so verbs target the cursor row" do
+    tmp_store do |store|
+      id = add_flow(store, "GET", "/a", 200)
+      view = HistoryView.new
+      view.reload(store)
+      view.mark_count.should eq(0)
+      view.marked?(id).should be_false
+      view.target_ids.should eq([id]) # cursor fallback
+    end
+  end
+
+  it "toggles the cursor row's mark and advances, so a run of `t` marks consecutive rows" do
+    tmp_store do |store|
+      ids = (0...3).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store) # newest-first: the cursor starts on the newest row
+      view.toggle_mark
+      view.toggle_mark
+      view.mark_count.should eq(2)
+      view.marked_ids.should eq([ids[2], ids[1]]) # display order — newest first
+      view.target_ids.should eq([ids[2], ids[1]]) # …and that IS the target set now
+      # Toggling a marked row again clears it.
+      view.select_row(0)
+      view.toggle_mark
+      view.marked?(ids[2]).should be_false
+    end
+  end
+
+  it "saturates the cursor at the last row instead of wrapping" do
+    tmp_store do |store|
+      ids = (0...2).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      # Only 2 rows, so the 3rd `t` lands back on the bottom row and un-marks it.
+      3.times { view.toggle_mark }
+      view.selected_id.should eq(ids[0])
+      view.mark_count.should eq(1)
+      view.marked?(ids[1]).should be_true
+    end
+  end
+
+  it "keeps a mark across a reload, a re-sort and a filter change" do
+    tmp_store do |store|
+      keep = add_flow(store, "GET", "/keep", 200)
+      add_flow(store, "GET", "/other", 500)
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(view.rows.index { |r| r.id == keep }.not_nil!)
+      view.toggle_mark
+      view.marked?(keep).should be_true
+
+      view.reload(store)
+      view.marked?(keep).should be_true
+
+      # Re-sort: oldest-first flips the row order, and an INDEX-keyed mark would retarget here.
+      prev = Gori::Settings.history_list_order
+      begin
+        Gori::Settings.history_list_order = "oldest"
+        view.reload(store)
+        view.marked?(keep).should be_true
+      ensure
+        Gori::Settings.history_list_order = prev
+      end
+
+      # Filter the marked flow OUT: the mark set is independent of the visible window, so it
+      # survives and is REPORTED as hidden rather than silently lost.
+      "status:500".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+      view.rows.map(&.id).should_not contain(keep)
+      view.marked?(keep).should be_true
+      view.mark_count.should eq(1)
+      view.marked_hidden_count.should eq(1)
+    end
+  end
+
+  it "marks every row the CURRENT filter shows, unioned with what is already marked" do
+    tmp_store do |store|
+      ok = add_flow(store, "GET", "/ok", 200)
+      err1 = add_flow(store, "GET", "/e1", 500)
+      err2 = add_flow(store, "GET", "/e2", 500)
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(view.rows.index { |r| r.id == ok }.not_nil!)
+      view.toggle_mark # one mark that the filter below excludes
+
+      "status:500".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+      view.mark_all
+      view.mark_count.should eq(3) # the 2 errors PLUS the pre-existing /ok mark
+      [ok, err1, err2].each { |id| view.marked?(id).should be_true }
+      view.marked_hidden_count.should eq(1) # /ok is marked but filtered out
+    end
+  end
+
+  it "extends a contiguous range from the anchor, re-seeding it after a plain move" do
+    tmp_store do |store|
+      ids = (0...5).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(0) # newest row
+      view.extend_marks(1)
+      view.extend_marks(1)
+      view.marked_ids.should eq([ids[4], ids[3], ids[2]]) # anchor + two steps, inclusive
+
+      # A plain move clears the anchor, so the next shift-arrow starts from the NEW cursor
+      # instead of silently sweeping everything back to the old one.
+      view.clear_marks
+      view.select_row(0)
+      view.move(1)
+      view.move(1) # plain moves → cursor two rows down, anchor cleared
+      view.extend_marks(1)
+      view.marked_ids.should eq([ids[2], ids[1]])
+    end
+  end
+
+  it "re-seeds the range anchor on a click, like a plain keyboard move" do
+    tmp_store do |store|
+      ids = (0...4).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(0)
+      view.toggle_mark   # anchors on the newest row
+      view.select_row(2) # the MOUSE path — must not leave that anchor behind
+      view.extend_marks(1)
+      # Rows 2..3 only. A stale row-0 anchor would have swept in ids[2] as well.
+      view.marked_ids.should eq([ids[3], ids[1], ids[0]])
+      view.marked?(ids[2]).should be_false
+    end
+  end
+
+  it "does not pop focus or scroll a focused preview when extending" do
+    tmp_store do |store|
+      ids = (0...3).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(0)
+      view.extend_marks(-1) # already at the top: clamps, marks just this row
+      view.selected_id.should eq(ids[2])
+      view.marked_ids.should eq([ids[2]])
+
+      # With a preview pane focused, `move` scrolls the PREVIEW; extend must still move the
+      # list cursor, or shift-down would silently do nothing.
+      prev = Gori::Settings.history_preview
+      begin
+        Gori::Settings.history_preview = true
+        view.set_preview_focus(:req)
+        view.clear_marks
+        view.extend_marks(1)
+        view.selected_id.should eq(ids[1])
+        view.mark_count.should eq(2)
+      ensure
+        Gori::Settings.history_preview = prev
+      end
+    end
+  end
+
+  it "prunes the marks it deletes, and drops every mark on a clear" do
+    tmp_store do |store|
+      ids = (0...3).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.mark_all
+      view.mark_count.should eq(3)
+
+      view.delete_ids(store, [ids[0], ids[1]])
+      store.count.should eq(1)
+      view.mark_count.should eq(1) # deleted ids can't linger and inflate the next count
+      view.marked?(ids[2]).should be_true
+
+      view.clear(store)
+      view.mark_count.should eq(0)
+    end
+  end
+
+  it "renders a marked row distinctly from the cursor row, with a live count" do
+    tmp_store do |store|
+      3.times { |i| add_flow(store, "GET", "/p#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      backend = MemoryBackend.new(80, 12)
+      view.render_list(Screen.new(backend), Rect.new(0, 0, 80, 12))
+      backend.contains?("marked").should be_false # nothing marked ⇒ no chip
+      backend.contains?("▌").should be_false      # …and no mark gutter
+
+      view.select_row(1)
+      view.toggle_mark
+      view.toggle_mark
+      view.select_row(0) # park the cursor on an UNMARKED row so all three states render
+      backend2 = MemoryBackend.new(80, 12)
+      view.render_list(Screen.new(backend2), Rect.new(0, 0, 80, 12))
+      backend2.contains?("2 marked").should be_true
+      backend2.contains?("▌").should be_true # the fuller mark bar, on the 2 marked rows
+      backend2.contains?("▎").should be_true # the cursor bar still reads differently
+    end
+  end
+
+  it "reports the hidden split on the count chip, so the count never outruns the screen" do
+    tmp_store do |store|
+      add_flow(store, "GET", "/ok", 200)
+      add_flow(store, "GET", "/err", 500)
+      view = HistoryView.new
+      view.reload(store)
+      view.mark_all
+      "status:500".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+      backend = MemoryBackend.new(80, 12)
+      view.render_list(Screen.new(backend), Rect.new(0, 0, 80, 12))
+      backend.contains?("2 marked").should be_true
+      backend.contains?("1 hidden").should be_true
+    end
+  end
+
+  # "Copy as…" over the target SET. One flow keeps the familiar single-message format list;
+  # N flows get the set-shaped formats, because concatenating N raw dumps is never the ask.
+  it "offers single-message formats for one flow and set formats for many" do
+    tmp_store do |store|
+      a = add_flow(store, "GET", "/a", 200, host: "one.test")
+      b = add_flow(store, "POST", "/b", 200, host: "two.test")
+      view = HistoryView.new
+      view.reload(store)
+
+      title, opts = view.list_copy_as_menu(store, [a])
+      title.should eq("COPY REQUEST AS")
+      opts.map(&.key).should contain('u') # URL
+      opts.map(&.key).should contain('r') # Raw request
+
+      title, opts = view.list_copy_as_menu(store, [a, b])
+      title.should eq("COPY 2 FLOWS AS")
+      by_key = opts.to_h { |o| {o.key, o} }
+      by_key['u'].label.should eq("URLs")
+      by_key['u'].text.lines.size.should eq(2)
+      by_key['h'].label.should eq("Host list")
+      by_key['h'].text.lines.sort!.should eq(["one.test", "two.test"])
+      by_key['l'].label.should eq("cURL")
+      # Raw messages contain blank lines, so each is prefixed with a labelled separator
+      # rather than joined on a blank line (which would be ambiguous).
+      by_key['r'].text.should contain("===== flow ##{a}")
+      by_key['r'].text.should contain("===== flow ##{b}")
+    end
+  end
+
+  # Past the cap the byte-carrying formats are not offered — AND the bodies are never read.
+  # get_flow pulls the full request+response (2 MiB each); ⇧T can hand this a whole page, and
+  # this all runs on the single-threaded render loop, so loading N bodies to print N URLs would
+  # freeze for the length of the keypress. The counting store below is the regression guard.
+  it "drops the byte-carrying copy formats past the cap without loading any body" do
+    tmp_counting_store do |store|
+      ids = (0..HistoryView::COPY_BYTES_CAP).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      store.reset_counts
+      _, opts = view.list_copy_as_menu(store, ids)
+      keys = opts.map(&.key)
+      keys.should contain('u')
+      keys.should contain('h')
+      keys.should_not contain('l')      # cURL
+      keys.should_not contain('r')      # raw requests
+      keys.should_not contain('s')      # raw responses
+      store.get_flow_calls.should eq(0) # rows only — no body reads past the cap
+      store.flow_row_calls.should eq(ids.size)
+    end
+  end
+
+  it "loads one body per flow for the byte formats inside the cap" do
+    tmp_counting_store do |store|
+      ids = (0...3).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      store.reset_counts
+      _, opts = view.list_copy_as_menu(store, ids)
+      opts.map(&.key).should contain('r')
+      store.get_flow_calls.should eq(ids.size)
+    end
+  end
+
+  it "resolves marks through the store, so a mark for a vanished flow is skipped" do
+    tmp_store do |store|
+      add_flow(store, "GET", "/a", 200)
+      b = add_flow(store, "GET", "/b", 200)
+      view = HistoryView.new
+      view.reload(store)
+      view.mark_all
+      store.delete_flow(b) # gone behind the view's back (another surface, a trim)
+      _, opts = view.list_copy_as_menu(store, view.target_ids)
+      opts.find { |o| o.key == 'u' }.not_nil!.text.lines.size.should eq(1)
     end
   end
 end

@@ -29,8 +29,13 @@ module Gori::Tui
     NOTIFY_CHOICES = Miner::NotifyMode.values
 
     getter seed : MineSeed
+    # Additional flows this one config starts a session for — History's multi-select (#442).
+    # The CHECKBOXES come from `seed` (the first target), because locations are per-request;
+    # the Runner narrows the committed config to each extra seed's own `applicable` set so a
+    # body location checked on a POST is simply not mined on a GET.
+    getter extra_seeds : Array(MineSeed)
 
-    def initialize(@seed : MineSeed)
+    def initialize(@seed : MineSeed, @extra_seeds : Array(MineSeed) = [] of MineSeed)
       @checked = Hash(Miner::Location, Bool).new
       @seed.applicable.each { |l| @checked[l] = @seed.default.includes?(l) }
       @conc_idx = CONC_CHOICES.index(10) || 1
@@ -165,6 +170,19 @@ module Gori::Tui
       @checked.values.includes?(true)
     end
 
+    # How many flows Start will kick off a session for (1 unless batching, #442).
+    def target_count : Int32
+      1 + @extra_seeds.size
+    end
+
+    # The bold line under the title: the seeded request normally, or the flow count when
+    # this popup is configuring a marked SET — N individual summaries wouldn't fit, and the
+    # count is the thing worth confirming before N background sessions start.
+    private def header_summary : String
+      return @seed.summary if @extra_seeds.empty?
+      "#{target_count} flows · one mining session each"
+    end
+
     def overlay_box(area : Rect) : Rect?
       w = {area.w - 4, 54}.min
       h = {area.h - 2, row_count + 5}.min # title + summary + gap + rows + border
@@ -179,7 +197,7 @@ module Gori::Tui
         return
       end
       Frame.card(screen, box, "MINE PARAMETERS", border: Theme.border_focus)
-      screen.text(box.x + 2, box.y + 1, @seed.summary, Theme.text_bright, Theme.panel, Attribute::Bold, width: box.w - 4)
+      screen.text(box.x + 2, box.y + 1, header_summary, Theme.text_bright, Theme.panel, Attribute::Bold, width: box.w - 4)
       first = box.y + 3
       row_count.times do |i|
         py = first + i

@@ -62,6 +62,14 @@ module Gori::Tui
       @selected = 0
       @scroll = 0
       @follow = true
+      # Multi-select marks (#442), keyed by FLOW ID rather than row index: the list
+      # reloads, re-sorts and re-filters constantly (the cursor itself is already
+      # id-anchored across a reload — see `prev_id` in #reload), so an index-keyed set
+      # would silently retarget on the next data_version tick. A mark whose flow falls
+      # out of the current filter/window stays marked (marked_hidden_count reports it);
+      # a mark whose flow is gone simply fails to resolve at the verb.
+      @marks = Set(Int64).new
+      @mark_anchor = nil.as(Int64?)               # id-keyed range anchor for the ⇧arrow extend
       @filter_dirty = false                       # a filtered view needs a coalesced reload after draining
       @last_filter_flush = nil.as(Time::Instant?) # debounce clock for flush_filter (nil ⇒ first flush is immediate)
       @query = ""
@@ -394,7 +402,8 @@ module Gori::Tui
       @selected = (@selected + delta).clamp(0, @rows.size - 1)
       # "Following" the live tail means sitting on the newest row (top or bottom).
       @follow = (@selected == follow_index)
-      @preview_id = nil # force refresh_preview to re-fetch on the next controller tick
+      @preview_id = nil  # force refresh_preview to re-fetch on the next controller tick
+      @mark_anchor = nil # a plain move re-seeds the range anchor, like a GUI list
     end
 
     getter selected : Int32
@@ -449,7 +458,8 @@ module Gori::Tui
       return if @rows.empty?
       @selected = idx.clamp(0, @rows.size - 1)
       @follow = (@selected == follow_index)
-      @preview_id = nil # force preview refresh
+      @preview_id = nil  # force preview refresh
+      @mark_anchor = nil # same as the keyboard `move`: a plain click re-seeds the anchor
       @preview_focus = :list
     end
 
@@ -482,6 +492,95 @@ module Gori::Tui
       @rows[@selected]?
     end
 
+    # --- marks (multi-select, #442) -------------------------------------------
+
+    def marked?(id : Int64) : Bool
+      @marks.includes?(id)
+    end
+
+    def mark_count : Int32
+      @marks.size
+    end
+
+    # Marks whose flow is NOT in the current window (filtered out, trimmed, or deleted).
+    # Surfaced next to the count so a set larger than what's on screen is never a surprise.
+    def marked_hidden_count : Int32
+      return 0 if @marks.empty?
+      visible = 0
+      @rows.each { |r| visible += 1 if @marks.includes?(r.id) }
+      @marks.size - visible
+    end
+
+    # Marks in DISPLAY order. Flow ids are monotonic with capture time and the list is
+    # ordered by id, so sorting by id reproduces display order exactly — including for
+    # marks that are currently off-window, which no @rows walk could place.
+    def marked_ids : Array(Int64)
+      ids = @marks.to_a.sort!
+      ids.reverse! if newest_first?
+      ids
+    end
+
+    # The effective target set every batch verb acts on: the marks if any are set, else
+    # the cursor row (#442). One rule, so a verb needs no notion of "batch mode".
+    def target_ids : Array(Int64)
+      return marked_ids unless @marks.empty?
+      [selected_id].compact
+    end
+
+    # `t` — flip the cursor row's mark, then advance so a run of `t` marks consecutive
+    # rows. The anchor lands on the row just toggled, so `t` followed by ⇧↓ extends from it.
+    def toggle_mark : Nil
+      return unless id = selected_id
+      @marks.includes?(id) ? @marks.delete(id) : @marks.add(id)
+      step_cursor(1)
+      @mark_anchor = id
+    end
+
+    # ⇧T — mark every row in the CURRENT filtered list, unioned with what's already
+    # marked (so narrowing the filter twice accumulates rather than replaces).
+    def mark_all : Nil
+      @rows.each { |r| @marks.add(r.id) }
+      @mark_anchor = selected_id
+    end
+
+    def clear_marks : Nil
+      @marks.clear
+      @mark_anchor = nil
+    end
+
+    # Drop specific marks — the post-batch-delete prune, so a deleted flow's id can't
+    # linger in the set and inflate the next count.
+    def unmark_ids(ids : Enumerable(Int64)) : Nil
+      ids.each { |id| @marks.delete(id) }
+      @mark_anchor = nil if (a = @mark_anchor) && !@marks.includes?(a) && index_of(a).nil?
+    end
+
+    # ⇧↑/⇧↓ — extend a contiguous range from the anchor, the keyboard form of a GUI
+    # shift+click. The anchor is seeded from the cursor when it's unset or off-window
+    # (a plain move/click clears it), so the first ⇧arrow always starts from where you are.
+    def extend_marks(delta : Int32) : Nil
+      return if @rows.empty?
+      anchor_idx = @mark_anchor.try { |a| index_of(a) }
+      unless anchor_idx
+        @mark_anchor = selected_id
+        anchor_idx = @selected
+      end
+      step_cursor(delta)
+      lo, hi = {anchor_idx, @selected}.minmax
+      (lo..hi).each { |i| @rows[i]?.try { |r| @marks.add(r.id) } }
+    end
+
+    # Cursor step used by the mark gestures. Deliberately NOT `move` (which redirects to
+    # scroll_preview when a preview pane is focused) and NOT the controller's
+    # move_selection (which pops focus to the tab bar at the top row — that would eject
+    # you mid-range-selection). Clamps, so it saturates at both ends instead of wrapping.
+    private def step_cursor(delta : Int32) : Nil
+      return if @rows.empty?
+      @selected = (@selected + delta).clamp(0, @rows.size - 1)
+      @follow = (@selected == follow_index)
+      @preview_id = nil # force refresh_preview on the next controller tick
+    end
+
     # Short "METHOD /path" label for confirm dialogs; falls back to "flow #id".
     def flow_summary(id : Int64) : String
       if (d = @detail) && d.row.id == id
@@ -497,9 +596,18 @@ module Gori::Tui
     # showing that flow. Id is captured by the controller at confirm-open time so a
     # live-capture reload can't retarget the delete.
     def delete_by_id(store : Store, id : Int64) : Nil
-      store.delete_flow(id)
-      close_detail if @detail.try(&.row.id) == id
-      clear_preview if @preview_id == id
+      delete_ids(store, [id])
+    end
+
+    # Batch form (#442): one store round-trip for N marked flows, then the same
+    # re-anchoring. The deleted ids are pruned from the mark set so a stale mark can't
+    # inflate the next count.
+    def delete_ids(store : Store, ids : Array(Int64)) : Nil
+      return if ids.empty?
+      store.delete_flows(ids)
+      close_detail if @detail.try(&.row.id).try { |d| ids.includes?(d) }
+      clear_preview if @preview_id.try { |p| ids.includes?(p) }
+      unmark_ids(ids)
       reload(store)
     end
 
@@ -508,6 +616,7 @@ module Gori::Tui
       store.clear_flows
       close_detail
       clear_preview
+      clear_marks
       reload(store)
     end
 
@@ -810,6 +919,75 @@ module Gori::Tui
     # flow's target URL); RESPONSE offers status+headers/body/raw. Decoded panes
     # (SAML/JWT/…) and the hex dump have no format variants — an empty list there lets
     # the runner fall back to the plain selection copy.
+    # Max flows a BYTE-CARRYING copy format (curl/raw) will span. ⇧T over a filtered list can
+    # mark up to PAGE rows, and concatenating a thousand full head+body pairs into one
+    # clipboard string is not a copy anyone asked for — above this those rows simply aren't
+    # offered (CopyMenu already drops formats that don't apply). URLs/hosts stay uncapped:
+    # they're a line each, and "the URLs of everything I marked" is the whole point.
+    COPY_BYTES_CAP = 20
+
+    # "Copy as…" for the LIST (#442) — the detail's twin above works per pane; this one works
+    # per TARGET SET. One flow gets exactly the familiar single-message format list (so a
+    # single-target copy-as behaves identically to the drill-in's REQUEST pane); N flows get
+    # the set-shaped formats, since "copy the URLs" is what marking 12 rows is for.
+    def list_copy_as_menu(store : Store, ids : Array(Int64)) : {String, Array(CopyMenu::Option)}
+      return {"COPY AS", [] of CopyMenu::Option} if ids.empty?
+      if ids.size == 1
+        # Resolved through the store, not @rows: a mark can outlive the visible window.
+        d = store.get_flow(ids.first)
+        return {"COPY AS", [] of CopyMenu::Option} unless d
+        return {"COPY REQUEST AS", CopyMenu.request_options(request_wire(d), copy_target(d))}
+      end
+      # URLs and the host list need only the ROW, so read flow_row here — get_flow pulls the
+      # full request+response bodies (2 MiB each), and ⇧T can hand this a full PAGE of marks.
+      # Loading a thousand bodies to print a thousand URLs would freeze the render loop for the
+      # duration of the keypress. The byte-carrying formats below load bodies only INSIDE the cap.
+      rows = ids.compact_map { |id| store.flow_row(id) }
+      return {"COPY AS", [] of CopyMenu::Option} if rows.empty?
+      opts = [] of CopyMenu::Option
+      urls = rows.map(&.url).reject(&.empty?)
+      opts << CopyMenu::Option.new("URLs", 'u', urls.join('\n')) unless urls.empty?
+      hosts = rows.map(&.host).reject(&.empty?).uniq!
+      opts << CopyMenu::Option.new("Host list", 'h', hosts.join('\n')) unless hosts.empty?
+      opts.concat(byte_copy_options(store, ids)) if rows.size <= COPY_BYTES_CAP
+      {"COPY #{rows.size} FLOWS AS", opts}
+    end
+
+    # curl / raw-request / raw-response across the set. Only called within COPY_BYTES_CAP, so
+    # this is the one place that loads N full details.
+    private def byte_copy_options(store : Store, ids : Array(Int64)) : Array(CopyMenu::Option)
+      details = ids.compact_map { |id| store.get_flow(id) }
+      opts = [] of CopyMenu::Option
+      # cURL comes from the SAME builder the single-flow path uses — no second serialiser.
+      curls = details.compact_map do |d|
+        CopyMenu.request_options(request_wire(d), copy_target(d)).find { |o| o.key == 'l' }.try(&.text)
+      end
+      opts << CopyMenu::Option.new("cURL", 'l', curls.join("\n\n")) unless curls.empty?
+      # A raw HTTP message contains blank lines, so joining on one would be ambiguous about
+      # where a message ends — each gets a labelled separator line instead. The message bytes
+      # themselves are untouched (P7).
+      {"Raw requests" => 'r', "Raw responses" => 's'}.each do |label, key|
+        parts = details.compact_map do |d|
+          bytes = key == 'r' ? combine_bytes(d.request_head, d.request_body) : combine_bytes(d.response_head, d.response_body)
+          bytes ? "#{copy_separator(d.row)}\n#{String.new(bytes)}" : nil
+        end
+        opts << CopyMenu::Option.new(label, key, parts.join("\n\n")) unless parts.empty?
+      end
+      opts
+    end
+
+    private def request_wire(d : Store::FlowDetail) : String
+      String.new(combine_bytes(d.request_head, d.request_body) || Bytes.empty)
+    end
+
+    private def copy_target(d : Store::FlowDetail) : String
+      Repeater::FlowRequest.build_target(d.row.scheme, d.row.host, d.row.port)
+    end
+
+    private def copy_separator(row : Store::FlowRow) : String
+      "===== flow ##{row.id} #{row.method} #{row.url} ====="
+    end
+
     def detail_copy_as_menu : {String, Array(CopyMenu::Option)}
       detail = @detail
       return {"COPY AS", [] of CopyMenu::Option} unless detail
@@ -1210,12 +1388,23 @@ module Gori::Tui
         row = @rows[ri]
         y = list_top + i
         selected = ri == @selected
-        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
-        fg = selected ? Theme.text_bright : Theme.text
+        # A marked row (#442) reads as a dim band with a FULLER gutter bar, so it stays
+        # distinguishable from the cursor row (which keeps the accent band) and from a
+        # cursor row that is ALSO marked (accent band + full bar). Both glyphs are
+        # single-width, so no column offset moves — list_top/list_row_at stay valid.
+        marked = @marks.includes?(row.id)
+        bg = if selected
+               focused ? Theme.accent_bg : Theme.selection_dim
+             elsif marked
+               Theme.selection_dim
+             else
+               Theme.bg
+             end
+        fg = selected || marked ? Theme.text_bright : Theme.text
 
-        if selected
+        if selected || marked
           screen.fill(Rect.new(rect.x, y, rect.w, 1), bg)
-          screen.cell(rect.x, y, '▎', Theme.accent, bg)
+          screen.cell(rect.x, y, marked ? '▌' : '▎', Theme.accent, bg)
         end
         screen.text(time_x, y, fmt_time(row.created_at), Theme.muted, bg)
         screen.text(method_x, y, row.method, Theme.method_color(row.method), bg)
@@ -1628,7 +1817,9 @@ module Gori::Tui
       follow_shown = fx > rect.x + 1
       screen.text(fx, rect.y, fchip, @follow ? Theme.accent : Theme.muted) if follow_shown
 
-      left_w = {(follow_shown ? fx : scope_x) - (rect.x + 1) - 1, 0}.max
+      lx = render_mark_chip(screen, rect, follow_shown ? fx : scope_x)
+
+      left_w = {lx - (rect.x + 1) - 1, 0}.max
       if !@query.blank?
         # The committed query stays highlighted — this readout is what you scan to
         # check how the active filter is actually being read.
@@ -1642,6 +1833,21 @@ module Gori::Tui
         # repeating it, and the user's next move here is to ADD a query atop the lens.
         screen.text(rect.x + 1, rect.y, FILTER_HINT, Theme.muted, width: left_w)
       end
+    end
+
+    # Mark count (#442), drawn right-to-left ending just left of `right_x`; returns the new
+    # left edge of the chip cluster. Always shown while any mark is set — marks deliberately
+    # survive a tab switch, so this chip is what keeps the set from being invisible when you
+    # come back. The hidden split covers marks the current filter/window doesn't show, so the
+    # count never silently exceeds what's on screen.
+    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
+      return right_x if @marks.empty?
+      hidden = marked_hidden_count
+      chip = hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
+      x = right_x - chip.size - 1
+      return right_x unless x > rect.x + 1 # too narrow — the row count/scope chips win
+      screen.text(x, rect.y, chip, Theme.accent)
+      x
     end
 
     private def render_suggestions(screen : Screen, rect : Rect, y : Int32) : Nil

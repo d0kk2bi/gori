@@ -79,7 +79,12 @@ module Gori::Tui
     # Open scoped to `scope`+`section` (captured by the Runner at the space
     # keystroke, before the overlay/focus state can change). Seeds the entry list
     # and the group split.
-    def open(scope : Verb::Scope, section : Symbol, ctx : Verb::ExecContext) : Nil
+    # `banner` overrides the card's context label when the caller has something to say about
+    # the CURRENT STATE rather than the focus area — History's "3 MARKED" (#442), so a batch
+    # action can never be a surprise. It wins over the section label and, crucially, applies to
+    # the single-group branch too: History Body has no context section, so a section label
+    # alone would never render.
+    def open(scope : Verb::Scope, section : Symbol, ctx : Verb::ExecContext, banner : String? = nil) : Nil
       @ctx = ctx
       @selected = 0
       @scroll = 0
@@ -100,7 +105,7 @@ module Gori::Tui
         # Nothing to distinguish — one flat column, no headers.
         @entries = groups.empty? ? ([] of Verb::Definition) : groups[0][1]
         @groups = [] of Group
-        @section_label = ""
+        @section_label = banner || ""
       else
         @entries = groups.flat_map(&.[1])
         idx = 0
@@ -109,7 +114,7 @@ module Gori::Tui
           idx += verbs.size
           g
         end
-        @section_label = label
+        @section_label = banner || label
       end
       # Widest of the entry titles AND the group headers ("─ LABEL ─", 4 chars of
       # chrome around the label) — a grouped view with a long section label (e.g.

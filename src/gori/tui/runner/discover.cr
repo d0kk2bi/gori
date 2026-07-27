@@ -21,19 +21,40 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     open_discover_config(build_discover_seed(origin, ep[:host], target))
   end
 
+  # Marks (#442) enrich this WITHIN one host: the config popup's start-target list becomes the
+  # union of the marked flows' paths, so "mark five endpoints, then pick which to spider under"
+  # works. It stays deliberately SINGLE-HOST — one popup chooses one start target from one
+  # host's path list, and the header-reuse confirm it raises is nested over that popup
+  # (return_to: :discover_config), so neither generalises to M hosts without either M stacked
+  # popups or silently discarding the target the user picked. Multi-host marks are refused with
+  # a toast and fall back to the cursor row.
   def history_discover : Nil
-    id = history_target_flow_id
-    # get_flow (not flow_row) so we also have the request head to offer its headers.
-    unless id && (detail = @session.store.get_flow(id))
-      @toast = "select a flow to discover"
+    ids = history_target_flow_ids
+    # flow_row, not get_flow: all this needs per flow is the URL, and get_flow would pull the
+    # full request+response bodies for every mark — up to a whole page after ⇧T — most of which
+    # this then throws away. Only the ONE header donor below is loaded in full.
+    parsed = ids.compact_map do |id|
+      @session.store.flow_row(id).try { |row| Discover::Url.parse(row.url).try { |p| {id, p} } }
+    end
+    if parsed.empty?
+      @toast = ids.empty? ? "select a flow to discover" : "flow has no discoverable URL"
       return
     end
-    unless p = Discover::Url.parse(detail.row.url)
-      @toast = "flow has no discoverable URL"
-      return
+    hosts = parsed.map { |(_, p)| p.host }.uniq!
+    if hosts.size > 1
+      # Act on the cursor row alone rather than guessing which host the user meant.
+      @toast = "marked flows span #{hosts.size} hosts — discover runs one host at a time"
+      parsed = parsed.first(1)
     end
-    open_discover_config(build_discover_seed(Discover::Url.origin(p), p.host, p.path))
-    offer_flow_headers(id, detail.request_head)
+    donor_id, first = parsed.first
+    open_discover_config(build_discover_seed(Discover::Url.origin(first), first.host,
+      parsed.map { |(_, p)| p.path }))
+    # One donor for the reused auth/cookie headers — the confirm is nested over the config
+    # popup and can't loop, so the first marked flow supplies them. This is the only full
+    # detail load on this path.
+    if donor = @session.store.get_flow(donor_id)
+      offer_flow_headers(donor_id, donor.request_head)
+    end
   end
 
   def discover_run : Nil

@@ -2,9 +2,23 @@
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
   # CROSS-TAB: open History's selection as a new Fuzzer session (⇧I).
+  # Batch-capable (#442): one fuzz session per marked flow, capped like Repeater. Nothing is
+  # SENT here — a session only fires on ^R — so the >1 confirm names the session count.
   def fuzz_selected : Nil
-    id = history_target_flow_id
-    fuzzer_controller.fuzz_flow(id) if id
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    return fuzzer_controller.fuzz_flow(ids.first) if ids.size == 1
+    return unless targets = batch_within_cap(ids, "Fuzzer")
+    confirm("SEND TO FUZZER", "Open #{targets.size} flows as #{targets.size} fuzz sessions?",
+      confirm_label: "open", danger: false) do
+      opened = 0
+      targets.each do |id|
+        next unless @session.store.flow_row(id) # a stale mark: skip, report in the summary
+        fuzzer_controller.fuzz_flow(id)
+        opened += 1
+      end
+      @toast = batch_summary("opened", opened, targets.size)
+    end
   end
 
   # CROSS-TAB: turn the current Repeater request into a Fuzzer template.

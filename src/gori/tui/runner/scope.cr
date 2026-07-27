@@ -8,15 +8,20 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     project_controller.focus_scope
   end
 
+  # Batch-capable (#442): every marked flow's host, deduped, in ONE lens edit + one reload.
+  # 12 flows on 2 hosts adds 2 rules, not 12.
   def scope_add_host : Nil
-    id = history_target_flow_id
-    return unless id
-    if row = @session.store.flow_row(id)
-      @scope.add("include", "host", row.host)
-      @scope.enable
-      history_controller.view.reload(@session.store)
-      @toast = "added #{row.host} to scope (#{@scope.size})"
-    end
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    # Resolved through the store, never the view's rows: a kept mark can outlive the
+    # visible window (filter change, trim, follow reload).
+    hosts = ids.compact_map { |id| @session.store.flow_row(id).try(&.host) }.uniq!
+    return (@toast = "no flows left to add") if hosts.empty?
+    hosts.each { |h| @scope.add("include", "host", h) }
+    @scope.enable
+    history_controller.view.reload(@session.store)
+    added = hosts.size == 1 ? hosts.first : "#{hosts.size} hosts"
+    @toast = "added #{added} to scope (#{@scope.size})"
   end
 
   # Toggle the scope display lens (in-scope-only ⇄ all flows) right from History —

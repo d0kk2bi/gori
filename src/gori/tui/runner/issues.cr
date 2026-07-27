@@ -1,11 +1,16 @@
 # Issues report — ExecContext verb implementations, reopens Gori::Tui::Runner (see
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
+  # ONE issue, every targeted flow attached as evidence (#442). The form's title/host/primary
+  # evidence come from the first flow; the rest ride along as extra_flow_ids and are linked
+  # after the insert — so marking 5 flows and pressing ⇧F files one finding with five samples,
+  # not five issues.
   def issue_create : Nil
-    id = history_target_flow_id
-    return unless id
-    if row = @session.store.flow_row(id)
-      open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, id))
+    ids = history_target_flow_ids
+    return if ids.empty?
+    if row = @session.store.flow_row(ids.first)
+      open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, ids.first,
+        extra_flow_ids: ids[1..]))
     end
   end
 

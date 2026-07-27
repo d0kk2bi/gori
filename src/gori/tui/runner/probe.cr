@@ -86,13 +86,21 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     @toast = "this issue has no sample evidence"
   end
 
-  # History list / open detail → the selected (or open) flow.
+  # History list / open detail → the selected (or open) flow, or every MARKED flow (#442).
+  # The popup then shows the summed per-rule estimate, so N>1 is confirm-gated by a request
+  # count exactly as one flow already was.
   def probe_active_selected : Nil
-    id = history_target_flow_id
-    return (@toast = "select a flow first") unless id
-    detail = @session.store.get_flow(id)
-    return (@toast = "flow no longer available") unless detail
-    open_probe_active_overlay(detail)
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    # Capped like the other batch verbs, and for two reasons at once: the estimate below has to
+    # load a FULL detail per flow (bodies included) before it can show a count, and ⇧T can mark
+    # a whole page — so an uncapped run would freeze the render loop and then offer to send
+    # thousands of requests.
+    return unless targets = batch_within_cap(ids, "the active scan")
+    # Through the store, not the view's rows — a mark can outlive the visible window.
+    details = targets.compact_map { |id| @session.store.get_flow(id) }
+    return (@toast = "flow no longer available") if details.empty?
+    open_probe_active_overlay(details)
   end
 
   # Probe findings list → the selected issue's sample flow (re-test the evidence in place).

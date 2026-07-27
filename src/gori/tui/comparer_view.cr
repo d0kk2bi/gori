@@ -144,6 +144,15 @@ module Gori::Tui
       slot
     end
 
+    # Fill BOTH slots in one go — History's "exactly 2 marked → compare these" (#442).
+    # Skips the next-slot ring entirely (and re-arms it at A), so the caller decides which
+    # flow is the baseline instead of inheriting whatever the ring's phase happened to be.
+    def set_pair(a : Store::FlowDetail, b : Store::FlowDetail) : Nil
+      set_slot(:a, a)
+      set_slot(:b, b)
+      @fill_next = :a
+    end
+
     def swap : Nil
       @slot_a, @slot_b = @slot_b, @slot_a
       invalidate

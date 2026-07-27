@@ -169,6 +169,18 @@ module Gori
       }
     end
 
+    # Batch form of delete_flow — the History list's multi-select delete (#442). ONE
+    # exec_task, so 20 marked flows cost one transaction and one fsync instead of 20
+    # (P6 — never stall the data path). Same per-id cascade, so a batch of one is
+    # byte-identical to delete_flow.
+    def delete_flows(ids : Array(Int64)) : Nil
+      return if ids.empty?
+      exec_task ->(c : DB::Connection) {
+        ids.each { |id| delete_flow_one(c, id) }
+        nil
+      }
+    end
+
     # Wipe every captured History flow in this project (and their WS/FTS/h2 logs and
     # flow entity_links). Repeater-owned WS rows (repeater_id set) and workbench sessions
     # are left intact. Issues/Probe keep dangling sample flow ids.
