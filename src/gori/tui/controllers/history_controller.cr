@@ -125,11 +125,18 @@ module Gori::Tui
       true
     end
 
-    # Tab cycles list ↔ Req/Res preview focus when the list+preview layout is active.
+    # esc clears the marks; Tab cycles list ↔ Req/Res preview focus when the list+preview
+    # layout is active. Runs BEFORE the Body keymap, so the esc branch shadows
+    # body.to-menu ONLY while marks are set — with none set, esc still pops to the tab bar.
+    # (The QL bar claims every key ahead of this while it's up, so filter-esc is unaffected.)
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       return false if @host.overlay == :detail
-      return false unless @history.preview_enabled?
       return false if ev.ctrl? || ev.alt?
+      if ev.key.escape? && @history.mark_count > 0
+        @history.clear_marks
+        return true
+      end
+      return false unless @history.preview_enabled?
       if ev.key.tab?
         @history.cycle_preview_focus
         return true
@@ -347,6 +354,56 @@ module Gori::Tui
       @history.selected_id
     end
 
+    # The effective target set for a batch verb: the marks if any, else the cursor row
+    # (#442). Runner#history_target_flow_ids wraps this with the detail-overlay case.
+    def target_flow_ids : Array(Int64)
+      @history.target_ids
+    end
+
+    def marked_flow_count : Int32
+      @history.mark_count
+    end
+
+    # The one privileged target when a batch verb needs a single representative (see
+    # HistoryView#primary_target_id — deliberately NOT the display-order first).
+    def primary_target_flow_id : Int64?
+      @history.primary_target_id
+    end
+
+    def history_mark_toggle : Nil
+      return @host.status("no flow to mark") unless @history.selected_id
+      @history.toggle_mark
+      @host.status(mark_status)
+    end
+
+    def history_mark_all : Nil
+      return @host.status("no flows to mark") if @history.empty?
+      @history.mark_all
+      @host.status(mark_status)
+    end
+
+    def history_mark_clear : Nil
+      @history.clear_marks
+      @host.status("marks cleared")
+    end
+
+    def history_mark_extend(delta : Int32) : Nil
+      return if @history.empty?
+      @history.extend_marks(delta)
+      @host.status(mark_status)
+    end
+
+    # Shared mark toast — says the count AND how much of it is off-window, matching the
+    # QL-bar chip, so a set larger than the visible list is never a surprise.
+    private def mark_status : String
+      n = @history.mark_count
+      return "no marks — verbs act on the cursor row" if n == 0
+      hidden = @history.marked_hidden_count
+      msg = "#{n} flow#{n == 1 ? "" : "s"} marked"
+      msg += " (#{hidden} not visible)" if hidden > 0
+      msg
+    end
+
     # Copy the selected flow's raw request (head + body, byte-exact P7) to the
     # system clipboard via OSC 52.
     def copy_selection(id : Int64? = nil) : Nil
@@ -366,6 +423,23 @@ module Gori::Tui
       @host.status(msg)
     end
 
+    # Multi-mark copy (#442): concatenating N raw request dumps is not what anyone marking
+    # 12 rows wants — "copy the URLs" is. So bare `y` over a mark set yields the URL list;
+    # the other formats live behind the Copy-as picker (Runner#copy_as_menu).
+    def copy_urls(ids : Array(Int64)) : Nil
+      store = @host.session.store
+      urls = ids.compact_map { |id| store.flow_row(id).try(&.url) }
+      return @host.status("copy: no flows left to copy") if urls.empty?
+      text = urls.join('\n')
+      written = Clipboard.copy(text)
+      msg = "copied #{urls.size} URL#{urls.size == 1 ? "" : "s"} to clipboard (#{written}b)"
+      # A thousand marked URLs overrun the 64KB clipboard cap, and a severed list that CLAIMS a
+      # thousand is worse than a short one that admits it (mirrors copy_selection above).
+      msg += " — clipped from #{text.bytesize}b (64KB cap)" if written < text.bytesize
+      msg += " — #{ids.size - urls.size} no longer available" if urls.size < ids.size
+      @host.status(msg)
+    end
+
     def history_query : Nil
       @history.start_query
       @host.status("filter: type a query · ↹ complete · ↵ apply · esc clear")
@@ -376,15 +450,32 @@ module Gori::Tui
     # ProbeController#probe_delete). Works from the list or the open detail.
     def history_delete : Nil
       from_detail = @host.overlay == :detail
-      id = from_detail ? @history.detail_flow_id : @history.selected_id
-      return unless id
-      label = @history.flow_summary(id)
+      # The mark set only applies from the list — an open detail is pinned to ONE flow
+      # (see Runner#history_target_flow_ids for the same precedence).
+      ids = from_detail ? [@history.detail_flow_id].compact : @history.target_ids
+      return if ids.empty?
+      # Marks can outlive the visible window (a filter change, a trim), so a batch confirm
+      # spells out the split: this dialog — not the list chip — is the last thing read
+      # before data is destroyed.
+      label =
+        if ids.size == 1
+          "\"#{@history.flow_summary(ids.first)}\""
+        else
+          hidden = @history.marked_hidden_count
+          "#{ids.size} flows#{hidden > 0 ? " (#{hidden} not visible)" : ""}"
+        end
       # return_to: :detail when launched from the open flow detail, so CANCEL restores the
       # detail (instead of dropping to the list) and the guard below still fires on accept
       # (the flow is gone, so :detail → :none).
-      @host.confirm("DELETE FLOW", "Delete \"#{label}\"?\nThis can't be undone.",
+      @host.confirm(ids.size == 1 ? "DELETE FLOW" : "DELETE FLOWS", "Delete #{label}?\nThis can't be undone.",
         confirm_label: "delete", danger: true, return_to: from_detail ? :detail : :none) do
-        @history.delete_by_id(@host.session.store, id)
+        # A rolled-back write (cross-process SQLite busy/lock) leaves the flows AND the marks in
+        # place — say so instead of reporting a delete that didn't happen, so the set is still
+        # there to retry.
+        unless @history.delete_ids(@host.session.store, ids)
+          @host.status("delete failed — project busy, marks kept; try again")
+          next
+        end
         @host.request_overlay(:none) if @host.overlay == :detail
         @host.status("deleted #{label}")
       end
@@ -433,6 +524,12 @@ module Gori::Tui
     # The focus-aware "copy as X" menu for the open detail pane ({title, options}).
     def detail_copy_as_menu : {String, Array(CopyMenu::Option)}
       @history.detail_copy_as_menu
+    end
+
+    # "Copy as…" over the list's effective target set (#442) — the Runner passes the ids so
+    # the detail-vs-marks precedence stays in one place (history_target_flow_ids).
+    def list_copy_as_menu(ids : Array(Int64)) : {String, Array(CopyMenu::Option)}
+      @history.list_copy_as_menu(@host.session.store, ids)
     end
 
     def hscroll_detail(delta : Int32) : Nil

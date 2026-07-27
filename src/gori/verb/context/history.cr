@@ -7,6 +7,25 @@ abstract class Gori::Verb::ExecContext
   abstract def close_detail : Nil
   abstract def toggle_follow : Nil
   abstract def selected_flow_id : Int64?
+
+  # --- multi-select marks (#442) ---
+  # The effective target set every BATCH-capable History verb acts on:
+  #
+  #     the marks if any are set, else the cursor row
+  #
+  # (and, when the flow detail is open, just that flow — it's pinned to one). One rule, so
+  # a verb never needs a notion of "batch mode" and keeps its single registered call path
+  # (P1). `selected_flow_id` above is UNCHANGED — it still means the cursor row alone, so
+  # every single-only verb needs no edit.
+  abstract def selected_flow_ids : Array(Int64)
+  # The TRUE mark count — 0 means "cursor mode", which selected_flow_ids.size cannot say
+  # (it returns 1 either way). Gates the clear-marks verb and drives the menu titles.
+  abstract def marked_flow_count : Int32
+  abstract def history_mark_toggle : Nil                # flip the cursor row's mark, then advance
+  abstract def history_mark_all : Nil                   # mark every row in the current filtered list
+  abstract def history_mark_clear : Nil                 # drop every mark
+  abstract def history_mark_extend(delta : Int32) : Nil # ⇧↑/⇧↓: extend a range from the anchor
+
   abstract def copy_selection : Nil
   abstract def history_query : Nil # focus the QL filter bar
   # History destructive actions (space-menu only; each opens a confirm first).

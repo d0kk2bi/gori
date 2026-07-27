@@ -12,6 +12,15 @@ private def on(tab : Symbol, selected : Int64? = nil) : FakeExecContext
   ctx
 end
 
+# Marks set (#442) but nothing under the cursor — the state only the PLURAL gate
+# (selected_flow_ids) survives, which is what a filter change or a live-capture reload creates.
+private def marked(*ids : Int64) : FakeExecContext
+  ctx = FakeExecContext.new
+  ctx.current_tab = :history
+  ctx.marks = ids.to_a
+  ctx
+end
+
 describe "Gori::Verbs.register_history" do
   r = Gori::Verbs.registry
 
@@ -53,6 +62,68 @@ describe "Gori::Verbs.register_history" do
         r[id].available?(empty).should be_true
         r[id].available?(elsewhere).should be_false
         verb_intents(r, id).should eq([intent])
+      end
+    end
+
+    # Multi-select (#442). The batch verbs read ctx.selected_flow_ids — "the marks if any,
+    # else the cursor row" — so they stay available when the marks are the only thing left
+    # to act on, which is exactly the state a filter change or a live-capture reload creates.
+    describe "marks" do
+      it "registers the mark gestures on keys that are free across Body" do
+        r["history.mark-toggle"].chords.map(&.label).should eq(["t"])
+        r["history.mark-toggle"].menu_key.should eq('t')
+        # Chord.new("t", shift: true), never Chord.new("T") — Keybind.from_event normalises a
+        # typed capital to shift+lowercase, so a "T" chord could never fire.
+        r["history.mark-all"].chords.should eq([Gori::Verb::Chord.new("t", shift: true)])
+        r["history.mark-all"].menu_key.should eq('T')
+        r["history.mark-clear"].chords.should be_empty
+        r["history.mark-clear"].menu_key.should eq('N')
+        r["history.copy-as"].chords.should be_empty
+        r["history.copy-as"].menu_key.should eq('F') # 'Y' is taken in Body by project.copy
+      end
+
+      it "extends the range on shift+arrows — hidden nav, but still tab-gated" do
+        {"history.mark-extend-up" => "shift-up", "history.mark-extend-down" => "shift-down"}.each do |id, label|
+          v = r[id]
+          v.chords.map(&.label).should eq([label])
+          v.hidden?.should be_true # a nav primitive, like body.up/body.down
+          v.menu_key.should be_nil # …so it never shows in the space menu
+          # hidden does NOT gate the tab, and Scope::Body is shared with Project/Comparer.
+          v.available?(on(:history)).should be_true
+          v.available?(on(:project, 7_i64)).should be_false
+        end
+        verb_intents(r, "history.mark-extend-down").should eq([:history_mark_extend])
+        FakeExecContext.new.tap { |c| r["history.mark-extend-up"].call(c) }
+          .args_for(:history_mark_extend).should eq(["-1"])
+      end
+
+      it "offers clear-marks only while something is marked" do
+        r["history.mark-clear"].available?(on(:history, 7_i64)).should be_false
+        r["history.mark-clear"].available?(marked(1_i64, 2_i64)).should be_true
+        elsewhere = marked(1_i64)
+        elsewhere.current_tab = :repeater # marks are History state; another tab must not offer it
+        r["history.mark-clear"].available?(elsewhere).should be_false
+        verb_intents(r, "history.mark-clear").should eq([:history_mark_clear])
+      end
+
+      # The whole point of the plural gate: every mark can scroll out from under the cursor
+      # (a filter change, a trim, follow snapping to the tail) and the batch must still fire.
+      it "keeps the batch verbs available on marks alone, with no cursor row" do
+        set = marked(4_i64, 9_i64)
+        %w[history.copy history.copy-as history.delete history.repeater history.fuzz
+          history.mine history.probe-active history.discover history.compare
+          scope.add-host issue.create link.history.to-issue link.history.to-note].each do |id|
+          r[id].available?(set).should be_true
+          r[id].available?(on(:history)).should be_false # neither marks nor a cursor row
+        end
+      end
+
+      # Single-target even with marks set — they must NOT quietly become batch-capable.
+      it "leaves the genuinely single-target verbs on the cursor row" do
+        r["body.open"].available?(marked(4_i64, 9_i64)).should be_false # no cursor ⇒ nothing to open
+        r["body.open"].available?(on(:history, 7_i64)).should be_true
+        r["history.sequence"].available?(marked(4_i64, 9_i64)).should be_false
+        r["history.sequence"].available?(on(:history, 7_i64)).should be_true
       end
     end
 

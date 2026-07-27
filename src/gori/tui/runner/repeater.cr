@@ -3,9 +3,25 @@
 class Gori::Tui::Runner < Gori::Verb::ExecContext
   # --- Repeater ExecContext --- (delegated to RepeaterController; cross-tab mediators kept)
   # CROSS-TAB mediator: load History's selection into a new Repeater tab.
+  # Batch-capable (#442): one sub-tab per marked flow, capped (BATCH_SUBTAB_CAP) since ⇧T
+  # over a filtered list can mark up to a full page. Nothing is SENT here — a Repeater
+  # session only fires on ^R — so the >1 case just confirms the sub-tab count.
   def repeater_selected : Nil
-    id = history_target_flow_id
-    repeater_controller.repeater_flow(id) if id
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    return repeater_controller.repeater_flow(ids.first) if ids.size == 1
+    return unless ids = batch_within_cap(ids, "Repeater")
+    targets = ids
+    confirm("SEND TO REPEATER", "Open #{targets.size} flows as #{targets.size} Repeater sub-tabs?",
+      confirm_label: "open", danger: false) do
+      opened = 0
+      targets.each do |id|
+        next unless @session.store.flow_row(id) # a stale mark: skip, report in the summary
+        repeater_controller.repeater_flow(id)
+        opened += 1
+      end
+      @toast = batch_summary("opened", opened, targets.size)
+    end
   end
 
   def repeater_new : Nil

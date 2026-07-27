@@ -243,6 +243,28 @@ describe Gori::Tui::SpaceMenu do
     backend2.contains?("SPACE · COMMON").should be_false # flat render — no section suffix
   end
 
+  # #442 — History's Body menu is the SINGLE-GROUP case (no context section), where the card
+  # title is normally bare "SPACE". A banner has to reach that branch too, or a batch action
+  # over 3 marked flows would look identical to a single-flow one.
+  it "puts a state banner in the card title, including on a flat single-group render" do
+    ctx = FakeExecContext.new
+    ctx.selected = 5_i64
+    menu = SpaceMenu.new(Gori::Verbs.registry)
+
+    menu.open(Gori::Verb::Scope::Body, :common, ctx, banner: "3 MARKED")
+    backend = MemoryBackend.new(100, 30)
+    menu.render(Screen.new(backend), Rect.new(0, 0, 100, 28))
+    backend.contains?("SPACE · 3 MARKED").should be_true
+    backend.contains?("COMMON").should be_false # still flat: no group headers
+
+    # No banner ⇒ byte-identical to before (a bare "SPACE" card).
+    menu.open(Gori::Verb::Scope::Body, :common, ctx)
+    backend2 = MemoryBackend.new(100, 30)
+    menu.render(Screen.new(backend2), Rect.new(0, 0, 100, 28))
+    backend2.contains?("SPACE").should be_true
+    backend2.contains?("SPACE ·").should be_false
+  end
+
   it "yields COMMON + the focus-area's own group when opened with a non-common section (Fuzzer)" do
     ctx = FakeExecContext.new
     ctx.current_tab = :fuzzer

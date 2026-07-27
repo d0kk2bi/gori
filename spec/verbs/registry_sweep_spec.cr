@@ -28,6 +28,20 @@ describe "Gori::Verbs.registry (every verb)" do
     answered.should eq(r.size)
   end
 
+  # #442 made the History verbs act on N flows by widening what they TARGET, not by adding a
+  # second set of ids. A `history.batch-delete` beside `history.delete` would be two
+  # declarations of one feature — two menu rows, two keybindings to keep in sync, two places
+  # to fix a bug (P1, one execution path). This is the cheap guard against that drifting back.
+  it "has no parallel batch-* twin of an existing verb" do
+    ids = r.map(&.id).to_set
+    twins = ids.select do |id|
+      parts = id.split('.', 2)
+      parts.size == 2 && parts[1].starts_with?("batch-") &&
+        ids.includes?("#{parts[0]}.#{parts[1].lchop("batch-")}")
+    end
+    twins.should be_empty
+  end
+
   it "gives every verb a non-empty id, title and description" do
     # All three are user-visible in the palette; a blank one ships as an unlabelled row.
     r.each do |v|

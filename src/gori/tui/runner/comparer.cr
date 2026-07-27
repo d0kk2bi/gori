@@ -54,11 +54,28 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # CROSS-TAB mediator: send History's selected flow to the next Comparer slot
   # on the *active* comparison sub-tab (rings A → B → A).
   def comparer_add_selected : Nil
-    id = history_target_flow_id
-    return (@toast = "select a flow first") unless id
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    return comparer_add_pair(ids) if ids.size == 2
+    # 1 mark (or none — the cursor row), or 3+: keep the next-slot ring. 3+ marks has no
+    # meaning for a two-slot diff, so it falls back rather than silently picking two.
+    @toast = "comparer takes 2 flows — mark exactly 2, or use the cursor row" if ids.size > 2
+    id = ids.first
     detail = @session.store.get_flow(id)
     return (@toast = "flow no longer available") unless detail
     slot = comparer_controller.view.add_flow(detail)
     @toast = "comparer: set #{slot.to_s.upcase} — open Comparer (^P) to view the diff"
+  end
+
+  # Exactly 2 marked (#442): fill A and B directly instead of making the user guess where
+  # today's next-slot ring (A → B → A) happens to be. A is the OLDER flow (lower id) and B
+  # the newer regardless of the list's display direction — a diff reads before → after.
+  private def comparer_add_pair(ids : Array(Int64)) : Nil
+    older, newer = ids.minmax
+    a = @session.store.get_flow(older)
+    b = @session.store.get_flow(newer)
+    return (@toast = "flow no longer available") unless a && b
+    comparer_controller.view.set_pair(a, b)
+    @toast = "comparer: A ##{older} · B ##{newer} — open Comparer (^P) to view the diff"
   end
 end

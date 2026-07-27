@@ -169,6 +169,24 @@ module Gori
       }
     end
 
+    # Batch form of delete_flow — the History list's multi-select delete (#442). ONE
+    # exec_task_ok, so 20 marked flows cost one transaction and one fsync instead of 20
+    # (P6 — never stall the data path). Same per-id cascade, so a batch of one is
+    # byte-identical to delete_flow.
+    #
+    # exec_task_OK, not exec_task: a DELETE reports nothing through last_insert_rowid, so a
+    # batch rolled back by an unrelated co-submitted write (the writer loop batches ops into one
+    # transaction) would be indistinguishable from success — and the caller would drop the marks
+    # that identified those rows while every one of them reappeared in the list. Returns whether
+    # the delete actually committed.
+    def delete_flows(ids : Array(Int64)) : Bool
+      return true if ids.empty?
+      exec_task_ok ->(c : DB::Connection) {
+        ids.each { |id| delete_flow_one(c, id) }
+        nil
+      }
+    end
+
     # Wipe every captured History flow in this project (and their WS/FTS/h2 logs and
     # flow entity_links). Repeater-owned WS rows (repeater_id set) and workbench sessions
     # are left intact. Issues/Probe keep dangling sample flow ids.

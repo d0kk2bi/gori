@@ -118,6 +118,38 @@ class FakeExecContext < Gori::Verb::ExecContext
     @selected
   end
 
+  # Multi-select marks (#442). `marks` is settable state (the query half); the effective
+  # target set derives from it exactly as the Runner's does — marks if any, else the cursor
+  # — so a spec can exercise the marks-vs-cursor rule without a live view. Defaults to
+  # empty so every `available?` lambda is safe on a bare FakeExecContext
+  # (spec/verbs/registry_sweep_spec.cr).
+  property marks = [] of Int64
+
+  def selected_flow_ids : Array(Int64)
+    return marks unless marks.empty?
+    [@selected].compact
+  end
+
+  def marked_flow_count : Int32
+    marks.size
+  end
+
+  def history_mark_toggle : Nil
+    rec(:history_mark_toggle)
+  end
+
+  def history_mark_all : Nil
+    rec(:history_mark_all)
+  end
+
+  def history_mark_clear : Nil
+    rec(:history_mark_clear)
+  end
+
+  def history_mark_extend(delta : Int32) : Nil
+    rec(:history_mark_extend, delta)
+  end
+
   def copy_selection : Nil
     rec(:copy_selection)
   end

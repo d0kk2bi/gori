@@ -2,10 +2,26 @@
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
   # CROSS-TAB: open the config popup for History's selected flow (space → Mine params).
+  # Batch-capable (#442): ONE config popup, then a mining session per marked flow. Capped
+  # like the other session-spawning verbs. Flows with no mineable location are dropped here
+  # rather than starting an empty session.
   def mine_selected : Nil
-    id = history_target_flow_id
-    return (@toast = "select a flow first") unless id
-    open_mine_config(miner_controller.build_seed_from_flow(id))
+    ids = history_target_flow_ids
+    return (@toast = "select a flow first") if ids.empty?
+    return open_mine_config(miner_controller.build_seed_from_flow(ids.first)) if ids.size == 1
+    return unless targets = batch_within_cap(ids, "the Miner")
+    seeds = targets.compact_map { |id| miner_controller.build_seed_from_flow(id) }.reject(&.applicable.empty?)
+    return (@toast = "no mineable locations in the marked flows") if seeds.empty?
+    # The config popup's checkboxes come from ONE seed, and the Runner then narrows the committed
+    # config to each other seed's own `applicable` — so a location absent from the seeding flow
+    # can never be checked and is silently unmineable everywhere. Seed from the flow offering the
+    # MOST locations (a POST with a JSON body, not a bare GET), which makes the widest set of
+    # choices reachable. Deliberately not `seeds.first`: that follows the display order, so a
+    # history_list_order flip would change what the batch actually mines.
+    best = (0...seeds.size).max_by { |i| seeds[i].applicable.size }
+    extra = seeds.dup
+    extra.delete_at(best)
+    open_mine_config(seeds[best], extra)
   end
 
   # CROSS-TAB: open the config popup for the current Repeater request.

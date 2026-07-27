@@ -42,6 +42,28 @@ describe "entity_links (V21)" do
     end
   end
 
+  # History's multi-select link (#442) attaches N refs to one owner. Looping add_link would cost
+  # one blocking transaction + SELECT per ref on the render loop, so add_links does the whole set
+  # in one write and reports the INSERTED count from changes() — which must see through
+  # INSERT OR IGNORE, i.e. count only what was really new.
+  it "adds many links in one write, counting only the ones that were new" do
+    with_store do |store|
+      issue_id = store.insert_issue("batch", Gori::Store::Severity::Low, nil, nil)
+      refs = (1_i64..3_i64).map { |i| {Gori::Store::LinkRefKind::Flow, i} }
+      store.add_links(Gori::Store::LinkOwnerKind::Issue, issue_id, refs).should eq(3)
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, issue_id).map(&.ref_id).sort!.should eq([1_i64, 2_i64, 3_i64])
+
+      # Re-adding two of the three plus one genuinely new ref: only the new one counts, and
+      # nothing is duplicated.
+      again = [{Gori::Store::LinkRefKind::Flow, 2_i64}, {Gori::Store::LinkRefKind::Flow, 3_i64},
+               {Gori::Store::LinkRefKind::Flow, 4_i64}]
+      store.add_links(Gori::Store::LinkOwnerKind::Issue, issue_id, again).should eq(1)
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, issue_id).size.should eq(4)
+
+      store.add_links(Gori::Store::LinkOwnerKind::Issue, issue_id, [] of {Gori::Store::LinkRefKind, Int64}).should eq(0)
+    end
+  end
+
   it "adds, dedupes, and removes links" do
     with_store do |store|
       issue_id = store.insert_issue("t", Gori::Store::Severity::Info, nil, nil)

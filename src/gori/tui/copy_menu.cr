@@ -44,6 +44,22 @@ module Gori::Tui
       opts
     end
 
+    # Just the cURL line for one request — what History's multi-flow "Copy as… cURL" needs
+    # (#442). request_options above would allocate the Headers join, the Body and the whole Raw
+    # request alongside it, i.e. several extra copies of a multi-MiB body per flow, only for the
+    # caller to discard all but this one; and picking it out by its 'l' key would silently yield
+    # nothing if the option list were ever renumbered. nil when there is no resolvable URL,
+    # matching request_options dropping the row in that case.
+    def self.curl_text(wire : String, target : String) : String?
+      head, body = split_message(wire)
+      lines = head.scrub.split(/\r?\n/)
+      header_lines = lines.size > 1 ? lines[1..] : [] of String
+      method, req_target, _ = parse_request_line(lines.first? || "")
+      url = resolve_url(req_target, target, header_lines)
+      return nil if url.empty?
+      curl_command(method, url, header_lines, body)
+    end
+
     # Options for a RESPONSE pane, built from the raw head bytes (with or without a
     # trailing blank line) and body. "Raw response" re-joins them with a single CRLF
     # separator so a doubled/absent separator in `head` never leaks through — and is

@@ -3,11 +3,13 @@ require "../verb"
 module Gori
   module Verbs
     def self.register_issues(r : Verb::Registry) : Nil
-      # create from History (selected flow)
+      # create from History (selected flow, or ONE issue carrying every marked flow as
+      # evidence — #442). Gates on the effective target set, which also aligns the gate with
+      # what the handler already acted on (history_target_flow_id: the open detail's flow).
       r.register Verb::Definition.new(
-        "issue.create", "Add issue", "Create an issue from the selected flow", Verb::Scope::Body,
+        "issue.create", "Add issue", "Create an issue from the selected flow (every marked flow is attached as evidence)", Verb::Scope::Body,
         [Verb::Chord.new("f", shift: true)],
-        available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history && !ctx.selected_flow_id.nil? }, mnemonic: 'a') { |ctx| ctx.issue_create; nil }
+        available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history && !ctx.selected_flow_ids.empty? }, mnemonic: 'a') { |ctx| ctx.issue_create; nil }
 
       # issues list
       r.register Verb::Definition.new(

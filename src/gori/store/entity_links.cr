@@ -24,6 +24,30 @@ module Gori
       nil
     end
 
+    # Attach MANY refs to one owner — History's multi-select link (#442). Returns how many rows
+    # were actually inserted (the rest were already linked).
+    #
+    # One exec_task for the whole set, like delete_flows: add_link is a separate transaction plus
+    # a SELECT per call, and exec_task BLOCKS the calling fiber on its reply, so looping it over a
+    # marked set would stall the single-threaded render loop for one write-batch round-trip per
+    # flow — seconds at typical fsync latency once ⇧T has marked a page. The inserted count comes
+    # from `changes()` inside the same transaction, so no follow-up read is needed either.
+    def add_links(owner_kind : LinkOwnerKind, owner_id : Int64, refs : Array({LinkRefKind, Int64})) : Int32
+      return 0 if refs.empty?
+      ts = now_us
+      inserted = 0
+      exec_task ->(c : DB::Connection) {
+        refs.each do |(ref_kind, ref_id)|
+          c.exec(
+            "INSERT OR IGNORE INTO entity_links (owner_kind, owner_id, ref_kind, ref_id, created_at) VALUES (?,?,?,?,?)",
+            owner_kind.label, owner_id, ref_kind.label, ref_id, ts)
+          inserted += c.scalar("SELECT changes()").as(Int64).to_i
+        end
+        nil
+      }
+      inserted
+    end
+
     def link_id(owner_kind : LinkOwnerKind, owner_id : Int64, ref_kind : LinkRefKind, ref_id : Int64) : Int64?
       @db.query(
         "SELECT id FROM entity_links WHERE owner_kind = ? AND owner_id = ? AND ref_kind = ? AND ref_id = ?",

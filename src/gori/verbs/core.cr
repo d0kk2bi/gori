@@ -96,8 +96,11 @@ module Gori
         Verb::Scope::Global) { |ctx| ctx.scope_open; nil }
 
       r.register Verb::Definition.new(
-        "scope.add-host", "Add host to scope", "Add the selected flow's host to the scope lens",
-        Verb::Scope::Body, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history && !ctx.selected_flow_id.nil? }, mnemonic: 'h') { |ctx| ctx.scope_add_host; nil }
+        "scope.add-host", "Add host to scope", "Add the selected/marked flows' hosts to the scope lens",
+        # Batch-capable (#442): gates on the effective target set (marks if any, else the
+        # cursor row) — which also aligns the gate with what the handler already acted on
+        # (history_target_flow_id, i.e. the OPEN DETAIL's flow when one is up).
+        Verb::Scope::Body, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history && !ctx.selected_flow_ids.empty? }, mnemonic: 'h') { |ctx| ctx.scope_add_host; nil }
 
       r.register Verb::Definition.new(
         "scope.toggle", "Toggle scope lens", "Filter History/Sitemap to in-scope flows on/off",

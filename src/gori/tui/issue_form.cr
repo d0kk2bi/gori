@@ -22,11 +22,17 @@ module Gori::Tui
     getter severity : Store::Severity
     getter edit_id : Int64?
     getter link_ref : {Store::LinkRefKind, Int64}?
+    # Additional flows to attach as evidence beyond `flow_id` — History's multi-select
+    # (#442): mark 5 flows, ⇧F, and the ONE issue you create carries all five. Captured here
+    # for the same reason as `link_ref`: cancelling the form drops the pending attachments
+    # with it instead of leaving them for a later create to pick up.
+    getter extra_flow_ids : Array(Int64)
 
     def initialize(@issue_title : String = "", @host : String? = nil, @flow_id : Int64? = nil,
                    @severity : Store::Severity = Store::Severity::Medium,
                    @edit_id : Int64? = nil, @heading : String = "NEW ISSUE",
-                   @link_ref : {Store::LinkRefKind, Int64}? = nil)
+                   @link_ref : {Store::LinkRefKind, Int64}? = nil,
+                   @extra_flow_ids : Array(Int64) = [] of Int64)
       @cx = @issue_title.size
       @preedit = ""
     end

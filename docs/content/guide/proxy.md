@@ -91,6 +91,31 @@ Type a query in the History filter bar, or run it headless:
 gori run history -q 'status:5xx host:api.example.com'
 ```
 
+## Marking flows (multi-select)
+
+Press `t` to **mark** the flow under the cursor and step to the next older one, so a run of `t` marks consecutive rows (in either list order). `Shift-↑` / `Shift-↓` extend a contiguous range from where you started, `Shift-T` marks everything the current filter shows, and `Esc` clears the marks. Marked rows get a full bar in the gutter and the filter row shows a live `3 marked` count.
+
+Marks change **what the space menu acts on**, not which actions exist:
+
+> the effective target is **the marks if any are set, else the cursor row**
+
+So `/ status:5xx` → `Shift-T` → `Space` → `X` deletes every error in one confirm, and `Space` → `F` copies all their URLs. The menu title reads `SPACE · 3 MARKED` and the entries rename themselves (`Delete 3 flows`, `Mine 3 flows`) so a batch is never a surprise.
+
+| Action | Key | Over marks |
+|--------|-----|-----------|
+| Copy | `y` | The URL list (one per line) |
+| Copy as… | `Space` `F` | urls / host list / cURL / raw requests / raw responses |
+| Delete | `Space` `X` | One confirm for the whole set |
+| Link to issue / note | `Space` `k` / `u` | Pick the owner once, attach every flow |
+| Add issue | `Shift-F` | One issue with every flow as evidence |
+| Repeater / Fuzzer | `Ctrl-R` / `Shift-I` | One sub-tab per flow (max 20) |
+| Mine parameters | `Space` `m` | One config popup, one session per flow (max 20) |
+| Run active scan | `Space` `A` | The request estimate is summed across the set |
+| Add host to scope | `Space` `h` | Hosts deduplicated — 12 flows on 2 hosts adds 2 rules |
+| Send to Comparer | `Space` `c` | Exactly 2 marked fills A (older) and B (newer) directly |
+
+Marks survive a filter change, a re-sort, and leaving the tab and coming back; the count chip tells you how many are currently off-screen. Anything that sends traffic still asks first and still honours scope per request — marking changes the request count, never the gate. A few actions stay single-target because they only make sense for one flow (opening the detail, the Sequencer); their menu entries say `(cursor)` while marks are set.
+
 ## Match & Replace (Rewriter tab)
 
 The **Rewriter** tab is the Match & Replace editor: rules that rewrite requests and responses in flight. It is hidden by default, so reach it from the tab-bar `⋯` menu or the command palette (`Ctrl-P` → **Match & Replace**, or **Go to Rewriter**).

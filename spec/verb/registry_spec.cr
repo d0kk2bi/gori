@@ -88,6 +88,34 @@ private class FakeContext < ExecContext
     @selected
   end
 
+  # Multi-select marks (#442) — see the note on FakeExecContext in spec/support.
+  property marks = [] of Int64
+
+  def selected_flow_ids : Array(Int64)
+    return marks unless marks.empty?
+    [@selected].compact
+  end
+
+  def marked_flow_count : Int32
+    marks.size
+  end
+
+  def history_mark_toggle : Nil
+    @calls << :history_mark_toggle
+  end
+
+  def history_mark_all : Nil
+    @calls << :history_mark_all
+  end
+
+  def history_mark_clear : Nil
+    @calls << :history_mark_clear
+  end
+
+  def history_mark_extend(delta : Int32) : Nil
+    @calls << :history_mark_extend
+  end
+
   def copy_selection : Nil
     @calls << :copy
   end

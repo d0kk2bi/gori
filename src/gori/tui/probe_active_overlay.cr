@@ -19,8 +19,16 @@ module Gori::Tui
   class ProbeActiveOverlay < Overlay
     NOTIFY_CHOICES = Miner::NotifyMode.values
 
-    getter detail : Store::FlowDetail
+    # Every flow this run covers (#442 — History's multi-select). `detail` is the FIRST, kept
+    # as its own getter because the single-flow callers and the header text speak of one
+    # request; `details` is what the Runner loops when it fires the scan. A one-element
+    # `details` is exactly the pre-batch behaviour.
+    getter details : Array(Store::FlowDetail)
     getter repeater_id : Int64?
+
+    def detail : Store::FlowDetail
+      @details.first
+    end
 
     @selected : Int32
     @notify_idx : Int32
@@ -31,7 +39,17 @@ module Gori::Tui
     # `est_safe` is what runs with the safe-method gate (default); `est_unsafe` is what runs once
     # unsafe methods are allowed (always a superset). When they differ, the unsafe opt-in row is
     # offered; otherwise it's hidden (the common GET/HEAD case is unchanged).
-    def initialize(@detail : Store::FlowDetail,
+    # Single-flow convenience: the Probe / Repeater / History-detail entry points each resolve
+    # exactly one request, and reading `.new(detail, …)` at those sites says so. The batch form
+    # below is the History list's marked set (#442).
+    def self.new(detail : Store::FlowDetail,
+                 est_safe : Array(Probe::Analyzer::ActiveEstimate),
+                 est_unsafe : Array(Probe::Analyzer::ActiveEstimate),
+                 repeater_id : Int64? = nil)
+      new([detail], est_safe, est_unsafe, repeater_id)
+    end
+
+    def initialize(@details : Array(Store::FlowDetail),
                    @est_safe : Array(Probe::Analyzer::ActiveEstimate),
                    @est_unsafe : Array(Probe::Analyzer::ActiveEstimate),
                    @repeater_id : Int64? = nil)
@@ -40,9 +58,14 @@ module Gori::Tui
         @notify_idx = NOTIFY_CHOICES.index(mode) || @notify_idx
       end
       @allow_unsafe = false
-      # est_unsafe is a superset of est_safe (allow_unsafe only widens the method gate), so a size
-      # difference means unsafe probing would add checks — only then is the opt-in meaningful.
-      @show_unsafe_row = @est_unsafe.size != @est_safe.size
+      # est_unsafe is a superset of est_safe (allow_unsafe only widens the method gate), so any
+      # DIFFERENCE means unsafe probing would add checks — only then is the opt-in meaningful.
+      # Compared by CONTENT, not size: over a marked set the estimates are merged per rule
+      # (Runner#merged_active_estimate), so a GET+POST pair where the same rule applies to the
+      # GET safely and to both unsafely yields one entry either way — identical sizes, different
+      # request counts. A size check would hide the opt-in row AND the "enable unsafe methods"
+      # hint, silently never probing the POST with no control left to include it.
+      @show_unsafe_row = @est_unsafe != @est_safe
       @selected = run_row # start on Run so a reflexive ↵ fires with the saved defaults
       @info = build_info
     end
@@ -175,24 +198,41 @@ module Gori::Tui
 
     private def build_info : Array(String)
       lines = [] of String
-      url = @detail.row.url
-      url = "#{url[0, 51]}…" if url.size > 52
-      lines << "#{@detail.row.method} #{url}"
+      if @details.size == 1
+        url = detail.row.url
+        url = "#{url[0, 51]}…" if url.size > 52
+        lines << "#{detail.row.method} #{url}"
+      else
+        # N marked flows: the individual request lines wouldn't fit, and the counts below are
+        # already summed across the set — so name the set and the hosts it will reach.
+        hosts = @details.map(&.row.host).uniq!
+        lines << "#{@details.size} flows · #{hosts.size == 1 ? hosts.first : "#{hosts.size} hosts"}"
+      end
       lines << ""
       est = estimate
       if est.empty?
         lines << "  no active checks apply"
         # A state-changing flow with the opt-in still off: point at the toggle rather than dead-end.
         if @show_unsafe_row && !@allow_unsafe
-          lines << "  (enable unsafe methods below to probe this #{@detail.row.method})"
+          lines << "  (enable unsafe methods below to probe this #{detail.row.method})"
         end
       else
         est.each { |e| lines << "  #{e.info.name} — #{req_label(e.requests)}" }
       end
       lines << ""
-      lines << "⚠ re-sends #{@detail.row.method} — may mutate server data" if @allow_unsafe
-      lines << (est.empty? ? "0 requests → #{@detail.row.host}" : "#{total_label} → #{@detail.row.host}")
+      lines << "⚠ re-sends #{unsafe_methods_label} — may mutate server data" if @allow_unsafe
+      dest = @details.size == 1 ? detail.row.host : "#{@details.map(&.row.host).uniq!.size} host(s)"
+      lines << (est.empty? ? "0 requests → #{dest}" : "#{total_label} → #{dest}")
       lines
+    end
+
+    # The methods the unsafe opt-in would actually re-send, deduped across the set — one flow
+    # names its own method, a batch names every state-changing one it holds. SAFE_METHODS are
+    # excluded: naming GET in a "may mutate server data" warning points at the one method that
+    # provably can't, which blunts the caution instead of aiming it.
+    private def unsafe_methods_label : String
+      unsafe = @details.map(&.row.method).reject { |m| Probe::Active::SAFE_METHODS.includes?(m.upcase) }.uniq!
+      unsafe.empty? ? @details.map(&.row.method).uniq!.join('/') : unsafe.join('/')
     end
 
     private def req_label(rng : Range(Int32, Int32)) : String

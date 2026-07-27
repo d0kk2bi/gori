@@ -1,12 +1,25 @@
 # Issues report — ExecContext verb implementations, reopens Gori::Tui::Runner (see
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
+  # ONE issue, every targeted flow attached as evidence (#442). The form's title/host/primary
+  # evidence come from the first flow; the rest ride along as extra_flow_ids and are linked
+  # after the insert — so marking 5 flows and pressing ⇧F files one finding with five samples,
+  # not five issues.
   def issue_create : Nil
-    id = history_target_flow_id
-    return unless id
-    if row = @session.store.flow_row(id)
-      open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, id))
-    end
+    ids = history_target_flow_ids
+    return if ids.empty?
+    # The primary supplies the title/host/evidence; it is the CURSOR row when that is itself a
+    # target, else the oldest mark — never `ids.first`, which follows the display order and would
+    # hand a different flow the title after a history_list_order flip.
+    primary = history_controller.primary_target_flow_id
+    # Find the first target that still resolves rather than dead-ending on a stale primary: with
+    # 5 marks and the primary deleted from another surface, giving up would silently discard four
+    # live marks with no form and no toast.
+    row = primary.try { |id| @session.store.flow_row(id) }
+    row ||= ids.each.compact_map { |id| @session.store.flow_row(id) }.first?
+    return (@toast = "no flows left to file an issue for") unless row
+    open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, row.id,
+      extra_flow_ids: ids.reject(row.id)))
   end
 
   def issues_new : Nil
