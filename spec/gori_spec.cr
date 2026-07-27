@@ -2,6 +2,6 @@ require "./spec_helper"
 
 describe Gori do
   it "exposes a version" do
-    Gori::VERSION.should eq("0.1.4")
+    Gori::VERSION.should eq("0.2.0")
   end
 end
