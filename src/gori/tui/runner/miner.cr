@@ -12,7 +12,16 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     return unless targets = batch_within_cap(ids, "the Miner")
     seeds = targets.compact_map { |id| miner_controller.build_seed_from_flow(id) }.reject(&.applicable.empty?)
     return (@toast = "no mineable locations in the marked flows") if seeds.empty?
-    open_mine_config(seeds.first, seeds[1..])
+    # The config popup's checkboxes come from ONE seed, and the Runner then narrows the committed
+    # config to each other seed's own `applicable` — so a location absent from the seeding flow
+    # can never be checked and is silently unmineable everywhere. Seed from the flow offering the
+    # MOST locations (a POST with a JSON body, not a bare GET), which makes the widest set of
+    # choices reachable. Deliberately not `seeds.first`: that follows the display order, so a
+    # history_list_order flip would change what the batch actually mines.
+    best = (0...seeds.size).max_by { |i| seeds[i].applicable.size }
+    extra = seeds.dup
+    extra.delete_at(best)
+    open_mine_config(seeds[best], extra)
   end
 
   # CROSS-TAB: open the config popup for the current Repeater request.

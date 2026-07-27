@@ -2023,28 +2023,22 @@ module Gori::Tui
     end
 
     # Batch form (#442): attach N refs to ONE owner, after the issue/note was picked once.
-    # A single ref delegates to commit_link_to_owner so that path is byte-identical to
-    # before; N goes straight to the same store primitive, then reports once — one toast and
-    # one refresh_link_owners instead of N of each. A ref whose flow is gone (a stale mark) is
-    # skipped rather than filing an orphan link row, and counted in the summary.
+    # A single ref delegates to commit_link_to_owner so that path stays byte-identical to before;
+    # N goes through Store#add_links — ONE transaction for the whole set, because add_link blocks
+    # the calling fiber on a write-batch reply and this runs on the render loop. Then it reports
+    # once: one toast, one refresh_link_owners. A ref whose flow is gone (a stale mark) is dropped
+    # before the write rather than filing an orphan link row, and counted in the summary.
     # Returns true when at least one link was created.
     private def commit_links_to_owner(owner_kind : Store::LinkOwnerKind, owner_id : Int64,
                                       refs : Array({Store::LinkRefKind, Int64})) : Bool
       return false if refs.empty?
       return commit_link_to_owner(owner_kind, owner_id, refs.first[0], refs.first[1]) if refs.size == 1
-      linked = 0
-      dupes = 0
-      gone = 0
-      refs.each do |kind, rid|
-        if kind.flow? && @session.store.flow_row(rid).nil?
-          gone += 1
-          next
-        end
-        @session.store.add_link(owner_kind, owner_id, kind, rid) ? (linked += 1) : (dupes += 1)
-      end
+      live = refs.select { |kind, rid| !kind.flow? || !@session.store.flow_row(rid).nil? }
+      gone = refs.size - live.size
+      linked = @session.store.add_links(owner_kind, owner_id, live)
       refresh_link_owners(owner_kind, owner_id)
       parts = ["linked #{linked}"]
-      parts << "#{dupes} already linked" if dupes > 0
+      parts << "#{live.size - linked} already linked" if live.size > linked
       parts << "#{gone} no longer available" if gone > 0
       @toast = parts.join(" · ")
       linked > 0
@@ -2313,15 +2307,14 @@ module Gori::Tui
         new_id = @session.store.insert_issue(title, form.severity, form.host, form.flow_id)
         # History's marked set beyond the primary evidence flow (#442) — one issue, N flows.
         # insert_issue already linked form.flow_id, so exclude it and never re-link. A flow the
-        # store can't resolve (a stale mark) is skipped rather than filing an orphan link row.
+        # store can't resolve (a stale mark) is dropped rather than filing an orphan link row, and
+        # `attached` counts what was ACHIEVED, not what was asked for — the toast below must not
+        # claim 5 flows when two marks had gone stale.
         extra = form.extra_flow_ids.reject { |fid| fid == form.flow_id }
-        unless extra.empty?
-          extra.each do |fid|
-            next unless @session.store.flow_row(fid)
-            @session.store.add_link(Store::LinkOwnerKind::Issue, new_id, Store::LinkRefKind::Flow, fid)
-          end
-          refresh_link_owners(Store::LinkOwnerKind::Issue, new_id)
-        end
+          .select { |fid| @session.store.flow_row(fid) }
+        attached = (form.flow_id ? 1 : 0) + @session.store.add_links(Store::LinkOwnerKind::Issue, new_id,
+          extra.map { |fid| {Store::LinkRefKind::Flow, fid} })
+        refresh_link_owners(Store::LinkOwnerKind::Issue, new_id) unless extra.empty?
         if ref = form.link_ref
           # insert_issue already entity-links flow when form.flow_id matches; other
           # ref kinds (repeater/fuzz/miner) still need an explicit add_link.
@@ -2329,7 +2322,10 @@ module Gori::Tui
           unless already_flow
             commit_link_to_owner(Store::LinkOwnerKind::Issue, new_id, ref[0], ref[1])
           end
-          @toast = "issue ##{new_id} created and linked"
+          # Name the extra evidence too — this branch is reached from the picker's "+ New issue…",
+          # which is exactly where a marked set arrives, so reporting only the picker's own ref
+          # would leave the N flows just attached unmentioned.
+          @toast = attached > 1 ? "issue ##{new_id} created and linked · #{attached} flows attached" : "issue ##{new_id} created and linked"
           # Ask open-vs-stay (default stay). FALSE, not true: offer_open_created has just
           # put a confirm up, and "close the overlay" would be asking the shell to close a
           # form it is no longer holding. close_active_overlay's identity check would make
@@ -2340,8 +2336,7 @@ module Gori::Tui
           @active_tab = :issues
           @focus = :body
           issues_controller.view.reload(@session.store)
-          n = extra.size + (form.flow_id ? 1 : 0)
-          @toast = n > 1 ? "issue created with #{n} flows attached" : "issue created"
+          @toast = attached > 1 ? "issue created with #{attached} flows attached" : "issue created"
         end
       end
       true

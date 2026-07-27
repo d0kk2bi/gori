@@ -69,7 +69,12 @@ module Gori::Tui
       # out of the current filter/window stays marked (marked_hidden_count reports it);
       # a mark whose flow is gone simply fails to resolve at the verb.
       @marks = Set(Int64).new
-      @mark_anchor = nil.as(Int64?)               # id-keyed range anchor for the ⇧arrow extend
+      @mark_anchor = nil.as(Int64?) # id-keyed range anchor for the ⇧arrow extend
+      # Ids the CURRENT ⇧arrow gesture added, so shrinking the range gives them back — a GUI
+      # shift+click shrinks the selection, where a plain union would only ever grow. Scoped to
+      # the gesture, so marks made by `t`/⇧T outside the range are never disturbed. Cleared
+      # whenever the anchor is.
+      @mark_extent = Set(Int64).new
       @filter_dirty = false                       # a filtered view needs a coalesced reload after draining
       @last_filter_flush = nil.as(Time::Instant?) # debounce clock for flush_filter (nil ⇒ first flush is immediate)
       @query = ""
@@ -402,8 +407,8 @@ module Gori::Tui
       @selected = (@selected + delta).clamp(0, @rows.size - 1)
       # "Following" the live tail means sitting on the newest row (top or bottom).
       @follow = (@selected == follow_index)
-      @preview_id = nil  # force refresh_preview to re-fetch on the next controller tick
-      @mark_anchor = nil # a plain move re-seeds the range anchor, like a GUI list
+      @preview_id = nil # force refresh_preview to re-fetch on the next controller tick
+      reset_mark_anchor # a plain move re-seeds the range anchor, like a GUI list
     end
 
     getter selected : Int32
@@ -458,8 +463,8 @@ module Gori::Tui
       return if @rows.empty?
       @selected = idx.clamp(0, @rows.size - 1)
       @follow = (@selected == follow_index)
-      @preview_id = nil  # force preview refresh
-      @mark_anchor = nil # same as the keyboard `move`: a plain click re-seeds the anchor
+      @preview_id = nil # force preview refresh
+      reset_mark_anchor # same as the keyboard `move`: a plain click re-seeds the anchor
       @preview_focus = :list
     end
 
@@ -527,13 +532,32 @@ module Gori::Tui
       [selected_id].compact
     end
 
-    # `t` — flip the cursor row's mark, then advance so a run of `t` marks consecutive
-    # rows. The anchor lands on the row just toggled, so `t` followed by ⇧↓ extends from it.
+    # The ONE flow a batch verb should treat as privileged when it genuinely needs a single
+    # representative — the issue form's title/host, Discover's header donor. NOT `target_ids.first`:
+    # that follows the display order, so a pure layout preference (history_list_order) would flip
+    # which flow gets to name the issue or donate its cookies. The cursor row wins when it is
+    # itself a target (it is the flow you were looking at); otherwise the oldest, which is stable
+    # under every sort and filter.
+    def primary_target_id : Int64?
+      ids = target_ids
+      return nil if ids.empty?
+      cur = selected_id
+      return cur if cur && ids.includes?(cur)
+      ids.min
+    end
+
+    # `t` — flip the cursor row's mark, then step to the next OLDER flow, so a run of `t` marks
+    # consecutive rows. "Older", not "down": follow parks the cursor on the newest row, which is
+    # the BOTTOM row under oldest-first order — stepping down there is a clamp, so the second `t`
+    # would land on the same row and un-mark what the first just marked. Walking away from the
+    # live tail is the triage gesture ("this one and the next few older ones") and works in both
+    # orders. The anchor lands on the row just toggled, so `t` then ⇧↓ extends from it.
     def toggle_mark : Nil
       return unless id = selected_id
       @marks.includes?(id) ? @marks.delete(id) : @marks.add(id)
-      step_cursor(1)
+      step_cursor(newest_first? ? 1 : -1)
       @mark_anchor = id
+      @mark_extent.clear
     end
 
     # ⇧T — mark every row in the CURRENT filtered list, unioned with what's already
@@ -541,18 +565,26 @@ module Gori::Tui
     def mark_all : Nil
       @rows.each { |r| @marks.add(r.id) }
       @mark_anchor = selected_id
+      @mark_extent.clear
     end
 
     def clear_marks : Nil
       @marks.clear
+      reset_mark_anchor
+    end
+
+    # Forget where a range gesture started (and what it had added), so the next ⇧arrow anchors
+    # at the cursor instead of sweeping back to a stale point.
+    private def reset_mark_anchor : Nil
       @mark_anchor = nil
+      @mark_extent.clear
     end
 
     # Drop specific marks — the post-batch-delete prune, so a deleted flow's id can't
     # linger in the set and inflate the next count.
     def unmark_ids(ids : Enumerable(Int64)) : Nil
-      ids.each { |id| @marks.delete(id) }
-      @mark_anchor = nil if (a = @mark_anchor) && !@marks.includes?(a) && index_of(a).nil?
+      ids.each { |id| @marks.delete(id); @mark_extent.delete(id) }
+      reset_mark_anchor if (a = @mark_anchor) && !@marks.includes?(a) && index_of(a).nil?
     end
 
     # ⇧↑/⇧↓ — extend a contiguous range from the anchor, the keyboard form of a GUI
@@ -564,10 +596,19 @@ module Gori::Tui
       unless anchor_idx
         @mark_anchor = selected_id
         anchor_idx = @selected
+        @mark_extent.clear
       end
       step_cursor(delta)
       lo, hi = {anchor_idx, @selected}.minmax
-      (lo..hi).each { |i| @rows[i]?.try { |r| @marks.add(r.id) } }
+      wanted = Set(Int64).new
+      (lo..hi).each { |i| @rows[i]?.try { |r| wanted.add(r.id) } }
+      # Give back what THIS gesture added but the new range no longer covers, so ⇧↑ after ⇧↓⇧↓
+      # leaves two rows marked rather than three. @mark_extent holds only ids the gesture itself
+      # added, so a mark made earlier by `t`/⇧T survives a range sweeping over it and back off.
+      (@mark_extent - wanted).each { |id| @marks.delete(id) }
+      added = wanted - @marks
+      @marks.concat(added)
+      @mark_extent = (@mark_extent & wanted) | added
     end
 
     # Cursor step used by the mark gestures. Deliberately NOT `move` (which redirects to
@@ -595,20 +636,25 @@ module Gori::Tui
     # Hard-delete one flow by id, then re-anchor the list. Closes the detail if it was
     # showing that flow. Id is captured by the controller at confirm-open time so a
     # live-capture reload can't retarget the delete.
-    def delete_by_id(store : Store, id : Int64) : Nil
+    def delete_by_id(store : Store, id : Int64) : Bool
       delete_ids(store, [id])
     end
 
     # Batch form (#442): one store round-trip for N marked flows, then the same
     # re-anchoring. The deleted ids are pruned from the mark set so a stale mark can't
     # inflate the next count.
-    def delete_ids(store : Store, ids : Array(Int64)) : Nil
-      return if ids.empty?
-      store.delete_flows(ids)
+    #
+    # Returns whether the write committed. On a rollback NOTHING local is touched — the marks
+    # in particular stay put, because they are the only remaining handle on the set the user
+    # asked to delete, and dropping them on a failed write would leave no way to retry.
+    def delete_ids(store : Store, ids : Array(Int64)) : Bool
+      return true if ids.empty?
+      return false unless store.delete_flows(ids)
       close_detail if @detail.try(&.row.id).try { |d| ids.includes?(d) }
       clear_preview if @preview_id.try { |p| ids.includes?(p) }
       unmark_ids(ids)
       reload(store)
+      true
     end
 
     # Wipe every History flow, close detail/preview, and reload the empty list.
@@ -936,7 +982,15 @@ module Gori::Tui
         # Resolved through the store, not @rows: a mark can outlive the visible window.
         d = store.get_flow(ids.first)
         return {"COPY AS", [] of CopyMenu::Option} unless d
-        return {"COPY REQUEST AS", CopyMenu.request_options(request_wire(d), copy_target(d))}
+        opts = CopyMenu.request_options(request_wire(d), copy_target(d))
+        # …plus the response, on the same 's' key the multi-flow set uses. Without it, marking a
+        # SECOND flow would be the only way to reach the raw response, and the guide advertises
+        # the format unconditionally. 's' rather than response_options' own keys because those
+        # collide with the request list's 'h'/'b'/'r', and CopyPicker dispatches on unique keys.
+        if bytes = combine_bytes(d.response_head, d.response_body)
+          opts << CopyMenu::Option.new("Raw response", 's', String.new(bytes))
+        end
+        return {"COPY REQUEST AS", opts}
       end
       # URLs and the host list need only the ROW, so read flow_row here — get_flow pulls the
       # full request+response bodies (2 MiB each), and ⇧T can hand this a full PAGE of marks.
@@ -958,10 +1012,10 @@ module Gori::Tui
     private def byte_copy_options(store : Store, ids : Array(Int64)) : Array(CopyMenu::Option)
       details = ids.compact_map { |id| store.get_flow(id) }
       opts = [] of CopyMenu::Option
-      # cURL comes from the SAME builder the single-flow path uses — no second serialiser.
-      curls = details.compact_map do |d|
-        CopyMenu.request_options(request_wire(d), copy_target(d)).find { |o| o.key == 'l' }.try(&.text)
-      end
+      # cURL comes from the SAME serialiser the single-flow path uses, via the narrow entry point
+      # — request_options would allocate the headers/body/raw variants per flow too, several extra
+      # copies of a multi-MiB body, for one line we keep.
+      curls = details.compact_map { |d| CopyMenu.curl_text(request_wire(d), copy_target(d)) }
       opts << CopyMenu::Option.new("cURL", 'l', curls.join("\n\n")) unless curls.empty?
       # A raw HTTP message contains blank lines, so joining on one would be ambiguous about
       # where a message ends — each gets a labelled separator line instead. The message bytes

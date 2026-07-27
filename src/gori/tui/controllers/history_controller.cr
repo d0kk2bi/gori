@@ -364,6 +364,12 @@ module Gori::Tui
       @history.mark_count
     end
 
+    # The one privileged target when a batch verb needs a single representative (see
+    # HistoryView#primary_target_id — deliberately NOT the display-order first).
+    def primary_target_flow_id : Int64?
+      @history.primary_target_id
+    end
+
     def history_mark_toggle : Nil
       return @host.status("no flow to mark") unless @history.selected_id
       @history.toggle_mark
@@ -424,8 +430,12 @@ module Gori::Tui
       store = @host.session.store
       urls = ids.compact_map { |id| store.flow_row(id).try(&.url) }
       return @host.status("copy: no flows left to copy") if urls.empty?
-      written = Clipboard.copy(urls.join('\n'))
+      text = urls.join('\n')
+      written = Clipboard.copy(text)
       msg = "copied #{urls.size} URL#{urls.size == 1 ? "" : "s"} to clipboard (#{written}b)"
+      # A thousand marked URLs overrun the 64KB clipboard cap, and a severed list that CLAIMS a
+      # thousand is worse than a short one that admits it (mirrors copy_selection above).
+      msg += " — clipped from #{text.bytesize}b (64KB cap)" if written < text.bytesize
       msg += " — #{ids.size - urls.size} no longer available" if urls.size < ids.size
       @host.status(msg)
     end
@@ -459,7 +469,13 @@ module Gori::Tui
       # (the flow is gone, so :detail → :none).
       @host.confirm(ids.size == 1 ? "DELETE FLOW" : "DELETE FLOWS", "Delete #{label}?\nThis can't be undone.",
         confirm_label: "delete", danger: true, return_to: from_detail ? :detail : :none) do
-        @history.delete_ids(@host.session.store, ids)
+        # A rolled-back write (cross-process SQLite busy/lock) leaves the flows AND the marks in
+        # place — say so instead of reporting a delete that didn't happen, so the set is still
+        # there to retry.
+        unless @history.delete_ids(@host.session.store, ids)
+          @host.status("delete failed — project busy, marks kept; try again")
+          next
+        end
         @host.request_overlay(:none) if @host.overlay == :detail
         @host.status("deleted #{label}")
       end

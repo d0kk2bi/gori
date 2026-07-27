@@ -1126,6 +1126,62 @@ describe "Gori::Tui::HistoryView marks" do
     end
   end
 
+  # `t` steps toward OLDER, not "down the screen". Under oldest-first the follow cursor parks on
+  # the BOTTOM row (newest), where stepping down is a clamp — so a hardcoded +1 made the second
+  # `t` land on the same row and un-mark what the first just marked, i.e. a run of `t` marked
+  # nothing. Every other mark spec runs the default order, so this is the only cover for it.
+  it "marks consecutive rows under oldest-first order too" do
+    prev = Gori::Settings.history_list_order
+    begin
+      Gori::Settings.history_list_order = "oldest"
+      tmp_store do |store|
+        ids = (0...3).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+        view = HistoryView.new
+        view.reload(store)
+        view.selected_id.should eq(ids[2]) # follow → newest, which is the BOTTOM row here
+        view.toggle_mark
+        view.toggle_mark
+        view.mark_count.should eq(2)
+        view.marked?(ids[2]).should be_true
+        view.marked?(ids[1]).should be_true
+      end
+    ensure
+      Gori::Settings.history_list_order = prev
+    end
+  end
+
+  # The privileged single target must not follow a DISPLAY preference: it decides which flow
+  # names an issue, donates Discover's cookies, and seeds the Miner's checkboxes.
+  it "picks the same primary target under either list order" do
+    tmp_store do |store|
+      ids = (0...3).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      %w[newest oldest].each do |order|
+        prev = Gori::Settings.history_list_order
+        begin
+          Gori::Settings.history_list_order = order
+          view = HistoryView.new
+          view.reload(store)
+          row_of = ->(id : Int64) { view.rows.index { |r| r.id == id }.not_nil! }
+          # Mark the two OLDER flows, then park the cursor on the newest (unmarked) one.
+          [ids[0], ids[1]].each do |id|
+            view.select_row(row_of.call(id))
+            view.toggle_mark
+          end
+          view.select_row(row_of.call(ids[2]))
+          view.marked?(ids[2]).should be_false
+          view.primary_target_id.should eq(ids[0]) # the oldest mark, in BOTH orders
+
+          # And the cursor wins outright once it is itself a target.
+          view.toggle_mark
+          view.select_row(row_of.call(ids[2]))
+          view.primary_target_id.should eq(ids[2])
+        ensure
+          Gori::Settings.history_list_order = prev
+        end
+      end
+    end
+  end
+
   it "saturates the cursor at the last row instead of wrapping" do
     tmp_store do |store|
       ids = (0...2).map { |i| add_flow(store, "GET", "/#{i}", 200) }
@@ -1210,6 +1266,38 @@ describe "Gori::Tui::HistoryView marks" do
       view.move(1) # plain moves → cursor two rows down, anchor cleared
       view.extend_marks(1)
       view.marked_ids.should eq([ids[2], ids[1]])
+    end
+  end
+
+  # A GUI shift+click SHRINKS the selection when you come back; a plain union would only ever
+  # grow, leaving a row marked that the gesture no longer covers and no way to un-mark a range.
+  it "gives back what the range gesture added when the range shrinks" do
+    tmp_store do |store|
+      ids = (0...4).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(0)
+      view.extend_marks(1)
+      view.extend_marks(1)
+      view.marked_ids.should eq([ids[3], ids[2], ids[1]]) # rows 0..2
+      view.extend_marks(-1)
+      view.marked_ids.should eq([ids[3], ids[2]]) # row 2 handed back
+    end
+  end
+
+  it "never hands back a mark the range gesture did not make" do
+    tmp_store do |store|
+      ids = (0...4).map { |i| add_flow(store, "GET", "/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.select_row(2)
+      view.toggle_mark # an independent mark, made by `t`
+      view.select_row(0)
+      view.extend_marks(1)
+      view.extend_marks(1)  # the range sweeps OVER the `t` mark at row 2
+      view.extend_marks(-1) # …and back off it
+      # Rows 0..1 from the range, plus row 2 which was never the gesture's to remove.
+      view.marked_ids.should eq([ids[3], ids[2], ids[1]])
     end
   end
 

@@ -175,12 +175,17 @@ module Gori::Tui
       1 + @extra_seeds.size
     end
 
-    # The bold line under the title: the seeded request normally, or the flow count when
-    # this popup is configuring a marked SET — N individual summaries wouldn't fit, and the
-    # count is the thing worth confirming before N background sessions start.
+    # The bold line under the title: the seeded request normally, or the flow count when this
+    # popup is configuring a marked SET — N individual summaries wouldn't fit, and the count is
+    # the thing worth confirming before N background sessions start.
+    #
+    # It spells out that concurrency is PER SESSION, because this popup is the only gate on the
+    # batch (P4 — the human decides, so what they're deciding has to be legible): N sessions at
+    # the cycler's value means N × that many requests in flight, and a reader who takes the "10"
+    # below as a batch-wide ceiling would be off by a factor of N.
     private def header_summary : String
       return @seed.summary if @extra_seeds.empty?
-      "#{target_count} flows · one mining session each"
+      "#{target_count} flows · one session each · concurrency is per session"
     end
 
     def overlay_box(area : Rect) : Rect?

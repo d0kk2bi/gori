@@ -58,9 +58,14 @@ module Gori::Tui
         @notify_idx = NOTIFY_CHOICES.index(mode) || @notify_idx
       end
       @allow_unsafe = false
-      # est_unsafe is a superset of est_safe (allow_unsafe only widens the method gate), so a size
-      # difference means unsafe probing would add checks — only then is the opt-in meaningful.
-      @show_unsafe_row = @est_unsafe.size != @est_safe.size
+      # est_unsafe is a superset of est_safe (allow_unsafe only widens the method gate), so any
+      # DIFFERENCE means unsafe probing would add checks — only then is the opt-in meaningful.
+      # Compared by CONTENT, not size: over a marked set the estimates are merged per rule
+      # (Runner#merged_active_estimate), so a GET+POST pair where the same rule applies to the
+      # GET safely and to both unsafely yields one entry either way — identical sizes, different
+      # request counts. A size check would hide the opt-in row AND the "enable unsafe methods"
+      # hint, silently never probing the POST with no control left to include it.
+      @show_unsafe_row = @est_unsafe != @est_safe
       @selected = run_row # start on Run so a reflexive ↵ fires with the saved defaults
       @info = build_info
     end
@@ -222,9 +227,12 @@ module Gori::Tui
     end
 
     # The methods the unsafe opt-in would actually re-send, deduped across the set — one flow
-    # names its own method, a batch names every state-changing one it holds.
+    # names its own method, a batch names every state-changing one it holds. SAFE_METHODS are
+    # excluded: naming GET in a "may mutate server data" warning points at the one method that
+    # provably can't, which blunts the caution instead of aiming it.
     private def unsafe_methods_label : String
-      @details.map(&.row.method).uniq!.join('/')
+      unsafe = @details.map(&.row.method).reject { |m| Probe::Active::SAFE_METHODS.includes?(m.upcase) }.uniq!
+      unsafe.empty? ? @details.map(&.row.method).uniq!.join('/') : unsafe.join('/')
     end
 
     private def req_label(rng : Range(Int32, Int32)) : String

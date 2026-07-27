@@ -8,10 +8,18 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   def issue_create : Nil
     ids = history_target_flow_ids
     return if ids.empty?
-    if row = @session.store.flow_row(ids.first)
-      open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, ids.first,
-        extra_flow_ids: ids[1..]))
-    end
+    # The primary supplies the title/host/evidence; it is the CURSOR row when that is itself a
+    # target, else the oldest mark — never `ids.first`, which follows the display order and would
+    # hand a different flow the title after a history_list_order flip.
+    primary = history_controller.primary_target_flow_id
+    # Find the first target that still resolves rather than dead-ending on a stale primary: with
+    # 5 marks and the primary deleted from another surface, giving up would silently discard four
+    # live marks with no form and no toast.
+    row = primary.try { |id| @session.store.flow_row(id) }
+    row ||= ids.each.compact_map { |id| @session.store.flow_row(id) }.first?
+    return (@toast = "no flows left to file an issue for") unless row
+    open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, row.id,
+      extra_flow_ids: ids.reject(row.id)))
   end
 
   def issues_new : Nil

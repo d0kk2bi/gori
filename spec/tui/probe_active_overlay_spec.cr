@@ -73,6 +73,38 @@ describe Gori::Tui::ProbeActiveOverlay do
     end
   end
 
+  # Multi-select (#442): over a marked set the Runner MERGES the estimates per rule, so a GET+POST
+  # pair where one rule applies safely to the GET and unsafely to both yields ONE entry either way
+  # — same array size, different request counts. Gating the opt-in row on Array#size hid it AND the
+  # "enable unsafe methods" hint, so the POST was silently never probed with no control left to
+  # include it. The gate compares CONTENT.
+  it "offers the unsafe opt-in when a merged estimate differs only in request count" do
+    tmp_store do |store|
+      details = [flow(store, "GET", "/s?q=1"), flow(store, "POST", "/submit")]
+      info = Gori::Probe::RuleInfo.new("reflected_param", "Reflected param", "d", Gori::Probe::Category::ACTIVE)
+      safe = [Gori::Probe::Analyzer::ActiveEstimate.new(info, 1..1)]   # applies to the GET only
+      unsafe = [Gori::Probe::Analyzer::ActiveEstimate.new(info, 2..2)] # …and to the POST too
+      safe.size.should eq(unsafe.size)                                 # the trap: sizes match
+      ov = ProbeActiveOverlay.new(details, safe, unsafe)
+
+      # The opt-in row exists, so rows are [notify, unsafe, run] and Run is index 2.
+      ov.on_run_row?.should be_true
+      ov.move(-1)
+      ov.on_run_row?.should be_false
+      ov.toggle
+      ov.allow_unsafe?.should be_true
+      ov.total_label.should eq("2 requests") # the widened count, reachable
+
+      backend = MemoryBackend.new(80, 20)
+      ov.render(Screen.new(backend), Rect.new(0, 0, 80, 20))
+      rendered = (0...20).map { |y| backend.row(y) }.join("\n")
+      rendered.should contain("2 flows")
+      # The warning names the state-changing method only — GET provably cannot mutate anything.
+      rendered.should contain("POST")
+      rendered.should_not contain("GET/POST")
+    end
+  end
+
   it "renders without crashing and hit-tests all three rows for a POST flow" do
     tmp_store do |store|
       d = flow(store, "POST", "/submit?q=1")

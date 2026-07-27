@@ -42,11 +42,15 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
     hosts = parsed.map { |(_, p)| p.host }.uniq!
     if hosts.size > 1
-      # Act on the cursor row alone rather than guessing which host the user meant.
+      # Narrow to the PRIMARY target's host — the cursor row when it is itself a target, else the
+      # oldest mark. Not `parsed.first`: that is display order, so which host survived would flip
+      # with a history_list_order change, and the toast below promises the cursor row.
       @toast = "marked flows span #{hosts.size} hosts — discover runs one host at a time"
-      parsed = parsed.first(1)
+      primary = history_controller.primary_target_flow_id
+      keep = parsed.find { |(id, _)| id == primary } || parsed.first
+      parsed = parsed.select { |(_, p)| p.host == keep[1].host }
     end
-    donor_id, first = parsed.first
+    donor_id, first = parsed.find { |(id, _)| id == history_controller.primary_target_flow_id } || parsed.first
     open_discover_config(build_discover_seed(Discover::Url.origin(first), first.host,
       parsed.map { |(_, p)| p.path }))
     # One donor for the reused auth/cookie headers — the confirm is nested over the config
