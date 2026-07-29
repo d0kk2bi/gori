@@ -64,8 +64,13 @@ gori에 저장되는 모든 환경설정은 하나의 화면, **Preferences** �
 | **Theme** | 오프너: 테마 선택기(내장 테마와 직접 만든 테마) |
 | **Display** | Default detail pane, History list time, Line numbers, Preview body limit (KiB), Resource meter, Terminal title |
 | **Layout** | History Req/Res preview, Probe issue preview, Issues preview, History list order, Sitemap expand depth |
+| **Pet** | Pet (Miss Ring), Placement, Motion, Notices |
 
 Theme 행은 현재 테마를 인라인으로 미리 보여줍니다. 이름과 팔레트 스와치가 함께 표시됩니다. [테마 가이드](/ko/guide/themes/)를 참고하세요.
+
+Pet은 기본값이 off입니다. 켜면 금빛 고리 마스코트 Miss Ring이 스스로 눈을 깜빡이고 윙크하며 백그라운드 작업 결과에 반응하고, 90초간 아무 입력이 없으면 잠들어 애니메이션을 완전히 멈춥니다. Motion을 `calm`으로 두면 눈 깜빡임 주기가 절반이 되고 나머지 움직임은 꺼집니다. SSH나 배터리 환경용입니다.
+
+Placement가 비용을 결정합니다. `body`는 탭 본문 우하단에 8&times;3 스프라이트를 두며, 세 줄을 가리고 결과를 말풍선으로 알립니다. `bar`는 상태 줄 맨 오른쪽, 시계보다 더 바깥에 일곱 칸짜리 칩을 둡니다 — 고리의 위아래를 뺀 얼굴만 들어갑니다. 아무것도 가리지 않고 말풍선도 사라집니다. 그녀의 문구가 상태 줄의 텍스트 슬롯을 통해 나가기 때문입니다. 이렇게 가장자리에 앉을 수 있는 건 어떤 표정에서도 폭이 같기 때문입니다. 눈을 깜빡여도 시계나 CPU/MEM 표시가 밀리지 않습니다. 그 슬롯은 메시지를 하나만 담으므로, 토스트와 그녀의 알림은 더 최신인 쪽이 이깁니다. Notices는 어느 쪽이든 하단 상태바 토스트와 독립적으로 동작합니다.
 
 ### Editor & Keys {#editor-keys}
 

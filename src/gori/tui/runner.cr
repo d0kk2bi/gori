@@ -59,6 +59,7 @@ require "./palette"
 require "./space_menu"
 require "./jobs"
 require "./notifications"
+require "./pet"
 require "./notifications_overlay"
 require "./path_complete"
 require "./fuzz_set_overlay"
@@ -206,6 +207,9 @@ module Gori::Tui
       # Far-right status-bar readout of gori's own CPU/RSS (settings:display → Resource meter).
       # Samples nothing while disabled; see ResourceMeter for the idle-repaint discipline.
       @resource = ResourceMeter.new
+      # Miss Ring (settings:pet). Off by default; while off she is the same zero-cost
+      # no-op the resource meter is, and she stops ticking entirely once she dozes.
+      @pet = Pet.new(@notifications)
       @spinner_frame = 0
       # The Miner config popup (History/Repeater → space → "Mine parameters") rides the
       # Overlay seam (@active_overlay); built fresh each open with an injected commit.
@@ -222,12 +226,16 @@ module Gori::Tui
       @focus = :menu                   # default focus on the tab bar (TABS) on project entry; :body for content
       @menu_more = false               # tab-bar focus is on the far-right ⋯ "more" affordance (only meaningful when @focus == :menu)
       @toast = nil.as(String?)         # transient action feedback; nil → show key hints
-      @outcome = :running              # :running | :quit | :back
-      @quit_armed = false              # first ^D/^C arms quit; second confirms (avoids accidental exit)
-      @resized = false                 # set on a Resize event → next frame full-repaints
-      @body_h = 24                     # last body rect height (captured at render); drives PageUp/Down step size
-      @title_text = nil.as(String?)    # last string emitted as the terminal-window title (memo; see sync_terminal_title)
-      @title_written = false           # have we ever written a title? gates the neutral restore on leave when the pref is "off"
+      # When the toast was set. The status row has ONE text slot and Miss Ring's bar
+      # placement also writes to it, so the two are resolved by recency rather than by a
+      # fixed precedence — see #pet_notice for why a fixed one is wrong.
+      @toast_at = nil.as(Time::Instant?)
+      @outcome = :running           # :running | :quit | :back
+      @quit_armed = false           # first ^D/^C arms quit; second confirms (avoids accidental exit)
+      @resized = false              # set on a Resize event → next frame full-repaints
+      @body_h = 24                  # last body rect height (captured at render); drives PageUp/Down step size
+      @title_text = nil.as(String?) # last string emitted as the terminal-window title (memo; see sync_terminal_title)
+      @title_written = false        # have we ever written a title? gates the neutral restore on leave when the pref is "off"
 
       # Per-tab controllers (strangler-fig: tabs migrate into this registry one at a
       # time; an unmigrated tab is absent and still runs through the case ladders
@@ -407,6 +415,7 @@ module Gori::Tui
             # scrolling tracks the input. Bounded so an infinitely-held key can't
             # starve the render / async-channel drains below.
             drain_burst
+            @pet.wake_on_input # any key/click re-arms Miss Ring's idle clock
           end
           dirty = true if drain_events # always drains; true if anything arrived
           if repeater_controller.drain_results
@@ -492,6 +501,12 @@ module Gori::Tui
           # only reports true when the RENDERED string changes, so a parked gori doesn't
           # repaint on a timer just to redraw the same "CPU 0%".
           dirty = true if @resource.tick(now)
+          # Miss Ring: advance the animation beat and pick up new notifications. Like the
+          # resource meter above she reports dirty ONLY when the drawn sprite/bubble
+          # changes, and stops reporting at all once she dozes off (Pet::SLEEP_AFTER).
+          # Placed after every controller drain, so a note pushed this tick is announced
+          # on THIS frame rather than the next.
+          dirty = true if @pet.tick(now)
           # Debounced QL filter: fire the deferred search once typing has paused.
           dirty = true if history_controller.flush_query_reload_if_due(now)
           dirty = true if sitemap_controller.flush_query_reload_if_due(now)
@@ -2772,12 +2787,14 @@ module Gori::Tui
         tabs: vis_tabs, intercept_count: @session.interceptor.pending_count,
         hidden_count: hid_tabs.size, more_focused: @focus == :menu && @menu_more)
       render_body(screen, layout.body)
+      render_pet(screen, layout.body)
       # One retag for the whole status row: key_hints already funnels the Runner's own
       # hint literals, every overlay/prompt hint AND every controller body_hint, and the
       # toast branch covers the "(^P)" pointers in messages like the bind-failure notice.
       Chrome.render_status(screen, layout.status, focus: focus_label,
-        hints: Hotkeys.retag(format_status_message(@toast) || key_hints),
-        activity: activity_chip, resource: @resource.label, time: clock_label)
+        hints: Hotkeys.retag(status_line || key_hints),
+        activity: activity_chip, resource: @resource.label, time: clock_label,
+        pet: pet_bar_frame)
       Chrome.render_statusline(screen, layout.statusline, @statusline.segments) unless layout.statusline.empty?
       @palette.render(screen, layout.body) if @overlay.palette?
       @more_menu.try(&.render(screen, more_anchor_rect(layout), layout.body)) if @overlay.tabs_more?
@@ -2969,6 +2986,59 @@ module Gori::Tui
       @tabs[@active_tab]?.try(&.render_body(screen, rect, @focus))
     end
 
+    # Miss Ring rides the BODY rect (bottom-right), so she has to paint over the tab body
+    # — hence immediately after render_body. But every float drawn AFTER this point (the
+    # palette, the ⋯ menu, migrated modals, the space menu, the pickers, the bottom
+    # prompts) would clip her box and leave an orphaned corner poking out — exactly the
+    # failure TrafficEmptyState.suppressed exists to prevent. So the gate hides her
+    # outright rather than relying on z-order.
+    private def render_pet(screen : Screen, body : Rect) : Nil
+      return if Settings.pet_in_bar? # she rides the status row instead
+      return unless frame = @pet.frame
+      return unless pet_visible?
+      Pet.draw(screen, body, frame)
+    end
+
+    # The status-bar placement. Nil unless she is both enabled and set to `bar`, which is
+    # what keeps the chip out of the run entirely rather than reserving an empty slot.
+    # Unlike the body form this needs no visibility gate: the status row is drawn after the
+    # body and nothing but the ^F/^G prompts is ever laid over it.
+    private def pet_bar_frame : Mascot::Frame?
+      return nil unless Settings.pet_in_bar?
+      @pet.frame
+    end
+
+    # In BAR placement she has no bubble to speak in, so her line goes through the status
+    # row's own text slot instead — BEHIND a real toast, ahead of the key hints.
+    #
+    # This closes a gap rather than duplicating the toast. Her Notices setting is
+    # deliberately independent of Settings.notify_toast?, so with the toast off and Notices
+    # on she would otherwise change face with nothing on screen to explain why. When the
+    # toast IS on it wins, and the two never both appear — it is one slot.
+    # The status row's single text slot. Two things want it: the toast (action feedback)
+    # and, in BAR placement, Miss Ring's notice — she has no bubble there to speak in.
+    #
+    # NEWER WINS, rather than "the toast always does". A job's START toast is plain action
+    # feedback cleared only by the next keypress, so with nothing pressed while the job
+    # runs it is still sitting there when the job FINISHES, masking her completion line for
+    # the whole few seconds it is alive. Recency is the only rule that also gets the
+    # opposite case right — fresh action feedback while an older notice is still up.
+    private def status_line : String?
+      toast = @toast
+      notice = Settings.pet_in_bar? ? @pet.frame.try(&.bubble) : nil
+      return format_status_message(toast) unless notice
+      return notice unless toast && (at = @toast_at)
+      @pet.bubble_at.try { |b| b > at } ? notice : format_status_message(toast)
+    end
+
+    private def pet_visible? : Bool
+      return false unless @overlay.none? # palette / detail / tabs_more / every modal
+      return false if @space_menu_open || copy_as_shown? || send_to_shown?
+      return false if @goto_open || @search_open || @rename_open || @tag_edit_open
+      return false if body_editor? # she steps aside while you're typing
+      true
+    end
+
     # A row delta for a page/jump key, or nil if `key` isn't one. PageUp/PageDown step
     # by ~one screenful (the last body height, minus a couple rows of overlap); Home/End
     # pass a large magnitude that the target view clamps to its top/bottom. Shared by the
@@ -3017,6 +3087,7 @@ module Gori::Tui
 
     def status(message : String) : Nil
       @toast = message
+      @toast_at = Time.instant
     end
 
     def open_palette : Nil
@@ -3036,6 +3107,17 @@ module Gori::Tui
     def refresh_screen : Nil
       @resized = true
       status("screen refreshed")
+    end
+
+    def toggle_pet : Nil
+      Settings.pet = !Settings.pet?
+      saved = Settings.save
+      @pet.wake_on_input
+      # The toggle has ALREADY applied in memory either way, so a failed save must still
+      # report the new state — "could not save" alone reads as though nothing happened.
+      # Same shape as the tabs/hotkeys/env/hosts toasts.
+      shown = Settings.pet? ? "Miss Ring is here" : "Miss Ring hidden"
+      status(saved ? shown : "#{shown} — could not save to #{Settings.path}")
     end
 
     # --- Host (the facade per-tab controllers drive the shell through) -------
@@ -4630,7 +4712,7 @@ module Gori::Tui
     # to the modal) would behave differently.
     private def open_settings_section(section : Symbol, back : PreferencesOverlay?) : Nil
       case section
-      when :network, :editor, :keys, :layout, :statusline, :display, :notifications, :general
+      when :network, :editor, :keys, :layout, :statusline, :display, :pet, :notifications, :general
         open_preferences(section)                       # the unified grouped modal, positioned at this section
       when :theme   then open_overlay(theme_card(back)) # theme keeps its dedicated swatch-list card
       when :tabs    then open_overlay(tabs_editor(back))
@@ -4764,6 +4846,7 @@ module Gori::Tui
               when :theme   then apply_theme(msg)
               when :layout  then apply_layout(msg)
               when :display then apply_display(msg)
+              when :pet     then apply_pet(msg)
               when :keys    then apply_keys(msg)
               else               msg
               end
@@ -4800,6 +4883,13 @@ module Gori::Tui
     # History preview so a new cap (or default pane) is reflected on the current selection now.
     private def apply_display(save_msg : String) : String
       history_controller.refresh_preview
+      save_msg
+    end
+
+    # Enable/disable and the motion change land on the SAME frame as the save rather than
+    # up to one BEAT later; Pet#tick self-gates on Settings.pet? for the rest.
+    private def apply_pet(save_msg : String) : String
+      @pet.wake_on_input
       save_msg
     end
 
