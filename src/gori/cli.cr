@@ -23,12 +23,6 @@ module Gori
   # - `gori update`                 → channel-aware self-update (binary / brew / snap / AUR)
   module CLI
     def self.run(argv : Array(String) = ARGV) : Nil
-      # Global version (works before/after any subcommand or alone)
-      if argv.any? { |a| a == "-v" || a == "-V" || a == "--version" }
-        puts "gori #{VERSION}"
-        return
-      end
-
       # `--config PATH` is consumed HERE, before subcommand detection, rather than being added
       # to each subcommand's OptionParser. It must apply to every surface (tui, run, mcp,
       # settings) and take effect before anything reads Settings, so one central strip is both
@@ -36,16 +30,22 @@ module Gori
       # otherwise reject it through invalid_option.
       argv = extract_config_flag(argv)
 
+      # Split once: the version rule, the top-level help, and the dispatch all key off it.
+      sub, subargs = split_subcommand(argv)
+
+      # Global version (alone, or against a top-level subcommand) — see global_version_flag?.
+      if global_version_flag?(subargs)
+        puts "gori #{VERSION}"
+        return
+      end
+
       # Top-level help when no explicit subcommand is given
-      has_explicit_sub = !argv.empty? && !argv[0].starts_with?("-")
-      if argv.any? { |a| a == "-h" || a == "--help" } && !has_explicit_sub
+      if argv.any? { |a| a == "-h" || a == "--help" } && sub.nil?
         print_main_help
         return
       end
 
-      # Subcommand detection (first non-flag arg, else default to tui for bare `gori`)
-      subcmd = has_explicit_sub ? argv[0] : "tui"
-      subargs = has_explicit_sub ? argv[1..] : argv
+      subcmd = sub || "tui" # bare `gori` (or leading flags only) starts the TUI
 
       case subcmd
       when "tui"
@@ -77,6 +77,37 @@ module Gori
       # file, both landed that way. Deliberately narrow — an IO error, a nil, anything gori
       # did not anticipate still backtraces, because those are bugs and want a trace.
       abort "gori: #{ex.message.presence || ex.class}"
+    end
+
+    private VERSION_FLAGS = {"-v", "-V", "--version"}
+
+    # The top-level subcommand and the arguments belonging to it. A leading flag — or an empty
+    # argv — means none was named, so every token belongs to the default surface (the TUI).
+    # Split once, because three rules key off it: the version flag, the top-level `-h`, and the
+    # dispatch itself.
+    private def self.split_subcommand(argv : Array(String)) : {String?, Array(String)}
+      return {nil, argv} if argv.empty? || argv[0].starts_with?("-")
+      {argv[0], argv[1..]}
+    end
+
+    # A version flag belongs to the TOP LEVEL — `gori -v`, `gori --version`, `gori run -v` —
+    # which is exactly what print_main_help promises ("Flags like --version and --help work at
+    # the top level too"), and exactly the FIRST token of the subcommand's own args.
+    #
+    # It must not be claimed once a NESTED subcommand has been named, because there the same
+    # token is that command's own option, or worse its option VALUE. A blanket `argv.any?`
+    # claimed all of them, so `gori run rewriter add --find X -v boom` (rewriter's own
+    # documented `-vVALUE`) and `gori run decoder base64-encode --input -v` printed the version
+    # and returned 0 WITHOUT doing the work — a silent no-op carrying a SUCCESS status, the
+    # worst failure mode there is for a surface scripts consume (`… || die` never fires).
+    #
+    # Keying on the first token excludes those STRUCTURALLY rather than by counting them: a
+    # value-taking flag always sits ahead of its own value, so a VALUE can never be at position
+    # 0. That covers `gori run --project -v` too, which no positional scan could — deciding it
+    # by inspection would need to know which flags take values, and that lives in each
+    # subcommand's OptionParser, which does not exist yet at this layer.
+    private def self.global_version_flag?(subargs : Array(String)) : Bool
+      (first = subargs.first?) ? VERSION_FLAGS.includes?(first) : false
     end
 
     # Pull `--config PATH` / `--config=PATH` out of argv, point Settings at it, and return the

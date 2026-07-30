@@ -22,7 +22,12 @@ module Gori
         positional = [] of String
 
         parser = OptionParser.new do |p|
-          p.banner = "Usage: gori run notes [<n>] [options]\n\nList the project's notes; with <n> (1-based) print that note in full, or --all to print them all."
+          p.banner = "Usage: gori run notes [<n>] [options]\n\n" \
+                     "List the project's notes; with <n> (1-based) print that note in full, " \
+                     "or --all to print them all.\n\n" \
+                     "Or run with a subcommand:\n" \
+                     "  gori run notes create [--text TEXT] [options]\n" \
+                     "  gori run notes delete <n> [options]"
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("--all", "Print every note in full instead of the one-line list") { all = true }

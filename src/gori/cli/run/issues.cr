@@ -6,11 +6,19 @@ module Gori
       # `case` can grow without pushing the (already large) list command over the
       # cyclomatic-complexity bar.
       private def self.cmd_issues(args : Array(String)) : Nil
-        case args.first?
+        case sub = args.first?
         when "create"       then cmd_issues_create(args[1..])
         when "update"       then cmd_issues_update(args[1..])
         when "delete", "rm" then cmd_issues_delete(args[1..])
-        else                     cmd_issues_list(args)
+        when "list"         then cmd_issues_list(args[1..])
+        else
+          # Why this guard exists at all: see `verb_token?`. Local to issues — the same
+          # fallthrough swallowed a positional query, so `issues severity:high` listed EVERY
+          # issue rather than narrowing, because only the TUI implements Issues::Filter.
+          if verb_token?(sub)
+            abort "gori run issues: unknown subcommand '#{sub}' (create, update, delete, list)"
+          end
+          cmd_issues_list(args)
         end
       end
 
