@@ -113,6 +113,258 @@ describe Gori::Bindings do
       end
     end
 
+    # The check belongs to this chokepoint and not to one surface's argument parsing: the CLI
+    # calls `Bindings` rather than the store precisely so it "gets the SAME refusals the TUI
+    # and MCP do", and while the range test lived in the MCP tool layer alone that was false —
+    # a `kind=position` rule with no range saved from the TUI and the CLI and could never bind
+    # (`TokenExtract.position` returns nil for `hi <= lo`), missing forever with no reason given.
+    it "refuses a position descriptor whose range cannot select anything" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("A", "", Gori::ExtractKind::Position).to_s.should contain("byte range")
+        b.add("B", "", Gori::ExtractKind::Position, "", 32, 32).to_s.should contain("byte range")
+        b.add("C", "", Gori::ExtractKind::Position, "", 40, 8).to_s.should contain("byte range")
+        store.extract_rules.should be_empty
+        # A real range still saves, and the other kinds never consult the ints.
+        b.add("D", "", Gori::ExtractKind::Position, "", 0, 32).should be_nil
+        b.add("E", "", Gori::ExtractKind::Cookie, "sid").should be_nil
+        # An UPDATE takes the same refusal, so a good rule cannot be edited into a dead one.
+        id = b.rules.first.id
+        b.update(id, "D", "", Gori::ExtractKind::Position, "", 0, 0).to_s.should contain("byte range")
+        b.rules.first.pos_end.should eq(32)
+      end
+    end
+
+    # A binding value is the ORIGIN'S, not the operator's, and it is spliced into a request
+    # gori then sends — `Rules#substitute` writes it straight into `Authorization: <value>`.
+    # So `abc\r\nX-Admin: true` forged a second header line and `abc\r\n\r\nGET /…` forged a
+    # whole second request onto a pooled keep-alive upstream. `escape_backrefs` already
+    # covers this value being re-read by `gsub`'s replacement grammar; the message boundary
+    # is the other half, and `Import::Builder` guards exactly it on the sibling path.
+    # It BINDS — a CR/LF in a body forges nothing, and `Env.expand_bindings` documents body
+    # injection as a designed case (a PEM block, a SAML assertion, a formatted JSON
+    # sub-document). What is refused is the HEAD half, at the injection site.
+    it "binds a multi-line value but withholds it from the head" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+        head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+        # A JSON-escaped CRLF: the origin's own bytes, decoded into a real CR LF by the
+        # extractor — which is exactly how it would reach a header line.
+        b.observe(response_result(head, %({"token":"abc\\r\\nX-Admin: true"})), subject)
+          .should eq(["SESSION"])
+        b.bound?("SESSION").should be_true
+
+        with_layer(b) do
+          wire = "GET /a HTTP/1.1\r\nCookie: sid=$SESSION\r\n\r\nbody=$SESSION"
+          out = String.new(Gori::Env.expand_bindings(wire.to_slice))
+          # Head: left LITERAL, so the forged header line never exists and the operator can
+          # see why the request failed.
+          out.should contain("Cookie: sid=$SESSION")
+          out.should_not contain("X-Admin: true\r\nCookie")
+          # Body: substituted, newline and all.
+          out.should contain("body=abc\r\nX-Admin: true")
+        end
+      end
+    end
+
+    it "withholds a boundary-forging value from a header rule, not from a body rule" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"token":"a\\r\\nX-Evil: 1"})),
+          subject).should eq(["SESSION"])
+        with_layer(b) do
+          rules = Gori::Rules.new(store, store.match_rules)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "GET",
+            "$SESSION", Gori::Store::RuleOp::SetHeader, Gori::Store::MatchKind::Literal,
+            "auth", "", "")
+          req = "GET /a HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice
+          # The rule does not apply at all, exactly as it does not for an unbound name —
+          # rather than writing a second header line the origin would read as its own.
+          String.new(rules.rewrite_request(req, "acme.test")).should_not contain("X-Evil")
+        end
+      end
+    end
+
+    # Binding values resolve at SEND time, after every plan builder has already framed the
+    # request. Without this the declared length described the UNEXPANDED body: on a pipelined
+    # send-group the origin read the declared prefix and the remainder became the front of the
+    # NEXT request line — gori desyncing its own connection and putting the session token on
+    # the wire as a method.
+    it "moves the Content-Length by what a body substitution added" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("CSRF", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"t":"TOKEN-0123456789abcdef"})),
+          subject).should eq(["CSRF"])
+        with_layer(b) do
+          wire = "POST /a HTTP/1.1\r\nHost: acme.test\r\nContent-Length: 10\r\n\r\ncsrf=$CSRF"
+          out = String.new(Gori::Env.expand_bindings(wire.to_slice))
+          body = out.split("\r\n\r\n", 2)[1]
+          body.should eq("csrf=TOKEN-0123456789abcdef")
+          # 10 + (27 - 10) = 27, which is the body actually sent.
+          out.should contain("Content-Length: 27")
+        end
+      end
+    end
+
+    # A DELTA, not a resync: an operator with auto-Content-Length off authored the mismatch as
+    # their payload (a smuggling probe), and re-syncing would silently destroy it.
+    it "preserves a deliberate Content-Length mismatch's offset" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("T", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"t":"abcdef"})), subject)
+        with_layer(b) do
+          # Declared 4 for a 3-byte body: an offset of -(-1)… i.e. 1 MORE than the body.
+          wire = "POST /a HTTP/1.1\r\nContent-Length: 4\r\n\r\n$T"
+          out = String.new(Gori::Env.expand_bindings(wire.to_slice))
+          out.split("\r\n\r\n", 2)[1].should eq("abcdef") # 6 bytes, was 2
+          out.should contain("Content-Length: 8")         # 4 + 4, offset preserved
+        end
+      end
+    end
+
+    # Everything outside the digit span is the operator's payload on this path: header casing,
+    # the space after the colon and a leading zero are live smuggling / WAF-bypass variables,
+    # and an obs-folded `Content-Length` under another header is the whole content of an
+    # obfuscated-framing probe. The shift runs unconditionally with no auto-CL opt-out, so it
+    # has to leave all of that byte-exact.
+    it "moves only the digits, never the operator's framing bytes" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("T", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"t":"0123456789"})), subject)
+        with_layer(b) do
+          shift = ->(head : String) { String.new(Gori::Env.expand_bindings("#{head}\r\n$T".to_slice)) }
+          # Spelling and spacing survive; only the number moves (2 → 10, a +8 body delta).
+          shift.call("POST /a HTTP/1.1\r\ncontent-length: 2\r\n").should contain("content-length: 10")
+          shift.call("POST /a HTTP/1.1\r\nCONTENT-LENGTH: 2\r\n").should contain("CONTENT-LENGTH: 10")
+          shift.call("POST /a HTTP/1.1\r\nContent-Length:2\r\n").should contain("Content-Length:10")
+          # An obs-fold continuation belongs to the header ABOVE it and is invisible to a
+          # strict parser — promoting or editing it would send a different probe than authored.
+          folded = shift.call("POST /a HTTP/1.1\r\nX-Note: see\r\n Content-Length: 2\r\n")
+          folded.should contain("X-Note: see\r\n Content-Length: 2\r\n")
+        end
+      end
+    end
+
+    # A MIXED-EOL head is itself a parser-discrepancy probe. Splitting the whole head on one
+    # spelling glued three lines into one, so the shift silently did nothing.
+    it "shifts through a mixed-EOL head" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("T", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"t":"0123456789"})), subject)
+        with_layer(b) do
+          wire = "POST /a HTTP/1.1\nX-Inj: v\r\nContent-Length: 2\nX-Other: keep\n\n$T"
+          out = String.new(Gori::Env.expand_bindings(wire.to_slice))
+          out.should contain("Content-Length: 10")
+          out.should contain("X-Other: keep") # nothing else moved
+          out.should contain("X-Inj: v\r\n")  # the CRLF line kept its own terminator
+        end
+      end
+    end
+
+    # Chunked framing lives in the BODY's chunk-size lines, which gori will not rewrite — that
+    # would replace the operator's framing payload. So the head is left exactly as authored
+    # (`Fuzz::ContentLength.sync` does the same) and the caller warns rather than going quiet.
+    it "leaves a chunked head alone rather than bumping a stray Content-Length" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("T", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"t":"0123456789"})), subject)
+        with_layer(b) do
+          wire = "POST /a HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n$T\r\n0\r\n\r\n"
+          out = String.new(Gori::Env.expand_bindings(wire.to_slice))
+          out.should contain("Content-Length: 2\r\n") # untouched
+          out.should contain("2\r\n0123456789\r\n")    # the body still substituted
+        end
+      end
+    end
+
+    it "leaves a head-only substitution's Content-Length alone" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("S", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"t":"longvalue"})), subject)
+        with_layer(b) do
+          wire = "POST /a HTTP/1.1\r\nCookie: sid=$S\r\nContent-Length: 4\r\n\r\nbody"
+          out = String.new(Gori::Env.expand_bindings(wire.to_slice))
+          out.should contain("Cookie: sid=longvalue")
+          out.should contain("Content-Length: 4") # the body did not move
+        end
+      end
+    end
+
+    # A DIAL TUPLE cannot defer: it is frozen into the plan, the ConnPool is built on it and
+    # the Layer-1 scope verdict was taken against it. Left deferred, `$SESSION` shipped as the
+    # literal host — every send failing DNS, and `Outbound.scope_url` asked about
+    # `https://$SESSION/a`, which no rule can match, so the run was refused as out-of-scope:
+    # a refusal naming the wrong gate.
+    it "refuses a declared binding in a dial target at plan-build" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid").should be_nil
+        with_layer(b) do
+          # Bound or not makes no difference — the tuple is read once, before any send.
+          b.observe(response_result("HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc\r\n\r\n"), subject)
+          scope = Gori::Scope.load(store)
+          err = expect_raises(Gori::Repeater::PlanError) do
+            Gori::Repeater::Plan.build(
+              Gori::Repeater::PlanOptions.new(["GET /a HTTP/1.1\r\nHost: x\r\n\r\n".to_slice],
+                target: "https://$SESSION/a"), Gori::Outbound.cli(scope, false))
+          end
+          err.message.to_s.should contain("SESSION")
+          # The SNI is the same kind of field and takes the same refusal — with the SAME
+          # declared name, so this is the deferral being closed and not the pre-existing
+          # unknown-key refusal.
+          expect_raises(Gori::Repeater::PlanError, /SESSION/) do
+            Gori::Repeater::Plan.build(
+              Gori::Repeater::PlanOptions.new(["GET /a HTTP/1.1\r\nHost: x\r\n\r\n".to_slice],
+                target: "https://acme.test/a", sni: "$SESSION"), Gori::Outbound.cli(scope, false))
+          end
+          # …while a request BODY keeps its deferral: that one IS re-scanned at send.
+          Gori::Repeater::Plan.build(
+            Gori::Repeater::PlanOptions.new(["POST /a HTTP/1.1\r\nHost: x\r\n\r\nt=$SESSION".to_slice],
+              target: "https://acme.test/a"), Gori::Outbound.cli(scope, false)).should_not be_nil
+        end
+      end
+    end
+
+    it "a value with no boundary byte is untouched by any of this" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("A", "", Gori::ExtractKind::JsonPath, "$.t").should be_nil
+        head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+        # A horizontal tab is legal in a field-value (RFC 7230 §3.2) and stays legal: the
+        # guard is the three bytes `Import::Builder::HEADER_INJECT` names, not "anything odd".
+        b.observe(response_result(head, %({"t":"ab\\tcd"})), subject).should eq(["A"])
+        with_layer(b) do
+          String.new(Gori::Env.expand_bindings("X: $A\r\n\r\n".to_slice)).should eq("X: ab\tcd\r\n\r\n")
+        end
+      end
+    end
+
+    it "reports whether a toggle or a delete actually committed" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid").should be_nil
+        id = b.rules.first.id
+        # The store has always answered this; dropping the answer is how the TUI came to
+        # toast "extract rule deleted" for a write that rolled back.
+        b.toggle(id).should be_true
+        b.rules.first.enabled?.should be_false
+        b.remove(id).should be_true
+        # The Bool means the write COMMITTED (the store's own contract — false is busy /
+        # locked / closing), so a DELETE of a row that is already gone is still a commit.
+        # `toggle` is false here for a different reason: it reads the rule first, and there is
+        # no state to flip, so claiming one changed would be its own false report.
+        b.toggle(id).should be_false
+      end
+    end
+
     it "stops declaring a disabled rule's name" do
       with_store do |store|
         b = Gori::Bindings.load(store)
@@ -208,7 +460,30 @@ describe Gori::Bindings do
         b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid")
         b.observe(response_result("HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc\r\n\r\n"), subject)
         b.toggle(b.rules.first.id)
+        # Retained, so re-enabling does not cost a round trip — but read from the table the
+        # Bindings pane reads, NOT from `values`, which is what resolves `$NAME` (below).
+        b.bound?("SESSION").should be_true
+        b.rows.first.value.should eq("abc")
+        b.toggle(b.rules.first.id)
         b.values["SESSION"].should eq("abc")
+      end
+    end
+
+    it "stops resolving a disabled rule's name instead of injecting the stale value" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid")
+        b.observe(response_result("HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc\r\n\r\n"), subject)
+        b.toggle(b.rules.first.id)
+        # `declared` already dropped the name; `values` has to agree, or every reader that
+        # asks "is this key known?" first — `Env.expand_bindings`, `Rules#substitute` on the
+        # proxy path — keeps substituting a token whose writer the operator switched off.
+        b.declared.should be_empty
+        b.values.has_key?("SESSION").should be_false
+        with_layer(b) do
+          Gori::Env.expand_bindings("Cookie: sid=$SESSION").should eq("Cookie: sid=$SESSION")
+          Gori::Env.display_vars.has_key?("SESSION").should be_false
+        end
       end
     end
   end

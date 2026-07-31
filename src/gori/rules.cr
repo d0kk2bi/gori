@@ -127,16 +127,25 @@ module Gori
       Rules.normalize_shape(op, target, part)
     end
 
-    def remove(id : Int64) : Nil
-      @store.delete_rule(id)
+    # False when the write did NOT commit (store busy, locked or closing) — the rule is still
+    # there and still rewriting live traffic. The store has always answered this; it was
+    # discarded here, so the TUI reported "rule deleted" for a rollback while the headless
+    # surfaces (`mcp/tools/rules.cr`, `cli/run/rewriter.cr`) refused to. It means COMMITTED,
+    # not "a row existed", which is the store's own contract.
+    def remove(id : Int64) : Bool
+      ok = @store.delete_rule(id)
       refresh
+      ok
     end
 
-    def toggle(id : Int64) : Nil
+    # False when the write did NOT commit; see `remove`. A missing rule is `false` too — there
+    # was nothing to toggle, so claiming a state change would be just as wrong.
+    def toggle(id : Int64) : Bool
       rule = rules.find(&.id.==(id))
-      return unless rule
-      @store.set_rule_enabled(id, !rule.enabled?)
+      return false unless rule
+      ok = @store.set_rule_enabled(id, !rule.enabled?)
       refresh
+      ok
     end
 
     # Move a rule one slot up (dir < 0) / down (dir > 0) in the applied order.
@@ -335,11 +344,22 @@ module Gori
     # Split an HTTP message into {head, body, separator}. Separator is "\r\n\r\n" or
     # "\n\n" when a blank line exists; otherwise the whole text is the head and sep/body
     # are empty (so header-only samples still rewrite).
+    #
+    # The EARLIEST blank line wins, in either spelling. Preferring `\r\n\r\n` wherever it
+    # appeared let the message's own BODY move the boundary: the Rewriter preview feeds
+    # LF-joined text (`TextArea#text`), so a pasted sample whose body carries a CRLFCRLF —
+    # a multipart part, a captured message — put the CRLF hit after the real separator, and
+    # the preview then ran the HEAD rules inside the body and the body rules over the head.
+    # It showed the operator the opposite of what the proxy does. Same defect as the one
+    # fixed in `RuleStub.split`; two spellings of one delimiter take min(index), never a
+    # fixed preference order.
     private def split_message(text : String) : {String, String, String}
-      if idx = text.index("\r\n\r\n")
-        {text[0, idx], text[idx + 4..], "\r\n\r\n"}
-      elsif idx = text.index("\n\n")
-        {text[0, idx], text[idx + 2..], "\n\n"}
+      crlf = text.index("\r\n\r\n")
+      lf = text.index("\n\n")
+      if crlf && (lf.nil? || crlf < lf)
+        {text[0, crlf], text[crlf + 4..], "\r\n\r\n"}
+      elsif lf
+        {text[0, lf], text[lf + 2..], "\n\n"}
       else
         {text, "", ""}
       end
@@ -419,7 +439,18 @@ module Gori
       # replacement means the identical String comes back, exactly as before this feature.
       return repl if prefix.empty? || !repl.byte_index(prefix)
       vars, declared = subst_snapshot
-      substitute(repl, prefix, vars, declared, rule.op.replace? && rule.match_kind.regex?)
+      substitute(repl, prefix, vars, declared, rule.op.replace? && rule.match_kind.regex?,
+        head: head_scoped?(rule))
+    end
+
+    # Whether this rule writes into the HEAD of a message, which is where a value carrying
+    # CR/LF can forge a header line or a whole second request. The three header ops write
+    # header lines by construction; a `Replace` is judged by its `part`. See
+    # `Bindings.boundary_forging?` for why the check lives at the injection site rather than
+    # at extraction: a CR/LF in a BODY forges nothing and body injection is a designed case.
+    private def head_scoped?(rule : Store::MatchRule) : Bool
+      return true if rule.op.set_header? || rule.op.add_header? || rule.op.remove_header?
+      rule.part.head?
     end
 
     # ONE left-to-right pass that resolves `$NAME`, translates the Caido-style `$1` capture
@@ -445,7 +476,7 @@ module Gori
     # Byte-level for the same reason `Env.expand` is: a BODY replacement can carry bytes
     # that are not valid UTF-8, and `String#chars` would turn each of them into U+FFFD.
     private def substitute(repl : String, prefix : String, vars : Hash(String, String),
-                           declared : Array(String), regex : Bool) : String?
+                           declared : Array(String), regex : Bool, head : Bool = false) : String?
       bytes = repl.to_slice
       prefix_bytes = prefix.to_slice
       n = bytes.size
@@ -468,6 +499,7 @@ module Gori
           key, consumed = parsed
           # Declared by an extract rule but not bound yet → the rule must not apply.
           return nil if !vars.has_key?(key) && declared.includes?(key)
+          return nil if head && forges_boundary?(vars, declared, key)
           i += emit_key(buf, bytes, vars, key, consumed, prefix, plen, regex)
           next
         end
@@ -482,6 +514,19 @@ module Gori
         i += plen
       end
       String.new(buf.to_slice)
+    end
+
+    # Whether resolving `key` here would write a boundary-forging value into a HEAD, in which
+    # case the rule must not apply at all — the same disposition an unbound name gets, and for
+    # a stronger reason. A server-controlled `abc\r\nX-Admin: true` in a `SetHeader`
+    # replacement becomes two header lines the origin reads as its own. Only for a BINDING
+    # (`declared`): an env var is the operator's own bytes and stays byte-exact (P7), and only
+    # in the head — the same value in a BODY replacement forges nothing, which is the designed
+    # case `Env.expand_bindings` documents.
+    private def forges_boundary?(vars : Hash(String, String), declared : Array(String),
+                                 key : String) : Bool
+      return false unless declared.includes?(key)
+      (v = vars[key]?) ? Bindings.boundary_forging?(v) : false
     end
 
     private def prefix_at?(bytes : Bytes, prefix_bytes : Bytes, at : Int32) : Bool

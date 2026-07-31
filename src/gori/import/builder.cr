@@ -194,13 +194,95 @@ module Gori
           # stores the ORIGIN's Content-Length beside a capped BLOB, so honouring the declared
           # size here is what makes a re-imported truncated flow match the captured one instead
           # of advertising the prefix length as the whole entity.
+          wire_chunked = wire_chunked?(headers, body)
           headers.each do |k, v|
             next if k.compare("content-length", case_insensitive: true) == 0
+            next if !wire_chunked && transfer_encoding?(k)
             b << k << ": " << v << "\r\n"
           end
-          b << "Content-Length: " << (content_length || body.size) << "\r\n" if body
+          b << "Content-Length: " << (content_length || body.size) << "\r\n" if body && !wire_chunked
           b << "\r\n"
         end.to_slice
+      end
+
+      private def self.transfer_encoding?(name : String) : Bool
+        name.compare("transfer-encoding", case_insensitive: true) == 0
+      end
+
+      # Whether this message is chunk-framed AS STORED — a `Transfer-Encoding` header AND a
+      # body that really is chunked octets. Both halves are load-bearing, because the two
+      # sources these builders serve disagree about the body and the headers cannot tell them
+      # apart:
+      #
+      #   * a gori-written HAR carries the WIRE body (`export/har.cr` writes the wire form on
+      #     purpose), so a chunked flow round-trips with its framing intact — and synthesizing
+      #     a Content-Length beside the TE produced the CL+TE shape gori's own
+      #     `Codec::Body.request_framing` REJECTS as illegal, out of a flow captured legally;
+      #   * a browser / Charles / Postman HAR passes `transfer-encoding: chunked` through
+      #     verbatim while `content.text` is the DECODED body. Trusting the header alone there
+      #     stores a head declaring `Chunked` over a body that is not, which every consumer
+      #     (Repeater replay, `gori run` reconstruct, re-export) then misframes — silently,
+      #     where the CL+TE at least got refused loudly.
+      #
+      # So the BODY decides and the head is made to describe what is actually stored: keep the
+      # TE when the bytes back it, otherwise drop the header and state the real length.
+      private def self.wire_chunked?(headers : Headers, body : Bytes?) : Bool
+        return false unless body
+        headers.any? { |(k, _)| transfer_encoding?(k) } && chunk_framed?(body)
+      end
+
+      # A strict walk: `<hex-size>[;ext]CRLF <size octets> CRLF` repeated, ending at a zero
+      # chunk, consuming the WHOLE slice. Deliberately stricter than
+      # `ContentDecode.dechunk` (which is lenient by design, for a display projection): here a
+      # false positive would keep a `Transfer-Encoding` over a body that is not chunked, which
+      # is the misframe this is written to prevent. Real decoded content parsing cleanly as
+      # complete chunk framing is not a case that occurs.
+      private def self.chunk_framed?(body : Bytes) : Bool
+        pos = 0
+        loop do
+          size, pos = chunk_size(body, pos) || return false
+          return pos == body.size || trailer_only?(body, pos) if size == 0
+          return false if pos + size + 2 > body.size
+          return false unless body[pos + size] == 0x0d_u8 && body[pos + size + 1] == 0x0a_u8
+          pos += size + 2
+        end
+      end
+
+      # {declared size, offset past the CRLF} for the chunk-size line at `pos`, or nil when it
+      # is not one. `<hex>[;ext]CRLF` — the CR is required here even though `ContentDecode`
+      # tolerates a bare LF, because a lenient read is what would let a decoded body pass.
+      private def self.chunk_size(body : Bytes, pos : Int32) : {Int32, Int32}?
+        eol = body.index(0x0a_u8, pos)
+        return nil unless eol && eol > pos && body[eol - 1] == 0x0d_u8
+        line = String.new(body[pos, eol - 1 - pos])
+        hex = line.index(';').try { |i| line[0...i] } || line
+        return nil if hex.empty? || !hex.each_char.all?(&.to_i?(16))
+        size = hex.to_i?(base: 16)
+        return nil unless size && size >= 0
+        {size, eol + 1}
+      end
+
+      # After the terminating zero chunk a message may carry TRAILER FIELDS and must end with
+      # a blank line. The first version accepted only a bare CRLF, which the name already
+      # contradicted — and it dropped the Transfer-Encoding off every trailered message
+      # (`grpc-status` / `grpc-message` on gRPC and gRPC-web over h1, anything declared via
+      # `Trailer:`), re-framing raw chunk octets as a plain entity. That is the very
+      # head-lies-about-body shape this walker exists to prevent, inverted.
+      #
+      # `name: value CRLF` repeated, then the terminating CRLF. Deliberately strict — a bare
+      # LF, a missing colon or trailing garbage all mean the bytes were not really a chunked
+      # message, and a false positive here keeps a TE over a body that is not chunked.
+      private def self.trailer_only?(body : Bytes, pos : Int32) : Bool
+        loop do
+          return false if pos >= body.size
+          eol = body.index(0x0a_u8, pos)
+          return false unless eol && eol > pos && body[eol - 1] == 0x0d_u8
+          line_len = eol - 1 - pos
+          return eol + 1 == body.size if line_len == 0 # the terminating blank line
+          colon = body[pos, line_len].index(0x3a_u8)
+          return false unless colon && colon > 0
+          pos = eol + 1
+        end
       end
 
       def self.response_head(http_version : String, status : Int32, reason : String,
@@ -211,11 +293,14 @@ module Gori
         String.build do |b|
           b << http_version << ' ' << status << ' ' << reason << "\r\n"
           has_cl = false
+          wire_chunked = wire_chunked?(headers, body)
           headers.each do |k, v|
+            next if !wire_chunked && transfer_encoding?(k)
             has_cl = true if !has_cl && k.compare("content-length", case_insensitive: true) == 0
             b << k << ": " << v << "\r\n"
           end
-          b << "Content-Length: " << (body.try(&.size) || 0) << "\r\n" unless has_cl
+          # See `wire_chunked?`: a length only where the body is not chunk-framed as stored.
+          b << "Content-Length: " << (body.try(&.size) || 0) << "\r\n" unless has_cl || wire_chunked
           b << "\r\n"
         end.to_slice
       end

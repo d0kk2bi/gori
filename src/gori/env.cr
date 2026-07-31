@@ -52,8 +52,17 @@ module Gori
     abstract class Layer
       # Names an extract rule declares, whether or not one is bound yet.
       abstract def declared : Array(String)
-      # Currently bound values, by name.
+      # Values available for RESOLUTION — what `$NAME` may expand to at send time.
       abstract def values : Hash(String, String)
+
+      # Every value the layer is HOLDING, resolvable or not. Defaults to `values`; a layer
+      # whose two answers differ must override it. `Bindings` does: it keeps a disabled
+      # rule's token so re-enabling costs no round trip, while refusing to resolve it. See
+      # `Env.masking_vars` — a secret that stopped resolving has not stopped being a secret.
+      def held_values : Hash(String, String)
+        values
+      end
+
       # Bumped on every rule edit and every rebind, so a consumer can cache a merged
       # snapshot instead of rebuilding one per message (see `Rules`).
       abstract def rev : UInt64
@@ -103,6 +112,21 @@ module Gori
       h
     end
 
+    # What a MASKING surface must treat as secret: build-time vars plus every value the
+    # binding layer is holding, INCLUDING one whose rule is currently disabled.
+    #
+    # Deliberately wider than `display_vars`, and the two must not be merged. `display_vars`
+    # answers "what will resolve", which is what `token_regions` paints and what completion
+    # offers — a disabled name is not resolvable and must not paint as bound. Masking asks a
+    # different question: those bytes were observed from a real response and are sitting in
+    # memory, so a redaction that stopped the moment the operator toggled a rule off would
+    # print the token into an export, a note or the detail view.
+    def self.masking_vars : Hash(String, String)
+      h = effective_vars
+      (@@layer.try(&.held_values) || {} of String => String).each { |(k, v)| h[k] = v }
+      h
+    end
+
     # Substitute BOUND binding values in final wire bytes, at send time. Returns the same
     # slice when there is nothing to do — the common case, and byte-fidelity (P7) besides.
     #
@@ -111,18 +135,200 @@ module Gori
     # safe here in a way `unresolved_wire`'s head-only rule was not, because this matches a
     # SPECIFIC declared name rather than the `$`+`[A-Za-z_]` shape — a random collision with
     # `$SESSION` in a binary body is a 2^-56 event, not the ~3-per-4KB one #525 measured.
+    # A value carrying CR/LF/NUL is withheld from the HEAD half and substituted freely in the
+    # BODY. A binding value is the ORIGIN'S — see `Bindings.boundary_forging?` — and in a head
+    # `abc\r\nX-Admin: true` becomes two header lines while `abc\r\n\r\nGET /...` forges a whole
+    # second request onto a pooled keep-alive upstream. In a body it forges nothing, and the
+    # sentence above is the designed case, so the split is by POSITION rather than by value.
+    # A name whose value is withheld stays LITERAL, `Env.expand`'s documented contract for an
+    # unknown key — visible in the request rather than silently dropped.
     def self.expand_bindings(bytes : Bytes) : Bytes
       vals = binding_values
       return bytes if vals.empty?
       prefix = Settings.env_prefix
       return bytes if prefix.empty? || !contains_prefix?(bytes, prefix)
-      expand(String.new(bytes), vals, prefix).to_slice
+      safe = boundary_safe(vals)
+      boundary = head_body_boundary(bytes)
+      head = expand(String.new(bytes[0...boundary]), safe, prefix).to_slice
+      return head if boundary >= bytes.size
+      raw_body = bytes[boundary..]
+      body = expand(String.new(raw_body), vals, prefix).to_slice
+      unless body.size == raw_body.size
+        shifted = shift_content_length(head, body.size - raw_body.size)
+        warn_unshiftable_framing if shifted.same?(head)
+        head = shifted
+      end
+      buf = IO::Memory.new(head.size + body.size)
+      buf.write(head)
+      buf.write(body)
+      buf.to_slice
     end
 
-    def self.expand_bindings(text : String) : String
+    # `head` with its `Content-Length` moved by `delta`, every other byte untouched. No-op
+    # when the head declares none.
+    #
+    # ## Why this lives here and why it is a DELTA
+    #
+    # Binding values resolve at SEND time, which is after every plan builder has framed the
+    # request — `Repeater::Plan` runs `resync_content_length`, `Fuzz::Generator#emit` runs
+    # `ContentLength.sync`, both over bytes that still hold the literal `$NAME`. Nothing
+    # re-framed afterwards, so a `$NAME` in a BODY shipped a Content-Length describing the
+    # UNEXPANDED body: on a pipelined send-group the origin read the declared prefix and the
+    # remainder became the front of the next request line — gori desyncing its own connection
+    # and putting the session token on the wire as a method. A value shorter than the token
+    # hangs the connection instead. On h2 a `content-length` disagreeing with the DATA frames
+    # is malformed outright (RFC 9113 §8.1.2.6).
+    #
+    # A DELTA and not a resync, because both framing modes have to survive: an operator with
+    # auto-Content-Length OFF (`Repeater`) or `update_content_length` off (`Fuzz`) authored a
+    # deliberate mismatch as their payload, and a resync would silently destroy it. Shifting
+    # by what the substitution actually added keeps that offset exactly, while a request that
+    # WAS in sync stays in sync. It is also why this sits inside `expand_bindings` rather than
+    # at the five send seams: the seam that forgets is the one that desyncs.
+    # Only the DIGITS move. The field name's spelling, the colon and the optional whitespace
+    # on either side are copied through byte-exact, because on this codebase's requests they
+    # are the payload: `content-length:   2` with lower-case and extra OWS IS a
+    # header-parsing-discrepancy probe, and canonicalising it to `Content-Length: 2` silently
+    # sends a different test than the operator wrote.
+    #
+    # And with MORE THAN ONE Content-Length the shift is refused outright. A CL.CL request is
+    # a desync probe whose whole content is the RELATIONSHIP between the two numbers; moving
+    # one of them turns the operator's `2/99` into `10/99`, and there is no reading of "which
+    # one did they mean" that is not a guess. Refusing leaves their bytes alone — the request
+    # still goes out exactly as authored.
+    private def self.shift_content_length(head : Bytes, delta : Int32) : Bytes
+      span = content_length_digits(head)
+      return head unless span
+      start, stop = span
+      current = String.new(head[start, stop - start]).to_i64?
+      return head unless current
+      shifted = {current + delta, 0_i64}.max.to_s
+      buf = IO::Memory.new(head.size + shifted.bytesize)
+      buf.write(head[0, start])
+      buf << shifted
+      buf.write(head[stop, head.size - stop])
+      buf.to_slice
+    end
+
+    # The byte range of the Content-Length VALUE's digits, or nil when this head must not be
+    # touched. Everything outside that range is copied verbatim, which is the whole point:
+    # header casing, the space after the colon and a leading zero are live smuggling and
+    # WAF-bypass variables on the send path, and this runs unconditionally with no
+    # auto-Content-Length opt-out. `Fuzz::ContentLength.sync` is the same discipline.
+    #
+    # nil — leave the head exactly as authored — for each of:
+    #
+    #   * a `Transfer-Encoding` anywhere in the head. The framing is the chunk-size lines
+    #     inside the BODY, and gori cannot re-chunk without rewriting the operator's framing
+    #     payload. `ContentLength.sync` returns unchanged for chunked too. The caller warns,
+    #     because a `$NAME` in a chunked body still desyncs and silence would be worse.
+    #   * more than one Content-Length. A CL.CL request is a desync probe whose content IS the
+    #     relationship between the two numbers; there is no "which one did they mean" that is
+    #     not a guess.
+    #   * a line starting with SP or HTAB — an obs-fold continuation. ` Content-Length: 2`
+    #     folded under `X-Note:` is part of THAT header's value and invisible to a strict
+    #     parser, which is exactly what an obfuscated-framing probe is built on.
+    #
+    # Line splitting is on LF with an optional preceding CR, per line, so a deliberately
+    # MIXED-EOL head is handled rather than silently skipped.
+    private def self.content_length_digits(head : Bytes) : {Int32, Int32}?
+      found = nil.as({Int32, Int32}?)
+      pos = 0
+      first = true
+      while pos < head.size
+        lf = head.index(0x0a_u8, pos)
+        stop = lf || head.size
+        line_end = (stop > pos && head[stop - 1] == 0x0d_u8) ? stop - 1 : stop
+        unless first || fold_or_blank?(head, pos, line_end)
+          case header_name(head, pos, line_end)
+          when "transfer-encoding" then return nil
+          when "content-length"
+            return nil if found # a second one: refuse, see above
+            found = value_digits(head, pos, line_end)
+          end
+        end
+        first = false
+        break unless lf
+        pos = lf + 1
+      end
+      found
+    end
+
+    # An obs-fold continuation (SP/HTAB first) or an empty line — neither is a header of its
+    # own, and treating a fold as one is how a `Content-Length` hidden inside another header's
+    # value gets edited.
+    private def self.fold_or_blank?(head : Bytes, pos : Int32, line_end : Int32) : Bool
+      pos >= line_end || head[pos] == 0x20_u8 || head[pos] == 0x09_u8
+    end
+
+    private def self.header_name(head : Bytes, pos : Int32, line_end : Int32) : String?
+      colon = index_in(head, 0x3a_u8, pos, line_end)
+      colon ? String.new(head[pos, colon - pos]).strip.downcase : nil
+    end
+
+    # The value's digit span with the OWS on both sides excluded, or nil when the value is
+    # empty. The colon is re-found rather than threaded so `header_name` stays a pure lookup.
+    private def self.value_digits(head : Bytes, pos : Int32, line_end : Int32) : {Int32, Int32}?
+      colon = index_in(head, 0x3a_u8, pos, line_end)
+      return nil unless colon
+      vs = colon + 1
+      while vs < line_end && (head[vs] == 0x20_u8 || head[vs] == 0x09_u8)
+        vs += 1
+      end
+      ve = line_end
+      while ve > vs && (head[ve - 1] == 0x20_u8 || head[ve - 1] == 0x09_u8)
+        ve -= 1
+      end
+      ve > vs ? {vs, ve} : nil
+    end
+
+    @@warned_unshiftable = false
+
+    # A binding substitution changed the body's length and the head's framing could not follow
+    # — chunked, a CL.CL pair, an obs-folded Content-Length, or no Content-Length at all. The
+    # message goes out as authored, which for a chunked body means the chunk-size lines now
+    # disagree with the chunk: the same desync the Content-Length shift exists to prevent,
+    # surviving in the other framing mode. gori will not re-chunk (that would rewrite the
+    # framing the operator authored), so the honest answer is to say so. Once per process:
+    # this is a send loop.
+    private def self.warn_unshiftable_framing : Nil
+      return if @@warned_unshiftable
+      @@warned_unshiftable = true
+      ::Log.warn do
+        "a session binding changed a request body's length, but its head's framing could not " \
+        "be adjusted (chunked, more than one Content-Length, an obs-folded one, or none). The " \
+        "request goes out exactly as authored, so its declared framing may now disagree with " \
+        "the body — bind the value into a header, or size the body yourself"
+      end
+    end
+
+    private def self.index_in(bytes : Bytes, byte : UInt8, from : Int32, to : Int32) : Int32?
+      i = from
+      while i < to
+        return i if bytes[i] == byte
+        i += 1
+      end
+      nil
+    end
+
+    # The String form has no head/body split to take, so the caller says whether what it holds
+    # is boundary-sensitive. A `--target` or an SNI lands on the request line or in a header
+    # and is (`guard_boundary: true`, the default); a WebSocket frame is ALL payload — there is
+    # no head in it for a CR/LF to forge a line into, and the proxy's own WS path agrees
+    # (`Rules#head_scoped?` maps `part: Ws` to false). Withholding there would kill exactly the
+    # multi-line values this feature allows: a PEM block, a SAML assertion, a formatted JSON
+    # sub-document.
+    def self.expand_bindings(text : String, guard_boundary : Bool = true) : String
       vals = binding_values
       return text if vals.empty?
-      expand(text, vals, Settings.env_prefix)
+      expand(text, guard_boundary ? boundary_safe(vals) : vals, Settings.env_prefix)
+    end
+
+    # `vals` minus every value that would forge a message boundary where it is injected.
+    # Returns the SAME Hash when nothing is withheld, which is the common case.
+    private def self.boundary_safe(vals : Hash(String, String)) : Hash(String, String)
+      return vals unless vals.any? { |(_, v)| Bindings.boundary_forging?(v) }
+      vals.reject { |_, v| Bindings.boundary_forging?(v) }
     end
 
     # Declared binding names in `bytes` that have no value yet, first-appearance order.
@@ -405,10 +611,12 @@ module Gori
     # just the masked spans. Byte-level value matching is also strictly more
     # precise than char matching: it finds a value's literal bytes regardless of
     # whether the surrounding haystack happens to be well-formed UTF-8.
-    # `display_vars`, not `effective_vars`: a bound session token is exactly the value a
+    # `masking_vars`, not `effective_vars`: a bound session token is exactly the value a
     # masking surface must not print, and widening the default here is what makes every
-    # existing caller mask it without a per-caller change (the design's "for free").
-    def self.mask_secrets(text : String, vars : Hash(String, String) = display_vars,
+    # existing caller mask it without a per-caller change (the design's "for free"). Wider
+    # than `display_vars` on purpose — see `masking_vars`: a value whose rule was disabled
+    # stops RESOLVING but is still a secret sitting in memory.
+    def self.mask_secrets(text : String, vars : Hash(String, String) = masking_vars,
                           prefix : String = Settings.env_prefix) : String
       return text if prefix.empty? || vars.empty?
 

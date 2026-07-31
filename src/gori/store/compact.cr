@@ -155,6 +155,26 @@ class Gori::Store
       conn.exec("UPDATE flows SET request_body = X'', request_body_truncated = 1 " \
                 "WHERE request_body IS NOT NULL AND LENGTH(request_body) > 0")
     end
+    # Dropping a body drops what `body:` searches, so the FTS index has to go with it. Both
+    # siblings already maintain it — `delete_flow_one` deletes the row's entry, `clear_flows`
+    # issues `'delete-all'` — and only this path skipped it, so `body:secret` kept hitting a
+    # flow whose body is gone AND that body's own trigram tokens (up to `FTS_INDEX_MAX` of
+    # them) stayed in the file, which is the opposite of what compact is asked for.
+    #
+    # SCOPED to the rows whose bodies were actually emptied — `changes()` right after each
+    # UPDATE, and the same `WHERE` re-expressed as the rows now carrying an empty blob with
+    # the truncation flag set. A `'delete-all'` + blanket `fts_dirty = 1` was the first
+    # version and was far too wide: the index holds HEAD text too (`flows_fts(req, resp)`),
+    # so wiping it blinded `body:` and free-text search PROJECT-WIDE — including rows compact
+    # never touched — until a drain that runs 32 rows per tick on the single writer fiber,
+    # behind which live capture blocks and which `index_pending!` makes the first `body:`
+    # query wait for. It also regrew the trigram index immediately after the VACUUM the
+    # operator had just paid for. The two siblings delete precise rowids (`delete_flow_one`,
+    # `prune_old_flows`) and only `clear_flows` wipes, because there nothing survives.
+    if plan.response_bodies || plan.request_bodies
+      conn.exec("DELETE FROM flows_fts WHERE rowid IN (SELECT id FROM flows WHERE #{emptied_where(plan)})")
+      conn.exec("UPDATE flows SET fts_dirty = 1 WHERE #{emptied_where(plan)}")
+    end
     if plan.h2_frames
       # The raw h2 frame log is a detail-view-only diagnostic; each flow rebuilds
       # from its own request_head/response_head, so dropping it loses no traffic.
@@ -180,11 +200,31 @@ class Gori::Store
   # Keep only the newest `keep` flows (by id, which is monotonic), cascading to
   # their ws messages, FTS rows and orphaned h2 frames/connections — the same
   # cascade the retention sweep (`prune`) uses, but with an explicit keep count.
+  # The rows this plan just emptied: an empty blob with the truncation flag set is exactly
+  # what the two UPDATEs above leave behind, and it is stable across a re-run (a second
+  # compact re-selects the same rows and re-dirties them, which is harmless). Kept as one
+  # expression so the FTS delete and the dirty flag can never select different rows.
+  private def self.emptied_where(plan : CompactPlan) : String
+    parts = [] of String
+    parts << "(response_body IS NOT NULL AND LENGTH(response_body) = 0 AND response_body_truncated = 1)" if plan.response_bodies
+    parts << "(request_body IS NOT NULL AND LENGTH(request_body) = 0 AND request_body_truncated = 1)" if plan.request_bodies
+    parts.join(" OR ")
+  end
+
+  # The cutoff is the id of the OLDEST flow that survives, taken from the rows that actually
+  # exist rather than from `MAX(id) - keep`. That arithmetic is "keep the newest N" only on a
+  # gap-free id space, and gaps are ordinary: a `history delete`, an earlier compact, a
+  # sweep. With 10 flows of which the operator hand-deleted 6 mid-history ones (ids 1, 2, 9,
+  # 10 survive), `keep: 4` gave `cutoff = 6` and destroyed flows 1 and 2 — kept TWO of the
+  # four it was asked for, out of a database that held exactly four. Irreversible loss in the
+  # option whose whole promise is "keep only the newest `keep` flows".
   private def self.prune_old_flows(conn : DB::Connection, keep : Int32) : Nil
     return if keep <= 0
-    max_id = conn.query_one?("SELECT MAX(id) FROM flows", as: Int64?)
-    return unless max_id
-    cutoff = max_id - keep
+    cutoff = conn.query_one?(
+      "SELECT MIN(id) FROM (SELECT id FROM flows ORDER BY id DESC LIMIT ?)", keep, as: Int64?)
+    return unless cutoff
+    # Everything strictly below the oldest survivor goes; `<=` below is against `cutoff - 1`.
+    cutoff -= 1
     return if cutoff <= 0
     conn.exec("DELETE FROM ws_messages WHERE flow_id <= ? AND repeater_id IS NULL", cutoff)
     conn.exec("DELETE FROM flows_fts WHERE rowid <= ?", cutoff)

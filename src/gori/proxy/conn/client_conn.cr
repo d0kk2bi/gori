@@ -504,8 +504,17 @@ module Gori::Proxy
       # ttfb/duration stay nil on purpose. There was no round trip to measure, and a `0`
       # would render in History as an impossibly fast origin — the exact misreading the
       # short-circuit marker exists to prevent. `—` is the truth.
+      # Capped like every other capture path (`capped` eight lines above for the request,
+      # `CaptureBuffer` on the streaming path, the h2 assembler). The stub's body is bounded
+      # only by `RuleStub::MAX_BODY_FILE_BYTES` = 8 MiB, four times the default
+      # `Settings.capture_max`, and it is written PER REQUEST — so a `body_file` stub on an
+      # endpoint a page hits repeatedly grew `flows.response_body` by the whole file each
+      # time, which the retention cap (counted in rows) cannot reclaim and lowering
+      # `capture_max` did not shrink.
+      resp_stored, resp_trunc, resp_size = capped(send_body ? stub.body : nil)
       @sink.on_response(FlowMapper.response(resp,
-        flow_id: flow_id, body: send_body ? stub.body : nil,
+        flow_id: flow_id, body: resp_stored,
+        body_truncated: resp_trunc, body_size: resp_size,
         state: written ? Store::FlowState::Complete : Store::FlowState::Aborted,
         error: written ? stub.error : "client closed before the short-circuit response was written"))
       return false unless written
@@ -1098,6 +1107,29 @@ module Gori::Proxy
     # Cleartext HTTP/2 (h2c) tunnelled inside a CONNECT: the target is the
     # CONNECT authority, so we dial it plaintext and run the same h2 relay (no
     # :authority routing / HPACK coupling needed). The origin must speak h2c.
+    # A rule kind this tunnel cannot serve, or nil. Mirrors `tls/tunnel.cr#h2_candidate?`'s
+    # three rule gates — a body Match&Replace rule, a short-circuit stub, a body-scoped
+    # extract rule — all of which live on `ClientConn`'s h1 path and are unreachable from the
+    # h2 relay. On the TLS path they earn a downgrade to h1; here the client has already sent
+    # the preface, so the only honest answers are refuse or lie.
+    private def h2c_unservable?(host : String) : Bool
+      reason =
+        if @rewriter.try(&.rewrites_body_for_host?(host))
+          "a Match&Replace BODY rule is live and body rewriting on HTTP/2 is not implemented yet"
+        elsif @rewriter.try(&.short_circuits_for_host?(host))
+          "a Match&Replace short-circuit rule is live and the h2 relay cannot answer a request locally"
+        elsif @extractor.try(&.extracts_body_for_host?(host))
+          "a body-scoped session-binding extract rule is live and the h2 relay never holds a body"
+        end
+      return false unless reason
+      ::Log.warn do
+        "h2c CONNECT to #{host}: refused because #{reason}. The client committed to HTTP/2 by " \
+        "sending the preface, so there is nothing to downgrade — disable the rule for this host " \
+        "to allow the tunnel, or reach it over TLS where gori can downgrade the connection"
+      end
+      true
+    end
+
     private def intercept_h2c(host : String, port : Int32, client : IO) : Nil
       upstream = Upstream.dial(host, port, overrides: @host_overrides, pin: dial_pin)
       return unless upstream
@@ -1106,7 +1138,16 @@ module Gori::Proxy
       SocketTuning.relax(client)
       SocketTuning.relax(upstream)
       begin
-        H2::Relay.run(client, upstream, host, port, @sink, extractor: @extractor)
+        # The same four lenses the TLS h2 path wires in (`tls/tunnel.cr#relay_h2`). Only the
+        # extractor was threaded here by #501 slice 2, and `HeadRewrite` is the ONLY producer
+        # of the decoded projection an extract rule needs — so without a rewriter the
+        # extractor was structurally inert on this path, and Match&Replace head rules and
+        # intercept holds did not reach h2c-in-CONNECT at all. Nothing about this tunnel makes
+        # those rules less applicable than on the TLS one; the asymmetry was a wiring gap, not
+        # a decision (the surrounding comments enumerate the sandbox and `http2_disabled?`
+        # gates and say nothing about rules or intercept).
+        H2::Relay.run(client, upstream, host, port, @sink,
+          rewriter: @rewriter, interceptor: @interceptor, extractor: @extractor)
       ensure
         upstream.close rescue nil
       end
@@ -1182,6 +1223,12 @@ module Gori::Proxy
           # silently relaying it would make "force HTTP/1.1" quietly untrue for this path,
           # which is worse than a visible refusal.
           return false if Settings.http2_disabled?
+          # The other three gates `tls/tunnel.cr#h2_candidate?` applies, which had no h2c
+          # equivalent. Same reasoning as the line above, and the same disposition: there is
+          # nothing to downgrade here, so a rule the relay structurally cannot apply gets a
+          # VISIBLE refusal rather than a tunnel that looks like it honours the rule table
+          # while a stub rule quietly lets the request reach the origin.
+          return false if h2c_unservable?(host)
           intercept_h2c(host, port, stream)
         else
           tls.intercept(host, port, stream, @sink, dial_addr: dial_pin)

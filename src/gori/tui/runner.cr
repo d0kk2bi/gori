@@ -610,7 +610,14 @@ module Gori::Tui
         desc = "#{item.method} #{item.host}#{item.target}"
         case cmd.verb
         when "forward"
-          ic.forward(item_id)
+          # The store's ack is the agent's only record, so it reports what actually happened:
+          # `forward` is false when somebody else settled the item first (the operator's own
+          # decision, `forward_all`, the reaper), and acking "forwarded" for that is the same
+          # silent-no-op class the rest of this batch removed.
+          unless ic.forward(item_id)
+            store.ack_intercept_command(cmd.id, "error", "already decided by another surface: #{desc}")
+            return false
+          end
           store.ack_intercept_command(cmd.id, "forwarded", desc)
           push_agent_note(:success, "forwarded #{desc}", item)
         when "drop"
@@ -624,7 +631,10 @@ module Gori::Tui
           end
           # Forward the AGENT's edited bytes DIRECTLY — never through view.forward_bytes, which
           # would pull the human editor buffer and re-expand $VARS (wrong bytes + secret leak).
-          ic.forward(item_id, bytes)
+          unless ic.forward(item_id, bytes)
+            store.ack_intercept_command(cmd.id, "error", "already decided by another surface: #{desc}")
+            return false
+          end
           store.ack_intercept_command(cmd.id, "edited", desc)
           push_agent_note(:success, "forwarded (edited) #{desc}", item)
         end
@@ -687,7 +697,9 @@ module Gori::Tui
       pending.each do |it|
         watched = {it.held_at_ms, viewed[it.id]? || 0_i64}.max
         next if now_ms - watched < @intercept_max_hold_ms
-        ic.forward(it.id) # original bytes (fail-open), same as toggle-off / release_all
+        # original bytes (fail-open), same as toggle-off / release_all. A false answer means
+        # the operator decided it in the same tick — say nothing rather than claim a reap.
+        next unless ic.forward(it.id)
         secs = @intercept_max_hold_ms // 1000
         goto = (fid = it.flow_id) ? Jobs::Goto.new(:history, fid) : nil
         @notifications.push(:warn, "auto-forwarded held #{it.method} #{it.host}#{it.target} (no decision after #{secs}s)", goto, source: "app")
@@ -2608,6 +2620,14 @@ module Gori::Tui
       # shows a blank count for an empty query and "no matches" for a fruitless one.
       return if @search_buffer.empty?
       n = search_match_count
+      # -1 = the buffer is not valid UTF-8, so a PCRE cannot run over it (see
+      # `TextArea#searchable?`). Named rather than folded into "no matches": this is the
+      # ordinary shape of a Repeater tab seeded from a captured upload, and silence would
+      # read as "your query is not in there".
+      if n < 0
+        return status("replace: this buffer holds bytes that are not valid UTF-8 — " \
+                      "search and replace cannot run over it (^F highlighting still works)")
+      end
       return if n == 0
       q, r = @search_buffer, @search_replace_buffer
       plural = n == 1 ? "" : "s"

@@ -75,6 +75,44 @@ module Gori
     # WHICH rule wrote a name after the operator has edited several.
     private record Bound, value : String, rule_id : Int64, at : Time
 
+    # Bytes that would forge a message boundary out of a value, so a value carrying one is
+    # never bound. `Import::Builder::HEADER_INJECT`, deliberately the same set and the same
+    # reasoning: only CR/LF/NUL, because a value may legally contain a horizontal tab and
+    # bytes that merely break a value without forging a boundary are not this feature's
+    # business.
+    #
+    # ## Why this is a refusal and not a P7 passthrough
+    #
+    # The axis is PROVENANCE. Everywhere else in this codebase a malformed value is the
+    # OPERATOR'S PAYLOAD and is replayed byte-exact — an imported target, a hand-typed header,
+    # a Repeater template. A binding value is the ORIGIN'S, and it is spliced into a request
+    # gori then sends: `Rules#substitute` writes it into `Authorization: <value>`, so
+    # `abc\r\nX-Admin: true` becomes two header lines and `abc\r\n\r\nGET /...` forges a whole
+    # second request onto a pooled keep-alive upstream. `rules.cr` already reasons about a
+    # binding value being re-interpreted downstream — that is what `escape_backrefs` is for —
+    # and covers `gsub`'s replacement grammar only; the message boundary is the other half.
+    #
+    # ## Why it is asked at the INJECTION SITE and not at extraction
+    #
+    # Refusing at extraction was the first answer and it was too wide. `Env.expand_bindings`
+    # states that "injecting a token into a body is a designed case (a `Replace` rule with
+    # `part: Body`, an operator's Repeater template)", and CR/LF in a BODY forges nothing — a
+    # PEM block, a SAML assertion, a formatted JSON sub-document are all legitimate values for
+    # exactly that case. So the value is bound either way and the refusal lives where the
+    # boundary exists: the head half of a message, and any short field that lands on the
+    # request line. `Env.expand_bindings` splits the message and applies it to the head only;
+    # `Rules#substitute` applies it for the head ops and the head part.
+    #
+    # A BYTE scan and not a Regex: a header value or a `position` slice can carry bytes that
+    # are not valid UTF-8, and Crystal's Regex raises `ArgumentError` on such a subject — which
+    # would turn this guard into an exception on exactly the input it exists to stop.
+    def self.boundary_forging?(value : String) : Bool
+      value.each_byte do |b|
+        return true if b == 0x0d_u8 || b == 0x0a_u8 || b == 0x00_u8
+      end
+      false
+    end
+
     @rules : Array(Store::ExtractRule)
     @compiled : Array(Compiled)
     @values : Hash(String, Bound)
@@ -95,6 +133,10 @@ module Gori
       # Rule ids already reported as needing an entity that was not buffered, at that rule
       # revision — see `miss_no_entity`.
       @no_entity_reported = Set(Int64).new
+      # Rule ids that already reported a plain miss at binding revision `@miss_reported_rev`
+      # — see `report_miss?`.
+      @miss_reported = Set(Int64).new
+      @miss_reported_rev = 0_u64
     end
 
     def self.load(store : Store) : Bindings
@@ -112,7 +154,32 @@ module Gori
       @mutex.synchronize { @compiled.select(&.rule.enabled?).map(&.rule.name) }
     end
 
+    # Values an ENABLED rule declares. This is what `Env.expand_bindings` and
+    # `Rules#substitute` resolve `$NAME` against, so the enabled test has to be HERE and not
+    # only on `declared`: `substitute` asks `vars.has_key?(key)` FIRST and emits the value it
+    # finds, so an unfiltered table left every reader — the proxy Match&Replace path most of
+    # all, which has no plan-build refusal in front of it — silently injecting the stale value
+    # of a rule the operator had switched off. That is the outcome `declared` above documents
+    # as ruled out, so both halves now answer the same question.
+    #
+    # The value itself SURVIVES in `@values` (see `refresh`): toggling a rule off and back on
+    # must not lose the token. `rows` and `bound?` read that table directly, which is what
+    # keeps the Bindings pane showing a disabled rule's value while nothing resolves it.
     def values : Hash(String, String)
+      @mutex.synchronize do
+        live = Set(String).new
+        @rules.each { |r| live << r.name if r.enabled? }
+        h = {} of String => String
+        @values.each { |(k, b)| h[k] = b.value if live.includes?(k) }
+        h
+      end
+    end
+
+    # Every value held, enabled or not — the MASKING half of the split above. A token whose
+    # rule the operator switched off stops resolving, but it was still observed from a real
+    # response and is still in memory, so `Env.mask_secrets` must keep redacting it out of
+    # exports, notes and the detail view. See `Env.masking_vars`.
+    def held_values : Hash(String, String)
       @mutex.synchronize do
         h = {} of String => String
         @values.each { |(k, b)| h[k] = b.value }
@@ -143,8 +210,16 @@ module Gori
     # with `path:/login OR path:/refresh`, not two rules racing for a name.
     #
     # `except_id` excludes the row being edited from the duplicate-name test.
+    #
+    # The `position` range lives HERE and not in one surface's argument parsing, because this
+    # is the chokepoint all three go through — the CLI's own comment says it calls `Bindings`
+    # rather than `store.insert_extract_rule` precisely so it "gets the SAME refusals the TUI
+    # and MCP do". While the check sat in MCP's tool layer alone that sentence was false: a
+    # `kind=position` rule with no range saved happily from the TUI and the CLI and could
+    # never bind (`TokenExtract.position` returns nil for `hi <= lo`), so it logged a miss
+    # forever and nothing said why.
     def validate(name : String, kind : Gori::ExtractKind, selector : String,
-                 except_id : Int64? = nil) : String?
+                 except_id : Int64? = nil, pos_start : Int32 = 0, pos_end : Int32 = 0) : String?
       return "a binding needs a name" if name.empty?
       unless Env.valid_key?(name)
         return "#{name.inspect} is not a valid binding name (letters, digits and _ only, not starting with a digit)"
@@ -153,6 +228,9 @@ module Gori
         return "$#{name} is already written by another extract rule — one name, one writer"
       end
       return "a #{kind.label} descriptor needs a selector" if kind_needs_selector?(kind) && selector.empty?
+      if kind.position? && pos_end <= pos_start
+        return "a position descriptor needs a byte range with an end past its start (got #{pos_start}...#{pos_end})"
+      end
       if kind.regex?
         begin
           Regex.new(selector)
@@ -171,7 +249,7 @@ module Gori
     def add(name : String, match_filter : String, kind : Gori::ExtractKind,
             selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
             host : String = "") : String?
-      if err = validate(name, kind, selector)
+      if err = validate(name, kind, selector, pos_start: pos_start, pos_end: pos_end)
         return err
       end
       @store.insert_extract_rule(name, match_filter, kind, selector, pos_start, pos_end, host)
@@ -182,7 +260,7 @@ module Gori
     def update(id : Int64, name : String, match_filter : String, kind : Gori::ExtractKind,
                selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
                host : String = "") : String?
-      if err = validate(name, kind, selector, except_id: id)
+      if err = validate(name, kind, selector, except_id: id, pos_start: pos_start, pos_end: pos_end)
         return err
       end
       previous = @mutex.synchronize { @rules.find(&.id.==(id)) }
@@ -197,18 +275,29 @@ module Gori
       nil
     end
 
-    def remove(id : Int64) : Nil
+    # False when the write did NOT commit (store busy, locked or closing) — the rule is still
+    # there and still observing responses. `Rules#remove`'s contract, for the same reason:
+    # the store already answers this and dropping the answer is how a surface comes to
+    # report work it did not do. It means COMMITTED, not "a row existed" — the store's own
+    # contract — so deleting an id that is already gone is still true.
+    #
+    # The in-memory value is dropped only on a committed delete; `refresh` would restore it
+    # anyway on a rollback, but saying so here keeps the two halves from disagreeing.
+    def remove(id : Int64) : Bool
       gone = @mutex.synchronize { @rules.find(&.id.==(id)) }
-      @store.delete_extract_rule(id)
-      @mutex.synchronize { @values.delete(gone.name) } if gone
+      ok = @store.delete_extract_rule(id)
+      @mutex.synchronize { @values.delete(gone.name) } if ok && gone
       refresh
+      ok
     end
 
-    def toggle(id : Int64) : Nil
+    # False when the write did NOT commit, or when there is no such rule; see `remove`.
+    def toggle(id : Int64) : Bool
       rule = @mutex.synchronize { @rules.find(&.id.==(id)) }
-      return unless rule
-      @store.set_extract_rule_enabled(id, !rule.enabled?)
+      return false unless rule
+      ok = @store.set_extract_rule_enabled(id, !rule.enabled?)
       refresh
+      ok
     end
 
     # Re-read the store snapshot (an MCP / other-instance edit). Same work `refresh` does,
@@ -271,7 +360,8 @@ module Gori
     def observe(raw : Repeater::Result, subject : InterceptFilter::Subject,
                 flow_id : Int64? = nil) : Array(String)
       return [] of String if raw.error
-      run(candidates(subject), raw, flow_id, entity_available: true)
+      # Not throttled: one deliberate send is one operator action, and they asked for it.
+      run(candidates(subject), raw, flow_id, entity_available: true, throttle: false)
     end
 
     # ── Proxy::ResponseExtract (the proxy response path, slice 2) ─────────────
@@ -352,7 +442,9 @@ module Gori
       # Parsed only now — after the host glob and the condition have both matched. A response
       # no rule claims never pays for this, and neither does one no rule's condition selects.
       raw = Repeater::Result.new(head, body, Proxy::Codec::Http1.parse_response_head(head), 0_i64)
-      run(picked, raw, flow_id, entity_available: !body.nil?)
+      # Throttled: this runs per RESPONSE, so an unthrottled miss writes one `events` row per
+      # message on the response path — see `report_miss?`.
+      run(picked, raw, flow_id, entity_available: !body.nil?, throttle: true)
     rescue ex
       ::Log.warn { "extract rules skipped for a proxied response: #{ex.message}" }
     end
@@ -370,7 +462,7 @@ module Gori
     end
 
     private def run(picked : Array(Compiled), raw : Repeater::Result, flow_id : Int64?,
-                    *, entity_available : Bool) : Array(String)
+                    *, entity_available : Bool, throttle : Bool) : Array(String)
       return [] of String if picked.empty?
       bound = [] of String
       now = Time.utc
@@ -384,8 +476,12 @@ module Gori
           next
         end
         value = Gori::TokenExtract.extract(raw, c.rule.token_loc, c.re)
-        if value.nil? || value.empty?
-          miss(c.rule, value.nil? ? "no match" : "matched an empty value", flow_id)
+        if value.nil?
+          record_miss(c.rule, "no match", flow_id, throttle)
+          next
+        end
+        if reason = unusable(value)
+          record_miss(c.rule, reason, flow_id, throttle)
           next
         end
         @mutex.synchronize { @values[c.rule.name] = Bound.new(value, c.rule.id, now) }
@@ -399,6 +495,39 @@ module Gori
         Env.bump_highlight_rev
       end
       bound
+    end
+
+    # Why an extracted value may not be bound, or nil to bind it. A value that HIT but cannot
+    # be used is still a miss — the previous binding stands and the operator is told which it
+    # was, rather than being left to wonder why `$NAME` did not move.
+    private def unusable(value : String) : String?
+      return "matched an empty value" if value.empty?
+      nil
+    end
+
+    private def record_miss(rule : Store::ExtractRule, reason : String, flow_id : Int64?,
+                            throttle : Bool) : Nil
+      miss(rule, reason, flow_id) if !throttle || report_miss?(rule.id)
+    end
+
+    # Whether this rule's miss is worth an `events` row right now. One row per (rule, binding
+    # revision), which is `Rules#report_unbound`'s key and it is the same flood: on the proxy
+    # path `observe_response` runs for every response the rule's host glob AND condition
+    # select, so a cookie descriptor scoped to a host the operator browses writes one row —
+    # one synchronous store write, on the response path — per subresource. `miss_no_entity`
+    # already deduped for exactly this reason; a plain miss is the far more common one.
+    #
+    # Keyed on the revision rather than latched forever so the report self-resets: `@rev`
+    # moves on every rebind, every clear and every rule edit, which is precisely when "this
+    # rule found nothing" becomes news again.
+    private def report_miss?(rule_id : Int64) : Bool
+      @mutex.synchronize do
+        if @miss_reported_rev != @rev
+          @miss_reported_rev = @rev
+          @miss_reported.clear
+        end
+        @miss_reported.add?(rule_id)
+      end
     end
 
     private def miss(rule : Store::ExtractRule, reason : String, flow_id : Int64?) : Nil

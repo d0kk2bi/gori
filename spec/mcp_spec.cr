@@ -868,6 +868,37 @@ describe Gori::MCP::Server do
       end
     end
 
+    # The same "persists nothing" contract, on the EXTRACT tools. It did not hold: the rule
+    # was written first and `enabled` was read after, so a rejected call left a live, ENABLED
+    # extract rule behind — already observing every matching response and binding its name for
+    # Match&Replace injection. `bool_arg` raises on a non-boolean, and clients that stringify
+    # booleans (`"enabled": "yes"`) are exactly what its own comment warns about.
+    it "rejects a non-boolean 'enabled' on extract create WITHOUT leaving the rule behind" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_extract_rule",) +
+               %("arguments":{"name":"SESSION","kind":"cookie","selector":"sid","enabled":"yes"}}})
+        resp = drive(store, call)[0]["result"]
+        resp["isError"].as_bool.should be_true
+        # The caller's argument, so INVALID_ARGUMENT — not the catch-all's INTERNAL.
+        resp["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+        store.extract_rules.should be_empty
+      end
+    end
+
+    it "rejects a non-boolean 'enabled' on extract update WITHOUT committing the other fields" do
+      with_store do |store|
+        create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_extract_rule",) +
+                 %("arguments":{"name":"SESSION","kind":"cookie","selector":"sid"}}})
+        id = tool_payload(drive(store, create)[0])["id"].as_i64
+        call = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_extract_rule",) +
+               %("arguments":{"id":#{id},"selector":"other","enabled":"nope"}}})
+        resp = drive(store, call)[0]["result"]
+        resp["isError"].as_bool.should be_true
+        resp["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+        store.extract_rules.first.selector.should eq("sid") # unchanged
+      end
+    end
+
     it "rejects an unrecognized match kind instead of silently coercing to literal" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"pattern":"x","match":"regex-ignorecase"}}})
@@ -2656,20 +2687,29 @@ describe "MCP entity links" do
     end
   end
 
-  it "marks a link whose target vanished as stale instead of hiding it" do
+  # This example used to pin the OPPOSITE — that deleting a repeater leaves the link dangling,
+  # "because gone is not the same as never there". That reading only holds where the id cannot
+  # come back, which is true of flows and false of repeaters: `repeaters.id` has no
+  # AUTOINCREMENT and closing the NEWEST tab deletes at the top of the id space, so the
+  # counter resets and the very next tab takes the dead id. The link then resolved
+  # `stale: false` to an unrelated request — an issue's evidence pointer naming a different
+  # URL. A pointer that starts lying is worse than either honest answer, so this one cascades.
+  it "drops a repeater link when the repeater is deleted, because its id can be reused" do
     with_store do |store|
-      rid = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+      rid = store.insert_repeater("https://victim.test/a", "GET /a HTTP/1.1\r\nHost: victim.test\r\n\r\n".to_slice,
         false, true, nil, 0)
       iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
       tools = tools_for(store)
       ok_json(tools, "add_link", %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"repeater","ref_id":#{rid}}))
 
-      # Deleting a repeater does NOT cascade entity_links (unlike deleting a flow), so this
-      # is the path that actually leaves a dangling pointer.
       store.delete_repeater(rid)
-      listed = ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))
-      listed["total"].as_i.should eq(1) # still reported — "gone" is not the same as "never there"
-      listed["links"].as_a.first["stale"].as_bool.should be_true
+      ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
+
+      # The id comes straight back — which is exactly why the link could not be left behind.
+      again = store.insert_repeater("https://unrelated.test/z", "GET /z HTTP/1.1\r\nHost: unrelated.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      again.should eq(rid)
+      ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
     end
   end
 
