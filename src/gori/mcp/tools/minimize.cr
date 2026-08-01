@@ -19,8 +19,13 @@ module Gori
       # (the Gori::Outbound decision its Fuzz::Sender carries hard-blocks a Sandbox/exclude
       # at the socket seam).
       private def minimize_repeater(h) : Result
-        id = int(h, "repeater_id")
-        return Result.new(id_error(h, "repeater_id"), is_error: true) unless id
+        # `delete_repeater` and `update_repeater` name this same thing `id`, so an agent
+        # generalising from its siblings reaches for `id` here. That used to be a SILENT
+        # no-op; now that unknown arguments are a hard error it would be a loud one, which is
+        # the better failure but still a failure over a naming inconsistency. Accept both.
+        key = present?(h, "repeater_id") ? "repeater_id" : "id"
+        id = int(h, key)
+        return Result.new(id_error(h, key), is_error: true) unless id
         rec = store.get_repeater(id)
         return not_found("no repeater with id #{id}") unless rec
 

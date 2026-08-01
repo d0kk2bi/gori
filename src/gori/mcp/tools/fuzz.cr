@@ -245,6 +245,10 @@ module Gori
           # the origin once, not a path a template mutates per-request. The Outbound re-reads
           # the scope periodically, so a mid-run EXCLUDE / Sandbox toggle stops the sweep.
           verify: @verify_upstream && !(bool(h, "insecure") || false),
+          # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
+          # `Fuzz::PlanOptions` and the CLI have always carried it; MCP's only route to it was
+          # create_repeater{sni} → send_request{repeater_id}, i.e. not a sweep at all.
+          sni: str(h, "sni"),
           overrides: HostOverrides.load(store))
         plan = Fuzz::Plan.build(options, ob)
         {plan.engine, plan.origin, plan.total, use_h2}
@@ -553,7 +557,7 @@ module Gori
         # that halts the dispatcher at request 0); fall back to the hard ceiling.
         caller_cap = int(h, "max_requests").try { |m| m > 0 ? m : nil }
         cap = [caller_cap, FUZZ_MAX_REQUESTS].compact.min
-        Fuzz::Config.new(mode: mode,
+        cfg = Fuzz::Config.new(mode: mode,
           concurrency: clamp(int(h, "concurrency"), 20, FUZZ_MAX_CONCURRENCY),
           rps: (rate && rate > 0 ? rate : nil),
           retries: (int(h, "retries") || 0_i64).clamp(0_i64, 1000_i64).to_i,
@@ -562,6 +566,18 @@ module Gori
           max_requests: cap,
           # Absent ⇒ the Config default (on); only an explicit `false` opts out.
           keep_alive: bool_arg(h, "keep_alive", true))
+        # Knobs the Config and the CLI have both always had, and MCP could not reach. Set
+        # after construction rather than added to the already-nine-argument ctor.
+        #
+        # `follow_redirects` is the one that changes RESULTS, not just cost: against an
+        # endpoint that 302s, every status/size/words/lines/regex match runs against the
+        # redirect stub, so an agent-driven run reported uniform "no differences" on exactly
+        # the sweeps the CLI found hits in.
+        cfg.follow_redirects = bool_arg(h, "follow_redirects", cfg.follow_redirects?)
+        int(h, "max_redirects").try { |v| cfg.max_redirects = v.clamp(0_i64, 50_i64).to_i }
+        cfg.auto_calibrate = bool_arg(h, "auto_calibrate", cfg.auto_calibrate?)
+        int(h, "throttle_ms").try { |v| cfg.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
+        cfg
       end
     end
   end

@@ -1316,7 +1316,8 @@ module Gori
               "calibrated baseline (Caido-\"squash\"-style). ACTIVE: sends MANY real outbound " \
               "requests (capped at 250) and is scope-gated. Returns the trimmed request plus " \
               "what was removed; pass apply:true to also save it back to the session." do |s|
-              s.field "repeater_id", intprop("repeater database id"), required: true
+              s.field "repeater_id", intprop("repeater database id (`id` is accepted as an alias — the sibling repeater tools spell it that way)"), required: true
+              s.field "id", intprop("alias for repeater_id")
               s.field "apply", boolprop("write the minimized request back into the session (default false)")
               s.field "allow_unscoped", boolprop("minimize even when the target host is outside — or without — a configured scope (default false)")
             end
@@ -1384,6 +1385,11 @@ module Gori
               s.field "rate", intprop("requests/sec cap (0 = unlimited)")
               s.field "timeout_ms", intprop("per-request connect + idle (read/write) timeout in milliseconds")
               s.field "retries", intprop("retries per request on a network error")
+              s.field "follow_redirects", boolprop("follow 3xx responses (default false). Matters more than it sounds: against an endpoint that 302s, every status/size/words/lines/regex match otherwise runs against the redirect STUB, so a run reports uniform \"no differences\" while the interesting response is one hop away. Mirrors CLI --follow.")
+              s.field "max_redirects", intprop("hop limit when follow_redirects is on")
+              s.field "auto_calibrate", boolprop("drop responses identical to the baseline, so only what a payload CHANGED is reported (mirrors CLI --ac)")
+              s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test")
               s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection across many requests (default true) — one TCP/TLS handshake per worker instead of per request. Set false to dial a fresh connection per request, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection) or when keep-alive handling is itself what you are probing.")
               s.field "http2", boolprop("use real HTTP/2 (default false)")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
