@@ -323,7 +323,7 @@ module Gori
           j.field "#{field}_total_bytes", text.bytesize
           j.field "#{field}_read_more", read_more if read_more
         end
-        return unless cut || !text.valid_encoding?
+        return if !cut && text.valid_encoding?
         j.field "#{field}_lossy", true
         return unless include_sensitive && (bytes = raw)
         j.field "#{field}_base64", Base64.strict_encode(bytes)

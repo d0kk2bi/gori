@@ -274,7 +274,6 @@ module Gori
         when Bool    then raw.to_s
         when Int64   then raw.to_s
         when Float64 then (raw.finite? && raw == raw.trunc) ? raw.to_i64.to_s : nil
-        else              nil
         end
       end
 

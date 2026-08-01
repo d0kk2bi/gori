@@ -297,7 +297,7 @@ module Gori
         # produced a session (`#5 [H2] fieldnative`) that could never be sent again from any
         # surface — the CLI refused it with the pseudo-header message and MCP read its method
         # back as `":method:"`. See `replayable_field_head`.
-        saved_bytes = h2_fields ? replayable_field_head(h2_fields, built, built.bytes) : built.bytes
+        saved_bytes = replayable_field_head(h2_fields, built, built.bytes)
         masked_req = Env.mask_secrets(String.new(saved_bytes))
         repeater_id = store.insert_repeater(
           target: masked_target,
@@ -342,13 +342,16 @@ module Gori
       # exactly what `field_dump` exists to show — but it is lossy in the one direction that
       # keeps the evidence usable, and it is the same projection the h2 CAPTURE path stores
       # for every intercepted h2 request. Evidence gori writes must be replayable by gori.
-      private def replayable_field_head(fields : Array({String, String}),
+      # Nil `fields` means this was never a field-native send, so the bytes are already the
+      # operator's own text and pass through — that way no caller needs a branch of its own.
+      private def replayable_field_head(fields : Array({String, String})?,
                                         built : RequestBuilder::Built, wire : Bytes) : Bytes
+        return wire unless fields
         authority = Proxy::H2::HeadCodec.pseudo(fields, ":authority") ||
                     "#{built.host}:#{built.port}"
         head = Proxy::H2::HeadCodec.synth_request(fields, authority)
         _, body = split_wire_request(wire)
-        return head unless body && !body.empty?
+        return head if body.nil? || body.empty?
         joined = Bytes.new(head.size + body.size)
         head.copy_to(joined)
         body.copy_to(joined + head.size)
@@ -360,7 +363,7 @@ module Gori
       # `wire_request`.
       private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool,
                                           h2_fields : Array({String, String})? = nil) : Int64
-        head, body = split_wire_request(h2_fields ? replayable_field_head(h2_fields, built, wire) : wire)
+        head, body = split_wire_request(replayable_field_head(h2_fields, built, wire))
         # Field-native: `head` is the h1 PROJECTION, not the pseudo-explicit dump, so the
         # method/target COLUMNS (list_history / QL / sitemap read them) come off the FIELDS a
         # receiver routes on and agree with the head text. See `replayable_field_head`.
