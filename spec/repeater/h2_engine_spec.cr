@@ -423,6 +423,58 @@ private def start_h2_origin_early_response(init_window : Int32, after : Int32, s
   port
 end
 
+# An origin that answers a tight window with an INTERIM 1xx and then expects the rest of the
+# body — the complement of `start_h2_origin_early_response`, and the shape that decides
+# whether "a header block on stream 1" may be read as "stop writing". It advertises
+# `init_window`, sends `100 Continue` (HEADERS, END_HEADERS, NO END_STREAM) once the window is
+# spent, then replenishes until the whole body has arrived and answers 200. A client that
+# stops writing at the 1xx starves here. Reports the body bytes it received.
+private def start_h2_origin_interim(init_window : Int32, total : Int32, seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    settings = IO::Memory.new
+    settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian)
+    settings.write_bytes(init_window.to_u32, IO::ByteFormat::BigEndian)
+    send_server_preface(conn, settings.to_slice)
+
+    got = 0
+    sent_interim = false
+    begin
+      until got >= total
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.frame_type == Frame::Type::Data && f.stream_id == 1
+        got += f.payload.size
+        break if f.end_stream?
+        unless sent_interim
+          sent_interim = true
+          ib = HPACK::Encoder.new.encode([{":status", "100"}])
+          conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, ib).to_bytes)
+        end
+        inc = Bytes.new(4)
+        IO::ByteFormat::BigEndian.encode(init_window.to_u32, inc)
+        {0_u32, 1_u32}.each do |sid|
+          conn.write(Frame::Header.new(Frame::Type::WindowUpdate.value, 0_u8, sid, inc).to_bytes)
+        end
+        conn.flush
+      end
+      sb = HPACK::Encoder.new.encode([{":status", "200"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
+      conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "ok".to_slice).to_bytes)
+      conn.flush
+      sleep 0.2.seconds
+    rescue
+    end
+    seen.send(got)
+    conn.close
+  end
+  port
+end
+
 # An origin whose FIRST frame is NOT SETTINGS — a PING or a connection WINDOW_UPDATE — with
 # its real SETTINGS (`init_window`) arriving `delay` later. RFC 9113 §3.4 says SETTINGS comes
 # first, but a client that reads exactly ONE frame draws the wrong conclusion from any other
@@ -1178,6 +1230,25 @@ describe Gori::Repeater::H2Engine do
         seen.receive.should eq(500)
         result.response.try(&.status).should eq(200)
         result.error.should be_nil
+      end
+
+      it "keeps writing the body through an interim 1xx on the same stream" do
+        # The complement that constrains the fix's SHAPE. "A header block arrived on stream 1"
+        # is NOT the end-of-write condition, because a 100 Continue is one — and an
+        # `Expect: 100-continue` origin sends it precisely to ask for the body. END_STREAM is,
+        # and it excludes the interim for free: a 1xx cannot end the stream.
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_interim(4096, 20_000, seen)
+        body = ("I" * 20_000).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/expect"}, {":scheme", "http"}, {":authority", "h"},
+           {"expect", "100-continue"}, {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 3.seconds)
+
+        seen.receive.should eq(20_000)               # the whole body, not 4096
+        result.response.try(&.status).should eq(200) # the FINAL status, not the 100
+        result.error.should be_nil                   # nothing was truncated
       end
     end
 
