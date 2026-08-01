@@ -60,33 +60,7 @@ module Gori
         # Content-Length disagreed with it for a reason the operator did not choose.
         # (`session_plan_options` folds the same two flags together the same way.)
         auto_cl = !verbatim && rec.auto_content_length?
-        # Mirrors the TUI's resolve: env-expand, then Content-Length resync only when the
-        # session has Auto-CL on (the same gate that lets body params be removed at all).
-        # `Minimize.run` hands its `resolve` the request LF-normalized (its text helpers are
-        # written against that form) and restores the operator's terminator only on the
-        # REPORT. `Env.expand_wire` re-terminates the head with CRLF, so the non-verbatim path
-        # never noticed; a verbatim resolver that just took the bytes would have put a
-        # CRLF-stored session on the wire bare-LF — inventing the very desync primitive this
-        # flag exists to preserve. So restore the terminator here, by the same rule
-        # `Minimize#restore_eol` uses, and the wire and the printed report agree.
-        stored_crlf = text.includes?("\r\n")
-        # …with the one case that rule cannot carry: a head whose lines DISAGREE (some CRLF,
-        # some bare LF) is itself a smuggling shape, and minimize's LF round-trip flattens it
-        # to all-CRLF. Nothing here can undo that — the algorithm rebuilds the head — so say
-        # it rather than let `--verbatim` imply a byte-exactness it is not delivering.
-        if verbatim && stored_crlf && mixed_line_endings?(text)
-          STDERR.puts "gori run repeater minimize: session ##{id}'s head mixes CRLF and bare-LF " \
-                      "line endings; minimize rebuilds the head, so every line is sent CRLF-terminated. " \
-                      "Use `gori run repeater send #{id} --verbatim` for a byte-exact replay."
-        end
-        resolve = ->(t : String) do
-          if verbatim
-            stored_crlf ? restore_head_crlf(t) : t.to_slice
-          else
-            raw = Env.expand_wire(t)
-            auto_cl ? Repeater::FlowRequest.resync_content_length(raw) : raw
-          end
-        end
+        resolve = minimize_resolver(id, text, verbatim, auto_cl)
         # Fuzz::Sender applies the Outbound gate (Sandbox / exclude) at the socket seam;
         # CappedBackend bounds total sends. Same stack the TUI builds.
         backend = Fuzz::CappedBackend.new(
@@ -123,6 +97,43 @@ module Gori
         # is the point of storing it).
         report_repeater_minimize(id, report, format, apply, resolve)
         exit 1 if report.aborted
+      end
+
+      # The editor-text → wire-bytes step `Minimize` sends through, and the ONE thing
+      # `--verbatim` changes about this command.
+      #
+      # Draft (default): mirrors the TUI's resolve — env-expand, then a Content-Length resync
+      # only when the session has Auto-CL on (the same gate that lets body params be removed
+      # at all). VERBATIM: neither, because the operator has said the stored bytes ARE the
+      # message — `repeater send --verbatim` means exactly this, and without it a session
+      # holding a capture was either refused outright or minimized against bytes that differ
+      # from what a later send would put on the wire.
+      #
+      # `Minimize.run` hands this proc the request LF-NORMALIZED (its text helpers are written
+      # against that form) and restores the operator's terminator only on the REPORT.
+      # `Env.expand_wire` re-terminates the head with CRLF, so the draft path never noticed; a
+      # verbatim resolver that simply took the bytes would have put a CRLF-stored session on
+      # the wire bare-LF, inventing the very desync primitive the flag exists to preserve.
+      private def self.minimize_resolver(id : Int64, text : String, verbatim : Bool,
+                                         auto_cl : Bool) : Proc(String, Bytes)
+        stored_crlf = text.includes?("\r\n")
+        # The one case that restore cannot carry: a head whose lines DISAGREE (some CRLF, some
+        # bare LF) is itself a smuggling shape, and minimize's LF round-trip flattens it to
+        # all-CRLF. Nothing here can undo that — the algorithm rebuilds the head — so say it
+        # rather than let `--verbatim` imply a byte-exactness it is not delivering.
+        if verbatim && stored_crlf && mixed_line_endings?(text)
+          STDERR.puts "gori run repeater minimize: session ##{id}'s head mixes CRLF and bare-LF " \
+                      "line endings; minimize rebuilds the head, so every line is sent CRLF-terminated. " \
+                      "Use `gori run repeater send #{id} --verbatim` for a byte-exact replay."
+        end
+        ->(t : String) do
+          if verbatim
+            stored_crlf ? restore_head_crlf(t) : t.to_slice
+          else
+            raw = Env.expand_wire(t)
+            auto_cl ? Repeater::FlowRequest.resync_content_length(raw) : raw
+          end
+        end
       end
 
       # Put CRLF terminators back on the HEAD of a `Minimize` working text, leaving the body

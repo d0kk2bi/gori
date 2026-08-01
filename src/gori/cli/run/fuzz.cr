@@ -277,6 +277,17 @@ module Gori
         STDERR.flush
       end
 
+      # A cap that HALTED the run is not the same run as one that finished — say which, and
+      # how much was left untried. Keyed on the TRUE wire count (`requests`, what the cap is
+      # enforced against), and only claimed when payloads really were left: a sweep that
+      # happened to land exactly on its budget with nothing remaining is complete.
+      private def self.warn_fuzz_budget(p : Fuzz::Progress, max_requests : Int64?) : Nil
+        return unless (cap = max_requests) && p.requests >= cap
+        return unless (total = p.total) && p.sent < total
+        STDERR.puts "budget exhausted · stopped at --max-requests #{cap} with " \
+                    "#{total - p.sent} of #{total} payloads untried"
+      end
+
       private def self.fuzz_done(ev : Fuzz::DoneEvent, emitted : Int32, pool : Fuzz::ConnPool?,
                                  max_requests : Int64? = nil) : Nil
         STDERR.print "\r" if STDERR.tty? # clear the in-place meter (none was drawn when piped)
@@ -286,10 +297,7 @@ module Gori
         p = ev.progress
         extra = p.requests > p.sent ? " · #{p.requests} requests on the wire" : ""
         STDERR.puts "done · #{p.sent} sent#{extra} · #{emitted} shown · #{p.errors} errors#{ev.stopped ? " (stopped)" : ""}"
-        # A cap that HALTED the run is not the same run as one that finished — say which.
-        if (cap = max_requests) && p.requests >= cap && (t = p.total) && p.sent < t
-          STDERR.puts "budget exhausted · stopped at --max-requests #{cap} with #{t - p.sent} of #{t} payloads untried"
-        end
+        warn_fuzz_budget(p, max_requests)
         # Sends stopped BEFORE the socket (Sandbox, an exclude rule, an unbound binding). They
         # already appear as per-row errors, but a run that is 100% refused reads as "the
         # target is down" unless the gate is named once, with its remedy.
