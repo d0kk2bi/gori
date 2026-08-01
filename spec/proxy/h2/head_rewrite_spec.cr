@@ -1,4 +1,5 @@
 require "../../spec_helper"
+require "log/spec"
 
 private alias Frame = Gori::Proxy::H2::Frame
 private alias HPACK = Gori::Proxy::H2::HPACK
@@ -532,6 +533,70 @@ describe Gori::Proxy::H2::HeadRewrite do
         headers(1_u32, Bytes.empty), Bytes.empty, false)
       edited = pipe.encode_edited(fine, "HTTP/2 200\r\nx-echo: edited\r\n\r\n".to_slice).not_nil!
       edited.fields.map(&.to_tuple).should eq([{":status", "200"}, {"x-echo", "edited"}])
+    end
+
+    # R3-F3. `finish` snapshots the buffer and calls `reset` up front — deliberately, it closes
+    # a whole class of leak — and `reset` zeroes `@block_stream`. Every warning below that point
+    # then named "stream 0", a stream that cannot exist (stream 0 is the connection). An
+    # operator who did go looking could not map the warning to a flow.
+    it "names the REAL stream in the rule-path warning, not the zeroed @block_stream" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("/two", "/twoLONGER"), direction: "out")
+      evil = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"},
+              {":path", "/two"}, {"x-reflected", "a\r\nx-injected: 1"}]
+      block = HPACK::Encoder.new.encode(evil)
+      Log.capture do |logs|
+        pipe.accept(headers(3_u32, block)) { |f, pre| assembler.feed("out", f, pre) }
+        entry = logs.check(:warn, /no HTTP\/1\.1 text form/).entry
+        entry.message.should contain("stream 3")
+        entry.message.should_not contain("stream 0")
+        # ...and it names the offending FIELD, which is what connects the warning to the probe
+        # that induced it.
+        entry.message.should contain("x-reflected")
+      end
+    end
+
+    # The complement: the SAME connection, the same rule, a head the text CAN carry — the rule
+    # fires and nothing is warned about.
+    it "fires the rule normally on a head that has an h1 text form" do
+      pipe, assembler, sink = pipeline(SubRewriter.new("/two", "/twoLONGER"), direction: "out")
+      ok = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"}, {":path", "/two"}]
+      emitted = [] of Frame::Header
+      pipe.accept(headers(1_u32, HPACK::Encoder.new.encode(ok))) do |f, pre|
+        emitted << f
+        assembler.feed("out", f, pre)
+      end
+      HPACK::Decoder.new.decode(emitted.first.payload)
+        .find { |(n, _)| n == ":path" }.not_nil![1].should eq("/twoLONGER")
+      sink.requests.first.target.should eq("/twoLONGER")
+    end
+
+    # R3-F2. `restore_length` is provenance: an editor that recomputed Content-Length against a
+    # body h2 will not send gets the peer's value back; an operator who DECLARED one keeps it,
+    # exactly as h1 forwards the identical edit byte-exact.
+    it "honours a declared content-length on an edit, and reverts a synced one" do
+      sink = RecSink.new
+      assembler = Gori::Proxy::H2::Assembler.new(sink, "a.test", 443, 1_i64)
+      pipe = Gori::Proxy::H2::HeadRewrite.new("out", nil, assembler, "a.test")
+      fields = [HPACK::Field.new(":method", "POST"), HPACK::Field.new(":scheme", "https"),
+                HPACK::Field.new(":authority", "a.test"), HPACK::Field.new(":path", "/cl"),
+                HPACK::Field.new("content-length", "10")]
+      block = Gori::Proxy::H2::HeadRewrite::Block.new(
+        [] of Frame::Header, HeadBlock.new(fields.map(&.to_tuple)), fields,
+        "POST /cl HTTP/2\r\nHost: a.test\r\ncontent-length: 10\r\n\r\n".to_slice,
+        headers(1_u32, Bytes.empty), Bytes.empty, true)
+      edit = "POST /cl HTTP/2\r\nHost: a.test\r\ncontent-length: 3\r\nx-probe: cl\r\n\r\n".to_slice
+
+      declared = pipe.encode_edited(block, edit, false).not_nil!
+      declared.fields.map(&.to_tuple).should eq([
+        {":method", "POST"}, {":scheme", "https"}, {":authority", "a.test"}, {":path", "/cl"},
+        {"content-length", "3"}, {"x-probe", "cl"},
+      ])
+
+      synced = pipe.encode_edited(block, edit).not_nil!
+      synced.fields.map(&.to_tuple).should eq([
+        {":method", "POST"}, {":scheme", "https"}, {":authority", "a.test"}, {":path", "/cl"},
+        {"content-length", "10"}, {"x-probe", "cl"},
+      ])
     end
 
     it "still adds two headers for a CRLF the OPERATOR wrote — those are their bytes (P7)" do

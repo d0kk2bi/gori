@@ -454,4 +454,130 @@ describe "Interceptor scope gates over an ABSOLUTE-FORM target" do
       end
     end
   end
+  # R2-F5. The ack for a forward/drop/edit is the agent's and the script's ONLY receipt for an
+  # irreversible action on a held message, and one expression composed it for every kind:
+  # `"#{method} #{host}#{target}"`. `Item#target` is deliberately overloaded per kind, so a
+  # proxied h1 request doubled its authority and a held response welded the host to the status
+  # line — `POST 127.0.0.1200 OK`, which reads as HTTP status 1200.
+  describe "Item#label" do
+    it "does not double the authority of an absolute-form (forward-proxy) request target" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        item = ic.enqueue_request("x".to_slice, method: "POST",
+          target: "http://127.0.0.1:19201/held", host: "127.0.0.1", port: 19201,
+          scheme: "http").not_nil!
+        item.label.should eq("POST 127.0.0.1/held")
+      end
+    end
+
+    it "leaves an origin-form request target alone (the case that always read correctly)" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        item = ic.enqueue_request("x".to_slice, method: "POST", target: "/held",
+          host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+        item.label.should eq("POST 127.0.0.1/held")
+      end
+    end
+
+    it "separates a response's status line from the host" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        h1 = ic.enqueue_response("x".to_slice, flow_id: 1_i64, method: "POST", target: "200 OK",
+          host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+        h1.label.should eq("POST 127.0.0.1 -> 200 OK")
+        h1.label.should_not contain("127.0.0.1200")
+        # h2 has no reason phrase (RFC 9113 §8.3.2), so its response target is the bare code.
+        h2 = ic.enqueue_response("x".to_slice, flow_id: 2_i64, method: "GET", target: "200",
+          host: "api.test", port: 443, scheme: "https").not_nil!
+        h2.label.should eq("GET api.test -> 200")
+      end
+    end
+
+    it "identifies WHICH message on a socket, since every row on it shares the handshake" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        out = ic.enqueue_ws("hello".to_slice, to_server: true, method: "GET", target: "/ws",
+          host: "acme.test", port: 443, scheme: "https", flow_id: 9_i64, binary: false).not_nil!
+        out.label.should eq("acme.test/ws client->server 5B")
+        back = ic.enqueue_ws(Bytes[0xFF, 0xFE], to_server: false, method: "GET", target: "/ws",
+          host: "acme.test", port: 443, scheme: "https", flow_id: 9_i64, binary: true).not_nil!
+        back.label.should eq("acme.test/ws server->client 2B")
+      end
+    end
+  end
+
+  # The head/body boundary an intercept edit is split on. Shared with `H2::StreamGate`, which
+  # encodes the head half, so the surface that acks the edit and the gate that applies it
+  # cannot disagree about whether an edit added a body.
+  describe ".split_edit" do
+    it "takes the EARLIEST blank line in either spelling" do
+      head, body = Gori::Interceptor.split_edit("GET / HTTP/2\r\nHost: h\r\n\r\nBODY".to_slice)
+      String.new(head).should eq("GET / HTTP/2\r\nHost: h\r\n\r\n")
+      body.should be_true
+      # LF-joined head (what the intercept editor's TextArea produces) whose BODY carries a
+      # CRLFCRLF: preferring the CRLF form took the boundary INSIDE the body.
+      head, body = Gori::Interceptor.split_edit("GET / HTTP/2\nHost: h\n\nA\r\n\r\nB".to_slice)
+      String.new(head).should eq("GET / HTTP/2\nHost: h\n\n")
+      body.should be_true
+    end
+
+    it "reports no body for a head-only edit, in either spelling" do
+      Gori::Interceptor.split_edit("GET / HTTP/2\r\nHost: h\r\n\r\n".to_slice)[1].should be_false
+      Gori::Interceptor.split_edit("GET / HTTP/2\nHost: h\n\n".to_slice)[1].should be_false
+      # No blank line at all: the whole thing is the head.
+      Gori::Interceptor.split_edit("GET / HTTP/2".to_slice)[1].should be_false
+    end
+  end
+  # R3-F1/F2, the surface half. `refuse_edit` is what every surface that offers an edit asks
+  # BEFORE it decides, because the settle side can only discard — and discarding after an ack
+  # is how "edited: GET 127.0.0.1/unf3" came to mean "the original went on the wire".
+  describe "Item#refuse_edit" do
+    it "refuses every edit to a message gori cannot apply one to, and says why" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        item = ic.enqueue_request("GET /unf3 HTTP/2\r\nHost: h\r\n\r\n".to_slice, method: "GET",
+          target: "/unf3", host: "h", port: 443, scheme: "https", head_only: true,
+          edit_refusal: "the value of \"x-evil\" carries a CR or LF").not_nil!
+        item.refuse_edit("GET /OPERATOR-EDIT HTTP/2\r\nHost: h\r\n\r\n".to_slice)
+          .not_nil!.should contain("x-evil")
+        # ...including one that changes nothing structural: the refusal is about the MESSAGE.
+        item.refuse_edit(item.raw).not_nil!.should contain("x-evil")
+      end
+    end
+
+    it "refuses a body added to a head-only (h2) hold, and allows a head-only edit" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        item = ic.enqueue_request("GET /p HTTP/2\r\nHost: h\r\n\r\n".to_slice, method: "GET",
+          target: "/p", host: "h", port: 443, scheme: "https", head_only: true).not_nil!
+        item.refuse_edit("GET /edited HTTP/2\r\nHost: h\r\n\r\nOPERATORBODY".to_slice)
+          .not_nil!.should contain("HEAD only")
+        # Complement: the same edit without a body is applied.
+        item.refuse_edit("GET /edited HTTP/2\r\nHost: h\r\n\r\n".to_slice).should be_nil
+        # ...and so is one that only declares a content-length. That value is the operator's
+        # RFC 9113 §8.1.1 probe, not a body.
+        item.refuse_edit("POST /edited HTTP/2\r\nHost: h\r\ncontent-length: 3\r\n\r\n".to_slice)
+          .should be_nil
+      end
+    end
+
+    it "leaves an h1 hold (head AND body) free to carry a body, as it always has" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        item = ic.enqueue_request("POST /p HTTP/1.1\r\nHost: h\r\n\r\nab".to_slice, method: "POST",
+          target: "/p", host: "h", port: 80, scheme: "http").not_nil!
+        item.head_only?.should be_false
+        item.edit_refusal.should be_nil
+        item.refuse_edit("POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\n\r\nZZZZ".to_slice)
+          .should be_nil
+      end
+    end
+  end
 end

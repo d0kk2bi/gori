@@ -81,6 +81,11 @@ module Gori::Proxy::H2
       # response HEADERS/DATA frame (time-to-first-byte).
       getter started_at : Time::Instant = Time.instant
       property resp_first_at : Time::Instant? = nil
+      # The stream whose PUSH_PROMISE invented this request, when the client never sent it.
+      # A pushed flow was indistinguishable in History / QL / the Sitemap from one the client
+      # made — the origin authoring rows in an operator's evidence — so the projection says so
+      # (`HeadCodec::PUSHED_MARKER`).
+      property pushed_by : UInt32? = nil
     end
 
     def initialize(@sink : FlowSink, @host : String, @port : Int32, @created_at : Int64,
@@ -316,6 +321,7 @@ module Gori::Proxy::H2
       # Same rule as finish_header_block: `pre` means the block is already decoded.
       promised.req.headers = pre ? (pre.fields || raise Gori::Error.new("h2 push block failed to decode")) : decoder.decode(block)
       promised.req.ended = true
+      promised.pushed_by = frame.stream_id
       emit_request(promised_id, promised)
     end
 
@@ -388,7 +394,7 @@ module Gori::Proxy::H2
       cap = stream.req.body
       body = cap.total == 0 ? nil : cap.to_slice
 
-      head = synth_request_head(headers, authority)
+      head = synth_request_head(headers, authority, stream.req.trailer_names, stream.pushed_by)
       captured = Store::CapturedRequest.new(
         created_at: @created_at, scheme: scheme, host: host, port: port,
         method: method, target: path, http_version: "HTTP/2", head: head, body: body,
@@ -428,6 +434,7 @@ module Gori::Proxy::H2
       emit_request(stream_id, stream) if stream.req.headers && stream.flow_id.nil?
       flow_id = stream.flow_id
       return unless flow_id # never saw request headers — nothing to project
+      reason = extended_connect_note(stream, reason)
       if stream.resp.headers
         if stream.resp.ended
           emit_response(stream) # response fully received; only the request never cleanly closed
@@ -438,6 +445,30 @@ module Gori::Proxy::H2
         duration_us = (Time.instant - stream.started_at).total_microseconds.to_i64
         @sink.on_response(FlowMapper.aborted_response(flow_id, reason, duration_us: duration_us))
       end
+    end
+
+    # RFC 8441 extended CONNECT — `:method CONNECT` plus a `:protocol` pseudo-header, which is
+    # how a WebSocket is opened over HTTP/2. Such a stream ends as an abort ("h2 connection
+    # closed", "stream reset"), and that reason describes the SYMPTOM: what the operator needs
+    # to know is that gori carried the stream but read nothing on it.
+    #
+    # Deliberately an advisory and NOT a refusal. gori relays the ORIGIN's SETTINGS frame
+    # verbatim (`StreamGate#write` / `Relay#emit` on stream 0), so a client facing an origin
+    # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL sees that advertisement and is entitled
+    # to use it — and the CONNECT stream's DATA frames then relay byte-for-byte like any
+    # others. RST-ing it (RFC 9113 §8.5 would allow that for a setting gori itself never sent)
+    # would break a path that works end to end. What does NOT work is everything gori adds:
+    # the WS message transcript, the message gate, intercept and Match&Replace all live on the
+    # HTTP/1.1 Upgrade path, so those frames are opaque DATA here. Say that, on the flow.
+    private def extended_connect_note(stream : Stream, reason : String) : String
+      headers = stream.req.headers
+      return reason unless headers
+      protocol = pseudo(headers, ":protocol")
+      return reason if protocol.nil? || protocol.empty?
+      "#{reason} — this is an RFC 8441 extended CONNECT stream (:protocol #{protocol.inspect}). " \
+      "gori relayed it byte-for-byte but did not decode it: WebSocket messages are read on the " \
+      "HTTP/1.1 Upgrade path only, so this socket has no message transcript, no message " \
+      "intercept and no Match&Replace"
     end
 
     # Called by the relay when the connection closes, to flush any streams still in
@@ -470,8 +501,16 @@ module Gori::Proxy::H2
     # produce the SAME bytes to run rules against — that is what makes the Rewriter tab's
     # preview (`rules.cr:331-345`, which reads exactly this head off a stored flow) agree
     # with what the live proxy does to an h2 head. Two copies would drift; there is one.
-    private def synth_request_head(headers : Array({String, String}), authority : String) : Bytes
-      HeadCodec.synth_request(headers, authority)
+    #
+    # `trailers` is the same CAPTURE-only extra `synth_response_head` passes, and it was
+    # one-sided by omission: a request trailer block is merged into `headers` by
+    # `finish_header_block` exactly as a response one is, so after the merge `x-req-trailer`
+    # read like a header the client sent in its head. `Side#trailer_names` was already being
+    # recorded for both sides.
+    private def synth_request_head(headers : Array({String, String}), authority : String,
+                                   trailers : Array(String)? = nil,
+                                   pushed_by : UInt32? = nil) : Bytes
+      HeadCodec.synth_request(headers, authority, trailers, pushed_by)
     end
 
     # `trailers` is the CAPTURE projection's extra: only the stored head names which fields

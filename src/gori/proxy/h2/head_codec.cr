@@ -39,16 +39,40 @@ module Gori::Proxy::H2
     # host at all, breaking `gori run show` / MCP get_flow / QL `header:host`. Emitted only
     # when the fields carry no explicit (non-pseudo) `host`, which is what makes the
     # mapping reversible: see `parse_request`.
-    def synth_request(fields : Array({String, String}), authority : String) : Bytes
+    #
+    # `trailers` is `synth_response`'s argument, and it is here for the reason `TRAILER_MARKER`
+    # exists at all: a REQUEST trailer block (a gRPC client-streaming call, a `TE: trailers`
+    # probe) is merged into the request head by `Assembler#finish_header_block` exactly as a
+    # response trailer is, and after the merge it reads like a header the client sent in its
+    # head. Whether a target/CDN/WAF treats a trailer as a header is the test the operator came
+    # to run, and that question is no less real on the request side. Passed ONLY by the capture
+    # projection; the rewrite path re-synthesizes from the live fields and passes nothing, so
+    # the fabricated line can never reach an h2 wire.
+    #
+    # `pushed_by` is the same kind of capture-only line for a request the CLIENT NEVER SENT: a
+    # PUSH_PROMISE is the origin inventing a request, and `Assembler#handle_push_promise`
+    # projects it as an ordinary flow, so History / QL / the Sitemap handed an operator reading
+    # for evidence a row the origin authored, with nothing saying so.
+    def synth_request(fields : Array({String, String}), authority : String,
+                      trailers : Array(String)? = nil, pushed_by : UInt32? = nil) : Bytes
       method = pseudo(fields, ":method") || "GET"
       path = pseudo(fields, ":path") || "/"
       String.build do |io|
         io << line_safe(method) << ' ' << line_safe(path) << " HTTP/2\r\n"
         io << "Host: " << line_safe(authority) << "\r\n" if !authority.empty? && !explicit_host?(fields)
         regular(fields) { |n, v| io << line_safe(n) << ": " << line_safe(v) << "\r\n" }
+        if trailers && !trailers.empty?
+          io << TRAILER_MARKER << ": " << line_safe(trailers.join(", ")) << "\r\n"
+        end
+        pushed_by.try { |sid| io << PUSHED_MARKER << ": server push promised on stream " << sid << "\r\n" }
         io << "\r\n"
       end.to_slice
     end
+
+    # See `synth_request`'s `pushed_by`. Same discipline as `TRAILER_MARKER`: additive, on the
+    # stored projection only, so nothing that reads a field off the head changes behaviour and
+    # the line can never reach an h2 wire (the rewrite path re-synthesizes from live fields).
+    PUSHED_MARKER = "X-Gori-Pushed"
 
     # The marker line that names which fields of a synthesized h2 response head arrived in a
     # TRAILING HEADERS block rather than the response head (`Assembler` merges the two — that
@@ -70,6 +94,8 @@ module Gori::Proxy::H2
     # `trailers` names the fields that came from a trailing HEADERS block; it is passed ONLY
     # by the capture projection (`Assembler`). The rewrite path re-synthesizes from the live
     # fields and passes nothing, so this fabricated line can never reach an h2 wire.
+    #
+    # `synth_request` takes the same argument for the same reason — see its own comment.
     def synth_response(fields : Array({String, String}), trailers : Array(String)? = nil) : Bytes
       status = (pseudo(fields, ":status") || "0").to_i? || 0
       String.build do |io|
@@ -225,12 +251,46 @@ module Gori::Proxy::H2
     # §8.1.1), so a rule-changed value would RST the stream instead of rewriting anything.
     # The h1 path restores framing headers after a head rewrite for the same reason (#403,
     # `client_conn.cr:1367`); h2 has no Transfer-Encoding to restore alongside it.
+    #
+    # ## Only for bytes gori produced, never for bytes the operator authored
+    #
+    # That argument is a RULE's. It is not an intercept edit's: on h1 the same edit is
+    # forwarded byte-exact and the comment there says why — "the proxy must not rewrite bytes
+    # the human chose to send (e.g. a deliberately CL-mismatched smuggling probe)"
+    # (`client_conn.cr`). Whether a given origin/CDN/WAF/gRPC gateway actually enforces §8.1.1
+    # is PRECISELY the probe an operator opens the intercept editor to run, and reverting their
+    # value made it unexpressible on the live h2 path — silently, with the surface reporting
+    # success. So the caller decides: `HeadRewrite#rewrite` restores, `#encode_edited` restores
+    # only when the surface that produced the bytes recomputed the value itself (the TUI
+    # editor's `^L`), which on a head-only hold would otherwise declare `content-length: 0`
+    # beside DATA gori is still going to relay.
+    #
+    # Restored IN PLACE. Rejecting and re-appending moved `content-length` to the END of the
+    # field list, so a rule that touched an unrelated header silently reordered the head on the
+    # wire — a change gori made, that nothing displayed, in the one field order a header-order
+    # probe is about.
     def restore_content_length(fields : Array(HPACK::Field),
                                original : Array(HPACK::Field)) : Array(HPACK::Field)
       orig = original.select { |f| f.name == "content-length" }
       return fields if orig.map(&.value) == fields.select { |f| f.name == "content-length" }.map(&.value)
-      fields_out = fields.reject { |f| f.name == "content-length" }
-      fields_out.concat(orig)
+      fields_out = [] of HPACK::Field
+      taken = 0
+      fields.each do |f|
+        if f.name == "content-length"
+          # Positional replacement while the original has one left to give; a rule that ADDED
+          # a `content-length` the peer never sent has its extra occurrences dropped, which is
+          # the same disposition the old reject-then-append had.
+          if o = orig[taken]?
+            fields_out << o
+            taken += 1
+          end
+        else
+          fields_out << f
+        end
+      end
+      # The peer sent more than the rewritten head kept (a rule removed the line). Those go
+      # back at the end — there is no position left to restore them to.
+      fields_out.concat(orig[taken..]) if taken < orig.size
       fields_out
     end
 
@@ -260,6 +320,22 @@ module Gori::Proxy::H2
     # directions, though only `request_pseudo` drops every duplicate while `parse_response`
     # drops only a second `:status`. Duplicate pseudo-headers are malformed either way.
     def h1_faithful?(fields : Array(HPACK::Field), request : Bool) : Bool
+      h1_unfaithful_reason(fields, request).nil?
+    end
+
+    # `h1_faithful?`, but it says WHICH field and WHY — nil when the round trip is sound.
+    #
+    # The refusal above is correct and deliberate; what cost an operator a live test was that it
+    # was invisible. An intercept edit on such a message was accepted by the surface and thrown
+    # away here, and "gori will not apply an edit to this message" is a fact known the moment
+    # the head is decoded, so it can be told BEFORE the operator writes one. A refusal has to
+    # name its real cause, and "the peer's head has no HTTP/1.1 text form" names a class, not a
+    # cause — the operator needs to read `x-evil` and `CR/LF` to connect it to the injection
+    # sink they just probed.
+    #
+    # First offender wins: with a CRLF reflected into three headers the operator fixes the same
+    # thing three times either way, and one field name is a sentence a CLI ack can carry.
+    def h1_unfaithful_reason(fields : Array(HPACK::Field), request : Bool) : String?
       seen = Set(String).new
       regular = false
       fields.each do |f|
@@ -267,14 +343,21 @@ module Gori::Proxy::H2
           # §8.3 puts the pseudo-headers first and `parse_*` re-emits them there, so a peer
           # that sent one AFTER a regular field would get its order corrected. A duplicate is
           # dropped outright by the `seen` guard in `request_pseudo`.
-          return false if regular || !seen.add?(f.name)
-          return false unless pseudo_faithful?(f, fields, request)
+          return "the pseudo-header #{f.name} arrives after a regular field, and the h1 text " \
+                 "form would silently move it back in front (RFC 9113 §8.3)" if regular
+          return "the pseudo-header #{f.name} appears more than once, and the h1 text form " \
+                 "carries only one of them" unless seen.add?(f.name)
+          if reason = pseudo_reason(f, fields, request)
+            return reason
+          end
         else
           regular = true
-          return false unless regular_faithful?(f)
+          if reason = regular_reason(f)
+            return reason
+          end
         end
       end
-      request ? request_shape?(fields, seen) : seen.includes?(":status")
+      request ? request_shape_reason(fields, seen) : shape_reason(seen.includes?(":status"), ":status")
     end
 
     # A regular field survives iff the text can hold it: `header_lines` cuts the line at its
@@ -285,56 +368,86 @@ module Gori::Proxy::H2
     # CRLF truncates the head and drops every field after it, and a lone CR/LF survives here
     # today only because the synthesized EOL happens to be CRLF — the same byte still ends
     # the head early for `StreamGate#split_edit`'s `\n\n` scan on an intercept edit.
-    private def regular_faithful?(f : HPACK::Field) : Bool
+    private def regular_reason(f : HPACK::Field) : String?
       name = f.name
-      !name.empty? && !name.includes?(':') && !line_broken?(name) &&
-        name == name.strip.downcase &&
-        !line_broken?(f.value) && !f.value.starts_with?(' ')
+      return "a header field has an empty name" if name.empty?
+      return "the field name #{name.inspect} contains a colon, and the h1 text form cuts a " \
+             "line at its first colon — it would come back as a different field" if name.includes?(':')
+      return "the field name #{name.inspect} carries a CR or LF, and the h1 text form would " \
+             "read it back as two fields" if line_broken?(name)
+      return "the field name #{name.inspect} is not lowercase and trimmed, and the h1 round " \
+             "trip normalizes it — a different name would go on the wire" unless name == name.strip.downcase
+      return "the value of #{name.inspect} carries a CR or LF, so the h1 text form would read " \
+             "it back as two fields (a header-injection primitive — the raw frames are " \
+             "untouched and the stored head escapes it)" if line_broken?(f.value)
+      return "the value of #{name.inspect} starts with a space, which the h1 round trip eats" if f.value.starts_with?(' ')
+      nil
     end
 
     # A pseudo-header survives iff the start line (or the synthetic `Host:` line) can hold it.
     # A pseudo belonging to the OTHER direction — a `:status` on a request, a `:method` on a
     # response — is copied straight off `original`, exactly like `:scheme` and an unknown one,
     # and so cannot be damaged.
-    private def pseudo_faithful?(f : HPACK::Field, fields : Array(HPACK::Field), request : Bool) : Bool
-      request ? request_pseudo_faithful?(f, fields) : response_pseudo_faithful?(f)
+    private def pseudo_reason(f : HPACK::Field, fields : Array(HPACK::Field), request : Bool) : String?
+      request ? request_pseudo_reason(f, fields) : response_pseudo_reason(f)
     end
 
-    private def request_pseudo_faithful?(f : HPACK::Field, fields : Array(HPACK::Field)) : Bool
-      value = f.value
+    private def request_pseudo_reason(f : HPACK::Field, fields : Array(HPACK::Field)) : String?
       case f.name
-      when ":method"
-        # `request_line` splits the start line on its FIRST space: a method carrying one comes
-        # back with its tail moved into `:path`.
-        !value.empty? && !value.includes?(' ') && !line_broken?(value)
-      when ":path"
-        # A CRLF here splits the START line — the injected field lands ahead of every real one.
-        !value.empty? && !line_broken?(value)
-      when ":authority"
-        # Only the SYNTHETIC `Host:` line can damage it; with an explicit `host` field
-        # `resolve_authority` preserves `:authority` off the original instead.
-        return true if host_carrier?(fields)
-        !value.empty? && !value.starts_with?(' ') && !line_broken?(value)
-      else
-        true
+      when ":method"    then method_reason(f.value)
+      when ":path"      then path_reason(f.value)
+      when ":authority" then host_carrier?(fields) ? nil : authority_reason(f.value)
       end
+    end
+
+    # `request_line` splits the start line on its FIRST space: a method carrying one comes back
+    # with its tail moved into `:path`.
+    private def method_reason(value : String) : String?
+      return ":method is empty, and the h1 text form has no way to say so" if value.empty?
+      return ":method #{value.inspect} contains a space, and the h1 start line splits on its " \
+             "first one — the tail would move into :path" if value.includes?(' ')
+      ":method #{value.inspect} carries a CR or LF, which would split the start line" if line_broken?(value)
+    end
+
+    # A CRLF here splits the START line — the injected field lands ahead of every real one.
+    private def path_reason(value : String) : String?
+      return ":path is empty, and the h1 text form would come back with \"/\" invented" if value.empty?
+      ":path #{value.inspect} carries a CR or LF, which splits the START line — the injected " \
+      "field would land ahead of every real one" if line_broken?(value)
+    end
+
+    # Only the SYNTHETIC `Host:` line can damage `:authority`; with an explicit `host` field
+    # `resolve_authority` preserves it off the original instead, so the caller skips this.
+    private def authority_reason(value : String) : String?
+      return ":authority is empty, and the h1 text form has no way to say so" if value.empty?
+      return ":authority #{value.inspect} starts with a space, which the Host: round trip eats" if value.starts_with?(' ')
+      ":authority #{value.inspect} carries a CR or LF, which the Host: line cannot hold" if line_broken?(value)
     end
 
     # `synth_response` normalizes the code through `to_i` so a stored head does not vary with a
     # peer's padding — which also turns a `:status` of `0200` (§8.3.2 requires exactly three
     # digits, so a conformant client rejects it) into an accepted `200`.
-    private def response_pseudo_faithful?(f : HPACK::Field) : Bool
-      return true unless f.name == ":status"
-      (f.value.to_i? || 0).to_s == f.value
+    private def response_pseudo_reason(f : HPACK::Field) : String?
+      return nil unless f.name == ":status"
+      return nil if (f.value.to_i? || 0).to_s == f.value
+      ":status #{f.value.inspect} is not the normalized form of its code, and the h1 status " \
+      "line would launder it into one a client accepts (RFC 9113 §8.3.2 wants exactly three digits)"
     end
 
     # `synth_request` defaults a missing `:method`/`:path` and `resolve_authority` maps the
     # `Host:` line back to `:authority`, so a request missing any of the three comes back
     # with it INVENTED — §8.3.1 requires all three, so that is another malformed head made
     # acceptable. (`:authority` may legitimately be absent when a `host` field carries it.)
-    private def request_shape?(fields : Array(HPACK::Field), seen : Set(String)) : Bool
-      seen.includes?(":method") && seen.includes?(":path") &&
-        (seen.includes?(":authority") || host_carrier?(fields))
+    private def request_shape_reason(fields : Array(HPACK::Field), seen : Set(String)) : String?
+      shape_reason(seen.includes?(":method"), ":method") ||
+        shape_reason(seen.includes?(":path"), ":path") ||
+        shape_reason(seen.includes?(":authority") || host_carrier?(fields), ":authority")
+    end
+
+    private def shape_reason(present : Bool, name : String) : String?
+      return nil if present
+      "the head carries no #{name}, and the h1 text form would come back with one invented " \
+      "(RFC 9113 §8.3 requires it)"
     end
 
     private def line_broken?(s : String) : Bool

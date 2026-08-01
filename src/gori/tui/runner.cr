@@ -616,7 +616,12 @@ module Gori::Tui
           store.ack_intercept_command(cmd.id, "no_such_item", "item #{item_id} is no longer held")
           return false
         end
-        desc = "#{item.method} #{item.host}#{item.target}"
+        # `Item#label` composes per kind. The one expression that used to live here glued
+        # `host` onto `target`, and `target` is overloaded per kind — so a held response acked
+        # as `POST 127.0.0.1200 OK` (reads as HTTP status 1200) and a proxied h1 request as
+        # `POST 127.0.0.1http://127.0.0.1:19201/held`. This string is the agent's only receipt
+        # for an irreversible action.
+        desc = item.label
         case cmd.verb
         when "forward"
           # The store's ack is the agent's only record, so it reports what actually happened:
@@ -637,6 +642,20 @@ module Gori::Tui
           bytes = cmd.bytes
           unless bytes
             store.ack_intercept_command(cmd.id, "error", "forward_edit missing bytes"); return false
+          end
+          # An edit gori will not apply is REFUSED HERE, at the surface that asked for it, and
+          # the item stays held so the operator can forward it, drop it, or edit it again.
+          #
+          # Both refusals are decided by the settle side (`H2::StreamGate` / `HeadRewrite`) and
+          # used to be discovered there, on the gate's wait fiber, with no path back — the ack
+          # two lines below had already gone out saying "edited". On an h2 message whose head
+          # has no HTTP/1.1 text form that meant gori accepted every edit and applied none,
+          # which is exactly the state a CRLF-injection probe INDUCES. Both facts are pure
+          # functions of the held block, so they are known at hold time and readable here.
+          if refusal = item.refuse_edit(bytes)
+            store.ack_intercept_command(cmd.id, "error", "edit refused (#{desc} is still held) — #{refusal}")
+            push_agent_note(:warn, "intercept edit REFUSED, still held: #{desc}", item)
+            return false
           end
           # Forward the AGENT's edited bytes DIRECTLY — never through view.forward_bytes, which
           # would pull the human editor buffer and re-expand $VARS (wrong bytes + secret leak).
@@ -711,7 +730,7 @@ module Gori::Tui
         next unless ic.forward(it.id)
         secs = @intercept_max_hold_ms // 1000
         goto = (fid = it.flow_id) ? Jobs::Goto.new(:history, fid) : nil
-        @notifications.push(:warn, "auto-forwarded held #{it.method} #{it.host}#{it.target} (no decision after #{secs}s)", goto, source: "app")
+        @notifications.push(:warn, "auto-forwarded held #{it.label} (no decision after #{secs}s)", goto, source: "app")
         reaped = true
       end
       reaped

@@ -91,6 +91,17 @@ private def headers(stream : UInt32, block : Bytes, flags = Frame::END_HEADERS |
   Frame::Header.new(Frame::Type::Headers.value, flags, stream, block)
 end
 
+# RFC 9113 §6.6: the payload is the promised stream id (R + 31 bits) followed by the header
+# block fragment carrying the request the SERVER invented.
+private def push_promise(stream : UInt32, promised : UInt32, block : Bytes) : Frame::Header
+  payload = IO::Memory.new
+  id = Bytes.new(4)
+  IO::ByteFormat::BigEndian.encode(promised, id)
+  payload.write(id)
+  payload.write(block)
+  Frame::Header.new(Frame::Type::PushPromise.value, Frame::END_HEADERS, stream, payload.to_slice)
+end
+
 private def data(stream : UInt32, body : String, flags = 0_u8) : Frame::Header
   Frame::Header.new(Frame::Type::Data.value, flags, stream, body.to_slice)
 end
@@ -352,6 +363,97 @@ describe Gori::Proxy::H2::StreamGate do
       head.find { |(n, _)| n == ":method" }.not_nil![1].should eq("POST") # the head edit lands
       head.any? { |(n, _)| n == "content-length" }.should be_false        # DATA is untouched, so CL is not the operator's to set
       rig.to_origin.any? { |f| f.frame_type == Frame::Type::Data }.should be_false
+    end
+  end
+
+  # ---- R3-F1/F2: what the surface is told BEFORE it acks an edit ---------------
+  #
+  # The refusal itself (#517) is correct: the h1 text is lossy for these heads, so re-parsing
+  # an operator's edit would apply it to a DIFFERENT message. What cost a live test is that it
+  # ran on the wait fiber, after the CLI/MCP/TUI had already reported the edit applied. It is a
+  # pure function of the decoded block, so the item carries it from the moment it is held.
+
+  it "marks a held request whose head has no h1 text form as uneditable, naming the field" do
+    with_ic do |ic|
+      rig = Rig.new(ic)
+      fields = request("/unf") + [{"x-evil", "a\r\nx-injected: yes"}, {"x-tail", "z"}]
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(fields)))
+      settle
+      item = ic.pending.first
+      item.edit_refusal.not_nil!.should contain("x-evil")
+      item.edit_refusal.not_nil!.should contain("CR or LF")
+      item.head_only?.should be_true
+    end
+  end
+
+  # The complement, and the one that matters most: an ordinary head must stay editable, or the
+  # fix would have turned a silent discard into a blanket refusal.
+  it "leaves an ordinary held request editable" do
+    with_ic do |ic|
+      rig = Rig.new(ic)
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/ok"))))
+      settle
+      ic.pending.first.edit_refusal.should be_nil
+    end
+  end
+
+  it "marks a held RESPONSE the same way — the direction a CRLF-injection probe reflects on" do
+    with_ic do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::ResponseOnly)
+      rig = Rig.new(ic)
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/x")), Frame::END_HEADERS))
+      rig.s2c.accept(headers(1_u32, rig.enc_in.encode(response("200") + [{"x-evil", "a\r\nx-injected: 1"}]),
+        Frame::END_HEADERS))
+      settle
+      ic.pending.first.edit_refusal.not_nil!.should contain("x-evil")
+
+      # Complement, same direction, same run shape: a clean response head stays editable.
+      rig.c2s.accept(headers(3_u32, rig.enc_out.encode(request("/y")), Frame::END_HEADERS))
+      rig.s2c.accept(headers(3_u32, rig.enc_in.encode(response("200")), Frame::END_HEADERS))
+      settle
+      ic.pending.find { |it| it.id != 1 }.not_nil!.edit_refusal.should be_nil
+    end
+  end
+
+  # R3-F2. h1 forwards the identical edit byte-exact and its comment says why: "the proxy must
+  # not rewrite bytes the human chose to send (e.g. a deliberately CL-mismatched smuggling
+  # probe)". On h2 that probe is the RFC 9113 §8.1.1 one, and it was unexpressible.
+  it "honours a content-length the operator DECLARED (no editor synced it)" do
+    with_ic do |ic|
+      rig = Rig.new(ic)
+      fields = post("/cl") + [{"content-length", "10"}]
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(fields), Frame::END_HEADERS))
+      settle
+      item = ic.pending.first
+      ic.forward(item.id,
+        "POST /cl HTTP/2\r\nHost: api.example.com\r\ncontent-length: 3\r\nx-probe: cl-mismatch\r\n\r\n".to_slice)
+      settle
+
+      head = head_of(rig.to_origin, 1_u32).not_nil!
+      head.find { |(n, _)| n == "content-length" }.not_nil![1].should eq("3")
+      head.find { |(n, _)| n == "x-probe" }.not_nil![1].should eq("cl-mismatch")
+      # ...and in the position the operator wrote it, not moved to the end of the list.
+      head.map(&.[0]).should eq([":method", ":scheme", ":authority", ":path", "content-length", "x-probe"])
+    end
+  end
+
+  # The complement: a content-length that AGREES with the (absent) body of the edit, which is
+  # exactly what every "update Content-Length" affordance produces on a head-only hold — the
+  # TUI's `^L`, the MCP tool's default, `gori run intercept edit`. Those get the peer's back.
+  it "puts the peer's content-length back when the surface synced it against a body h2 will not send" do
+    with_ic do |ic|
+      rig = Rig.new(ic)
+      fields = post("/cl") + [{"content-length", "10"}]
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(fields), Frame::END_HEADERS))
+      settle
+      item = ic.pending.first
+      ic.forward(item.id,
+        "POST /cl HTTP/2\r\nHost: api.example.com\r\ncontent-length: 0\r\nx-probe: edited\r\n\r\n".to_slice)
+      settle
+
+      head = head_of(rig.to_origin, 1_u32).not_nil!
+      head.find { |(n, _)| n == "content-length" }.not_nil![1].should eq("10")
+      head.find { |(n, _)| n == "x-probe" }.not_nil![1].should eq("edited")
     end
   end
 
@@ -658,6 +760,73 @@ describe Gori::Proxy::H2::StreamGate do
       allowed = request("/api/ok") + [{"x-token", "abc"}]
       rig.c2s.accept(headers(3_u32, rig.enc_out.encode(allowed), Frame::END_HEADERS))
       head_of(rig.to_origin, 3_u32).should eq(allowed)
+    end
+  end
+
+  # ---- R3-F4: server push, the request the ORIGIN invented ---------------------
+  #
+  # `sandbox_refuses_locked` could not reach a PUSH_PROMISE: it arrives on the RESPONSE leg
+  # (where `@ordered` is false) and `head_text` returns nil for it, so `block.head` is nil too.
+  # A promise therefore named any authority it liked and got a History row, on the same
+  # connection that refuses the identical authority on a real request.
+
+  it "refuses a PUSH_PROMISE for an out-of-scope authority and cancels the promised stream" do
+    with_ic(intercept: false) do |ic, scope|
+      scope.add("include", "string", "https://api.example.com/api/")
+      scope.enable_sandbox
+      rig = Rig.new(ic)
+
+      # A real, in-scope request first, so the connection is an ordinary one.
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/api/ok"))))
+      rig.to_origin.map(&.stream_id).should eq([1_u32])
+
+      rig.s2c.accept(push_promise(1_u32, 2_u32,
+        rig.enc_in.encode(request("/pushed", "evil.test"))))
+
+      # The client never learns the promise exists...
+      rig.to_client.any? { |f| f.frame_type == Frame::Type::PushPromise }.should be_false
+      # ...and the ORIGIN is told to cancel the promised stream, which is a client's own §8.4
+      # way of declining a push.
+      rst = rig.to_origin.select { |f| f.frame_type == Frame::Type::RstStream }
+      rst.map(&.stream_id).should eq([2_u32])
+      IO::ByteFormat::BigEndian.decode(UInt32, rst.first.payload).should eq(Gate::CANCEL)
+
+      # Visible in History under the same string a refused request gets, and marked as pushed.
+      pushed = rig.sink.requests.find { |r| r.host == "evil.test" }.not_nil!
+      String.new(pushed.head).should contain("X-Gori-Pushed")
+      rig.sink.responses.map(&.error).should contain(Gate::SANDBOX_REASON)
+
+      # A pushed response already in flight is swallowed rather than written to a client that
+      # never learned the stream exists.
+      rig.s2c.accept(headers(2_u32, rig.enc_in.encode(response("200")), Frame::END_HEADERS))
+      rig.to_client.any? { |f| f.stream_id == 2_u32 }.should be_false
+    end
+  end
+
+  it "relays a PUSH_PROMISE whose promised URL IS in scope" do
+    with_ic(intercept: false) do |ic, scope|
+      scope.add("include", "string", "https://api.example.com/api/")
+      scope.enable_sandbox
+      rig = Rig.new(ic)
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/api/ok"))))
+      rig.s2c.accept(push_promise(1_u32, 2_u32, rig.enc_in.encode(request("/api/sub"))))
+
+      rig.to_client.any? { |f| f.frame_type == Frame::Type::PushPromise }.should be_true
+      rig.to_origin.any? { |f| f.frame_type == Frame::Type::RstStream }.should be_false
+    end
+  end
+
+  it "relays an out-of-scope PUSH_PROMISE when the sandbox is OFF (the scope is a lens then)" do
+    with_ic(intercept: false) do |ic, scope|
+      scope.add("include", "string", "https://api.example.com/api/")
+      # Sandbox NOT enabled.
+      rig = Rig.new(ic)
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/api/ok"))))
+      rig.s2c.accept(push_promise(1_u32, 2_u32, rig.enc_in.encode(request("/pushed", "evil.test"))))
+
+      rig.to_client.any? { |f| f.frame_type == Frame::Type::PushPromise }.should be_true
+      rig.to_origin.any? { |f| f.frame_type == Frame::Type::RstStream }.should be_false
+      rig.heads_in.engaged?.should be_false # and the direction stays byte-exact
     end
   end
 
