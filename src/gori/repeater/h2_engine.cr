@@ -47,22 +47,61 @@ module Gori
         return failure(connect_error(scheme, host, port, verify_upstream), started) unless upstream
         begin
           headers, body = parse_request(request, scheme, host, port, preserve_field_case)
-          write_request(upstream, headers, body)
-          status, resp_headers, resp_body, complete, goaway = read_response(upstream)
-          if status == 0 && resp_headers.empty?
-            # A GOAWAY is the origin naming the reason it hung up (RFC 9113 §6.8) and it is
-            # usually about the bytes GORI sent — reporting it as "no h2 response" sent the
-            # operator looking at the origin. Prefer it over the generic sentence.
-            return failure(goaway ? "#{goaway} from #{host}:#{port}" : "no h2 response from #{host}:#{port}", started)
-          end
-          head = synth_head(status, resp_headers)
-          resp = Proxy::Codec::Http1.parse_response_head(head)
-          Result.new(head, resp_body, resp, elapsed(started), incomplete: !complete)
+          exchange(upstream, headers, body, host, port, started)
         rescue ex
           failure(ex.message || "h2 repeater error", started)
         ensure
           upstream.close rescue nil
         end
+      end
+
+      # Send a hand-authored request as its EXACT HPACK field list — the field-native path.
+      #
+      # `send`/`parse_request` derive the fields from HTTP/1.1 head TEXT, and that text
+      # structurally cannot hold a duplicate pseudo-header, a pseudo AFTER a regular field, a
+      # `:scheme` that disagrees with the connection, `:protocol` (RFC 8441 extended CONNECT),
+      # an unknown pseudo, or a leading-space value — `HeadCodec.h1_faithful?` enumerates
+      # exactly that loss set. A conformance / desync test is MADE of those shapes, so before
+      # this an operator could express none of them on any scripted surface: the blocker was
+      # the CARRIER, not the HPACK encoder, which encodes any of them without complaint.
+      #
+      # Here the fields ARE the message: they reach `write_request` verbatim, in the given
+      # order, with no dedup, reorder, case-fold, strip, `reject_uncarriable`, or `:authority`/
+      # `:scheme` injection — the operator owns every pseudo-header, so an OMITTED `:authority`
+      # is the missing-authority probe, not a bug to repair. The default frame sequence
+      # (PREFACE, SETTINGS, HEADERS[+CONTINUATION at MAX_FRAME], DATA) is unchanged: this
+      # widens WHAT the HEADERS block carries, not HOW it is framed.
+      def self.send_fields(fields : Array({String, String}), body : Bytes?, *, scheme : String,
+                           host : String, port : Int32, verify_upstream : Bool, sni : String? = nil,
+                           timeout : Time::Span? = nil, overrides : Gori::HostOverrides? = nil) : Result
+        started = Time.instant
+        upstream = open(scheme, host, port, verify_upstream, sni, timeout, overrides)
+        return failure(connect_error(scheme, host, port, verify_upstream), started) unless upstream
+        begin
+          exchange(upstream, fields, body, host, port, started)
+        rescue ex
+          failure(ex.message || "h2 repeater error", started)
+        ensure
+          upstream.close rescue nil
+        end
+      end
+
+      # Write the request, read the one-shot response, and shape it into a `Result`. Extracted
+      # from `send` so the h1-text path and the field-native `send_fields` path share the exact
+      # same exchange — the fields differ, the framing and reassembly do not.
+      private def self.exchange(upstream : IO, headers : Array({String, String}), body : Bytes?,
+                                host : String, port : Int32, started : Time::Instant) : Result
+        write_request(upstream, headers, body)
+        status, resp_headers, resp_body, complete, goaway = read_response(upstream)
+        if status == 0 && resp_headers.empty?
+          # A GOAWAY is the origin naming the reason it hung up (RFC 9113 §6.8) and it is
+          # usually about the bytes GORI sent — reporting it as "no h2 response" sent the
+          # operator looking at the origin. Prefer it over the generic sentence.
+          return failure(goaway ? "#{goaway} from #{host}:#{port}" : "no h2 response from #{host}:#{port}", started)
+        end
+        head = synth_head(status, resp_headers)
+        resp = Proxy::Codec::Http1.parse_response_head(head)
+        Result.new(head, resp_body, resp, elapsed(started), incomplete: !complete)
       end
 
       private def self.open(scheme : String, host : String, port : Int32, verify : Bool,
@@ -412,6 +451,51 @@ module Gori
         head.copy_to(joined)
         body.copy_to(joined + head.size)
         joined
+      end
+
+      # The FAITHFUL text view of a field-native request — every field in the order it will be
+      # encoded, PSEUDO-HEADERS INCLUDED, so a duplicate `:method`, a `:scheme` that disagrees
+      # with the connection, `:protocol`, an unknown pseudo and a leading-space value all SHOW.
+      #
+      # This is where "report before capability" is paid: `synth_request`/`encoded_request`
+      # project the fields onto an h1 head, and that projection is the very thing a field-native
+      # request defeats — `:scheme` and every duplicate pseudo vanish (F11), so a new shape
+      # would land INVISIBLE in `run show` and MCP `effective_request` (the F5 failure again).
+      # The pseudo-explicit dump is the same "raw frames are the truth, the projection is a
+      # view" split `Assembler` draws (P7): a RICHER view for the surfaces that report the wire,
+      # never a wire format itself — the wire is the HPACK block `write_request` encodes from
+      # the identical array. It is deliberately NOT a valid HTTP/1.1 head (a duplicate `:method`
+      # has no request line that could hold it); a consumer that needs method/target reads them
+      # off the fields with `pseudo_field`, not by parsing this text.
+      def self.field_dump(fields : Array({String, String}), body : Bytes?) : Bytes
+        head = String.build do |io|
+          fields.each { |(n, v)| io << n << ": " << v << "\r\n" }
+          io << "\r\n"
+        end.to_slice
+        return head unless body && !body.empty?
+        joined = Bytes.new(head.size + body.size)
+        head.copy_to(joined)
+        body.copy_to(joined + head.size)
+        joined
+      end
+
+      # The FIRST value of a pseudo-header (`:method`, `:path`, …) in a field list, or nil.
+      # A field-native request may carry the pseudo more than once (that IS a probe); the
+      # scope gate and the History columns anchor on the first, the same one a conformant
+      # receiver would act on.
+      def self.pseudo_field(fields : Array({String, String}), name : String) : String?
+        HeadCodec.pseudo(fields, name)
+      end
+
+      # A synthetic `METHOD PATH HTTP/2` head for the SCOPE / extract path only. The Sandbox
+      # gate and the binding-extract subject key off a request line (`Outbound.request_target`
+      # reads the path token), and a field-native send has no head text — so one is derived
+      # from the first `:method`/`:path`, the fields a conformant receiver routes on. Never put
+      # on the wire; the HPACK block is.
+      def self.field_scope_line(fields : Array({String, String})) : Bytes
+        method = pseudo_field(fields, ":method") || "GET"
+        path = pseudo_field(fields, ":path") || "/"
+        "#{method} #{path} HTTP/2\r\n\r\n".to_slice
       end
 
       # RFC 9113 §8.2.1: a field name or value may carry no CR, LF or NUL. `rstrip('\r')`

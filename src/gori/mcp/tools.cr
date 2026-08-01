@@ -1107,6 +1107,8 @@ module Gori
               s.field "body", strprop("request body, sent as-is")
               s.field "raw", strprop("verbatim raw HTTP/1.1 request; overrides method/headers/body (scheme/host/port still come from url)")
               s.field "verbatim", boolprop("send 'raw' EXACTLY as given: no $VAR expansion and no bare-LF→CRLF promotion in the head (default false). Use for desync/smuggling tests where a bare LF header terminator IS the payload")
+              s.field "h2_fields", h2fieldsprop
+              s.field "body_base64", strprop("base64 request body for the h2_fields path when the body is not UTF-8 (e.g. a gRPC/protobuf frame); ignored unless h2_fields is set")
               s.field "http2", boolprop("use real HTTP/2; defaults to the flow's version when flow_id is set)")
               s.field "timeout_ms", intprop("per-operation connect + idle (read/write) timeout in milliseconds; a timeout surfaces as a network-error result with error_kind (1-600000)")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
@@ -2193,6 +2195,21 @@ module Gori
                "\"opcode\" to override the frame type"
         JSON.parse(%({"description":#{desc.to_json},"oneOf":) +
                    %([{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},{"type":"string"}]}))
+      end
+
+      # The EXACT HPACK field list for a field-native h2 send (`send_request` h2_fields). An
+      # array of `[name, value]` two-element string arrays; a leading colon marks a
+      # pseudo-header, and NOTHING is normalized — the shapes h1 head text cannot carry (a
+      # duplicate/out-of-order/unknown pseudo, a `:scheme` disagreeing with the connection,
+      # `:protocol`, a leading-space value) are exactly what this expresses.
+      private def h2fieldsprop : JSON::Any
+        desc = "field-native HTTP/2: the exact ordered HPACK field list as [name, value] " \
+               "pairs, e.g. [[\":method\",\"GET\"],[\":path\",\"/\"],[\":scheme\",\"https\"]," \
+               "[\":authority\",\"host\"]]. Sent verbatim — pseudo-headers, duplicates, order, " \
+               "case and leading spaces are all preserved. Forces http2; url still sets the " \
+               "dial origin. Body via `body` (UTF-8) or `body_base64`."
+        JSON.parse(%({"type":"array","description":#{desc.to_json},) +
+                   %("items":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":2}}))
       end
 
       # Accepts a JSON object directly or a JSON-encoded string (LLM clients vary).

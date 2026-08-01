@@ -2,6 +2,11 @@ require "../spec_helper"
 
 private alias R = Gori::Repeater
 
+# A field-native field list carrying the shapes h1 head text cannot hold: a duplicate
+# `:method`, a `:scheme` disagreeing with the connection, an operator-chosen `:authority`.
+FN_FIELDS = [{":method", "GET"}, {":method", "POST"}, {":path", "/fn"},
+             {":scheme", "http"}, {":authority", "spoofed"}]
+
 # The builder takes the Outbound as an argument (Layer-1 strictness differs per surface on
 # purpose), so the equivalence check uses one ungated decision for all three — the gate is
 # not what is under test here, `spec/outbound_spec.cr` owns that.
@@ -223,6 +228,42 @@ describe Gori::Repeater::Plan do
         default_target: "http://[::1]:8080"), ungated)
       plan.host.should eq("::1")
       plan.port.should eq(8080)
+    end
+  end
+
+  describe "field-native h2 (h2_fields)" do
+    it "builds a field-native plan: forces http2, carries the fields, needs no request bytes" do
+      plan = R::Plan.build(R::PlanOptions.new(
+        h2_fields: FN_FIELDS, target: "https://t.test:8443"), ungated)
+      plan.http2?.should be_true
+      plan.websocket?.should be_false
+      plan.h2_fields.should eq(FN_FIELDS)
+      plan.scheme.should eq("https")
+      plan.host.should eq("t.test")
+      plan.port.should eq(8443)
+    end
+
+    it "carries a field-native body onto the plan" do
+      plan = R::Plan.build(R::PlanOptions.new(
+        h2_fields: FN_FIELDS, h2_body: "payload".to_slice, target: "https://t.test"), ungated)
+      String.new(plan.h2_body.not_nil!).should eq("payload")
+    end
+
+    # `refusal`, the scope gate and `unbound_refusal?` all key off a request LINE, and a
+    # field-native send has no head text — so `requests` holds ONE synthetic scope line built
+    # from the FIRST :method/:path (the pair a receiver routes on). This pins that derivation
+    # so the scope decision cannot silently start reading `/` for every field-native send.
+    it "synthesizes the scope request line from the first :method/:path" do
+      plan = R::Plan.build(R::PlanOptions.new(
+        h2_fields: FN_FIELDS, target: "https://t.test"), ungated)
+      String.new(plan.bytes).should start_with("GET /fn HTTP/2\r\n")
+    end
+
+    it "still resolves the origin (a bad target is refused before any send)" do
+      ex = expect_raises(R::PlanError) do
+        R::Plan.build(R::PlanOptions.new(h2_fields: FN_FIELDS, target: "ftp://t.test"), ungated)
+      end
+      ex.reason.should eq(R::PlanError::Reason::UnsupportedScheme)
     end
   end
 

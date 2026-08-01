@@ -16,9 +16,123 @@ module Gori
         elsif sub == "minimize"
           cmd_repeater_minimize(args[1..])
           return
+        elsif sub == "h2"
+          cmd_repeater_h2fields(args[1..])
+          return
         end
 
         cmd_repeater_single(args)
+      end
+
+      # `gori run repeater h2 --target URL --fields FILE` — send a FIELD-NATIVE HTTP/2 request:
+      # the exact HPACK field list, no HTTP/1.1 head text in between. That text structurally
+      # cannot hold a duplicate pseudo-header, a pseudo after a regular field, a `:scheme` that
+      # disagrees with the connection, `:protocol` (RFC 8441), an unknown pseudo, or a
+      # leading-space value — `HeadCodec.h1_faithful?` is the loss set — so a conformance /
+      # desync test made of those shapes had no scripted surface. Here they go on the wire
+      # verbatim.
+      #
+      # The field list comes from a FILE, not a flag: it is long, and its colons and spaces are
+      # painful to shell-quote correctly — the same reason `create` reads a request from `-f`.
+      # The file is JSON: either a bare array `[[":method","GET"],…]`, or an object
+      # `{"fields": […], "body": "…"}` / `{"fields": […], "body_base64": "…"}`.
+      private def self.cmd_repeater_h2fields(args : Array(String)) : Nil
+        db_path : String? = nil
+        project_name : String? = nil
+        target : String? = nil
+        fields_file : String? = nil
+        insecure = false
+        allow_unscoped = false
+        format = :text
+
+        parser = OptionParser.new do |p|
+          p.banner = "Usage: gori run repeater h2 --target URL --fields FILE [options]\n\n" \
+                     "Send a field-native HTTP/2 request (exact HPACK field list, no h1-text carrier).\n" \
+                     "FILE is JSON: a [[name,value],…] array, or {\"fields\":[…],\"body\":\"…\"}."
+          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
+          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          p.on("-tURL", "--target=URL", "Dial origin (scheme://host[:port]); :authority/:scheme in the fields may differ") { |v| target = v }
+          p.on("--fields=FILE", "JSON file with the ordered HPACK field list (and optional body)") { |v| fields_file = v }
+          p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
+          p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
+          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
+          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.invalid_option { |f| abort "gori run repeater h2: unknown option: #{f}\n#{p}" }
+          p.missing_option { |f| abort "gori run repeater h2: missing value for #{f}" }
+        end
+        parser.parse(args)
+
+        tgt = target
+        abort "gori run repeater h2: --target is required" if tgt.nil? || tgt.empty?
+        file = fields_file
+        abort "gori run repeater h2: --fields is required" if file.nil? || file.empty?
+        abort "gori run repeater h2: --fields file '#{file}' is not readable" unless File.exists?(file) && !File.directory?(file)
+        fields, body = parse_h2_fields_file(File.read(file))
+
+        overrides = begin
+          store = open_store(resolve_read_project(project_name, db_path))
+          begin
+            Gori::HostOverrides.load(store)
+          ensure
+            store.close
+          end
+        end
+        outbound = project_outbound(project_name, db_path, allow_unscoped)
+        plan = begin
+          Repeater::Plan.build(Repeater::PlanOptions.new(
+            h2_fields: fields, h2_body: body, target: tgt,
+            http2: true, verify: !insecure, overrides: overrides), outbound)
+        rescue ex : Repeater::PlanError
+          repeater_plan_abort("gori run repeater h2", ex)
+        end
+        abort_if_out_of_scope!(outbound, plan, "gori run repeater h2")
+        abort_if_blocked!(plan, "gori run repeater h2")
+        result = plan.send
+        outbound.close
+
+        new_body, _ = decode_body(result.head, result.body)
+        emit_repeater_result(result, new_body, nil, format)
+        exit 1 unless result.ok?
+      end
+
+      # Parse the `--fields` JSON into the ordered HPACK field list and optional body. Accepts a
+      # bare `[[name,value],…]` array or an object `{"fields":[…],"body":"…"/"body_base64":"…"}`.
+      # NOTHING is normalized — a leading colon, a leading-space value, an uppercase name are
+      # the payload. `abort`s with a clean message on a shape that is not a pair list.
+      private def self.parse_h2_fields_file(text : String) : {Array({String, String}), Bytes?}
+        doc = begin
+          JSON.parse(text)
+        rescue ex : JSON::ParseException
+          abort "gori run repeater h2: --fields is not valid JSON: #{ex.message}"
+        end
+        # The BARE-ARRAY form has no object to read `body`/`body_base64` from, and
+        # `JSON::Any#[]?(String)` RAISES on an array rather than returning nil — so reading
+        # the body keys unconditionally crashed the very form the help text advertises first.
+        # Hold the object (if there is one) instead of re-indexing `doc`.
+        obj = doc.as_h?
+        arr = doc.as_a? || obj.try(&.["fields"]?).try(&.as_a?)
+        abort "gori run repeater h2: --fields must be a [[name,value],…] array or {\"fields\":[…]}" unless arr
+        fields = [] of {String, String}
+        arr.each do |item|
+          pair = item.as_a?
+          abort "gori run repeater h2: each field must be a [name, value] pair" unless pair && pair.size == 2
+          name = pair[0].as_s?
+          value = pair[1].as_s?
+          abort "gori run repeater h2: field names and values must both be strings" if name.nil? || value.nil?
+          fields << {name, value}
+        end
+        abort "gori run repeater h2: the field list is empty" if fields.empty?
+        body =
+          if b64 = obj.try(&.["body_base64"]?).try(&.as_s?)
+            begin
+              Base64.decode(b64)
+            rescue
+              abort "gori run repeater h2: 'body_base64' is not valid base64"
+            end
+          else
+            obj.try(&.["body"]?).try(&.as_s?).try(&.to_slice)
+          end
+        {fields, body}
       end
 
       private def self.cmd_repeater_list(args : Array(String)) : Nil
@@ -726,7 +840,8 @@ module Gori
                      "Re-send a captured flow. Or manage repeater sessions:\n" \
                      "  gori run repeater list                List repeater sessions in the workbench\n" \
                      "  gori run repeater create [options]    Create a repeater session (--flow/--request-file/--request-raw)\n" \
-                     "  gori run repeater send <id> [opts]    Replay a saved repeater SESSION (not a flow id)\n\n" \
+                     "  gori run repeater send <id> [opts]    Replay a saved repeater SESSION (not a flow id)\n" \
+                     "  gori run repeater h2 [options]        Send a field-native HTTP/2 request (--target/--fields)\n\n" \
                      "Options (single-flow replay):"
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }

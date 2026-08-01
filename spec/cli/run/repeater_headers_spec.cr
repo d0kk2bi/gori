@@ -87,3 +87,43 @@ describe "gori run repeater — -H / --rm-header" do
     out.should contain("X-Dup: one\r\nX-Dup: two\r\n")
   end
 end
+
+# `gori run repeater h2 --fields FILE` accepts two shapes, and the BARE ARRAY is the one the
+# help text advertises first. Reading the optional body keys off `doc` unconditionally CRASHED
+# on it — `JSON::Any#[]?(String)` raises on an array rather than returning nil — so the
+# documented primary form was an unhandled exception while the object form worked.
+module Gori::CLI::Run
+  def self.parse_h2_fields_file_for_spec(text : String) : {Array({String, String}), Bytes?}
+    parse_h2_fields_file(text)
+  end
+end
+
+describe "gori run repeater h2 — --fields parsing" do
+  it "accepts a bare [[name,value],…] array (no body)" do
+    fields, body = Gori::CLI::Run.parse_h2_fields_file_for_spec(
+      %([[":method","GET"],[":method","POST"],[":scheme","http"],["X-Up","  lead"]]))
+    fields.should eq([{":method", "GET"}, {":method", "POST"}, {":scheme", "http"}, {"X-Up", "  lead"}])
+    body.should be_nil
+  end
+
+  it "keeps duplicates, order, case and leading whitespace — the fields ARE the payload" do
+    fields, _ = Gori::CLI::Run.parse_h2_fields_file_for_spec(
+      %([["x-b","2"],[":path","/late-pseudo"],["X-MiXeD","  v  "]]))
+    # A pseudo AFTER a regular field, an uppercase name, and a value with leading AND trailing
+    # spaces: each is illegal h2 and each is a conformance probe. Nothing normalizes them.
+    fields.should eq([{"x-b", "2"}, {":path", "/late-pseudo"}, {"X-MiXeD", "  v  "}])
+  end
+
+  it "accepts the object form with a plain body" do
+    fields, body = Gori::CLI::Run.parse_h2_fields_file_for_spec(
+      %({"fields":[[":method","POST"]],"body":"hi"}))
+    fields.should eq([{":method", "POST"}])
+    String.new(body.not_nil!).should eq("hi")
+  end
+
+  it "accepts the object form with body_base64, for bytes JSON cannot carry" do
+    _, body = Gori::CLI::Run.parse_h2_fields_file_for_spec(
+      %({"fields":[[":method","POST"]],"body_base64":"AAECgP8="}))
+    body.not_nil!.to_a.should eq([0x00, 0x01, 0x02, 0x80, 0xFF])
+  end
+end

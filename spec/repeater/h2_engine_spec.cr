@@ -610,4 +610,82 @@ describe Gori::Repeater::H2Engine do
     result.response.not_nil!.status.should eq(200)
     result.body.not_nil!.size.should eq(100_000)
   end
+
+  describe ".send_fields" do
+    # The whole reason the field-native path exists: an HTTP/1.1 head cannot carry a duplicate
+    # pseudo-header, a pseudo AFTER a regular field, a `:scheme` that disagrees with the
+    # connection, an unknown pseudo, or a leading-space value — `HeadCodec.h1_faithful?` is
+    # exactly that loss set — so `send`/`parse_request` could express NONE of them. Here the
+    # fields ARE the message: the origin must see them byte-for-byte, in order, unnormalized.
+    it "puts the EXACT field list on the wire, in order, with the shapes h1 text cannot hold" do
+      seen = Channel({Array({String, String}), Array({String, Int32})}).new(1)
+      port = start_h2_origin_recording(seen)
+
+      fields = [
+        {":method", "GET"}, {":method", "POST"}, # duplicate pseudo (parser-differential)
+        {"x-early", "1"},                        # a regular field BEFORE the rest of the pseudos
+        {":path", "/fn"}, {":scheme", "http"},   # :scheme disagrees with the (cleartext, but "http") conn
+        {":authority", "spoofed.example"},       # authority the operator chose, not the dial host
+        {":foo", "bar"},                         # unknown pseudo
+        {"X-Upper", "  lead"},                   # uppercase name + leading-space value
+      ]
+      result = Gori::Repeater::H2Engine.send_fields(fields, nil,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+      got, _ = seen.receive
+      got.should eq(fields) # nothing dropped, reordered, deduped, folded or stripped
+      result.ok?.should be_true
+    end
+
+    it "sends a field-native body as a DATA frame with END_STREAM" do
+      seen = Channel(String).new(1)
+      port = start_h2_origin(201, "created", seen)
+
+      fields = [{":method", "POST"}, {":path", "/upload"}, {":scheme", "https"}, {":authority", "h"}]
+      result = Gori::Repeater::H2Engine.send_fields(fields, "payload".to_slice,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+      seen.receive.should eq("POST /upload body=payload")
+      result.response.not_nil!.status.should eq(201)
+    end
+
+    # The default frame sequence (and MAX_FRAME chunking) is UNCHANGED — this widens what the
+    # HEADERS block carries, not how it is framed. A 30 KB pseudo value still splits.
+    it "still splits an over-size field block into HEADERS + CONTINUATION at MAX_FRAME" do
+      seen = Channel({Array({String, String}), Array({String, Int32})}).new(1)
+      port = start_h2_origin_recording(seen)
+
+      fields = [{":method", "GET"}, {":path", "/big"}, {":scheme", "https"}, {":authority", "h"},
+                {"x-big", "A" * 30_000}]
+      Gori::Repeater::H2Engine.send_fields(fields, nil,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+      got, shape = seen.receive
+      shape.size.should be > 1
+      shape.first[0].should eq("Headers")
+      shape[1..].each { |(type, _)| type.should eq("Continuation") }
+      shape.each { |(_, size)| size.should be <= Gori::Repeater::H2Engine::MAX_FRAME }
+      got.should contain({"x-big", "A" * 30_000})
+    end
+  end
+
+  describe ".field_dump" do
+    # "Report before capability": `synth_request`'s h1 projection drops `:scheme` and collapses
+    # a duplicate pseudo (F11), so a field-native shape would land INVISIBLE in `run show` /
+    # MCP `effective_request` (the F5 failure). The dump is the faithful view — every field, in
+    # order, pseudo-headers included — the same raw-frames-are-truth split `Assembler` draws.
+    it "renders every field in order, pseudo-headers and duplicates included" do
+      fields = [{":method", "GET"}, {":method", "POST"}, {":path", "/x"},
+                {":scheme", "http"}, {":authority", "h"}, {"x-foo", "bar"}]
+      dump = String.new(Gori::Repeater::H2Engine.field_dump(fields, nil))
+      dump.should eq(":method: GET\r\n:method: POST\r\n:path: /x\r\n:scheme: http\r\n" \
+                     ":authority: h\r\nx-foo: bar\r\n\r\n")
+    end
+
+    it "appends the body after the blank line" do
+      fields = [{":method", "POST"}, {":path", "/p"}, {":scheme", "https"}, {":authority", "h"}]
+      dump = String.new(Gori::Repeater::H2Engine.field_dump(fields, "hello".to_slice))
+      dump.should end_with("\r\n\r\nhello")
+    end
+  end
 end

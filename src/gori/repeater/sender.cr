@@ -95,6 +95,23 @@ module Gori
         result
       end
 
+      # Send a field-native h2 request: the operator's exact HPACK field list plus body, with
+      # no h1-text carrier in between (see `H2Engine.send_fields`). Gated identically to `send`
+      # — Sandbox / exclude on a request line synthesized from `:method`/`:path`, so a
+      # field-native send can no more reach a blocked host than a byte-authored one. The
+      # unbound-`$NAME` half of `refusal` is harmless here: it scans only that synthetic line,
+      # which carries no operator token, so a field-native path is never expanded or injected.
+      def send_fields(fields : Array({String, String}), body : Bytes?) : Result
+        scope = H2Engine.field_scope_line(fields)
+        if reason = refusal(scope)
+          return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
+        end
+        result = H2Engine.send_fields(fields, body, scheme: @scheme, host: @host, port: @port,
+          verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
+        extract(scope, result)
+        result
+      end
+
       def send_group(requests : Array(Bytes)) : Array(Result)
         if reason = group_refusal(requests)
           return requests.map { Result.new(Bytes.new(0), nil, nil, 0_i64, reason) }
