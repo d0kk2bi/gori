@@ -266,6 +266,35 @@ describe Gori::MCP::Server do
       end
     end
 
+    # `flows.id` is a REUSABLE rowid, so a clear restarts numbering and a forward cursor held
+    # from before it is permanently ahead of every row. `since` then returned `[]` forever
+    # while the rows sat right there — "no new flows" and "your cursor is stranded" were the
+    # same answer, and an agent polling this feed simply went blind.
+    it "names a stranded 'since' cursor instead of answering with an empty page forever" do
+      with_store do |store|
+        3.times { |i| seed_flow(store, "h.test", "GET", "/p#{i}", 200) }
+        store.clear_flows
+        fresh = seed_flow(store, "h.test", "GET", "/after-clear", 200)
+        fresh.should eq(1) # ids really do restart — that is what strands the cursor
+
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"since":22}}})
+        resp = drive(store, call)[0]
+        resp["result"]["isError"].as_bool.should be_true
+        text = resp["result"]["content"][0]["text"].as_s
+        text.should contain("ahead of the newest flow")
+        text.should contain("since=0")
+      end
+    end
+
+    it "still answers an in-range 'since' cursor normally" do
+      with_store do |store|
+        a = seed_flow(store, "h.test", "GET", "/a", 200)
+        b = seed_flow(store, "h.test", "GET", "/b", 200)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"since":#{a}}}})
+        tool_payload(drive(store, call)[0]).as_a.map(&.["id"].as_i64).should eq([b])
+      end
+    end
+
     it "paginates filtered results with before_id" do
       with_store do |store|
         a = seed_flow(store, "h.test", "GET", "/a", 500)
@@ -2137,6 +2166,28 @@ describe Gori::MCP::Serialize do
 end
 
 describe Gori::MCP::RequestBuilder do
+  # `normalize_raw` exists so a hand-typed request still frames, but a bare-LF header
+  # terminator is a standard front-end/back-end desync primitive — promoting it removed a
+  # whole payload class from this surface while the TUI's byte modes could always send it.
+  it "promotes a bare LF in the head by default" do
+    raw = "GET /v HTTP/1.1\r\nHost: h.test\nX-B: lf\n\r\n"
+    args = JSON.parse({"url" => "http://h.test/", "raw" => raw}.to_json).as_h
+    String.new(Gori::MCP::RequestBuilder.build(args).bytes)
+      .should eq("GET /v HTTP/1.1\r\nHost: h.test\r\nX-B: lf\r\n\r\n")
+  end
+
+  it "keeps the bare LF byte-exact under verbatim" do
+    raw = "GET /v HTTP/1.1\r\nHost: h.test\nX-B: lf\n\r\n"
+    args = JSON.parse({"url" => "http://h.test/", "raw" => raw, "verbatim" => true}.to_json).as_h
+    String.new(Gori::MCP::RequestBuilder.build(args).bytes).should eq(raw)
+  end
+
+  it "leaves a $VAR unexpanded under verbatim, for Plan.build to refuse" do
+    raw = "GET /v HTTP/1.1\r\nHost: h.test\r\nX-T: $NOPE\r\n\r\n"
+    args = JSON.parse({"url" => "http://h.test/", "raw" => raw, "verbatim" => true}.to_json).as_h
+    String.new(Gori::MCP::RequestBuilder.build(args).bytes).should contain("$NOPE")
+  end
+
   it "builds exact request bytes with Host + Content-Length" do
     args = JSON.parse(%({"url":"https://h.test:8443/a?b=1","method":"post","headers":{"X-Test":"y"},"body":"hi"})).as_h
     built = Gori::MCP::RequestBuilder.build(args)

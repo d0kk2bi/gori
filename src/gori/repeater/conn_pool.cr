@@ -2,6 +2,21 @@ require "../proxy/codec/body"
 require "../proxy/codec/http1"
 require "./engine"
 
+# Non-blocking "is there residue in the read buffer?" — the piece Crystal's public IO has no
+# way to ask. `ConnPool#drained?` needs it because `read_head` reads byte-by-byte through the
+# buffered layer, which pulls a large chunk off the socket into `@in_buffer_rem`; any bytes
+# the origin left past the framed body therefore sit in THAT buffer, not on the kernel socket,
+# where an fd-level `MSG_PEEK` cannot see them. `peek` would find them but calls `fill_buffer`
+# (blocking) when the buffer is empty, which is the common clean-socket case — so it cannot be
+# used on the keep-alive fast path. Reading `@in_buffer_rem` directly is the only non-blocking
+# answer. The name is long-standing Crystal internals; if it ever changes this fails to compile
+# rather than silently misbehaving.
+module IO::Buffered
+  def gori_buffered_residue? : Bool
+    !@in_buffer_rem.empty?
+  end
+end
+
 module Gori::Repeater
   # HTTP/1.1 keep-alive connection pool for a sweep's sends.
   #
@@ -85,6 +100,16 @@ module Gori::Repeater
       # bytes were consumed — see reusable_response?.
       method = Repeater::Engine.request_method(bytes)
       if keepable && (io = @idle.pop?)
+        # Residue check AT CHECKOUT, not only when we parked it. The previous exchange's leftover
+        # bytes (a body past Content-Length, a HEAD-with-body) may not have arrived by the time
+        # `recycle` ran — the origin can be a peer whose write races our park — so `recycle`'s
+        # check is an early retire, and THIS one, right before we write onto the socket, is the
+        # reliable one: by now any straggler residue is on the wire. Without it a poisoned socket
+        # would frame this request's response against the previous response's leftovers.
+        unless drained?(io)
+          close(io)
+          return dial_and_send(bytes, keepable, method)
+        end
         started = Time.instant
         result = Repeater::Engine.exchange(io, bytes, @host, @port, started)
         if stale?(result)
@@ -132,6 +157,14 @@ module Gori::Repeater
     # Park the socket for the next send, or close it. Same retirement rule `send_pipeline`
     # applies to a group's connection (error or incomplete ⇒ unusable), plus the response's
     # own keep-alive signals.
+    #
+    # The EMPTY-socket check that guards against residue (a body past Content-Length, a
+    # HEAD-with-body — the canonical response-desync primitives gori exists to DETECT) lives at
+    # CHECKOUT (`send`), not here. Residue can arrive AFTER we would park — the origin's write
+    # races our recycle — so checking here would miss a straggler and still hand a poisoned
+    # socket to the next send. `reusable_response?` interrogates only the response HEAD and
+    # cannot see the leftover bytes; the checkout-time `drained?` is what catches them, once
+    # they are reliably on the wire.
     private def recycle(io : IO, result : Repeater::Result, keepable : Bool, method : String) : Nil
       if @pooling && keepable && @idle.size < @max_idle && ConnPool.reusable_response?(result, method)
         @idle.push(io)
@@ -140,8 +173,84 @@ module Gori::Repeater
       end
     end
 
+    # POSIX `MSG_PEEK` — read-without-consume. Not in Crystal's `LibC`, but the value is
+    # 0x02 on every platform gori targets (Linux, macOS, the BSDs).
+    MSG_PEEK = 0x02
+
+    # The short-probe deadline for a non-`TCPSocket` (TLS) socket, where the fd trick below
+    # cannot see decrypted application bytes. Only ever paid on a socket that turns out
+    # CLEAN, which is the common case — but a reused TLS socket has already saved a full
+    # handshake, so a millisecond to prove it is safe is a good trade.
+    DRAIN_PROBE = 1.millisecond
+
+    # Whether the socket has NO unread bytes waiting. A parked socket must be empty, or the
+    # next request reads the leftovers as its own response.
+    #
+    # For a plaintext `TCPSocket` this is an fd-level `MSG_PEEK` — Crystal's socket fd is
+    # already non-blocking (evented IO), so `recv` returns immediately: `EAGAIN`/`EWOULDBLOCK`
+    # means nothing is waiting (drained), any byte or an EOF means retire. ~0.3µs, so it costs
+    # the keep-alive fast path nothing. A TLS socket hides its fd and the residue may sit in
+    # OpenSSL's decrypted buffer where a raw peek cannot see it, so it falls back to a short
+    # read probe, which naturally covers both `SSL_pending` and a kernel-buffered record.
+    private def drained?(io : IO) : Bool
+      # 1. Residue already pulled into the buffered layer by `read_head`'s byte reads. This is
+      #    where a body-past-Content-Length or a HEAD-with-body actually lands, and it is
+      #    non-blocking, so it must be checked FIRST.
+      return false if io.is_a?(IO::Buffered) && io.gori_buffered_residue?
+      # 2. Residue still on the kernel socket. A plaintext `TCPSocket`'s fd is non-blocking
+      #    (evented IO), so `MSG_PEEK` returns at once: `EAGAIN`/`EWOULDBLOCK` = nothing waiting
+      #    (drained), any byte or EOF = retire. ~0.3µs, so the clean plaintext path pays
+      #    nothing. A TLS socket hides its fd and OpenSSL may hold a partial record, so it
+      #    falls back to a short read probe (only ever paid on a socket that turns out clean —
+      #    and a reused TLS socket has already saved a whole handshake).
+      # EOF here (the peer already sent FIN) is deliberately NOT treated as residue: a closed
+      # socket is the idle-timeout race the stale-retry path already handles by re-sending on a
+      # fresh connection, and papering over it here would bypass STALE_GIVE_UP's bookkeeping.
+      # Only actual WAITING BYTES cause misattribution, so only those retire the socket.
+      if io.is_a?(TCPSocket)
+        buf = uninitialized UInt8[1]
+        n = LibC.recv(io.fd, buf.to_unsafe.as(Void*), LibC::SizeT.new(1), MSG_PEEK)
+        return true if n == 0 # EOF — let stale? handle it
+        n < 0 && {Errno::EAGAIN, Errno::EWOULDBLOCK}.includes?(Errno.value)
+      elsif io.responds_to?(:read_timeout=) && io.responds_to?(:read_timeout)
+        prev = io.read_timeout
+        begin
+          io.read_timeout = DRAIN_PROBE
+          io.read_byte.nil? # nil = EOF (drained, stale? handles it); a byte = residue (retire)
+        rescue IO::TimeoutError
+          true
+        ensure
+          io.read_timeout = prev
+        end
+      else
+        true # an IO with no timeout knob is not a pooled socket; nothing to prove
+      end
+    rescue
+      false # any probe error ⇒ do not risk parking a bad socket
+    end
+
+    # A REUSED socket that failed BEFORE any response byte arrived: the request never reached
+    # the application, so — per the contract at the top of this class — it is re-sent once on
+    # a fresh connection. Only ever consulted on the `@idle.pop?` branch, so "reused" is
+    # implicit.
+    #
+    # It used to compare the error string to `no_response_error` exactly, which matches ONLY a
+    # clean EOF. An origin that RESET the parked socket failed with an `Errno`-derived message
+    # instead, so `stale?` said false, the request was NOT retried, and the payload surfaced a
+    # "connection reset" the origin never saw — a silent false negative in the middle of a
+    # sweep, plus `@consecutive_stale` never advanced so `STALE_GIVE_UP` could never bound the
+    # wasted redials against an origin that always resets.
+    #
+    # The discriminator is "no response byte was DELIVERED", not which IO error ended it.
+    # `response.nil?` alone is not that: `exchange` returns `response: nil` for an interim-1xx
+    # failure too (`malformed interim` / `too many interim` / `upstream closed after interim`),
+    # and by then the origin has the whole request (gori writes it up front), so re-sending a
+    # non-idempotent POST would DOUBLE its side effect. `delivered?` is false only before any
+    # response byte arrives — a clean EOF, a reset, or a write failure on a parked socket — which
+    # is exactly the re-sendable case. An INCOMPLETE response (head read, body cut) carries a
+    # non-nil `response` and so is already excluded.
     private def stale?(result : Repeater::Result) : Bool
-      result.error == Repeater::Engine.no_response_error(@host, @port)
+      !result.error.nil? && result.response.nil? && !result.delivered?
     end
 
     private def drain : Nil

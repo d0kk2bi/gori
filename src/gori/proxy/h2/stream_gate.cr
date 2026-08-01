@@ -196,7 +196,11 @@ module Gori::Proxy::H2
     # the queue until a human acts.
     def close : Nil
       slots = @mutex.synchronize do
-        @heads.drain { |f, pre| write(f, pre) rescue nil }
+        # Discard a still-buffered (no-END_HEADERS) block on the REQUEST leg when the sandbox is
+        # on: it was never scope-tested, so writing it to the peer is a bypass. `undecodable`'s
+        # own gate (`@ordered && sandbox_enabled?`) is the condition. `drain` writes it verbatim
+        # otherwise (P7). Discarding cannot raise, so the rest of `close` still runs.
+        @heads.drain(discard: @ordered && @interceptor.sandbox_enabled?) { |f, pre| write(f, pre) rescue nil }
         @closed = true
         vals = @slots.values
         @slots.clear
@@ -253,13 +257,6 @@ module Gori::Proxy::H2
 
     private def accept_locked(frame : Frame::Header) : Array(UInt32)
       return NO_CROSS if @closed
-      # Connection-level frames are NEVER deferred (#492 step 3, D1 rule 1): parking a SETTINGS
-      # ACK, a PING or the SHARED connection window behind a held stream kills the connection
-      # or starves every stream on it. `Assembler#feed` already treats stream 0 as not-a-stream.
-      if frame.stream_id == 0
-        write(frame, nil)
-        return NO_CROSS
-      end
       cross = NO_CROSS
       # Every header block goes through `@heads` even for a deferred stream: the per-direction
       # HPACK decoder must advance in ARRIVAL order, so a block cannot wait in a Slot undecoded
@@ -267,6 +264,19 @@ module Gori::Proxy::H2
       # blocks (trailers) still carry the peer's HPACK insertions, so they must be decoded even
       # though nothing is written.
       @heads.accept(frame) do |f, pre|
+        if f.stream_id == 0
+          # Connection-level frames are NEVER deferred (#492 step 3, D1 rule 1): parking a
+          # SETTINGS ACK, a PING or the SHARED connection window behind a held stream kills the
+          # connection or starves every stream on it. They now flow THROUGH `@heads.accept`
+          # rather than being hoisted ahead of it, so one arriving inside a buffered header
+          # block hits the §6.2/§6.10 intruder rule (ending the connection under the sandbox)
+          # instead of being reordered past it and the block silently repaired. `HeadRewrite`'s
+          # `opens` excludes stream 0, so a `HEADERS(0)` — itself a §6.2 connection error —
+          # cannot open a buffered block here and mint a Slot keyed 0 that later PINGs park
+          # behind. `Assembler#feed` already treats stream 0 as not-a-stream.
+          write(f, nil)
+          next
+        end
         slot = @slots[f.stream_id]?
         if @refused.includes?(f.stream_id)
           # Swallowed, not written: the far leg never saw this stream open. Deliberately not
@@ -543,10 +553,12 @@ module Gori::Proxy::H2
       return nil if status < 200
       ref = @assembler.request_ref(block.stream_id)
       if ref.nil?
-        # No request projected for this stream (past `Assembler::MAX_LIVE_STREAMS`). h1 scopes a
-        # response hold on the REQUEST's target (`client_conn.cr:501`); with no request target
-        # there is nothing to scope against, and inventing one is how a hold escapes scope.
-        warn_unscopable(block.stream_id)
+        # No request projected for this stream. h1 scopes a response hold on the REQUEST's
+        # target (`client_conn.cr:501`); with no request target there is nothing to scope
+        # against, and inventing one is how a hold escapes scope. Warn only when a hold could
+        # actually have happened — this runs before `intercepts_response?`, so it used to fire
+        # on connections with intercept switched off entirely.
+        warn_unscopable(block.stream_id) if @interceptor.enabled?
         return nil
       end
       host, port = Upstream.split_host_port(ref.authority, @port)
@@ -836,8 +848,15 @@ module Gori::Proxy::H2
       return if @warned_scope
       @warned_scope = true
       ::Log.warn do
-        "h2 in: stream #{stream_id} is not tracked (over #{Assembler::MAX_LIVE_STREAMS} live " \
-        "streams), so its response has no request target to scope an intercept hold against — not held"
+        # Do NOT assert the cause. This message named the live-stream ceiling unconditionally,
+        # and it fired on connections carrying a SINGLE stream — where the real reason was an
+        # undecodable request head, so the assembler never tracked the stream in the first
+        # place. An operator asking "why did my hold not fire / why did $SESSION not bind" was
+        # sent to look at a limit they were nowhere near. Same shape as the #536 note about
+        # this message.
+        "h2 in: stream #{stream_id} has no projected request, so its response has no request " \
+        "target to scope an intercept hold against — not held. Either the request head could " \
+        "not be decoded, or the connection is past #{Assembler::MAX_LIVE_STREAMS} live streams"
       end
     end
   end

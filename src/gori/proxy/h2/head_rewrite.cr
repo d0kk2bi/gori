@@ -183,7 +183,7 @@ module Gori::Proxy::H2
     # decoded projection the assembler should use for it (nil = the assembler decodes).
     # Yields nothing while a header block is still being buffered.
     def accept(frame : Frame::Header, &) : Nil
-      opens = frame.frame_type == Frame::Type::Headers || frame.frame_type == Frame::Type::PushPromise
+      opens = block_opener?(frame)
       continues = pending? && frame.frame_type == Frame::Type::Continuation &&
                   frame.stream_id == @block_stream
 
@@ -194,8 +194,21 @@ module Gori::Proxy::H2
       # handling (and the assembler's #409 guard) take it from there. Order and P7 both
       # survive, and the assembler sees exactly the frames it would have seen.
       if pending? && !continues
-        @buf.each { |f| yield f, nil }
+        # The buffered block is abandoned here WITHOUT ever reaching `finish`, so it is never
+        # decoded and never scope-tested — flushing it verbatim was a live sandbox bypass in
+        # three frames: HEADERS(1) with END_HEADERS cleared for an out-of-scope path, ANY
+        # intruder frame (a bare PRIORITY does it), then the CONTINUATION. Measured: the origin
+        # received both halves of `/blocked` and ANSWERED it, while the control without the
+        # intruder got `RST_STREAM code=8` and the origin got nothing. That every route in is
+        # itself a §6.10 violation is not a mitigation gori may lean on — it is the reasoning
+        # `undecodable`'s own comment rejects, and the out-of-scope bytes reach the origin
+        # either way. So tell the deferrer, exactly as the ceiling and HPACK-failure branches
+        # do: this IS "a head with no URL to scope-test". Sandbox ON ends the connection;
+        # sandbox OFF keeps the verbatim forward the paragraph above describes (P7).
+        frames, stream = @buf.dup, @block_stream
         reset
+        @deferrer.try(&.undecodable(stream))
+        frames.each { |f| yield f, nil }
       end
 
       unless opens || continues
@@ -216,24 +229,56 @@ module Gori::Proxy::H2
       # by 64 MiB of CONTINUATION. With the sandbox off `undecodable` is a no-op and this
       # stays the verbatim forward it has always been.
       if @block_bytes > Assembler::MAX_HEADER_BLOCK
-        @deferrer.try(&.undecodable(@block_stream))
-        @buf.each { |f| yield f, nil }
+        # Drain the buffer into a local and `reset` BEFORE the deferrer is told, because
+        # `undecodable` RAISES to end the connection when the sandbox is on. The raise unwinds
+        # through `pump_gated`'s `ensure gate.close`, and `close` drains this same buffer
+        # straight to `@dst` (`stream_gate.cr`) — so leaving the frames here forwarded the very
+        # block the gate had just refused to let past, unexamined, while the WARN said the
+        # opposite. Empty buffer, nothing for `close` to write.
+        frames, stream = @buf.dup, @block_stream
         reset
+        @deferrer.try(&.undecodable(stream))
+        frames.each { |f| yield f, nil }
         return
       end
       return unless frame.end_headers?
 
-      frames, pre = finish
+      frames, pre = finish # resets @buf itself
       last = frames.size - 1
       frames.each_with_index { |f, i| yield f, (i == last ? pre : nil) }
+    end
+
+    # Any frames still buffered when the connection ends: a block that never got END_HEADERS,
+    # so it never reached `finish` and was never decoded or scope-tested.
+    #
+    # `discard` is the sandbox's answer to that. Verbatim release is P7's "nothing is silently
+    # swallowed", and it stays that with the sandbox OFF (`discard: false`). But a block with no
+    # END_HEADERS has no URL to scope-test, so with the sandbox ON writing it to the peer was the
+    # fifth site of the buffered-block leak — reachable in one frame plus a hangup
+    # (`HEADERS(no END_HEADERS)` for an out-of-scope path, then close). It is dropped instead: the
+    # connection is ending regardless, and the raw h2 frame log already recorded what arrived, so
+    # nothing is lost that P7 needs. Not routed through `undecodable`: `close` wraps only the
+    # `write` in `rescue nil`, so a raise here would escape `@mutex.synchronize` and skip the rest
+    # of `close` (slot cleanup, handing held items back to the Interceptor) — leaking queue rows.
+    def drain(discard : Bool = false, &) : Nil
+      if discard
+        ::Log.warn { "h2: dropped a #{@buf.size}-frame header block with no END_HEADERS at connection close (sandbox on — no URL to scope-test)" } unless @buf.empty?
+      else
+        @buf.each { |f| yield f, nil }
+      end
       reset
     end
 
-    # Any frames still buffered when the connection ends: a block that never got
-    # END_HEADERS. Release them verbatim so nothing is silently swallowed (P7).
-    def drain(&) : Nil
-      @buf.each { |f| yield f, nil }
-      reset
+    # A HEADERS/PUSH_PROMISE that opens a buffered block. `stream_id != 0` is load-bearing:
+    # `StreamGate` now routes connection-level frames through `accept` (so one inside a buffered
+    # block is caught as an intruder), and a HEADERS/PUSH_PROMISE on stream 0 is a §6.2
+    # connection error. Without this guard such a frame would OPEN a block, `defer?` could mint a
+    # Slot keyed 0, and every later SETTINGS/PING/WINDOW_UPDATE would park behind it — the freeze
+    # D1 rule 1 forbids. With it, a stream-0 frame falls to the `unless opens || continues` yield
+    # and is written at once, as before.
+    private def block_opener?(frame : Frame::Header) : Bool
+      (frame.frame_type == Frame::Type::Headers || frame.frame_type == Frame::Type::PushPromise) &&
+        frame.stream_id != 0
     end
 
     private def pending? : Bool
@@ -255,16 +300,26 @@ module Gori::Proxy::H2
     # and will write them when the operator decides.
     private def finish : {Array(Frame::Header), Assembler::HeadBlock}
       first = @buf.first
-      split = split_block(first)
+      split = split_block(first) # reads every frame in @buf (assembles the CONTINUATIONs)
+      # Snapshot the frames and `reset` HERE, the moment `split_block` has finished reading
+      # `@buf`, rather than at the single `defer?` site below. Everything between this point
+      # and the return — `decode_head_block`, `head_text`, `notice_coalesced`, `rewrite`
+      # (which runs OPERATOR REGEXES over PEER BYTES), `@encoder.encode`, and `defer?` itself —
+      # can raise, and a raise unwinds to `StreamGate#close`'s `drain`, which writes whatever
+      # is still in `@buf` to the peer. Leaving `@buf` full through all of that is the residual
+      # window each per-site fix closed one at a time; clearing it up front closes the class.
+      # `snapshot` is what a passthrough block and `unreadable` forward — never `@buf` again.
+      snapshot = @buf.dup
+      reset
       # Malformed padding (RFC 7540 §6.1): we cannot locate the block, so forward exactly
       # what arrived and let the assembler drop the projection, as `validate_pad` does.
-      return unreadable(first) if split.nil?
+      return unreadable(first, snapshot) if split.nil?
       prefix, block = split
 
       fields = @assembler.decode_head_block(@direction, block)
       # Malformed/hostile HPACK. Same disposition, and the nil projection is what stops the
       # assembler from running a second (differently-positioned) decode over the same bytes.
-      return unreadable(first) if fields.nil?
+      return unreadable(first, snapshot) if fields.nil?
 
       request = @direction == "out"
       head = head_text(fields, first, request)
@@ -278,7 +333,8 @@ module Gori::Proxy::H2
       built = if rewritten.nil? && !@engaged
                 # Unchanged, and this direction has never re-encoded: byte-exact passthrough,
                 # which is also what keeps the peer's HPACK table driven by the original encoder.
-                Block.new(@buf.dup, Assembler::HeadBlock.new(pairs(fields)), fields, head, first, prefix, request)
+                # `snapshot`, not `@buf` — `@buf` was cleared above.
+                Block.new(snapshot, Assembler::HeadBlock.new(pairs(fields)), fields, head, first, prefix, request)
               else
                 @engaged = true
                 # A rule changed the head, so the TEXT the gate would show a human is the
@@ -288,17 +344,21 @@ module Gori::Proxy::H2
                 Block.new(reframe(first, prefix, @encoder.encode(emit_fields)),
                   Assembler::HeadBlock.new(pairs(emit_fields)), emit_fields, shown, first, prefix, request)
               end
+      # `@buf` was already cleared at the top, so `defer?` raising here (StreamGate ends the
+      # connection past MAX_REFUSED_STREAMS) leaves `close`'s drain nothing to write.
       return {[] of Frame::Header, built.pre} if @deferrer.try(&.defer?(built))
       {built.frames, built.pre}
     end
 
-    # A block this direction could not read. The frames go out exactly as they arrived, with a
-    # nil projection so the assembler does not attempt its own decode — that part is unchanged.
-    # What is new is telling the `Deferrer` first: it may refuse a connection it has gone blind
-    # on, which is the only honest answer for a blocking gate. See `Deferrer#undecodable`.
-    private def unreadable(first : Frame::Header) : {Array(Frame::Header), Assembler::HeadBlock}
+    # A block this direction could not read. The frames go out exactly as they arrived (from the
+    # snapshot `finish` took before clearing `@buf`), with a nil projection so the assembler does
+    # not attempt its own decode. The `Deferrer` is told first: it may refuse a connection it has
+    # gone blind on, which is the only honest answer for a blocking gate — and since `@buf` is
+    # already empty, that raise reaches `close`'s drain with nothing to leak.
+    private def unreadable(first : Frame::Header,
+                           frames : Array(Frame::Header)) : {Array(Frame::Header), Assembler::HeadBlock}
       @deferrer.try(&.undecodable(first.stream_id))
-      {@buf.dup, Assembler::HeadBlock.new(nil)}
+      {frames, Assembler::HeadBlock.new(nil)}
     end
 
     # This block's h1-equivalent head text, or nil when the block is not a message head.

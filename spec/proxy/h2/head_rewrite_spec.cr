@@ -41,6 +41,49 @@ private class SubRewriter < Gori::Proxy::HeadRewriter
   end
 end
 
+# The sandbox's BLOCKING gate: `StreamGate#undecodable` raises to end the connection when the
+# sandbox is on and a head arrives with no URL to scope-test.
+private class BlockingDeferrer
+  include Gori::Proxy::H2::HeadRewrite::Deferrer
+  getter told = [] of UInt32
+
+  def defer?(block : Gori::Proxy::H2::HeadRewrite::Block) : Bool
+    false
+  end
+
+  def undecodable(stream_id : UInt32) : Nil
+    @told << stream_id
+    raise Gori::Error.new("h2 sandbox: undecodable header block on stream #{stream_id}")
+  end
+end
+
+# The sandbox-OFF disposition: told, but nothing is refused, so the frames go out verbatim (P7).
+private class QuietDeferrer
+  include Gori::Proxy::H2::HeadRewrite::Deferrer
+  getter told = [] of UInt32
+
+  def defer?(block : Gori::Proxy::H2::HeadRewrite::Block) : Bool
+    false
+  end
+
+  def undecodable(stream_id : UInt32) : Nil
+    @told << stream_id
+  end
+end
+
+# A gate whose `defer?` RAISES — `StreamGate` ends the connection once `remember_refused`
+# passes MAX_REFUSED_STREAMS, and that raise unwinds through the same `close`/`drain` path.
+private class RefusingDeferrer
+  include Gori::Proxy::H2::HeadRewrite::Deferrer
+
+  def defer?(block : Gori::Proxy::H2::HeadRewrite::Block) : Bool
+    raise Gori::Error.new("h2 out: over 4096 streams refused on one connection")
+  end
+
+  def undecodable(stream_id : UInt32) : Nil
+  end
+end
+
 private def pipeline(rewriter : Gori::Proxy::HeadRewriter, direction = "out",
                      sink = RecSink.new) : {Gori::Proxy::H2::HeadRewrite, Gori::Proxy::H2::Assembler, RecSink}
   assembler = Gori::Proxy::H2::Assembler.new(sink, "api.example.com", 443, 1_i64)
@@ -260,6 +303,160 @@ describe Gori::Proxy::H2::HeadRewrite do
     sink.requests.size.should eq(2)
     sink.requests[1].target.should eq("/second")
     String.new(sink.requests[1].head).should contain("x-a: 0123456789abcdef")
+  end
+
+  # The sandbox gate is BLOCKING, so `undecodable` raises — and the raise unwinds through
+  # `Relay#pump_gated`'s `ensure gate.close`, which drains this very buffer to the peer. If the
+  # frames are still buffered when the deferrer is told, the refusal forwards the exact block it
+  # refused: an unexamined, out-of-scope request reaching the origin while the WARN says the
+  # connection was closed instead. Measured at the wire before the fix — a PADDED head with a
+  # bad pad length arrived at the origin complete (END_STREAM|END_HEADERS), and a CONTINUATION
+  # flood past the 1 MiB ceiling delivered ~1.06 MB. Both assert on `drain` because `close` is
+  # what writes them.
+  describe "an undecodable block the sandbox refuses" do
+    # PADDED with a pad length past the end of the payload: RFC 9113 §6.1, the block cannot be
+    # located, so `finish` takes the `unreadable` path.
+    bad_pad = Bytes.new(20) { |i| i == 0 ? 250_u8 : 0_u8 }
+
+    it "leaves nothing buffered, so connection teardown cannot forward what was refused" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      pipe.deferrer = deferrer = BlockingDeferrer.new
+
+      expect_raises(Gori::Error, /undecodable/) do
+        push(pipe, assembler, headers(1_u32, bad_pad, Frame::END_HEADERS | Frame::END_STREAM | Frame::PADDED))
+      end
+
+      deferrer.told.should eq([1_u32])
+      drained = [] of Frame::Header
+      pipe.drain { |f, _| drained << f }
+      drained.should be_empty
+    end
+
+    it "leaves nothing buffered when the block passes the 1 MiB ceiling either" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      pipe.deferrer = deferrer = BlockingDeferrer.new
+      over = Bytes.new(Gori::Proxy::H2::Assembler::MAX_HEADER_BLOCK + 1)
+
+      expect_raises(Gori::Error, /undecodable/) do
+        push(pipe, assembler, headers(3_u32, over, 0_u8)) # no END_HEADERS: a CONTINUATION flood
+      end
+
+      deferrer.told.should eq([3_u32])
+      drained = [] of Frame::Header
+      pipe.drain { |f, _| drained << f }
+      drained.should be_empty
+    end
+
+    it "still forwards it verbatim when the sandbox is OFF (P7 — the raw log is the truth)" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      pipe.deferrer = deferrer = QuietDeferrer.new
+
+      sent = push(pipe, assembler, headers(1_u32, bad_pad, Frame::END_HEADERS | Frame::END_STREAM | Frame::PADDED))
+
+      sent.map(&.payload).should eq([bad_pad]) # byte-exact, as it arrived
+      deferrer.told.should eq([1_u32])         # told either way; only the disposition differs
+      drained = [] of Frame::Header
+      pipe.drain { |f, _| drained << f }
+      drained.should be_empty # and not left behind to be written a second time
+    end
+  end
+
+  # The same buffered-block leak as the `undecodable` pair, reached through the two OTHER ways
+  # `accept` can part with a block. Both were measured at the wire against a real client.
+  describe "a block abandoned without ever being scope-tested" do
+    it "does not forward an intruder-interrupted block, which never reached the decode at all" do
+      # Three frames: HEADERS with END_HEADERS cleared, ANY intruder (a bare PRIORITY does it),
+      # then the CONTINUATION. The block never reaches `finish`, so it is never decoded and
+      # never scope-tested — and flushing it verbatim put an out-of-scope request on the wire
+      # that the origin ANSWERED, while the same request without the intruder got RST_STREAM.
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      pipe.deferrer = deferrer = BlockingDeferrer.new
+      block = HPACK::Encoder.new.encode(req("/blocked"))
+
+      push(pipe, assembler, headers(1_u32, block, 0_u8)).should be_empty # buffered, no END_HEADERS
+      expect_raises(Gori::Error, /undecodable/) do
+        push(pipe, assembler, Frame::Header.new(Frame::Type::Priority.value, 0_u8, 3_u32, Bytes.new(5)))
+      end
+
+      deferrer.told.should eq([1_u32])
+      drained = [] of Frame::Header
+      pipe.drain { |f, _| drained << f }
+      drained.should be_empty
+    end
+
+    it "still releases an intruder-interrupted block verbatim, in arrival order, with the sandbox OFF" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      pipe.deferrer = QuietDeferrer.new
+      block = HPACK::Encoder.new.encode(req("/blocked"))
+      intruder = Frame::Header.new(Frame::Type::Priority.value, 0_u8, 3_u32, Bytes.new(5))
+
+      push(pipe, assembler, headers(1_u32, block, 0_u8)).should be_empty
+      sent = push(pipe, assembler, intruder)
+
+      sent.size.should eq(2)
+      sent[0].payload.should eq(block) # the held block first...
+      sent[1].frame_type.should eq(Frame::Type::Priority)
+      pipe.drain { |_, _| fail "nothing should be left buffered" }
+    end
+
+    # The FIFTH site: a block with no END_HEADERS never reaches `finish`, so it is still buffered
+    # when the connection ends — and `StreamGate#close` calls `drain`, which wrote it to the peer.
+    # Measured at the wire as one HEADERS(no END_HEADERS) for an out-of-scope path plus a hangup.
+    # `drain(discard: true)` is the sandbox's answer; `discard: false` keeps the P7 verbatim
+    # release. `StreamGate#close` computes the flag as `@ordered && sandbox_enabled?`.
+    it "drains a no-END_HEADERS block verbatim by default but drops it when discard is set" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      block = HPACK::Encoder.new.encode(req("/blocked"))
+      push(pipe, assembler, headers(1_u32, block, 0_u8)).should be_empty # buffered, no END_HEADERS
+
+      released = [] of Frame::Header
+      pipe.drain(discard: false) { |f, _| released << f }
+      released.map(&.payload).should eq([block]) # P7: verbatim when the sandbox is off
+    end
+
+    it "drops a buffered no-END_HEADERS block under discard, leaving close nothing to write" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      push(pipe, assembler, headers(1_u32, HPACK::Encoder.new.encode(req("/blocked")), 0_u8)).should be_empty
+      pipe.drain(discard: true) { |_, _| fail "discard must not yield the unexamined block" }
+    end
+
+    it "does not forward a completed block when the gate refuses the connection at defer?" do
+      # `defer?` raises past MAX_REFUSED_STREAMS, and `accept`'s `reset` only ran after `finish`
+      # RETURNED — so the completed block sat in `@buf` and teardown wrote it to the peer.
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      pipe.deferrer = RefusingDeferrer.new
+
+      expect_raises(Gori::Error, /streams refused/) do
+        push(pipe, assembler, headers(1_u32, HPACK::Encoder.new.encode(req("/blocked"))))
+      end
+
+      drained = [] of Frame::Header
+      pipe.drain { |f, _| drained << f }
+      drained.should be_empty
+    end
+  end
+
+  # `StreamGate` now routes connection-level frames through `accept`, and a HEADERS/PUSH_PROMISE
+  # on stream 0 is a §6.2 connection error. It must NOT open a buffered block — otherwise a Slot
+  # keyed 0 could be minted and later PINGs would park behind it (the freeze D1 rule 1 forbids).
+  describe "a header-type frame on stream 0" do
+    it "is yielded straight through, never buffered" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      zero = headers(0_u32, HPACK::Encoder.new.encode(req("/x")))
+      sent = push(pipe, assembler, zero)
+      sent.size.should eq(1)
+      sent.first.stream_id.should eq(0_u32)
+      pipe.drain { |_, _| fail "a stream-0 HEADERS must not be left buffered" }
+    end
+
+    it "does not become the opener a following CONTINUATION on stream 1 attaches to" do
+      pipe, assembler, _ = pipeline(SubRewriter.new("x-tag: a", "x-tag: b"))
+      push(pipe, assembler, headers(0_u32, HPACK::Encoder.new.encode(req("/x")))) # not an opener
+      # A real block on stream 1 now opens cleanly; the stream-0 frame did not leave state behind.
+      out = push(pipe, assembler, headers(1_u32, HPACK::Encoder.new.encode(req("/y"))))
+      out.size.should eq(1)
+      out.first.stream_id.should eq(1_u32)
+    end
   end
 
   # #517. A field value carrying the head's own delimiter has no h1-text form, and the bridge

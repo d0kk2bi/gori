@@ -197,7 +197,13 @@ module Gori
 
     # Wipe every captured History flow in this project (and their WS/FTS/h2 logs and
     # flow entity_links). Repeater-owned WS rows (repeater_id set) and workbench sessions
-    # are left intact. Issues/Probe keep dangling sample flow ids.
+    # are left intact, and so are `sitemap_tags`: a tag is the OPERATOR'S memo on a path, in
+    # the same class as a note or an issue, and `history clear` clears captured traffic rather
+    # than the operator's own annotations. It is keyed by `(host, path)` and not by a flow id,
+    # so it survives correctly and re-attaches if that path is captured again — it is simply
+    # unreachable from the Sitemap tree meanwhile, and `sitemap tag --list` is where to find
+    # it. Spelled out because this list is what a reader checks, and tags were the one spared
+    # table it did not name.
     # Returns whether the wipe committed; see `delete_flow`. A rolled-back clear reported as
     # done is the worst of the three, because the operator moves on believing the project is
     # empty.
@@ -209,6 +215,7 @@ module Gori
         # so a large clear doesn't leave a full-size tombstone table behind.
         c.exec("INSERT INTO flows_fts(flows_fts) VALUES('delete-all')")
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'flow'")
+        detach_flow_refs(c, nil)
         c.exec("DELETE FROM flows")
         c.exec("DELETE FROM h2_frames")
         c.exec("DELETE FROM h2_connections")
@@ -223,6 +230,7 @@ module Gori
       conn.exec("DELETE FROM ws_messages WHERE flow_id = ? AND repeater_id IS NULL", id)
       conn.exec("DELETE FROM flows_fts WHERE rowid = ?", id)
       conn.exec("DELETE FROM entity_links WHERE ref_kind = 'flow' AND ref_id = ?", id)
+      detach_flow_refs(conn, id)
       # The h2 frame log (often the flow's bulk bytes) — capture the conn BEFORE deleting
       # the flow row so we can reclaim it if this was the last flow on that connection.
       h2_conn = conn.query_one?("SELECT h2_conn_id FROM flows WHERE id = ?", id, as: Int64?)
@@ -234,6 +242,55 @@ module Gori
       if cid = h2_conn
         conn.exec("DELETE FROM h2_frames WHERE conn_id = ? AND ? NOT IN (SELECT h2_conn_id FROM flows WHERE h2_conn_id IS NOT NULL)", cid, cid)
         conn.exec("DELETE FROM h2_connections WHERE id = ? AND id NOT IN (SELECT h2_conn_id FROM flows WHERE h2_conn_id IS NOT NULL)", cid, cid)
+      end
+    end
+
+    # The newest flow id, or nil in an empty project. A rightmost-leaf seek on the primary
+    # key — measured at ~6 ms including process startup on a 50k-flow / 3.4 GB project, so it
+    # is free enough to run per cursored read.
+    def max_flow_id : Int64?
+      @db.query_one?("SELECT MAX(id) FROM flows", as: Int64?)
+    rescue
+      nil
+    end
+
+    # Every table that cross-references a flow by id, in one place. `id` nil = every flow is
+    # going (a clear), so every reference is dangling.
+    #
+    # `flows.id` is a plain `INTEGER PRIMARY KEY`, i.e. the rowid, which SQLite REUSES: delete
+    # the newest flow (or clear the project) and the next capture is handed the same id. These
+    # columns were deliberately left dangling on the assumption that they would resolve to
+    # "gone" — they do not, they re-point at whatever traffic takes the id next. Measured: a
+    # probe finding promoted to an Issue after a clear cited a flow captured afterwards, and
+    # `get_repeater_context` reported a session as seeded from an unrelated request. On a tool
+    # whose product is evidence, silently wrong evidence is the worst outcome available;
+    # NULLing turns it into absent evidence, which every one of these surfaces already renders
+    # honestly.
+    #
+    # `entity_links` is DELETED rather than kept-and-marked-stale (`links.cr` renders a
+    # dangling ref as `(stale)`, which reads better) for the same reason: while ids are
+    # reusable, a kept pointer re-binds, and re-binding is strictly worse than losing the
+    # pointer. Marking stale becomes the right answer only once ids are monotonic — which
+    # needs a `flows` table rebuild, measured at 16.1 s on a 50k-flow project against a 5 s
+    # `busy_timeout`, i.e. a hard `database is locked` for every other gori process. That
+    # belongs in an opt-in maintenance command, not on open.
+    #
+    # `ws_messages.flow_id` is NOT NULL, so a repeater-owned WS row (`repeater_id` set, which
+    # `delete_flow_one` deliberately spares) keeps its id. Its session is covered instead:
+    # `repeaters.flow_id` is nulled here, which is where a surface reads the provenance from.
+    private def detach_flow_refs(conn : DB::Connection, id : Int64?) : Nil
+      {"issues", "repeaters", "fuzz_sessions", "miner_sessions", "sequencer_sessions",
+       "events", "intercept_held"}.each do |table|
+        if fid = id
+          conn.exec("UPDATE #{table} SET flow_id = NULL WHERE flow_id = ?", fid)
+        else
+          conn.exec("UPDATE #{table} SET flow_id = NULL WHERE flow_id IS NOT NULL")
+        end
+      end
+      if fid = id
+        conn.exec("UPDATE probe_issues SET sample_flow_id = NULL WHERE sample_flow_id = ?", fid)
+      else
+        conn.exec("UPDATE probe_issues SET sample_flow_id = NULL WHERE sample_flow_id IS NOT NULL")
       end
     end
 

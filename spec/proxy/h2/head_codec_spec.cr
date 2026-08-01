@@ -149,6 +149,74 @@ describe Gori::Proxy::H2::HeadCodec do
       head = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("content-type", "text/html")])))
       head.should eq("HTTP/2 200\r\ncontent-type: text/html\r\n\r\n")
     end
+
+    # #517 on the CAPTURE side. `h1_faithful?` guards `parse_*`/`rewrite`/`encode_edited`, but
+    # `Assembler` calls these two DIRECTLY to build the stored head, so a peer field whose value
+    # carried a CRLF was projected as two well-formed headers into `gori run show`, MCP get_flow,
+    # QL `header:`, the Rewriter preview, and the bytes the Repeater replays. Measured at the
+    # wire: the client received ONE h2 field (HEADERS len=83, forwarded verbatim) while gori's
+    # own record showed two. The projection has to stay injective at the line level.
+    it "does not project a CRLF-bearing request value as a second header" do
+      fields = req_fields + [f("x-evil", "A\r\nx-injected: yes")]
+      head = String.new(HeadCodec.synth_request(tuples(fields), "api.example.com"))
+      # One line, bytes still visible, and no invented field anywhere in the head.
+      head.should eq("GET /x HTTP/2\r\nHost: api.example.com\r\nx-evil: A\\r\\nx-injected: yes\r\n\r\n")
+      head.lines.count(&.starts_with?("x-injected")).should eq(0)
+    end
+
+    it "does not project a CRLF-bearing response value as a second header (the origin's bytes)" do
+      fields = [f(":status", "200"), f("x-evil", "A\r\nset-cookie: injected=1")]
+      head = String.new(HeadCodec.synth_response(tuples(fields)))
+      head.should eq("HTTP/2 200\r\nx-evil: A\\r\\nset-cookie: injected=1\r\n\r\n")
+      head.should_not contain("\r\nset-cookie:")
+    end
+
+    it "escapes a lone CR or LF too, and leaves an ordinary value byte-exact" do
+      fields = [f(":status", "200"), f("a", "x\ry"), f("b", "x\ny"), f("c", "plain value")]
+      head = String.new(HeadCodec.synth_response(tuples(fields)))
+      head.should eq("HTTP/2 200\r\na: x\\ry\r\nb: x\\ny\r\nc: plain value\r\n\r\n")
+    end
+
+    # Injectivity in the direction that matters: an operator opens this view to ask "did the
+    # ORIGIN inject a CRLF here, or did the value always contain that text?" A literal
+    # backslash-r used to render identically to a real CR, so the view could not answer it.
+    it "distinguishes a real CRLF from a value that literally contains backslash-r-backslash-n" do
+      injected = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("x", "A\r\nB")])))
+      literal = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("x", "A\\r\\nB")])))
+      injected.should contain("x: A\\r\\nB")
+      literal.should contain("x: A\\\\r\\\\nB")
+      injected.should_not eq(literal)
+    end
+
+    it "distinguishes a backslash immediately before a REAL CR/LF from a literal backslash-r" do
+      # `x\<CR>y` (backslash then a real CR) must not render the same as `x\ry` (backslash then
+      # the letter r), or the injected CR is disguised as innocuous literal text.
+      injected_cr = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("x", "x\\\ry")])))
+      literal_r = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("x", "x\\ry")])))
+      injected_cr.should contain("x: x\\\\\\ry") # three backslashes then r
+      literal_r.should contain("x: x\\\\ry")     # two backslashes then r
+      injected_cr.should_not eq(literal_r)
+
+      injected_lf = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("x", "x\\\ny")])))
+      literal_n = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("x", "x\\ny")])))
+      injected_lf.should_not eq(literal_n)
+    end
+
+    it "leaves an ordinary backslash byte-identical, so a rule written against it still matches" do
+      head = String.new(HeadCodec.synth_response(tuples([f(":status", "200"),
+                                                         f("x-path", "C:\\Users\\admin"), f("x-re", "\\d+\\s*")])))
+      head.should contain("x-path: C:\\Users\\admin")
+      head.should contain("x-re: \\d+\\s*")
+    end
+
+    it "keeps the start line and the synthetic Host line to one line each" do
+      fields = [f(":method", "GET"), f(":scheme", "https"), f(":authority", "h\r\nx: 1"),
+                f(":path", "/p\r\nx: 2")]
+      head = String.new(HeadCodec.synth_request(tuples(fields), "h\r\nx: 1"))
+      head.lines.size.should eq(3) # start line, Host, and the blank terminator
+      head.should contain("GET /p\\r\\nx: 2 HTTP/2")
+      head.should contain("Host: h\\r\\nx: 1")
+    end
   end
 
   describe "round trip" do

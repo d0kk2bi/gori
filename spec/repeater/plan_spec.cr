@@ -362,4 +362,64 @@ describe Gori::Repeater::Plan do
       rewritten.sender.should be(plan.sender) # the SAME gated dialer, not a second one
     end
   end
+  # `downgrade_version_line` documents itself as running "unasked on every send", but the TUI
+  # was its only caller — so the SAME session sent `HTTP/2` down an h1 socket from
+  # `gori run repeater send` and MCP while the TUI corrected it. Recorded at a raw-socket
+  # origin before the fix. Doing it in `Plan.build` puts it on the path all three surfaces share.
+  describe "an HTTP/2 version line on an h1 send" do
+    it "is downgraded whichever surface built the plan" do
+      plan = R::Plan.build(R::PlanOptions.new(["GET /v HTTP/2\r\nHost: h.test\r\n\r\n".to_slice],
+        default_target: "http://h.test"), ungated)
+      String.new(plan.bytes).lines.first.should eq("GET /v HTTP/1.1")
+    end
+
+    it "leaves a version the operator meant alone" do
+      {"HTTP/1.0", "HTTP/9.9"}.each do |v|
+        plan = R::Plan.build(R::PlanOptions.new(["GET /v #{v}\r\nHost: h.test\r\n\r\n".to_slice],
+          default_target: "http://h.test"), ungated)
+        String.new(plan.bytes).lines.first.should eq("GET /v #{v}")
+      end
+    end
+
+    it "does not touch an h2 send, which builds its fields from this text" do
+      plan = R::Plan.build(R::PlanOptions.new(["GET /v HTTP/2\r\nHost: h.test\r\n\r\n".to_slice],
+        default_target: "http://h.test", http2: true), ungated)
+      String.new(plan.bytes).lines.first.should eq("GET /v HTTP/2")
+    end
+  end
+  # `--request-raw` / `--request-file` are documented as verbatim, and were not: `expand_wire`
+  # promotes a bare LF to CRLF on every headless send, and `--no-auto-cl` only disabled the
+  # Content-Length resync. A bare-LF header terminator is a standard front-end/back-end desync
+  # primitive, so that removed a whole payload class from the headless surfaces while the TUI's
+  # byte modes could still send it. `expand_request: false` is the flag every surface already
+  # uses to mean "these bytes ARE the message"; `gori run repeater send --verbatim` sets it.
+  describe "verbatim sends" do
+    it "keeps a bare LF in the head instead of promoting it to CRLF" do
+      raw = "GET /v HTTP/1.1\r\nHost: h.test\nX-Bare: lf\n\r\n".to_slice
+      plan = R::Plan.build(R::PlanOptions.new([raw], default_target: "http://h.test",
+        expand_request: false, auto_content_length: false), ungated)
+      String.new(plan.bytes).should eq(String.new(raw))
+    end
+
+    it "promotes it by default, which is what every other send still does" do
+      raw = "GET /v HTTP/1.1\r\nHost: h.test\nX-Bare: lf\n\r\n".to_slice
+      plan = R::Plan.build(R::PlanOptions.new([raw], default_target: "http://h.test"), ungated)
+      String.new(plan.bytes).should eq("GET /v HTTP/1.1\r\nHost: h.test\r\nX-Bare: lf\r\n\r\n")
+    end
+
+    it "also leaves the version line alone, since the operator asked for these exact bytes" do
+      raw = "GET /v HTTP/2\r\nHost: h.test\r\n\r\n".to_slice
+      plan = R::Plan.build(R::PlanOptions.new([raw], default_target: "http://h.test",
+        expand_request: false, auto_content_length: false), ungated)
+      String.new(plan.bytes).lines.first.should eq("GET /v HTTP/2")
+    end
+
+    it "still refuses an unresolved $VAR, which is checked regardless of expansion" do
+      raw = "GET /v HTTP/1.1\r\nHost: h.test\r\nX-T: $NOPE\r\n\r\n".to_slice
+      expect_raises(R::PlanError) do
+        R::Plan.build(R::PlanOptions.new([raw], default_target: "http://h.test",
+          expand_request: false, auto_content_length: false), ungated)
+      end
+    end
+  end
 end

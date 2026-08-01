@@ -43,9 +43,9 @@ module Gori::Proxy::H2
       method = pseudo(fields, ":method") || "GET"
       path = pseudo(fields, ":path") || "/"
       String.build do |io|
-        io << method << ' ' << path << " HTTP/2\r\n"
-        io << "Host: " << authority << "\r\n" if !authority.empty? && !explicit_host?(fields)
-        regular(fields) { |n, v| io << n << ": " << v << "\r\n" }
+        io << line_safe(method) << ' ' << line_safe(path) << " HTTP/2\r\n"
+        io << "Host: " << line_safe(authority) << "\r\n" if !authority.empty? && !explicit_host?(fields)
+        regular(fields) { |n, v| io << line_safe(n) << ": " << line_safe(v) << "\r\n" }
         io << "\r\n"
       end.to_slice
     end
@@ -58,9 +58,66 @@ module Gori::Proxy::H2
       status = (pseudo(fields, ":status") || "0").to_i? || 0
       String.build do |io|
         io << "HTTP/2 " << status << "\r\n"
-        regular(fields) { |n, v| io << n << ": " << v << "\r\n" }
+        regular(fields) { |n, v| io << line_safe(n) << ": " << line_safe(v) << "\r\n" }
         io << "\r\n"
       end.to_slice
+    end
+
+    # Keep the synthesis INJECTIVE at the line level: one h2 field must never become two text
+    # lines (#517). `h1_faithful?` is that precondition for `parse_*`/`rewrite`/`encode_edited`,
+    # which refuse outright — but `Assembler` calls `synth_*` DIRECTLY to build the stored head,
+    # and had no such guard, so a peer field whose value carried a CRLF was projected as two
+    # well-formed headers into everything derived from the head: `gori run show`, MCP get_flow,
+    # QL `header:`, the Rewriter preview, and the bytes the Repeater/fuzz/mine editors replay
+    # from. Response-direction is the dangerous one — the value is the ORIGIN'S, so it is a
+    # header-injection primitive handed to whatever replays the projection.
+    #
+    # Refusing is not available here (a captured flow still has to render), so the CR/LF is
+    # escaped instead: the field stays one line, the operator SEES the injected bytes, and the
+    # text cannot be re-read as two fields. This is a projection, not the wire — the raw frames
+    # remain the truth (P7), and `synth_response` already normalizes `:status` the same way.
+    # Every path that could put these bytes back on an h2 wire refuses them before reaching
+    # here, so nothing that was byte-exact stops being byte-exact.
+    private def line_safe(s : String) : String
+      return s unless needs_escape?(s)
+      String.build do |io|
+        chars = s.each_char.to_a
+        chars.each_with_index do |c, i|
+          case c
+          when '\r' then io << "\\r"
+          when '\n' then io << "\\n"
+          when '\\'
+            # A backslash is escaped ONLY when it could be read back as one of the escapes
+            # above. Without this the projection is not injective in the direction that
+            # matters: a value carrying the two literal characters `\` `r` rendered
+            # identically to one carrying a real CR, and "was this CRLF injected by the
+            # origin, or did it always contain that text?" is the question an operator opens
+            # this view to ask. Leaving `\` alone before anything else keeps an ordinary
+            # `C:\path` or a regex value byte-identical, so a Match&Replace rule written
+            # against one still matches.
+            #
+            # A REAL CR/LF as the next char counts too: it is itself rendered as `\r`/`\n`
+            # below, so a lone `\` in front of it would merge into `\\r` — indistinguishable
+            # from a literal backslash-r. Escaping the `\` here makes `x\<CR>y` come back as
+            # `x\\\ry` (three) versus a literal `x\ry` as `x\\ry` (two).
+            nxt = chars[i + 1]?
+            io << (nxt == 'r' || nxt == 'n' || nxt == '\\' || nxt == '\r' || nxt == '\n' ? "\\\\" : "\\")
+          else io << c
+          end
+        end
+      end
+    end
+
+    # `line_safe`'s guard, in one allocation-free pass: a real CR/LF, or a backslash that would
+    # be read back as one of its escapes.
+    private def needs_escape?(s : String) : Bool
+      prev_backslash = false
+      s.each_char do |c|
+        return true if c == '\r' || c == '\n'
+        return true if prev_backslash && (c == 'r' || c == 'n' || c == '\\')
+        prev_backslash = c == '\\'
+      end
+      false
     end
 
     # Invert `synth_request`. `original` supplies everything the h1 text cannot carry.
