@@ -921,21 +921,45 @@ describe Gori::Settings do
     end
   end
 
-  it "round-trips open Decoder sub-tabs (sessions)" do
+  # Open sub-tabs moved to the per-project store; settings.json only still READS a
+  # pre-upgrade block so DecoderController can adopt it once. Saving must never write one
+  # back — that block is exactly what carried one project's decoded material into the next.
+  it "reads a legacy Decoder sessions block but never writes one back" do
     dir = File.tempname("gori-settings-decoder-sessions")
     Dir.mkdir_p(dir)
     prev = ENV["GORI_HOME"]?
     begin
       ENV["GORI_HOME"] = dir
       Gori::Settings.decoder_chains = [] of {String, String}
-      Gori::Settings.decoder_sessions = [{"in1", "base64", "first"}, {"in2", "hex > upper", ""}]
-      Gori::Settings.save.should be_true
-      raw = File.read(Gori::Settings.path)
-      raw.includes?(%("sessions")).should be_true
-
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
+      File.write(Gori::Settings.path,
+        %({"decoder":{"sessions":[{"input":"in1","chain":"base64","name":"first"},{"input":"in2","chain":"hex > upper"}]}}))
       Gori::Settings.load
       Gori::Settings.decoder_sessions.should eq([{"in1", "base64", "first"}, {"in2", "hex > upper", ""}])
+
+      # save no longer SERIALIZES sessions, but it cannot erase what disk already has: an
+      # unserialized section reads as "unchanged" to the 3-way merge and yields to the copy on
+      # disk. That gap is exactly why the migration needs its own eraser.
+      File.write(Gori::Settings.path,
+        %({"theme":"goridark","decoder":{"sessions":[{"input":"tok","chain":"base64"}],"chains":[{"name":"h","spec":"md5"}]}}))
+      Gori::Settings.load
+      Gori::Settings.save.should be_true
+      File.read(Gori::Settings.path).includes?(%("sessions")).should be_true
+
+      Gori::Settings.drop_legacy_decoder_sessions.should be_true
+      after = File.read(Gori::Settings.path)
+      after.includes?(%("sessions")).should be_false
+      after.includes?(%("md5")).should be_true   # the named chains survive
+      after.includes?("goridark").should be_true # and so does every unrelated section
+      # a fresh process (empty property) finds nothing left to adopt from the erased file —
+      # the tolerant parser keeps the CURRENT value for an absent node, so clear it first
+      Gori::Settings.decoder_sessions = [] of {String, String, String}
+      Gori::Settings.load
+      Gori::Settings.decoder_sessions.should be_empty
+      Gori::Settings.decoder_chains.should eq([{"h", "md5"}])
+
+      # idempotent: a second pass (or a file that never had the block) is a no-op success
+      Gori::Settings.drop_legacy_decoder_sessions.should be_true
+      File.read(Gori::Settings.path).should eq(after)
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
@@ -955,9 +979,9 @@ describe Gori::Settings do
       Gori::Settings.save.should be_true
       File.read(Gori::Settings.path).includes?("decoder").should be_false
 
-      # a single blank+unnamed open session is still "nothing to persist" — a cleared or
-      # dirtied-but-empty workbench must not write a stub "decoder" block either
-      Gori::Settings.decoder_sessions = [{"", "", ""}]
+      # sessions no longer feed the block at all — even a non-blank legacy set (still in
+      # memory before the migration clears it) must not resurrect a "decoder" section
+      Gori::Settings.decoder_sessions = [{"secret-token", "base64-decode", "loot"}]
       Gori::Settings.save.should be_true
       File.read(Gori::Settings.path).includes?("decoder").should be_false
     ensure

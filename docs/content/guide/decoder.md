@@ -25,7 +25,7 @@ Four cards stack top to bottom:
 | **PIPELINE** | One row per step with its intermediate output |
 | **OUTPUT** | Final result (text / hex / base64 display modes) |
 
-You can keep several conversions open as **sub-tabs** (new, rename, duplicate, close from the space menu).
+You can keep several conversions open as **sub-tabs** (new, rename, duplicate, close from the space menu). Open sub-tabs are saved with the **project**, so they come back the next time you open it and never follow you into another project.
 
 ## Building a Chain
 
@@ -39,7 +39,7 @@ gzip-decompress | json-unescape
 
 Aliases work the same as the primary name (`b64` → `base64-encode`, `url` → `url-encode`, and so on). Autocomplete helps when the name is fuzzy.
 
-Save a chain under a name (**Save chain by name** from the space menu) and reload it later. Defaults also persist under the `decoder` section of settings.
+Save a chain under a name (**Save chain by name** from the space menu) and reload it later. Named chains live under the `decoder` section of settings and are shared by every project — the chain is a recipe, while what you run through it stays with the project.
 
 ## Converters
 

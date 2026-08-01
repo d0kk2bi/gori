@@ -24,7 +24,12 @@ module Gori::Tui
       @sub_sel = 0
       @sub_scroll = 0
       @focus = :list # :list | :preview_in | :preview_out
-      @preview_input = TextArea.new(DEFAULT_SAMPLE)
+      # The sample is per PROJECT (the rules it previews already are): an operator pastes a
+      # real captured request in here, so it must not follow them into the next project.
+      # Absent from the store = never edited here → the demo default.
+      sample = @host.session.store.setting(Store::REWRITER_SAMPLE_KEY) || DEFAULT_SAMPLE
+      @preview_input = TextArea.new(sample)
+      @saved_sample = @preview_input.text # what the store holds, in the form `commit` compares
       @out_scroll = 0
       @last_body = Rect.new(0, 0, 0, 0) # last content rect — click/wheel geometry
     end
@@ -75,6 +80,17 @@ module Gori::Tui
     def on_external_change : Nil
       rules_engine.reload
       bindings.reload
+    end
+
+    # Flush an edited preview sample to the project store on leave/quit. Compared against the
+    # last value known to be stored rather than tracked with a dirty flag: every edit path
+    # funnels through this one TextArea, so the comparison cannot miss a site — and an
+    # untouched sample never writes a row. A failed write leaves @saved_sample alone, so the
+    # next leave retries.
+    def commit : Nil
+      text = @preview_input.text
+      return if text == @saved_sample
+      @saved_sample = text if @host.session.store.set_setting(Store::REWRITER_SAMPLE_KEY, text)
     end
 
     def selected_rule : Store::MatchRule?

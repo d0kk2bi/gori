@@ -3152,6 +3152,7 @@ module Gori::Tui
       sequencer_controller.save_current
       issues_controller.commit
       decoder_controller.commit
+      rewriter_controller.commit # the editable preview sample
     end
 
     def status(message : String) : Nil
@@ -3706,6 +3707,7 @@ module Gori::Tui
       miner_controller.save_current if @active_tab == :miner
       sequencer_controller.save_current if @active_tab == :sequencer
       decoder_controller.commit if @active_tab == :decoder
+      rewriter_controller.commit if @active_tab == :rewriter
       notes_controller.save_notes if @active_tab == :notes
       issues_controller.commit if @active_tab == :issues
     end
