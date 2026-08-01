@@ -787,6 +787,17 @@ module Gori
         if detail.request_body_truncated?
           cap_mib = Settings.effective_capture_max_mib
           STDERR.puts "gori run repeater: request body was truncated at the #{cap_mib} MiB capture cap — resending the stored (shorter) body with a corrected Content-Length"
+        elsif detail.row.state.error? || detail.row.state.aborted?
+          # A capture that never completed can hold a Content-Length larger than the body it
+          # actually stored — the client hung up mid-upload. Replay is byte-exact now (a
+          # stored CL is evidence, not a draft), which is right when that mismatch IS the
+          # probe and a trap when it is just a dead client: the origin will sit waiting for
+          # bytes that no longer exist. The truncation branch above cannot cover this — it
+          # keys on the CAPTURE CAP column, which a mid-upload abort never sets. So say it,
+          # rather than quietly picking one of the two intentions.
+          STDERR.puts "gori run repeater: flow ##{id} was captured incomplete (#{detail.row.state}) — " \
+                      "its Content-Length is resent verbatim and may exceed the stored body. " \
+                      "Use -b/--body to reframe, or --rm-header Content-Length to send without one."
         end
 
         built = Repeater::FlowRequest.build(detail)
