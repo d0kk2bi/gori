@@ -88,23 +88,28 @@ describe "held-item edit refusal on the read surfaces" do
     detail["edit_refusal"].as_s.should contain("x-evil")
   end
 
-  # A head-only hold with NO refusal is still editable — only a BODY has nowhere to go — so
-  # the warning has to say that and not "edits are refused".
-  it "warns about a head-only hold without claiming the message is uneditable" do
+  # EVERY h2 hold is head-only (`H2::StreamGate` passes `head_only: true` on both legs), so
+  # folding that into `edit_refusal` would mark every held HTTP/2 message uneditable — head
+  # edits DO apply, only a body has nowhere to go. Two statements, two fields.
+  it "does not report a head-only hold as a refusal" do
     row = refusing_row(nil, head_only: true)
-    row.edit_warning.not_nil!.should contain("HEAD only")
-    row.edit_warning.not_nil!.should_not contain("CR or LF")
-    JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) })["head_only"]
-      .as_bool.should be_true
+    row.edit_refusal.should be_nil
+    row.head_only_note.not_nil!.should contain("HEAD only")
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) }).as_h
+    obj["head_only"].as_bool.should be_true
+    obj["head_only_note"].as_s.should contain("ADDS A BODY")
+    obj.has_key?("edit_refusal").should be_false
   end
 
-  # The complement: an h1 hold covers head+body and forwards byte-exact, so neither field is
+  # The complement: an h1 hold covers head+body and forwards byte-exact, so no field is
   # emitted and a client keying off field presence sees exactly the shape it saw before.
   it "says nothing at all about an ordinary h1 hold" do
     row = refusing_row
-    row.edit_warning.should be_nil
+    row.edit_refusal.should be_nil
+    row.head_only_note.should be_nil
     obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) }).as_h
     obj.has_key?("edit_refusal").should be_false
     obj.has_key?("head_only").should be_false
+    obj.has_key?("head_only_note").should be_false
   end
 end

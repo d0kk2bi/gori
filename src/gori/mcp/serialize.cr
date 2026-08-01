@@ -178,9 +178,15 @@ module Gori
       # wrote an edit, called `intercept_forward_edit`, and only then got the refusal. That is
       # the state a CRLF-injection probe INDUCES, so it is the normal case for the test an
       # agent is most likely to be running. Emitted only when there is something to say.
+      # `edit_refusal` is the HARD one — gori will apply no edit to this message at all.
+      # `head_only` is the caveat: it is true for EVERY h2 hold (the gate holds the head), a
+      # head edit applies normally, and only a body has nowhere to go. Reporting the caveat as
+      # a refusal would mark every held HTTP/2 message uneditable, so they stay separate
+      # fields and an agent can act on each.
       def self.emit_edit_warning(j : JSON::Builder, row : Store::HeldRow) : Nil
         j.field "head_only", true if row.head_only?
-        row.edit_warning.try { |w| j.field "edit_refusal", text(w) }
+        row.head_only_note.try { |n| j.field "head_only_note", text(n) }
+        row.edit_refusal.try { |r| j.field "edit_refusal", text(r) }
       end
 
       # Detail projection: full redacted head + body size. The FULL raw message base64 (for

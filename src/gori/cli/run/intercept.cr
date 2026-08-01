@@ -178,7 +178,9 @@ module Gori
               # `[no-edit]` marks a message an edit cannot be applied to, so the state is
               # scannable down a queue listing the way `[stub]` is in History. The sentence
               # itself is `intercept get`'s; a list row has no space for it.
-              chip = r.edit_warning ? "  [no-edit]" : ""
+              # `edit_refusal` ONLY, never `head_only`: the gate holds the head of every h2
+              # message, so chipping on that would mark every held HTTP/2 row uneditable.
+              chip = r.edit_refusal ? "  [no-edit]" : ""
               puts "##{r.item_id}  [#{r.kind}]  #{method} #{CLI::Output.term_safe(intercept_row_where(r))}  (#{body.size}b body)#{chip}"
             end
           end
@@ -188,9 +190,14 @@ module Gori
       # "gori will not apply an edit to this message, and here is why" — printed before the
       # head so the operator reads it before writing one. Silent when the message is editable.
       private def self.emit_edit_warning(r : Store::HeldRow) : Nil
-        return unless warning = r.edit_warning
-        STDERR.puts "! edits cannot be applied to this message: #{CLI::Output.term_safe(warning)}"
-        STDERR.puts "! it stays held — forward it as it is, drop it, or replay it from the Repeater."
+        if refusal = r.edit_refusal
+          STDERR.puts "! edits cannot be applied to this message: #{CLI::Output.term_safe(refusal)}"
+          STDERR.puts "! it stays held — forward it as it is, drop it, or replay it from the Repeater."
+          return
+        end
+        # Not a refusal: the head IS editable. Said anyway, because the surface that offers an
+        # edit is the one that has to name what the edit cannot carry.
+        r.head_only_note.try { |n| STDERR.puts "! #{CLI::Output.term_safe(n)}" }
       end
 
       # WHERE a held item is, for one text row. The escape-neutralizing wrap is the caller's;

@@ -930,16 +930,17 @@ module Gori
                      @edit_refusal = nil, @head_only = false)
       end
 
-      # Why an EDIT to this held message will be refused, or nil when it will be applied.
-      # The read-side twin of `Interceptor::Item#refuse_edit`, minus the bytes: a surface
-      # asks this to warn BEFORE the operator writes an edit, and `Item#refuse_edit` is what
-      # actually decides when the edited bytes exist.
-      def edit_warning : String?
-        return @edit_refusal if @edit_refusal
+      # The head-only CAVEAT, and deliberately NOT folded into `edit_refusal`.
+      #
+      # Every h2 hold is head-only (`H2::StreamGate` passes `head_only: true` on both legs),
+      # so treating it as a refusal would mark every held HTTP/2 message uneditable — and head
+      # edits DO apply. Only a body has nowhere to go. Two different statements, so two
+      # accessors: a surface that chips "cannot be edited" must key on `edit_refusal` alone.
+      # nil when the hold covers head+body (h1), where an edit is forwarded byte-exact.
+      def head_only_note : String?
         return nil unless @head_only
-        "this HTTP/2 hold covers the HEAD only — a body added by an edit has nowhere to go " \
-        "(DATA frames stream past the intercept gate untouched), so an edit that adds one " \
-        "will be refused"
+        "this HTTP/2 hold covers the HEAD only — an edit that ADDS A BODY will be refused " \
+        "(DATA frames stream past the intercept gate untouched); a head edit applies normally"
       end
     end
 

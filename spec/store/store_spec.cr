@@ -141,9 +141,12 @@ describe Gori::Store do
       held = store.intercept_held(tok)
       held.map(&.edit_refusal).should eq([reason, nil, nil])
       held.map(&.head_only?).should eq([true, true, false])
-      held[0].edit_warning.should eq(reason)
-      held[1].edit_warning.not_nil!.should contain("HEAD only")
-      held[2].edit_warning.should be_nil
+      held[0].edit_refusal.should eq(reason)
+      # head_only is a CAVEAT, not a refusal: it holds for every h2 message and a head edit
+      # still applies, so it must never read as "this message cannot be edited".
+      held[1].edit_refusal.should be_nil
+      held[1].head_only_note.not_nil!.should contain("HEAD only")
+      held[2].head_only_note.should be_nil
     end
   end
 
