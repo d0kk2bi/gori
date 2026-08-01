@@ -386,11 +386,29 @@ module Gori::Proxy::H2
       fields_out = [] of {String, String}
       lines.each do |line|
         break if line.empty?
-        idx = line.index(':')
-        return nil if idx.nil? || idx == 0
-        fields_out << {line[0, idx].strip, line[(idx + 1)..].lstrip(' ')}
+        pair = header_field(line)
+        return nil unless pair
+        fields_out << pair
       end
       fields_out
+    end
+
+    # ONE head line as `{name, value}`, or nil when it is not a header field at all.
+    #
+    # Public because `Repeater::H2Engine` encodes the SAME h1 text into the SAME h2 fields and
+    # had its own copy, which `strip`ped the value on BOTH sides. The two encoders then
+    # disagreed about what an operator's `X-Pad: sp   ` means on the wire: the proxy's
+    # intercept-edit path sent the trailing space (the RFC 9113 §8.2.1 probe that a conformant
+    # peer must reject — the whole point of typing it), the repeater ate it. Sharing the line
+    # rule and not the loop is deliberate: this cut is the same everywhere, but "stop at the
+    # blank line" belongs to the round trip, and the repeater must instead REFUSE the text
+    # after a bare-LF blank rather than silently drop it.
+    #
+    # See `regular_faithful?` for why the `strip`/`lstrip` asymmetry is what it is.
+    def header_field(line : String) : {String, String}?
+      idx = line.index(':')
+      return nil if idx.nil? || idx == 0
+      {line[0, idx].strip, line[(idx + 1)..].lstrip(' ')}
     end
 
     # {method, path} from a rewritten request line. Splits on the FIRST space, and on the
@@ -398,7 +416,12 @@ module Gori::Proxy::H2
     # space (malformed, but a peer can send one and P7 says we carry it) survives the round
     # trip. Deliberately NOT `Codec::Http1.parse_request_head`, whose `parts.size != 3` rule
     # (`http1.cr:107-120`) would call that line malformed and truncate the path.
-    private def request_line(start : String) : {String?, String?}
+    #
+    # Public for the same reason as `header_lines`: `Repeater::H2Engine` had a copy that cut
+    # at the LAST space unconditionally, so a version-less `GET /noversion` — what a parser-
+    # differential probe writes, and what hand-editing the line in the TUI editor produces —
+    # had `last_sp == first_sp`, fell through the ternary, and went out as `:path` `/`.
+    def request_line(start : String) : {String?, String?}
       sp = start.index(' ')
       return {nil, nil} if sp.nil? || sp == 0
       rest = start[(sp + 1)..]
