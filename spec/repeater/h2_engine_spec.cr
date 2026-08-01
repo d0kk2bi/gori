@@ -704,7 +704,7 @@ describe Gori::Repeater::H2Engine do
     request = "GET /api/thing HTTP/2\r\nx-repeater: yes\r\n\r\n".to_slice
     result = Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    seen.receive.should eq("GET /api/thing body=") # origin saw the HPACK-encoded request
+    receive_within(seen).should eq("GET /api/thing body=") # origin saw the HPACK-encoded request
     result.ok?.should be_true
     result.response.not_nil!.status.should eq(200)
     String.new(result.head).should contain("HTTP/2 200")
@@ -765,7 +765,7 @@ describe Gori::Repeater::H2Engine do
     result = Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1",
       port: port, verify_upstream: false)
 
-    seen.receive.should eq("GET /f body=")
+    receive_within(seen).should eq("GET /f body=")
     result.ok?.should be_true
   end
 
@@ -788,7 +788,7 @@ describe Gori::Repeater::H2Engine do
     request = "POST /submit HTTP/2\r\ncontent-type: text/plain\r\n\r\nhello-h2-body".to_slice
     result = Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    seen.receive.should eq("POST /submit body=hello-h2-body")
+    receive_within(seen).should eq("POST /submit body=hello-h2-body")
     result.response.not_nil!.status.should eq(201)
     String.new(result.body.not_nil!).should eq("created")
   end
@@ -811,7 +811,7 @@ describe Gori::Repeater::H2Engine do
     request = "GET / HTTP/2\r\nHost: victim.internal\r\n\r\n".to_slice
     result = Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    seen.receive.should eq("victim.internal")
+    receive_within(seen).should eq("victim.internal")
     result.ok?.should be_true
   end
 
@@ -822,7 +822,7 @@ describe Gori::Repeater::H2Engine do
     result = Gori::Repeater::H2Engine.send("GET / HTTP/2\r\n\r\n".to_slice,
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    seen.receive.should eq("127.0.0.1:#{port}")
+    receive_within(seen).should eq("127.0.0.1:#{port}")
     result.ok?.should be_true
   end
 
@@ -848,7 +848,7 @@ describe Gori::Repeater::H2Engine do
     result = Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1",
       port: port, verify_upstream: false)
 
-    fields, _ = seen.receive
+    fields, _ = receive_within(seen)
     fields.should contain({"transfer-encoding", "chunked"})
     fields.should contain({"connection", "keep-alive"})
     fields.should contain({"upgrade", "h2c"})
@@ -870,7 +870,7 @@ describe Gori::Repeater::H2Engine do
     Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1",
       port: port, verify_upstream: false)
 
-    fields, _ = seen.receive
+    fields, _ = receive_within(seen)
     fields.should contain({"x-pad", "trailing   "})
   end
 
@@ -884,7 +884,7 @@ describe Gori::Repeater::H2Engine do
     Gori::Repeater::H2Engine.send("GET / HTTP/2\r\nx-lead:    lead\r\n\r\n".to_slice,
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    fields, _ = seen.receive
+    fields, _ = receive_within(seen)
     fields.should contain({"x-lead", "lead"})
   end
 
@@ -895,7 +895,7 @@ describe Gori::Repeater::H2Engine do
     Gori::Repeater::H2Engine.send("GET / HTTP/2\r\nX-MiXeD-Case: KeepMe\r\n\r\n".to_slice,
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    fields, _ = seen.receive
+    fields, _ = receive_within(seen)
     fields.should contain({"x-mixed-case", "KeepMe"}) # name folded, VALUE untouched
   end
 
@@ -911,7 +911,7 @@ describe Gori::Repeater::H2Engine do
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
       preserve_field_case: true)
 
-    fields, _ = seen.receive
+    fields, _ = receive_within(seen)
     fields.should contain({"X-MiXeD-Case", "KeepMe"})
   end
 
@@ -927,7 +927,7 @@ describe Gori::Repeater::H2Engine do
     result = Gori::Repeater::H2Engine.send("GET /noversion\r\nx-case: a\r\n\r\n".to_slice,
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    seen.receive.should eq("GET /noversion body=")
+    receive_within(seen).should eq("GET /noversion body=")
     result.ok?.should be_true
   end
 
@@ -945,7 +945,7 @@ describe Gori::Repeater::H2Engine do
     result = Gori::Repeater::H2Engine.send(request, scheme: "http", host: "127.0.0.1",
       port: port, verify_upstream: false)
 
-    fields, shape = seen.receive
+    fields, shape = receive_within(seen)
     shape.size.should be > 1
     shape.first[0].should eq("Headers")
     shape[1..].each { |(type, _)| type.should eq("Continuation") }
@@ -1051,7 +1051,7 @@ describe Gori::Repeater::H2Engine do
       result = Gori::Repeater::H2Engine.send_fields(fields, nil,
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-      got, _ = seen.receive
+      got, _ = receive_within(seen)
       got.should eq(fields) # nothing dropped, reordered, deduped, folded or stripped
       result.ok?.should be_true
     end
@@ -1064,7 +1064,7 @@ describe Gori::Repeater::H2Engine do
       result = Gori::Repeater::H2Engine.send_fields(fields, "payload".to_slice,
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-      seen.receive.should eq("POST /upload body=payload")
+      receive_within(seen).should eq("POST /upload body=payload")
       result.response.not_nil!.status.should eq(201)
     end
 
@@ -1079,7 +1079,7 @@ describe Gori::Repeater::H2Engine do
       Gori::Repeater::H2Engine.send_fields(fields, nil,
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-      got, shape = seen.receive
+      got, shape = receive_within(seen)
       shape.size.should be > 1
       shape.first[0].should eq("Headers")
       shape[1..].each { |(type, _)| type.should eq("Continuation") }
@@ -1124,7 +1124,7 @@ describe Gori::Repeater::H2Engine do
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
         timeout: 5.seconds)
 
-      seen.receive.should eq(200_000) # -1 would mean gori overran the window
+      receive_within(seen).should eq(200_000) # -1 would mean gori overran the window
       result.error.should be_nil
       result.response.try(&.status).should eq(200)
     end
@@ -1140,7 +1140,7 @@ describe Gori::Repeater::H2Engine do
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
         timeout: 5.seconds)
 
-      seen.receive.should eq(20_000)
+      receive_within(seen).should eq(20_000)
       result.error.should be_nil
     end
 
@@ -1153,7 +1153,7 @@ describe Gori::Repeater::H2Engine do
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
         timeout: 500.milliseconds)
 
-      seen.receive.should eq(65_535) # exactly the window, not a byte more
+      receive_within(seen).should eq(65_535) # exactly the window, not a byte more
       error = result.error.should_not be_nil
       error.should contain("h2 flow control")
       error.should contain("only 65535 of 200000 request body bytes")
@@ -1184,7 +1184,7 @@ describe Gori::Repeater::H2Engine do
           scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
           timeout: 3.seconds)
 
-        seen.receive.should eq(4096)
+        receive_within(seen).should eq(4096)
         # The response ARRIVED — it must survive the writer's disposition.
         result.response.try(&.status).should eq(413)
         String.new(result.head).should contain("413")
@@ -1208,7 +1208,7 @@ describe Gori::Repeater::H2Engine do
           scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
           timeout: 3.seconds)
 
-        seen.receive.should eq(4096)
+        receive_within(seen).should eq(4096)
         result.response.try(&.status).should eq(413)
         error = result.error.should_not be_nil # was `ok:true, error:null`
         error.should contain("truncated at 4096 of 20000 bytes")
@@ -1227,7 +1227,7 @@ describe Gori::Repeater::H2Engine do
           scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
           timeout: 3.seconds)
 
-        seen.receive.should eq(500)
+        receive_within(seen).should eq(500)
         result.response.try(&.status).should eq(200)
         result.error.should be_nil
       end
@@ -1246,7 +1246,7 @@ describe Gori::Repeater::H2Engine do
           scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
           timeout: 3.seconds)
 
-        seen.receive.should eq(20_000)               # the whole body, not 4096
+        receive_within(seen).should eq(20_000)       # the whole body, not 4096
         result.response.try(&.status).should eq(200) # the FINAL status, not the 100
         result.error.should be_nil                   # nothing was truncated
       end
@@ -1270,7 +1270,7 @@ describe Gori::Repeater::H2Engine do
             scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
             timeout: 2.seconds)
 
-          seen.receive.should eq(4096) # -1 = gori overran the window it was told about
+          receive_within(seen).should eq(4096) # -1 = gori overran the window it was told about
           # No window was ever granted, so this stalls — but on gori's OWN accounting, with
           # no GOAWAY drawn and the origin never blamed.
           error = result.error.should_not be_nil
@@ -1293,7 +1293,7 @@ describe Gori::Repeater::H2Engine do
           scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
           timeout: 2.seconds)
 
-        seen.receive.should eq(-1) # gori overran, as the RFC default entitles it to
+        receive_within(seen).should eq(-1) # gori overran, as the RFC default entitles it to
         error = result.error.should_not be_nil
         error.should contain("FLOW_CONTROL_ERROR")
         error.should contain("gori's own accounting")
@@ -1319,7 +1319,7 @@ describe Gori::Repeater::H2Engine do
           timeout: 1.second)
         elapsed = Time.instant - started
 
-        seen.receive.should eq(1024)
+        receive_within(seen).should eq(1024)
         elapsed.should be < 10.seconds # unbounded before: the PINGs reset the idle timer
         error = result.error.should_not be_nil
         error.should contain("only 1024 of 20000 request body bytes")
@@ -1336,7 +1336,7 @@ describe Gori::Repeater::H2Engine do
           scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
           timeout: 1.second)
 
-        seen.receive.should eq(1024)
+        receive_within(seen).should eq(1024)
         error = result.error.should_not be_nil
         error.should contain("WINDOW_UPDATE with a 0 increment")
         error.should contain("§6.9.1")
@@ -1355,7 +1355,7 @@ describe Gori::Repeater::H2Engine do
           timeout: 700.milliseconds)
         elapsed = Time.instant - started
 
-        seen.receive.should eq(65_535)
+        receive_within(seen).should eq(65_535)
         result.error.should_not be_nil
         # One patience budget, not two: the write stall must not be followed by a full
         # response-read timeout on a socket that produced no frames.
@@ -1462,7 +1462,7 @@ describe Gori::Repeater::H2Engine do
       Gori::Repeater::H2Engine.send(
         "GET /dup HTTP/2\r\nHost: first.example\r\nHost: second.example\r\nX-A: 1\r\n\r\n".to_slice,
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, timeout: 5.seconds)
-      fields, _ = seen.receive
+      fields, _ = receive_within(seen)
       fields.should contain({":authority", "first.example"})
       fields.should contain({"host", "second.example"})
     end
@@ -1473,7 +1473,7 @@ describe Gori::Repeater::H2Engine do
       Gori::Repeater::H2Engine.send(
         "GET /e HTTP/2\r\nHost: \r\nX-A: 1\r\n\r\n".to_slice,
         scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, timeout: 5.seconds)
-      fields, _ = seen.receive
+      fields, _ = receive_within(seen)
       fields.should contain({":authority", ""})
       fields.map(&.[1]).should_not contain("127.0.0.1:#{port}")
     end

@@ -43,7 +43,7 @@ describe Gori::Interceptor do
       item.host.should eq("acme.test")
 
       ic.forward(item.id, "GET /edited HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice)
-      d = result.receive
+      d = receive_within(result)
       d.action.should eq(Gori::Interceptor::Action::Forward)
       String.new(d.bytes).should contain("/edited")
       ic.pending_count.should eq(0)
@@ -65,7 +65,7 @@ describe Gori::Interceptor do
 
       r2 = ic.revision
       ic.forward(ic.pending.first.id)
-      result.receive
+      receive_within(result)
       (ic.revision > r2).should be_true # forward bumped
     end
   end
@@ -78,7 +78,7 @@ describe Gori::Interceptor do
       spawn { result.send(req(ic, "GET / HTTP/1.1\r\n\r\n")) }
       Fiber.yield
       ic.drop(ic.pending.first.id)
-      result.receive.action.should eq(Gori::Interceptor::Action::Drop)
+      receive_within(result).action.should eq(Gori::Interceptor::Action::Drop)
     end
   end
 
@@ -94,7 +94,7 @@ describe Gori::Interceptor do
       item.held_at_ms.should be > 0                                  # wall-clock captured once at hold
       ic.get(item.id).not_nil!.held_at_ms.should eq(item.held_at_ms) # never re-stamped
       ic.forward(item.id)
-      result.receive
+      receive_within(result)
       ic.get(item.id).should be_nil # gone after forward
     end
   end
@@ -108,7 +108,7 @@ describe Gori::Interceptor do
       Fiber.yield
       ic.pending_count.should eq(1)
       ic.toggle # off → release held
-      result.receive.action.should eq(Gori::Interceptor::Action::Forward)
+      receive_within(result).action.should eq(Gori::Interceptor::Action::Forward)
       ic.pending_count.should eq(0)
     end
   end
@@ -122,7 +122,7 @@ describe Gori::Interceptor do
       Fiber.yield
       ic.pending_count.should eq(2)
       ic.release_all
-      2.times { done.receive }
+      2.times { receive_within(done) }
       ic.pending_count.should eq(0)
     end
   end
@@ -150,7 +150,7 @@ describe Gori::Interceptor do
       item.method.should eq("GET")
 
       ic.forward(item.id) # no override → the ORIGINAL bytes, byte-exact
-      d = result.receive
+      d = receive_within(result)
       d.action.should eq(Gori::Interceptor::Action::Forward)
       String.new(d.bytes).should eq("GET /a HTTP/1.1\r\nHost: acme.test\r\n\r\n")
       ic.pending_count.should eq(0)

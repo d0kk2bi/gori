@@ -31,3 +31,23 @@ Spec.after_suite { FileUtils.rm_rf(GORI_TEST_HOME) }
 def ungated_outbound : Gori::Outbound
   Gori::Outbound.waived(nil, Gori::Outbound::Reason::NoProject)
 end
+
+# NEVER a bare `Channel#receive` in a spec driven by real sockets — use this instead.
+#
+# PR #555 hung CI for 24 minutes on exactly that. The suite was green on macOS; on Linux a
+# client close was observed before the proxy had recorded its response, so nothing was ever
+# sent on the channel and the receive blocked forever. `crystal spec` block-buffers its dots
+# under Actions, so the hang left no output at all — not even how far it got.
+#
+# A timeout turns "it never arrived" into ONE failing example that says so, which is the
+# difference between a five-second diagnosis and a rerun. The default is deliberately long:
+# this is a deadlock guard, not a latency assertion, and a slow CI runner must not fail an
+# example that would have passed. Pass `what` to name what was expected.
+def receive_within(chan : Channel(T), seconds : Int32 = 20, what : String = "a value") : T forall T
+  select
+  when got = chan.receive
+    got
+  when timeout(seconds.seconds)
+    raise "nothing arrived on the channel within #{seconds}s (expected #{what})"
+  end
+end
