@@ -183,15 +183,30 @@ module Gori
       # Read inbound frames until the server sends Close, goes idle (read timeout),
       # or a cap trips. Reassembles fragmented data messages; answers Ping with a
       # Pong. Returns the close status code if the server framed one.
+      #
+      # Reassembly has THREE moments, not one, and this method used to have only the last:
+      #
+      #   1. a new data frame arriving while the previous message never sent its FIN — an
+      #      RFC 6455 §5.4 violation, and the whole point of pointing a repeater at a server;
+      #   2. FIN, the ordinary end of a message;
+      #   3. the drain ending with a fragment still unterminated (CLOSE / EOF / idle / a cap).
+      #
+      # Without 1 the two messages were concatenated, so `TEXT fin=0 "AAA"` then
+      # `TEXT fin=1 "BBB"` was reported as one well-formed `AAABBB` that never existed; without
+      # 3 an origin that died mid-message left the bytes it did send nowhere at all. The
+      # capture relay has had all three since #552 and reported the same origin bytes
+      # correctly, so the two surfaces disagreed about the same protocol. `emit_pending` is
+      # 1 and 3, `Proxy::WS::MessageShape` is the accumulator both now share, and the flushed
+      # fragment carries `fin: false` — gori reports the violation rather than repairing it.
       private def self.drain(io : IO, messages : Array(Message), idle : Time::Span) : Int32?
         assembling = IO::Memory.new
         msg_opcode = Proxy::WS::OP_TEXT
-        msg_shape = Proxy::WS::Shape::DEFAULT
-        msg_frames = 0
+        shape = Proxy::WS::MessageShape.new
         ctl_count = 0
         recv_bytes = 0_i64
         recv_count = 0
         frames = 0
+        close_code = nil.as(Int32?)
         started = Time.instant
         loop do
           # Count EVERY frame, not just completed messages: an origin flooding pings or
@@ -214,11 +229,20 @@ module Gori
 
           if frame.data?
             if frame.opcode != Proxy::WS::OP_CONT
+              if shape.frames > 0
+                # Moment 1: the previous message never FIN'd. Its bytes are the finding, so
+                # they get their own row instead of being merged into this one's — and that
+                # row counts against the same caps a completed message does. Without the
+                # count, an origin that simply never sends a FIN would buy an unbounded
+                # transcript: the byte cap lives on `assembling`, which this flush empties.
+                recv_count += 1
+                recv_bytes += assembling.bytesize
+                assembling = emit_pending(messages, assembling, msg_opcode, shape)
+                break if recv_caps_hit?(recv_count, recv_bytes)
+              end
               msg_opcode = frame.opcode
-              msg_shape = frame.shape
-              msg_frames = 0
             end
-            msg_frames += 1
+            shape.note(frame)
             assembling.write(frame.payload)
             break if assembling.bytesize > MAX_RECV_BYTES # runaway fragmented message
             if frame.fin?
@@ -228,11 +252,8 @@ module Gori
               # First frame's RSV/mask (§5.2 puts an extension's flags there), last frame's
               # FIN, and how many frames it took — the same accounting the capture relay does,
               # so the two agree about identical bytes.
-              messages << Message.new("in", msg_opcode.to_i, payload,
-                Proxy::WS::Shape.new(fin: true, rsv: msg_shape.rsv, masked: msg_shape.masked,
-                  mask_key: msg_shape.mask_key, frames: msg_frames))
+              messages << Message.new("in", msg_opcode.to_i, payload, shape.take)
               assembling = IO::Memory.new
-              msg_frames = 0
               break if recv_caps_hit?(recv_count, recv_bytes)
             end
           elsif frame.close?
@@ -240,8 +261,16 @@ module Gori
             # was already reported; the REASON — the free-text half of §5.5.1, and where a
             # server actually explains itself — was dropped on the floor, and a PING payload
             # (a real covert channel, and a real length-check bug site) with it.
+            #
+            # A half-assembled message ahead of it is flushed by the post-loop `emit_pending`,
+            # so the CLOSE row lands AFTER the fragment the origin sent before it — arrival
+            # order, which is the order the relay records the same bytes in. Hence `break`
+            # and not `return`: an early return skipped that flush, which is exactly how
+            # `TEXT fin=0 "UNTERMINATED"` followed by a CLOSE left the 12 bytes nowhere.
+            close_code = close_status(frame.payload)
+            assembling = emit_pending(messages, assembling, msg_opcode, shape)
             messages << Message.new("in", frame.opcode.to_i, frame.payload.dup, frame.shape)
-            return close_status(frame.payload)
+            break
           else
             # PING/PONG, bounded: `recv_count` only counts DATA messages, so an origin
             # pinging under the idle timeout would otherwise grow this array until
@@ -254,7 +283,23 @@ module Gori
             send_pong(io, frame.payload) if frame.opcode == Proxy::WS::OP_PING
           end
         end
-        nil
+        # Moment 3. Every exit above is a `break`, so this is reached on the idle timeout, on
+        # EOF, on a truncated frame, on a cap and on the CLOSE path alike — the same reason
+        # `Relay.pump` puts its own flush in an `ensure` rather than at the tail.
+        emit_pending(messages, assembling, msg_opcode, shape)
+        close_code
+      end
+
+      # Whatever fragments are buffered, as ONE message, and a fresh buffer. A no-op when
+      # nothing is being reassembled. `fin: false` is the point: the origin never sent the
+      # FIN, so gori does not invent one — the row says the message ended unterminated, which
+      # is the finding. `shape.frames` and not `assembling.bytesize` decides, because a
+      # leading fragment with an empty payload is still a fragment that never ended.
+      private def self.emit_pending(messages : Array(Message), assembling : IO::Memory,
+                                    opcode : UInt8, shape : Proxy::WS::MessageShape) : IO::Memory
+        return assembling if shape.frames == 0
+        messages << Message.new("in", opcode.to_i, assembling.to_slice.dup, shape.take)
+        IO::Memory.new
       end
 
       private def self.recv_caps_hit?(count : Int32, bytes : Int64) : Bool

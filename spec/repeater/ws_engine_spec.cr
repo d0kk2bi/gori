@@ -46,6 +46,31 @@ private UPGRADE = ("GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
                    "Upgrade: websocket\r\nConnection: Upgrade\r\n" \
                    "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").to_slice
 
+# An origin that completes the upgrade and then writes EXACTLY these bytes — a frame script,
+# so a sequence RFC 6455 forbids (and therefore `WS.encode` will not build) can still be put
+# on the wire. It never reads, so nothing here depends on what the engine sends.
+private def start_scripted_ws_origin(frames : Bytes) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    head = Gori::Proxy::Codec::Http1.read_head(conn).not_nil!
+    key = String.new(head).each_line
+      .find(&.downcase.starts_with?("sec-websocket-key:"))
+      .try { |l| l.split(':', 2)[1].strip } || ""
+    accept = Base64.strict_encode(Digest::SHA1.digest(key + WsEngine::GUID))
+    conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
+            "Connection: Upgrade\r\nSec-WebSocket-Accept: #{accept}\r\n\r\n"
+    conn.flush
+    conn.write(frames)
+    conn.flush
+    conn.close
+  rescue
+  end
+  port
+end
+
 # An origin that completes the upgrade and then closes at once, without reading or sending a
 # single frame — the shape that made a repeater run report success for messages nobody got.
 private def start_dead_ws_origin : Int32
@@ -188,6 +213,78 @@ describe Gori::Repeater::WsEngine do
 
     result.messages.count { |m| m.direction == "in" && m.opcode == 1 }.should eq(1)
     (result.note || "").should_not contain("delivery unconfirmed")
+  end
+
+  # The drain reassembles on FIN and had no other message boundary, so it merged an RFC 6455
+  # §5.4 violation into one clean message and dropped an unterminated fragment outright — while
+  # `Relay.pump`, fed the identical origin bytes, reported both correctly. A server that emits a
+  # new data frame mid-fragment, or that dies mid-message, is the finding a WebSocket test is
+  # looking for; the two surfaces may not disagree about it.
+  it "reports a §5.4 sequence as two messages instead of merging them" do
+    port = start_scripted_ws_origin(
+      Bytes[0x01, 0x03, 0x41, 0x41, 0x41] + # TEXT fin=0 "AAA" — never FIN'd
+      Bytes[0x81, 0x03, 0x42, 0x42, 0x42] + # TEXT fin=1 "BBB" — a NEW data message
+      Bytes[0x88, 0x02, 0x03, 0xE8])        # CLOSE 1000
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    # The two data rows used to be ONE, reading `AAABBB` — a well-formed message that was
+    # never on the wire.
+    inbound.map(&.opcode).should eq([1, 1, 8])
+    inbound[0..1].map { |m| String.new(m.payload) }.should eq(["AAA", "BBB"])
+    # Non-final, because the origin never sent the FIN: the violation is reported, not repaired.
+    inbound[0].shape.fin.should be_false
+    inbound[1].shape.fin.should be_true
+    result.close_code.should eq(1000)
+  end
+
+  it "keeps an unterminated fragment the origin sent before its CLOSE" do
+    port = start_scripted_ws_origin(
+      Bytes[0x01, 0x0C] + "UNTERMINATED".to_slice + # TEXT fin=0, no FIN ever follows
+      Bytes[0x88, 0x02, 0x03, 0xE8])                # CLOSE 1000
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    # The 12 bytes the origin framed vanished entirely: only the CLOSE row was reported.
+    inbound.map(&.opcode).should eq([1, 8])
+    String.new(inbound[0].payload).should eq("UNTERMINATED")
+    inbound[0].shape.fin.should be_false
+    result.close_code.should eq(1000)
+  end
+
+  # Same buffer, no CLOSE: the origin just goes away mid-message. Every exit from the drain
+  # has to flush, which is why the flush is after the loop and not on the CLOSE branch.
+  it "keeps an unterminated fragment when the origin disappears mid-message" do
+    port = start_scripted_ws_origin(Bytes[0x01, 0x04] + "HALF".to_slice)
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    inbound.map { |m| {m.opcode, String.new(m.payload)} }.should eq([{1, "HALF"}])
+    inbound[0].shape.fin.should be_false
+    result.close_code.should be_nil
+  end
+
+  # A fragmented message that DOES end normally must keep reporting exactly one row, with the
+  # first frame's RSV/mask and the frame count — the accounting the flushes are layered on top
+  # of, and the thing a copy-instead-of-share fix would have been free to get wrong.
+  it "still reassembles an ordinary fragmented message into one message" do
+    port = start_scripted_ws_origin(
+      Bytes[0x41, 0x03, 0x41, 0x41, 0x41] + # TEXT fin=0 rsv=4 "AAA"
+      Bytes[0x00, 0x03, 0x42, 0x42, 0x42] + # CONT fin=0 "BBB"
+      Bytes[0x80, 0x03, 0x43, 0x43, 0x43] + # CONT fin=1 "CCC"
+      Bytes[0x88, 0x02, 0x03, 0xE8])
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    inbound.map(&.opcode).should eq([1, 8])
+    String.new(inbound[0].payload).should eq("AAABBBCCC")
+    inbound[0].shape.fin.should be_true
+    inbound[0].shape.rsv.should eq(4) # §5.2 puts an extension's flags on the FIRST frame
+    inbound[0].shape.frames.should eq(3)
   end
 end
 

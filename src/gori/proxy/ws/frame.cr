@@ -57,6 +57,88 @@ module Gori::Proxy::WS
     end
   end
 
+  # One message's own wire frames, in the two forms a hold can need them.
+  #
+  # `interleaved` is exactly what arrived — every data fragment plus any PING/PONG that sat
+  # BETWEEN them (RFC 6455 §5.4 permits that), in arrival order. It is what goes on the wire
+  # whenever the message is written through, and it is what makes "a message neither stage
+  # changed goes out as the peer's own frames" true about ORDER and not only about bytes.
+  # Whether a peer tolerates a control frame between fragments is a standard hardening
+  # question, so a relay that removes the interleave removes the property under test.
+  #
+  # `data_only` is the same message with the control frames taken back out, and `controls`
+  # is those frames alone. The pair exists for the one case where the interleave genuinely
+  # cannot survive: a message PARKED on an intercept hold. A PONG cannot wait for a human
+  # (see `MessageGate`'s header), so there the controls go out immediately and the message's
+  # own frames follow whenever the operator releases them. With nothing interleaved — every
+  # message on a socket whose peers do not ping mid-message — the two byte slices are the
+  # same one and `controls` is nil, so the split costs nothing in the common case.
+  record RawFrames, interleaved : Bytes, data_only : Bytes, controls : Bytes? = nil
+
+  # Accumulates the frame-header facts of the message currently being reassembled, so the
+  # row that records it can say what its frames looked like (V7).
+  #
+  # First frame vs last is not arbitrary. RFC 6455 §5.2 puts an extension's RSV flags on
+  # the FIRST frame of a message, and the mask key that matters for a §5.1 question is the
+  # first one too; FIN is only interesting on the LAST frame, where 0 means the message
+  # never ended (a §5.4 violation, or a teardown mid-fragment). `frames` is the count,
+  # which is the only thing that distinguishes a two-fragment message from the single frame
+  # its reassembled row otherwise reads as exactly.
+  #
+  # It lives HERE, beside `Shape`, and not inside `Relay` because three reassemblers have to
+  # agree about identical bytes: the byte-exact pump, the assembling pump, and
+  # `Repeater::WsEngine.drain`. The repeater kept its own hand-rolled copy of the accounting
+  # and was missing both of the flushes the pumps have, so an origin that violated §5.4 was
+  # reported as one well-formed message that never existed. Sharing the accumulator is what
+  # makes the three agree by construction rather than by three parallel implementations.
+  class MessageShape
+    @fin = true
+    @rsv = 0
+    @masked : Bool? = nil
+    @mask_key : Bytes? = nil
+    @frames = 0
+
+    # How many frames of the CURRENT message have been noted. Zero means nothing is being
+    # reassembled, which is the only honest test for "is there a fragment still owed a row?"
+    # — the payload buffer cannot answer it, because a leading fragment may be empty.
+    getter frames
+
+    def reset : Nil
+      @fin = true
+      @rsv = 0
+      @masked = nil
+      @mask_key = nil
+      @frames = 0
+    end
+
+    def note(fin : Bool, rsv : UInt8, masked : Bool, mask_key : Bytes?) : Nil
+      if @frames == 0
+        @rsv = rsv.to_i
+        @masked = masked
+        @mask_key = mask_key
+      end
+      @fin = fin
+      @frames += 1
+    end
+
+    def note(h : Header) : Nil
+      note(h.fin?, h.rsv, h.masked?, h.masked? ? h.mask_key.dup : nil)
+    end
+
+    def note(f : Frame) : Nil
+      note(f.fin?, f.rsv, f.masked?, f.mask_key)
+    end
+
+    # The accumulated shape, and start over. `frames` floors at 1: a caller emitting a
+    # message with nothing noted (the oversized-frame marker) still describes one frame.
+    def take : Shape
+      s = Shape.new(fin: @fin, rsv: @rsv, masked: @masked, mask_key: @mask_key,
+        frames: @frames < 1 ? 1 : @frames)
+      reset
+      s
+    end
+  end
+
   # A parsed WebSocket frame. `payload` is unmasked (for capture); `raw` is the
   # exact wire bytes (for byte-faithful forwarding, P7).
   struct Frame

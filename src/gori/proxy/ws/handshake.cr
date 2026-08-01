@@ -28,11 +28,23 @@ module Gori::Proxy::WS
   # bits a meaning, so every one of them breaks capture the same way. Removing the field
   # entire is also what `Repeater::WsEngine.build_handshake` already does.
   #
-  # Only the client's offer is removed. The origin's ACCEPT is relayed untouched, see
-  # `Relay`/`ClientConn`: stripping an accept the origin believes in would leave it
-  # compressing into a client that saw no acceptance and must therefore fail the
-  # connection on the first RSV1 frame (RFC 6455 §5.2). That desync would be gori's own
-  # manufacture, and it is the strictly worse half of the same trade.
+  # BOTH halves of the negotiation go, and they go together. Removing only the client's
+  # offer used to be the policy, on the argument that stripping an accept the origin
+  # believes in would leave it compressing into a client that saw no acceptance and must
+  # then fail the connection on the first RSV1 frame (RFC 6455 §5.2). That argument is
+  # sound — for a handshake gori did NOT strip. It is exactly backwards for one gori did:
+  # an origin cannot "believe in" an acceptance of something it was never offered, so the
+  # accept is answering a header that no longer exists, and relaying it is what manufactures
+  # a desync rather than what avoids one. The client took the 101 at its word, turned
+  # permessage-deflate on and sent RSV1 frames into an origin that had negotiated nothing —
+  # the §5.2 connection failure the old comment was trying to prevent, aimed at the other
+  # peer. History read the same way round: an origin sending an unsolicited accept.
+  #
+  # `carries_extensions?` on the head gori ACTUALLY SENT is the condition that tells the two
+  # cases apart, and `ClientConn#settle_ws_extensions` is where it is asked. An acceptance on
+  # a handshake gori left alone (an operator who put
+  # the offer back with a Match&Replace rule, or an origin violating §4.1) is still relayed
+  # untouched: there the two peers do agree, and gori's store is the only thing that suffers.
   module Handshake
     # The field-name gori removes, lower-cased for the byte compare.
     EXTENSIONS_NAME = "sec-websocket-extensions"
@@ -53,12 +65,35 @@ module Gori::Proxy::WS
       upgrade.split(',').any? { |token| token.strip.compare("websocket", case_insensitive: true) == 0 }
     end
 
+    # True when this raw head still carries a `Sec-WebSocket-Extensions` line.
+    #
+    # Asked of the head gori ACTUALLY SENT, because that is the only thing that answers "did
+    # the origin receive an offer?". The parsed client request cannot: `strip_ws_extension_offer`
+    # runs BEFORE Match&Replace precisely so a rule can put the header back, and the request
+    # projection the response path carries is still the client's own.
+    def self.carries_extensions?(head : Bytes) : Bool
+      pos = 0
+      start_line = true
+      while pos < head.size
+        lf = head.index(0x0a_u8, pos)
+        stop = lf ? lf + 1 : head.size
+        return true if !start_line && extensions_line?(head[pos, stop - pos])
+        start_line = false
+        pos = stop
+      end
+      false
+    end
+
     # `head` with every `Sec-WebSocket-Extensions` line removed and every other byte
     # copied verbatim (P7), including the start-line and the terminating CRLFCRLF.
     # Header VALUE bytes are never round-tripped through String, so a non-UTF-8
     # cookie/auth token on the handshake survives byte-exact (mirroring
     # `Repeater::WsEngine.build_handshake`, which strips the same header from its own
     # handshake and is the precedent this follows).
+    #
+    # Direction-agnostic: it copies the start-line through untouched and only ever drops a
+    # header line, so the same method removes the client's OFFER from a request head and the
+    # origin's ACCEPT from the 101 that answers it.
     #
     # Lines are split on the terminator only and the field-name is matched EXACTLY,
     # the same view `Codec::Http1.parse_headers` takes. An obs-folded or

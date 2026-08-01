@@ -61,6 +61,19 @@ private class WsSink < Gori::Proxy::FlowSink
   end
 end
 
+# Wait for `n` captured WS rows, BOUNDED: a row that never arrives has to fail the example
+# rather than park the suite on a channel nobody will send to.
+private def expect_ws_rows(chan : Channel(Nil), n : Int32) : Nil
+  n.times do
+    select
+    when chan.receive
+      # got one
+    when timeout(3.seconds)
+      fail "timed out waiting for a captured ws_messages row"
+    end
+  end
+end
+
 private MASKED_HI   = Bytes[0x81, 0x82, 0x01, 0x02, 0x03, 0x04, 0x69, 0x6b] # masked text "hi"
 private UNMASKED_YO = Bytes[0x81, 0x02, 0x79, 0x6f]                         # unmasked text "yo"
 
@@ -581,6 +594,91 @@ describe Gori::Proxy::WS do
       String.new(Gori::Proxy::WS.read_body(ts_r, second).not_nil!.payload).should eq("bye")
     end
 
+    # ... but a message NOTHING changed must keep the interleave, because the interleave is
+    # the test. `TEXT fin=0 "AAA"` / `PING` / `CONT fin=1 "BBB"` asks whether the peer accepts
+    # a control frame between fragments (RFC 6455 §5.4). Arming ANY `part: ws` rule — even one
+    # scoped to a pattern that never matches — used to hoist the PING to the front, so gori
+    # answered the question before the peer could. The bytes were all there; the sequence,
+    # which is the whole finding, was not.
+    it "keeps a PING exactly where it arrived inside a message no rule matched" do
+      first = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "AAA".to_slice, fin: false)
+      ping = masked_op_frame(Gori::Proxy::WS::OP_PING, "pi".to_slice)
+      second = masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice)
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(first); cs_w.write(ping); cs_w.write(second); cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      ts_w.close
+      # Byte-for-byte what the client wrote, in the order it wrote it — which is also exactly
+      # what the byte-exact pump (no rule armed) puts on this socket.
+      ts_r.gets_to_end.to_slice.should eq(first + ping + second)
+      sink.messages.should eq([{"out", 9, "pi"}, {"out", 1, "AAABBB"}])
+    end
+
+    it "keeps a server PONG where it arrived on the in direction too" do
+      lead = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "AAA".to_slice, mask: false, fin: false)
+      pong = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_PONG, "p".to_slice, mask: false)
+      tail = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_CONT, "BBB".to_slice, mask: false)
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.close
+      ss_w.write(lead); ss_w.write(pong); ss_w.write(tail); ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_client: {"absent", "x"}), WS_CTX)
+
+      tc_w.close
+      tc_r.gets_to_end.to_slice.should eq(lead + pong + tail)
+      _ = ts_r
+    end
+
+    # The other side of the same rule: once gori is re-framing the message, the sender's
+    # fragmentation is gone and there is no position left to hold the control frame at — so it
+    # goes out AHEAD, which is what keeps the peer's ping timer answered. Both dispositions in
+    # one place, because the boundary between them is the whole design.
+    it "hoists an interleaved PING only when the message is actually re-framed" do
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(masked_op_frame(Gori::Proxy::WS::OP_TEXT, "AAA".to_slice, fin: false))
+      cs_w.write(masked_op_frame(Gori::Proxy::WS::OP_PING, "pi".to_slice))
+      cs_w.write(masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice))
+      cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      # Matches across the fragment boundary, so the message can only leave re-framed.
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"AAABBB", "Z"}), WS_CTX)
+
+      first = Gori::Proxy::WS.read_header(ts_r).not_nil!
+      first.opcode.should eq(Gori::Proxy::WS::OP_PING)
+      String.new(Gori::Proxy::WS.read_body(ts_r, first).not_nil!.payload).should eq("pi")
+      second = Gori::Proxy::WS.read_header(ts_r).not_nil!
+      second.opcode.should eq(Gori::Proxy::WS::OP_TEXT)
+      String.new(Gori::Proxy::WS.read_body(ts_r, second).not_nil!.payload).should eq("Z")
+    end
+
     it "puts a never-FINished message on the wire rather than losing it to the next one" do
       cs_r, cs_w = IO.pipe
       ts_r, ts_w = IO.pipe
@@ -697,7 +795,43 @@ describe Gori::Proxy::WS::Handshake do
     end
   end
 
+  describe ".carries_extensions?" do
+    # Asked of the head gori ACTUALLY SENT, because the strip runs before Match&Replace and a
+    # rule is allowed to put the offer back — in which case the origin's acceptance is genuine
+    # and must be relayed. The client's own parsed request cannot answer that.
+    it "sees an offer that survived onto the wire" do
+      Gori::Proxy::WS::Handshake.carries_extensions?(
+        handshake("Sec-WebSocket-Extensions: permessage-deflate\r\n")).should be_true
+    end
+
+    it "is false once the line is gone" do
+      Gori::Proxy::WS::Handshake.carries_extensions?(handshake("")).should be_false
+    end
+
+    it "never counts a start-line shaped like the header" do
+      raw = "sec-websocket-extensions: permessage-deflate\r\nUpgrade: websocket\r\n\r\n"
+      Gori::Proxy::WS::Handshake.carries_extensions?(raw.to_slice).should be_false
+    end
+
+    it "does not count a header whose name only STARTS with it" do
+      Gori::Proxy::WS::Handshake.carries_extensions?(
+        handshake("Sec-WebSocket-Extensions-Note: keep\r\n")).should be_false
+    end
+  end
+
   describe ".strip_extensions" do
+    # The same method serves both directions: it copies the start-line through and only ever
+    # drops a header line, so the origin's ACCEPT comes out of a 101 exactly as the client's
+    # OFFER comes out of the request.
+    it "removes the acceptance from a 101 response head as well" do
+      resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
+             "Connection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n" \
+             "Sec-WebSocket-Accept: abc\r\n\r\n"
+      want = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
+             "Connection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\n"
+      Gori::Proxy::WS::Handshake.strip_extensions(resp.to_slice).should eq(want.to_slice)
+    end
+
     it "removes the offer and leaves every other byte alone" do
       stripped = Gori::Proxy::WS::Handshake.strip_extensions(
         handshake("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"))
@@ -843,6 +977,106 @@ describe "WebSocket through the proxy (end-to-end)" do
     sink.heads.size.should eq(1)
     sink.heads[0].downcase.should_not contain("sec-websocket-extensions")
     sink.ws.should contain({"out", "hello"})
+  end
+
+  # An origin that accepts `permessage-deflate` unconditionally is common in the wild, and it
+  # answers an offer gori had already removed. Relaying that acceptance told the client to
+  # turn compression on and send RSV1 frames into an origin that had negotiated nothing — the
+  # RFC 6455 §5.2 connection failure the "don't strip the accept" policy existed to avoid,
+  # aimed at the other peer. Once gori removed the offer, the accept is answering a header
+  # nobody sent, so removing it is what PREVENTS a desync rather than what causes one.
+  it "removes an acceptance that answers the offer it stripped, and says so on the flow (#518)" do
+    origin = TCPServer.new("127.0.0.1", 0)
+    port = origin.local_address.port
+    seen = Channel(String).new(1)
+    spawn do
+      conn = origin.accept
+      seen.send(String.new(Gori::Proxy::Codec::Http1.read_head(conn).not_nil!))
+      conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+              "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+      conn.flush
+      frame = Gori::Proxy::WS.read_frame(conn).not_nil!
+      conn.write(Bytes[0x81_u8, frame.payload.size.to_u8])
+      conn.write(frame.payload)
+      conn.flush
+    rescue
+    end
+
+    ws_chan = Channel(Nil).new(8)
+    sink = IntegSink.new(ws_chan)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 5.seconds
+    client << "GET /pmd HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\n" \
+              "Upgrade: websocket\r\nConnection: Upgrade\r\n" \
+              "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n" \
+              "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+    client.flush
+
+    seen.receive.downcase.should_not contain("sec-websocket-extensions") # the offer, as before
+    resp_head = String.new(Gori::Proxy::Codec::Http1.read_head(client).not_nil!)
+    resp_head.should contain("101")
+    # ... and now the acceptance too, so the client never turns permessage-deflate on.
+    resp_head.downcase.should_not contain("sec-websocket-extensions")
+
+    client.write(masked_frame("hello"))
+    client.flush
+    Gori::Proxy::WS.read_frame(client).not_nil!
+    expect_ws_rows(ws_chan, 3) # the notice, then out, then in
+    client.close
+    proxy.stop
+
+    # A gori.log line reaches only an operator who knew to tail it. The flow's own message
+    # stream is where they are already looking.
+    notice = sink.ws.find { |(_, text)| text.starts_with?("[gori] ") }
+    notice.should_not be_nil
+    notice.not_nil![1].should contain("permessage-deflate")
+    notice.not_nil![1].should contain("removed the origin's")
+    sink.ws.should contain({"out", "hello"})
+  end
+
+  it "leaves an unsolicited acceptance alone — there the two peers really do agree (#518)" do
+    # The client offered nothing, so gori stripped nothing; an acceptance here is the origin
+    # violating RFC 6455 §4.1 (or an operator's rule putting the offer back). Removing it
+    # WOULD manufacture the desync the old policy warned about, so the bytes stand and only
+    # the advisory changes — what suffers is gori's store, and that is what it says.
+    origin = TCPServer.new("127.0.0.1", 0)
+    port = origin.local_address.port
+    seen = Channel(String).new(1)
+    spawn do
+      conn = origin.accept
+      seen.send(String.new(Gori::Proxy::Codec::Http1.read_head(conn).not_nil!))
+      conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+              "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+      conn.flush
+      Gori::Proxy::WS.read_frame(conn)
+    rescue
+    end
+
+    ws_chan = Channel(Nil).new(8)
+    sink = IntegSink.new(ws_chan)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 5.seconds
+    client << "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\n" \
+              "Upgrade: websocket\r\nConnection: Upgrade\r\n" \
+              "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    client.flush
+
+    seen.receive
+    resp_head = String.new(Gori::Proxy::Codec::Http1.read_head(client).not_nil!)
+    resp_head.should contain("Sec-WebSocket-Extensions: permessage-deflate") # P7: untouched
+    expect_ws_rows(ws_chan, 1)                                               # the notice row
+    client.close
+    proxy.stop
+
+    notice = sink.ws.find { |(_, text)| text.starts_with?("[gori] ") }
+    notice.should_not be_nil
+    notice.not_nil![1].should contain("that gori did not remove")
   end
 
   it "leaves the header alone on a request that is not upgrading" do
