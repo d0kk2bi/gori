@@ -80,10 +80,12 @@ module Gori::Proxy::WS
       # The payload as it would have gone on the wire (post-rewrite). Owned by the slot —
       # `submit` dups it, because the pump reuses its assembly buffer for the next message.
       getter payload : Bytes
-      # The peer's OWN wire frames, concatenated, when no rule changed the message. Reused
-      # verbatim on an unedited release, so a hold that ends in "forward" preserves the
-      # sender's fragmentation, FIN/RSV bits and mask keys.
-      getter raw : Bytes?
+      # The peer's OWN wire frames, when no rule changed the message. Reused verbatim on an
+      # unedited release, so a hold that ends in "forward" preserves the sender's
+      # fragmentation, FIN/RSV bits and mask keys. Released as `data_only`: any control frame
+      # that sat between the fragments was written the moment this slot was created, because
+      # it cannot wait for a human (see this class's header).
+      getter raw : WS::RawFrames?
       # The operator's bytes, once a decision has arrived.
       property decided : Bytes?
       property? dropped = false
@@ -96,7 +98,7 @@ module Gori::Proxy::WS
       # must claim the sender's RSV bits and fragment count, and an edited one must not.
       getter shape : WS::Shape
 
-      def initialize(@opcode : UInt8, @payload : Bytes, @raw : Bytes?,
+      def initialize(@opcode : UInt8, @payload : Bytes, @raw : WS::RawFrames?,
                      @shape : WS::Shape = WS::Shape::DEFAULT)
       end
     end
@@ -127,15 +129,25 @@ module Gori::Proxy::WS
     # `raw` is the sender's own frame bytes when they are still usable; `payload` is what
     # would go out. The pump owns both only until this returns, so anything the gate keeps is
     # duplicated here.
-    def submit(opcode : UInt8, payload : Bytes, raw : Bytes?,
+    def submit(opcode : UInt8, payload : Bytes, raw : WS::RawFrames?,
                shape : WS::Shape = WS::Shape::DEFAULT) : Nil
       @mutex.synchronize do
         return if @closed
         held = holds?(payload)
         if !held && @queue.empty?
-          write_message(opcode, payload, raw, shape)
+          # Nothing is waiting, so this message goes out now and the peer's own interleave is
+          # still reproducible — its fragments and any control frame that sat between them,
+          # in arrival order. That is the case an armed-but-non-matching socket is in for
+          # every message, and it must be indistinguishable from an unarmed one.
+          write_message(opcode, payload, raw.try(&.interleaved), shape)
           return
         end
+        # From here the message waits — for a human, or for the messages queued ahead of it.
+        # A control frame that arrived between its fragments cannot wait with it: a PONG
+        # parked behind a hold is how the peer's ping timer closes the socket (this class's
+        # header). So THIS is where the interleave is given up, and the only place — the
+        # controls go out now, the message's own frames follow on release.
+        raw.try(&.controls).try { |c| write_raw(c) }
         kept = payload.dup
         slot = Slot.new(opcode, kept, raw, shape)
         item = held ? start_hold(opcode, kept) : nil
@@ -306,8 +318,20 @@ module Gori::Proxy::WS
       # cannot be reproduced, and a client → server frame is re-masked with a fresh key
       # (RFC 6455 §5.3), exactly as step 1's rewrite path already does.
       unedited = bytes == slot.payload
-      @lost += 1 unless write_message(slot.opcode, bytes, unedited ? slot.raw : nil,
+      @lost += 1 unless write_message(slot.opcode, bytes,
+                          unedited ? slot.raw.try(&.data_only) : nil,
                           unedited ? slot.shape : WS::Shape.new(masked: @mask))
+    end
+
+    # A direct write with no capture row: the parked control frames of a message this gate is
+    # about to hold. They were already recorded by the pump at their arrival position, and a
+    # second row would claim gori saw them twice.
+    private def write_raw(bytes : Bytes) : Nil
+      @dst.write(bytes)
+      @dst.flush
+    rescue
+      # The peer is gone. The pump's next read ends this direction, which is where a dead
+      # socket is reported; inventing a failure for a keepalive frame here says nothing new.
     end
 
     # True iff the bytes reached the socket. A failed write leaves NO capture row on purpose:

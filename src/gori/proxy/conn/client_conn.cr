@@ -91,6 +91,10 @@ module Gori::Proxy
       # rejection (the #323 case, whose fix is --insecure-upstream) and from an upstream proxy
       # that refused the tunnel outright. See `upstream_error_message`.
       @last_dial_error = nil.as(Upstream::DialError?)
+      # Did gori remove THIS request's `Sec-WebSocket-Extensions` offer (#518)? Set per
+      # request by `strip_ws_extension_offer`, read by the 101 path: an acceptance is only
+      # gori's to remove when gori is the reason nothing was offered. See `WS::Handshake`.
+      @ws_offer_stripped = false
     end
 
     # The address every upstream dial on THIS connection is pinned to, or nil when nothing
@@ -413,7 +417,10 @@ module Gori::Proxy
     # all, because `Codec::Body.request_framing` rejects the whole request just below.
     private def strip_ws_extension_offer(req : Codec::RawRequest,
                                          forward_head : Bytes) : {Bytes, Bytes, Codec::RawRequest}
-      return {req.raw_head, forward_head, req} unless WS::Handshake.offers_extensions?(req.headers)
+      # Reset per request: this connection is keep-alive, and the answer belongs to the
+      # handshake in hand, not to the one before it.
+      @ws_offer_stripped = WS::Handshake.offers_extensions?(req.headers)
+      return {req.raw_head, forward_head, req} unless @ws_offer_stripped
       client_head = WS::Handshake.strip_extensions(req.raw_head)
       {client_head, WS::Handshake.strip_extensions(forward_head), Codec::Http1.parse_request_head(client_head)}
     end
@@ -661,6 +668,15 @@ module Gori::Proxy
           sent_resp = Codec::Http1.parse_response_head(sent_resp_head)
         end
       end
+      # The `Sec-WebSocket-Extensions` half of a 101 (#518): removed when it answers an offer
+      # gori itself removed, kept when it answers one the origin really received. Either way
+      # the operator gets told, on the flow and not only in gori.log. Runs on the head that
+      # goes to the CLIENT; framing below still keys off the original response.
+      ws_notice = nil.as(String?)
+      if websocket_upgrade?(resp)
+        sent_resp_head, sent_resp, ws_notice =
+          settle_ws_extensions(sent_resp_head, sent_resp, sent_req, sent_head, host)
+      end
       # Body framing must reflect the method the ORIGIN actually received (HEAD/CONNECT
       # are bodyless per RFC 7230 §3.3.3). A Match&Replace / intercept edit can rewrite
       # the request-line method, so key off sent_req, not the client's original req.
@@ -728,7 +744,6 @@ module Gori::Proxy
         SocketTuning.relax(@io)
         SocketTuning.relax(upstream)
         if websocket_upgrade?(resp)
-          warn_unoffered_ws_extension(resp, host, sent_req.target)
           # `@rewriter` carries Match & Replace (#500 step 1) and `@interceptor` the message
           # hold (step 2) into the tunnel; `ctx` is the 101 handshake's identity, which both
           # scope on — a WebSocket message has no authority, scheme or path of its own. The
@@ -736,7 +751,8 @@ module Gori::Proxy
           # answers "no" to both keeps the byte-exact pump (P6/P7).
           ws_ctx = WS::Context.new(host: host, port: port, scheme: scheme,
             method: sent_req.method, target: sent_req.target)
-          WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor) # frames until close
+          # frames until close
+          WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor, notice: ws_notice)
         else
           Pump.blind_tunnel(@io, upstream) # non-WS upgrade: raw pipe until close
         end
@@ -1163,23 +1179,45 @@ module Gori::Proxy
       end
     end
 
-    # A 101 whose `Sec-WebSocket-Extensions` acceptance answers an offer gori removed
-    # (#518). The accept is relayed UNTOUCHED — see `WS::Handshake` for why removing it
-    # is the worse half — so the two peers still agree and the socket works; what is
-    # wrong is gori's own store, because `WS::Relay` records the extension's encoded
-    # bytes as the message. Nothing else on the path can tell, so say it here.
+    # The `Sec-WebSocket-Extensions` half of a 101 (#518). Returns the head and projection
+    # the CLIENT should receive, plus an advisory for the flow's WebSocket message stream —
+    # a `gori.log` line is where an operator does not look, and this is a fact about the
+    # socket they are about to read frames from.
     #
-    # Reaching this means either an origin that accepted an extension it was not offered
-    # (a protocol violation, RFC 6455 §4.1) or an operator who put the offer back with a
-    # Match&Replace rule. The consequence for capture is the same in both cases.
-    private def warn_unoffered_ws_extension(resp : Codec::RawResponse, host : String, target : String) : Nil
-      accepted = resp.headers.get?("Sec-WebSocket-Extensions")
-      return if accepted.nil? || accepted.blank?
-      ::Log.warn do
-        "ws #{ws_log_label(host, target)}: origin accepted extension #{accepted.inspect} — captured frames on " \
-        "this socket are that extension's encoded bytes, not the messages (gori removes the " \
-        "client's Sec-WebSocket-Extensions offer; see #518)"
+    # Two cases, and the code already knows which it is in:
+    #
+    #   * gori removed the offer and nothing put it back on the wire — then the origin was
+    #     never offered anything, its acceptance answers a header it did not receive, and
+    #     relaying it is what CREATES a desync: the client turns permessage-deflate on and
+    #     sends RSV1 frames the origin must fail the connection over (RFC 6455 §5.2). Both
+    #     halves go, and History stops reading as "the origin sent an unsolicited accept".
+    #   * the origin really was offered it — an operator's Match&Replace rule put the offer
+    #     back, or the origin accepted one nobody offered (§4.1). Here the two peers DO
+    #     agree, so removing the accept is the manufactured desync the old policy warned
+    #     about. The bytes are left alone and the store is what suffers, which is what the
+    #     advisory says.
+    private def settle_ws_extensions(head : Bytes, resp : Codec::RawResponse,
+                                     sent_req : Codec::RawRequest, sent_head : Bytes,
+                                     host : String) : {Bytes, Codec::RawResponse, String?}
+      accepted = resp.headers.get?(WS::Handshake::EXTENSIONS_NAME)
+      return {head, resp, nil} if accepted.nil? || accepted.blank?
+      label = ws_log_label(host, sent_req.target)
+      # `sent_head` and not `sent_req`: the strip runs before Match&Replace so a rule CAN put
+      # the offer back, and when it does the origin really was offered the extension.
+      if @ws_offer_stripped && !WS::Handshake.carries_extensions?(sent_head)
+        stripped = WS::Handshake.strip_extensions(head)
+        note = "removed the origin's #{accepted.inspect} acceptance from the 101 — gori had " \
+               "already removed the client's Sec-WebSocket-Extensions offer, so the origin " \
+               "negotiated no extension and a client acting on that accept would have sent " \
+               "it frames it cannot read (#518)"
+        ::Log.info { "ws #{label}: #{note}" }
+        return {stripped, Codec::Http1.parse_response_head(stripped), note}
       end
+      note = "origin accepted extension #{accepted.inspect} that gori did not remove — the " \
+             "captured frames on this socket are that extension's encoded bytes, not the " \
+             "messages (#518)"
+      ::Log.warn { "ws #{label}: #{note}" }
+      {head, resp, note}
     end
 
     # `host` + `target` for a log line. On the plaintext forward-proxy path `target` is
