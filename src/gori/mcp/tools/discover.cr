@@ -41,7 +41,19 @@ module Gori
       # ceilings); seed normalization, wordlist load, scope policy and sender wiring are the
       # builder's. Raises FuzzArgError (clean message) on any malformed input.
       private def build_discover_plan(h, ob : Outbound) : Discover::Plan
-        options = Discover::PlanOptions.new(str(h, "url") || "", config: discover_config(h),
+        config = discover_config(h)
+        # The second half of the header refusal, and the realistic one: the header the caller
+        # passed is fine and the ENV VAR is not (`{"Authorization": "Bearer $TOKEN"}` where
+        # TOKEN was read from a file and kept its trailing newline). A QUERY, run before any
+        # traffic — `Discover::Headers.expand`'s send-time backstop drops such a value on
+        # every probe without a word, and by then the crawl is already running. `gori run
+        # discover` aborts here; MCP crawled on unauthenticated and reported "found nothing".
+        unsafe = Discover::Headers.unsafe_expanded(config.headers)
+        unless unsafe.empty?
+          raise FuzzArgError.new("header #{unsafe.first.inspect} rejected — its value contains CR or LF " \
+                                 "after $VAR expansion, which would splice extra headers into every probe")
+        end
+        options = Discover::PlanOptions.new(str(h, "url") || "", config: config,
           verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           overrides: HostOverrides.load(store))
         Discover::Plan.build(options, ob)
@@ -72,7 +84,30 @@ module Gori
           max_depth: clamp(int(h, "max_depth"), 4, DISCOVER_MAX_DEPTH),
           user_wordlist: str(h, "wordlist").presence,
           extensions: discover_extensions(h), containment: discover_containment(h),
-          headers: Discover::Headers.parse_lines(discover_header_lines(h)))
+          headers: discover_headers(h))
+      end
+
+      # The caller's `headers` map, REFUSING by name anything gori will not put on the wire.
+      # `parse_lines` drops a CR/LF-carrying value and a non-token name — right, since this is
+      # an automated crawler splicing the value into every probe's header block — but dropping
+      # it SILENTLY is not: the drop takes `Authorization` with it, so an agent's authenticated
+      # sweep ran unauthenticated over the whole authenticated surface and reported "found
+      # nothing" with no error anywhere. `gori run discover` aborts on exactly this (#556);
+      # MCP is the surface where nobody is watching stderr, so it matters more here.
+      #
+      # Only the header NAME is echoed back, never the rejected line: the value is the thing
+      # most likely to be a credential.
+      private def discover_headers(h) : Array({String, String})
+        rejected = [] of String
+        lines = discover_header_lines(h)
+        parsed = Discover::Headers.parse_lines(lines, rejected)
+        unless rejected.empty?
+          name = rejected.first.partition(':')[0].strip
+          raise FuzzArgError.new("header #{name.inspect} rejected — a header value may not contain " \
+                                 "CR or LF, and a header name must be an RFC 7230 token " \
+                                 "(#{rejected.size} of #{lines.size} headers rejected)")
+        end
+        parsed
       end
 
       private def discover_containment(h) : Discover::Containment
@@ -153,13 +188,17 @@ module Gori
           djob.queued = ev.progress.queued
           djob.stats = ev.stats
           # Discover has no fixed candidate total (a live crawl's denominator moves), so the
-          # shortfall is read the other way round: tasks still QUEUED when the run ended mean
-          # max_requests halted it, exactly the :budget_exhausted fuzz and mine derive from
-          # `done_count < total`. Without this a budget-capped sweep that never sent 275 of
-          # 283 tasks reported `status:"done", job_complete:true, has_more:false` — an agent
-          # reads that as an exhaustive directory sweep and stops looking.
-          djob.status = terminal_status(djob.status, ev.stopped, 0_i64,
-            djob.queued > 0 ? djob.queued.to_i64 : nil)
+          # shortfall cannot be derived the way fuzz and mine derive it from `done_count <
+          # total`. The ENGINE says it: `DoneEvent#budget_exhausted` is `cap_reached? &&
+          # (frontier non-empty || refused > 0)`. Reading `queued > 0` instead — which is what
+          # this line did — agrees on the 275-of-283 case and silently misses the other half:
+          # a Calibrate task whose probes were all REFUSED consumes no frontier entry, so the
+          # frontier drains to empty while real work was skipped, and the run came back
+          # `status:"done", job_complete:true, has_more:false`. An agent reads that as an
+          # exhaustive directory sweep and stops looking. `queued` is still reported below —
+          # it is how MUCH was left, not WHETHER anything was.
+          djob.status = terminal_status(djob.status, ev.stopped, 0_i64, nil,
+            declared: ev.budget_exhausted)
           djob.ended_at_ms = Time.utc.to_unix_ms
         when Discover::ErrorEvent
           djob.status = :error

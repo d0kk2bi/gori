@@ -185,7 +185,7 @@ describe "MCP WebSocket frame object form" do
         verify_upstream: false)[0]
       resp["result"]["isError"].as_bool.should be_false
 
-      frames = decode_frames(seen.receive)
+      frames = decode_frames(receive_within(seen))
       frames.map(&.opcode).first(5).should eq([9, 0, 10, 8, 1])
       frames[3].payload.should eq(Bytes[0x03, 0xe9])
       frames[4].payload.should eq(Bytes[0xff, 0xfe])
@@ -333,7 +333,7 @@ describe "MCP boolean arguments" do
         %({"url":"http://127.0.0.1:#{port}/x",) +
         %("raw":"GET /lf HTTP/1.1\\nHost: h\\n\\n","verbatim":"TRUE","allow_unscoped":"true"})))[0]
       resp["result"]["isError"].as_bool.should be_false
-      String.new(seen.receive).should eq("GET /lf HTTP/1.1\nHost: h\n\n")
+      String.new(receive_within(seen)).should eq("GET /lf HTTP/1.1\nHost: h\n\n")
     end
   end
 end
@@ -348,7 +348,7 @@ describe "MCP effective_request" do
       resp = drive(store, call_line("send_request",
         %({"url":"http://127.0.0.1:#{port}/09","raw":"GET /old09\\r\\n\\r\\n",) +
         %("verbatim":true,"allow_unscoped":true})))[0]
-      String.new(seen.receive).should eq("GET /old09\r\n\r\n")
+      String.new(receive_within(seen)).should eq("GET /old09\r\n\r\n")
       payload(resp)["effective_request"]["http_version"].raw.should be_nil
     end
   end
@@ -372,7 +372,7 @@ describe "MCP flow replay" do
         resp = drive(store, call_line("send_request",
           %({"flow_id":#{id},"allow_unscoped":true,"record_history":false})))[0]
         resp["result"]["isError"].as_bool.should be_false
-        String.new(seen.receive).should eq(text)
+        String.new(receive_within(seen)).should eq(text)
       end
     end
   end
@@ -392,7 +392,7 @@ describe "MCP field-native h2 evidence" do
         %({"url":"http://127.0.0.1:#{port}/api/v1/user","h2_fields":#{fields},) +
         %("body":"{\\"a\\":1}","allow_unscoped":true,"save_as_repeater":true})))[0]
       body = payload(resp)
-      seen.receive # the h2 attempt itself
+      receive_within(seen) # the h2 attempt itself
 
       body["sent_h2_fields"].as_a.map(&.as_a.first.as_s)
         .should eq([":method", ":path", ":scheme", ":authority", "cookie"])
@@ -407,7 +407,7 @@ describe "MCP field-native h2 evidence" do
       saved = body["saved_repeater_id"].as_i64
       drive(store, call_line("send_request",
         %({"repeater_id":#{saved},"http2":false,"allow_unscoped":true,"record_history":false})))
-      String.new(seen.receive).lines.first.should eq("POST /api/v1/user?id=1 HTTP/1.1")
+      String.new(receive_within(seen)).lines.first.should eq("POST /api/v1/user?id=1 HTTP/1.1")
     end
   end
 end

@@ -233,10 +233,13 @@ module Gori
       # Build a ready-to-run engine + its origin + total + effective http2 from the
       # tool args. Raises FuzzArgError (clean message) on any malformed input.
       private def build_fuzz_job(h, ob : Outbound) : {Fuzz::Engine, Fuzz::Origin, Int64?, Bool}
-        text, default_target, src_h2 = fuzz_template_source(h)
+        text, default_target, src_h2, evidence = fuzz_template_source(h)
         use_h2 = bool_arg(h, "http2", false) || src_h2
         mode = fuzz_mode(h)
         options = Fuzz::PlanOptions.new(text,
+          # A `flow_id` template is CAPTURED evidence; a `template` string is the caller's
+          # draft. See `Fuzz::PlanOptions#evidence?`.
+          evidence: evidence,
           default_target: default_target, target: str(h, "url"),
           auto_mark: bool_arg(h, "auto", false), marks: fuzz_marks(h), http2: use_h2,
           sources: fuzz_sources(h), processors: fuzz_processors(h),
@@ -286,15 +289,22 @@ module Gori
         end
       end
 
-      private def fuzz_template_source(h) : {String, String?, Bool}
+      # {template text, the seeding flow's target, http2, EVIDENCE?}. The last element is the
+      # provenance bit `Fuzz::PlanOptions#evidence?` documents: a `flow_id` template is a
+      # CAPTURE, a `template` string is a draft the caller typed. `gori run fuzz` has carried
+      # it at its own `--flow` seed since #556; MCP did not, so an agent seeding a sweep from
+      # an OData capture (`$filter`, `$top`) had the run REFUSED for an unbound variable
+      # nobody typed, and a captured bare-LF head was silently promoted to CRLF — the one
+      # thing that makes every desync result from the sweep unreadable.
+      private def fuzz_template_source(h) : {String, String?, Bool, Bool}
         if t = str(h, "template")
-          return {t, nil, false} unless t.strip.empty?
+          return {t, nil, false, false} unless t.strip.empty?
         end
         if id = int(h, "flow_id")
           detail = store.get_flow(id)
           raise FuzzArgError.new("no flow with id #{id}") unless detail
           built = Repeater::FlowRequest.build(detail)
-          return {String.new(built.bytes).scrub, built.target, built.http2}
+          return {String.new(built.bytes).scrub, built.target, built.http2, true}
         end
         raise FuzzArgError.new("provide a 'template' (raw request with §…§) or a 'flow_id'")
       end
@@ -596,6 +606,12 @@ module Gori
         int(h, "max_redirects").try { |v| cfg.max_redirects = v.clamp(0_i64, 50_i64).to_i }
         cfg.auto_calibrate = bool_arg(h, "auto_calibrate", cfg.auto_calibrate?)
         int(h, "throttle_ms").try { |v| cfg.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
+        # `gori run fuzz --verbatim` and `intercept_forward_edit{update_content_length:false}`
+        # both reach this knob; fuzz_start could not, so the whole CL-desync probe class (a
+        # Content-Length shorter or longer than the substituted body, or CL alongside
+        # Transfer-Encoding) was unreachable for an agent — every payload was re-framed to fit
+        # before it went out, which is precisely the observation such a sweep is looking for.
+        cfg.update_content_length = bool_arg(h, "update_content_length", cfg.update_content_length?)
         cfg
       end
     end

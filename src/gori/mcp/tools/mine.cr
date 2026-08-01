@@ -94,9 +94,33 @@ module Gori
             j.field "job_complete", mjob.status != :running
             j.field "incomplete_reason", incomplete_reason(mjob.status)
             j.field "error", mjob.error_msg
+            emit_mine_skipped(j, mjob)
             emit_audit(j, mjob.audit, mjob.ended_at_ms)
           end
         end)
+      end
+
+      # Wordlist names this run's locations CANNOT carry, per location, against the wordlist's
+      # own size. The rejection is right (a header/cookie name must be an RFC 7230 token, and
+      # `Content-Length`/`Host` would break framing) but `names_total` sums the FILTERED sizes,
+      # so without this the same wordlist mined "444 names" at the query and "435" at headers
+      # with nothing anywhere to say the other nine were dropped: coverage was incomplete and
+      # the job reported clean. `gori run mine` prints this on stderr; the agent had no route
+      # to the fact at all. Emitted as an ARRAY (empty when nothing was dropped) so a caller
+      # never has to distinguish "no skips" from "this field does not exist".
+      private def emit_mine_skipped(j : JSON::Builder, mjob : MineJob) : Nil
+        engine = mjob.engine
+        j.field "candidate_names", engine.candidate_names
+        j.field "skipped" do
+          j.array do
+            engine.skipped_names.each do |(loc, n)|
+              j.object do
+                j.field "location", loc.label
+                j.field "names", n
+              end
+            end
+          end
+        end
       end
 
       private def mine_results(h) : Result
@@ -151,7 +175,7 @@ module Gori
       # Build a ready-to-run mining engine + its origin + name count. Raises FuzzArgError
       # (clean message) on malformed input. Reuses the fuzz timeout helper.
       private def build_mine_job(h, ob : Outbound) : {Miner::Engine, Fuzz::Origin, Int64}
-        text, default_target, src_h2 = mine_template_source(h)
+        text, default_target, src_h2, evidence = mine_template_source(h)
         config = Miner::Config.new
         config.concurrency = clamp(int(h, "concurrency"), 10, MINE_MAX_CONCURRENCY)
         config.rps = int(h, "rate").try(&.to_f64)
@@ -162,6 +186,9 @@ module Gori
         config.user_wordlist = str(h, "wordlist").presence
         int(h, "throttle_ms").try { |v| config.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
         options = Miner::PlanOptions.new(text,
+          # A `flow_id` template is CAPTURED evidence; a `template` string is the caller's
+          # draft. See `Miner::PlanOptions#evidence?`.
+          evidence: evidence,
           default_target: default_target, target: str(h, "url"),
           http2: bool_arg(h, "http2", false) || src_h2,
           locations: mine_locations(h), bucket: mine_bucket(h), config: config,
@@ -204,15 +231,19 @@ module Gori
       # http2}. The target is handed over raw too: expanding it here as well as in the plan
       # builder was a double pass, so a var whose value contained a token resolved one level
       # deeper on MCP than on the CLI.
-      private def mine_template_source(h) : {String, String?, Bool}
+      # The 4th element is PROVENANCE (`Miner::PlanOptions#evidence?`): a `flow_id` template is
+      # a CAPTURE, a `template` string is a draft. `gori run mine --flow` has carried it since
+      # #556 and MCP did not, so an agent mining a captured OData request had the run refused
+      # for a `$filter` nobody typed, and a bare-LF captured head was promoted to CRLF.
+      private def mine_template_source(h) : {String, String?, Bool, Bool}
         if t = str(h, "template")
-          return {t, nil, false} unless t.strip.empty?
+          return {t, nil, false, false} unless t.strip.empty?
         end
         if id = int(h, "flow_id")
           detail = store.get_flow(id)
           raise FuzzArgError.new("no flow with id #{id}") unless detail
           built = Repeater::FlowRequest.build(detail)
-          return {String.new(built.bytes), built.target, built.http2}
+          return {String.new(built.bytes), built.target, built.http2, true}
         end
         raise FuzzArgError.new("provide a 'template' (raw request) or a 'flow_id'")
       end

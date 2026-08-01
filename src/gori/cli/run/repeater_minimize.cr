@@ -116,7 +116,10 @@ module Gori
       # the wire bare-LF, inventing the very desync primitive the flag exists to preserve.
       private def self.minimize_resolver(id : Int64, text : String, verbatim : Bool,
                                          auto_cl : Bool) : Proc(String, Bytes)
-        stored_crlf = text.includes?("\r\n")
+        # HEAD only, and the same question `Minimize.run` asks: a CRLF pair inside a multipart
+        # body says nothing about how the operator terminated their header lines, and reading
+        # it as if it did would re-terminate an LF-headed session on the way out.
+        stored_crlf = Repeater::Minimize.head_crlf?(text)
         # The one case that restore cannot carry: a head whose lines DISAGREE (some CRLF, some
         # bare LF) is itself a smuggling shape, and minimize's LF round-trip flattens it to
         # all-CRLF. Nothing here can undo that — the algorithm rebuilds the head — so say it
@@ -141,22 +144,16 @@ module Gori
       # 0x0A is a line ending, in the body it is a byte.
       #
       # Needed because `Minimize` hands its `resolve` proc two different forms — the
-      # LF-normalized working text during the search, and `restore_eol`'s already-CRLF text in
-      # the report — so the step has to be idempotent (LF-normalize first, or the second call
-      # produces `\r\r\n`). Restoring the head ALONE also undoes, for the bytes this command
-      # sends and prints, `restore_eol`'s blanket `gsub("\n", "\r\n")` over the BODY: a
-      # captured body ending in a bare LF under a deliberately-short Content-Length came back
-      # one byte longer, which is the CL-desync evidence `--verbatim` exists to preserve.
+      # head-LF-normalized working text during the search, and `restore_eol`'s already-CRLF
+      # text in the report — so the step has to be idempotent. It is: `Env.normalize_crlf`
+      # never emits `\r\r\n`, which is why `Minimize.restore_eol` can be reused verbatim here.
+      #
+      # It used to whole-string `gsub("\r\n", "\n")` first, to undo `restore_eol`'s blanket
+      # `gsub("\n", "\r\n")` over the BODY. `Minimize` no longer touches the body at all, so
+      # that pre-pass is not merely unnecessary — it would now flatten a multipart body's own
+      # CRLF boundaries on the way to the wire.
       private def self.restore_head_crlf(text : String) : Bytes
-        bytes = text.gsub("\r\n", "\n").to_slice
-        boundary = Env.head_body_boundary(bytes)
-        head = Env.normalize_crlf(bytes[0...boundary])
-        return head if boundary >= bytes.size
-        body = bytes[boundary..]
-        io = IO::Memory.new(head.size + body.size)
-        io.write(head)
-        io.write(body)
-        io.to_slice
+        Repeater::Minimize.restore_eol(text, true).to_slice
       end
 
       # Does the HEAD carry both CRLF- and bare-LF-terminated lines? Head only: a raw 0x0A in

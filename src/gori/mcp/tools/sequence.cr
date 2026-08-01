@@ -144,7 +144,7 @@ module Gori
       # Normalize the tool args into `Sequencer::PlanOptions` and let the shared builder
       # assemble the run. Raises FuzzArgError (clean message) on any malformed input.
       private def build_sequence_plan(h, ob : Outbound) : Sequencer::Plan
-        bytes, default_target, src_h2 = sequence_request_source(h)
+        bytes, default_target, src_h2, evidence = sequence_request_source(h)
         config = Sequencer::Config.new(mode: Sequencer::Mode::LiveReplay,
           token_loc: sequence_token_loc(h), goal: clamp(int(h, "count"), 500, SEQUENCE_MAX_GOAL),
           concurrency: clamp(int(h, "concurrency"), 1, SEQUENCE_MAX_CONCURRENCY))
@@ -157,6 +157,9 @@ module Gori
         # The builder's sender carries the Outbound decision, so Sandbox / EXCLUDE hard-block
         # a collection run per send — sequence_start used to have only the job-start check.
         options = Sequencer::PlanOptions.new(bytes, default_target: default_target,
+          # A `flow_id` request is CAPTURED evidence; a `template` string is the caller's
+          # draft. See `Sequencer::PlanOptions#evidence?`.
+          evidence: evidence,
           target: str(h, "url"), http2: bool_arg(h, "http2", false) || src_h2, config: config,
           verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           # SNI independent of the Host header is the vhost-confusion / domain-fronting test,
@@ -191,15 +194,19 @@ module Gori
       # {raw request bytes, the seeding flow's target, http2} for a collection. Deliberately
       # UNEXPANDED — `Sequencer::Plan.build` owns `Env.expand`, and expanding here as well
       # would resolve a var whose value itself contains a `$TOKEN` twice.
-      private def sequence_request_source(h) : {Bytes, String?, Bool}
+      # The 4th element is PROVENANCE (`Sequencer::PlanOptions#evidence?`): a `flow_id` request
+      # is a CAPTURE, a `template` string is a draft. `gori run sequence --flow` has carried it
+      # since #556 and MCP did not, so a token-randomness sweep seeded from a captured login
+      # was refused for a `$` in the capture, or ran against a head silently re-terminated.
+      private def sequence_request_source(h) : {Bytes, String?, Bool, Bool}
         if t = str(h, "template")
-          return {t.to_slice, nil, false} unless t.strip.empty?
+          return {t.to_slice, nil, false, false} unless t.strip.empty?
         end
         if id = int(h, "flow_id")
           detail = store.get_flow(id)
           raise FuzzArgError.new("no flow with id #{id}") unless detail
           built = Repeater::FlowRequest.build(detail)
-          return {built.bytes, built.target, built.http2}
+          return {built.bytes, built.target, built.http2, true}
         end
         raise FuzzArgError.new("provide a 'template' (raw request) or a 'flow_id'")
       end

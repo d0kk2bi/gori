@@ -391,6 +391,10 @@ module Gori
         getter audit : JobAudit
 
         getter db_path : String?
+        # The run's engine. Exposed for its two PURE reporting queries (`skipped_names` /
+        # `candidate_names`), which are derived from the loaded wordlist and the config's
+        # locations and so are safe to read from the status fiber while the run is live.
+        getter engine
 
         def initialize(@id : String, @total : Int64, @engine : Miner::Engine, @audit : JobAudit,
                        @db_path : String? = nil)
@@ -1426,6 +1430,7 @@ module Gori
               s.field "max_requests", intprop("caller cap on total requests")
               s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
               s.field "record_history", strprop("none (default) | matched | all — record each sent request+response as a History flow for audit/evidence; matched results carry the flow_id in fuzz_results (fetch full detail with get_flow). 'all' is capped at #{FUZZ_HISTORY_MAX} flows.")
+              s.field "update_content_length", boolprop("recompute Content-Length after each payload is spliced into the body (default true). Set FALSE to send your template's declared value verbatim — a Content-Length shorter or longer than the body, or Content-Length alongside Transfer-Encoding, is the canonical request-smuggling primitive, and with the default on every payload is silently re-framed to fit before it leaves. Mirrors CLI `gori run fuzz --verbatim` and intercept_forward_edit{update_content_length:false}.")
             end
 
             tool j, "fuzz_status", "Counts + state of a fuzz job (running|done|budget_exhausted|stopped|error). " \
@@ -1474,7 +1479,11 @@ module Gori
             end
 
             tool j, "mine_status", "Counts + state of a mine job (running|done|budget_exhausted|stopped|error). " \
-                                   "budget_exhausted means max_requests halted the run before every name was tried; see incomplete_reason." do |s|
+                                   "budget_exhausted means max_requests halted the run before every name was tried; see incomplete_reason. " \
+                                   "`skipped` lists wordlist names a location cannot carry (a header/cookie name must be an RFC 7230 " \
+                                   "token, and framing headers are never injected) against `candidate_names`, the wordlist's own size — " \
+                                   "names_total counts only the names that survived that filter, so without `skipped` an incomplete " \
+                                   "sweep reads as a clean one." do |s|
               s.field "job_id", strprop("id from mine_start"), required: true
             end
 
@@ -1961,14 +1970,24 @@ module Gori
         job.ended_at_ms ||= Time.utc.to_unix_ms
       end
 
-      # Terminal status for a finished fuzz/mine job. A non-stopped Done whose
+      # Terminal status for a finished fuzz/mine/discover job. A non-stopped Done whose
       # processed count fell short of the known candidate `total` means the request
       # budget (max_requests) halted the run early — reported as :budget_exhausted
       # so a partial "0 found" is not read as an exhaustive result. A prior :error
       # is preserved (a generation ErrorEvent then a Done must stay failed).
-      private def terminal_status(current : Symbol, stopped : Bool, done_count : Int64, total : Int64?) : Symbol
+      #
+      # `declared` is for an engine that says so ITSELF rather than letting a consumer derive
+      # it. Discover is that engine: it has no stable candidate denominator (`est_total` is a
+      # moving estimate of a live crawl), so `Discover::DoneEvent#budget_exhausted` is the
+      # authority and MCP must not re-infer the answer. It used to infer `queued > 0`, which
+      # misses the half the engine's own predicate exists for — a Calibrate task whose probes
+      # were ALL refused consumes no frontier entry, so the frontier drains to empty with real
+      # work skipped and the run came back `status:"done", job_complete:true, has_more:false`.
+      private def terminal_status(current : Symbol, stopped : Bool, done_count : Int64, total : Int64?,
+                                  declared : Bool = false) : Symbol
         return :error if current == :error
         return :stopped if stopped
+        return :budget_exhausted if declared
         (total && done_count < total) ? :budget_exhausted : :done
       end
 

@@ -9,15 +9,29 @@ module Gori::Fuzz
   # Sniper, and as the seed the user edits over).
   #
   # The template keeps wire-form CRLF line endings so `render` produces a sendable
-  # request byte-for-byte (only the payload spans differ between variations). Binary
-  # request bodies can't be carried as text — the same limit the Repeater editor has;
-  # the byte-exact path remains `gori run repeater` / export.
+  # request byte-for-byte (only the payload spans differ between variations).
+  #
+  # `parse` and `render` are BYTE-oriented, so a request body that is not valid UTF-8
+  # survives them intact. They used to iterate `marked.chars`, and Crystal's char iteration
+  # substitutes U+FFFD for every invalid byte — so a captured body carrying a raw 0x80-0xFF
+  # run (a protobuf/gRPC frame, a gzip'd or otherwise binary POST, a latin-1 form field) came
+  # out of `render` with each of those bytes replaced by a THREE-byte replacement character.
+  # Every request the sweep sent was a different length from the one the operator seeded it
+  # with, under a Content-Length recomputed to match the corruption, and nothing said so.
+  # Scrubbing at load time only moves that corruption earlier; this is where it has to stop.
   struct Template
     MARKER = '§'
     # Value|chain delimiter inside a marker: `§value¦chain§`. NOT '|' — the Decoder
     # chain syntax already uses '|'/','/'>'  as step separators, so the boundary must
     # be a char the chain never contains. `¦¦` escapes a literal `¦`, mirroring `§§`.
     CHAIN_SEP = '¦'
+
+    # UTF-8 encodings of the two delimiters, for the byte scan. Matching these two-byte
+    # sequences is exactly as precise as matching the chars was: UTF-8 is self-synchronizing
+    # and 0xC2 is a LEAD byte, never a continuation (continuations are 0x80..0xBF), so
+    # `C2 A7` inside well-formed text can only ever be `§`.
+    MARKER_BYTES    = Bytes[0xC2_u8, 0xA7_u8]
+    CHAIN_SEP_BYTES = Bytes[0xC2_u8, 0xA6_u8]
 
     record Position, index : Int32, default : String, chain : String = ""
 
@@ -31,75 +45,92 @@ module Gori::Fuzz
     # The result of scanning one marker's interior (see scan_interior): the decoded
     # {default, chain}, whether a chain part was opened (a bare `¦` seen — needed to
     # rebuild an unbalanced marker faithfully), whether the closing § was found, and the
-    # index just past the closing § (or n when unbalanced).
+    # BYTE index just past the closing § (or n when unbalanced).
     private record InteriorScan, default : String, chain : String,
       chained : Bool, closed : Bool, next_i : Int32
 
+    # Branch-for-branch the scan it has always been — escaped `§§`, the `¦` value|chain
+    # split, the unbalanced-trailing-`§` tail-fold — over BYTES rather than chars, so a
+    # non-UTF-8 body passes through untouched. Every offset here is a byte offset; the
+    # CHARACTER offsets the TUI highlight needs stay in `marked_spans`, which reads the
+    # editor's (already well-formed) text.
     def self.parse(marked : String, http2 : Bool = false) : Template
       segs = [] of String
       defs = [] of {String, String} # {default, chain}
       lit = IO::Memory.new
-      chars = marked.chars
-      n = chars.size
+      bytes = marked.to_slice
+      n = bytes.size
       i = 0
       while i < n
-        c = chars[i]
-        if c != MARKER
-          lit << c
+        if !marker_at?(bytes, i)
+          lit.write_byte(bytes[i])
           i += 1
-        elsif chars[i + 1]? == MARKER # escaped literal §
-          lit << MARKER
-          i += 2
+        elsif marker_at?(bytes, i + 2) # escaped literal §
+          lit.write(MARKER_BYTES)
+          i += 4
         else
-          s = scan_interior(chars, i, n)
+          s = scan_interior(bytes, i, n)
           if s.closed
-            segs << lit.to_s
+            segs << String.new(lit.to_slice)
             lit = IO::Memory.new
             defs << {s.default, s.chain}
           else # unbalanced trailing § → literal text, opens no position (no truncation:
             # the § + interior fold into `lit` so render's positions.size+1 segments keep it)
-            lit << MARKER << s.default
-            lit << CHAIN_SEP << s.chain if s.chained
+            lit.write(MARKER_BYTES)
+            lit << s.default
+            if s.chained
+              lit.write(CHAIN_SEP_BYTES)
+              lit << s.chain
+            end
           end
           i = s.next_i
         end
       end
-      segs << lit.to_s
+      segs << String.new(lit.to_slice)
       positions = defs.map_with_index { |(d, ch), k| Position.new(k, d, ch) }
       new(segs, positions, http2)
     end
 
-    # Scan from the opening § at `open` to the matching close, decoding `§§`→§ and
-    # `¦¦`→¦; the first bare `¦` splits the interior into value|chain. Returns the decoded
+    # Is the two-byte `§` encoding at byte offset `i`? Bounds-checked, so it answers false
+    # rather than raising at the end of the slice (the `chars[i + 1]?` this replaced).
+    private def self.marker_at?(bytes : Bytes, i : Int32) : Bool
+      i >= 0 && i + 1 < bytes.size && bytes[i] == 0xC2_u8 && bytes[i + 1] == 0xA7_u8
+    end
+
+    private def self.chain_sep_at?(bytes : Bytes, i : Int32) : Bool
+      i >= 0 && i + 1 < bytes.size && bytes[i] == 0xC2_u8 && bytes[i + 1] == 0xA6_u8
+    end
+
+    # Scan from the opening § at byte offset `open` to the matching close, decoding `§§`→§
+    # and `¦¦`→¦; the first bare `¦` splits the interior into value|chain. Returns the decoded
     # parts even when unbalanced (closed: false), so parse can fold them back as literal.
-    private def self.scan_interior(chars : Array(Char), open : Int32, n : Int32) : InteriorScan
-      j = open + 1
+    private def self.scan_interior(bytes : Bytes, open : Int32, n : Int32) : InteriorScan
+      j = open + 2
       val = IO::Memory.new
       chn = IO::Memory.new
       in_chain = false
       while j < n
-        cj = chars[j]
-        if cj == MARKER
-          if chars[j + 1]? == MARKER # §§ inside a marker → literal §
-            (in_chain ? chn : val) << MARKER
-            j += 2
+        if marker_at?(bytes, j)
+          if marker_at?(bytes, j + 2) # §§ inside a marker → literal §
+            (in_chain ? chn : val).write(MARKER_BYTES)
+            j += 4
             next
           end
-          return InteriorScan.new(val.to_s, chn.to_s, in_chain, true, j + 1)
-        elsif cj == CHAIN_SEP
-          if chars[j + 1]? == CHAIN_SEP # ¦¦ inside a marker → literal ¦
-            (in_chain ? chn : val) << CHAIN_SEP
-            j += 2
+          return InteriorScan.new(String.new(val.to_slice), String.new(chn.to_slice), in_chain, true, j + 2)
+        elsif chain_sep_at?(bytes, j)
+          if chain_sep_at?(bytes, j + 2) # ¦¦ inside a marker → literal ¦
+            (in_chain ? chn : val).write(CHAIN_SEP_BYTES)
+            j += 4
             next
           end
-          in_chain ? (chn << CHAIN_SEP) : (in_chain = true) # 1st bare ¦ splits value|chain; a 2nd is literal
-          j += 1
+          in_chain ? chn.write(CHAIN_SEP_BYTES) : (in_chain = true) # 1st bare ¦ splits value|chain; a 2nd is literal
+          j += 2
           next
         end
-        (in_chain ? chn : val) << cj
+        (in_chain ? chn : val).write_byte(bytes[j])
         j += 1
       end
-      InteriorScan.new(val.to_s, chn.to_s, in_chain, false, n)
+      InteriorScan.new(String.new(val.to_slice), String.new(chn.to_slice), in_chain, false, n)
     end
 
     def position_count : Int32

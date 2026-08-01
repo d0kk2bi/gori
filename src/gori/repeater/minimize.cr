@@ -1,5 +1,6 @@
 require "json"
 require "./engine"
+require "../env"
 require "../fuzz/engine"
 require "../fuzz/matcher"
 require "../miner/inject"
@@ -104,8 +105,17 @@ module Gori::Repeater
       # enumerated. The same session minimized further from the TUI than from `gori run
       # repeater minimize` on identical bytes. Normalise once here so the file's stated
       # assumption is actually true, and put the operator's line endings back on the way out.
-      crlf = base_text.includes?("\r\n")
-      base_text = base_text.gsub("\r\n", "\n") if crlf
+      #
+      # HEAD ONLY, both ways. In a header block a 0x0A is a line ending; in a BODY it is a
+      # byte, and the round-trip used to run over the whole request: `\r\n`→`\n` on the way in
+      # flattened a multipart body's CRLF boundaries, and `restore_eol`'s blanket `\n`→`\r\n`
+      # on the way out promoted a body's bare LF, so a captured body ending in one came back
+      # a byte longer in `minimized_text` — i.e. in `minimized_request`, in `minimized_source`,
+      # and in what `--apply` STORES over the session. The CLI's send path patched that for
+      # the bytes it sent and printed; leaving the body untouched end to end fixes the stored
+      # form too, and is the rule every other site on this branch now follows.
+      crlf = head_crlf?(base_text)
+      base_text = normalize_head_lf(base_text) if crlf
       candidates = candidates_for(base_text, auto_cl: auto_cl)
       return Report.new(restore_eol(base_text, crlf), [] of Removed, 0, false, "already minimal — nothing removable") if candidates.empty?
 
@@ -150,10 +160,47 @@ module Gori::Repeater
       Report.new(restore_eol(working, crlf), removed, sends, false, summary_note(removed, sends))
     end
 
-    # Put CRLF back on a report built from LF-normalised text. After the normalisation above
-    # there is no lone CR left, so this is exact.
-    private def self.restore_eol(text : String, crlf : Bool) : String
-      crlf ? text.gsub("\n", "\r\n") : text
+    # Put CRLF back on the HEAD of a report built from head-LF-normalised text, leaving the
+    # BODY byte for byte as it arrived. Split on `Env.head_body_boundary` — the same boundary,
+    # and for the same reason, as `Env.expand_wire` and `gori run intercept edit`.
+    #
+    # Public, and IDEMPOTENT (`Env.normalize_crlf` never produces `\r\r\n`), because a
+    # `--verbatim` resolver has to apply the same restoration to the two different forms
+    # `run` hands it: the LF-headed working text during the search, and this method's own
+    # already-CRLF output when a surface re-resolves the finished report.
+    def self.restore_eol(text : String, crlf : Bool) : String
+      return text unless crlf
+      bytes = text.to_slice
+      boundary = Env.head_body_boundary(bytes)
+      head = Env.normalize_crlf(bytes[0, boundary])
+      return String.new(head) if boundary >= bytes.size
+      body = bytes[boundary..]
+      io = IO::Memory.new(head.size + body.size)
+      io.write(head)
+      io.write(body)
+      String.new(io.to_slice)
+    end
+
+    # Does the HEAD carry CRLF terminators? Head only, for `restore_eol`'s reason: a lone
+    # 0x0D 0x0A inside a multipart body says nothing about how the header lines were written,
+    # and treating it as if it did would re-terminate an LF head the operator wrote. Public
+    # so a surface's `--verbatim` resolver asks the SAME question `run` asked.
+    def self.head_crlf?(text : String) : Bool
+      bytes = text.to_slice
+      String.new(bytes[0, Env.head_body_boundary(bytes)]).includes?("\r\n")
+    end
+
+    # `\r\n` → `\n` over the HEAD alone, body copied through byte for byte.
+    private def self.normalize_head_lf(text : String) : String
+      bytes = text.to_slice
+      boundary = Env.head_body_boundary(bytes)
+      head = String.new(bytes[0, boundary]).gsub("\r\n", "\n")
+      return head if boundary >= bytes.size
+      body = bytes[boundary..]
+      io = IO::Memory.new(head.bytesize + body.size)
+      io << head
+      io.write(body)
+      String.new(io.to_slice)
     end
 
     # ── candidate enumeration ──────────────────────────────────────────────────────────

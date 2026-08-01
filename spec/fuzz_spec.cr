@@ -635,7 +635,7 @@ describe F::Engine do
     gen = F::Generator.new(base, [set], cfg)
     backend = FakeBackend.new(F::Origin.new("http", "h", 80)) do |_b|
       started.send(nil)
-      gate.receive
+      receive_within(gate)
       ok_result(200, "ok")
     end
     engine = F::Engine.new(gen, F::Matcher.new, backend, cfg)
@@ -643,11 +643,11 @@ describe F::Engine do
     done = Channel(Nil).new
     spawn { engine.run { |_ev| }; done.send(nil) }
 
-    2.times { started.receive } # both workers are inside send() (in-flight)
-    10.times { Fiber.yield }    # let the dispatcher fill the buffered @jobs channel
+    2.times { receive_within(started) } # both workers are inside send() (in-flight)
+    10.times { Fiber.yield }            # let the dispatcher fill the buffered @jobs channel
     engine.stop
     spawn { loop { gate.send(nil) } } # release: in-flight finish, buffered must be skipped
-    done.receive
+    receive_within(done)
 
     # concurrency (2) buffered on top of concurrency (2) in-flight = 4 previously fired
     # after stop; now only the in-flight batch does.
@@ -679,7 +679,7 @@ describe F::Engine do
 
     results.size.should eq(2)
     results.all? { |r| r.status == 200 && r.length == 4 }.should be_true
-    got = [seen.receive, seen.receive].sort
+    got = [receive_within(seen), receive_within(seen)].sort
     got.should contain("GET /?q=one HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
     got.should contain("GET /?q=two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
     origin.close
