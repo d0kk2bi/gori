@@ -303,11 +303,20 @@ module Gori::Proxy
       # faithfully — the codec raises to force a close. But the attempt must stay
       # VISIBLE in History (this smuggling-shape traffic is exactly what a pentester
       # wants to see); previously the raise unwound to `run`'s blanket rescue and no
-      # flow was recorded at all. Record an error flow, then close.
+      # flow was recorded at all. Record an error flow, answer 400, then close.
+      #
+      # The 400 matters as much as the History row: closing with ZERO bytes is
+      # indistinguishable from the ORIGIN hanging up, so an operator probing a
+      # smuggling shape through gori cannot tell whose refusal they just measured —
+      # and would score gori's own defense as a target finding. RFC 9112 §6.3 has a
+      # proxy respond 400 here. Mirrors `write_sandbox_block`'s distinct-answer
+      # rationale one gate above; `X-Gori-Error` is the machine-readable half.
       begin
         req_framing, req_len = Codec::Body.request_framing(req)
       rescue ex : Gori::Error
-        record_error(sent_req, scheme, host, port, created_at, "request framing rejected: #{ex.message}")
+        reason = ex.message || "ambiguous request framing"
+        record_error(sent_req, scheme, host, port, created_at, "request framing rejected: #{reason}")
+        write_framing_reject(reason)
         return false
       end
 
@@ -1533,6 +1542,30 @@ module Gori::Proxy
     # closes right after: no keep-alive on a blocked connection.
     private def write_sandbox_block : Nil
       @io.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\nX-Gori-Sandbox: blocked\r\n\r\n".to_slice)
+      @io.flush
+    rescue
+    end
+
+    # Answer a request whose framing gori refused to forward (CL+TE, non-final
+    # chunked, obfuscated framing header, bad Content-Length). Self-framed and
+    # `Connection: close`, because the body boundary is exactly what we could not
+    # determine — whatever remains in the socket is unread on purpose.
+    #
+    # `reason` is one of `Codec::Body`'s static literals today, but a CR/LF reaching
+    # a header value would turn gori's own diagnostic into the response split it is
+    # refusing, so it is scrubbed at the boundary rather than trusted upstream.
+    private def write_framing_reject(reason : String) : Nil
+      safe = reason.gsub(/[\r\n]+/, " ").strip
+      safe = "ambiguous request framing" if safe.empty?
+      body = "gori refused to forward this request: #{safe}\n"
+      @io.write(String.build do |s|
+        s << "HTTP/1.1 400 Bad Request\r\n"
+        s << "Content-Type: text/plain; charset=utf-8\r\n"
+        s << "Content-Length: " << body.bytesize << "\r\n"
+        s << "Connection: close\r\n"
+        s << "X-Gori-Error: request-framing\r\n\r\n"
+        s << body
+      end.to_slice)
       @io.flush
     rescue
     end

@@ -516,7 +516,13 @@ module Gori
           # `false || flow.http2` kept h2). Carry the captured SNI so an origin where
           # SNI ≠ Host (domain fronting / multi-cert vhost) presents the right certificate,
           # matching `gori run repeater`.
+          # `auto_content_length` is deliberately OFF here (it used to default ON, silently):
+          # this tool documents a flow replay as byte-exact, and a captured
+          # `Content-Length: 99` over a 2-byte body is the CL-desync probe the operator
+          # wants re-sent, not a mistake to correct. `resync_cl_after_expansion` keeps the
+          # one case that must still recompute — a `$KEY` in the body changing its length.
           Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
+            auto_content_length: false, resync_cl_after_expansion: true,
             http2: bool_arg(h, "http2", flow.http2), sni: flow.sni, verify: verify,
             timeout: timeout, overrides: overrides)
         else
@@ -527,6 +533,11 @@ module Gori
           built = RequestBuilder.build(h)
           Repeater::PlanOptions.new([built.bytes], expand_request: false,
             auto_content_length: false,
+            # `verbatim:true` means the operator's bytes ARE the message (RequestBuilder
+            # already skipped expansion for it), so a leftover `$user.name` / `$IFS` is the
+            # SSTI/shell payload and must not be refused here. Non-verbatim callers keep the
+            # refusal: RequestBuilder expanded, so a surviving `$KEY` really is unresolved.
+            refuse_unresolved_env: !bool_arg(h, "verbatim", false),
             origin: Repeater::Origin.new(built.scheme, built.host, built.port),
             http2: bool_arg(h, "http2", false), verify: verify,
             timeout: timeout, overrides: overrides)

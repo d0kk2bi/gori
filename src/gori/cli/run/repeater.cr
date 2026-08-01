@@ -241,6 +241,10 @@ module Gori
         Repeater::PlanOptions.new([rec.request],
           default_target: rec.target, http2: rec.http2?, sni: rec.sni,
           expand_request: !verbatim,
+          # `--verbatim` says "no $VAR expansion" — so an unresolved `$VAR` is the payload,
+          # not a mistake to refuse. Without this the flag could not send the SSTI/shell
+          # probes (`$user.name`, `$IFS`) that are the reason to leave a `$` unexpanded.
+          refuse_unresolved_env: !verbatim,
           auto_content_length: !verbatim && rec.auto_content_length?, verify: !insecure,
           overrides: overrides)
       end
@@ -528,15 +532,23 @@ module Gori
       # pinning a CL reach the builder as one knob instead of two open-coded branches.
       private def self.build_single_flow_request(head_bytes : Bytes, body_bytes : Bytes,
                                                  headers : Array(String), body_override : String?,
-                                                 target_override : String?) : {Bytes, Bool}
+                                                 target_override : String?,
+                                                 removed_headers : Array(String) = [] of String) : {Bytes, Bool}
         head_str = String.new(head_bytes)
         first_crlf = head_str.index("\r\n") || head_str.size
         request_line = head_str[0, first_crlf]
         # Header lines between the request line and the terminating blank line, each verbatim.
         raw_lines = head_str[first_crlf..].split("\r\n").reject(&.empty?)
 
-        # -H overrides: lower-name → value, plus the flag-cased name in flag order for appends.
-        custom_headers = {} of String => String
+        # -H overrides: lower-name → the values given for it, IN FLAG ORDER, plus the
+        # flag-cased name in flag order for appends.
+        #
+        # A LIST, not one value: repeating `-H "X: a" -H "X: b"` used to have the second
+        # silently overwrite the first, so `-H` could never produce two same-named header
+        # lines — and duplicate-header handling is itself a thing operators come here to
+        # test. Now n flags for one name emit n lines. A single `-H` still replaces (the
+        # common case is unchanged); only repeating it adds.
+        custom_headers = {} of String => Array(String)
         custom_order = [] of {String, String}
         headers.each do |h_str|
           next unless h_str.includes?(':')
@@ -544,8 +556,11 @@ module Gori
           next if name.strip.empty?
           lname = name.strip.downcase
           custom_order << {lname, name.strip} unless custom_headers.has_key?(lname)
-          custom_headers[lname] = val.strip
+          (custom_headers[lname] ||= [] of String) << val.strip
         end
+        # --rm-header: drop every line with this name. Distinct from `-H "X:"`, which sends
+        # X with an EMPTY value — both are real tests and neither can express the other.
+        dropped = removed_headers.map(&.strip.downcase).reject(&.empty?).to_set
 
         # The header NAME of a raw line (bytes before the first colon), or "" for a
         # colon-less line — those are kept verbatim, never treated as a header to edit.
@@ -562,17 +577,19 @@ module Gori
         raw_lines.each do |line|
           name = line_name.call(line)
           lname = name.strip.downcase
-          if !lname.empty? && custom_headers.has_key?(lname)
+          if !lname.empty? && dropped.includes?(lname)
+            next
+          elsif !lname.empty? && (vals = custom_headers[lname]?)
             next if applied.includes?(lname)
             applied << lname
-            new_lines << "#{name}: #{custom_headers[lname]}"
+            vals.each { |v| new_lines << "#{name}: #{v}" }
           else
             new_lines << line
           end
         end
         custom_order.each do |(lname, orig)|
           next if applied.includes?(lname)
-          new_lines << "#{orig}: #{custom_headers[lname]}"
+          custom_headers[lname].each { |v| new_lines << "#{orig}: #{v}" }
         end
 
         final_body = if b_over = body_override
@@ -594,9 +611,19 @@ module Gori
         # When present, skip BOTH the auto-resync below and the post-expansion resync so neither
         # overwrites the user's value — the header the override loop already wrote into new_lines
         # stands.
-        explicit_cl = custom_headers.has_key?("content-length")
-        has_cl = new_lines.any? { |l| line_name.call(l).compare("Content-Length", case_insensitive: true) == 0 }
-        if !explicit_cl && !has_te && (body_override || has_cl || final_body.size > 0)
+        # `--rm-header Content-Length` counts as an intentional pin too: an operator asking for
+        # a body with NO Content-Length is testing exactly the framing gori would otherwise
+        # restore under them. Same for Host below — re-adding a header the operator just
+        # deleted makes the flag look like it did nothing.
+        explicit_cl = custom_headers.has_key?("content-length") || dropped.includes?("content-length")
+        # Re-frame ONLY the body the operator replaced. This used to fire on `has_cl ||
+        # final_body.size > 0` too, i.e. on every replay carrying a body — so a captured
+        # `Content-Length: 99` over 2 bytes, or a `Content-Length:  0004  ` written with
+        # obfuscating OWS, was rewritten to the "correct" value and the operator scored a
+        # verdict on a request gori never sent. A capture is evidence; only `-b` makes it a
+        # draft. (A capture TRUNCATED mid-body is re-framed earlier, by
+        # `FlowRequest.resync_truncated_head` — not here.)
+        if !explicit_cl && !has_te && body_override
           cl_idx = new_lines.index { |l| line_name.call(l).compare("Content-Length", case_insensitive: true) == 0 }
           if cl_idx
             new_lines[cl_idx] = "#{line_name.call(new_lines[cl_idx])}: #{final_body.size}"
@@ -608,7 +635,7 @@ module Gori
         # Sync Host from --target, UNLESS the user set an explicit `-H "Host: …"` — a
         # host-header-confusion / vhost test deliberately pairs --target (where to connect)
         # with a different claimed Host, so that override must win.
-        if (override = target_override) && !custom_headers.has_key?("host")
+        if (override = target_override) && !custom_headers.has_key?("host") && !dropped.includes?("host")
           scheme_part, host_part, port_part = Repeater::FlowRequest.parse_target(override)
           # FlowRequest.authority, not a local formula: the two it replaced were both wrong.
           # This one omitted `wss` from the default-port test, so a `wss://h` target — which
@@ -646,6 +673,7 @@ module Gori
         do_diff = false
         format = :text
         headers = [] of String
+        removed_headers = [] of String
         body_override : String? = nil
         allow_unscoped = false
         positional = [] of String
@@ -664,7 +692,8 @@ module Gori
           p.on("--sni=HOST", "TLS SNI override") { |v| sni_override = v }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
           p.on("--diff", "Diff the new response against the captured one") { do_diff = true }
-          p.on("-HHEADER", "--header=HEADER", "Custom header to overwrite/add (repeatable). An explicit Content-Length is honored verbatim (no auto-resync) for CL-mismatch testing") { |v| headers << v }
+          p.on("-HHEADER", "--header=HEADER", "Custom header to overwrite/add. Repeat the SAME name to send duplicate header lines. An explicit Content-Length is honored verbatim (no auto-resync) for CL-mismatch testing") { |v| headers << v }
+          p.on("--rm-header=NAME", "Delete every header with this name (repeatable). Removing Content-Length suppresses the auto-resync; removing Host suppresses the --target sync") { |v| removed_headers << v }
           p.on("-bBODY", "--body=BODY", "Request body override") { |v| body_override = v }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
@@ -732,14 +761,14 @@ module Gori
         head_bytes = raw_bytes[0, crlf_crlf_idx + 4]
         body_bytes = raw_bytes[crlf_crlf_idx + 4..]
 
-        wire, explicit_cl = build_single_flow_request(head_bytes, body_bytes, headers, body_override, target_override)
+        wire, explicit_cl = build_single_flow_request(head_bytes, body_bytes, headers, body_override, target_override, removed_headers)
         outbound = project_outbound(project_name, db_path, allow_unscoped)
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([wire],
             target: target_override, default_target: built.target,
             http2: force_h2 || built.http2, sni: sni_override.presence || built.sni,
-            auto_content_length: !explicit_cl, verify: !insecure,
-            overrides: host_overrides), outbound)
+            auto_content_length: false, resync_cl_after_expansion: !explicit_cl,
+            verify: !insecure, overrides: host_overrides), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater", ex)
         end

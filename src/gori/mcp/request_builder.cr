@@ -60,8 +60,9 @@ module Gori
             # bare-LF promotion. `normalize_raw` exists so a hand-typed request still frames,
             # but a bare-LF header terminator is a standard front-end/back-end desync
             # primitive, so promoting it removes a payload class from this surface — the TUI's
-            # byte modes have always been able to send it. `Plan.build` still refuses an
-            # unresolved `$VAR` regardless of expansion, so nothing ships a literal token.
+            # byte modes have always been able to send it. An unresolved `$VAR` is NOT refused
+            # under `verbatim` — see `PlanOptions#refuse_unresolved_env?`; the literal `$` is
+            # the SSTI/shell payload the flag exists to deliver.
             raw_bytes(raw, args)
           else
             build_from_parts(uri, scheme, host, port, args)
@@ -73,8 +74,21 @@ module Gori
       # `verbatim` means the operator's bytes ARE the message. Kept out of `build` so that
       # method's branch count stays where it was.
       private def self.raw_bytes(raw : String, args : Hash(String, JSON::Any)) : Bytes
-        return raw.to_slice if args["verbatim"]?.try(&.as_bool?)
+        return raw.to_slice if verbatim?(args)
         normalize_raw(Env.expand(raw))
+      end
+
+      # `as_bool?` alone read a STRINGIFIED `"true"` — which LLM clients emit constantly,
+      # the schema's "boolean" being advisory — as nil, so `verbatim` silently turned OFF and
+      # the bare LF the caller asked to preserve was promoted to CRLF. Matches `Tools#bool`'s
+      # leniency, and must: `send.cr` reads the same key through `bool_arg`, so a stricter
+      # reading here would have the two disagree about whether one call is verbatim.
+      def self.verbatim?(args : Hash(String, JSON::Any)) : Bool
+        v = args["verbatim"]?
+        return false unless v
+        b = v.as_bool?
+        return b unless b.nil?
+        v.as_s?.try(&.downcase) == "true"
       end
 
       private def self.build_from_parts(uri : URI, scheme : String, host : String, port : Int32,

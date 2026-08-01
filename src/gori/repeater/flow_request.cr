@@ -83,6 +83,35 @@ module Gori
         "#{lines.join("\r\n")}\r\n\r\n#{body}".to_slice
       end
 
+      # The CAPTURED-FLOW replay policy, as opposed to the repeater's auto-CL toggle above.
+      #
+      # A stored Content-Length is evidence: `Content-Length: 99` over a 2-byte body, a
+      # `content-length:2` spelled without OWS, a `Content-Length:  0004  ` — each is a
+      # request-smuggling / CL-desync probe someone captured *because* it is wrong, and
+      # recomputing it means the operator reads a verdict about a request gori never sent.
+      # So replay leaves the line alone.
+      #
+      # The one exception is the reason `resync_content_length` exists on this path at all:
+      # a `$KEY` in the body. `build` framed the stored CL over the PRE-expansion bytes, so
+      # after expansion the header under-counts a body the operator did not author, and the
+      # origin over/under-reads. Detect that by the BODY LENGTH changing — an expansion that
+      # only touched the head must not be allowed to overwrite a deliberately-wrong CL.
+      def self.resync_content_length_if_body_changed(before : Bytes, after : Bytes) : Bytes
+        b = body_bytesize(before)
+        a = body_bytesize(after)
+        return after if b.nil? || a.nil? || b == a
+        resync_content_length(after)
+      end
+
+      # Body length of a wire-form request, or nil when there is no CRLFCRLF terminator.
+      # Splits exactly the way `resync_content_length` does so the two cannot disagree.
+      private def self.body_bytesize(bytes : Bytes) : Int32?
+        text = String.new(bytes)
+        sep = text.index("\r\n\r\n")
+        return nil unless sep
+        text[(sep + 4)..].bytesize
+      end
+
       # The default port for a scheme, **ws/wss included**.
       #
       # Deliberately NOT `Discover::Url.default_port?`, which knows only http/https: it answers

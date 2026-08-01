@@ -90,10 +90,27 @@ module Gori::Repeater
     # is passed in rather than loaded.
     property overrides : Gori::HostOverrides?
 
+    # Replay of a CAPTURED flow: keep the stored Content-Length byte-exact, and recompute it
+    # ONLY where env expansion changed the body's length. Distinct from `auto_content_length`,
+    # which is the repeater's explicit operator toggle ("keep CL matching the body I typed")
+    # and must keep recomputing unconditionally. A flow's bytes are evidence, not a draft.
+    property? resync_cl_after_expansion : Bool
+
+    # Whether an unresolved `$VAR` left in the request is a refusal. ON everywhere by
+    # default — a typo'd `$KEY` that ships literally is almost always a mistake, and this is
+    # the last look before a socket. A surface turns it OFF only when the operator has said
+    # the bytes ARE the message (`--verbatim`, MCP `verbatim:true`), because then a literal
+    # `$user.name` / `$IFS` / `$PATH` is the payload: those are Velocity/OGNL SSTI and shell
+    # probes, and refusing them made `verbatim` unable to send its own advertised content.
+    # (The refusal was already inconsistent — `${jndi:…}` and `$(id)` passed it.)
+    property? refuse_unresolved_env : Bool
+
     def initialize(@requests : Array(Bytes) = [] of Bytes,
                    *,
                    @expand_request : Bool = true,
                    @auto_content_length : Bool = true,
+                   @resync_cl_after_expansion : Bool = false,
+                   @refuse_unresolved_env : Bool = true,
                    @origin : Origin? = nil,
                    @target : String? = nil,
                    @default_target : String? = nil,
@@ -191,7 +208,7 @@ module Gori::Repeater
       # point: when it is false the surface expanded already (MCP's `RequestBuilder`, the
       # TUI editor's byte modes), so an unresolved token is sitting in the bytes it handed
       # over and this is still the last place anyone looks before they reach a socket.
-      refuse_unresolved(options.requests.flat_map { |b| Env.unresolved_wire(String.new(b)) }.uniq!)
+      refuse_unresolved(options.requests.flat_map { |b| Env.unresolved_wire(String.new(b)) }.uniq!) if options.refuse_unresolved_env?
       wires = options.expand_request? ? options.requests.map { |b| Env.expand_wire(String.new(b)) } : options.requests
 
       # Detect the upgrade on the FINAL wire, not the stored text: the bytes that decide
@@ -201,7 +218,15 @@ module Gori::Repeater
       # A handshake carries no body, and all three surfaces have always sent it verbatim —
       # `resync_content_length` never ADDS a header, but a captured upgrade that happened to
       # carry a Content-Length would be rewritten, so skip the pass rather than rely on that.
-      wires = wires.map { |b| FlowRequest.resync_content_length(b) } if options.auto_content_length? && !websocket
+      if !websocket
+        if options.auto_content_length?
+          wires = wires.map { |b| FlowRequest.resync_content_length(b) }
+        elsif options.resync_cl_after_expansion?
+          # Flow replay: byte-exact unless a `$KEY` in the body just changed its length.
+          # See `FlowRequest.resync_content_length_if_body_changed`.
+          wires = wires.map_with_index { |b, i| FlowRequest.resync_content_length_if_body_changed(options.requests[i], b) }
+        end
+      end
       # `HTTP/2` on the version line of a request going down an h1 socket is never anything
       # but a mistake (a Burp-pasted h2 view, or a captured h2 flow replayed as h1), and
       # `FlowRequest.downgrade_version_line` exists to correct it. Its comment says it "runs

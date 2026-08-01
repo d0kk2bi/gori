@@ -162,15 +162,39 @@ describe "Gori::CLI::Run.build_single_flow_request (explicit Content-Length — 
     String.new(plan.bytes).should contain("Content-Length: 999")
   end
 
-  it "auto-syncs Content-Length to the actual body when no explicit CL override is given" do
+  it "leaves a CAPTURED Content-Length alone when the operator did not replace the body" do
+    # REVERSED from the original assertion, which pinned a real defect: this used to resync
+    # a stored `Content-Length: 999` over a 5-byte body down to 5. A captured CL that
+    # disagrees with its body is not a mistake to correct — it is the CL-desync probe the
+    # operator captured in order to replay it, and rewriting it means they read a verdict
+    # about a request gori never sent. `-b` is what turns a capture into a draft.
     head = "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 999\r\n\r\n".to_slice
     wire, explicit_cl = Gori::CLI::Run.build_single_flow_request_for_spec(
       head, "hello".to_slice, [] of String, nil, nil)
     out = String.new(wire)
 
-    explicit_cl.should be_false
-    out.should contain("Content-Length: 5") # resynced to the real 5-byte body
+    explicit_cl.should be_false # no -H CL was pinned…
+    out.should contain("Content-Length: 999")
+    out.should_not contain("Content-Length: 5")
+
+    # …and the assembly the command actually performs must not undo that either. The real
+    # call passes auto_content_length:false + resync_cl_after_expansion, NOT the plain
+    # auto-CL toggle (which belongs to the repeater editor, where the operator IS drafting).
+    plan = Gori::Repeater::Plan.build(Gori::Repeater::PlanOptions.new([wire],
+      target: "http://h", auto_content_length: false,
+      resync_cl_after_expansion: !explicit_cl), ungated_outbound)
+    String.new(plan.bytes).should contain("Content-Length: 999")
+  end
+
+  it "re-frames Content-Length when -b replaces the body" do
+    head = "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 999\r\n\r\n".to_slice
+    wire, _ = Gori::CLI::Run.build_single_flow_request_for_spec(
+      head, "hello".to_slice, [] of String, "hi", nil)
+    out = String.new(wire)
+
+    out.should contain("Content-Length: 2")
     out.should_not contain("Content-Length: 999")
+    out.should end_with("\r\n\r\nhi")
   end
 
   # The POST-expansion half, which the two cases above cannot reach: `build_single_flow_request`
@@ -184,18 +208,22 @@ describe "Gori::CLI::Run.build_single_flow_request (explicit Content-Length — 
       Gori::Settings.env_prefix = "$"
       head = "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\n".to_slice
 
+      # Both plans below are built the way `cmd_repeater_single` builds them, so the spec
+      # cannot pass on a knob combination the command never uses.
       wire, explicit_cl = Gori::CLI::Run.build_single_flow_request_for_spec(
         head, "p=$PW".to_slice, [] of String, nil, nil)
       plan = Gori::Repeater::Plan.build(Gori::Repeater::PlanOptions.new([wire],
-        target: "http://h", auto_content_length: !explicit_cl), ungated_outbound)
-      # "p=" + the 14-char expansion = 16 bytes; the pre-expansion framing said 5.
+        target: "http://h", auto_content_length: false,
+        resync_cl_after_expansion: !explicit_cl), ungated_outbound)
+      # "p=" + the 14-char expansion = 16 bytes; the pre-expansion framing said 3.
       String.new(plan.bytes).should contain("Content-Length: 16\r\n")
       String.new(plan.bytes).should contain("p=hunter2hunter2")
 
       pinned, pinned_explicit = Gori::CLI::Run.build_single_flow_request_for_spec(
         head, "p=$PW".to_slice, ["Content-Length: 3"], nil, nil)
       pinned_plan = Gori::Repeater::Plan.build(Gori::Repeater::PlanOptions.new([pinned],
-        target: "http://h", auto_content_length: !pinned_explicit), ungated_outbound)
+        target: "http://h", auto_content_length: false,
+        resync_cl_after_expansion: !pinned_explicit), ungated_outbound)
       String.new(pinned_plan.bytes).should contain("Content-Length: 3\r\n")
     ensure
       Gori::Settings.env_vars = saved || [] of {String, String}
@@ -224,7 +252,8 @@ end
 # bare-call wrapper, the same trick the other `*_for_spec` specs use.
 module Gori::CLI::Run
   def self.build_single_flow_request_for_spec(head : Bytes, body : Bytes, headers : Array(String),
-                                              body_override : String?, target_override : String?) : {Bytes, Bool}
-    build_single_flow_request(head, body, headers, body_override, target_override)
+                                              body_override : String?, target_override : String?,
+                                              removed : Array(String) = [] of String) : {Bytes, Bool}
+    build_single_flow_request(head, body, headers, body_override, target_override, removed)
   end
 end

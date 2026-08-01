@@ -450,6 +450,39 @@ module Gori
         end
       end
 
+      # Argument names a call passed that the tool does not declare.
+      #
+      # Silently ignoring these was not neutral: a mistyped `verbatm:true` left `verbatim`
+      # off, so gori promoted a bare LF to CRLF and answered `isError:false` — the caller
+      # measured a target's handling of a request it never sent. `add_scope_rule{"match":…}`
+      # stored the default `host` type and reported success. For an AI-driven surface, where
+      # the caller cannot see the wire, a typo has to be an error.
+      #
+      # Keys starting with `_` are exempt: `_meta` is JSON-RPC's own envelope extension and
+      # some clients attach it to every call.
+      private def unknown_args(name : String, h) : Array(String)?
+        allowed = declared_args[name]?
+        return nil unless allowed
+        h.keys.reject { |k| allowed.includes?(k) || k.starts_with?('_') }
+      end
+
+      # tool name → declared property names, harvested from `list` itself so the validator
+      # cannot drift from the advertised schema (a hand-maintained second list would).
+      # Built once per process, on the first call that needs it.
+      private def declared_args : Hash(String, Set(String))
+        @declared_args ||= begin
+          map = {} of String => Set(String)
+          JSON.parse(JSON.build { |j| list(j) }).as_a.each do |t|
+            next unless tname = t["name"]?.try(&.as_s?)
+            props = t.dig?("inputSchema", "properties").try(&.as_h?)
+            map[tname] = (props ? props.keys.to_set : Set(String).new)
+          end
+          map
+        end
+      end
+
+      @declared_args : Hash(String, Set(String))? = nil
+
       # Emits the tools/list array, honouring the action gate.
       def list(j : JSON::Builder) : Nil
         j.array do
@@ -1532,6 +1565,11 @@ module Gori
         # dispatch; runs inside this method's rescue, so a store read error becomes an
         # INTERNAL result rather than crashing the loop.
         refresh_project_env if ENV_REFRESH_TOOLS.includes?(name)
+        if (bad = unknown_args(name, h)) && !bad.empty?
+          return err("unknown argument#{bad.size > 1 ? "s" : ""} for '#{name}': #{bad.join(", ")}. " \
+                     "Accepted: #{declared_args[name].to_a.sort.join(", ")}",
+            "INVALID_ARGUMENT", field: bad.first)
+        end
         result = read_tool(name, h) || action_tool(name, h) ||
                  err("unknown tool: #{name}", "UNKNOWN_TOOL")
         result = classify(result)
@@ -1806,18 +1844,19 @@ module Gori
         end
       end
 
+      # Split a wire-form request into head + body for the History row.
+      #
+      # This used to scan for `\r\n\r\n` ONLY and RAISE when it found none — which made
+      # `record_history` (default true) refuse the whole send, so a bare-LF-terminated
+      # request never reached a socket at all. That is the canonical payload `verbatim:true`
+      # exists to deliver, and the error named History while naming no way out. Recording is
+      # bookkeeping; it must never decide whether a request is sendable.
+      #
+      # `Env.head_body_boundary` is the shared answer: first of `\n\n` or `\r\n\r\n`,
+      # whichever comes earlier, and `bytes.size` when there is no terminator — in which
+      # case the whole message is the head, rather than a split landing inside the body.
       private def split_wire_request(bytes : Bytes) : {Bytes, Bytes?}
-        boundary = nil.as(Int32?)
-        i = 0
-        while i + 3 < bytes.size
-          if bytes[i] == 0x0d_u8 && bytes[i + 1] == 0x0a_u8 &&
-             bytes[i + 2] == 0x0d_u8 && bytes[i + 3] == 0x0a_u8
-            boundary = i + 4
-            break
-          end
-          i += 1
-        end
-        raise Gori::Error.new("request has no CRLF header terminator; cannot record it in History") unless boundary
+        boundary = Env.head_body_boundary(bytes)
         head = bytes[0, boundary]
         body_size = bytes.size - boundary
         body = body_size > 0 ? bytes[boundary, body_size] : nil
