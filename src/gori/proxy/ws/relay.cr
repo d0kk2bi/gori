@@ -414,8 +414,8 @@ module Gori::Proxy::WS
       # hands them to the gate the moment a hold actually parks the message.
       @parked = [] of {Int32, Bytes}
       @parked_overflowed = false
-      @in_bypass = false  # the gate's lock is already held, so writes must not re-take it
-      @torn_down = false  # `flush_at_teardown` has run; there is nothing left to owe the wire
+      @in_bypass = false # the gate's lock is already held, so writes must not re-take it
+      @torn_down = false # `flush_at_teardown` has run; there is nothing left to owe the wire
       @scratch : Bytes
       # The V7 frame-shape accumulator and this direction's ping/pong capture budget. Both
       # pumps have to record identical facts about identical bytes, or an operator's finding
