@@ -148,6 +148,15 @@ module Gori::Tui
       @decoded.env_complete = true # env tokens re-encode into the request on send here too (WS messages, decoded payload)
       @req_pane = :envelope        # :envelope | :decoded — which split sub-pane is active
       @decoded_dirty = false       # the decoded payload was edited → re-encode on send
+      # The WS session's outbound messages EXACTLY as they were loaded, opcodes and raw
+      # bytes, plus whether the pane has been touched since. The pane is a text projection —
+      # one message per line, LF-split — so it cannot represent a binary frame or a TEXT
+      # frame carrying invalid UTF-8. Sending the projection back was how a captured binary
+      # message became an opcode-1 text one on every save. So: untouched pane → the seed
+      # goes out (and is persisted) verbatim; edited pane → what the operator typed, as
+      # text. Same rule the WS relay keeps — gori's own framing only for what was changed.
+      @ws_out_seed = [] of Store::WsOutMessage
+      @ws_out_edited = false
       @saml_param = "SAMLResponse"
       @saml_binding = :post       # :post (base64) | :redirect (deflate+base64)
       @saml_location = :body      # :body (form) | :query (request line)
@@ -458,10 +467,11 @@ module Gori::Tui
     getter? ws_mode : Bool
 
     # Load a captured WebSocket flow (101) for repeater. The request editor is seeded
-    # with the handshake upgrade request; the messages editor is seeded with the
-    # recorded client→server TEXT messages (one per line, editable). Binary outbound
-    # messages aren't representable as editable text, so they're omitted from the seed.
-    def load_ws(detail : Store::FlowDetail, out_messages : Array(String)) : Nil
+    # with the handshake upgrade request; the messages editor is seeded with the recorded
+    # client→server TEXT messages (one per line, editable). A BINARY message is not
+    # representable as editable text so it stays out of the pane — but it stays IN the
+    # seed, so an unedited replay still sends it (see `@ws_out_seed`).
+    def load_ws(detail : Store::FlowDetail, out_messages : Array(Store::WsOutMessage)) : Nil
       @flow = detail
       @ws_mode = true
       @http2 = false # WebSocket is HTTP/1.1
@@ -474,7 +484,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(String.new(detail.request_head))
-      @decoded.set_text(out_messages.join('\n'))
+      seed_ws_out(out_messages)
       @original_lines = [] of String
       @result = nil
       @prev_result = nil
@@ -498,9 +508,40 @@ module Gori::Tui
     # trailing '\r'. (A captured frame with an embedded newline can't be represented
     # one-per-line — a known v1 limit.)
     def ws_out_messages : Array(Repeater::WsEngine::OutMsg)
+      if ws_out_seeded?
+        return @ws_out_seed.map do |m|
+          # `Env.expand` scans BYTES and copies every unmatched span through untouched, so a
+          # TEXT frame carrying invalid UTF-8 survives it; a BINARY frame is not expanded at
+          # all, the same rule `gori run repeater send` and MCP `send_websocket` apply.
+          Repeater::WsEngine::OutMsg.new(m.opcode,
+            m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload)
+        end
+      end
       @decoded.text.split('\n').compact_map do |line|
         line.empty? ? nil : Repeater::WsEngine::OutMsg.new(1, Env.expand(line).to_slice)
       end
+    end
+
+    # Is the pane still showing exactly what the session was loaded with? An empty seed
+    # means there is nothing to preserve, so a hand-typed list takes the text path.
+    private def ws_out_seeded? : Bool
+      !@ws_out_edited && !@ws_out_seed.empty?
+    end
+
+    # Install a session's outbound messages as both the seed and the pane's text. The pane
+    # shows the TEXT frames only — a binary payload rendered into a TextArea is noise the
+    # operator cannot meaningfully edit, and writing it back was how it became opcode 1.
+    #
+    # A soft reconcile (`apply_peer_request`) reaches this on every peer request-side change,
+    # so an UNSAVED local edit is left alone — the same guard the pane's `set_text` already
+    # had. Adopting the peer's seed under it would send their messages while showing ours.
+    private def seed_ws_out(messages : Array(Store::WsOutMessage)) : Nil
+      joined = messages.select(&.text?).join('\n') { |m| String.new(m.payload) }
+      same = @decoded.text == TextArea.normalize_lf(joined)
+      return if @ws_out_edited && !same
+      @decoded.set_text(joined) unless same
+      @ws_out_seed = messages
+      @ws_out_edited = false
     end
 
     # The env tokens in the outbound message lines that resolve to nothing — what
@@ -522,16 +563,32 @@ module Gori::Tui
     # such bytes roughly once per 1.2KB by chance (#519). Without this the pane refused a
     # real captured binary frame, naming the `$A` inside a JPEG.
     def ws_unresolved_env : Array(String)
-      @decoded.text.split('\n')
-        .select { |line| !line.empty? && line.valid_encoding? }
+      texts = if ws_out_seeded?
+                @ws_out_seed.select(&.text?).map { |m| String.new(m.payload) }
+              else
+                @decoded.text.split('\n')
+              end
+      texts.select { |line| !line.empty? && line.valid_encoding? }
         .flat_map { |line| Env.unresolved(line) }.uniq!
     end
 
-    # Raw outbound message lines (LF-split, env tokens UNexpanded) for persistence.
-    # The store masks secrets and stores these verbatim, so `$KEY` survives to re-expand
-    # on the next send — never bake an expanded secret into the DB (see ws_out_messages).
-    def ws_out_texts_raw : Array(String)
-      @decoded.text.split('\n').reject(&.empty?)
+    # The outbound messages to persist (env tokens UNexpanded). The store masks secrets and
+    # stores these verbatim, so `$KEY` survives to re-expand on the next send — never bake
+    # an expanded secret into the DB (see ws_out_messages).
+    #
+    # An untouched pane hands back the seed, opcodes and bytes intact; that is what lets a
+    # captured BINARY frame survive a save it had nothing to do with.
+    def ws_out_messages_raw : Array(Store::WsOutMessage)
+      return @ws_out_seed if ws_out_seeded?
+      @decoded.text.split('\n').reject(&.empty?).map { |l| Store::WsOutMessage.text(l) }
+    end
+
+    # Persistence just wrote `ws_out_messages_raw` — those bytes ARE the session now, so the
+    # pane counts as unedited again. Without this a second save would still be comparing
+    # against the pre-edit seed.
+    def ws_out_persisted : Nil
+      @ws_out_seed = ws_out_messages_raw
+      @ws_out_edited = false
     end
 
     def ws_upgrade_bytes : Bytes
@@ -1050,7 +1107,7 @@ module Gori::Tui
                 response_head : Bytes? = nil, response_body : Bytes? = nil,
                 response_error : String? = nil, response_duration_us : Int64? = nil,
                 sni : String = "",
-                ws_messages : Array(String)? = nil) : Nil
+                ws_messages : Array(Store::WsOutMessage)? = nil) : Nil
       @flow = nil
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages)
 
@@ -1081,7 +1138,7 @@ module Gori::Tui
     # bump or a peer request edit looked like "send reset the response to Target".
     def apply_peer_request(target : String, request : String, http2 : Bool, auto_cl : Bool,
                            sni : String = "",
-                           ws_messages : Array(String)? = nil) : Nil
+                           ws_messages : Array(Store::WsOutMessage)? = nil) : Nil
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages)
       @req_hex_edit = nil
       # Leave @result / @prev_result / @focus / @scroll / @resp_mode / @original_lines alone.
@@ -1109,7 +1166,7 @@ module Gori::Tui
     # Shared request/target/flag write used by restore (full) and apply_peer_request (soft).
     private def apply_request_fields(target : String, request : String, http2 : Bool, auto_cl : Bool,
                                      sni : String,
-                                     ws_messages : Array(String)?) : Nil
+                                     ws_messages : Array(Store::WsOutMessage)?) : Nil
       @http2 = http2
       @target = target
       @tcx = @target.size
@@ -1126,11 +1183,10 @@ module Gori::Tui
         # that only touched a non-text field must not disturb the pane. `wire_text` is
         # set_text's exact inverse, so this is the precise "would set_text be a no-op?" test —
         # no normalization, and a line-ending-only difference is honoured as the edit it is.
+        # (Normalizing here would compare unequal on EVERY poll once the store round-trips
+        # wire form exactly, and slam the caret.)
         @editor.set_text(request) if @editor.wire_text != request
-        # The outbound-message pane stays a DOCUMENT compare: it is persisted as LF-split
-        # lines (ws_out_texts_raw), so there is no wire form to be exact about.
-        joined = (ws_messages || [] of String).join('\n')
-        @decoded.set_text(joined) if @decoded.text != TextArea.normalize_lf(joined)
+        seed_ws_out(ws_messages || [] of Store::WsOutMessage)
         @req_pane = :decoded
       else
         @ws_mode = false
@@ -1219,6 +1275,8 @@ module Gori::Tui
       @req_pane = src.@req_pane
       @decoded.set_text(src.@decoded.text)
       @decoded_dirty = src.@decoded_dirty
+      @ws_out_seed = src.@ws_out_seed
+      @ws_out_edited = src.@ws_out_edited
 
       # Hex-mode buffer is authoritative while set — snapshot it into the text editor
       # so the clone is plain text (no shared hex cursor state).
@@ -1961,6 +2019,7 @@ module Gori::Tui
     private def mark_req_edit : Nil
       if (@decode_kind || @ws_mode) && @req_pane == :decoded
         @decoded_dirty = true
+        @ws_out_edited = true
       else
         @dirty = true
         reflect_content_length_in_editor

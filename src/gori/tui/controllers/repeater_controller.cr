@@ -40,11 +40,11 @@ module Gori::Tui
       @repeaters = [] of RepeaterTab
       @host.session.store.repeaters.each do |r|
         view = RepeaterView.new
-        ws_msgs = nil.as(Array(String)?)
+        ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         request_text = String.new(r.request)
         if Repeater::WsEngine.upgrade_request?(request_text)
           ws_msgs = @host.session.store.ws_messages_for_repeater(r.id).compact_map do |m|
-            m.direction == "out" ? String.new(m.payload) : nil
+            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload) : nil
           end
         end
         view.restore(r.target, request_text, r.http2?, r.auto_content_length?,
@@ -995,11 +995,11 @@ module Gori::Tui
         # Soft sync: request/target/flags only. Full restore() would reset focus to
         # :target and clear @result (no response BLOBs on this path) — that is the
         # "send then response vanishes / focus jumps to Target" bug.
-        ws_msgs = nil.as(Array(String)?)
+        ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
         if Repeater::WsEngine.upgrade_request?(row_request_text)
           ws_msgs = @host.session.store.ws_messages_for_repeater(row.id).compact_map do |m|
-            m.direction == "out" ? String.new(m.payload) : nil
+            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload) : nil
           end
         end
         v.apply_peer_request(row.target, row_request_text, row.http2?, row.auto_content_length?,
@@ -1011,11 +1011,11 @@ module Gori::Tui
       rows.each do |row|
         next if local_ids.includes?(row.id)
         view = RepeaterView.new
-        ws_msgs = nil.as(Array(String)?)
+        ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
         if Repeater::WsEngine.upgrade_request?(row_request_text)
           ws_msgs = @host.session.store.ws_messages_for_repeater(row.id).compact_map do |m|
-            m.direction == "out" ? String.new(m.payload) : nil
+            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload) : nil
           end
         end
         view.restore(row.target, row_request_text, row.http2?, row.auto_content_length?,
@@ -1055,18 +1055,17 @@ module Gori::Tui
       return unless detail = @host.session.store.get_flow(id)
       view = RepeaterView.new
       if detail.row.status == 101
-        # WebSocket: seed the editor with recorded client→server TEXT messages. The
-        # tab is session-only (db_id nil) — WS transcripts aren't persisted/synced.
+        # WebSocket: seed the editor with the recorded client→server messages. The tab is
+        # session-only (db_id nil) — WS transcripts aren't persisted/synced.
         all_out = @host.session.store.ws_messages(id).select { |m| m.direction == "out" }
-        out_msgs = all_out.select(&.text?).map { |m| String.new(m.payload).scrub }
-        view.load_ws(detail, out_msgs)
+        view.load_ws(detail, all_out.map { |m| Store::WsOutMessage.new(m.opcode, m.payload) })
         @repeaters << RepeaterTab.new(view, id, nil)
-        # The WS message editor is text-only (one message per line), so binary outbound frames
-        # can't be represented/edited and are omitted from the seed — say so in the status line
-        # rather than letting them vanish from the replay without a trace.
-        dropped = all_out.size - out_msgs.size
-        omitted = dropped > 0 ? " — #{dropped} binary frame#{dropped == 1 ? "" : "s"} omitted (text editor can't replay them)" : ""
-        @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{omitted} · ^R send · esc back")
+        # The pane is text-only (one message per line), so a binary frame is not shown and
+        # not editable — but it is still in the seed and still replays, as long as the list
+        # is left alone. Say which, rather than letting the operator guess.
+        binary = all_out.count { |m| !m.text? }
+        note = binary > 0 ? " — #{binary} binary frame#{binary == 1 ? "" : "s"} not shown; #{binary == 1 ? "it replays" : "they replay"} unless you edit the list" : ""
+        @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{note} · ^R send · esc back")
       elsif grpc_flow?(detail)
         # gRPC: head editable as text; a unary call's message payload is hex-editable (^X)
         # and reframed on send. Session-only (db_id nil) — the binary body can't round-trip
@@ -1142,7 +1141,8 @@ module Gori::Tui
                 persist_new_repeater(view, nil)
               end
       if (id = db_id) && view.ws_mode?
-        @host.session.store.update_repeater_ws_messages(id, view.ws_out_texts_raw)
+        @host.session.store.update_repeater_ws_messages(id, view.ws_out_messages_raw)
+        view.ws_out_persisted
       end
       @repeaters << RepeaterTab.new(view, nil, db_id)
       @current_repeater_idx = @repeaters.size - 1
@@ -1459,7 +1459,8 @@ module Gori::Tui
         @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
           v.sni_override)
         # Raw message lines too — the store masks secrets; env tokens re-expand on send.
-        @host.session.store.update_repeater_ws_messages(id, v.ws_out_texts_raw)
+        @host.session.store.update_repeater_ws_messages(id, v.ws_out_messages_raw)
+        v.ws_out_persisted
       else
         @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
           v.sni_override)

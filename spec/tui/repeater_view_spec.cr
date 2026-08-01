@@ -918,7 +918,7 @@ describe Gori::Tui::RepeaterView do
         method: "GET", target: "/ws", http_version: "HTTP/1.1",
         head: "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       wview = RepeaterView.new
-      wview.load_ws(store.get_flow(wid).not_nil!, [] of String)
+      wview.load_ws(store.get_flow(wid).not_nil!, [] of Gori::Store::WsOutMessage)
       wview.toggle_http2.should be_false # stays h1 — no flip
       wview.http2?.should be_false
     end
@@ -931,7 +931,8 @@ describe Gori::Tui::RepeaterView do
         method: "GET", target: "/ws/chat", http_version: "HTTP/1.1",
         head: "GET /ws/chat HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       view = RepeaterView.new
-      view.load_ws(store.get_flow(id).not_nil!, ["{\"a\":1}", "ping"])
+      view.load_ws(store.get_flow(id).not_nil!,
+        ["{\"a\":1}", "ping"].map { |t| Gori::Store::WsOutMessage.text(t) })
 
       msgs = view.ws_out_messages
       msgs.size.should eq(2)
@@ -943,6 +944,56 @@ describe Gori::Tui::RepeaterView do
       view.summary.should eq("GET /ws/chat")
     end
   end
+
+  it "replays a captured BINARY message an untouched pane never showed, and drops it once edited" do
+    # The pane is a text projection — one message per line, LF-split — so it cannot carry a
+    # binary payload. Sending the projection back was how a captured binary message became
+    # an opcode-1 text one on every save, and how it vanished from every later replay. The
+    # rule is the WS relay's: gori's own shape only for what the operator actually changed.
+    bin = Bytes[0x00, 0xFF, 0x0A, 0x41]
+    repeater_tmp_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "ws.test", port: 443,
+        method: "GET", target: "/ws", http_version: "HTTP/1.1",
+        head: "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
+      view = RepeaterView.new
+      view.load_ws(store.get_flow(id).not_nil!, [
+        Gori::Store::WsOutMessage.text("first"),
+        Gori::Store::WsOutMessage.new(2, bin),
+      ])
+
+      view.ws_out_messages.map(&.opcode).should eq([1, 2])
+      view.ws_out_messages[1].payload.should eq(bin)
+      view.ws_out_messages_raw.map(&.opcode).should eq([1, 2]) # what a save would persist
+      view.ws_out_messages_raw[1].payload.should eq(bin)
+
+      # Editing the list makes it the operator's, and it is text.
+      view.edit_insert('X')
+      view.ws_out_messages.map(&.opcode).should eq([1])
+      String.new(view.ws_out_messages[0].payload).should eq("Xfirst")
+      view.ws_out_messages_raw.map(&.opcode).should eq([1])
+    end
+  end
+
+  it "keeps an unsaved message edit when a peer's request-side change reconciles in" do
+    # `apply_peer_request` runs on every cross-session request-side change and re-seeds the
+    # message pane. Adopting the peer's messages under an unsaved local edit would send
+    # THEIRS while showing OURS — the pane's own `set_text` guard already refused to clobber
+    # the text, and the seed has to refuse alongside it.
+    view = RepeaterView.new
+    ws = "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n"
+    view.restore("https://ws.test", ws, false, true,
+      ws_messages: [Gori::Store::WsOutMessage.text("mine")])
+    view.focus_pane(:request) # restore lands on :target; the message pane is under :request
+    view.edit_insert('!')
+    String.new(view.ws_out_messages[0].payload).should eq("!mine")
+
+    view.apply_peer_request("https://ws.test", ws + "X-Peer: 1\r\n", false, true,
+      ws_messages: [Gori::Store::WsOutMessage.text("theirs")])
+    view.ws_out_messages.size.should eq(1)
+    String.new(view.ws_out_messages[0].payload).should eq("!mine")
+  end
+
   it "allows editing both handshake request and messages in ws_mode" do
     repeater_tmp_store do |store|
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
@@ -950,7 +1001,8 @@ describe Gori::Tui::RepeaterView do
         method: "GET", target: "/ws/chat", http_version: "HTTP/1.1",
         head: "GET /ws/chat HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       view = RepeaterView.new
-      view.load_ws(store.get_flow(id).not_nil!, ["{\"a\":1}", "ping"])
+      view.load_ws(store.get_flow(id).not_nil!,
+        ["{\"a\":1}", "ping"].map { |t| Gori::Store::WsOutMessage.text(t) })
 
       view.ws_mode?.should be_true
       view.req_pane.should eq(:decoded)

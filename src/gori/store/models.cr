@@ -160,6 +160,30 @@ module Gori
       end
     end
 
+    # One outbound message to persist on a repeater SESSION. Carries the OPCODE and raw
+    # BYTES, because `update_repeater_ws_messages` used to take `Array(String)` and write a
+    # hardcoded `opcode 1`: a captured BINARY frame could not round-trip a session at all
+    # (`gori run repeater create` warned on stderr and dropped it; MCP and the TUI dropped it
+    # silently), and every TEXT frame went through `String#scrub`, which rewrote an
+    # invalid-UTF-8 payload — `696e76616c6964fffe`, 9 bytes — to U+FFFD, 13 bytes, and then
+    # SENT that. RFC 6455 §8.1/§5.6 UTF-8 validation is a standard WebSocket test, so those
+    # bytes ARE the payload.
+    #
+    # A record rather than a bare tuple so F-shaped frame fields (fin, rsv, an explicit mask
+    # key, a declared length that disagrees with the payload) can be added with defaults
+    # later without touching a caller. Nothing here validates the opcode: a store is not the
+    # place to decide which frame shapes an operator may keep.
+    record WsOutMessage, opcode : Int32, payload : Bytes do
+      # The common case: a line the operator typed into an editor or a JSON string.
+      def self.text(s : String) : WsOutMessage
+        new(1, s.to_slice)
+      end
+
+      def text? : Bool
+        @opcode == 1
+      end
+    end
+
     # Severity of an issue (stored as the enum value).
     enum Severity
       Info

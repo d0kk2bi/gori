@@ -80,9 +80,9 @@ module Gori::Proxy::WS
       # The payload as it would have gone on the wire (post-rewrite). Owned by the slot —
       # `submit` dups it, because the pump reuses its assembly buffer for the next message.
       getter payload : Bytes
-      # The peer's OWN frame bytes, when the message arrived as a single frame and no rule
-      # changed it. Reused verbatim on an unedited release, so a hold that ends in "forward"
-      # preserves the sender's framing and mask key.
+      # The peer's OWN wire frames, concatenated, when no rule changed the message. Reused
+      # verbatim on an unedited release, so a hold that ends in "forward" preserves the
+      # sender's fragmentation, FIN/RSV bits and mask keys.
       getter raw : Bytes?
       # The operator's bytes, once a decision has arrived.
       property decided : Bytes?
@@ -103,6 +103,13 @@ module Gori::Proxy::WS
       @warned_overflow = false
       @dropped = 0
       @stranded = 0
+      @lost = 0
+    end
+
+    # Is anything still parked in this direction's queue? Asked by `Relay.run` at the
+    # CLOSE_TIMEOUT deadline, so an operator whose decision window just expired is TOLD.
+    def pending? : Bool
+      @mutex.synchronize { !@queue.empty? }
     end
 
     # --- pump side (never blocks on a human) ---------------------------------
@@ -171,29 +178,53 @@ module Gori::Proxy::WS
     # than delaying it. Its wait fiber owns the settle and is already runnable, so the loop
     # yields to it instead.
     def bypass(reason : String, & : -> Nil) : Nil
+      settle(reason)
+      @mutex.synchronize { yield }
+    end
+
+    # Force the queue out, in order, and wait (bounded) for any decision already in flight.
+    # `bypass` minus the direct write — `Relay.run` calls it on both gates the moment it
+    # decides to tear the tunnel down, while the sockets are still OPEN.
+    #
+    # That timing is the whole point. `close` runs from the pump's `ensure`, which is only
+    # reached AFTER `run` has closed both sockets to unblock the pump's read — so anything
+    # released there is written to a dead socket. A held message therefore had until
+    # `Relay::CLOSE_TIMEOUT` and then simply ceased to exist: no bytes on either socket, no
+    # `ws_messages` row, and a teardown line calling it "released".
+    def settle(reason : String) : Nil
       BYPASS_SETTLE_TURNS.times do
         drained = @mutex.synchronize { fail_open_locked(reason); @queue.empty? || @closed }
         break if drained
         Fiber.yield
       end
-      @mutex.synchronize { yield }
     end
 
-    # The direction ended. Hand every still-held item back to the `Interceptor` — that
-    # resolves the queue row, bumps the revision so the TUI redraws, and unblocks the wait
-    # fiber, which then finds `@closed` and discards the decision. `H2::StreamGate#close`,
-    # verbatim, and for the same reason: without it a dead socket leaves ghost rows in the
-    # queue and leaked fibers parked on a channel nobody will ever send to.
+    # The direction ended. Fail whatever is left open, THEN shut the gate, then hand every
+    # still-held item back to the `Interceptor` — that resolves the queue row, bumps the
+    # revision so the TUI redraws, and unblocks the wait fiber, which then finds `@closed`
+    # and discards the decision. `H2::StreamGate#close`'s reason for the last part holds
+    # here too: without it a dead socket leaves ghost rows in the queue and leaked fibers
+    # parked on a channel nobody will ever send to.
+    #
+    # The ORDER is the fix. `@closed = true` used to run first, so the wait fiber woken by
+    # `forward` below reached `resolve_locked`'s `return if @closed` and the message was
+    # written to neither socket and to no `ws_messages` row — while the line below called it
+    # "released unread", the word for "forwarded without a decision". `fail_open_locked` is
+    # the disposition every other involuntary release in this class already takes (the byte
+    # ceiling, `bypass`, `release_all`, the #123 reaper, `H2::StreamGate#fail_open`), and a
+    # teardown is involuntary. `Relay.run` calls `settle` while the sockets are still open,
+    # so by the time this runs the queue is normally already empty; what reaches here is the
+    # residue of a decision that raced the teardown.
     def close : Nil
       slots = @mutex.synchronize do
-        @closed = true
+        fail_open_locked("the socket closed with the message still held")
         q = @queue
         @queue = [] of Slot
+        @closed = true
         q
       end
-      stranded = slots.count(&.item)
+      @stranded += slots.count(&.item)
       slots.each { |s| s.item.try { |it| @interceptor.forward(it.id) } }
-      @stranded += stranded
       warn_teardown
     end
 
@@ -263,22 +294,26 @@ module Gori::Proxy::WS
         return
       end
       bytes = slot.decided || slot.payload
-      # An unedited forward keeps the sender's own frame — byte-exact, mask key and all (P7).
+      # An unedited forward keeps the sender's own frames — byte-exact, mask keys and all (P7).
       # An edit is re-framed as ONE frame: once the length changes the sender's fragmentation
       # cannot be reproduced, and a client → server frame is re-masked with a fresh key
       # (RFC 6455 §5.3), exactly as step 1's rewrite path already does.
-      write_message(slot.opcode, bytes, bytes == slot.payload ? slot.raw : nil)
+      @lost += 1 unless write_message(slot.opcode, bytes, bytes == slot.payload ? slot.raw : nil)
     end
 
-    private def write_message(opcode : UInt8, payload : Bytes, raw : Bytes?) : Nil
+    # True iff the bytes reached the socket. A failed write leaves NO capture row on purpose:
+    # a `ws_messages` row is gori's claim that the peer saw these bytes, and inventing one for
+    # a write that raised would be the same class of lie as the teardown line this replaced.
+    # The teardown log counts the loss instead.
+    private def write_message(opcode : UInt8, payload : Bytes, raw : Bytes?) : Bool
       @dst.write(raw || WS.encode(opcode, payload, mask: @mask, fin: true))
       @dst.flush
       # Record what gori WROTE, not what arrived — the same way step 1's rewrite path keeps
       # P7. The capture has to be the bytes the peer actually sees.
       @sink.on_ws_message(@flow_id, @direction, opcode.to_i, payload.dup)
+      true
     rescue
-      # The socket is gone. `close` reaps whatever is still queued; there is nothing useful
-      # to do with a write error on a direction that has already ended.
+      false
     end
 
     # --- ceiling / fail-open --------------------------------------------------
@@ -334,12 +369,19 @@ module Gori::Proxy::WS
       end
     end
 
+    # Each count is a DIFFERENT fate and the operator has to be able to tell them apart —
+    # the old line collapsed the last two into "released unread", which named a forward for
+    # something that was destroyed.
     private def warn_teardown : Nil
-      return if @dropped == 0 && @stranded == 0
+      return if @dropped == 0 && @stranded == 0 && @lost == 0
       ::Log.info do
-        "ws #{@direction}: #{@dropped} held message(s) dropped and #{@stranded} released " \
-        "unread when the socket closed. A dropped WebSocket message is written nowhere — " \
-        "neither endpoint can see the gap, and gori keeps no ws_messages row for it"
+        parts = [] of String
+        parts << "#{@dropped} dropped by the operator" if @dropped > 0
+        parts << "#{@lost} forwarded too late to reach the socket" if @lost > 0
+        parts << "#{@stranded} discarded still undecided" if @stranded > 0
+        "ws #{@direction}: held message(s) at teardown — #{parts.join(", ")}. None of these " \
+        "left a ws_messages row and neither endpoint can see the gap: a WebSocket message " \
+        "has no identity for a peer to miss"
       end
     end
   end

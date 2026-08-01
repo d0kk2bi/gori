@@ -476,9 +476,26 @@ end
 # `ws_out_messages` is private CLI glue (mirrors MCP send_websocket's default-messages
 # fallback) — reopen the module for a bare-call wrapper.
 module Gori::CLI::Run
-  def self.ws_out_messages_for_spec(store : Gori::Store, id : Int64, override : Array(String)) : Array(Gori::Repeater::WsEngine::OutMsg)
-    ws_out_messages(store, id, override)
+  def self.ws_out_messages_for_spec(store : Gori::Store, id : Int64, override : Array(String),
+                                    verbatim : Bool = false) : Array(Gori::Repeater::WsEngine::OutMsg)
+    ws_out_messages(store, id, override, verbatim)
   end
+end
+
+# `Settings` env vars are a process-wide singleton — set, yield, always restore. `env_prefix`
+# is pinned too: another spec file sets it and does not restore it.
+private def with_ws_env_vars(pairs : Array({String, String}), &)
+  saved_global = Gori::Settings.env_vars
+  saved_project = Gori::Settings.project_env_vars
+  saved_prefix = Gori::Settings.env_prefix
+  Gori::Settings.env_vars = pairs
+  Gori::Settings.project_env_vars = [] of {String, String}
+  Gori::Settings.env_prefix = "$"
+  yield
+ensure
+  Gori::Settings.env_vars = saved_global || [] of {String, String}
+  Gori::Settings.project_env_vars = saved_project || [] of {String, String}
+  Gori::Settings.env_prefix = saved_prefix || "$"
 end
 
 describe "gori run repeater send (WebSocket)" do
@@ -493,10 +510,54 @@ describe "gori run repeater send (WebSocket)" do
   it "falls back to the repeater's stored OUT messages when no override is given" do
     with_store do |store|
       id = store.insert_repeater("ws://x.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
-      store.update_repeater_ws_messages(id, ["hello"])
+      store.update_repeater_ws_messages(id, [Gori::Store::WsOutMessage.text("hello")])
       msgs = Gori::CLI::Run.ws_out_messages_for_spec(store, id, [] of String)
       msgs.size.should eq(1)
       String.new(msgs[0].payload).should eq("hello")
+    end
+  end
+
+  it "round-trips a BINARY message and an invalid-UTF-8 TEXT one, byte for byte" do
+    # The session store took `Array(String)` and wrote a hardcoded opcode 1, so a captured
+    # binary out-frame could not be persisted at all, and `String#scrub` on the text path
+    # turned `696e76616c6964fffe` (9 bytes) into `…efbfbdefbfbd` (13) — the §8.1/§5.6
+    # validation payload rewritten and then SENT, with no warning on any surface.
+    bad = Bytes[0x69, 0x6e, 0x76, 0x61, 0x6c, 0x69, 0x64, 0xff, 0xfe] # "invalid" + ff fe
+    bin = Bytes[0x00, 0xff, 0x00, 0xff]
+    with_store do |store|
+      id = store.insert_repeater("ws://x.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      store.update_repeater_ws_messages(id, [
+        Gori::Store::WsOutMessage.new(1, bad),
+        Gori::Store::WsOutMessage.new(2, bin),
+      ])
+      stored = store.ws_messages_for_repeater(id)
+      stored.map(&.opcode).should eq([1, 2])
+      stored.map(&.payload).should eq([bad, bin])
+
+      msgs = Gori::CLI::Run.ws_out_messages_for_spec(store, id, [] of String)
+      msgs.map(&.opcode).should eq([1, 2])
+      msgs.map(&.payload).should eq([bad, bin]) # what goes on the wire
+    end
+  end
+
+  it "leaves $VAR literal under --verbatim, as the flag's own help text promises" do
+    # `verbatim` was threaded into the handshake's PlanOptions but was not a parameter of
+    # `cmd_repeater_send_ws`, so a WS message was expanded anyway — and `Env.expand` has no
+    # escape form, making a literal `$TOKEN` (the payload you send at a server-side template
+    # or shell sink) unsendable whenever a var of that name exists.
+    with_ws_env_vars([{"TOKEN", "SECRETVAL"}]) do
+      with_store do |store|
+        id = store.insert_repeater("ws://x.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+        store.update_repeater_ws_messages(id, [Gori::Store::WsOutMessage.text("hello $TOKEN")])
+
+        expanded = Gori::CLI::Run.ws_out_messages_for_spec(store, id, [] of String)
+        String.new(expanded[0].payload).should eq("hello SECRETVAL")
+        verbatim = Gori::CLI::Run.ws_out_messages_for_spec(store, id, [] of String, verbatim: true)
+        String.new(verbatim[0].payload).should eq("hello $TOKEN")
+
+        over = Gori::CLI::Run.ws_out_messages_for_spec(store, 1_i64, ["x $TOKEN"], verbatim: true)
+        String.new(over[0].payload).should eq("x $TOKEN")
+      end
     end
   end
 end

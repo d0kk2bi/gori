@@ -1175,10 +1175,18 @@ module Gori::Proxy
       accepted = resp.headers.get?("Sec-WebSocket-Extensions")
       return if accepted.nil? || accepted.blank?
       ::Log.warn do
-        "ws #{host}#{target}: origin accepted extension #{accepted.inspect} — captured frames on " \
+        "ws #{ws_log_label(host, target)}: origin accepted extension #{accepted.inspect} — captured frames on " \
         "this socket are that extension's encoded bytes, not the messages (gori removes the " \
         "client's Sec-WebSocket-Extensions offer; see #518)"
       end
+    end
+
+    # `host` + `target` for a log line. On the plaintext forward-proxy path `target` is
+    # ABSOLUTE-form — that is how a proxy client writes a request line — so concatenating
+    # produced `ws 127.0.0.1http://127.0.0.1:19251/ws`. An absolute-form target already
+    # names the authority, leaving the host nothing to add.
+    private def ws_log_label(host : String, target : String) : String
+      target.starts_with?("http://") || target.starts_with?("https://") ? target : "#{host}#{target}"
     end
 
     private def websocket_upgrade?(resp : Codec::RawResponse) : Bool

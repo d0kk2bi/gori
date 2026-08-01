@@ -186,17 +186,22 @@ module Gori
       }
     end
 
-    def update_repeater_ws_messages(id : Int64, messages : Array(String)) : Nil
+    # Replace a repeater session's outbound WebSocket messages.
+    #
+    # `Env.mask_secrets` is byte-level (it scans `to_slice`, never `String#chars`), so the
+    # String round-trip through it is lossless for a payload that is not valid UTF-8 — which
+    # is the whole reason this can take raw bytes at all. `String#scrub` was the lossy step,
+    # and it lived in the callers, not here.
+    def update_repeater_ws_messages(id : Int64, messages : Array(WsOutMessage)) : Nil
       exec_task ->(conn : DB::Connection) {
         conn.exec("DELETE FROM ws_messages WHERE repeater_id = ?", id)
-        messages.each do |msg_text|
-          masked_msg = Env.mask_secrets(msg_text)
+        messages.each do |msg|
           ts = now_us
           # See insert_ws_one: an empty payload binds SQL NULL and violates the NOT NULL
           # column (an empty repeater message text hits this), so store X'' for it.
-          slice = masked_msg.to_slice
+          slice = Env.mask_secrets(String.new(msg.payload)).to_slice
           empty = slice.empty?
-          args = [0_i64, id, ts, "out", 1] of DB::Any
+          args = [0_i64, id, ts, "out", msg.opcode] of DB::Any
           args << slice unless empty
           conn.exec(
             "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload) " \

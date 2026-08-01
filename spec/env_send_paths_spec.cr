@@ -165,16 +165,18 @@ describe "WebSocket message payloads (#524)" do
         method: "GET", target: "/ws", http_version: "HTTP/1.1",
         head: "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       view = RepeaterView.new
-      view.load_ws(store.get_flow(id).not_nil!, [%({"t":"$SESSION"}), "ping $SESSION", "plain"])
+      view.load_ws(store.get_flow(id).not_nil!,
+        [%({"t":"$SESSION"}), "ping $SESSION", "plain"].map { |t| Gori::Store::WsOutMessage.text(t) })
 
       view.ws_unresolved_env.should eq(["SESSION"]) # deduplicated across lines
 
-      # A line seeded from a captured BINARY frame — the pane takes stored OUT frames
-      # verbatim, opcode and all — is not text an operator typed, and its `$A` is a byte.
+      # A captured BINARY frame is not text an operator typed, and its `$A` is a byte.
       # Refusing on it took out a real WS session (caught driving the built TUI, not by
-      # this spec: the status line named `$A, $_` alongside the genuine token).
+      # this spec: the status line named `$A, $_` alongside the genuine token). It is kept
+      # in the seed with its opcode, so it still replays; it just never reaches the pane.
       view.load_ws(store.get_flow(id).not_nil!,
-        [String.new(Bytes[0x8B, 0x1F, 0x24, 0x41, 0x00, 0xFE, 0x24, 0x5F]), "ping $SESSION"])
+        [Gori::Store::WsOutMessage.new(2, Bytes[0x8B, 0x1F, 0x24, 0x41, 0x00, 0xFE, 0x24, 0x5F]),
+         Gori::Store::WsOutMessage.text("ping $SESSION")])
       view.ws_unresolved_env.should eq(["SESSION"])
       # The DISPLAY path is untouched: the copy menu still reads the literal token.
       String.new(view.ws_out_messages[1].payload).should eq("ping $SESSION")
