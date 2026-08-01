@@ -26,7 +26,7 @@ module Gori
       end
 
       private def sequence_start(h) : Result
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         plan = build_sequence_plan(h, ob)
         # `origin!` never raises here: sequence_start only ever builds a LIVE plan (a pasted
         # token list is sequence_analyze's job and builds no engine at all).
@@ -153,11 +153,17 @@ module Gori
         config.retries = (int(h, "retries") || 1_i64).clamp(0_i64, 1000_i64).to_i
         cap = int(h, "max_requests")
         config.max_requests = cap ? {cap, SEQUENCE_MAX_REQUESTS}.min : SEQUENCE_MAX_REQUESTS
+        int(h, "throttle_ms").try { |v| config.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
         # The builder's sender carries the Outbound decision, so Sandbox / EXCLUDE hard-block
         # a collection run per send — sequence_start used to have only the job-start check.
         options = Sequencer::PlanOptions.new(bytes, default_target: default_target,
           target: str(h, "url"), http2: (bool(h, "http2") || false) || src_h2, config: config,
-          verify: @verify_upstream && !(bool(h, "insecure") || false),
+          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          # SNI independent of the Host header is the vhost-confusion / domain-fronting test,
+          # and a token-randomness sweep against such a vhost had NO route through MCP at all
+          # (`send_request` at least has create_repeater{sni} → send_request{repeater_id}).
+          # `Sequencer::PlanOptions` and `gori run sequence --sni` have always carried it.
+          sni: str(h, "sni"),
           overrides: HostOverrides.load(store))
         Sequencer::Plan.build(options, ob)
       rescue ex : Sequencer::PlanError

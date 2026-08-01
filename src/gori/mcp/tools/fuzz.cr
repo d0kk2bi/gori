@@ -15,7 +15,7 @@ module Gori
       # --- fuzz tools (gated, async job model) --------------------------------
 
       private def fuzz_start(h) : Result
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         engine, origin, total, http2 = build_fuzz_job(h, ob)
         # Scope gate before launching any real send (host-level: fuzz sweeps many
         # paths against one origin, so evaluate the origin host).
@@ -244,7 +244,7 @@ module Gori
           # Defense-in-depth alongside the job-start Layer-1 check: that check only covers
           # the origin once, not a path a template mutates per-request. The Outbound re-reads
           # the scope periodically, so a mid-run EXCLUDE / Sandbox toggle stops the sweep.
-          verify: @verify_upstream && !(bool(h, "insecure") || false),
+          verify: @verify_upstream && !bool_arg(h, "insecure", false),
           # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
           # `Fuzz::PlanOptions` and the CLI have always carried it; MCP's only route to it was
           # create_repeater{sni} → send_request{repeater_id}, i.e. not a sweep at all.

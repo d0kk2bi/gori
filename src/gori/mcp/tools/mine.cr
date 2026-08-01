@@ -11,7 +11,7 @@ module Gori
       # --- mine tools (gated, async job model) --------------------------------
 
       private def mine_start(h) : Result
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         engine, origin, total = build_mine_job(h, ob)
         sc = ob.check("#{origin.scheme}://#{origin.host}/", origin.host)
         return scope_blocked(sc) if sc.blocked?
@@ -160,6 +160,7 @@ module Gori
         cap = int(h, "max_requests")
         config.max_requests = cap ? {cap, MINE_MAX_REQUESTS}.min : MINE_MAX_REQUESTS
         config.user_wordlist = str(h, "wordlist").presence
+        int(h, "throttle_ms").try { |v| config.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
         options = Miner::PlanOptions.new(text,
           default_target: default_target, target: str(h, "url"),
           http2: (bool(h, "http2") || false) || src_h2,
@@ -167,7 +168,12 @@ module Gori
           # Defense-in-depth alongside the job-start Layer-1 check: that check only covers the
           # origin once, not a path mining mutates per-request. The Outbound re-reads the scope
           # periodically, so a mid-run EXCLUDE / Sandbox toggle stops the sweep.
-          verify: @verify_upstream && !(bool(h, "insecure") || false),
+          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
+          # `Miner::PlanOptions` and `gori run mine --sni` have always carried it; MCP had no
+          # route to it at all, so a param-mine against a vhost whose SNI must differ from the
+          # Host header — exactly what this tool exists for — was unreachable from an agent.
+          sni: str(h, "sni"),
           overrides: HostOverrides.load(store))
         plan = Miner::Plan.build(options, ob)
         {plan.engine, plan.origin, plan.total_names}

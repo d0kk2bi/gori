@@ -228,7 +228,11 @@ module Gori
           j.field "tags", Serialize.text(r.tags) if r.tags
           j.field "sni", Serialize.text(r.sni) if r.sni
           r_request_text = String.new(r.request).scrub
-          emit_capped_text(j, "request", Serialize.redact_head(r_request_text, include_sensitive)) if include_content
+          if include_content
+            emit_capped_text(j, "request", Serialize.redact_head(String.new(r.request), include_sensitive),
+              raw: r.request, include_sensitive: include_sensitive,
+              read_more: %(get_response_body_chunk(repeater_id: #{r.id}, part: "request", offset: …)))
+          end
 
           if Repeater::WsEngine.upgrade_request?(r_request_text)
             ws_msgs = store.ws_messages_for_repeater(r.id)
@@ -243,7 +247,14 @@ module Gori
                     j.field "type", Serialize.ws_frame_type(m.opcode)
                     j.field "at", m.created_at
                     if m.text?
-                      j.field "payload", String.new(m.payload).scrub
+                      raw = String.new(m.payload)
+                      j.field "payload", raw.scrub
+                      # A TEXT frame carrying invalid UTF-8 is the RFC 6455 §8.1/§5.6
+                      # validation payload, not an accident — see Serialize.emit_ws_messages.
+                      unless raw.valid_encoding?
+                        j.field "payload_lossy", true
+                        j.field "payload_base64", Base64.strict_encode(m.payload)
+                      end
                     else
                       # A binary frame carries arbitrary octets; emitting them as a raw
                       # string would put invalid UTF-8 on the stdio JSON-RPC stream (which
@@ -273,24 +284,49 @@ module Gori
               j.field "last_status", resp.status
               j.field "last_reason", Serialize.text(resp.reason)
             end
-            j.field "last_response_head", Serialize.redact_head_opt(Serialize.head_text(head), include_sensitive) if include_content
+            if include_content
+              j.field "last_response_head", Serialize.redact_head_opt(Serialize.head_text(head), include_sensitive)
+              # A response head comes straight off a remote socket — the least trustworthy
+              # source on this surface for UTF-8 validity — and `head_text` scrubs it. Same
+              # companion `get_flow` already emits for a captured head.
+              Serialize.emit_head_base64(j, "last_response_head", head, include_sensitive)
+            end
           end
         end
       end
 
-      private def emit_capped_text(j : JSON::Builder, field : String, text : String) : Nil
-        if text.bytesize > MCP_REPEATER_REQUEST_MAX
-          # Compare and cut by BYTES (the cap is a byte budget), then scrub — a slice
-          # through a multi-byte UTF-8 sequence would otherwise emit invalid UTF-8 into
-          # the JSON-RPC stream, which must be well-formed UTF-8 over the stdio transport.
-          j.field field, text.byte_slice(0, MCP_REPEATER_REQUEST_MAX).scrub
+      # A stored text blob, capped for LLM use — plus everything the caller needs to know that
+      # what it read is NOT what is stored.
+      #
+      # `scrub` is mandatory for the transport's UTF-8 contract but it is LOSSY and silently
+      # so, and this is the ONLY way to read a repeater's request back. An agent that stored
+      # exact octets with `request_base64` read them back U+FFFD-substituted, edited that
+      # string, and wrote it home with `update_repeater` — turning a 6-byte body into 10 and
+      # having gori recompute Content-Length to match, with `isError:false` throughout. So:
+      # `<field>_lossy` + `<field>_base64` whenever scrubbing changed anything, the same
+      # convention `Serialize.emit_lossy_text` / `emit_head_base64` already use, and the same
+      # `include_sensitive` gate `emit_head_base64` uses — base64 is encoding, not redaction,
+      # so emitting it by default would hand back the Authorization/Cookie bytes `redact_head`
+      # just removed. A truncated blob gets `<field>_read_more` naming the cursor that serves
+      # the rest, because 16 KiB of a 20 KB request with no way to fetch byte 16385 is the
+      # same silence in a different shape.
+      private def emit_capped_text(j : JSON::Builder, field : String, text : String, *,
+                                   raw : Bytes? = nil, include_sensitive : Bool = false,
+                                   read_more : String? = nil) : Nil
+        cut = text.bytesize > MCP_REPEATER_REQUEST_MAX
+        # Compare and cut by BYTES (the cap is a byte budget), then scrub — a slice
+        # through a multi-byte UTF-8 sequence would otherwise emit invalid UTF-8 into
+        # the JSON-RPC stream, which must be well-formed UTF-8 over the stdio transport.
+        j.field field, cut ? text.byte_slice(0, MCP_REPEATER_REQUEST_MAX).scrub : text.scrub
+        if cut
           j.field "#{field}_truncated", true
-        else
-          # Scrub here too: a repeater request built from a binary/non-UTF-8 body round-trips
-          # invalid UTF-8 through the store, and JSON::Builder emits it verbatim — which
-          # corrupts the stdio JSON-RPC stream (must be well-formed UTF-8).
-          j.field field, text.scrub
+          j.field "#{field}_total_bytes", text.bytesize
+          j.field "#{field}_read_more", read_more if read_more
         end
+        return unless cut || !text.valid_encoding?
+        j.field "#{field}_lossy", true
+        return unless include_sensitive && (bytes = raw)
+        j.field "#{field}_base64", Base64.strict_encode(bytes)
       end
 
       # The live-TUI repeater snapshot (ui["repeater"]) is the raw editor state the human is

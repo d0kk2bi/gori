@@ -92,6 +92,15 @@ module Gori
         # WebSocket mode check
         is_ws = Repeater::WsEngine.upgrade_request?(masked_request)
 
+        # Parsed BEFORE the row is inserted: a refused frame must leave nothing behind. Doing
+        # it after produced a half-created session — an error result and a persisted repeater
+        # whose message list was empty — which is the "partial operation reported as one
+        # outcome" this refusal exists to stop.
+        ws_messages =
+          if is_ws
+            present?(h, "ws_out_messages") ? ws_out_messages_arg(h) : (ws_messages_override || [] of Store::WsOutMessage)
+          end
+
         id = store.insert_repeater(
           target: masked_target,
           request: masked_request.to_slice,
@@ -115,11 +124,9 @@ module Gori
         end
 
         # WebSocket messages handling
-        if is_ws
-          messages = present?(h, "ws_out_messages") ? ws_out_messages_arg(h) : (ws_messages_override || [] of Store::WsOutMessage)
-          unless messages.empty?
-            store.update_repeater_ws_messages(id, messages)
-          end
+        ws_count = ws_messages.try(&.size)
+        if (messages = ws_messages) && !messages.empty?
+          store.update_repeater_ws_messages(id, messages)
         end
 
         # Derive summary from the MASKED request — the raw request may carry a secret
@@ -137,6 +144,9 @@ module Gori
             j.field "target", masked_target
             j.field "summary", summary
             j.field "position", position
+            # How many frames were actually stored, so an agent authoring a multi-frame
+            # sequence can assert on it rather than take the count on trust.
+            j.field "ws_out_message_count", ws_count if ws_count
           end
         })
       rescue ex : Gori::Error
@@ -152,12 +162,28 @@ module Gori
       # string form is a TEXT frame (opcode 1) — that was the only shape this tool could ever
       # produce, so `{"payload_base64": …}` (opcode 2 unless `opcode` says otherwise) is the
       # one addition, and it is where a later fin/rsv/mask field belongs too.
+      # An unparseable entry RAISES rather than being dropped. `compact_map` used to discard
+      # the nil, so `create_repeater` reported `isError:false` while storing 2 of the 4 frames
+      # it was handed — and the run then "passed" against a sequence that was never sent. The
+      # identical grammar on `send_websocket{messages}` has always refused the same entry;
+      # one grammar gets one behaviour. Both callers already rescue `Gori::Error`.
       private def ws_out_messages_arg(h) : Array(Store::WsOutMessage)
         if arr = h["ws_out_messages"]?.try(&.as_a?)
-          return arr.compact_map { |item| ws_out_message_item(item) }
+          return arr.map do |item|
+            msg, err = ws_out_message_item(item)
+            raise Gori::Error.new(ws_entry_error("ws_out_messages", item, err)) unless msg
+            msg
+          end
         end
         return [] of Store::WsOutMessage unless str_val = str(h, "ws_out_messages")
         str_val.split('\n').compact_map { |l| l.strip.empty? ? nil : Store::WsOutMessage.text(l) }
+      end
+
+      # The refusal for one bad `ws_out_messages` / `messages` entry. The entry is echoed so a
+      # caller building a long sequence can find it, and the parser's own sentence is appended
+      # so the answer is "which field, and why" rather than "something in here".
+      private def ws_entry_error(field : String, item : JSON::Any, detail : String?) : String
+        "invalid '#{field}' entry #{item.to_json}#{detail ? " — #{detail}" : ""}"
       end
 
       # One `ws_out_messages` / `messages` entry, in any form the schema advertises.
@@ -168,38 +194,87 @@ module Gori
       # `WsFrameSpec` grammar (`opcode=ping,text=hi`) is the scripted authoring form, shared
       # verbatim with `gori run repeater send --message-frame`; the OBJECT form is the same
       # fields spelled out, and is what a caller building JSON programmatically wants.
-      private def ws_out_message_item(item : JSON::Any) : Store::WsOutMessage?
+      # `{message, nil}` or `{nil, the reason}` — the same pair `WsFrameSpec.parse` returns,
+      # so a caller reports rather than guesses.
+      private def ws_out_message_item(item : JSON::Any) : {Store::WsOutMessage?, String?}
         if text = item.as_s?
-          msg, _ = Repeater::WsFrameSpec.parse(text) if ws_frame_spec?(text)
-          return msg || Store::WsOutMessage.text(text)
+          return Repeater::WsFrameSpec.parse(text) if ws_frame_spec?(text)
+          return {Store::WsOutMessage.text(text), nil}
         end
-        return nil unless obj = item.as_h?
+        return {nil, "expected a string or an object"} unless obj = item.as_h?
         ws_out_message_object(obj)
       end
 
-      # The OBJECT form. Split out so `ws_out_message_item` stays "which form is this?".
-      private def ws_out_message_object(obj : Hash(String, JSON::Any)) : Store::WsOutMessage?
-        shape = ws_shape_from(obj)
-        op = obj["opcode"]?.try(&.as_i?)
-        # A byte-encoded payload defaults to BINARY: a caller who reached for base64 or hex
-        # was not describing text.
-        if enc = obj["payload_base64"]?.try(&.as_s?) || obj["payload_hex"]?.try(&.as_s?)
-          bytes = decode_ws_payload(obj, enc) || return nil
-          return Store::WsOutMessage.new(op || 2, bytes, shape)
-        end
-        text = obj["text"]?.try(&.as_s?)
-        # An object with a shape but NO payload is a legal, useful frame: a bare PING, a
-        # CLOSE with no code, a zero-length TEXT heartbeat. Refusing it would put those back
-        # out of reach for exactly the reason this round exists.
-        return nil if text.nil? && op.nil?
-        Store::WsOutMessage.new(op || 1, (text || "").to_slice, shape)
+      # The OBJECT form, routed through the ONE parser the string form uses.
+      #
+      # It used to re-read the keys here, and that is the whole defect: `as_i?` returns nil
+      # for the NAMED opcode the schema advertises, `as_bool?` returns nil for the `0`/`1` it
+      # advertises for `fin`/`mask`, and every nil fell through to the encoder default. So a
+      # PING went out as TEXT, a CLOSE as BINARY, `fin:0` as FIN=1 and `mask:0` masked — with
+      # `isError:false`, and (through `ws_out_messages`) persisted into the project database,
+      # so every later send from any surface replayed the wrong frame. `rsv`, `mask_key`,
+      # `len` and any unknown key were dropped the same silent way.
+      #
+      # Building the spec string rather than reaching into `WsFrameSpec::Fields` keeps the
+      # grammar — the name table, the range checks, the "unknown field" refusal — in the one
+      # place that owns it. The two forms the schema presents as equivalent now are.
+      private def ws_out_message_object(obj : Hash(String, JSON::Any)) : {Store::WsOutMessage?, String?}
+        return {nil, "no frame fields (expected at least one of #{ws_object_field_list})"} if obj.empty?
+        spec, err = ws_spec_from_object(obj)
+        return {nil, err} unless spec
+        Repeater::WsFrameSpec.parse(spec)
       end
 
-      private def decode_ws_payload(obj : Hash(String, JSON::Any), enc : String) : Bytes?
-        if obj.has_key?("payload_base64")
-          Base64.decode(enc) rescue nil
-        else
-          enc.hexbytes rescue nil
+      # Object key → `WsFrameSpec` key, for the SHAPE fields. `len` is accepted alongside
+      # `declared_len` because the schema text has always named both.
+      WS_OBJECT_SHAPE = {
+        "opcode" => "opcode", "fin" => "fin", "rsv" => "rsv", "mask" => "mask",
+        "mask_key" => "mask_key", "declared_len" => "len", "len" => "len",
+      }
+      # Object key → `WsFrameSpec` key, for the PAYLOAD. Exactly one may be present: two
+      # payloads in one object have no defensible reading, and picking one silently is the
+      # class of bug this method exists to remove.
+      WS_OBJECT_PAYLOAD = {"text" => "text", "payload_base64" => "b64", "payload_hex" => "hex"}
+
+      private def ws_object_field_list : String
+        (WS_OBJECT_SHAPE.keys.to_a + WS_OBJECT_PAYLOAD.keys.to_a).join(", ")
+      end
+
+      # The object rendered as one `WsFrameSpec` spec, or the reason it cannot be. The payload
+      # goes LAST because `text=` swallows the remainder of the spec — that is what lets a
+      # payload contain a comma without an escape nobody would remember.
+      private def ws_spec_from_object(obj : Hash(String, JSON::Any)) : {String?, String?}
+        parts = [] of String
+        payload = nil.as({String, String}?)
+        obj.each do |k, v|
+          if key = WS_OBJECT_SHAPE[k]?
+            s = ws_scalar(v)
+            return {nil, "bad #{k} #{v.to_json} (expected a string, number or boolean)"} unless s
+            parts << "#{key}=#{s}"
+          elsif key = WS_OBJECT_PAYLOAD[k]?
+            return {nil, "pass only one of #{WS_OBJECT_PAYLOAD.keys.to_a.join(", ")}"} if payload
+            s = v.as_s?
+            return {nil, "bad #{k} #{v.to_json} (expected a string)"} unless s
+            payload = {key, s}
+          else
+            return {nil, "unknown frame field #{k.inspect} (expected #{ws_object_field_list})"}
+          end
+        end
+        parts << "#{payload[0]}=#{payload[1]}" if payload
+        {parts.join(','), nil}
+      end
+
+      # A JSON scalar as the text `WsFrameSpec` validates. Lenient on the ENCODING (a number,
+      # a boolean and their stringified forms all mean the same thing — clients and LLMs
+      # serialize tool args every which way, and `Tools#bool`/`#int` exist for that reason),
+      # strict on the VALUE: whatever comes out still has to satisfy the grammar.
+      private def ws_scalar(v : JSON::Any) : String?
+        case raw = v.raw
+        when String  then raw
+        when Bool    then raw.to_s
+        when Int64   then raw.to_s
+        when Float64 then (raw.finite? && raw == raw.trunc) ? raw.to_i64.to_s : nil
+        else              nil
         end
       end
 
@@ -208,20 +283,6 @@ module Gori
       # and misreading it would mean gori sending something other than what was asked for.
       private def ws_frame_spec?(s : String) : Bool
         s.matches?(/\A(opcode|fin|rsv|mask|mask_key|len|hex|b64|text)=/)
-      end
-
-      # The shape fields of an object-form message. Absent field = the encoder's own default,
-      # so an object that names none of them is byte-identical to the string form.
-      private def ws_shape_from(obj : Hash(String, JSON::Any)) : Store::WsShape
-        key = obj["mask_key"]?.try(&.as_s?).try { |k| (k.hexbytes rescue nil) }
-        masked = obj["mask"]?.try(&.as_bool?)
-        masked = true if masked.nil? && key
-        Store::WsShape.new(
-          fin: obj["fin"]?.try(&.as_bool?).nil? ? true : !!obj["fin"]?.try(&.as_bool?),
-          rsv: obj["rsv"]?.try(&.as_i?) || 0,
-          masked: masked,
-          mask_key: key,
-          declared_len: obj["declared_len"]?.try(&.as_i?))
       end
 
       private def update_repeater(h) : Result
@@ -258,6 +319,10 @@ module Gori
         masked_sni = sni.try { |s| Env.mask_secrets(s) }
         name = present?(h, "name") ? str(h, "name").try { |n| Env.mask_secrets(n) } : existing.name
 
+        # Parsed before the first write, as in create_repeater: a refused frame must not leave
+        # the target/request half-updated behind an error result.
+        ws_msgs = present?(h, "ws_out_messages") ? ws_out_messages_arg(h) : nil
+
         unless store.update_repeater(
                  id: id,
                  target: masked_target,
@@ -282,7 +347,8 @@ module Gori
         end
 
         # WebSocket messages handling
-        store.update_repeater_ws_messages(id, ws_out_messages_arg(h)) if present?(h, "ws_out_messages")
+        ws_count = ws_msgs.try(&.size)
+        store.update_repeater_ws_messages(id, ws_msgs) if ws_msgs
 
         # Derive the summary from the MASKED request, like create_repeater: the raw request may
         # carry a secret in the request-target (e.g. ?token=…) and this field goes to the LLM.
@@ -299,6 +365,7 @@ module Gori
             j.field "target", masked_target
             j.field "summary", summary
             j.field "position", existing.position
+            j.field "ws_out_message_count", ws_count if ws_count
           end
         })
       rescue ex : Gori::Error

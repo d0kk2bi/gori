@@ -30,7 +30,7 @@ module Gori
         return not_found("no repeater with id #{id}") unless rec
 
         text = String.new(rec.request)
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         target = minimize_target(id, rec, text, ob)
         return target if target.is_a?(Result)
         scheme, host, port = target

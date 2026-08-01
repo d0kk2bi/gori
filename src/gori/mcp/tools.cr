@@ -71,8 +71,16 @@ module Gori
       record Result, text : String, is_error : Bool = false,
         error_code : String? = nil, field : String? = nil,
         retryable : Bool = false, details : JSON::Any? = nil
+      # `part` is "response" (the default, and everything this tool ever served) or "request".
+      # The request cursor exists because `get_repeater_context` is the ONLY read-back of a
+      # repeater's request and it caps at MCP_REPEATER_REQUEST_MAX — so bytes past the cap
+      # were unreachable from MCP entirely.
       record BodyChunkOptions, flow_id : Int64?, repeater_id : Int64?, offset : Int64,
-        limit : Int32, raw : Bool
+        limit : Int32, raw : Bool, part : String = "response" do
+        def request? : Bool
+          part == "request"
+        end
+      end
 
       # Outcome of the active-tool scope gate, produced by the shared `Gori::Outbound` seam
       # (src/gori/outbound.cr) rather than a per-surface check. `decision` is "in_scope",
@@ -573,13 +581,16 @@ module Gori
           end
 
           tool j, "get_response_body_chunk",
-            "Read a byte range from a response body when get_flow/send_request reports truncation. " \
-            "Pass exactly one of flow_id or repeater_id. Content encoding is decoded by default so " \
-            "offsets continue the inline view; raw=true pages stored wire bytes. Returns UTF-8 text " \
-            "or base64 plus next_offset/complete. An offset past the body end is clamped and flagged " \
+            "Read a byte range from a stored message when get_flow / send_request / " \
+            "get_repeater_context reports truncation. Pass exactly one of flow_id or repeater_id, " \
+            "and part=\"response\" (default) or part=\"request\". Content encoding is decoded by " \
+            "default so offsets continue the inline view; raw=true pages stored wire bytes, and a " \
+            "request part is always the exact stored bytes. Returns UTF-8 text " \
+            "or base64 plus next_offset/complete. An offset past the end is clamped and flagged " \
             "(requested_offset, offset_out_of_range, warning) rather than silently returning empty." do |s|
             s.field "flow_id", intprop("History flow id")
             s.field "repeater_id", intprop("Repeater workbench database id")
+            s.field "part", strprop("response (default) | request — \"request\" pages the stored REQUEST bytes: for a repeater that is the exact head+body blob send_request(repeater_id) replays, which is the only way to read past get_repeater_context's inline cap")
             s.field "offset", intprop("zero-based byte offset (default 0)")
             s.field "limit", intprop("bytes to return (default 65536, max 262144)")
             s.field "raw", boolprop("page stored response bytes without content decoding (default false)")
@@ -642,6 +653,7 @@ module Gori
             s.field "allow_unscoped", boolprop("with active:true, run even when a target host is outside — or without — a configured scope (default false)")
             s.field "unsafe", boolprop("with active:true, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data (default false)")
             s.field "aggressive", boolprop("with active:true, raise per-rule caps + use wider bypass sets (implies unsafe) — authorized targets only (default false)")
+            s.field "insecure", boolprop("with active:true, skip upstream TLS verification (default false) — mirrors `gori run probe -k`, for a lab/staging origin with a self-signed certificate")
             s.field "limit", intprop("max issue groups to return (default 200, max 2000)")
           end
 
@@ -872,14 +884,17 @@ module Gori
               "message in EITHER `raw_base64` (byte-exact; the round trip for the bytes " \
               "intercept_get returns as raw_base64, and the only channel a binary body survives) " \
               "OR `raw` (plain text, for an ordinary edit). Content-Length is recomputed to match " \
-              "the body; otherwise the bytes are forwarded byte-exact (NO variable expansion — a " \
+              "the body by default; pass update_content_length:false to forward your framing " \
+              "headers untouched (a CL/TE desync). Otherwise the bytes are forwarded byte-exact " \
+              "(NO variable expansion — a " \
               "security tool forwards exactly what you send). In `raw`, a lone LF in the HEADER " \
               "block becomes CRLF so a hand-typed message still frames; the BODY is untouched. " \
               "Applied by the capturing instance + surfaced to the human. Returns " \
-              "forwarded (edited:true) | no_such_item | not_confirmed." do |s|
+              "forwarded (edited:true, content_length_synced) | no_such_item | not_confirmed." do |s|
               s.field "item_id", intprop("held item id from intercept_list"), required: true
               s.field "raw", strprop("the full edited HTTP wire message as text (request/status line + headers + body)")
               s.field "raw_base64", strprop("the full edited wire message, base64 — byte-exact; use this for a binary body")
+              s.field "update_content_length", boolprop("recompute Content-Length to match the edited body (default true). Set FALSE to hold your own value — a Content-Length shorter or longer than the body, or Content-Length alongside Transfer-Encoding, is the canonical request-smuggling primitive and the reason to hold a request at all. With it false, `raw_base64` really is byte-exact end to end.")
             end
 
             tool j, "intercept_toggle",
@@ -1105,12 +1120,11 @@ module Gori
               s.field "method", strprop("HTTP method (default GET)")
               s.field "headers", objprop("header name->value map")
               s.field "body", strprop("request body, sent as-is")
-              s.field "body_base64", strprop("request body as base64 — the byte-exact form. Use for a binary body or any octet a JSON string cannot carry (0x00, 0x80-0xFF, invalid UTF-8); overrides 'body' and is NOT $VAR-expanded")
+              s.field "body_base64", strprop("request body as base64 — the byte-exact form, and it works on BOTH the url/HTTP1.1 path and the h2_fields path. Use it whenever the body is not UTF-8 (binary, protobuf/gRPC, gzip, a multipart upload, an overlong-UTF-8 traversal payload) or carries an octet a JSON string cannot (0x00, 0x80-0xFF, invalid UTF-8) — 'body' is sent as its UTF-8 encoding. Wins over 'body' and is NOT $VAR-expanded")
               s.field "raw", strprop("verbatim raw HTTP/1.1 request; overrides method/headers/body (scheme/host/port still come from url)")
               s.field "raw_base64", strprop("the whole raw HTTP/1.1 request as base64 — the byte-exact form, and the only way to send a latin-1/invalid-UTF-8 header value or a binary body (a JSON string is sent as its UTF-8 encoding, so 'é' goes out as 2 bytes). Implies verbatim: no $VAR expansion, no bare-LF promotion")
               s.field "verbatim", boolprop("send 'raw' EXACTLY as given: no $VAR expansion and no bare-LF→CRLF promotion in the head (default false). Use for desync/smuggling tests where a bare LF header terminator IS the payload")
               s.field "h2_fields", h2fieldsprop
-              s.field "body_base64", strprop("base64 request body for the h2_fields path when the body is not UTF-8 (e.g. a gRPC/protobuf frame); ignored unless h2_fields is set")
               s.field "http2", boolprop("use real HTTP/2; defaults to the flow's version when flow_id is set)")
               s.field "timeout_ms", intprop("per-operation connect + idle (read/write) timeout in milliseconds; a timeout surfaces as a network-error result with error_kind (1-600000)")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
@@ -1446,6 +1460,8 @@ module Gori
               s.field "retries", intprop("retries per request on a network error")
               s.field "http2", boolprop("use real HTTP/2 (default false)")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+              s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni)")
               s.field "max_requests", intprop("caller cap on total requests")
               s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
             end
@@ -1489,6 +1505,8 @@ module Gori
               s.field "retries", intprop("retries per request on a network error")
               s.field "http2", boolprop("use real HTTP/2 (default false)")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+              s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni)")
               s.field "max_requests", intprop("caller cap on total requests")
               s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
             end
@@ -1530,6 +1548,7 @@ module Gori
               s.field "timeout_ms", intprop("per-request connect + idle timeout in milliseconds")
               s.field "retries", intprop("retries per request on a network error")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+              s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
               s.field "max_requests", intprop("caller cap on total requests")
               s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection per origin across many probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is the largest cost of a brute-force pass. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")
               s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED for an out-of-scope target, or when no scope is configured")
@@ -1595,6 +1614,15 @@ module Gori
         result = classify(result)
         log_agent_action(name, result) if @allow_actions && agent_action?(name, h)
         result
+      rescue ex : Gori::Error
+        # `Gori::Error` is caller-facing by convention across this codebase — every argument
+        # validator (`bool_arg`, `bounded_int_arg`, `base64_str`, the WS frame parser) raises
+        # it with a sentence naming the field. Letting the blanket rescue below code it
+        # INTERNAL told an agent's error policy "the server is broken, back off / escalate"
+        # for a mistake in its own call, and buried the sentence under a `tool error:` prefix
+        # that made it read like a crash. The identical class of mistake reported through the
+        # typed path (`err(…, "INVALID_ARGUMENT")`) has always come back correctly.
+        err(ex.message || "invalid arguments for '#{name}'", "INVALID_ARGUMENT")
       rescue ex
         Log.warn(exception: ex) { "tool #{name} failed" }
         err("tool error: #{ex.message}", "INTERNAL")
