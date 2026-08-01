@@ -744,6 +744,37 @@ describe Gori::Tui::RepeaterView do
     String.new(reqs[1][1]).should eq("GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
   end
 
+  # N1: auto-Content-Length reflected over the WHOLE buffer, so on a `%%%` send-group the
+  # first request's VISIBLE Content-Length covered its body, the separator and the entire
+  # second request (3 → 62). `pipeline_requests` framed each chunk correctly, so the wire was
+  # right and the editor lied — and chunk 2 onwards was never reflected at all.
+  it "reflects auto-Content-Length per %%% chunk, not over the whole buffer" do
+    view = RepeaterView.new
+    view.restore("http://127.0.0.1",
+      "POST /g1 HTTP/1.1\nHost: h\nContent-Length: 99\n\nAAA\n" \
+      "%%%\n" \
+      "POST /g2 HTTP/1.1\nHost: h\nContent-Length: 7\n\nBB\n",
+      false, true) # auto-CL ON → restore reflects
+    lines = view.request_text.split('\n')
+    lines.should contain("Content-Length: 3") # "AAA", not 62
+    lines.should contain("Content-Length: 2") # "BB" — the second chunk is reflected too
+    reqs = view.pipeline_requests
+    String.new(reqs[0][1]).should end_with("Content-Length: 3\r\n\r\nAAA")
+    String.new(reqs[1][1]).should end_with("Content-Length: 2\r\n\r\nBB")
+  end
+
+  # The other side of that: WITHOUT a separator, ^R sends the whole buffer including a
+  # trailing newline, so the reflection must not borrow the group split's blank-edge trim.
+  # It read 32 for a body of 34 while the send framed 34 — the same lie, reversed.
+  it "reflects auto-Content-Length over the whole buffer when there is no %%% separator" do
+    view = RepeaterView.new
+    body = "line1\r\nline2\r\n\r\ntail-after-blank\r\n" # 34 bytes, ENDS in a newline
+    req = "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 99\r\n\r\n#{body}"
+    view.restore("http://127.0.0.1", req, false, true)
+    view.request_text.split("\r\n").should contain("Content-Length: 34")
+    String.new(view.request_bytes).should eq(req.sub("Content-Length: 99", "Content-Length: 34"))
+  end
+
   # F1: the Repeater's ^R is documented as a byte-exact resend. A captured body is opaque
   # bytes; only the head is line-structured. The editor used to delete every CR at LOAD, so
   # `line1\r\nline2` went out as `line1\nline2` under a Content-Length silently resynced DOWN

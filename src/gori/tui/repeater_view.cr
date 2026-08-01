@@ -949,33 +949,48 @@ module Gori::Tui
     # surviving line's terminator is dropped: that newline is the one before the `%%%` (or the
     # end of the buffer), which belongs to the separator, not to the body.
     def pipeline_requests : Array({String, Bytes})
-      reqs = [] of {String, Bytes}
-      chunk = [] of {String, String}
-      flush = -> do
-        lines = chunk.dup
-        while !lines.empty? && lines.first[0].strip.empty? # drop blank lines around the separator
-          lines.shift
-        end
-        while !lines.empty? && lines.last[0].strip.empty?
-          lines.pop
-        end
-        unless lines.empty?
-          label = lines.first[0].strip
-          text = String.build do |io|
-            lines.each_with_index do |(l, eol), i|
-              io << l
-              io << eol unless i == lines.size - 1
-            end
-          end
-          reqs << {label, finalize_wire(expanded_text_to_bytes(text))}
-        end
-        chunk.clear
+      wl = @editor.wire_lines
+      chunk_line_spans(wl).map do |sp|
+        {wl[sp.begin][0].strip, finalize_wire(expanded_text_to_bytes(chunk_text(wl, sp)))}
       end
-      @editor.wire_lines.each do |pair|
-        pair[0].strip == PIPELINE_SEP ? flush.call : chunk << pair
+    end
+
+    # EDITOR line ranges of each `%%%` chunk, blank edges trimmed. The one place the group
+    # split is decided, so the bytes `pipeline_requests` sends and the Content-Length
+    # `reflect_content_length_in_editor` shows are derived from the SAME chunking — they used
+    # to disagree, and the visible header was the one that was wrong. No separator ⇒ one span
+    # covering the whole buffer, which is the ordinary single-request case.
+    private def chunk_line_spans(wl : Array({String, String})) : Array(Range(Int32, Int32))
+      spans = [] of Range(Int32, Int32)
+      push = ->(a : Int32, b : Int32) do
+        while a < b && wl[a][0].strip.empty? # drop blank lines around the separator
+          a += 1
+        end
+        while b > a && wl[b - 1][0].strip.empty?
+          b -= 1
+        end
+        spans << (a...b) if a < b
       end
-      flush.call
-      reqs
+      start = 0
+      wl.each_with_index do |(l, _), i|
+        next unless l.strip == PIPELINE_SEP
+        push.call(start, i)
+        start = i + 1
+      end
+      push.call(start, wl.size)
+      spans
+    end
+
+    # One chunk's wire text. The LAST line's terminator is dropped: that newline is the one
+    # before the `%%%` (or the end of the buffer), so it belongs to the separator rather than
+    # to the body — the same trim the blank-line shift/pop above performs at the edges.
+    private def chunk_text(wl : Array({String, String}), sp : Range(Int32, Int32)) : String
+      String.build do |io|
+        sp.each do |i|
+          io << wl[i][0]
+          io << wl[i][1] unless i == sp.end - 1
+        end
+      end
     end
 
     # True when the wire bytes already carry a CRLFCRLF head/body separator (so appending
@@ -1573,15 +1588,42 @@ module Gori::Tui
 
     # Mirror the auto-Content-Length resync into the visible REQUEST editor (^L on) so
     # the pane shows the same header `request_bytes` will send — not only at ^R time.
+    #
+    # PER CHUNK, because a `%%%` send-group is several requests and `pipeline_requests` frames
+    # each one separately. Reflecting over the whole buffer made the FIRST request's visible
+    # `Content-Length` cover the body, the `%%%` line and the entire second request (`3` → `62`
+    # in the reported case). The wire was right and the editor was not, which is the worse way
+    # round for a tool whose whole job is telling the operator what it sent. Chunk 2 onwards
+    # was never reflected at all.
+    #
+    # Only a REAL `%%%` group is chunked, though. Without a separator ^R sends the whole
+    # buffer, trailing newline and all, and `chunk_line_spans` trims blank edges + drops the
+    # last line's terminator — correct around a separator, wrong for a body that legitimately
+    # ends in one. Reflecting through it made a captured `…tail-after-blank\r\n` read as 32
+    # where the send framed 34: the same display-vs-wire lie in the other direction.
     private def reflect_content_length_in_editor : Nil
       return unless @auto_content_length
       return if @req_hex_edit || @grpc_mode || @ws_mode
       return if @decode_kind && @req_pane == :decoded
 
+      wl = @editor.wire_lines
+      if wl.none? { |(l, _)| l.strip == PIPELINE_SEP }
+        reflect_chunk_content_length(@editor.wire_text, wl, 0...wl.size)
+      else
+        chunk_line_spans(wl).each { |sp| reflect_chunk_content_length(chunk_text(wl, sp), wl, sp) }
+      end
+    end
+
+    # The reflection for ONE request: `text` is exactly the bytes that request will be built
+    # from. `wl` is the pre-edit line snapshot; a replace_line here swaps a line in place
+    # without changing the line COUNT, so the spans and indices taken from it stay valid
+    # across the loop above.
+    private def reflect_chunk_content_length(text : String, wl : Array({String, String}),
+                                             sp : Range(Int32, Int32)) : Nil
       # Expand env tokens first (like the send path's expanded_editor_bytes) — a `$KEY`
       # whose expansion changes the body length must reflect the SENT Content-Length, or
       # the visible header goes stale and, once Auto-CL is toggled off, is sent mismatched.
-      raw = expanded_editor_bytes
+      raw = expanded_text_to_bytes(text)
       # With §…§ markers present the CL that ^R actually sends is computed from the
       # RENDERED template (markers stripped, chains applied), not the raw marked text —
       # reflect THAT value so the visible header matches request_bytes.
@@ -1591,24 +1633,20 @@ module Gori::Tui
 
       synced_head = String.new(synced).split("\r\n\r\n", limit: 2).first
       return unless synced_head
+      new_line = synced_head.split("\r\n").find { |l| l.lstrip.downcase.starts_with?("content-length:") }
+      return unless new_line
 
-      synced_lines = synced_head.split("\r\n")
-      cl_idx = synced_lines.index { |l| l.lstrip.downcase.starts_with?("content-length:") }
-      return unless cl_idx
-      new_line = synced_lines[cl_idx]
-
-      env_sep = @editor.text.index("\n\n")
-      return unless env_sep
-
-      head_lines = @editor.text[0, env_sep].split('\n')
+      # This chunk's HEAD is its lines up to the first blank one (the LF-space `\n\n` the old
+      # whole-buffer scan looked for, scoped to the chunk).
+      head_end = (sp.begin...sp.end).find { |i| wl[i][0].empty? } || return
       # Locate the Content-Length line in the RAW editor head by CONTENT, not by transplanting
       # the expanded-space index — a multi-line $KEY expansion earlier can shift the line count,
-      # so cl_idx would otherwise point at (and overwrite) an unrelated raw header line.
-      raw_cl_idx = head_lines.index { |l| l.lstrip.downcase.starts_with?("content-length:") }
-      return unless raw_cl_idx
-      return if head_lines[raw_cl_idx] == new_line
+      # so the index would otherwise point at (and overwrite) an unrelated raw header line.
+      idx = (sp.begin...head_end).find { |i| wl[i][0].lstrip.downcase.starts_with?("content-length:") }
+      return unless idx
+      return if wl[idx][0] == new_line
 
-      @editor.replace_line(raw_cl_idx, new_line)
+      @editor.replace_line(idx, new_line)
     end
 
     # See @link_host_to_target: on the FIRST target edit of a fresh ^N tab, mirror the new
