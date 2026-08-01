@@ -292,7 +292,7 @@ module Gori
                                  ws_msgs : Array(Store::WsMessage)) : Nil
         if req
           puts "=== REQUEST (#{detail.http_version}) ==="
-          print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body))
+          print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body), detail.request_body)
           puts "  [request body truncated]" if detail.request_body_truncated?
         end
         if resp
@@ -302,7 +302,7 @@ module Gori
             puts "error: #{err}"
           end
           if h = detail.response_head
-            print_message_text(h, display_body(h, detail.response_body))
+            print_message_text(h, display_body(h, detail.response_body), detail.response_body)
             puts "  [response body truncated]" if detail.response_body_truncated?
           elsif detail.error.nil?
             puts "(no response captured)"
@@ -362,7 +362,14 @@ module Gori
         end
         if op = Graphql.from_flow(tgt, rh, rb)
           puts ""
-          puts "=== GRAPHQL ==="
+          # The parse-failure heading also names the capture cap when that is what cut the
+          # body — `detail` knows it and `Graphql` (which sees only bytes) cannot.
+          if note = op.note
+            capped = detail.request_body_truncated? ? "; body truncated at the capture cap" : ""
+            puts CLI::Output.term_safe("=== GRAPHQL (parse failed: #{note}#{capped}) ===")
+          else
+            puts "=== GRAPHQL ==="
+          end
           puts CLI::Output.term_safe_multiline(Graphql.display(op).scrub)
         end
         if fields = FormData.from_flow(tgt, rh, rb)
@@ -386,16 +393,27 @@ module Gori
       # `Proxy::H2::Grpc.messages`, then each non-trailer / non-compressed payload
       # is decoded by `Gori::Protobuf`. Compressed payloads stay opaque (not
       # protobuf until inflated); grpc-web trailer frames become header maps.
-      # Omitted entirely when the head is not gRPC or the body has no complete
-      # frames — so ordinary HTTP flows stay free of an empty shell.
+      # Omitted entirely when the head is not gRPC — so ordinary HTTP flows stay free of an
+      # empty shell. A gRPC head whose body does NOT frame is a different thing and is now
+      # reported: the guard used to be `msgs.empty?`, so a deliberately-wrong length prefix
+      # (one of the standard gRPC parser tests) made the whole object VANISH, which reads
+      # identically to "this flow is not gRPC". A trailing partial frame went the same way,
+      # with no count of what was left over. The raw body was stored correctly either way
+      # (P7) — this was only the report the operator reads.
       private def self.emit_grpc_messages_json(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
         return if head.nil? || body.nil? || body.empty?
         return unless Proxy::H2::Grpc.grpc?(content_type_of(head))
-        msgs = Proxy::H2::Grpc.messages(body)
-        return if msgs.empty?
+        msgs, residual = Proxy::H2::Grpc.scan(body)
+        return if msgs.empty? && residual == 0
         j.field "grpc_messages" do
           j.object do
             j.field "count", msgs.size
+            if residual > 0
+              j.field "residual_bytes", residual
+              j.field "framing_error",
+                "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
+                "a length prefix claiming more than arrived, or a body cut short"
+            end
             j.field "messages" do
               j.array do
                 msgs.each_with_index do |m, i|
@@ -447,11 +465,14 @@ module Gori
       # (scrubbed) payload; binary frames print a size + short hex preview.
       private def self.ws_message_text(m : Store::WsMessage) : String
         arrow = m.direction == "out" ? "→" : "←"
-        if m.text?
-          "#{arrow} #{CLI::Output.term_safe_multiline(String.new(m.payload).scrub)}"
+        shape = Output.ws_shape_note(m)
+        if m.control?
+          "#{arrow} #{shape} #{Output.ws_control_detail(m)}"
+        elsif m.text?
+          "#{arrow}#{shape.empty? ? "" : " #{shape}"} #{CLI::Output.term_safe_multiline(String.new(m.payload).scrub)}"
         else
           preview = m.payload[0, {m.payload.size, 16}.min].hexstring
-          "#{arrow} [binary #{m.payload.size}B] #{preview}#{m.payload.size > 16 ? "…" : ""}"
+          "#{arrow}#{shape.empty? ? "" : " #{shape}"} [binary #{m.payload.size}B] #{preview}#{m.payload.size > 16 ? "…" : ""}"
         end
       end
 
@@ -493,8 +514,12 @@ module Gori
                           j.object do
                             j.field "direction", m.direction
                             j.field "opcode", m.opcode
+                            Output.emit_ws_shape_json(j, m)
                             if m.text?
                               j.field "text", String.new(m.payload).scrub
+                              # See emit_ws_result: JSON cannot carry a byte that is not valid
+                              # UTF-8, and those bytes are the §8.1/§5.6 test case.
+                              j.field "base64", Base64.strict_encode(m.payload) unless String.new(m.payload).valid_encoding?
                             else
                               j.field "binary", true
                               j.field "size", m.payload.size

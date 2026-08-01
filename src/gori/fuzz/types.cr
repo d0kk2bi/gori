@@ -86,7 +86,13 @@ module Gori
       sent : Int64,
       total : Int64?,
       matched : Int64,
-      errors : Int64
+      errors : Int64,
+      # Attempts the gate REFUSED before the socket (Sandbox / an exclude rule / an unbound
+      # session binding), and the first refusal's text. Carried on Progress rather than left
+      # on the Backend because the surfaces that must not render a fully-refused run as
+      # "0 matches" only ever see events. See `Fuzz::Backend#blocked`.
+      blocked : Int64 = 0_i64,
+      blocked_reason : String? = nil
 
     # Engine → consumer events. A union (not a class hierarchy) so `Channel(Event)`
     # carries them without boxing surprises. Progress is droppable (latest wins);

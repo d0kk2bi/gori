@@ -653,4 +653,79 @@ describe Gori::Tui::TextArea do
       TextArea.normalize_lf("a\rb").should eq("a\rb")
     end
   end
+
+  # The editor holds an HTTP message whose HEAD is line-structured and whose BODY is opaque
+  # bytes. `#text` (LF) is the document projection every column/search path uses; `#wire_text`
+  # is what actually came in. Before this existed, `set_text` deleted every CR on load, so a
+  # captured `line1\r\nline2` body left the editor as `line1\nline2` and the Repeater's
+  # "byte-exact resend" was not.
+  describe "#wire_text" do
+    it "gives back exactly what set_text was given" do
+      {
+        "POST /x HTTP/1.1\r\nHost: h\r\n\r\nline1\r\nline2\r\n\r\ntail\r\n", # captured CRLF, body included
+        "POST /x HTTP/1.1\nHost: h\n\nbare\nlf\n",                           # all bare LF
+        "HEAD\r\nmixed\nendings\r\nhere",                                    # mixed, no trailing newline
+        "a\rb",                                                              # lone mid-line CR is data
+        "tail\r",                                                            # a CR terminating nothing
+        "a\r\r\n",                                                           # TWO CRs before the LF
+        "plain",
+        "",
+      }.each do |s|
+        TextArea.new(s).wire_text.should eq(s)
+        TextArea.new(s).wire_bytes.should eq(s.to_slice)
+      end
+    end
+
+    it "keeps the CR-free projection for #text while wire_text holds the endings" do
+      ta = TextArea.new("a\r\nb\r\n\r\nbody\r\n")
+      ta.text.should eq("a\nb\n\nbody\n")                      # unchanged: what render/search/compare see
+      ta.to_bytes.should eq("a\r\nb\r\n\r\nbody\r\n".to_slice) # unchanged: the "all head lines" join
+      ta.wire_text.should eq("a\r\nb\r\n\r\nbody\r\n")
+    end
+
+    # The whole point: editing a HEADER must not rewrite the BODY. This is the intercept
+    # "I only changed one header" case, which used to delete every CR in the body.
+    it "leaves body terminators alone when a head line is edited" do
+      ta = TextArea.new("GET / HTTP/1.1\r\nHost: h\r\n\r\nb1\r\nb2\r\n")
+      ta.place_cursor(1, 7) # end of "Host: h"
+      ta.insert('X')
+      ta.wire_text.should eq("GET / HTTP/1.1\r\nHost: hX\r\n\r\nb1\r\nb2\r\n")
+    end
+
+    # A break the operator TYPES is LF: `Env.expand_wire` promotes the head to CRLF on send
+    # and leaves the body alone, so LF is right in both halves.
+    it "gives a newly typed line break an LF terminator" do
+      ta = TextArea.new("a\r\nb\r\n")
+      ta.place_cursor(0, 1)
+      ta.insert_newline
+      ta.wire_text.should eq("a\n\r\nb\r\n") # the tail keeps the CRLF it had; the new break is LF
+    end
+
+    it "drops the right terminator when backspace and delete join lines" do
+      bs = TextArea.new("a\r\nb\nc\r\n")
+      bs.place_cursor(1, 0)
+      bs.backspace # join "a" + "b": the CRLF between them is what was deleted
+      bs.wire_text.should eq("ab\nc\r\n")
+
+      del = TextArea.new("a\r\nb\nc\r\n")
+      del.place_cursor(0, 1)
+      del.delete # same join, from the other side
+      del.wire_text.should eq("ab\nc\r\n")
+    end
+
+    it "restores terminators through undo" do
+      ta = TextArea.new("a\r\nb\r\n")
+      ta.place_cursor(1, 0)
+      ta.backspace
+      ta.wire_text.should eq("ab\r\n")
+      ta.undo
+      ta.wire_text.should eq("a\r\nb\r\n") # not "a\nb\r\n" — @eols is snapshotted with @lines
+    end
+
+    it "round-trips through replace_all" do
+      ta = TextArea.new("x\n")
+      ta.replace_all("h1\r\nh2\r\n\r\nbo\r\ndy", 0)
+      ta.wire_text.should eq("h1\r\nh2\r\n\r\nbo\r\ndy")
+    end
+  end
 end

@@ -90,10 +90,74 @@ module Gori::Repeater
     # is passed in rather than loaded.
     property overrides : Gori::HostOverrides?
 
+    # Replay of a CAPTURED flow: keep the stored Content-Length byte-exact, and recompute it
+    # ONLY where env expansion changed the body's length. Distinct from `auto_content_length`,
+    # which is the repeater's explicit operator toggle ("keep CL matching the body I typed")
+    # and must keep recomputing unconditionally. A flow's bytes are evidence, not a draft.
+    property? resync_cl_after_expansion : Bool
+
+    # PROVENANCE: these request bytes are stored EVIDENCE (a captured flow, or a flow gori
+    # recorded from a direct send), not a request the operator is DRAFTING in an editor.
+    #
+    # One signal rather than several, because every draft-time policy on this path is off for
+    # the same reason and they had already drifted apart across the surfaces:
+    #
+    #   * the unresolved-`$KEY` refusal. A stored head is full of `$` that no one typed —
+    #     OData `$filter`/`$top`, MongoDB `$where`, `$IFS` shell probes, `$user.name` SSTI,
+    #     a PHP/JS cookie — and refusing them made those captures unreplayable, while the
+    #     refusal's own remedy ("set the variable") would have SUBSTITUTED a value and sent a
+    #     different request. A surface still checks its OPERATOR-TYPED parts itself.
+    #   * the head's CRLF normalization. It exists because the TUI/Miner editors hold a
+    #     request as a line buffer whose fresh lines end in LF; a captured head is already
+    #     exact wire bytes, so normalizing can only CHANGE them — promoting a bare-LF
+    #     terminator (a front-end/back-end desync primitive gori stores byte-exact) into an
+    #     ordinary conformant request.
+    #
+    # Env expansion itself still runs (`expand_request?`), because a surface may have merged
+    # operator-typed overrides into these bytes; `expand_request: false` remains the separate
+    # "already final, do not expand" knob.
+    property? evidence : Bool
+
+    # Whether an unresolved `$VAR` left in the request is a refusal. ON everywhere by
+    # default — a typo'd `$KEY` that ships literally is almost always a mistake, and this is
+    # the last look before a socket. A surface turns it OFF only when the operator has said
+    # the bytes ARE the message (`--verbatim`, MCP `verbatim:true`), because then a literal
+    # `$user.name` / `$IFS` / `$PATH` is the payload: those are Velocity/OGNL SSTI and shell
+    # probes, and refusing them made `verbatim` unable to send its own advertised content.
+    # (The refusal was already inconsistent — `${jndi:…}` and `$(id)` passed it.)
+    property? refuse_unresolved_env : Bool
+
+    # h2 ONLY: put field names on the wire with the case the operator typed. Off by default
+    # because the h1 head text is both a wire format and the paste buffer — a request copied
+    # from Burp or curl is conventionally title-cased and h2 requires lowercase (RFC 9113
+    # §8.2.1), so verbatim case would kill the stream of every ordinary `--http2` send. A
+    # surface turns it on exactly where `refuse_unresolved_env?` goes off, and for the same
+    # reason: under `--verbatim` / MCP `verbatim:true` the bytes ARE the message, and an
+    # uppercase name is then the §8.2.1 conformance probe rather than a paste artifact.
+    # Ignored on the h1 path, which has always been byte-exact.
+    property? preserve_field_case : Bool
+
+    # h2 ONLY: the EXACT HPACK field list to encode, bypassing the h1-text carrier entirely.
+    # When set it WINS over `requests` and forces http2 — the operator supplies :method,
+    # :path, :scheme, :authority and every regular field verbatim, so the shapes h1 head text
+    # cannot hold (a duplicate pseudo-header, a pseudo AFTER a regular field, a :scheme that
+    # disagrees with the connection, :protocol per RFC 8441, an unknown pseudo, a leading-space
+    # value — `HeadCodec.h1_faithful?` is the loss set) become sendable. The body rides in
+    # `h2_body`. None of the byte-path normalization (env expansion, Content-Length resync,
+    # version-line downgrade, field-case fold) applies: the fields are the message.
+    property h2_fields : Array({String, String})?
+    property h2_body : Bytes?
+
     def initialize(@requests : Array(Bytes) = [] of Bytes,
                    *,
                    @expand_request : Bool = true,
                    @auto_content_length : Bool = true,
+                   @resync_cl_after_expansion : Bool = false,
+                   @evidence : Bool = false,
+                   @refuse_unresolved_env : Bool = true,
+                   @preserve_field_case : Bool = false,
+                   @h2_fields : Array({String, String})? = nil,
+                   @h2_body : Bytes? = nil,
                    @origin : Origin? = nil,
                    @target : String? = nil,
                    @default_target : String? = nil,
@@ -136,10 +200,23 @@ module Gori::Repeater
     getter? websocket : Bool
     # The expanded SNI host, or nil to present the dialed host.
     getter sni : String?
+    # See `PlanOptions#preserve_field_case?`. Carried on the plan (not only inside the
+    # `Sender`) so a surface that REPORTS the wire request can encode the same fields the
+    # send will — MCP's `effective_request` is derived that way.
+    getter? preserve_field_case : Bool
+
+    # The field-native request (see `PlanOptions#h2_fields`), or nil for the ordinary byte
+    # path. When present, `send` encodes THESE fields rather than `bytes`, and the surfaces
+    # that REPORT the wire render the faithful `H2Engine.field_dump` off them rather than the
+    # lossy h1 projection. `requests` still holds one synthetic scope line so `refusal`, the
+    # scope gate and `unbound_refusal?` work unchanged.
+    getter h2_fields : Array({String, String})?
+    getter h2_body : Bytes?
 
     def initialize(@sender : Sender, @requests : Array(Bytes), @scheme : String,
                    @host : String, @port : Int32, @http2 : Bool,
-                   @websocket : Bool, @sni : String?)
+                   @websocket : Bool, @sni : String?, @preserve_field_case : Bool = false,
+                   @h2_fields : Array({String, String})? = nil, @h2_body : Bytes? = nil)
     end
 
     # The single request's wire bytes (the first, for a group).
@@ -154,17 +231,32 @@ module Gori::Repeater
       @sender.group_refusal(@requests)
     end
 
+    # Whether `refusal` is the unbound-binding rule rather than Sandbox — see
+    # `Sender#unbound_refusal?`. Only a surface that must NAME the remedy asks this.
+    def unbound_refusal? : Bool
+      @sender.unbound_refusal?(@requests)
+    end
+
     def send : Result
-      @sender.send(bytes)
+      if fields = @h2_fields
+        @sender.send_fields(fields, @h2_body)
+      else
+        @sender.send(bytes)
+      end
     end
 
     def send_group : Array(Result)
       @sender.send_group(@requests)
     end
 
+    # `keep_key` sends the operator's own `Sec-WebSocket-Key` header instead of a fresh one.
+    # A send-time argument rather than a `PlanOptions` field: it changes nothing about the
+    # target, the scope verdict or the assembled bytes — only which of the head's own lines
+    # survives — so it has no business in the builder the scope gate reads.
     def send_ws(messages : Array(WsEngine::OutMsg),
-                idle : Time::Span = WsEngine::DEFAULT_IDLE) : WsEngine::Result
-      @sender.send_ws(bytes, messages, idle)
+                idle : Time::Span = WsEngine::DEFAULT_IDLE,
+                keep_key : Bool = false) : WsEngine::Result
+      @sender.send_ws(bytes, messages, idle, keep_key)
     end
 
     # The same target and gated dialer carrying different wire bytes — for a surface that
@@ -180,19 +272,29 @@ module Gori::Repeater
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if requests.empty?
       Plan.new(sender: @sender, requests: requests, scheme: @scheme, host: @host,
         port: @port, http2: @http2,
-        websocket: WsEngine.upgrade_request?(String.new(requests.first)), sni: @sni)
+        websocket: WsEngine.upgrade_request?(String.new(requests.first)), sni: @sni,
+        preserve_field_case: @preserve_field_case)
     end
 
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
+      # Field-native is a separate assembly with no bytes to expand, re-frame or version-fix —
+      # kept fully off the byte path below so an ordinary `--http2` send is byte-for-byte what
+      # it was, and a field list never accidentally acquires a normalization it opted out of.
+      if fields = options.h2_fields
+        return build_field_native(options, outbound, fields)
+      end
+
       scheme, host, port = resolve_origin(options)
 
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if options.requests.empty?
+      # The two DRAFT-TIME policies, both off for evidence — see `PlanOptions#evidence?`.
+      draft = !options.evidence?
       # Checked on `options.requests` REGARDLESS of `expand_request?`, and that is the
       # point: when it is false the surface expanded already (MCP's `RequestBuilder`, the
       # TUI editor's byte modes), so an unresolved token is sitting in the bytes it handed
       # over and this is still the last place anyone looks before they reach a socket.
-      refuse_unresolved(options.requests.flat_map { |b| Env.unresolved_wire(String.new(b)) }.uniq!)
-      wires = options.expand_request? ? options.requests.map { |b| Env.expand_wire(String.new(b)) } : options.requests
+      refuse_unresolved(options.requests.flat_map { |b| Env.unresolved_wire(String.new(b)) }.uniq!) if draft && options.refuse_unresolved_env?
+      wires = expand_requests(options, draft)
 
       # Detect the upgrade on the FINAL wire, not the stored text: the bytes that decide
       # which engine runs must be the bytes that go out, or a `$KEY` expanding into the
@@ -201,7 +303,15 @@ module Gori::Repeater
       # A handshake carries no body, and all three surfaces have always sent it verbatim —
       # `resync_content_length` never ADDS a header, but a captured upgrade that happened to
       # carry a Content-Length would be rewritten, so skip the pass rather than rely on that.
-      wires = wires.map { |b| FlowRequest.resync_content_length(b) } if options.auto_content_length? && !websocket
+      if !websocket
+        if options.auto_content_length?
+          wires = wires.map { |b| FlowRequest.resync_content_length(b) }
+        elsif options.resync_cl_after_expansion?
+          # Flow replay: byte-exact unless a `$KEY` in the body just changed its length.
+          # See `FlowRequest.resync_content_length_if_body_changed`.
+          wires = wires.map_with_index { |b, i| FlowRequest.resync_content_length_if_body_changed(options.requests[i], b) }
+        end
+      end
       # `HTTP/2` on the version line of a request going down an h1 socket is never anything
       # but a mistake (a Burp-pasted h2 view, or a captured h2 flow replayed as h1), and
       # `FlowRequest.downgrade_version_line` exists to correct it. Its comment says it "runs
@@ -237,9 +347,52 @@ module Gori::Repeater
       sni = options.sni.try { |s| Env.expand(s).presence }
       sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
         verify: options.verify?, http2: options.http2?, sni: sni,
-        timeout: options.timeout, overrides: options.overrides)
+        timeout: options.timeout, overrides: options.overrides,
+        preserve_field_case: options.preserve_field_case?)
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
-        http2: options.http2?, websocket: websocket, sni: sni)
+        http2: options.http2?, websocket: websocket, sni: sni,
+        preserve_field_case: options.preserve_field_case?)
+    end
+
+    # The request wires with `$KEY` expansion applied, or the originals when the surface says
+    # it already expanded (`expand_request: false` — MCP's pre-expanded `raw`, the TUI's byte
+    # modes, `--verbatim`).
+    #
+    # `expand_wire` for a DRAFT, plain `expand` for EVIDENCE. The only difference between them
+    # is that `expand_wire` re-terminates the HEAD with CRLF, which a line-buffer editor owes
+    # the wire and a stored capture does not: promoting a captured bare-LF terminator destroys
+    # a front-end/back-end desync primitive gori stores byte-exact. See `PlanOptions#evidence?`.
+    private def self.expand_requests(options : PlanOptions, draft : Bool) : Array(Bytes)
+      return options.requests unless options.expand_request?
+      if draft
+        options.requests.map { |b| Env.expand_wire(String.new(b)) }
+      else
+        options.requests.map { |b| Env.expand(String.new(b)).to_slice }
+      end
+    end
+
+    # A field-native h2 send: dial origin + SNI resolution, then a `Sender` whose `send` will
+    # encode the fields verbatim. `requests` carries ONE synthetic scope line
+    # (`H2Engine.field_scope_line`) so `refusal`/`unbound_refusal?`/the scope gate — all of
+    # which key off a request line — work with no special case. The scheme check and the SNI
+    # expansion mirror the byte path; everything the byte path does to the WIRE bytes (env
+    # expansion, Content-Length, version-line, field-case) is deliberately absent, because a
+    # field list is already the exact message.
+    private def self.build_field_native(options : PlanOptions, outbound : Gori::Outbound,
+                                        fields : Array({String, String})) : Plan
+      scheme, host, port = resolve_origin(options)
+      unless scheme.in?("http", "https")
+        raise PlanError.new(PlanError::Reason::UnsupportedScheme,
+          "unsupported target scheme #{scheme.inspect}", scheme)
+      end
+      options.sni.try { |s| refuse_unresolved(Env.unresolved(s, deferred: nil)) }
+      sni = options.sni.try { |s| Env.expand(s).presence }
+      sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
+        verify: options.verify?, http2: true, sni: sni,
+        timeout: options.timeout, overrides: options.overrides)
+      new(sender: sender, requests: [H2Engine.field_scope_line(fields)], scheme: scheme,
+        host: host, port: port, http2: true, websocket: false, sni: sni,
+        h2_fields: fields, h2_body: options.h2_body)
     end
 
     # The pre-resolved origin when the surface has one, else the explicit target, else the

@@ -51,8 +51,8 @@ module Gori
         # `timeout` is a PER-OPERATION bound (connect, and idle between reads/writes),
         # not a total request deadline — same model as the proxy's IO_TIMEOUT. A true
         # whole-request deadline would need a timer fiber racing a socket close.
-        upstream = dial(scheme, host, port, verify_upstream, sni, timeout, overrides)
-        return error(connect_error(scheme, host, port, verify_upstream), started) unless upstream
+        upstream, dial_error = dial_result(scheme, host, port, verify_upstream, sni, timeout, overrides)
+        return error(connect_error(scheme, host, port, verify_upstream, dial_error), started) unless upstream
 
         begin
           exchange(upstream, request, host, port, started)
@@ -69,13 +69,23 @@ module Gori
       def self.dial(scheme : String, host : String, port : Int32, verify_upstream : Bool,
                     sni : String?, timeout : Time::Span?,
                     overrides : Gori::HostOverrides?) : IO?
+        dial_result(scheme, host, port, verify_upstream, sni, timeout, overrides)[0]
+      end
+
+      # The same dial, paired with WHY there is no socket. Every active send path in gori
+      # (repeater, fuzz, mine, sequence, discover, probe, MCP) reaches the network through
+      # this one function or through `ConnPool`, which also uses it — so carrying the reason
+      # here is what makes an upstream proxy's 407 legible on ALL of them rather than on one.
+      def self.dial_result(scheme : String, host : String, port : Int32, verify_upstream : Bool,
+                           sni : String?, timeout : Time::Span?,
+                           overrides : Gori::HostOverrides?) : {IO?, Proxy::Upstream::DialError?}
         ct = timeout || Settings.connect_timeout
         it = timeout || Settings.io_timeout
         if scheme == "https"
-          Proxy::Upstream.dial_tls(host, port, verify: verify_upstream, sni: sni,
+          Proxy::Upstream.dial_tls_result(host, port, verify: verify_upstream, sni: sni,
             connect_timeout: ct, io_timeout: it, overrides: overrides)
         else
-          Proxy::Upstream.dial(host, port, connect_timeout: ct, io_timeout: it, overrides: overrides)
+          Proxy::Upstream.dial_result(host, port, connect_timeout: ct, io_timeout: it, overrides: overrides)
         end
       end
 
@@ -96,9 +106,9 @@ module Gori
                              overrides : Gori::HostOverrides? = nil) : Array(Result)
         results = [] of Result
         return results if requests.empty?
-        upstream = dial(scheme, host, port, verify_upstream, sni, timeout, overrides)
+        upstream, dial_error = dial_result(scheme, host, port, verify_upstream, sni, timeout, overrides)
         unless upstream
-          msg = connect_error(scheme, host, port, verify_upstream)
+          msg = connect_error(scheme, host, port, verify_upstream, dial_error)
           now = Time.instant
           requests.size.times { results << error(msg, now) }
           return results
@@ -221,11 +231,24 @@ module Gori
         Result.new(Bytes.new(0), nil, nil, elapsed(started), message, delivered: delivered)
       end
 
-      # The dialer collapses DNS failure / connection refused / timeout / TLS-verify
-      # rejection into a single nil socket, so spell out the likely causes — and, for
-      # verified https, that a self-signed/expired cert is a common one — rather than
-      # leaving the user with a bare "connect failed".
-      def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool) : String
+      # Why the dial produced no socket.
+      #
+      # `err` is the dialer's own account of it and is used VERBATIM when it has one, because
+      # the cases it can name are exactly the cases this function cannot guess: an upstream
+      # proxy that answered 407/403/502, or one gori could not reach at all. Guessing was the
+      # defect — a corporate proxy refusing the tunnel arrived at the operator as
+      # "host unreachable (DNS/refused/timeout)" naming the ORIGIN, so the next hour went on
+      # DNS and firewall rules for a host gori had never tried to contact.
+      #
+      # With no detail the fallback is the old sentence, which is still right: a bare Connect
+      # really is DNS/refused/timeout, and under verify-on an https dial genuinely cannot tell
+      # a failed handshake from an unreachable host without asking OpenSSL for more than the
+      # socket carries.
+      def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool,
+                             err : Proxy::Upstream::DialError? = nil) : String
+        if detail = err.try(&.detail)
+          return "connect failed: #{detail}"
+        end
         if scheme == "https" && verify
           "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout) or the origin's TLS certificate failed verification (e.g. self-signed/expired)"
         else

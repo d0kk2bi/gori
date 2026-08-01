@@ -46,6 +46,31 @@ private UPGRADE = ("GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
                    "Upgrade: websocket\r\nConnection: Upgrade\r\n" \
                    "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").to_slice
 
+# An origin that completes the upgrade and then writes EXACTLY these bytes — a frame script,
+# so a sequence RFC 6455 forbids (and therefore `WS.encode` will not build) can still be put
+# on the wire. It never reads, so nothing here depends on what the engine sends.
+private def start_scripted_ws_origin(frames : Bytes) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    head = Gori::Proxy::Codec::Http1.read_head(conn).not_nil!
+    key = String.new(head).each_line
+      .find(&.downcase.starts_with?("sec-websocket-key:"))
+      .try { |l| l.split(':', 2)[1].strip } || ""
+    accept = Base64.strict_encode(Digest::SHA1.digest(key + WsEngine::GUID))
+    conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
+            "Connection: Upgrade\r\nSec-WebSocket-Accept: #{accept}\r\n\r\n"
+    conn.flush
+    conn.write(frames)
+    conn.flush
+    conn.close
+  rescue
+  end
+  port
+end
+
 # An origin that completes the upgrade and then closes at once, without reading or sending a
 # single frame — the shape that made a repeater run report success for messages nobody got.
 private def start_dead_ws_origin : Int32
@@ -87,8 +112,11 @@ describe Gori::Repeater::WsEngine do
     result.ok?.should be_true
     result.upgraded?.should be_true
     result.note.should be_nil # accept verified against the regenerated key
-    result.messages.map { |m| {m.direction, String.new(m.payload)} }
-      .should eq([{"out", "ping"}, {"in", "ping"}])
+    # The origin's CLOSE is a transcript row now, not only a `close_code`: §5.5.1's reason
+    # is the free-text half, and dropping the frame dropped it.
+    result.messages.map { |m| {m.direction, m.opcode} }
+      .should eq([{"out", 1}, {"in", 1}, {"in", 8}])
+    result.messages[0..1].map { |m| String.new(m.payload) }.should eq(["ping", "ping"])
   end
 
   it "captures the server close code" do
@@ -183,7 +211,243 @@ describe Gori::Repeater::WsEngine do
     result = WsEngine.send(UPGRADE, [WsEngine::OutMsg.new(1, "ping".to_slice)],
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
 
-    result.messages.count { |m| m.direction == "in" }.should eq(1)
+    result.messages.count { |m| m.direction == "in" && m.opcode == 1 }.should eq(1)
     (result.note || "").should_not contain("delivery unconfirmed")
+  end
+
+  # The drain reassembles on FIN and had no other message boundary, so it merged an RFC 6455
+  # §5.4 violation into one clean message and dropped an unterminated fragment outright — while
+  # `Relay.pump`, fed the identical origin bytes, reported both correctly. A server that emits a
+  # new data frame mid-fragment, or that dies mid-message, is the finding a WebSocket test is
+  # looking for; the two surfaces may not disagree about it.
+  it "reports a §5.4 sequence as two messages instead of merging them" do
+    port = start_scripted_ws_origin(
+      Bytes[0x01, 0x03, 0x41, 0x41, 0x41] + # TEXT fin=0 "AAA" — never FIN'd
+      Bytes[0x81, 0x03, 0x42, 0x42, 0x42] + # TEXT fin=1 "BBB" — a NEW data message
+      Bytes[0x88, 0x02, 0x03, 0xE8])        # CLOSE 1000
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    # The two data rows used to be ONE, reading `AAABBB` — a well-formed message that was
+    # never on the wire.
+    inbound.map(&.opcode).should eq([1, 1, 8])
+    inbound[0..1].map { |m| String.new(m.payload) }.should eq(["AAA", "BBB"])
+    # Non-final, because the origin never sent the FIN: the violation is reported, not repaired.
+    inbound[0].shape.fin.should be_false
+    inbound[1].shape.fin.should be_true
+    result.close_code.should eq(1000)
+  end
+
+  it "keeps an unterminated fragment the origin sent before its CLOSE" do
+    port = start_scripted_ws_origin(
+      Bytes[0x01, 0x0C] + "UNTERMINATED".to_slice + # TEXT fin=0, no FIN ever follows
+      Bytes[0x88, 0x02, 0x03, 0xE8])                # CLOSE 1000
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    # The 12 bytes the origin framed vanished entirely: only the CLOSE row was reported.
+    inbound.map(&.opcode).should eq([1, 8])
+    String.new(inbound[0].payload).should eq("UNTERMINATED")
+    inbound[0].shape.fin.should be_false
+    result.close_code.should eq(1000)
+  end
+
+  # Same buffer, no CLOSE: the origin just goes away mid-message. Every exit from the drain
+  # has to flush, which is why the flush is after the loop and not on the CLOSE branch.
+  it "keeps an unterminated fragment when the origin disappears mid-message" do
+    port = start_scripted_ws_origin(Bytes[0x01, 0x04] + "HALF".to_slice)
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    inbound.map { |m| {m.opcode, String.new(m.payload)} }.should eq([{1, "HALF"}])
+    inbound[0].shape.fin.should be_false
+    result.close_code.should be_nil
+  end
+
+  # A fragmented message that DOES end normally must keep reporting exactly one row, with the
+  # first frame's RSV/mask and the frame count — the accounting the flushes are layered on top
+  # of, and the thing a copy-instead-of-share fix would have been free to get wrong.
+  it "still reassembles an ordinary fragmented message into one message" do
+    port = start_scripted_ws_origin(
+      Bytes[0x41, 0x03, 0x41, 0x41, 0x41] + # TEXT fin=0 rsv=4 "AAA"
+      Bytes[0x00, 0x03, 0x42, 0x42, 0x42] + # CONT fin=0 "BBB"
+      Bytes[0x80, 0x03, 0x43, 0x43, 0x43] + # CONT fin=1 "CCC"
+      Bytes[0x88, 0x02, 0x03, 0xE8])
+    result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
+      scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false)
+
+    inbound = result.messages.select { |m| m.direction == "in" }
+    inbound.map(&.opcode).should eq([1, 8])
+    String.new(inbound[0].payload).should eq("AAABBBCCC")
+    inbound[0].shape.fin.should be_true
+    inbound[0].shape.rsv.should eq(4) # §5.2 puts an extension's flags on the FIRST frame
+    inbound[0].shape.frames.should eq(3)
+  end
+end
+
+# --- the send model: every frame shape, and the Sec-WebSocket-Key opt-in ------------
+#
+# The engine folded every outbound message to `opcode == 2 ? OP_BIN : OP_TEXT`, FIN=1, RSV=0,
+# masked with a fresh key — one shape out of the dozen a WebSocket test needs. A captured
+# session of twelve distinct shapes replayed as seven identical ones.
+
+# A recording origin: does the 101 by hand, then records every post-handshake byte.
+private def with_recording_origin(accept : Bool = true, announce : Bool = false, &)
+  server = TCPServer.new("127.0.0.1", 0)
+  rx = Channel(Bytes).new(1)
+  head_ch = Channel(String).new(1)
+  spawn do
+    sock = server.accept
+    head = IO::Memory.new
+    until head.to_s.ends_with?("\r\n\r\n")
+      b = sock.read_byte
+      break unless b
+      head.write_byte(b)
+    end
+    head_ch.send(head.to_s)
+    key = ""
+    head.to_s.each_line do |l|
+      key = l.split(':', 2)[1].strip if l.downcase.starts_with?("sec-websocket-key:")
+    end
+    resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+    if accept
+      resp += "Sec-WebSocket-Accept: " +
+              Base64.strict_encode(Digest::SHA1.digest(key + Gori::Repeater::WsEngine::GUID)) + "\r\n"
+    end
+    sock << resp << "\r\n"
+    sock.flush
+    # An inbound frame is what makes the engine narrow its read bound from HANDSHAKE_TIMEOUT
+    # to `idle`; without one the drain runs until EOF, i.e. until THIS side gives up — so
+    # anything the engine writes at the end of the drain lands after the snapshot below.
+    if announce
+      sock.write(Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "go".to_slice, mask: false))
+      sock.flush
+    end
+    buf = IO::Memory.new
+    sock.read_timeout = 1.second
+    begin
+      chunk = Bytes.new(4096)
+      loop do
+        n = sock.read(chunk)
+        break if n == 0
+        buf.write(chunk[0, n])
+      end
+    rescue
+    end
+    rx.send(buf.to_slice)
+    sock.close rescue nil
+  end
+  begin
+    yield server.local_address.port, head_ch, rx
+  ensure
+    server.close rescue nil
+  end
+end
+
+describe "Gori::Repeater::WsEngine frame shapes" do
+  it "puts every previously-inexpressible frame shape on the wire" do
+    with_recording_origin do |port, _head, rx|
+      shape = Gori::Proxy::WS::Shape
+      msgs = [
+        Gori::Repeater::WsEngine::OutMsg.new(9, "ping!".to_slice),
+        Gori::Repeater::WsEngine::OutMsg.new(10, "pong!".to_slice),
+        Gori::Repeater::WsEngine::OutMsg.new(1, "rsv".to_slice, shape.new(rsv: 4)),
+        Gori::Repeater::WsEngine::OutMsg.new(1, "bare".to_slice, shape.new(masked: false)),
+        Gori::Repeater::WsEngine::OutMsg.new(1, "pin".to_slice,
+          shape.new(mask_key: Bytes[0xDE, 0xAD, 0xBE, 0xEF])),
+        Gori::Repeater::WsEngine::OutMsg.new(1, "part".to_slice, shape.new(fin: false)),
+        Gori::Repeater::WsEngine::OutMsg.new(0, "tail".to_slice),
+        Gori::Repeater::WsEngine::OutMsg.new(8, Bytes[0x03, 0xE9] + "bye".to_slice),
+      ]
+      Gori::Repeater::WsEngine.send(UPGRADE, msgs,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 200.milliseconds)
+      got = rx.receive
+      io = IO::Memory.new(got)
+      seen = [] of {Int32, Bool, Int32, Bool}
+      while (h = Gori::Proxy::WS.read_header(io))
+        seen << {h.opcode.to_i, h.fin?, h.rsv.to_i, h.masked?}
+        f = Gori::Proxy::WS.read_body(io, h)
+        break unless f
+      end
+      seen.should eq([
+        {9, true, 0, true},  # PING            — opcode was folded to TEXT before
+        {10, true, 0, true}, # PONG
+        {1, true, 4, true},  # RSV1 (§5.2)     — `encode` had no rsv parameter at all
+        {1, true, 0, false}, # UNMASKED (§5.1) — the commonest hardening probe
+        {1, true, 0, true},  # pinned mask key
+        {1, false, 0, true}, # FIN=0 (§5.4)    — `fin` was never plumbed from the engine
+        {0, true, 0, true},  # a lone CONT
+        {8, true, 0, true},  # CLOSE with a chosen code
+      ])
+    end
+  end
+
+  it "does not append its own CLOSE after one the operator sent (§5.5.1: one per direction)" do
+    with_recording_origin(announce: true) do |port, _head, rx|
+      Gori::Repeater::WsEngine.send(UPGRADE,
+        [Gori::Repeater::WsEngine::OutMsg.new(8, Bytes[0x03, 0xE9])],
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 200.milliseconds)
+      io = IO::Memory.new(rx.receive)
+      closes = 0
+      while (h = Gori::Proxy::WS.read_header(io))
+        closes += 1 if h.close?
+        break unless Gori::Proxy::WS.read_body(io, h)
+      end
+      closes.should eq(1)
+    end
+  end
+
+  it "regenerates Sec-WebSocket-Key by default, and honours the typed one under keep_key" do
+    typed = ("GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+             "Sec-WebSocket-Key: SHORT\r\nX-After-Key: yes\r\n\r\n").to_slice
+    with_recording_origin do |port, head, _rx|
+      Gori::Repeater::WsEngine.send(typed, [] of Gori::Repeater::WsEngine::OutMsg,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 100.milliseconds)
+      sent = head.receive
+      sent.should_not contain("Sec-WebSocket-Key: SHORT")
+      # ... and the regenerated line is APPENDED, so header order is not the operator's.
+      sent.index("X-After-Key").not_nil!.should be < sent.index("Sec-WebSocket-Key").not_nil!
+    end
+    with_recording_origin do |port, head, _rx|
+      Gori::Repeater::WsEngine.send(typed, [] of Gori::Repeater::WsEngine::OutMsg,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 100.milliseconds, keep_key: true)
+      sent = head.receive
+      sent.should contain("Sec-WebSocket-Key: SHORT\r\n")
+      sent.scan(/Sec-WebSocket-Key/).size.should eq(1) # not the typed one PLUS a fresh one
+      # Position preserved too: the block goes out as written.
+      sent.index("Sec-WebSocket-Key").not_nil!.should be < sent.index("X-After-Key").not_nil!
+    end
+  end
+
+  it "REPORTS a missing Sec-WebSocket-Accept instead of skipping the check" do
+    # `return nil unless got` gave a server that upgraded with NO accept header the same
+    # silence as one that answered correctly. The missing header IS the finding.
+    with_recording_origin(accept: false) do |port, _head, _rx|
+      result = Gori::Repeater::WsEngine.send(UPGRADE, [] of Gori::Repeater::WsEngine::OutMsg,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 100.milliseconds)
+      result.upgraded?.should be_true
+      (result.note || "(silence)").should contain("accept MISSING")
+    end
+  end
+
+  it "REPORTS that it cannot verify the accept when the request carried no single key" do
+    two = ("GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+           "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n" \
+           "Sec-WebSocket-Key: BBBBBBBBBBBBBBBBBBBBBB==\r\n\r\n").to_slice
+    with_recording_origin do |port, _head, _rx|
+      result = Gori::Repeater::WsEngine.send(two, [] of Gori::Repeater::WsEngine::OutMsg,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        idle: 100.milliseconds, keep_key: true)
+      (result.note || "(silence)").should contain("NOT verified")
+      (result.note || "(silence)").should contain("2 Sec-WebSocket-Key headers")
+    end
   end
 end

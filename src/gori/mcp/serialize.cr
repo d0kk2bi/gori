@@ -5,6 +5,8 @@ require "../issues_export"
 require "../repeater/engine"
 require "../fuzz"
 require "../proxy/codec/content_decode"
+require "../proxy/h2/grpc"
+require "../protobuf"
 
 module Gori
   module MCP
@@ -251,14 +253,95 @@ module Gori
           j.field "short_circuited", row.short_circuited?
           j.field "error", text(detail.error)
           j.field "request_head", redact_head_opt(head_text(detail.request_head), include_sensitive)
+          emit_head_base64(j, "request_head", detail.request_head, include_sensitive)
           emit_body(j, "request_body", detail.request_head, detail.request_body, detail.request_body_truncated?, body_cap, body_omit)
           j.field "response_head", redact_head_opt(head_text(detail.response_head), include_sensitive)
+          emit_head_base64(j, "response_head", detail.response_head, include_sensitive)
           j.field "sensitive_headers_redacted", true unless include_sensitive
           emit_body(j, "response_body", detail.response_head, detail.response_body, detail.response_body_truncated?, body_cap, body_omit)
           emit_sse_events(j, detail)
           emit_ws_messages(j, ws_msgs)
+          emit_grpc_messages(j, "request_grpc_messages", detail.request_head, detail.request_body)
+          emit_grpc_messages(j, "response_grpc_messages", detail.response_head, detail.response_body)
           emit_decoded(j, detail)
         end
+      end
+
+      GRPC_MSGS_MAX  =  200 # cap gRPC messages serialised for an LLM client
+      GRPC_BYTES_MAX = 8192 # cap the base64 of one compressed/opaque message
+
+      # The gRPC framing view of a message body, mirroring `gori run show --format json`'s
+      # `grpc_messages`. MCP had NO gRPC projection at all: an agent got the raw body and had
+      # to reframe the 5-byte length prefixes itself, and a FRAMING FAILURE — a length prefix
+      # claiming more than arrived, the standard gRPC parser test — was invisible on the one
+      # surface that cannot look at the wire.
+      #
+      # `Grpc.scan`, not `Grpc.messages`: the residual is the whole point. `messages` throws
+      # it away, so a deliberately-wrong prefix rendered as "no messages", which reads
+      # identically to "this flow is not gRPC".
+      def self.emit_grpc_messages(j : JSON::Builder, field_name : String,
+                                  head : Bytes?, body : Bytes?) : Nil
+        return if head.nil? || body.nil? || body.empty?
+        return unless Proxy::H2::Grpc.grpc?(grpc_content_type(head))
+        msgs, residual = Proxy::H2::Grpc.scan(body)
+        return if msgs.empty? && residual == 0
+        j.field field_name do
+          j.object do
+            j.field "count", msgs.size
+            if residual > 0
+              j.field "residual_bytes", residual
+              j.field "framing_error",
+                "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
+                "a length prefix claiming more than arrived, or a body cut short"
+            end
+            j.field "truncated", true if msgs.size > GRPC_MSGS_MAX
+            j.field "messages" do
+              j.array do
+                msgs.first(GRPC_MSGS_MAX).each_with_index do |m, i|
+                  j.object do
+                    j.field "index", i
+                    j.field "compressed", m.compressed
+                    j.field "trailer", m.trailer
+                    j.field "size", m.data.size
+                    if m.trailer
+                      # grpc-web TRAILER frame: ASCII headers, not protobuf — and for gRPC the
+                      # trailer IS the call's real status.
+                      j.field "headers" do
+                        j.object do
+                          Proxy::H2::Grpc.trailer_headers(m.data).each { |k, v| j.field k, text(v) }
+                        end
+                      end
+                    elsif m.compressed
+                      # Honour the 0x01 flag: compressed bytes are not a protobuf message until
+                      # the caller inflates them (the encoding is named by grpc-encoding, not us).
+                      j.field "note", "compressed payload — not decoded as protobuf"
+                      emit_grpc_bytes(j, m.data)
+                    else
+                      j.field "protobuf" { Protobuf.decode(m.data).to_json(j) }
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      private def self.emit_grpc_bytes(j : JSON::Builder, data : Bytes) : Nil
+        cut = data.size > GRPC_BYTES_MAX
+        j.field "bytes", Base64.strict_encode(cut ? data[0, GRPC_BYTES_MAX] : data)
+        j.field "bytes_truncated", true if cut
+      end
+
+      # Content-Type value from a message head (case-insensitive name, any spacing after the
+      # colon), nil when there is none.
+      private def self.grpc_content_type(head : Bytes) : String?
+        String.new(head).scrub.each_line do |line|
+          idx = line.index(':') || next
+          next unless line[0, idx].strip.compare("content-type", case_insensitive: true) == 0
+          return line[(idx + 1)..].strip
+        end
+        nil
       end
 
       WS_MSGS_MAX    =  500 # cap WS messages serialised for an LLM client
@@ -297,11 +380,32 @@ module Gori
                     j.field "type", ws_frame_type(m.opcode)
                     j.field "at", m.created_at
                     j.field "at_iso", unix_micros_iso(m.created_at)
+                    # The V7 shape (FIN / RSV / masked / frame count) and a CLOSE's code and
+                    # reason. `gori run show --format json` has emitted these since the shape
+                    # existed; MCP did not, so the agent surface was the one place a captured
+                    # RSV1 frame, an unmasked client frame, or a close code was invisible —
+                    # and a close code is the most diagnostic thing a failed WebSocket test
+                    # produces. Shared emitter, so the two projections cannot drift.
+                    CLI::Output.emit_ws_shape_json(j, m)
                     if m.text?
-                      s = String.new(m.payload).scrub
+                      raw = String.new(m.payload)
+                      s = raw.scrub
                       cut = s.size > WS_PAYLOAD_MAX
                       j.field "text", cut ? s[0, WS_PAYLOAD_MAX] : s
                       j.field "text_truncated", true if cut
+                      # RFC 6455 §8.1/§5.6 UTF-8 validation is a standard WebSocket test, so a
+                      # TEXT frame carrying invalid UTF-8 is the PAYLOAD, not an accident — and
+                      # `scrub` renders two different invalid bytes identically. A clip at
+                      # WS_PAYLOAD_MAX loses the tail the same way, and `get_response_body_chunk`
+                      # covers HTTP bodies, not `ws_messages`. `gori run show --format json` has
+                      # emitted this companion all along; the AGENT surface, the one that cannot
+                      # look at the wire itself, was the one place the bytes were unrecoverable.
+                      if cut || !raw.valid_encoding?
+                        j.field "text_lossy", true
+                        b64cut = m.payload.size > MAX_B64
+                        j.field "base64", Base64.strict_encode(b64cut ? m.payload[0, MAX_B64] : m.payload)
+                        j.field "base64_truncated", true if b64cut
+                      end
                     else
                       j.field "binary", true
                       j.field "size", m.payload.size
@@ -394,6 +498,24 @@ module Gori
         head ? String.new(head).scrub : nil
       end
 
+      # The head's exact octets, when `head_text` above had to scrub them away. Without this
+      # an 8-bit byte in a captured header was unrecoverable through MCP: the body has a
+      # base64 fallback and the head had none, so `X-Bin: \x80\xff` read as `X-Bin: ��` with
+      # no way back and no signal that anything was lost.
+      #
+      # Gated on `include_sensitive` for `intercept_item_detail`'s reason: base64 is encoding,
+      # not redaction, so emitting the raw head by default would hand back exactly the
+      # Authorization/Cookie bytes the `*_head` field carefully redacts. Redacting INSIDE the
+      # base64 is not an option — it would no longer be the bytes.
+      def self.emit_head_base64(j : JSON::Builder, field_name : String, head : Bytes?,
+                                include_sensitive : Bool) : Nil
+        return if head.nil?
+        return if String.new(head).valid_encoding?
+        j.field "#{field_name}_lossy", true
+        return unless include_sensitive
+        j.field "#{field_name}_base64", Base64.strict_encode(head)
+      end
+
       # RFC3339 UTC for store timestamps (unix microseconds). Helps LLM clients
       # that can't interpret raw microsecond integers.
       def self.unix_micros_iso(us : Int64) : String
@@ -438,8 +560,45 @@ module Gori
             # cap) so the caller knows whether more is recoverable. Branch-independent.
             j.field "wire_truncated", true if wire_truncated
             j.field "note", note if note
+            emit_trailers(j, head, body)
           end
         end
+      end
+
+      # The chunked message's TRAILER fields, beside the de-chunked body rather than folded
+      # into `headers`. `note:"de-chunked"` used to be the only trace that a trailer section
+      # could even exist: the head stops before the body and the de-chunk stops at the
+      # 0-chunk, so `X-T: gotcha` after it appeared nowhere while the origin's `Trailer:`
+      # announcement was echoed — which reads as "the origin sent none". Whether a target
+      # treats a trailer as a header is itself a test, so they stay a separate list.
+      def self.emit_trailers(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
+        trailers = Proxy::Codec::ContentDecode.trailers(head, body)
+        return if trailers.empty?
+        j.field "trailers" do
+          j.array do
+            trailers.each do |(name, value)|
+              j.object do
+                j.field "name", text(name)
+                # A trailer value is remote bytes like any response header — same lossy
+                # contract, same base64 escape hatch (see `emit_lossy_text`).
+                emit_lossy_text(j, "value", value)
+              end
+            end
+          end
+        end
+      end
+
+      # A string that came off the wire, emitted so the caller can always recover the exact
+      # octets. `text` (i.e. `scrub`) is mandatory for JSON-RPC UTF-8 validity, but it is
+      # LOSSY and silently so: two different invalid bytes both render `�`, and the response
+      # BODY had a base64 fallback while a header VALUE did not — leaving those bytes
+      # unrecoverable through MCP entirely. Emit the raw bytes beside the scrubbed text
+      # whenever scrubbing actually changed something, and say that it did.
+      def self.emit_lossy_text(j : JSON::Builder, field_name : String, s : String) : Nil
+        j.field field_name, text(s)
+        return if s.valid_encoding?
+        j.field "#{field_name}_base64", Base64.strict_encode(s.to_slice)
+        j.field "#{field_name}_lossy", true
       end
 
       # Emit the (possibly capped) body bytes as text or base64. byte_slice can

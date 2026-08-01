@@ -149,10 +149,18 @@ module Gori::Fuzz
     end
 
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
-      # ONE `Env.expand` over the template, before anything reads it — and first, a
+      # ONE `Env.expand_wire` over the template, before anything reads it — and first, a
       # refusal when a token in the HEAD resolves to nothing (see `refuse_unresolved`).
+      #
+      # `expand_wire`, not `expand`: this was the ONE plan builder of the three that skipped
+      # the head's LF→CRLF promotion (`miner/plan.cr` and `sequencer/plan.cr` have always
+      # used it), and the TUI editor joins lines with LF. So every Fuzzer run launched from
+      # the TUI put a BARE-LF request head on the wire while the Repeater, on the same flow
+      # in the same session, sent CRLF. A bare LF is itself a front-end/back-end desync
+      # primitive, so it does not merely look untidy — it confounds every result the sweep
+      # produces. The body is left byte-exact either way; `expand_wire` only touches the head.
       refuse_unresolved(Env.unresolved_wire(options.template))
-      text = Env.expand(options.template)
+      text = String.new(Env.expand_wire(options.template))
       text = Template.auto_mark(text) if options.auto_mark?
       marker = Template::MARKER
       mark_matches = options.marks.map do |tok|

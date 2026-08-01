@@ -26,5 +26,24 @@ module Gori
       end
       false
     end
+
+    # Does `hay` START WITH `needle` (ASCII case-insensitive)? `needle` MUST already be
+    # lowercase. Exists so a prefix test over bytes that MIGHT NOT BE VALID UTF-8 — a wire
+    # request line, a captured target — never has to reach for a Regex: PCRE2 raises
+    # `ArgumentError: UTF-8 error` on an invalid byte, and that raise took down a whole fuzz
+    # worker fiber the first time a payload carried one.
+    def self.starts_with_ci?(hay : Bytes, needle : Bytes) : Bool
+      n = needle.size
+      return true if n == 0
+      return false if hay.size < n
+      j = 0
+      while j < n
+        b = hay.unsafe_fetch(j)
+        b |= 0x20_u8 if b >= 0x41_u8 && b <= 0x5a_u8 # A-Z → a-z
+        return false unless b == needle.unsafe_fetch(j)
+        j += 1
+      end
+      true
+    end
   end
 end

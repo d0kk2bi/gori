@@ -48,7 +48,8 @@ private class HoldSink < Gori::Proxy::FlowSink
   def on_response(resp : Gori::Store::CapturedResponse) : Nil
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
     @messages << {direction, opcode, String.new(payload)}
   end
 end
@@ -308,6 +309,136 @@ describe Gori::Proxy::WS::MessageGate do
       wait_until("the queue row to be given back") { ic.pending_count == 0 }
     end
     r.shutdown
+  end
+
+  it "releases an unedited FRAGMENTED message as the peer's own frames, byte-exact" do
+    # A hold arms the assembling pump for every message on the direction, so this is the
+    # rewrite path's defect reached through the other door: both fragments were buffered and
+    # re-emitted as ONE frame with a mask key gori invented, for a message the operator
+    # forwarded untouched. `Slot#raw` only ever carried a single frame.
+    first = masked(WS::OP_TEXT, "frag-".to_slice, fin: false)
+    second = masked(WS::OP_CONT, "tail".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 34_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(second)
+      wait_until("the hold") { ic.pending_count == 1 }
+      ic.forward(ic.pending.first.id)
+
+      got = Bytes.new(first.size + second.size)
+      # A re-framed release is SHORTER than the two frames, so bound the read: the example
+      # must fail, not hang the suite.
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.read_fully(got)
+      got.should eq(first + second)
+      sink.messages.should eq([{"out", 1, "frag-tail"}])
+    end
+    r.shutdown
+  end
+
+  # Arming a `proto:ws` catch puts EVERY message on this direction through the assembling
+  # pump, including the ones the condition declines. Those are written through untouched, so
+  # they have to reach the origin exactly as they arrived — a PING that sat between two
+  # fragments included. `host:nosuchhost` narrows nothing (`arms_ws_hold?` tests the host
+  # coarsely), which is precisely how an operator arms this by accident.
+  it "keeps an interleaved PING in place for a message the condition declines" do
+    first = masked(WS::OP_TEXT, "AAA".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "pi".to_slice)
+    second = masked(WS::OP_CONT, "BBB".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws body:never-matches-this") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 51_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(ping)
+      r.cs_w.write(second)
+
+      got = Bytes.new(first.size + ping.size + second.size)
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.read_fully(got)
+      got.should eq(first + ping + second)
+      ic.pending_count.should eq(0)
+    end
+    r.shutdown
+  end
+
+  # And the one place the interleave is deliberately given up. A message the operator is
+  # actually holding may not sit on the peer's PONG — that is the liveness argument
+  # `MessageGate`'s header is built on — so the control frame overtakes it, exactly once, and
+  # the message's own frames follow on release with the control frame NOT duplicated.
+  it "lets an interleaved PING overtake a message that is really held, and only then" do
+    first = masked(WS::OP_TEXT, "hold".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "pi".to_slice)
+    second = masked(WS::OP_CONT, "-me".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 52_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(ping)
+      r.cs_w.write(second)
+      wait_until("the hold") { ic.pending_count == 1 }
+
+      # The PING is already through while the message is still parked: a peer's ping timer
+      # cannot be made to wait for a human.
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      early = Bytes.new(ping.size)
+      r.ts_r.read_fully(early)
+      early.should eq(ping)
+
+      ic.forward(ic.pending.first.id)
+      released = Bytes.new(first.size + second.size)
+      r.ts_r.read_fully(released)
+      released.should eq(first + second) # the peer's own frames, and the PING not sent twice
+      sink.messages.should eq([{"out", 9, "pi"}, {"out", 1, "hold-me"}])
+    end
+    r.shutdown
+  end
+
+  it "forwards a still-held message at teardown instead of destroying it" do
+    # The socket ends while the operator still owns the message. `MessageGate#close` runs
+    # from the pump's `ensure`, which is only reached AFTER `Relay.run` has closed both
+    # sockets to unblock the pump's read — so releasing there writes to a dead socket. It
+    # also set `@closed` BEFORE handing the item back, so the wait fiber returned at
+    # `resolve_locked`'s `return if @closed` and the bytes reached neither socket and no
+    # `ws_messages` row, under a log line calling them "released". `Relay.run` settles both
+    # gates while the sockets are still open; fail-open is the disposition every other
+    # involuntary release in this class already takes.
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::RequestOnly)
+      spawn { WS::Relay.run(r.client, r.upstream, 35_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(masked(WS::OP_TEXT, "CLIENT-HELD".to_slice))
+      wait_until("the hold") { ic.pending_count == 1 }
+
+      r.ss_w.close # the origin goes away with the decision still outstanding
+      read_message(r.ts_r).should eq({WS::OP_TEXT, "CLIENT-HELD"})
+      wait_until("the queue row to be given back") { ic.pending_count == 0 }
+      sink.messages.should eq([{"out", 1, "CLIENT-HELD"}])
+    end
+    r.shutdown
+  end
+
+  it "releases what it is holding on #close, before it shuts its own writers down" do
+    # `close` reached directly, without `Relay.run`'s settle in front of it, because the
+    # ORDER inside it was its own defect: `@closed = true` ran first, so the wait fiber woken
+    # by the `forward` below hit `resolve_locked`'s `return if @closed` and the bytes were
+    # written nowhere. `@dst` here is live, so a release that happens lands visibly.
+    dst = IO::Memory.new
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      gate = WS::MessageGate.new("out", dst, 36_i64, sink, ic, HOLD_CTX, mask: true)
+      gate.submit(WS::OP_TEXT, "held".to_slice, nil)
+      wait_until("the hold") { ic.pending_count == 1 }
+      gate.close
+      dst.size.should_not eq(0) # was: zero bytes, and no capture row either
+      read_message(IO::Memory.new(dst.to_slice)).should eq({WS::OP_TEXT, "held"})
+      sink.messages.should eq([{"out", 1, "held"}])
+      ic.pending_count.should eq(0)
+    end
   end
 
   it "hands every still-held message back when the socket dies, leaving no ghost row" do

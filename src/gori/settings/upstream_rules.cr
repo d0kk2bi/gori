@@ -39,23 +39,42 @@ module Gori::Settings
     end
 
     # The password, read from the OS environment at DIAL time (not at load), so exporting a
-    # shell variable takes effect without restarting gori. nil when unset or unnamed — the
-    # caller then attempts an unauthenticated connection, which is the honest behaviour: it
-    # fails at the proxy with a 407 the operator can see, rather than silently sending "".
+    # shell variable takes effect without restarting gori. nil when unset or unnamed.
     def password : String?
       password_env.presence.try { |name| ENV[name]?.presence }
+    end
+
+    # nil when the credentials are usable; the operator's mistake otherwise.
+    #
+    # The old comment argued that an unset variable should fall through to an unauthenticated
+    # connection because "it fails at the proxy with a 407 the operator can see". It does not:
+    # `username` alone still counts as authenticating, so gori sent `Basic base64("user:")` —
+    # an EMPTY password — and the 407 that came back was collapsed into
+    # "host unreachable (DNS/refused/timeout)" by the dialer. The operator saw nothing, least
+    # of all the name of the variable they forgot to export. NAMING a variable is a statement
+    # that a password is required, so an unset one is a configuration error and the dial is
+    # refused before the socket.
+    def credential_error : String?
+      name = password_env.presence
+      return nil unless name
+      return nil if ENV[name]?.presence
+      "$#{name} is unset — the upstream rule names it as the proxy password, so export it " \
+      "(or clear password_env if the proxy needs no password)"
     end
   end
 
   # The resolved decision for ONE destination host: collapses the project override, the rule
   # table and the legacy scalar into a single value, so Upstream.dial has exactly one
   # decision point instead of three branches that can disagree.
+  # `credential_error` is carried on the ROUTE, not re-derived at dial time, because the rule
+  # that produced the route is the only thing that knows which environment variable was named.
   record UpstreamRoute,
     kind : String,
     host : String = "",
     port : Int32 = 0,
     username : String = "",
-    password : String? = nil do
+    password : String? = nil,
+    credential_error : String? = nil do
     def direct? : Bool
       kind == "direct"
     end
@@ -121,7 +140,7 @@ module Gori::Settings
     return UpstreamRoute::DIRECT if rule.direct?
     addr = proxy_addr(rule.addr, default_port: rule.socks5? ? DEFAULT_SOCKS_PORT : DEFAULT_HTTP_PROXY_PORT)
     return UpstreamRoute::DIRECT unless addr
-    UpstreamRoute.new(rule.kind, addr[0], addr[1], rule.username, rule.password)
+    UpstreamRoute.new(rule.kind, addr[0], addr[1], rule.username, rule.password, rule.credential_error)
   end
 
   # An "host:port" string as an unauthenticated HTTP-proxy route, or nil when blank/unparseable.

@@ -88,9 +88,22 @@ module Gori
     # The Layer-1 outcome. `decision` is the WIRE string MCP already emits
     # ("in_scope" | "out_of_scope" | "unscoped") — kept a String so the JSON contract is
     # unchanged. `blocked` is authoritative: no caller re-derives it from `decision`.
-    record Verdict, decision : String, host : String, rule_id : Int64?, blocked : Bool do
+    #
+    # `excluded` is carried ALONGSIDE `decision` rather than as a fourth decision string:
+    # `blocked` is derived from `decision` above, so a new value would have had to be added
+    # to two gate branches to avoid letting an excluded target through the Configured gate.
+    # It exists because every surface phrased an out-of-scope refusal as "add a scope include
+    # rule", and for a target an EXCLUDE rule matched that advice cannot work — an include
+    # never overrides an exclude. The rule to delete is the one to name. Layer 2 already got
+    # this right (see `EXCLUDE_SWEEP_ERROR`); this is Layer 1 catching up.
+    record Verdict, decision : String, host : String, rule_id : Int64?, blocked : Bool,
+      excluded : Bool = false do
       def blocked? : Bool
         blocked
+      end
+
+      def excluded? : Bool
+        excluded
       end
 
       def in_scope? : Bool
@@ -106,6 +119,17 @@ module Gori
     IN_SCOPE     = "in_scope"
     OUT_OF_SCOPE = "out_of_scope"
     UNSCOPED     = "unscoped"
+
+    # The remedy sentence for a Layer-1 refusal, in ONE place so the six surfaces that abort
+    # on `blocked?` cannot each invent their own — and, more to the point, cannot each repeat
+    # the "add a scope include rule" advice for a target an EXCLUDE rule matched, where no
+    # include will ever help. `waiver` is the surface's own spelling of the override flag
+    # (`--allow-unscoped`, `allow_unscoped:true`); nil when the surface has none.
+    def self.remedy(verdict : Verdict, waiver : String?) : String
+      return "delete or narrow the scope EXCLUDE rule that matches it (an include rule cannot override an exclude)" if verdict.excluded?
+      base = "add a scope include rule"
+      waiver ? "#{base} or pass #{waiver}" : base
+    end
 
     getter scope : Scope?
     getter gate : Gate
@@ -169,13 +193,13 @@ module Gori
 
     # The scope verdict for one target URL. Made ONCE, before anything is sent.
     def check(url : String, host : String) : Verdict
-      decision, rule_id = evaluate(url, host)
+      decision, rule_id, excluded = evaluate(url, host)
       blocked = case @gate
                 in Gate::Waived     then false
                 in Gate::Allowlist  then decision != IN_SCOPE
                 in Gate::Configured then decision == OUT_OF_SCOPE
                 end
-      Verdict.new(decision, host, rule_id, blocked)
+      Verdict.new(decision, host, rule_id, blocked, excluded)
     end
 
     # `check` for callers that only need the yes/no (Probe's per-flow active filter).
@@ -307,11 +331,14 @@ module Gori
     # The scope's own reading of a URL, independent of the Gate: the allowlist test Probe
     # Active and the Sandbox gate share (≥1 INCLUDE matches, no EXCLUDE), plus the matched
     # include's rule id for the audit trail.
-    private def evaluate(url : String, host : String) : {String, Int64?}
+    private def evaluate(url : String, host : String) : {String, Int64?, Bool}
       s = @scope
-      return {UNSCOPED, nil} unless s && s.configured?
-      return {OUT_OF_SCOPE, nil} unless s.matches_url?(url, host)
-      {IN_SCOPE, s.rules.find { |r| r.include? && r.matches?(url, host) }.try(&.id)}
+      return {UNSCOPED, nil, false} unless s && s.configured?
+      # `matches_url?` folds "no include matched" and "an EXCLUDE matched" into one false.
+      # They need opposite remedies, so ask the exclude question separately rather than
+      # letting the caller guess from a single out_of_scope.
+      return {OUT_OF_SCOPE, nil, s.excluded?(url, host)} unless s.matches_url?(url, host)
+      {IN_SCOPE, s.rules.find { |r| r.include? && r.matches?(url, host) }.try(&.id), false}
     end
 
     # Throttled in-place reload of the scope from its store so a mid-run rule / Sandbox

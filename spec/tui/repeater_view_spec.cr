@@ -483,15 +483,39 @@ describe Gori::Tui::RepeaterView do
     view.request_text.includes?("Content-Length: 99").should be_false
   end
 
-  # Reconcile fires on every capture-driven data_version tick. The editor holds LF (set_text
-  # strips \r) but the store may hold wire CRLF (MCP create_repeater / import / a peer), so a
-  # naive request_text == row.request compare was LF-vs-CRLF false EVERY poll → apply_peer_request
-  # → set_text → request caret slammed to the top of the pane (only visible in READ mode; INS
-  # locks the tab out of reconcile). request_side_matches? must normalize CRLF so reconcile skips.
-  it "request_side_matches? treats a CRLF-stored request as equal to the LF editor buffer" do
+  # Reconcile fires on every capture-driven data_version tick, and set_text zeroes the caret +
+  # scroll and clears undo — so a compare that is falsely unequal slams the request caret to
+  # the top of the pane on every tick (only visible in READ mode; INS locks the tab out of
+  # reconcile). The compare used to normalize CRLF→LF because the editor could only HOLD LF;
+  # now `request_text` is wire form (TextArea#wire_text, set_text's exact inverse) and the
+  # store row is written from it, so a CRLF-stored request seeded into a CRLF editor is equal
+  # on the nose — which is the path that actually ticks (^R from History, MCP create_repeater,
+  # import: all wire CRLF).
+  it "request_side_matches? is exact on the wire form the store round-trips" do
+    view = RepeaterView.new
+    crlf_row = "GET /a HTTP/1.1\r\nHost: h.test\r\n\r\n"
+    view.restore("https://h.test", crlf_row, false, false)
+    view.request_text.should eq(crlf_row) # the editor gives the row back byte for byte
+    view.request_side_matches?("https://h.test", crlf_row, false, false, nil).should be_true
+
+    # An LF-stored row seeded into an LF editor is equally exact (a pre-fix DB, or MCP writing
+    # LF) — the point is that the editor no longer flattens what it was given.
+    lf = RepeaterView.new
+    lf.restore("https://h.test", "GET /a HTTP/1.1\nHost: h.test\n\n", false, false)
+    lf.request_side_matches?("https://h.test", "GET /a HTTP/1.1\nHost: h.test\n\n",
+      false, false, nil).should be_true
+  end
+
+  # The flip side of exactness, and a deliberate behaviour change: a peer that rewrote ONLY
+  # the line endings changed the bytes gori will put on the wire, so reconcile must NOT skip.
+  # It re-applies once and then matches (the editor now holds the peer's endings), so this
+  # converges — it does not re-slam the caret every tick.
+  it "request_side_matches? treats a line-ending-only difference as a real change" do
     view = RepeaterView.new
     view.restore("https://h.test", "GET /a HTTP/1.1\nHost: h.test\n\n", false, false)
     crlf_row = "GET /a HTTP/1.1\r\nHost: h.test\r\n\r\n"
+    view.request_side_matches?("https://h.test", crlf_row, false, false, nil).should be_false
+    view.apply_peer_request("https://h.test", crlf_row, false, false)
     view.request_side_matches?("https://h.test", crlf_row, false, false, nil).should be_true
   end
 
@@ -500,12 +524,12 @@ describe Gori::Tui::RepeaterView do
   # FuzzerView#apply_peer_session / NotesView#soft_merge_from.
   it "apply_peer_request keeps the request caret when only a non-text field changed" do
     view = RepeaterView.new
-    view.restore("https://h.test", "GET /aaa HTTP/1.1\nHost: h.test\nX-A: 1\nX-B: 2\n\n", false, false)
+    req = "GET /aaa HTTP/1.1\r\nHost: h.test\r\nX-A: 1\r\nX-B: 2\r\n\r\n"
+    view.restore("https://h.test", req, false, false)
     view.pane_advance(1)      # :target → :request
     view.goto_request_line(3) # caret at "X-A: 1", col 0
-    # Same request (as wire CRLF), only http2 flipped → text unchanged → set_text skipped.
-    view.apply_peer_request("https://h.test",
-      "GET /aaa HTTP/1.1\r\nHost: h.test\r\nX-A: 1\r\nX-B: 2\r\n\r\n", true, false)
+    # Same request, only http2 flipped → text unchanged → set_text skipped.
+    view.apply_peer_request("https://h.test", req, true, false)
     view.edit_insert('Z')
     view.request_text.includes?("ZX-A: 1").should be_true # caret preserved mid-buffer
     view.request_text.includes?("ZGET").should be_false   # NOT reset to the top
@@ -704,6 +728,106 @@ describe Gori::Tui::RepeaterView do
     String.new(reqs[1][1]).should eq("GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
   end
 
+  # The group split cuts the buffer on line boundaries, so it has to carry each line's own
+  # terminator across the cut — otherwise a chunk's BODY came out LF-joined and its
+  # Content-Length was resynced down, exactly like the single send did.
+  it "pipeline_requests keeps each chunk's body terminators" do
+    view = RepeaterView.new
+    # The newline before `%%%` belongs to the separator, so the chunk body is `b1\r\nb2` — 6
+    # bytes, and auto-CL must agree with that rather than with the 4 an LF-joined body had.
+    req = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n\r\nb1\r\nb2\r\n" \
+          "%%%\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"
+    view.restore("http://127.0.0.1", req, false, true) # auto-CL on: it must not shrink
+    reqs = view.pipeline_requests
+    reqs.size.should eq(2)
+    String.new(reqs[0][1]).should eq("POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n\r\nb1\r\nb2")
+    String.new(reqs[1][1]).should eq("GET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+  end
+
+  # N1: auto-Content-Length reflected over the WHOLE buffer, so on a `%%%` send-group the
+  # first request's VISIBLE Content-Length covered its body, the separator and the entire
+  # second request (3 → 62). `pipeline_requests` framed each chunk correctly, so the wire was
+  # right and the editor lied — and chunk 2 onwards was never reflected at all.
+  it "reflects auto-Content-Length per %%% chunk, not over the whole buffer" do
+    view = RepeaterView.new
+    view.restore("http://127.0.0.1",
+      "POST /g1 HTTP/1.1\nHost: h\nContent-Length: 99\n\nAAA\n" \
+      "%%%\n" \
+      "POST /g2 HTTP/1.1\nHost: h\nContent-Length: 7\n\nBB\n",
+      false, true) # auto-CL ON → restore reflects
+    lines = view.request_text.split('\n')
+    lines.should contain("Content-Length: 3") # "AAA", not 62
+    lines.should contain("Content-Length: 2") # "BB" — the second chunk is reflected too
+    reqs = view.pipeline_requests
+    String.new(reqs[0][1]).should end_with("Content-Length: 3\r\n\r\nAAA")
+    String.new(reqs[1][1]).should end_with("Content-Length: 2\r\n\r\nBB")
+  end
+
+  # The other side of that: WITHOUT a separator, ^R sends the whole buffer including a
+  # trailing newline, so the reflection must not borrow the group split's blank-edge trim.
+  # It read 32 for a body of 34 while the send framed 34 — the same lie, reversed.
+  it "reflects auto-Content-Length over the whole buffer when there is no %%% separator" do
+    view = RepeaterView.new
+    body = "line1\r\nline2\r\n\r\ntail-after-blank\r\n" # 34 bytes, ENDS in a newline
+    req = "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 99\r\n\r\n#{body}"
+    view.restore("http://127.0.0.1", req, false, true)
+    view.request_text.split("\r\n").should contain("Content-Length: 34")
+    String.new(view.request_bytes).should eq(req.sub("Content-Length: 99", "Content-Length: 34"))
+  end
+
+  # F1: the Repeater's ^R is documented as a byte-exact resend. A captured body is opaque
+  # bytes; only the head is line-structured. The editor used to delete every CR at LOAD, so
+  # `line1\r\nline2` went out as `line1\nline2` under a Content-Length silently resynced DOWN
+  # to match — request smuggling, CRLF-in-body and any 0x0D-bearing format were untestable.
+  it "resends a captured CRLF body byte-exact, with Content-Length untouched" do
+    view = RepeaterView.new
+    req = "POST /crlfbody HTTP/1.1\r\nHost: h\r\nContent-Length: 34\r\n\r\n" \
+          "line1\r\nline2\r\n\r\ntail-after-blank\r\n"
+    view.restore("http://127.0.0.1", req, false, true) # auto-Content-Length ON
+    String.new(view.request_bytes).should eq(req)
+  end
+
+  # The same defect had a SECOND site, upstream of the editor: `origin_form_text` split the
+  # whole captured message into lines and re-joined them with LF before set_text ever saw it,
+  # so the bytes were already gone by the time anything careful ran. Only the request LINE is
+  # rewritten (absolute-form → origin-form); everything after it is passed through verbatim.
+  it "loads a captured flow without flattening the body, absolute-form request line and all" do
+    repeater_tmp_store do |store|
+      body = "line1\r\nline2\r\n\r\ntail\r\n" # 22 bytes
+      head = "POST http://h.test/crlf HTTP/1.1\r\nHost: h.test\r\nContent-Length: 22\r\n\r\n"
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "POST", target: "/crlf", http_version: "HTTP/1.1",
+        head: head.to_slice, body: body.to_slice))
+      view = RepeaterView.new
+      view.load(store.get_flow(id).not_nil!)
+      String.new(view.request_bytes).should eq(
+        "POST /crlf HTTP/1.1\r\nHost: h.test\r\nContent-Length: 22\r\n\r\n#{body}")
+    end
+  end
+
+  it "keeps a bare LF in a body a bare LF, beside the CRs" do
+    view = RepeaterView.new
+    req = "POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 12\r\n\r\nA\u0000B\tC\r\nD\nE(F"
+    view.restore("http://127.0.0.1", req, false, true)
+    String.new(view.request_bytes).should eq(req)
+  end
+
+  # F2: hex mode is the documented byte-exact escape hatch ("sends exactly what you type"),
+  # and it snapshotted the TextArea re-joined with CRLF — inventing an 0x0D in front of every
+  # bare LF in the body. With auto-CL deliberately off in hex mode, those invented bytes
+  # shipped under the older, shorter Content-Length and the remainder was left on the socket
+  # for the origin to read as the next request.
+  it "snapshots the ORIGINAL wire bytes into hex mode, not a CRLF re-join" do
+    view = RepeaterView.new
+    req = "POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 12\r\n\r\nA\u0000B\tC\r\nD\nE(F"
+    view.restore("http://127.0.0.1", req, false, false)
+    view.toggle_request_hex.should be_true
+    String.new(view.request_bytes).should eq(req) # hex bytes ARE the request bytes
+    view.toggle_request_hex.should be_false       # and the trip back is lossless too
+    String.new(view.request_bytes).should eq(req)
+  end
+
   it "pipeline_requests keeps a bodied request's separator (no double terminator)" do
     view = RepeaterView.new
     req = "POST /a HTTP/1.1\nHost: h\nContent-Length: 4\n\ndata\n%%%\nGET /b HTTP/1.1\nHost: h\n"
@@ -794,7 +918,7 @@ describe Gori::Tui::RepeaterView do
         method: "GET", target: "/ws", http_version: "HTTP/1.1",
         head: "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       wview = RepeaterView.new
-      wview.load_ws(store.get_flow(wid).not_nil!, [] of String)
+      wview.load_ws(store.get_flow(wid).not_nil!, [] of Gori::Store::WsOutMessage)
       wview.toggle_http2.should be_false # stays h1 — no flip
       wview.http2?.should be_false
     end
@@ -807,7 +931,8 @@ describe Gori::Tui::RepeaterView do
         method: "GET", target: "/ws/chat", http_version: "HTTP/1.1",
         head: "GET /ws/chat HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       view = RepeaterView.new
-      view.load_ws(store.get_flow(id).not_nil!, ["{\"a\":1}", "ping"])
+      view.load_ws(store.get_flow(id).not_nil!,
+        ["{\"a\":1}", "ping"].map { |t| Gori::Store::WsOutMessage.text(t) })
 
       msgs = view.ws_out_messages
       msgs.size.should eq(2)
@@ -819,6 +944,63 @@ describe Gori::Tui::RepeaterView do
       view.summary.should eq("GET /ws/chat")
     end
   end
+
+  it "replays a captured BINARY message an untouched pane never showed, and KEEPS it once edited" do
+    # The pane is a text projection — one message per line, LF-split — so it cannot carry a
+    # binary payload. Sending the projection back was how a captured binary message became
+    # an opcode-1 text one on every save, and how it vanished from every later replay. The
+    # rule is the WS relay's: gori's own shape only for what the operator actually changed.
+    #
+    # That last sentence is why the "once edited" half of this spec inverted: an edit to a
+    # TEXT line is not a change to the BINARY frame beside it, and treating it as one deleted
+    # the frame from the wire and (on a persisted session) from the database. An edit is now
+    # a position-keyed splice over the seed, so the binary frame keeps its slot.
+    bin = Bytes[0x00, 0xFF, 0x0A, 0x41]
+    repeater_tmp_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "ws.test", port: 443,
+        method: "GET", target: "/ws", http_version: "HTTP/1.1",
+        head: "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
+      view = RepeaterView.new
+      view.load_ws(store.get_flow(id).not_nil!, [
+        Gori::Store::WsOutMessage.text("first"),
+        Gori::Store::WsOutMessage.new(2, bin),
+      ])
+
+      view.ws_out_messages.map(&.opcode).should eq([1, 2])
+      view.ws_out_messages[1].payload.should eq(bin)
+      view.ws_out_messages_raw.map(&.opcode).should eq([1, 2]) # what a save would persist
+      view.ws_out_messages_raw[1].payload.should eq(bin)
+
+      # Editing the TEXT line changes that line and nothing else.
+      view.edit_insert('X')
+      view.ws_out_messages.map(&.opcode).should eq([1, 2])
+      String.new(view.ws_out_messages[0].payload).should eq("Xfirst")
+      view.ws_out_messages[1].payload.should eq(bin)
+      view.ws_out_messages_raw.map(&.opcode).should eq([1, 2])
+      view.ws_out_messages_raw[1].payload.should eq(bin)
+    end
+  end
+
+  it "keeps an unsaved message edit when a peer's request-side change reconciles in" do
+    # `apply_peer_request` runs on every cross-session request-side change and re-seeds the
+    # message pane. Adopting the peer's messages under an unsaved local edit would send
+    # THEIRS while showing OURS — the pane's own `set_text` guard already refused to clobber
+    # the text, and the seed has to refuse alongside it.
+    view = RepeaterView.new
+    ws = "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n"
+    view.restore("https://ws.test", ws, false, true,
+      ws_messages: [Gori::Store::WsOutMessage.text("mine")])
+    view.focus_pane(:request) # restore lands on :target; the message pane is under :request
+    view.edit_insert('!')
+    String.new(view.ws_out_messages[0].payload).should eq("!mine")
+
+    view.apply_peer_request("https://ws.test", ws + "X-Peer: 1\r\n", false, true,
+      ws_messages: [Gori::Store::WsOutMessage.text("theirs")])
+    view.ws_out_messages.size.should eq(1)
+    String.new(view.ws_out_messages[0].payload).should eq("!mine")
+  end
+
   it "allows editing both handshake request and messages in ws_mode" do
     repeater_tmp_store do |store|
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
@@ -826,7 +1008,8 @@ describe Gori::Tui::RepeaterView do
         method: "GET", target: "/ws/chat", http_version: "HTTP/1.1",
         head: "GET /ws/chat HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n".to_slice, body: nil))
       view = RepeaterView.new
-      view.load_ws(store.get_flow(id).not_nil!, ["{\"a\":1}", "ping"])
+      view.load_ws(store.get_flow(id).not_nil!,
+        ["{\"a\":1}", "ping"].map { |t| Gori::Store::WsOutMessage.text(t) })
 
       view.ws_mode?.should be_true
       view.req_pane.should eq(:decoded)
@@ -1379,5 +1562,79 @@ describe Gori::Tui::RepeaterView do
       view.dirty?.should be_true
       view.request_text.should_not contain("Content-Length: 30")
     end
+  end
+end
+
+describe "RepeaterView WebSocket frame shapes (V7)" do
+  ws_head = "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n"
+
+  # The pane is one message per LINE. Until V7 the only thing it could not render was a
+  # binary payload; now a PING, a PONG, a CLOSE with a code, an RSV1 frame, a cleared FIN, a
+  # pinned mask key and a declared length that disagrees with the payload are all capturable
+  # — and every one of them would render as an ORDINARY line of text, so writing the pane
+  # back would silently discard exactly the shape the operator captured it for. Showing it
+  # and then losing it is worse than not showing it: the seed replays it verbatim.
+  it "keeps a shaped or control frame OUT of the pane and IN the seed" do
+    view = RepeaterView.new
+    shape = Gori::Store::WsShape
+    view.restore("https://ws.test", ws_head, false, true, ws_messages: [
+      Gori::Store::WsOutMessage.text("plain"),
+      Gori::Store::WsOutMessage.new(9, "ping".to_slice),
+      Gori::Store::WsOutMessage.new(1, "rsv".to_slice, shape.new(rsv: 4)),
+      Gori::Store::WsOutMessage.new(8, Bytes[0x03, 0xEA]),
+      Gori::Store::WsOutMessage.text("also-plain"),
+    ])
+    # Only the two plain TEXT frames are lines the operator can edit …
+    view.ws_out_messages_raw.size.should eq(5)
+    # … and an untouched pane replays all five, shapes intact.
+    view.ws_out_messages.map(&.opcode).should eq([1, 9, 1, 8, 1])
+    view.ws_out_messages[2].shape.rsv.should eq(4)
+  end
+
+  # An empty (or short) pane with frames still in the seed is exactly the situation where an
+  # operator misreads a result: they see nothing and a PING, a CLOSE 1002 and an RSV1 frame
+  # go out anyway. The MESSAGES border badge and the open-from-History status line read this.
+  it "names the seeded frames the pane is not showing" do
+    view = RepeaterView.new
+    view.restore("https://ws.test", ws_head, false, true, ws_messages: [
+      Gori::Store::WsOutMessage.text("plain"),
+      Gori::Store::WsOutMessage.new(9, "ping".to_slice),
+      Gori::Store::WsOutMessage.new(1, "r".to_slice, Gori::Store::WsShape.new(rsv: 4)),
+      Gori::Store::WsOutMessage.new(1, "u".to_slice, Gori::Store::WsShape.new(masked: false)),
+      Gori::Store::WsOutMessage.new(8, Bytes[0x03, 0xEA] + "bye".to_slice),
+    ])
+    view.ws_unshown_seed.should eq(["PING", "TEXT rsv=4", "TEXT unmasked", "CLOSE"])
+  end
+
+  it "says nothing when every seeded frame IS a plain line" do
+    view = RepeaterView.new
+    view.restore("https://ws.test", ws_head, false, true,
+      ws_messages: ["a", "b"].map { |t| Gori::Store::WsOutMessage.text(t) })
+    view.ws_unshown_seed.should be_empty
+  end
+
+  it "persists and reconciles the Sec-WebSocket-Key toggle" do
+    # Off is the default and stays it: a replayed handshake reusing a captured key looks to a
+    # server exactly like the replay a repeater guard watches for. But the editor SHOWS a key
+    # line gori was silently dropping and re-appending, so the key on the wire was never the
+    # key in the pane.
+    view = RepeaterView.new
+    view.restore("https://ws.test", ws_head, false, true, ws_messages: [] of Gori::Store::WsOutMessage)
+    view.ws_keep_key?.should be_false
+    view.toggle_ws_keep_key.should be_true
+    view.ws_keep_key?.should be_true
+    view.dirty?.should be_true
+    # It is part of the request side, so a peer that flips it must not be skipped by the
+    # reconcile poll's "nothing changed" test.
+    view.request_side_matches?("https://ws.test", ws_head, false, true, nil, false).should be_false
+    view.request_side_matches?("https://ws.test", ws_head, false, true, nil, true).should be_true
+  end
+
+  it "refuses the toggle outside WebSocket mode rather than storing a meaningless flag" do
+    view = RepeaterView.new
+    view.restore("https://h.test", "GET / HTTP/1.1\r\nHost: h.test\r\n\r\n", false, true)
+    view.ws_mode?.should be_false
+    view.toggle_ws_keep_key.should be_false
+    view.ws_keep_key?.should be_false
   end
 end

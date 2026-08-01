@@ -473,4 +473,46 @@ describe Gori::Proxy::Codec::ContentDecode do
     decoded, _ = ContentDecode.decode(head, body)
     String.new(decoded.not_nil!).should eq("HELLO WORLD")
   end
+
+  # A decoder that stopped early must SAY so: probing a truncated or bomb-shaped encoded body
+  # exists precisely to see that it did not finish, and `read_all` swallowed the exception and
+  # returned the partial, so `inflate` still handed back the success note `decoded: gzip`.
+  # The decoded BYTES are unchanged either way — only the report is new — so nothing on the
+  # live proxy path forwards differently.
+  describe "a stream that did not finish" do
+    gz_head = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_slice
+
+    it "names a mid-stream cut in the note, and reports it as incomplete" do
+      full = IO::Memory.new
+      Compress::Gzip::Writer.open(full) { |w| w.print("HELLO-GZIP-BODY-" * 4) }
+      cut = full.to_slice[0, 20]
+      decoded, note, complete = ContentDecode.decode_full(gz_head, cut)
+      complete.should be_false
+      note.should eq("decoded: gzip (stream truncated)")
+      String.new(decoded.not_nil!).should start_with("HELLO-GZI") # the partial is still shown
+    end
+
+    it "reports a COMPLETE gzip stream as complete, with the plain note" do
+      full = IO::Memory.new
+      Compress::Gzip::Writer.open(full) { |w| w.print("HELLO-GZIP-BODY") }
+      decoded, note, complete = ContentDecode.decode_full(gz_head, full.to_slice)
+      complete.should be_true
+      note.should eq("decoded: gzip")
+      String.new(decoded.not_nil!).should eq("HELLO-GZIP-BODY")
+    end
+
+    it "reports a chunked body cut before its 0-chunk" do
+      _, note, complete = ContentDecode.decode_full(head, "5\r\nHEL".to_slice)
+      complete.should be_false
+      note.should eq("de-chunked (stream truncated)")
+      ContentDecode.chunked_complete?("5\r\nHELLO\r\n0\r\n\r\n".to_slice).should be_true
+      ContentDecode.chunked_complete?("5\r\nHEL".to_slice).should be_false
+    end
+
+    it "keeps `decode`'s two-tuple contract for the many callers that want only bytes+note" do
+      decoded, note = ContentDecode.decode(head, "5\r\nHELLO\r\n0\r\n\r\n".to_slice)
+      String.new(decoded.not_nil!).should eq("HELLO")
+      note.should eq("de-chunked")
+    end
+  end
 end

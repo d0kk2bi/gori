@@ -516,8 +516,14 @@ module Gori
     # is the whole lesson of #491: a refusal that does not name its gate is barely better
     # than silence. Each surface prefixes its own prescription (#525's shape).
     def self.unbound_error(names : Array(String)) : String
-      "unbound session binding #{token_list(names)} — nothing has extracted it yet"
+      "#{UNBOUND_PREFIX} #{token_list(names)} — nothing has extracted it yet"
     end
+
+    # The opening words of `unbound_error`, so a surface can recognise its OWN sentence coming
+    # back to it as an engine's `blocked_reason` string and add the prescription it owns
+    # (`gori run` cannot bind at all without a replay step — see CLI::Run.seed_bindings).
+    # A named constant rather than a substring literal at the far end: the two must not drift.
+    UNBOUND_PREFIX = "unbound session binding"
 
     private def self.scan_unresolved(bytes : Bytes, vars : Hash(String, String),
                                      prefix : String, deferred : Array(String)?) : Array(String)
@@ -561,7 +567,17 @@ module Gori
     # verbatim). Returns `bytes.size` when no blank line is found — an all-head
     # buffer (no body), which `expand_wire` then normalizes in full, matching the
     # pre-existing behavior for header-only text.
-    private def self.head_body_boundary(bytes : Bytes) : Int32
+    # The end of the head (index of the first byte of the body) in wire-form bytes:
+    # the FIRST of `\n\n` or `\r\n\r\n`, whichever occurs earlier — never a fixed
+    # preference for one spelling, which is how a body containing a CRLFCRLF has
+    # repeatedly moved this boundary in this codebase. Returns `bytes.size` when the
+    # message has no terminator at all (a hand-authored head is still a head).
+    #
+    # Public because it is the ONLY correct answer to this question and every surface
+    # that splits a request must share it: MCP's History recording used to scan for
+    # `\r\n\r\n` alone and REFUSED to send a bare-LF-terminated request — the exact
+    # payload its `verbatim` flag advertises.
+    def self.head_body_boundary(bytes : Bytes) : Int32
       n = bytes.size
       i = 0
       while i < n

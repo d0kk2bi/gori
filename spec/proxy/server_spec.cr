@@ -20,7 +20,8 @@ private class RecordingSink < Gori::Proxy::FlowSink
     @done.send(nil)
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
   end
 end
 
@@ -1087,6 +1088,41 @@ describe Gori::Proxy::Server do
     sink.requests.first.host.should eq("evil.test")
     sink.responses.first.state.should eq(Gori::Store::FlowState::Aborted)
     sink.responses.first.error.should eq("blocked by sandbox (out of scope)")
+  end
+
+  it "answers 400 (not a silent empty close) when it refuses a request's framing" do
+    # gori is right to refuse CL+TE on the live MITM path (DESIGN P7) — but it used to do it
+    # by closing with ZERO bytes, which on the wire is indistinguishable from the ORIGIN
+    # hanging up. An operator probing a smuggling shape THROUGH gori then cannot tell whose
+    # refusal they measured, and scores gori's own defense as a target finding. The distinct
+    # answer is the point, mirroring the sandbox 403 one gate above.
+    done = Channel(Nil).new(1)
+    store_path = File.tempname("gori-framing", ".db")
+    store = Gori::Store.open(store_path)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    # No origin is started: the refusal must happen before any dial.
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "POST /smug HTTP/1.1\r\nHost: nope.test\r\n" \
+              "Content-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    client.flush
+    resp = client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+    store.close
+    File.delete?(store_path)
+    File.delete?("#{store_path}-wal")
+    File.delete?("#{store_path}-shm")
+
+    resp.should contain("400 Bad Request")
+    resp.should contain("X-Gori-Error: request-framing")
+    # The reason reaches the client, so it matches what History recorded.
+    resp.should contain("Transfer-Encoding and Content-Length both present")
+    sink.responses.first.error.try(&.includes?("request framing rejected")).should be_true
   end
 
   it "sandbox passes an in-scope request through to upstream" do

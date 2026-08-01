@@ -31,6 +31,7 @@ module Gori
         format = :text
         force = false
         allow_unscoped = false
+        bind_from : Int64? = nil
         fail_if_no_matches = false
         matcher = Fuzz::Matcher.new(keep_bodies: :none)
         positional = [] of String
@@ -80,6 +81,7 @@ module Gori
           p.on("--ac", "Auto-calibrate: sample the target's noise and drop matching responses") { auto_cal = true }
           p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
           p.on("--force", "Run even when the request count is huge or unknown") { force = true }
+          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run fuzz") }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--fail-if-no-matches", "Exit 3 when no result matched") { fail_if_no_matches = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -127,6 +129,10 @@ module Gori
         # Calibration SENDS, so it belongs inside the block that releases the read
         # connection — a raise in there would otherwise leak it.
         begin
+          # Session bindings: seed the in-memory table, or refuse before the sweep rather
+          # than after every row of it. See CLI::Run.seed_bindings.
+          (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run fuzz")
+          preflight_bindings(text, bind_from, "gori run fuzz")
           plan.engine.calibrate_baseline if auto_cal
           run_fuzz_stream(plan.engine, mode, origin.scheme, origin.host, origin.port, format, force, fail_if_no_matches, plan.pool)
         ensure
@@ -238,6 +244,13 @@ module Gori
       private def self.fuzz_done(ev : Fuzz::DoneEvent, emitted : Int32, pool : Fuzz::ConnPool?) : Nil
         STDERR.print "\r" if STDERR.tty? # clear the in-place meter (none was drawn when piped)
         STDERR.puts "done · #{ev.progress.sent} sent · #{emitted} shown · #{ev.progress.errors} errors#{ev.stopped ? " (stopped)" : ""}"
+        # Sends stopped BEFORE the socket (Sandbox, an exclude rule, an unbound binding). They
+        # already appear as per-row errors, but a run that is 100% refused reads as "the
+        # target is down" unless the gate is named once, with its remedy.
+        if (blocked = ev.progress.blocked) > 0
+          note = blocked_reason_line(ev.progress.blocked_reason, "gori run fuzz")
+          STDERR.puts "blocked · #{blocked} refused before the socket#{note ? " — #{note}" : ""}"
+        end
         # Handshakes actually paid for. Worth a line: it is how an operator sees whether the
         # origin honoured keep-alive at all (dialed ≈ sent means it closed after every
         # response, or the requests were too odd to share a socket — see ConnPool).

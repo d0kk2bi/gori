@@ -1,5 +1,13 @@
 require "../spec_helper"
 
+# A `Store::FlowDetail` the way a proxy capture stores one.
+private def flow_detail(head : String, body : Bytes? = nil) : Gori::Store::FlowDetail
+  row = Gori::Store::FlowRow.new(
+    id: 1_i64, created_at: 0_i64, scheme: "http", method: "GET", host: "h", port: 80,
+    target: "/", status: 200, size: 0_i64, state: Gori::Store::FlowState::Complete)
+  Gori::Store::FlowDetail.new(row, "HTTP/1.1", head.to_slice, body, nil, nil)
+end
+
 describe Gori::Repeater::FlowRequest do
   describe ".build_target / .parse_target" do
     it "omits the default port and round-trips a normal host" do
@@ -57,6 +65,103 @@ describe Gori::Repeater::FlowRequest do
     it "leaves bytes without a CRLFCRLF separator untouched" do
       wire = "GET /x HTTP/1.1\r\nHost: t\r\n".to_slice
       Gori::Repeater::FlowRequest.resync_content_length(wire).should eq(wire)
+    end
+
+    # RFC 7230 §3.3.3 forbids sending Transfer-Encoding and Content-Length together, so a
+    # message carrying both is a CL.TE / TE.CL smuggling probe and the disagreement IS the
+    # test. `repeater create` (auto-CL on by default) used to "correct" the CL over the
+    # chunked wire form — `Content-Length: 6` went out as `10` — turning the probe into a
+    # different probe with no notice, while the sibling flow-replay path already knew better.
+    it "leaves a message carrying Transfer-Encoding alone, Content-Length or not" do
+      clte = "POST /clte HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGPOST".to_slice
+      Gori::Repeater::FlowRequest.resync_content_length(clte).should eq(clte)
+    end
+
+    it "matches Transfer-Encoding case-insensitively and through leading OWS" do
+      wire = "POST /x HTTP/1.1\r\n transfer-encoding: chunked\r\nContent-Length: 3\r\n\r\nABCDEFGHIJ".to_slice
+      Gori::Repeater::FlowRequest.resync_content_length(wire).should eq(wire)
+    end
+  end
+
+  # The REQUEST-side fact behind the "captured incomplete" replay warning. It used to key on
+  # `FlowRow#state`, which is the whole FLOW's — set by response-side failures too — so the
+  # warning fired on essentially every flow whose response failed and prescribed `-b/--body`
+  # on bodyless GETs that carry no Content-Length at all.
+  describe ".request_short_of_framing?" do
+    it "is FALSE for a bodyless GET (the control case: only its RESPONSE failed)" do
+      head = "GET /r HTTP/1.1\r\nHost: h\r\nUser-Agent: curl/8.7.1\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, nil).should be_false
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, Bytes.empty).should be_false
+    end
+
+    it "is TRUE for a POST whose stored body is shorter than its Content-Length" do
+      head = "POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, "short".to_slice).should be_true
+    end
+
+    it "is FALSE when the stored body matches, or EXCEEDS, its Content-Length" do
+      head = "POST /u HTTP/1.1\r\nContent-Length: 5\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, "hello".to_slice).should be_false
+      # Over-long is a deliberate desync probe (the extra bytes are the smuggled prefix), not
+      # a truncated capture — and the origin will not block on it.
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, "hello-and-more".to_slice).should be_false
+    end
+
+    it "is TRUE for a chunked body cut before its terminating 0-chunk" do
+      head = "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, "5\r\nhel".to_slice).should be_true
+    end
+
+    it "is FALSE for a complete chunked body, even when a CL disagrees" do
+      head = "POST /u HTTP/1.1\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, "5\r\nhello\r\n0\r\n\r\n".to_slice).should be_false
+    end
+
+    it "ignores an unparseable Content-Length rather than guessing" do
+      head = "POST /u HTTP/1.1\r\nContent-Length: not-a-number\r\n\r\n".to_slice
+      Gori::Repeater::FlowRequest.request_short_of_framing?(head, "x".to_slice).should be_false
+    end
+  end
+
+  describe ".build — provenance of the absolute-form rewrite" do
+    it "REPORTS the rewrite it makes, so a surface can say so" do
+      built = Gori::Repeater::FlowRequest.build(flow_detail("GET http://evil.example/abs HTTP/1.1\r\nHost: evil.example\r\n\r\n"))
+      String.new(built.bytes).should start_with("GET /abs HTTP/1.1\r\n")
+      built.rewrote_request_line.should be_true
+    end
+
+    it "reports nothing when there was nothing to rewrite" do
+      built = Gori::Repeater::FlowRequest.build(flow_detail("GET /abs HTTP/1.1\r\nHost: h\r\n\r\n"))
+      built.rewrote_request_line.should be_false
+    end
+
+    # An absolute-form line is a proxy artifact on a proxy capture and the PAYLOAD on a flow
+    # recorded from a direct send (routing / cache-poisoning / SSRF probes are written that
+    # way). Nothing on the row tells them apart, so the operator gets the switch.
+    it "keeps the stored line when the caller opts out of the rewrite" do
+      head = "GET http://evil.example/abs HTTP/1.1\r\nHost: evil.example\r\n\r\n"
+      built = Gori::Repeater::FlowRequest.build(flow_detail(head), rewrite_absolute_form: false)
+      String.new(built.bytes).should eq(head)
+      built.rewrote_request_line.should be_false
+    end
+
+    # The BACKSTOP for an h2 field list recorded as HTTP/1.1 head text: sent verbatim over h1
+    # it makes `:method: POST` the start line, leaves every later header off by one, and gori
+    # then reports the origin's status as if the request had gone out intact.
+    it "refuses a head that opens with an HTTP/2 pseudo-header" do
+      head = ":method: POST\r\n:path: /api\r\n:scheme: http\r\ncookie: sid=abc\r\n\r\n"
+      expect_raises(Gori::Repeater::FlowRequest::PseudoHeaderHead, /pseudo-header/) do
+        Gori::Repeater::FlowRequest.build(flow_detail(head))
+      end
+    end
+
+    # …and refuses NOTHING else. P7 owns every other malformed head here; see
+    # spec/cli/run/replay_reconstruct_spec.cr for the full set.
+    it "still replays every other malformed head" do
+      ["", "GET / HTTP/1.1", "GET /only-two-tokens\r\nHost: h\r\n\r\n",
+       "GET /a b HTTP/1.1\r\nHost: h\r\n\r\n", String.new(Bytes[0x00, 0x01, 0xFF, 0x0A])].each do |head|
+        Gori::Repeater::FlowRequest.build(flow_detail(head)) # must not raise
+      end
     end
   end
 
@@ -141,6 +246,26 @@ describe Gori::Repeater::FlowRequest do
     it "keys on the Content-Type header, not on the text anywhere" do
       raw = "POST /x HTTP/1.1\r\nX-Note: multipart/form-data\r\n\r\na\nb".to_slice
       Gori::Repeater::FlowRequest.normalize_multipart_body(raw).should eq(raw)
+    end
+
+    # The step's premise ("the CRs are already gone — `TextArea#set_text` strips \r off every
+    # line") became FALSE once the editor started round-tripping terminators exactly, so on a
+    # CAPTURED upload it stopped restoring missing delimiters and started corrupting surviving
+    # ones: `alpha\nbeta\ngamma\n` of file content came back `alpha\r\nbeta\r\ngamma\r\n`,
+    # three bytes the operator never captured, with auto-Content-Length re-framing the body so
+    # nothing hung and nothing said a word.
+    it "leaves a CAPTURED multipart body byte-exact — its LFs are file content" do
+      body = "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n" \
+             "Content-Type: text/plain\r\n\r\nalpha\nbeta\ngamma\n\r\n--B--\r\n"
+      raw = ("POST /u HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=B\r\n" \
+             "Content-Length: #{body.bytesize}\r\n\r\n" + body).to_slice
+      Gori::Repeater::FlowRequest.normalize_multipart_body(raw).should eq(raw)
+    end
+
+    it "still fixes a freshly TYPED multipart, whose body has no CRLF anywhere" do
+      raw = "POST /u HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=B\r\n\r\n--B\nX: 1\n\nhi\n--B--\n".to_slice
+      String.new(Gori::Repeater::FlowRequest.normalize_multipart_body(raw))
+        .should end_with("--B\r\nX: 1\r\n\r\nhi\r\n--B--\r\n")
     end
   end
 end

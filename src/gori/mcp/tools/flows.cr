@@ -75,11 +75,13 @@ module Gori
       private def get_response_body_chunk(h) : Result
         options = body_chunk_options(h)
 
-        loaded = load_response_body(options.flow_id, options.repeater_id)
+        loaded = load_chunk_source(options)
         return loaded if loaded.is_a?(Result)
         head, body = loaded
         stored = body || Bytes.new(0)
-        decoded, decode_note = options.raw ? {nil, nil} : Proxy::Codec::ContentDecode.decode(head, stored)
+        # A REQUEST part is stored wire bytes, not a content-encoded response entity: there is
+        # nothing to decode and decoding would be a lie about what is on disk.
+        decoded, decode_note = (options.raw || options.request?) ? {nil, nil} : Proxy::Codec::ContentDecode.decode(head, stored)
         bytes = decoded || stored
         total = bytes.size.to_i64
         # The decoded view is capped at ContentDecode::MAX_OUT (decompression-bomb ceiling).
@@ -102,6 +104,7 @@ module Gori
           j.object do
             j.field "flow_id", options.flow_id
             j.field "repeater_id", options.repeater_id
+            j.field "part", options.part
             j.field "requested_offset", requested
             j.field "offset", start
             j.field "offset_out_of_range", true if offset_out_of_range
@@ -135,9 +138,36 @@ module Gori
         if flow_id.nil? == repeater_id.nil?
           raise Gori::Error.new("pass exactly one of flow_id or repeater_id")
         end
+        part = str(h, "part") || "response"
+        unless part == "response" || part == "request"
+          raise Gori::Error.new("invalid 'part' #{part.inspect} (expected \"response\" or \"request\")")
+        end
         offset = bounded_int_arg(h, "offset", 0_i64, min: 0_i64)
         limit = bounded_int_arg(h, "limit", 65_536_i64, min: 1_i64, max: 262_144_i64).to_i
-        BodyChunkOptions.new(flow_id, repeater_id, offset, limit, bool_arg(h, "raw", false))
+        BodyChunkOptions.new(flow_id, repeater_id, offset, limit, bool_arg(h, "raw", false), part)
+      end
+
+      # The bytes this chunk pages over: {head-for-decoding, payload}.
+      private def load_chunk_source(options : BodyChunkOptions) : {Bytes?, Bytes?} | Result
+        return load_response_body(options.flow_id, options.repeater_id) unless options.request?
+        if id = options.repeater_id
+          repeater = store.get_repeater(id)
+          return not_found("no repeater with id #{id}") unless repeater
+          # The stored blob IS head+body, byte-exact — the same bytes `send_request
+          # {repeater_id}` replays. That is exactly what a caller reading past
+          # get_repeater_context's cap wants.
+          {nil, repeater.request}
+        elsif id = options.flow_id
+          detail = store.get_flow(id)
+          return not_found("no flow with id #{id}") unless detail
+          # `get_flow` already returns a captured request head with a base64 companion; this
+          # is the paged route to the same bytes plus the body, for a request too big to inline.
+          head = detail.request_head || Bytes.new(0)
+          body = detail.request_body
+          {nil, body ? Bytes.new(head.size + body.size) { |i| i < head.size ? head[i] : body[i - head.size] } : head}
+        else
+          Result.new("pass exactly one of flow_id or repeater_id", is_error: true)
+        end
       end
 
       # Hard-delete ONE captured flow (the TUI History tab's delete). Single and explicit,

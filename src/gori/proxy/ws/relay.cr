@@ -36,7 +36,14 @@ module Gori::Proxy::WS
   # hold's edit is a STAGE inside that pipeline, not a second one beside it — two pipelines
   # would mean the operator editing bytes the rules had not seen, or rules re-running over an
   # operator's edit. Even on that path, a message neither stage changed goes out as the peer's
-  # own frame bytes, mask key and all.
+  # own frames — every fragment, in order, with its own FIN/RSV bits and mask key, and with
+  # any PING/PONG that arrived BETWEEN the fragments still sitting where it arrived (RFC 6455
+  # §5.4). That last clause is not decoration: whether a peer tolerates a control frame
+  # mid-message is a standard hardening probe, so hoisting one — which is what this pump did
+  # to every socket with a rule or a catch armed, matching or not — deletes the test rather
+  # than running it. The interleave is given up at exactly one point, and only for the message
+  # it applies to: when an intercept hold actually PARKS the message, where a control frame
+  # cannot wait for a human (see `MessageGate`'s header).
   module Relay
     # Cap on a reassembled (possibly fragmented) message we buffer for capture.
     # The raw forward is always byte-exact (P7); only the captured projection is
@@ -55,14 +62,62 @@ module Gori::Proxy::WS
     # see SocketTuning.relax in ClientConn), so it's kept well under the proxy's 30 s
     # baseline IO timeout (SocketTuning::CLIENT_IO_TIMEOUT / Upstream::IO_TIMEOUT): a real
     # peer replies near-instantly, and a dead one shouldn't pin the tunnel for 30 s.
+    #
+    # It is ALSO, once a hold is armed, the operator's decision window: from the moment
+    # either peer sends CLOSE, an undecided held message has this long. It is not
+    # configurable, and deliberately so — a longer window buys nothing, because the message
+    # is not destroyed at the deadline any more. `settle` forwards it unedited while the
+    # sockets are still open (the disposition every other involuntary release here takes),
+    # `warn_close_deadline` says the window expired, and the ws_messages row is written. A
+    # setting would only let an operator hold a dead-peer tunnel open longer.
     CLOSE_TIMEOUT = 5.seconds
+
+    # PING/PONG frames recorded per direction, per socket, before capture stops.
+    #
+    # Control frames were not captured AT ALL until V7, which cost the operator the CLOSE
+    # code and reason — the single most diagnostic thing a failed WebSocket test produces,
+    # and something the repeater engine already reported (`Result#close_code`), so the two
+    # surfaces disagreed about the same protocol. A PING payload is a real covert channel
+    # and a real length-check bug site, and it was invisible too.
+    #
+    # But `insert_ws_message` BLOCKS until the write commits, and PING/PONG is the one frame
+    # type a peer can emit without bound and without the operator's app doing anything. An
+    # uncapped capture would throttle the relay to DB speed on a ping flood — a cost the
+    # forward path did not have before, on frames nobody asked to see. So keepalives are
+    # bounded and CLOSE is not: there is at most one CLOSE per direction, and it is the whole
+    # reason this exists. Crossing the bound writes one marker row rather than going quiet.
+    MAX_CONTROL_CAPTURE = 64
+
+    # How many control frames may be parked between the fragments of ONE assembling message
+    # so their arrival position can be reproduced on the wire (see `AssemblingPump`).
+    #
+    # A ceiling and not a policy. Parking is what keeps the interleave, but a peer that opens
+    # a message with `TEXT fin=0` and then pings forever would park a PONG the far end's
+    # 20-30 s ping timer is waiting for (RFC 6455 §5.5.2/§5.5.3) — the exact liveness failure
+    # `MessageGate`'s header exists to prevent. Past this many, exactness is given up for that
+    # message: everything parked is written out at once and the rest of the message's control
+    # frames overtake it as they always did. §5.5 caps a control payload at 125 bytes, so this
+    # bounds the parked bytes too.
+    MAX_PARKED_CONTROLS = 8
+
+    # Prefix on a row this relay wrote about the SOCKET rather than about a frame a peer
+    # sent. Already the convention for the oversized-frame and ping-flood markers; a notice
+    # from the handshake is the same kind of statement and must be as unmistakable.
+    NOTICE_PREFIX = "[gori] "
 
     # `rewriter` is the Match & Replace seam (#500 step 1) and `interceptor` the hold seam
     # (step 2); `ctx` is the 101 handshake's identity, which both scope on. All three default
     # to "off", so every caller that only relays keeps today's byte-exact path.
+    #
+    # `notice` is something the HANDSHAKE settled that the frames cannot show — today, what
+    # gori did with `Sec-WebSocket-Extensions` (#518). It is recorded as the first
+    # `ws_messages` row so it sits above the frames it explains and travels wherever they do:
+    # History's WS pane, `gori run show`, MCP `get_flow`, an export. A `gori.log` line reaches
+    # only an operator who already knew to tail it.
     def self.run(client : IO, upstream : IO, flow_id : Int64, sink : FlowSink,
                  rewriter : HeadRewriter? = nil, ctx : Context = Context::NONE,
-                 interceptor : Gori::Interceptor? = nil) : Nil
+                 interceptor : Gori::Interceptor? = nil, notice : String? = nil) : Nil
+      record_notice(sink, flow_id, notice)
       # Asked ONCE per socket, not per message: a rule or the catch condition can change
       # mid-connection, but re-deciding per message would put a lock on the hot path for an
       # answer that is "no" for every socket in the common case. The next handshake picks up
@@ -101,8 +156,15 @@ module Gori::Proxy::WS
           second_pending = false # other side finished within the window (reply relayed, or its own end)
         when timeout(CLOSE_TIMEOUT)
           # peer never replied — give up waiting; the pump below is reaped after closing.
+          warn_close_deadline(out_gate, in_gate)
         end
       end
+      # Resolve both hold queues BEFORE the sockets go. `MessageGate#close` runs from the
+      # pump's `ensure`, which is only reached because the two lines below unblocked its
+      # read — so a message released there is written to a socket that is already gone. This
+      # is the one moment at which a held message can still reach its peer.
+      out_gate.try(&.settle("the socket is closing"))
+      in_gate.try(&.settle("the socket is closing"))
       client.close rescue nil
       upstream.close rescue nil
       # Every path above consumes exactly one of the two `done` sends before this point
@@ -110,6 +172,31 @@ module Gori::Proxy::WS
       # sockets just unblocked its pending read) — `run` must never return with a pump
       # fiber still alive.
       done.receive if second_pending
+    end
+
+    # The handshake's advisory as a `ws_messages` row, ahead of any frame. Direction "in":
+    # what it reports is what gori did to (or found in) the ORIGIN's 101. Best-effort — a
+    # capture write that fails must never stop the socket from relaying.
+    private def self.record_notice(sink : FlowSink, flow_id : Int64, notice : String?) : Nil
+      n = notice
+      return if n.nil? || n.empty?
+      sink.on_ws_message(flow_id, "in", OP_TEXT.to_i, "#{NOTICE_PREFIX}#{n}".to_slice)
+    rescue
+      nil
+    end
+
+    # CLOSE_TIMEOUT just expired with a message still held. Nothing else tells the operator
+    # that their decision window closed — the queue row simply vanishes from the TUI — and
+    # "why did my held message go out unedited" is unanswerable without this line.
+    private def self.warn_close_deadline(out_gate : MessageGate?, in_gate : MessageGate?) : Nil
+      held = [out_gate, in_gate].compact.select(&.pending?)
+      return if held.empty?
+      ::Log.warn do
+        "ws: a peer sent CLOSE and the other side did not answer within " \
+        "#{CLOSE_TIMEOUT.total_seconds.to_i}s — " \
+        "the decision window for #{held.size == 1 ? "a" : "both"} direction's held message(s) " \
+        "is over; they are being forwarded unedited before the tunnel is torn down"
+      end
     end
 
     # This direction's Match & Replace lens, or nil when no `part: ws` rule can reach this
@@ -158,6 +245,8 @@ module Gori::Proxy::WS
       message_opcode = OP_TEXT
       scratch = Bytes.new(STREAM_CHUNK)
       clean_close = false
+      shape = MessageShape.new
+      controls = 0
       loop do
         h = WS.read_header(src) || break
         # A new data message arriving while the previous one never sent its FIN is an RFC 6455
@@ -168,7 +257,7 @@ module Gori::Proxy::WS
         # it too; the default pump, which every socket with no rule and no hold runs, did not —
         # so the two pumps disagreed about identical bytes. Capture only: the wire is untouched.
         if h.data? && h.opcode != OP_CONT
-          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode)
+          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode, shape)
           message_opcode = h.opcode
         end
 
@@ -176,7 +265,7 @@ module Gori::Proxy::WS
           # Flush any buffered leading fragments of this message before the oversized-frame
           # marker, so captured prefix bytes aren't dropped and a later small FIN fragment
           # can't be surfaced as if it were the whole message.
-          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode) if h.data?
+          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode, shape) if h.data?
           break unless forward_oversized_frame(src, dst, h, direction, flow_id, sink, message_opcode, scratch)
           if h.close? # an oversized CLOSE still terminates the tunnel, like a normal one
             clean_close = true
@@ -188,7 +277,9 @@ module Gori::Proxy::WS
         frame = WS.read_body(src, h) || break
         dst.write(frame.raw)
         dst.flush
-        assembling = capture_frame(frame, assembling, direction, flow_id, sink, message_opcode)
+        controls = capture_control(frame, direction, flow_id, sink, controls)
+        shape.note(frame) if frame.data?
+        assembling = capture_frame(frame, assembling, direction, flow_id, sink, message_opcode, shape)
         if frame.close?
           clean_close = true
           break
@@ -206,7 +297,8 @@ module Gori::Proxy::WS
       # `ensure` types every body-assigned local as nilable (the raise could precede the
       # assignment), so bind it before asking.
       if buf = assembling
-        emit_pending(buf, direction, flow_id, sink, message_opcode || OP_TEXT) rescue nil
+        emit_pending(buf, direction, flow_id, sink, message_opcode || OP_TEXT,
+          shape || MessageShape.new) rescue nil
       end
     end
 
@@ -217,10 +309,37 @@ module Gori::Proxy::WS
     # copies and one omission between them, which is how the merged-row and dropped-bytes bugs
     # got in; `AssemblingPump` has the same three moments and its own equivalents.
     private def self.emit_pending(assembling : IO::Memory, direction : String, flow_id : Int64,
-                                  sink : FlowSink, message_opcode : UInt8) : IO::Memory
+                                  sink : FlowSink, message_opcode : UInt8,
+                                  shape : MessageShape) : IO::Memory
       return assembling if assembling.size == 0
-      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup)
+      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)
       assembling.size > RESET_THRESHOLD ? IO::Memory.new : assembling.tap(&.clear)
+    end
+
+    # Record a control frame (RFC 6455 §5.5). Returns the running PING/PONG count for this
+    # direction — see MAX_CONTROL_CAPTURE for why CLOSE is exempt from it.
+    #
+    # The forward already happened: this is capture only, and it runs AFTER the write for the
+    # same reason every other capture call here does — a blocking DB round-trip must never sit
+    # between a peer's frame and its delivery.
+    def self.capture_control(frame : WS::Frame, direction : String, flow_id : Int64,
+                             sink : FlowSink, seen : Int32) : Int32
+      return seen if frame.data?
+      if frame.close?
+        sink.on_ws_message(flow_id, direction, frame.opcode.to_i, frame.payload.dup, frame.shape)
+        return seen
+      end
+      n = seen + 1
+      if n <= MAX_CONTROL_CAPTURE
+        sink.on_ws_message(flow_id, direction, frame.opcode.to_i, frame.payload.dup, frame.shape)
+      elsif n == MAX_CONTROL_CAPTURE + 1
+        # One marker, then silence — but the operator is told which it is. A capture that
+        # simply stops looks exactly like a peer that stopped pinging.
+        marker = "[gori] more than #{MAX_CONTROL_CAPTURE} ping/pong frames on this direction; " \
+                 "the rest are forwarded but not recorded".to_slice
+        sink.on_ws_message(flow_id, direction, frame.opcode.to_i, marker, frame.shape)
+      end
+      n
     end
 
     # The assembling pump for ONE direction (#500). Only reached when a `part: ws` rule can
@@ -252,11 +371,38 @@ module Gori::Proxy::WS
     private class AssemblingPump
       @buffer = IO::Memory.new
       @opcode = OP_TEXT
-      @passthrough = false       # this message fell back to frame-by-frame byte-exact forwarding
-      @rewritable = false        # ... and this one is eligible for Match & Replace (TEXT + a live rule)
-      @fresh = true              # no data frame of this message has been buffered yet
-      @single_raw : Bytes? = nil # the message's own wire bytes, when it arrived as ONE frame
+      @passthrough = false # this message fell back to frame-by-frame byte-exact forwarding
+      @rewritable = false  # ... and this one is eligible for Match & Replace (TEXT + a live rule)
+      # This message's own wire frames, concatenated in arrival order — headers, FIN/RSV bits
+      # and mask keys included. Re-emitted verbatim whenever nothing changed the payload, which
+      # is what keeps the invariant above true for a FRAGMENTED message too. It used to hold
+      # only a single frame's `raw` (`@fresh && frame.fin?`), so every multi-frame message went
+      # out re-framed as ONE frame under a mask key gori invented — including messages no rule
+      # matched, on a socket armed for a rule scoped to some other host. Fragmentation IS the
+      # payload for per-frame length checks and WAF/IDS bypass tests, so removing it removed
+      # the property under test.
+      @raw = IO::Memory.new
+      @raw_kept = true # ... and whether those bytes are still complete (see MAX_MESSAGE)
+      # PING/PONG frames that arrived BETWEEN this message's fragments, each paired with the
+      # offset into `@raw` it arrived at. They are NOT on the wire yet: writing them the
+      # instant they arrive is what hoisted a control frame ahead of the fragments it was
+      # interleaved with, on every socket where a `part: ws` rule or a `proto:ws` catch was
+      # armed — even one whose condition matched nothing. Individual frame bytes survived
+      # that; the SEQUENCE did not, and the sequence is the §5.4 question.
+      #
+      # Bounded by MAX_PARKED_CONTROLS, and only ever populated while this message is still
+      # un-rewritten and un-held: `park_control?` declines on the passthrough path (whose
+      # frames are already on the wire, so the order is kept for free) and `emit_message`
+      # hands them to the gate the moment a hold actually parks the message.
+      @parked = [] of {Int32, Bytes}
+      @parked_overflowed = false
+      @in_bypass = false # the gate's lock is already held, so writes must not re-take it
       @scratch : Bytes
+      # The V7 frame-shape accumulator and this direction's ping/pong capture budget. Both
+      # pumps have to record identical facts about identical bytes, or an operator's finding
+      # would depend on whether a rule happened to be live on some other host.
+      @shape = MessageShape.new
+      @controls = 0
 
       def initialize(@src : IO, @dst : IO, @direction : String, @flow_id : Int64,
                      @sink : FlowSink, @rewriter : HeadRewriter?, @ctx : Context,
@@ -294,21 +440,32 @@ module Gori::Proxy::WS
         # so dropping them silently is a difference between the two pumps that should not
         # exist. Best-effort: this path is usually taken BECAUSE a peer went away.
         #
-        # GATED sockets are deliberately excluded, and NOT because of ordering. `bypass` runs
-        # `fail_open_locked` before it yields, so routing this through it would force every
-        # still-undecided held message out to the origin on any abnormal end — flipping
-        # `MessageGate#close`'s deliberate discard into a fail-open as a side effect, for
-        # messages the operator never looked at. With a gate armed, what happens to withheld
-        # bytes at teardown is `close`'s decision and it has already made it.
+        # GATED sockets are deliberately excluded. `Relay.run` closes both sockets to unblock
+        # this pump's read, so by the time this `ensure` runs on a gated socket the write has
+        # nowhere to go — and `flush_withheld` also writes a `ws_messages` row, which would
+        # then claim a delivery that did not happen. `run` has already given the gate its one
+        # real chance (`MessageGate#settle`, while the sockets were still open).
         (flush_withheld rescue nil) if @gate.nil?
       end
 
-      # A control frame (ping/pong/close) never takes part in a rewrite or a hold and is
-      # forwarded the instant it arrives, byte-exact, even in the middle of a fragmented data
-      # message (RFC 6455 §5.4). Parking a PONG behind an assembling or held message is how a
-      # server's 20-30 s ping timer would close the socket out from under the operator — and
-      # on the hold path that is not a refinement, it is the whole reason this pump may not
-      # block. See `MessageGate`'s header.
+      # A control frame (ping/pong/close) never takes part in a rewrite or a hold, and it is
+      # forwarded byte-exact. WHEN it is forwarded has two answers, and the difference is the
+      # §5.4 interleave.
+      #
+      # While this pump is withholding a message's fragments and nothing has yet been changed
+      # or held, the frame is PARKED at its arrival position (`park_control?`) and rides out
+      # inside the message's own wire bytes — so `TEXT fin=0 "AAA"` / `PING` / `CONT fin=1
+      # "BBB"` reaches the peer in that order, the order the byte-exact pump has always given
+      # it. Writing it immediately instead put the PING first on every socket with a `part:
+      # ws` rule or a `proto:ws` catch armed, matching or not, which silently deleted the
+      # test an operator arms such a socket to run.
+      #
+      # Everywhere else it goes out the instant it arrives: between messages, on the
+      # passthrough path (whose fragments are already on the wire), past the parking ceiling,
+      # and — the one that matters — the moment a hold actually PARKS the message. Holding a
+      # PONG behind a human is how a server's 20-30 s ping timer closes the socket out from
+      # under the operator, and on that path it is not a refinement, it is the whole reason
+      # this pump may not block. See `MessageGate`'s header.
       #
       # A CLOSE is the one control frame that cannot simply overtake: §5.5.1 forbids data
       # frames after it, so anything still queued would never reach the peer. Design D5
@@ -337,12 +494,88 @@ module Gori::Proxy::WS
             flush_withheld
             write_direct(ctl.raw)
           end
+        elsif park_control?(ctl)
+          # Nothing on the wire yet: it leaves with the message it is interleaved with.
         elsif gate = @gate
           gate.write_control(ctl.raw)
         else
           write_direct(ctl.raw)
         end
+        # After the forward, exactly like `Relay.pump` — the two pumps must record the same
+        # control frames or the CLOSE code would depend on whether a rule was live.
+        @controls = Relay.capture_control(ctl, @direction, @flow_id, @sink, @controls)
         true
+      end
+
+      # Park this control frame at its arrival position inside the message being assembled,
+      # answering whether it was taken (the caller then writes nothing). Declined when there
+      # is no assembling message to interleave it with, when this message's own wire bytes
+      # are gone anyway (passthrough, or past the raw cap — in both cases the fragments are
+      # already on the wire, so arrival order is preserved by writing straight through), and
+      # once MAX_PARKED_CONTROLS have piled up.
+      private def park_control?(ctl : WS::Frame) : Bool
+        return false if @passthrough || !@raw_kept || @raw.size == 0
+        if @parked.size >= MAX_PARKED_CONTROLS
+          # A message that never ends must not sit on the peer's PONG. Give up exactness for
+          # this message, say so once, and let this frame and every later one overtake.
+          warn_parking_ceiling
+          flush_parked
+          return false
+        end
+        @parked << {@raw.size, ctl.raw.dup}
+        true
+      end
+
+      # Write every parked control frame out, in arrival order, ahead of the message they
+      # arrived inside. The disposition when the interleave cannot be reproduced: gori is
+      # re-framing the message, a hold has parked it, or the ceiling above tripped.
+      private def flush_parked : Nil
+        return if @parked.empty?
+        bytes = parked_bytes
+        @parked.clear
+        return unless bytes
+        if (gate = @gate) && !@in_bypass
+          gate.write_control(bytes)
+        else
+          write_direct(bytes)
+        end
+      end
+
+      # The parked frames' bytes, concatenated in arrival order, or nil when none.
+      private def parked_bytes : Bytes?
+        return nil if @parked.empty?
+        io = IO::Memory.new
+        @parked.each { |(_, bytes)| io.write(bytes) }
+        io.to_slice
+      end
+
+      # This message's own wire bytes with the parked control frames spliced back in at the
+      # offsets they arrived at — the exact octets the peer wrote, in the exact order. With
+      # nothing parked (the common case even here) it is a VIEW into `@raw` and costs nothing;
+      # a caller that outlives this message — only the gate does — dups it.
+      private def interleaved_raw : Bytes
+        return @raw.to_slice if @parked.empty?
+        data = @raw.to_slice
+        io = IO::Memory.new(data.size + 32)
+        pos = 0
+        @parked.each do |(at, bytes)|
+          io.write(data[pos, at - pos]) if at > pos
+          io.write(bytes)
+          pos = at
+        end
+        io.write(data[pos, data.size - pos]) if pos < data.size
+        io.to_slice
+      end
+
+      private def warn_parking_ceiling : Nil
+        return if @parked_overflowed
+        @parked_overflowed = true
+        ::Log.warn do
+          "ws #{@direction}: more than #{MAX_PARKED_CONTROLS} control frames arrived between " \
+          "the fragments of one message — forwarding them ahead of it so the peer's ping " \
+          "timer still sees a reply. The frames are byte-exact; their position relative to " \
+          "this message's fragments is not"
+        end
       end
 
       # A new message begins.
@@ -370,8 +603,7 @@ module Gori::Proxy::WS
         @opcode = opcode
         @rewritable = opcode == OP_TEXT && !@rewriter.nil?
         @passthrough = !@rewritable && @gate.nil?
-        @fresh = true
-        @single_raw = nil
+        reset_raw
       end
 
       # A frame too large to buffer: this message can no longer be rewritten OR held. Put
@@ -384,7 +616,7 @@ module Gori::Proxy::WS
         # the "[gori] N-byte … too large to capture" marker ABOVE the fragment it followed, so
         # the two pumps disagreed about an identical frame sequence.
         prefix = @buffer.size > 0 ? @buffer.to_slice.dup : nil
-        prefix.try { |p| @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, p) }
+        prefix.try { |p| @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, p, @shape.take) }
         forwarded = bypassing("a frame too large to buffer arrived") do
           flush_buffered unless @passthrough
           Relay.forward_oversized_frame(@src, @dst, h, @direction, @flow_id, @sink, @opcode, @scratch)
@@ -392,14 +624,15 @@ module Gori::Proxy::WS
         reset_buffer if prefix
         @passthrough = true
         @rewritable = false
-        @single_raw = nil
+        reset_raw
         forwarded
       end
 
       private def handle_data(frame : WS::Frame) : Nil
+        @shape.note(frame)
         if @passthrough
           write_direct(frame.raw)
-          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode)
+          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode, @shape)
           return
         end
         # Outgrowing the buffer we are willing to hold. Put what we have on the wire and let
@@ -413,13 +646,30 @@ module Gori::Proxy::WS
           end
           @passthrough = true
           @rewritable = false
-          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode)
+          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode, @shape)
           return
         end
-        @single_raw = @fresh && frame.fin? ? frame.raw : nil
-        @fresh = false
+        keep_raw(frame)
         @buffer.write(frame.payload)
         emit_message if frame.fin?
+      end
+
+      # Accumulate this frame's own wire bytes. Bounded by MAX_MESSAGE like the payload
+      # buffer, because framing overhead is per-frame and a peer sending millions of
+      # one-byte fragments would otherwise cost more here than the payload cap allows.
+      # Past the cap the message simply loses its byte-exact form and is re-framed, the
+      # same disposition every other over-the-cap path in this class takes.
+      private def keep_raw(frame : WS::Frame) : Nil
+        return unless @raw_kept
+        if @raw.size + frame.raw.size > MAX_MESSAGE
+          # The frames these were parked between are gone, so there is no position left to
+          # hold them at. Out they go, ahead of whatever this message is re-framed as.
+          flush_parked
+          @raw_kept = false
+          @raw = IO::Memory.new
+          return
+        end
+        @raw.write(frame.raw)
       end
 
       # The message is complete. ONE pipeline: rewrite, then hold, then the wire.
@@ -432,32 +682,47 @@ module Gori::Proxy::WS
       #
       # Past the gate, a rewritten OR edited message MUST go out as ONE frame — once its
       # length changes the sender's fragmentation cannot be reproduced — but a message nothing
-      # changed is forwarded as the peer's own frame, mask key and all, whenever it arrived as
-      # a single frame.
+      # changed is forwarded as the peer's OWN frames: every fragment, in order, with its own
+      # FIN/RSV bits and its own mask key.
       private def emit_message : Nil
         payload = @buffer.to_slice
         rewritten = rewrite(payload)
-        raw = (r = @single_raw) && rewritten == payload ? r : nil
+        # The gate outlives this call and reuses its own buffers, so it gets a copy; the
+        # direct write below is done with the bytes before `reset_buffer` runs and does not.
+        reusable = @raw_kept && @raw.size > 0 && rewritten == payload
+        # The shape belongs to whatever goes on the wire, not to what arrived. Re-framing is
+        # the one moment gori's own framing replaces the sender's, so the row has to say so —
+        # otherwise a rewritten message would claim the RSV bits and the fragment count of the
+        # frames it just replaced.
+        arrived = @shape.take
+        emitted = reusable ? arrived : WS::Shape.new(masked: @mask)
+        # gori is re-framing this message, so the sender's fragmentation is gone and there is
+        # no position left to hold an interleaved control frame at. Out it goes ahead of the
+        # message — what this pump did for EVERY message before parking existed.
+        flush_parked unless reusable
         if gate = @gate
           # Never blocks: the gate either writes through or parks the message and waits on a
           # fiber of its own, so the next frame — including a PING — is read immediately.
-          gate.submit(@opcode, rewritten, raw)
+          # It gets the message's frames in both forms because only IT knows which applies:
+          # written through, the peer's own interleave goes back on the wire; parked on a
+          # hold, the control frames are split back out and sent now (see `WS::RawFrames`).
+          gate.submit(@opcode, rewritten,
+            reusable ? WS::RawFrames.new(interleaved: interleaved_raw.dup,
+              data_only: @raw.to_slice.dup, controls: parked_bytes) : nil,
+            arrived)
         else
-          write_direct(raw || WS.encode(@opcode, rewritten, mask: @mask, fin: true))
+          write_direct(reusable ? interleaved_raw : WS.encode(@opcode, rewritten, mask: @mask, fin: true))
           # Record what gori WROTE rather than what arrived, the way #513 keeps P7 on h2: the
           # capture has to be the bytes the peer actually sees.
-          @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, rewritten.dup)
+          @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, rewritten.dup, emitted)
         end
-        reset_buffer
         # This message is over, so the NEXT data frame starts one — even a stray `OP_CONT`,
-        # which does not go through `start_message`. Without the reset that frame found
-        # `@fresh == false`, dropped its own `raw`, and was re-emitted under the PREVIOUS
-        # message's opcode with a fresh mask key: gori silently REPAIRING a §5.4 violation
-        # that the byte-exact pump passes through for the peer to judge. That breaks this
-        # class's stated invariant — gori's own framing is used only for a message a rule or
-        # the operator actually changed.
-        @fresh = true
-        @single_raw = nil
+        # which does not go through `start_message`. Without `reset_buffer`'s reset of the
+        # accumulated wire bytes, that frame would ride out behind the PREVIOUS message's
+        # frames: gori silently REPAIRING a §5.4 violation that the byte-exact pump passes
+        # through for the peer to judge. That breaks this class's stated invariant — gori's
+        # own framing is used only for a message a rule or the operator actually changed.
+        reset_buffer
       end
 
       # Match & Replace, or the payload untouched when this message is not eligible (binary,
@@ -468,13 +733,21 @@ module Gori::Proxy::WS
         @direction == "out" ? rw.rewrite_ws_out(payload, @ctx.host) : rw.rewrite_ws_in(payload, @ctx.host)
       end
 
-      # Emit everything buffered so far as a NON-final frame, so the rest of the message can
-      # stream byte-exact behind it. Reached at most once per message (every caller either
-      # switches to passthrough or ends the message immediately after), so this is always
-      # the message's leading frame and carries the message opcode rather than OP_CONT.
+      # Emit everything buffered so far, so the rest of the message can stream byte-exact
+      # behind it. The buffer holds the payload as it ARRIVED (the rewrite only runs in
+      # `emit_message`), so the sender's own frames say the same thing byte for byte and are
+      # preferred — same invariant as `emit_message`. Only when they are gone (past the raw
+      # cap) is the prefix re-framed, as a NON-final frame carrying the message opcode rather
+      # than OP_CONT: this is reached at most once per message, so it is always the leading one.
       private def flush_buffered : Nil
         return if @buffer.size == 0
-        write_direct(WS.encode(@opcode, @buffer.to_slice, mask: @mask, fin: false))
+        if @raw_kept && @raw.size > 0
+          write_direct(interleaved_raw) # the peer's frames, control-frame interleave and all
+          @parked.clear
+        else
+          flush_parked # re-framed: nowhere to put them but in front
+          write_direct(WS.encode(@opcode, @buffer.to_slice, mask: @mask, fin: false))
+        end
       end
 
       # Put a half-assembled message on the wire and into capture, then forget it. Only the
@@ -484,9 +757,12 @@ module Gori::Proxy::WS
       #
       # Emitted NON-final, so gori does not invent a FIN the sender never sent.
       private def flush_withheld : Nil
+        # A control frame parked between fragments still owes the wire even when the
+        # fragments left nothing to flush (a leading fragment with an empty payload).
+        flush_parked if @buffer.size == 0
         return if @buffer.size == 0
         flush_buffered unless @passthrough
-        @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, @buffer.to_slice.dup)
+        @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, @buffer.to_slice.dup, @shape.take)
         reset_buffer
       end
 
@@ -503,7 +779,15 @@ module Gori::Proxy::WS
       # as step 1 shipped it.
       private def bypass(reason : String, &block : -> Nil) : Nil
         if gate = @gate
-          gate.bypass(reason, &block)
+          # `bypass` yields UNDER the gate's mutex, so anything the block writes has to go
+          # straight to the socket — `write_control` would re-take a lock this fiber already
+          # holds, which Crystal's checked Mutex raises on rather than deadlocking.
+          @in_bypass = true
+          begin
+            gate.bypass(reason, &block)
+          ensure
+            @in_bypass = false
+          end
         else
           block.call
         end
@@ -518,6 +802,15 @@ module Gori::Proxy::WS
 
       private def reset_buffer : Nil
         @buffer = @buffer.size > RESET_THRESHOLD ? IO::Memory.new : @buffer.tap(&.clear)
+        reset_raw
+      end
+
+      private def reset_raw : Nil
+        @raw = @raw.size > RESET_THRESHOLD ? IO::Memory.new : @raw.tap(&.clear)
+        @raw_kept = true
+        # Whoever ended the message has already disposed of these (written them through, or
+        # handed them to the gate); the offsets they carry belong to a buffer that is gone.
+        @parked.clear
       end
     end
 
@@ -529,7 +822,8 @@ module Gori::Proxy::WS
     # own private scope) shares it — the fallback paths must capture exactly as this pump
     # does, not approximately.
     def self.capture_frame(frame : WS::Frame, assembling : IO::Memory, direction : String,
-                           flow_id : Int64, sink : FlowSink, message_opcode : UInt8) : IO::Memory
+                           flow_id : Int64, sink : FlowSink, message_opcode : UInt8,
+                           shape : MessageShape) : IO::Memory
       return assembling unless frame.data?
       remaining = MAX_MESSAGE - assembling.size
       if remaining > 0 && !frame.payload.empty?
@@ -537,7 +831,7 @@ module Gori::Proxy::WS
         assembling.write(frame.payload[0, take])
       end
       return assembling unless frame.fin?
-      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup)
+      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)
       assembling.size > RESET_THRESHOLD ? IO::Memory.new : assembling.tap(&.clear)
     end
 
@@ -558,7 +852,10 @@ module Gori::Proxy::WS
       return false unless forwarded # peer died mid-payload
       if h.data?
         marker = "[gori] #{h.len}-byte WebSocket frame forwarded; too large to capture".to_slice
-        sink.on_ws_message(flow_id, direction, message_opcode.to_i, marker)
+        # The marker row still carries the frame's own header facts — its FIN, its RSV bits
+        # and its mask key are exactly what an operator is asking about when a frame is this
+        # size, and they are the part gori DID read.
+        sink.on_ws_message(flow_id, direction, message_opcode.to_i, marker, h.shape)
       end
       true
     end

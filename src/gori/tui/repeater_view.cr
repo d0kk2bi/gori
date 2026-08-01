@@ -120,6 +120,7 @@ module Gori::Tui
       @grpc_mode = false
       @grpc_body = Bytes.empty # the pristine framed request message(s), sent verbatim
       @grpc_msg_count = 0      # deframed message count of @grpc_body (immutable → computed once)
+      @grpc_req_residual = 0   # …and the tail of @grpc_body that is NOT a complete frame
       # A SINGLE-message gRPC call (the unary common case) is reframable: its payload is
       # hex-editable (^X) and the 5-byte length prefix is recomputed on send. A 0- or
       # multi-message body isn't (boundaries are prefix-defined) — it stays verbatim.
@@ -148,6 +149,21 @@ module Gori::Tui
       @decoded.env_complete = true # env tokens re-encode into the request on send here too (WS messages, decoded payload)
       @req_pane = :envelope        # :envelope | :decoded — which split sub-pane is active
       @decoded_dirty = false       # the decoded payload was edited → re-encode on send
+      # The WS session's outbound messages EXACTLY as they were loaded, opcodes and raw
+      # bytes, plus whether the pane has been touched since. The pane is a text projection —
+      # one message per line, LF-split — so it cannot represent a binary frame or a TEXT
+      # frame carrying invalid UTF-8. Sending the projection back was how a captured binary
+      # message became an opcode-1 text one on every save. So: untouched pane → the seed
+      # goes out (and is persisted) verbatim; edited pane → what the operator typed, as
+      # text. Same rule the WS relay keeps — gori's own framing only for what was changed.
+      @ws_out_seed = [] of Store::WsOutMessage
+      @ws_out_edited = false
+      # Send the handshake's own `Sec-WebSocket-Key` instead of a fresh one. Off, which is
+      # what this tab has always done — regenerating avoids a server's replay guard. On, the
+      # operator's header block goes out exactly as typed, key line and position included,
+      # which is the only way to ask what a server does with an absent, short, duplicated or
+      # non-base64 key. See `WsEngine.build_handshake`.
+      @ws_keep_key = false
       @saml_param = "SAMLResponse"
       @saml_binding = :post       # :post (base64) | :redirect (deflate+base64)
       @saml_location = :body      # :body (form) | :query (request line)
@@ -206,7 +222,16 @@ module Gori::Tui
       # In gRPC mode the hex buffer edits the deframed message PAYLOAD (the head stays in
       # @editor, sent as text); grpc_request_bytes re-length-prefixes it on send. Otherwise
       # it snapshots the whole wire request.
-      @req_hex_edit = HexEdit.new(@grpc_mode ? @grpc_payload : @editor.to_bytes)
+      #
+      # `wire_bytes`, NOT `to_bytes`. `to_bytes` re-joins the LF projection with CRLF, so the
+      # "raw bytes" pane was a FABRICATION: it invented an 0x0D in front of every bare LF in
+      # the body and showed the operator bytes that had never existed anywhere. Worse, hex
+      # mode deliberately disables auto-Content-Length, so those invented bytes shipped under
+      # the head's older, shorter CL and the remainder was left on the socket for the origin
+      # to read as the front of the next request — gori desyncing its own connection while
+      # reporting `✓ sent`. Hex mode is the documented byte-exact escape hatch; it has to
+      # start from the bytes.
+      @req_hex_edit = HexEdit.new(@grpc_mode ? @grpc_payload : @editor.wire_bytes)
       @scroll_req = 0 # entering the same bytes isn't an edit — no @dirty
     end
 
@@ -215,7 +240,10 @@ module Gori::Tui
         if @grpc_mode
           @grpc_payload = h.to_bytes # keep the edited payload byte-exact (reframed on send)
         else
-          @editor.set_text(String.new(h.to_bytes)) # LOSSY: U+FFFD for non-UTF8 + \r rstrip (accepted)
+          # Round-trips byte-exactly now: set_text keeps each line's terminator in @eols, and
+          # `String.new(Bytes)` does not scrub, so the hex buffer's bytes come back out of
+          # `wire_bytes` unchanged — hex ⇄ text is no longer a one-way door.
+          @editor.set_text(String.new(h.to_bytes))
         end
         @dirty = true # the edit is a content change
       end
@@ -334,15 +362,26 @@ module Gori::Tui
     end
 
     # --- persistence accessors (the Runner saves these + reconciles by them) ---
+    # What gets PERSISTED (and what reconcile compares against). Wire form, so a saved tab
+    # restores to the bytes it was sending: persisting the LF projection would have re-lost
+    # every body CR on the next restore, undoing the fix one session later.
     def request_text : String
-      (h = @req_hex_edit) ? String.new(h.to_bytes) : @editor.text # lossy snapshot in hex mode
+      (h = @req_hex_edit) ? String.new(h.to_bytes) : @editor.wire_text
     end
 
     # The buffer the external editor (^E) round-trips: the ACTIVE request sub-pane — the
     # envelope, or the decoded payload when it's the split's active pane (so you can edit
     # a big SAML XML / GraphQL query in $EDITOR). Non-decode tabs = the envelope, as before.
+    #
+    # `wire_text`, NOT `text` — the same distinction `request_text` above draws, and for the
+    # same reason. Handing `$EDITOR` the LF projection meant a captured request came back
+    # from a round trip with every CRLF in its BODY replaced by a bare LF, and auto-CL then
+    # resynced `Content-Length` down to the shortened body, so nothing errored and the
+    # smuggled `0\r\n\r\nGET /smuggled …` payload the operator was testing simply stopped
+    # being a payload. `set_text` (in `replace_edit_buffer`) is the exact inverse, so a file
+    # the editor left alone round-trips byte for byte.
     def edit_buffer_text : String
-      (h = @req_hex_edit) ? String.new(h.to_bytes) : req_editor.text
+      (h = @req_hex_edit) ? String.new(h.to_bytes) : req_editor.wire_text
     end
 
     def replace_edit_buffer(text : String) : Nil
@@ -443,13 +482,15 @@ module Gori::Tui
     getter? ws_mode : Bool
 
     # Load a captured WebSocket flow (101) for repeater. The request editor is seeded
-    # with the handshake upgrade request; the messages editor is seeded with the
-    # recorded client→server TEXT messages (one per line, editable). Binary outbound
-    # messages aren't representable as editable text, so they're omitted from the seed.
-    def load_ws(detail : Store::FlowDetail, out_messages : Array(String)) : Nil
+    # with the handshake upgrade request; the messages editor is seeded with the recorded
+    # client→server TEXT messages (one per line, editable). A BINARY message is not
+    # representable as editable text so it stays out of the pane — but it stays IN the
+    # seed, so an unedited replay still sends it (see `@ws_out_seed`).
+    def load_ws(detail : Store::FlowDetail, out_messages : Array(Store::WsOutMessage)) : Nil
       @flow = detail
       @ws_mode = true
-      @http2 = false # WebSocket is HTTP/1.1
+      @ws_keep_key = false # a fresh capture: the regenerated key is the default (see the ivar)
+      @http2 = false       # WebSocket is HTTP/1.1
       @ws_upgrade = detail.request_head
       @ws_result = nil
       @ws_lines_cache = nil
@@ -459,7 +500,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(String.new(detail.request_head))
-      @decoded.set_text(out_messages.join('\n'))
+      seed_ws_out(out_messages)
       @original_lines = [] of String
       @result = nil
       @prev_result = nil
@@ -476,16 +517,109 @@ module Gori::Tui
       @req_pane = :decoded
     end
 
-    # The editable outbound messages, parsed from the editor — one TEXT frame per
-    # non-empty line, with `$KEY` env tokens expanded at send time (parity with the
-    # handshake and every other outbound path). Uses @decoded.text (LF-joined) NOT
-    # to_bytes (CRLF-joined), else every frame but the last would carry a spurious
-    # trailing '\r'. (A captured frame with an embedded newline can't be represented
-    # one-per-line — a known v1 limit.)
+    # The outbound messages to SEND: exactly the list a save would persist
+    # (`ws_out_messages_raw`), with `$KEY` env tokens expanded (parity with the handshake and
+    # every other outbound path).
+    #
+    # Derived from `ws_out_messages_raw` rather than re-deriving the list itself, so the wire
+    # and the database can never disagree about which frames this tab holds. They did: this
+    # method used to fall back to its own LF-split of the pane the moment the pane was edited,
+    # while the badge on the pane's border kept naming the frames that fallback had dropped.
     def ws_out_messages : Array(Repeater::WsEngine::OutMsg)
-      @decoded.text.split('\n').compact_map do |line|
-        line.empty? ? nil : Repeater::WsEngine::OutMsg.new(1, Env.expand(line).to_slice)
+      ws_out_messages_raw.map do |m|
+        # `Env.expand` scans BYTES and copies every unmatched span through untouched, so a
+        # TEXT frame carrying invalid UTF-8 survives it; a BINARY frame is not expanded at
+        # all, the same rule `gori run repeater send` and MCP `send_websocket` apply.
+        Repeater::WsEngine::OutMsg.new(m.opcode,
+          m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload, m.shape)
       end
+    end
+
+    # Send the operator's own `Sec-WebSocket-Key` rather than a fresh one. Persisted per
+    # session (`repeaters.ws_keep_key`) because it is a property of the handshake being
+    # tested, not of one keystroke — and off by default, so every existing tab keeps the
+    # regenerated key it has always sent.
+    getter? ws_keep_key : Bool
+
+    def toggle_ws_keep_key : Bool
+      return @ws_keep_key unless @ws_mode
+      @dirty = true
+      @ws_keep_key = !@ws_keep_key
+    end
+
+    # Is the pane still showing exactly what the session was loaded with? An empty seed
+    # means there is nothing to preserve, so a hand-typed list takes the text path.
+    private def ws_out_seeded? : Bool
+      !@ws_out_edited && !@ws_out_seed.empty?
+    end
+
+    # Can this message be shown as ONE LINE OF TEXT in the pane, with nothing lost?
+    #
+    # Only a plain TEXT frame in the default shape. A binary payload rendered into a TextArea
+    # is noise the operator cannot meaningfully edit — that part is old. The rest is new: a
+    # PING, a PONG and a CLOSE are not text lines at all, and a TEXT frame carrying RSV1, a
+    # cleared FIN, a pinned mask key or a declared length that disagrees with its payload
+    # would render as an ORDINARY line, so writing the pane back would silently discard
+    # exactly the shape the operator captured it for. Showing it and then losing it is worse
+    # than not showing it: the seed replays it verbatim.
+    #
+    # The last two clauses apply that same rule to a payload whose BYTES defeat the one
+    # message = one line projection, which the shape fields do not describe:
+    #
+    #   * an embedded LF makes one frame render as two lines, and writing the pane back split
+    #     a captured `line1\nline2` into two frames on the wire — a real observed defect, not
+    #     a hypothetical (the origin logged `op=1 len=5` twice where the capture had one
+    #     `op=1 len=11`).
+    #   * invalid UTF-8 is a binary payload the pane happens to be displaying (RFC 6455 §5.6
+    #     makes UTF-8 the definition of a text frame), and a TextArea round-trip would scrub
+    #     it — the same reason `Store::WsOutMessage` exists at all.
+    #
+    # Both are frames the operator captured *for* those bytes, so they stay in the list and
+    # out of the pane, and the "+N not shown" badge names them.
+    def self.ws_line_renderable?(m : Store::WsOutMessage) : Bool
+      return false unless m.text? && m.shape.default?
+      return false if m.payload.includes?(0x0A_u8)
+      String.new(m.payload).valid_encoding?
+    end
+
+    # The badge/notice label for a frame the pane is not showing. `shape_label` names the
+    # frame SHAPE, which is the whole answer for a PING or an RSV1 frame and no answer at all
+    # for the two byte-level cases above — both are plain `TEXT` by shape, so the badge would
+    # have read "+2 not shown: TEXT, TEXT".
+    def self.ws_unshown_label(m : Store::WsOutMessage) : String
+      base = m.shape_label
+      return base unless m.text? && m.shape.default?
+      return "#{base} multiline" if m.payload.includes?(0x0A_u8)
+      "#{base} binary"
+    end
+
+    # Short labels for the frames the pane is NOT showing, for the badge on the MESSAGES
+    # border and the open-from-History status line. Empty when the pane shows everything,
+    # which is the ordinary case.
+    #
+    # Computed from the list actually going out / being written (`ws_out_messages_raw`), NOT
+    # from `@ws_out_seed`. It read the seed, which an edit never updates, so after the pane
+    # was edited the border went on advertising a PING and a BIN that the write-back had
+    # already deleted — the operator was told a binary frame was riding along when it was not.
+    def ws_unshown_seed : Array(String)
+      ws_out_messages_raw.reject { |m| RepeaterView.ws_line_renderable?(m) }
+        .map { |m| RepeaterView.ws_unshown_label(m) }
+    end
+
+    # Install a session's outbound messages as both the seed and the pane's text. The pane
+    # shows the TEXT frames only — a binary payload rendered into a TextArea is noise the
+    # operator cannot meaningfully edit, and writing it back was how it became opcode 1.
+    #
+    # A soft reconcile (`apply_peer_request`) reaches this on every peer request-side change,
+    # so an UNSAVED local edit is left alone — the same guard the pane's `set_text` already
+    # had. Adopting the peer's seed under it would send their messages while showing ours.
+    private def seed_ws_out(messages : Array(Store::WsOutMessage)) : Nil
+      joined = messages.select { |m| RepeaterView.ws_line_renderable?(m) }.join('\n') { |m| String.new(m.payload) }
+      same = @decoded.text == TextArea.normalize_lf(joined)
+      return if @ws_out_edited && !same
+      @decoded.set_text(joined) unless same
+      @ws_out_seed = messages
+      @ws_out_edited = false
     end
 
     # The env tokens in the outbound message lines that resolve to nothing — what
@@ -507,20 +641,64 @@ module Gori::Tui
     # such bytes roughly once per 1.2KB by chance (#519). Without this the pane refused a
     # real captured binary frame, naming the `$A` inside a JPEG.
     def ws_unresolved_env : Array(String)
-      @decoded.text.split('\n')
+      # The list that is actually going out (`ws_out_messages_raw`), for the same reason
+      # `ws_out_messages` reads it: a check run against a different list than the send is not
+      # a check. Pre-splice this branched on `ws_out_seeded?` and read the pane's raw lines.
+      ws_out_messages_raw.select(&.text?).map { |m| String.new(m.payload) }
         .select { |line| !line.empty? && line.valid_encoding? }
         .flat_map { |line| Env.unresolved(line) }.uniq!
     end
 
-    # Raw outbound message lines (LF-split, env tokens UNexpanded) for persistence.
-    # The store masks secrets and stores these verbatim, so `$KEY` survives to re-expand
-    # on the next send — never bake an expanded secret into the DB (see ws_out_messages).
-    def ws_out_texts_raw : Array(String)
-      @decoded.text.split('\n').reject(&.empty?)
+    # The outbound messages to persist (env tokens UNexpanded). The store masks secrets and
+    # stores these verbatim, so `$KEY` survives to re-expand on the next send — never bake
+    # an expanded secret into the DB (see ws_out_messages).
+    #
+    # An untouched pane hands back the seed, opcodes and bytes intact; that is what lets a
+    # captured BINARY frame survive a save it had nothing to do with.
+    #
+    # An EDITED pane is a position-keyed SPLICE over that seed, not a replacement of it. It
+    # used to be a replacement — `@decoded.text.split('\n').reject(&.empty?)`, every line a
+    # fresh default-shape TEXT frame — so one keystroke anywhere in the pane deleted every
+    # frame the pane had never rendered. On a persisted session that is irreversible:
+    # `Store#update_repeater_ws_messages` opens with `DELETE FROM ws_messages`, and a PING, a
+    # binary payload, an empty frame, an RSV1 frame and an unmasked frame were gone from the
+    # database with no confirmation and no undo. The pane is a text VIEW of a list it cannot
+    # fully represent; an edit to the view may only touch what the view showed.
+    #
+    # `reject(&.empty?)` is off the mapped range for the same reason: a captured TEXT frame
+    # with an empty payload IS renderable (it is a blank line), so dropping blank lines ate
+    # it. Only a SURPLUS blank line — one past the end of the seed's renderable slots, which
+    # is what pressing Enter at the end of the pane produces — is still discarded.
+    def ws_out_messages_raw : Array(Store::WsOutMessage)
+      return @ws_out_seed if ws_out_seeded?
+      lines = @decoded.text.split('\n')
+      out = @ws_out_seed.map { |m| m.as(Store::WsOutMessage?) }
+      # The seed positions this pane is showing, in pane order. `ws_line_renderable?` decides
+      # both this and what `seed_ws_out` joined into the pane, so line k IS slot slots[k].
+      slots = [] of Int32
+      @ws_out_seed.each_with_index { |m, i| slots << i if RepeaterView.ws_line_renderable?(m) }
+      slots.each_with_index do |idx, k|
+        # A line the operator deleted takes its slot with it; nil marks it for removal so the
+        # indices of the untouched slots stay valid while the rest are being written.
+        out[idx] = (line = lines[k]?) ? Store::WsOutMessage.text(line) : nil
+      end
+      messages = out.compact
+      # Lines with no slot are new: append them in order. Blank ones are the trailing newline
+      # an editor leaves behind, not a frame the operator asked for.
+      lines[slots.size..]?.try &.each { |l| messages << Store::WsOutMessage.text(l) unless l.empty? }
+      messages
+    end
+
+    # Persistence just wrote `ws_out_messages_raw` — those bytes ARE the session now, so the
+    # pane counts as unedited again. Without this a second save would still be comparing
+    # against the pre-edit seed.
+    def ws_out_persisted : Nil
+      @ws_out_seed = ws_out_messages_raw
+      @ws_out_edited = false
     end
 
     def ws_upgrade_bytes : Bytes
-      @ws_mode ? expanded_text_to_bytes(@editor.text) : (@ws_upgrade || Bytes.empty)
+      @ws_mode ? expanded_editor_bytes : (@ws_upgrade || Bytes.empty)
     end
 
     # Cross-process snapshot for `gori mcp get_repeater_context` (written into ui_state
@@ -531,6 +709,7 @@ module Gori::Tui
       j.field "summary", summary(80)
       j.field "http2", @http2
       j.field "auto_content_length", @auto_content_length
+      j.field "ws_keep_key", @ws_keep_key
       j.field "ws_mode", @ws_mode
       j.field "grpc_mode", @grpc_mode
       j.field "decode_mode", decode_mode?
@@ -609,7 +788,11 @@ module Gori::Tui
       @ws_mode = false
       @http2 = true # gRPC is HTTP/2
       @grpc_body = detail.request_body || Bytes.empty
-      msgs = Proxy::H2::Grpc.messages(@grpc_body)
+      # `scan`, not `messages`: the residual is the REQUEST side of the same report. A capture
+      # whose length prefix over-claims used to count as "0 messages" and be described in the
+      # transcript as `→ sent 0 request messages (10b)` — the byte count and the message count
+      # disagreeing, with nothing saying why.
+      msgs, @grpc_req_residual = Proxy::H2::Grpc.scan(@grpc_body)
       @grpc_msg_count = msgs.size
       # Reframable only when the body is EXACTLY one clean message: then a hex edit of the
       # payload can be re-length-prefixed unambiguously. (A partial trailing frame would
@@ -669,7 +852,7 @@ module Gori::Tui
       # Record the binding (POST body vs GET ?query=) so the re-encode targets the right place —
       # mirrors @saml_location. Without it a GET GraphQL edit would splice into a phantom body
       # while the origin reads the stale URL query (the decoded edit would never reach it).
-      @graphql_location = Graphql.location(detail.request_body)
+      @graphql_location = Graphql.location(detail.request_body, detail.request_head)
       seed_decode(detail, :graphql, Graphql.display(op))
     end
 
@@ -768,7 +951,7 @@ module Gori::Tui
           # Recompute the re-encode target too (mirrors SAML): an envelope edit that moves the
           # op from ?query=… (GET) to a JSON body (POST) must retarget the splice, else commit
           # rewrites the wrong side and the origin reads the old, unedited query.
-          @graphql_location = Graphql.location(body)
+          @graphql_location = Graphql.location(body, head)
           text = Graphql.display(op)
           @decoded.set_text(text) if text != @decoded.text
         end
@@ -820,6 +1003,13 @@ module Gori::Tui
     end
 
     private def graphql_splice_text(env : String) : String
+      # `:none` — a batched / persisted / multipart / `application/graphql` request. Those
+      # shapes render but do not round-trip (`Graphql::Op#editable?`), so there is nothing to
+      # splice: send the envelope the operator sees, byte for byte. The controller already
+      # declines to open them split; this is the second gate, because `refresh_decoded` can
+      # move a tab into one of those shapes mid-edit and a re-encode from a projection is a
+      # request the operator never wrote.
+      return env if @graphql_location == :none
       if @graphql_location == :query # GET: rewrite the request-line query (no body), like SAML Redirect
         lines = env.split('\n')
         lines[0] = graphql_query_line(lines[0], @decoded.text) if lines[0]?
@@ -858,7 +1048,7 @@ module Gori::Tui
     # the envelope, then send the envelope (the authoritative request) with CL synced.
     private def decoded_request_bytes : Bytes
       commit_decoded
-      finalize_wire(expanded_text_to_bytes(@editor.text))
+      finalize_wire(expanded_editor_bytes)
     end
 
     # The request HEAD as origin-form text (request line rewritten, headers), WITHOUT
@@ -883,7 +1073,7 @@ module Gori::Tui
     # matches the payload the origin receives; otherwise the pristine @grpc_body is resent
     # verbatim. Auto-Content-Length never applies (h2 frames by DATA/END_STREAM).
     private def grpc_request_bytes : Bytes
-      raw = expanded_text_to_bytes(@editor.text)
+      raw = expanded_editor_bytes
       n = raw.size
       while n > 0 && (raw[n - 1] == 0x0A_u8 || raw[n - 1] == 0x0D_u8) # trim trailing CR/LF
         n -= 1
@@ -929,28 +1119,53 @@ module Gori::Tui
     # response transcript. A head-only (bodyless) chunk gets its CRLFCRLF terminator
     # appended — the blank line the user typed before `%%%` is consumed by the split, so we
     # must NOT rely on it surviving (the timeout-hunting bug the group-send E2E caught).
+    # Carries each line's own terminator through the split, so a chunk's BODY keeps the CRs it
+    # was captured with — the same reason `expanded_editor_bytes` reads `wire_text`. The last
+    # surviving line's terminator is dropped: that newline is the one before the `%%%` (or the
+    # end of the buffer), which belongs to the separator, not to the body.
     def pipeline_requests : Array({String, Bytes})
-      reqs = [] of {String, Bytes}
-      chunk = [] of String
-      flush = -> do
-        lines = chunk.dup
-        while !lines.empty? && lines.first.strip.empty? # drop blank lines around the separator
-          lines.shift
-        end
-        while !lines.empty? && lines.last.strip.empty?
-          lines.pop
-        end
-        unless lines.empty?
-          label = lines.first.strip
-          reqs << {label, finalize_wire(expanded_text_to_bytes(lines.join('\n')))}
-        end
-        chunk.clear
+      wl = @editor.wire_lines
+      chunk_line_spans(wl).map do |sp|
+        {wl[sp.begin][0].strip, finalize_wire(expanded_text_to_bytes(chunk_text(wl, sp)))}
       end
-      @editor.text.split('\n').each do |line|
-        line.strip == PIPELINE_SEP ? flush.call : chunk << line
+    end
+
+    # EDITOR line ranges of each `%%%` chunk, blank edges trimmed. The one place the group
+    # split is decided, so the bytes `pipeline_requests` sends and the Content-Length
+    # `reflect_content_length_in_editor` shows are derived from the SAME chunking — they used
+    # to disagree, and the visible header was the one that was wrong. No separator ⇒ one span
+    # covering the whole buffer, which is the ordinary single-request case.
+    private def chunk_line_spans(wl : Array({String, String})) : Array(Range(Int32, Int32))
+      spans = [] of Range(Int32, Int32)
+      push = ->(a : Int32, b : Int32) do
+        while a < b && wl[a][0].strip.empty? # drop blank lines around the separator
+          a += 1
+        end
+        while b > a && wl[b - 1][0].strip.empty?
+          b -= 1
+        end
+        spans << (a...b) if a < b
       end
-      flush.call
-      reqs
+      start = 0
+      wl.each_with_index do |(l, _), i|
+        next unless l.strip == PIPELINE_SEP
+        push.call(start, i)
+        start = i + 1
+      end
+      push.call(start, wl.size)
+      spans
+    end
+
+    # One chunk's wire text. The LAST line's terminator is dropped: that newline is the one
+    # before the `%%%` (or the end of the buffer), so it belongs to the separator rather than
+    # to the body — the same trim the blank-line shift/pop above performs at the edges.
+    private def chunk_text(wl : Array({String, String}), sp : Range(Int32, Int32)) : String
+      String.build do |io|
+        sp.each do |i|
+          io << wl[i][0]
+          io << wl[i][1] unless i == sp.end - 1
+        end
+      end
     end
 
     # True when the wire bytes already carry a CRLFCRLF head/body separator (so appending
@@ -1010,9 +1225,10 @@ module Gori::Tui
                 response_head : Bytes? = nil, response_body : Bytes? = nil,
                 response_error : String? = nil, response_duration_us : Int64? = nil,
                 sni : String = "",
-                ws_messages : Array(String)? = nil) : Nil
+                ws_messages : Array(Store::WsOutMessage)? = nil,
+                ws_keep_key : Bool = false) : Nil
       @flow = nil
-      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages)
+      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
 
       @original_lines = [] of String
       # Rebuild the persisted result: a head (success) or an error (failed send)
@@ -1041,8 +1257,9 @@ module Gori::Tui
     # bump or a peer request edit looked like "send reset the response to Target".
     def apply_peer_request(target : String, request : String, http2 : Bool, auto_cl : Bool,
                            sni : String = "",
-                           ws_messages : Array(String)? = nil) : Nil
-      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages)
+                           ws_messages : Array(Store::WsOutMessage)? = nil,
+                           ws_keep_key : Bool = false) : Nil
+      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
       @req_hex_edit = nil
       # Leave @result / @prev_result / @focus / @scroll / @resp_mode / @original_lines alone.
       reflect_content_length_in_editor if @auto_content_length
@@ -1051,23 +1268,28 @@ module Gori::Tui
     # True when the live view's request-side fields match a store row (reconcile skip).
     # Normalizes empty SNI: view.sni_override is nil when blank, but older/peer rows
     # may store "" — those must compare equal or every poll re-applies needlessly.
-    # Normalizes CRLF→LF on the request: the TextArea holds LF (set_text strips \r) but
-    # the store may hold wire CRLF (MCP create_repeater / import / a peer). Without this
-    # the compare is LF-vs-CRLF false EVERY poll, so reconcile re-applies apply_peer_request
-    # → set_text on every capture tick — which slams the request caret back to the top of
-    # the pane in READ mode (INS locks the tab out of reconcile, so it looked NOR-only).
-    # Mirrors FuzzerView#session_side_matches?.
+    # The request compare is now EXACT (`request_text` is wire form, `set_text`'s exact
+    # inverse), so a store row holding wire CRLF — MCP create_repeater / import / a peer —
+    # matches without normalizing anything away. That normalization existed because the
+    # TextArea could only hold LF, which made the compare LF-vs-CRLF false on EVERY poll and
+    # slammed the request caret back to the top of the pane on every capture tick. It also
+    # made the compare blind to a pure line-ending difference, which is a real edit now.
+    # (FuzzerView#session_side_matches? still normalizes — its template is a document, not
+    # a captured message, and it is persisted from `#text`.)
     def request_side_matches?(target : String, request : String, http2 : Bool, auto_cl : Bool,
-                              sni : String?) : Bool
-      @target == target && request_text == TextArea.normalize_lf(request) &&
+                              sni : String?, ws_keep_key : Bool = false) : Bool
+      @target == target && request_text == request &&
         @http2 == http2 && @auto_content_length == auto_cl &&
+        @ws_keep_key == ws_keep_key &&
         (sni_override || "") == (sni || "")
     end
 
     # Shared request/target/flag write used by restore (full) and apply_peer_request (soft).
     private def apply_request_fields(target : String, request : String, http2 : Bool, auto_cl : Bool,
                                      sni : String,
-                                     ws_messages : Array(String)?) : Nil
+                                     ws_messages : Array(Store::WsOutMessage)?,
+                                     ws_keep_key : Bool = false) : Nil
+      @ws_keep_key = ws_keep_key
       @http2 = http2
       @target = target
       @tcx = @target.size
@@ -1081,16 +1303,17 @@ module Gori::Tui
         @ws_upgrade = request.to_slice
         # Only rewrite the editor when the text ACTUALLY changed: set_text resets the caret
         # + scroll and clears the undo stack, so a soft reconcile poll (apply_peer_request)
-        # that only touched a non-text field must not disturb the pane. Compare on a
-        # CRLF-normalized basis (the editor is LF; the store may be CRLF). Mirrors
-        # FuzzerView#apply_peer_session / NotesView#soft_merge_from.
-        @editor.set_text(request) if @editor.text != TextArea.normalize_lf(request)
-        joined = (ws_messages || [] of String).join('\n')
-        @decoded.set_text(joined) if @decoded.text != TextArea.normalize_lf(joined)
+        # that only touched a non-text field must not disturb the pane. `wire_text` is
+        # set_text's exact inverse, so this is the precise "would set_text be a no-op?" test —
+        # no normalization, and a line-ending-only difference is honoured as the edit it is.
+        # (Normalizing here would compare unequal on EVERY poll once the store round-trips
+        # wire form exactly, and slam the caret.)
+        @editor.set_text(request) if @editor.wire_text != request
+        seed_ws_out(ws_messages || [] of Store::WsOutMessage)
         @req_pane = :decoded
       else
         @ws_mode = false
-        @editor.set_text(request) if @editor.text != TextArea.normalize_lf(request)
+        @editor.set_text(request) if @editor.wire_text != request
       end
 
       @auto_content_length = auto_cl
@@ -1152,6 +1375,7 @@ module Gori::Tui
       @scx = @sni.size
       @target_field = :url
       @auto_content_length = src.@auto_content_length
+      @ws_keep_key = src.@ws_keep_key
       @name = SubtabClone.copy_name(src.@name)
 
       @ws_mode = src.@ws_mode
@@ -1175,6 +1399,8 @@ module Gori::Tui
       @req_pane = src.@req_pane
       @decoded.set_text(src.@decoded.text)
       @decoded_dirty = src.@decoded_dirty
+      @ws_out_seed = src.@ws_out_seed
+      @ws_out_edited = src.@ws_out_edited
 
       # Hex-mode buffer is authoritative while set — snapshot it into the text editor
       # so the clone is plain text (no shared hex cursor state).
@@ -1236,8 +1462,12 @@ module Gori::Tui
       finalize_wire(expanded_editor_bytes)
     end
 
+    # `wire_text`, NOT `text`: `text` is the LF projection, and joining the buffer with LF
+    # throws away every CR the capture carried in its BODY — where 0x0D is data, not a line
+    # ending. expand_wire below normalizes the HEAD to CRLF either way, so the only thing this
+    # changes is that body bytes now survive the round trip through the editor.
     private def expanded_editor_bytes : Bytes
-      expanded_text_to_bytes(@editor.text)
+      expanded_text_to_bytes(@editor.wire_text)
     end
 
     # Head terminator + auto-Content-Length: the last two steps every plain-text send
@@ -1540,15 +1770,42 @@ module Gori::Tui
 
     # Mirror the auto-Content-Length resync into the visible REQUEST editor (^L on) so
     # the pane shows the same header `request_bytes` will send — not only at ^R time.
+    #
+    # PER CHUNK, because a `%%%` send-group is several requests and `pipeline_requests` frames
+    # each one separately. Reflecting over the whole buffer made the FIRST request's visible
+    # `Content-Length` cover the body, the `%%%` line and the entire second request (`3` → `62`
+    # in the reported case). The wire was right and the editor was not, which is the worse way
+    # round for a tool whose whole job is telling the operator what it sent. Chunk 2 onwards
+    # was never reflected at all.
+    #
+    # Only a REAL `%%%` group is chunked, though. Without a separator ^R sends the whole
+    # buffer, trailing newline and all, and `chunk_line_spans` trims blank edges + drops the
+    # last line's terminator — correct around a separator, wrong for a body that legitimately
+    # ends in one. Reflecting through it made a captured `…tail-after-blank\r\n` read as 32
+    # where the send framed 34: the same display-vs-wire lie in the other direction.
     private def reflect_content_length_in_editor : Nil
       return unless @auto_content_length
       return if @req_hex_edit || @grpc_mode || @ws_mode
       return if @decode_kind && @req_pane == :decoded
 
+      wl = @editor.wire_lines
+      if wl.none? { |(l, _)| l.strip == PIPELINE_SEP }
+        reflect_chunk_content_length(@editor.wire_text, wl, 0...wl.size)
+      else
+        chunk_line_spans(wl).each { |sp| reflect_chunk_content_length(chunk_text(wl, sp), wl, sp) }
+      end
+    end
+
+    # The reflection for ONE request: `text` is exactly the bytes that request will be built
+    # from. `wl` is the pre-edit line snapshot; a replace_line here swaps a line in place
+    # without changing the line COUNT, so the spans and indices taken from it stay valid
+    # across the loop above.
+    private def reflect_chunk_content_length(text : String, wl : Array({String, String}),
+                                             sp : Range(Int32, Int32)) : Nil
       # Expand env tokens first (like the send path's expanded_editor_bytes) — a `$KEY`
       # whose expansion changes the body length must reflect the SENT Content-Length, or
       # the visible header goes stale and, once Auto-CL is toggled off, is sent mismatched.
-      raw = expanded_editor_bytes
+      raw = expanded_text_to_bytes(text)
       # With §…§ markers present the CL that ^R actually sends is computed from the
       # RENDERED template (markers stripped, chains applied), not the raw marked text —
       # reflect THAT value so the visible header matches request_bytes.
@@ -1558,24 +1815,20 @@ module Gori::Tui
 
       synced_head = String.new(synced).split("\r\n\r\n", limit: 2).first
       return unless synced_head
+      new_line = synced_head.split("\r\n").find { |l| l.lstrip.downcase.starts_with?("content-length:") }
+      return unless new_line
 
-      synced_lines = synced_head.split("\r\n")
-      cl_idx = synced_lines.index { |l| l.lstrip.downcase.starts_with?("content-length:") }
-      return unless cl_idx
-      new_line = synced_lines[cl_idx]
-
-      env_sep = @editor.text.index("\n\n")
-      return unless env_sep
-
-      head_lines = @editor.text[0, env_sep].split('\n')
+      # This chunk's HEAD is its lines up to the first blank one (the LF-space `\n\n` the old
+      # whole-buffer scan looked for, scoped to the chunk).
+      head_end = (sp.begin...sp.end).find { |i| wl[i][0].empty? } || return
       # Locate the Content-Length line in the RAW editor head by CONTENT, not by transplanting
       # the expanded-space index — a multi-line $KEY expansion earlier can shift the line count,
-      # so cl_idx would otherwise point at (and overwrite) an unrelated raw header line.
-      raw_cl_idx = head_lines.index { |l| l.lstrip.downcase.starts_with?("content-length:") }
-      return unless raw_cl_idx
-      return if head_lines[raw_cl_idx] == new_line
+      # so the index would otherwise point at (and overwrite) an unrelated raw header line.
+      idx = (sp.begin...head_end).find { |i| wl[i][0].lstrip.downcase.starts_with?("content-length:") }
+      return unless idx
+      return if wl[idx][0] == new_line
 
-      @editor.replace_line(raw_cl_idx, new_line)
+      @editor.replace_line(idx, new_line)
     end
 
     # See @link_host_to_target: on the FIRST target edit of a fresh ^N tab, mirror the new
@@ -1890,16 +2143,27 @@ module Gori::Tui
     private def mark_req_edit : Nil
       if (@decode_kind || @ws_mode) && @req_pane == :decoded
         @decoded_dirty = true
+        @ws_out_edited = true
       else
         @dirty = true
         reflect_content_length_in_editor
       end
     end
 
+    # undo / backspace / forward-delete are NO-OPS on an empty undo stack, at buffer start and
+    # at end-of-buffer respectively (TextArea returns early without bumping @edits). A no-op
+    # must not mark the buffer edited. `intercept_view.cr` has carried this guard and the
+    # reason for it since #513; the Repeater's copy did not, and the consequence here is
+    # worse: `mark_req_edit` sets `@ws_out_edited`, so a single `Ctrl-Z` in READ mode on an
+    # untouched WebSocket tab took the pane off its seed and dropped every frame the pane was
+    # not showing — observed as a captured BIN frame vanishing from the wire between two
+    # otherwise identical replays. Gate on a real edit.
     def edit_undo : Nil
       return unless @focus == :request
-      req_editor.undo
-      mark_req_edit
+      ed = req_editor
+      before = ed.edits
+      ed.undo
+      mark_req_edit if ed.edits != before
     end
 
     def edit_insert(ch : Char) : Nil
@@ -1923,8 +2187,10 @@ module Gori::Tui
 
     def edit_backspace : Nil
       return unless @focus == :request
-      req_editor.backspace
-      mark_req_edit
+      ed = req_editor
+      before = ed.edits
+      ed.backspace
+      mark_req_edit if ed.edits != before # no-op at buffer start — see edit_undo
     end
 
     def edit_move(dr : Int32, dc : Int32) : Nil
@@ -1963,8 +2229,10 @@ module Gori::Tui
     # Forward-delete: a content edit → dirties (matches edit_backspace).
     def edit_delete : Nil
       return unless @focus == :request
-      req_editor.delete
-      mark_req_edit
+      ed = req_editor
+      before = ed.edits
+      ed.delete
+      mark_req_edit if ed.edits != before # no-op at end-of-buffer — see edit_undo
     end
 
     # --- marker structure guards (delimiter delete / nesting) --------------------
@@ -2522,6 +2790,19 @@ module Gori::Tui
                 "DECODED · GraphQL"
               end
       Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused))
+      if @ws_mode
+        # The seeded frames this pane cannot render as a line. Without this the operator sees
+        # an empty (or short) MESSAGES pane and has no way to know a PING, a CLOSE 1002 or an
+        # RSV1 frame is still in the seed and still going out — which is precisely the
+        # difference between reading a result and misreading one. `ws_line_renderable?` owns
+        # the rule; this only says so.
+        unshown = ws_unshown_seed
+        unless unshown.empty?
+          badge = " +#{unshown.size} not shown: #{unshown.join(", ")} "
+          bx = {rect.right - badge.size - 1, rect.x + label.size + 4}.max
+          screen.text(bx, rect.y, badge, Theme.text_bright, Theme.accent_bg) if bx > rect.x + label.size + 4
+        end
+      end
       if @decode_kind == :saml
         badge = " #{@saml_param} · #{@saml_binding == :redirect ? "redirect" : "post"} "
         bx = {rect.right - badge.size - 1, rect.x + label.size + 4}.max
@@ -2640,6 +2921,11 @@ module Gori::Tui
         return
       end
       if @ws_mode
+        # KEY names what happens to the `Sec-WebSocket-Key` line the operator is looking at.
+        # OFF (the default) means gori drops it and appends a fresh one, so the key in this
+        # editor is NOT the key on the wire — which is worth a badge on its own, because the
+        # pane otherwise reads as byte-exact. ON sends the block as written.
+        Frame.toggle_badge(screen, send_edge, rect.y, min_x, "␣K", "KEY", @ws_keep_key)
         @editor.conceal_spans = [] of {Int32, Int32} # WS messages aren't §-marker HTTP text — no stale concealment
         @editor.chain_peek_text = nil
         @editor.render(screen, rect.inset(1, 1), cursor: focused && request_insert?, highlight: :request, peek: focused, gauge: true, gauge_focused: focused)
@@ -2839,7 +3125,7 @@ module Gori::Tui
           r.messages.each do |m|
             arrow = m.direction == "out" ? "→" : "←"
             color = m.direction == "out" ? Theme.text : Theme.green
-            text = m.opcode == 2 ? "#{arrow} «binary #{m.payload.size}b»" : "#{arrow} #{String.new(m.payload).scrub}"
+            text = "#{arrow} #{ws_transcript_body(m)}"
             text.split('\n').each_with_index { |t, i| rows << {i.zero? ? t : "    #{t}", color} }
           end
           if err = r.error
@@ -2862,6 +3148,26 @@ module Gori::Tui
       end
     end
 
+    # One transcript row's body: the frame's shape when it departs from an ordinary masked
+    # TEXT frame, then the payload.
+    #
+    # A CLOSE row used to render its raw payload — `→ \x03\xEAbye-reason` — because the
+    # transcript only ever expected opcodes 1 and 2. §5.5.1's status code is two BINARY bytes
+    # in front of the reason, so the one row an operator reads when a WebSocket test fails
+    # was the one row that came out as mojibake.
+    private def ws_transcript_body(m : Repeater::WsEngine::Message) : String
+      to_server = m.direction == "out"
+      msg = Store::WsOutMessage.new(m.opcode, m.payload, m.shape)
+      label = msg.shape_label(to_server)
+      prefix = (m.opcode == 1 && m.shape.default?(to_server)) ? "" : "[#{label}] "
+      if code = Store::WsMessage.new(0_i64, 0_i64, nil, 0_i64, m.direction, m.opcode, m.payload).close_code
+        reason = m.payload.size > 2 ? String.new(m.payload[2, m.payload.size - 2]).scrub : ""
+        return reason.empty? ? "#{prefix}code #{code}" : "#{prefix}code #{code} #{reason}"
+      end
+      return "#{prefix}«binary #{m.payload.size}b»" if m.opcode == 2
+      "#{prefix}#{String.new(m.payload).scrub}"
+    end
+
     # The gRPC transcript as {text, colour} rows (cached): the request message count,
     # the HTTP status, the deframed response messages (hex preview), and grpc-status.
     private def grpc_transcript_lines : Array({String, Color})
@@ -2876,6 +3182,7 @@ module Gori::Tui
           # Report the bytes actually put on the wire — a reframed (edited) unary payload
           # differs from the captured @grpc_body.
           rows << {"→ sent #{reqn} request message#{reqn == 1 ? "" : "s"} (#{grpc_send_body.size}b)", Theme.muted}
+          rows << {"⚠ #{Proxy::H2::Grpc.framing_error(@grpc_req_residual)}", Theme.yellow} if @grpc_req_residual > 0
           st = result.response.try(&.status) || 0
           rows << {"HTTP #{st}", st >= 400 ? Theme.red : Theme.text}
           grpc_response_rows(result).each { |r| rows << r }
@@ -2920,10 +3227,15 @@ module Gori::Tui
       end
     end
 
+    # `scan`, not `messages`: `messages` throws away the residual — the tail bytes that are
+    # not a complete frame — so a deliberately-wrong length prefix (a standard gRPC parser
+    # test) rendered as a bare "(no complete gRPC messages)" with no byte count, which reads
+    # identically to "this response is not gRPC at all". `gori run show --format json`
+    # already reports it; this is the pane that shows the same response.
     private def grpc_response_rows(result : Repeater::Result) : Array({String, Color})
       rows = [] of {String, Color}
-      msgs = Proxy::H2::Grpc.messages(result.body || Bytes.empty)
-      if msgs.empty?
+      msgs, residual = Proxy::H2::Grpc.scan(result.body || Bytes.empty)
+      if msgs.empty? && residual == 0
         rows << {"← (no complete gRPC messages)", Theme.muted}
       else
         msgs.each_with_index do |m, i|
@@ -2945,6 +3257,7 @@ module Gori::Tui
           end
         end
       end
+      rows << {"⚠ #{Proxy::H2::Grpc.framing_error(residual)}", Theme.yellow} if residual > 0
       rows
     end
 
@@ -3237,14 +3550,24 @@ module Gori::Tui
 
     # Rewrites an absolute-form request-line ("GET http://h/p ...") to origin-form
     # ("GET /p ..."); origin-form requests are left unchanged.
+    # The captured request as editor text, with ONLY the request line rewritten (absolute-form
+    # → origin-form). Everything after the first line is passed through byte for byte.
+    #
+    # It used to split/rstrip/re-join the whole message, which flattened every terminator in
+    # the request — head AND body — before `set_text` ever saw it. That happened at LOAD, so
+    # no amount of care in the send path could have recovered the bytes.
     private def origin_form_text(detail : Store::FlowDetail) : String
-      lines = String.new(combine(detail.request_head, detail.request_body)).split('\n').map(&.rstrip('\r'))
-      return "" if lines.empty?
-      parts = lines[0].split(' ')
+      raw = String.new(combine(detail.request_head, detail.request_body))
+      nl = raw.index('\n')
+      first = nl ? raw[0, nl] : raw
+      rest = nl ? raw[nl..] : ""
+      line = first.rstrip('\r')
+      eol = first[line.size..] # the CRs the request line carried — put back verbatim
+      parts = line.split(' ')
       if parts.size == 3 && (parts[1].starts_with?("http://") || parts[1].starts_with?("https://"))
-        lines[0] = "#{parts[0]} #{to_origin(parts[1])} #{parts[2]}"
+        line = "#{parts[0]} #{to_origin(parts[1])} #{parts[2]}"
       end
-      lines.join('\n')
+      "#{line}#{eol}#{rest}"
     end
 
     private def to_origin(url : String) : String

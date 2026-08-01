@@ -38,7 +38,7 @@ module Gori
           return Result.new(Outcome::Failed,
             error: status ? "editor exited #{status.exit_code}" : "editor did not run")
         end
-        edited = normalize(File.read(file.path))
+        edited = normalize(File.read(file.path), text, kind)
         edited == text ? Result.new(Outcome::Unchanged) : Result.new(Outcome::Changed, text: edited)
       rescue File::NotFoundError
         Result.new(Outcome::Failed, error: "editor not found: #{program}")
@@ -49,9 +49,37 @@ module Gori
       end
     end
 
-    # Editors append a final newline; TextArea.set_text would turn it into a
-    # spurious empty last line. Strip exactly ONE trailing "\n" (or "\r\n").
-    private def self.normalize(s : String) : String
+    # The kinds whose text is WIRE BYTES rather than prose: a request template, an
+    # intercepted message. Byte-exactness on the operator's own input is a P0 invariant here
+    # (DESIGN.md), and it is not one for a note or a project description.
+    WIRE_KINDS = {:request, :intercept}
+
+    # Undo the newline an editor appends at end-of-file, without touching one the operator
+    # meant. Both halves of that matter and the old rule only had one.
+    #
+    # The old rule stripped exactly one trailing newline UNCONDITIONALLY, because editors add
+    # one and `TextArea.set_text` would otherwise show a spurious empty last line. On prose
+    # that is right and stays. On a REQUEST it is a silent mutation of operator bytes: a body
+    # that genuinely ends in CRLF came back two bytes shorter and the declared
+    # `Content-Length: 34` no longer matched the 32 bytes sent — the exact desync a smuggling
+    # test is trying to CAUSE deliberately, arriving by accident.
+    #
+    # Split by CALLER, as the `kind` argument already distinguishes them, rather than changed
+    # globally: for a wire kind the strip is CONDITIONAL on the original not having ended in a
+    # newline, which is precisely "remove what the editor's ensure-newline-at-EOF added, and
+    # nothing else". Removing the strip outright would have been the mirror-image defect —
+    # a request that ended WITHOUT a newline would silently gain one.
+    private def self.normalize(edited : String, original : String, kind : Symbol) : String
+      return edited if WIRE_KINDS.includes?(kind) && ends_with_newline?(original)
+      chop_newline(edited)
+    end
+
+    private def self.ends_with_newline?(s : String) : Bool
+      s.ends_with?('\n')
+    end
+
+    # Strip exactly ONE trailing "\n" (or "\r\n").
+    private def self.chop_newline(s : String) : String
       if s.ends_with?("\r\n")
         s.rchop.rchop # two single-byte ASCII chars; rchop avoids byte-vs-char arithmetic
       elsif s.ends_with?('\n')

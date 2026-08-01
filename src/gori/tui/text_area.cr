@@ -20,11 +20,18 @@ module Gori::Tui
     # line Strings are immutable and every edit REPLACES `@lines[i]` (never mutates in place),
     # so unchanged lines are structurally shared across all 100 snapshots. This turns push_undo
     # from a whole-buffer String copy per keystroke (and up to 100 full-buffer copies retained)
-    # into an Array-of-pointers copy that shares the line data.
-    record UndoState, lines : Array(String), cy : Int32, cx : Int32
+    # into an Array-of-pointers copy that shares the line data. `eols` rides along for the same
+    # reason and at the same cost: an Array of pointers into a handful of shared literals.
+    record UndoState, lines : Array(String), eols : Array(String), cy : Int32, cx : Int32
+
+    # The terminator a NEWLY typed line break gets (`insert_newline`). LF, not CRLF, because
+    # the wire promotion of the HEAD is `Env.expand_wire`'s job and it is the only thing that
+    # knows where the head ends — a break typed into a BODY is a body byte and must stay one.
+    DEFAULT_EOL = "\n"
 
     def initialize(text : String = "")
       @lines = [""]
+      @eols = [""]
       @cy = 0
       @cx = 0
       @scroll = 0
@@ -89,32 +96,51 @@ module Gori::Tui
     getter? gutter : Bool
 
     # The exact LF form `set_text` would store for `text` — the single source of truth for
-    # "does this incoming string already match what the buffer holds?".
+    # "does this incoming string already match what the buffer holds?" **as a document**.
     #
-    # Every poll-driven reconcile path (RepeaterView#request_side_matches? /
-    # #apply_peer_request, FuzzerView#session_side_matches? / #apply_peer_session,
-    # NotesView#soft_merge_from) compares an incoming store string against `#text` BEFORE
+    # Compare against `#text`, never `#wire_text`: this deliberately erases line endings, and
+    # a caller that needs "would set_text be a no-op, byte for byte" wants `wire_text == s`
+    # instead (the Repeater's reconcile, which persists wire form and so can be exact).
+    #
+    # The DOCUMENT reconcile paths (FuzzerView#session_side_matches? / #apply_peer_session,
+    # NotesView#soft_merge_from) compare an incoming store string against `#text` BEFORE
     # calling set_text, because set_text zeroes the caret + scroll and CLEARS THE UNDO STACK.
-    # The buffer is always LF (set_text below splits on \n and rstrips \r) while the store can
-    # hold wire CRLF — MCP create_repeater/create_note + update_note, `gori run notes create`
-    # piping a raw request or a CRLF file, import, or a peer session all write the body
-    # verbatim. So a raw `==` is falsely unequal on EVERY poll, the guard never fires, and the
-    # caret is slammed back to 0,0 (and undo wiped) on every data_version tick (~1.3×/s while
-    # capturing). Lives here, next to set_text, because set_text is what defines the answer:
-    # the two cannot drift.
+    # `#text` is always LF while the store can hold wire CRLF — MCP create_note + update_note,
+    # `gori run notes create` piping a raw request or a CRLF file, import, or a peer session
+    # all write the body verbatim. So a raw `==` is falsely unequal on EVERY poll, the guard
+    # never fires, and the caret is slammed back to 0,0 (and undo wiped) on every data_version
+    # tick (~1.3×/s while capturing). Lives here, next to set_text, because set_text is what
+    # defines the answer: the two cannot drift.
     #
     # Mirrors set_text's split/rstrip rather than a blanket \r→\n gsub deliberately: a LONE \r
     # mid-line is data set_text KEEPS on the line, whereas a gsub would split it into a second
-    # line and report a spurious mismatch — the very false-negative this exists to kill.
+    # line and report a spurious mismatch — the very false-negative this exists to kill. The
+    # LAST segment is left alone for the same reason: nothing follows it, so a trailing `\r`
+    # there terminates no line — it is a byte, and set_text stores it as one.
     def self.normalize_lf(text : String) : String
       return text unless text.includes?('\r') # the overwhelmingly common case — no allocation
-      text.split('\n').map(&.rstrip('\r')).join('\n')
+      parts = text.split('\n')
+      last = parts.size - 1
+      parts.map_with_index { |p, i| i == last ? p : p.rstrip('\r') }.join('\n')
     end
 
-    # NOTE: `self.normalize_lf` above mirrors this line — keep them in step.
+    # NOTE: `self.normalize_lf` above mirrors this split — keep them in step.
+    #
+    # The `\r` stripped off each line is NOT discarded: it is moved into `@eols[i]`, the exact
+    # terminator that followed line i in `text`. `@lines` stays the CR-FREE projection every
+    # render/column/search path in this file already assumes, so nothing below changes; but
+    # `#wire_text` can now hand back the bytes that came in, and it is the EXACT inverse of
+    # this method.
+    #
+    # The old code destroyed those CRs outright, on the belief that a text editor's buffer is
+    # a list of lines and a line ending is a rendering detail. That is true of the HEAD of an
+    # HTTP message and false of its BODY, where 0x0D is data — and this editor holds both in
+    # one buffer. So a captured `line1\r\nline2` came back as `line1\nline2`, `Content-Length`
+    # was resynced DOWN to match, and the Repeater's "byte-exact resend" put a request on the
+    # wire that the operator never captured. Request smuggling, CRLF-in-body and every binary
+    # format that uses 0x0D were untestable from the TUI for exactly this reason.
     def set_text(text : String) : Nil
-      @lines = text.split('\n').map(&.rstrip('\r'))
-      @lines = [""] if @lines.empty?
+      @lines, @eols = split_wire(text)
       @cy = 0
       @cx = 0
       @scroll = 0
@@ -140,8 +166,74 @@ module Gori::Tui
       @preedit
     end
 
+    # Split `text` into the CR-free line projection + the exact terminator that followed each
+    # line. `lines[i] + eols[i]` concatenated is `text`, byte for byte, always — including the
+    # pathological `"a\r\r\n"` (line `"a"`, eol `"\r\r\n"`), which the old rstrip silently
+    # collapsed to one CR.
+    private def split_wire(text : String) : {Array(String), Array(String)}
+      parts = text.split('\n')
+      lines = Array(String).new(parts.size)
+      eols = Array(String).new(parts.size)
+      last = parts.size - 1
+      parts.each_with_index do |p, i|
+        if i == last
+          lines << p # nothing followed it — no terminator
+          eols << ""
+        elsif p.ends_with?('\r')
+          stripped = p.rstrip('\r')
+          n = p.bytesize - stripped.bytesize
+          lines << stripped
+          eols << (n == 1 ? "\r\n" : "#{"\r" * n}\n")
+        else
+          lines << p
+          eols << "\n"
+        end
+      end
+      lines << "" if lines.empty? # String#split never yields this, but the invariant is load-bearing
+      eols << "" if eols.empty?
+      {lines, eols}
+    end
+
+    # The terminator after line `i`, defaulting for any index an edit path has yet to fill in.
+    # Defensive on purpose: a desync between @lines and @eols must degrade to today's LF
+    # behaviour, never raise inside a render or a send.
+    private def eol_at(i : Int32) : String
+      @eols[i]? || DEFAULT_EOL
+    end
+
     def to_bytes : Bytes
       @lines.join("\r\n").to_slice
+    end
+
+    # The buffer with every line's ORIGINAL terminator — the exact inverse of `set_text`, and
+    # the only accessor a send path may use.
+    #
+    # Distinct from both of its neighbours, and all three are needed. `#text` (LF) is the
+    # document form: comparisons, search offsets, marker parsing, Notes. `#to_bytes` (CRLF)
+    # is the "everything is a header line" form the hex snapshot and the first-line probes
+    # want. `#wire_text` is what actually came in: CRLF where the capture had CRLF, LF where
+    # it had LF, and a lone CR left wherever it sat. `Env.expand_wire` still promotes the head
+    # afterwards, so a line the operator typed fresh (eol `\n`) is CRLF-terminated on the wire
+    # if it is a header and stays LF if it is body — which is the split this editor could not
+    # express before.
+    def wire_text : String
+      return @lines[0] if @lines.size == 1
+      String.build do |io|
+        @lines.each_with_index do |l, i|
+          io << l
+          io << eol_at(i)
+        end
+      end
+    end
+
+    def wire_bytes : Bytes
+      wire_text.to_slice
+    end
+
+    # The buffer as {line, terminator} pairs — for a consumer that has to cut the buffer on
+    # line boundaries and still reassemble wire bytes (the Repeater's `%%%` send-group).
+    def wire_lines : Array({String, String})
+      @lines.map_with_index { |l, i| {l, eol_at(i)} }
     end
 
     # Plain text (LF-joined) for non-wire uses (e.g. the Notes document).
@@ -211,8 +303,7 @@ module Gori::Tui
     # offsets are dropped (the owner re-feeds fresh ones next render).
     def replace_all(new_text : String, caret : Int32) : Nil
       push_undo
-      @lines = new_text.split('\n').map(&.rstrip('\r'))
-      @lines = [""] if @lines.empty?
+      @lines, @eols = split_wire(new_text)
       @conceal_spans = [] of {Int32, Int32} unless @conceal_spans.empty?
       @styled = nil
       @edits += 1
@@ -225,6 +316,12 @@ module Gori::Tui
       cx = @cx.clamp(0, line.size)
       @lines[@cy] = line[0, cx]
       @lines.insert(@cy + 1, line[cx..])
+      # The TAIL keeps whatever terminated the line we just split; the break the user typed is
+      # brand new, so it gets DEFAULT_EOL. (Splitting a CRLF-terminated header line therefore
+      # yields a new LF-terminated line — which expand_wire promotes back to CRLF, since it is
+      # still in the head. In a body it stays LF, matching what typing Enter has always sent.)
+      @eols.insert(@cy + 1, eol_at(@cy))
+      @eols[@cy] = DEFAULT_EOL
       @cy += 1
       @cx = 0
       @styled = nil
@@ -254,6 +351,9 @@ module Gori::Tui
         @cx = prev.size
         @lines[@cy - 1] = prev + @lines[@cy]
         @lines.delete_at(@cy)
+        # The terminator that separated the two lines is exactly what the backspace deleted;
+        # the merged line now ends with whatever ended the line pulled up.
+        @eols.delete_at(@cy - 1)
         @cy -= 1
         # The JOIN re-clusters across the seam: if the next line opened with a combining
         # mark it has just fused onto `prev`'s last glyph, so `prev.size` — the seam — is
@@ -294,6 +394,7 @@ module Gori::Tui
         push_undo
         @lines[@cy] = line + @lines[@cy + 1]
         @lines.delete_at(@cy + 1)
+        @eols.delete_at(@cy) # the separator is what forward-delete removed (mirrors backspace)
       else
         return # end of buffer — nothing to delete, don't dirty
       end
@@ -1028,7 +1129,7 @@ module Gori::Tui
     end
 
     private def push_undo : Nil
-      @undo_stack << UndoState.new(@lines.dup, @cy, @cx) # shallow: shares the immutable line Strings
+      @undo_stack << UndoState.new(@lines.dup, @eols.dup, @cy, @cx) # shallow: shares the immutable Strings
       @undo_stack.shift if @undo_stack.size > 100
     end
 
@@ -1036,7 +1137,11 @@ module Gori::Tui
       return if @undo_stack.empty?
       state = @undo_stack.pop
       @lines = state.lines # the snapshot is popped/unreferenced, so no defensive dup
-      @lines = [""] if @lines.empty?
+      @eols = state.eols   # restored in lockstep — a desync would send a line's neighbour's ending
+      if @lines.empty?
+        @lines = [""]
+        @eols = [""]
+      end
       @cy = state.cy.clamp(0, @lines.size - 1)
       @cx = state.cx.clamp(0, @lines[@cy].size)
       snap_cx_to_cluster(0) # the snapshot's line may differ from the one we clamp against

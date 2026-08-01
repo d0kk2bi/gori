@@ -30,7 +30,7 @@ module Gori
         # Layer 1's policy is chosen here (`Outbound.agent`) and handed to the builder — the
         # builder must never pick it, or MCP's strict "no scope ⇒ refuse" default would
         # silently become whichever policy got hard-coded there (DESIGN.md §7).
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         plan = build_send_plan(h, ob)
         return plan if plan.is_a?(Result)
         # OPT-IN Match&Replace parity (before the scope gate + History write so the
@@ -39,20 +39,31 @@ module Gori
         gate = send_gate(ob, plan)
         return gate if gate.is_a?(Result)
         sc = gate
-        built = RequestBuilder::Built.new(plan.bytes, plan.scheme, plan.host, plan.port)
+        # A field-native send has no h1-text source: its `built.bytes` is the FAITHFUL
+        # pseudo-explicit dump (`H2Engine.field_dump`), so the recorded/reported request shows
+        # `:scheme` and every duplicate pseudo the h1 projection drops (F11). The byte path is
+        # untouched — `plan.bytes` is still the operator's text there.
+        built =
+          if fields = plan.h2_fields
+            RequestBuilder::Built.new(Repeater::H2Engine.field_dump(fields, plan.h2_body),
+              plan.scheme, plan.host, plan.port)
+          else
+            RequestBuilder::Built.new(plan.bytes, plan.scheme, plan.host, plan.port)
+          end
         http2 = plan.http2?
-        recorded_flow_id = record_history ? record_outbound_request(built, http2) : nil
+        wire = wire_request(plan, built)
+        recorded_flow_id = record_history ? record_outbound_request(built, wire, http2, plan.h2_fields) : nil
         result = plan.send
         record_outbound_response(recorded_flow_id, result) if recorded_flow_id
         # Audit trail on STDERR — never STDOUT (reserved for JSON-RPC).
         Log.info { "send_request #{built.scheme}://#{built.host}:#{built.port} http2=#{http2} scope=#{sc.decision} flow_id=#{recorded_flow_id || "none"} -> #{result.ok? ? "ok" : result.error}" }
 
         repeater_id = persist_send_repeater(h, save, built, http2, result,
-          issue_id, recorded_flow_id)
+          issue_id, recorded_flow_id, plan.h2_fields)
 
         body_cap, body_omit = body_return_opts(h)
         Result.new(send_result_json(result, recorded_flow_id, repeater_id,
-          include_sensitive_headers, sc, built, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules),
+          include_sensitive_headers, sc, built, wire, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules, plan.h2_fields),
           is_error: !result.ok?)
       rescue ex : Gori::Error
         # Bad input (missing/invalid url, illegal header, …) — return a clean
@@ -67,16 +78,52 @@ module Gori
       # of them — so the caller can SEE what was dropped.
       private def flow_precedence_ignored(h) : Array(String)
         return [] of String unless present?(h, "flow_id") || present?(h, "repeater_id")
-        {"url", "method", "headers", "body", "raw"}.select { |f| present?(h, f) }.to_a
+        {"url", "method", "headers", "body", "body_base64", "raw", "raw_base64"}.select { |f| present?(h, f) }.to_a
       end
 
-      # The request actually put on the wire, parsed back from the built bytes, so
+      # The bytes that actually reach the origin, as head text.
+      #
+      # On h1 they ARE `built.bytes` — `Engine` writes them byte-exact (P7). On h2 the bytes
+      # are only the SOURCE: `H2Engine` resolves `:path` from the request line, folds `Host:`
+      # into `:authority` and (unless `verbatim`) lowercases field names. Deriving the report
+      # and the History row from the source therefore described a request gori never sent —
+      # MCP answered `target: "/mcp-noversion"` with `Transfer-Encoding` in the recorded head
+      # while `GET /` went out, and `run show <id> --format raw` printed those bytes back. An
+      # agent-driven scan reads exactly this.
+      #
+      # Falls back to the source when the encoding raises: `plan.send` hits the same refusal
+      # and reports it as the error, and a report is not the place to raise a second time.
+      private def wire_request(plan : Repeater::Plan, built : RequestBuilder::Built) : Bytes
+        # Field-native: `built.bytes` is already the faithful field dump — the fields go on the
+        # wire verbatim, so there is no h1-text to re-encode and nothing to project away.
+        return built.bytes if plan.h2_fields
+        return built.bytes unless plan.http2?
+        Repeater::H2Engine.encoded_request(built.bytes, scheme: built.scheme, host: built.host,
+          port: built.port, preserve_field_case: plan.preserve_field_case?)
+      rescue Gori::Error
+        built.bytes
+      end
+
+      # The request actually put on the wire, parsed back from the encoded bytes, so
       # a caller can confirm scheme/host/port/method/target/version independently
       # of which inputs it supplied (flow_id vs url/raw).
-      private def emit_effective_request(j : JSON::Builder, built : RequestBuilder::Built, http2 : Bool) : Nil
+      private def emit_effective_request(j : JSON::Builder, built : RequestBuilder::Built,
+                                         wire : Bytes, http2 : Bool,
+                                         h2_fields : Array({String, String})? = nil) : Nil
+        # Field-native: the wire is a pseudo-explicit dump whose first line is `:method: …`,
+        # not a request line — derive method/target from the FIELDS a receiver routes on (the
+        # first `:method`/`:path`), so `effective_request` describes the shape actually sent
+        # rather than mis-reading the dump's leading pseudo line.
         # `split` (no arg) collapses whitespace runs so a malformed request line with a
         # doubled space still reports the real method/target/version (see Outbound.request_target).
-        parts = (String.new(built.bytes).each_line.first? || "").split
+        parts = (String.new(wire).each_line.first? || "").split
+        if fields = h2_fields
+          method = Repeater::H2Engine.pseudo_field(fields, ":method") || ""
+          target = Repeater::H2Engine.pseudo_field(fields, ":path") || "/"
+        else
+          method = parts[0]? || ""
+          target = parts[1]? || "/"
+        end
         j.field "effective_request" do
           j.object do
             j.field "scheme", built.scheme
@@ -84,11 +131,37 @@ module Gori
             j.field "port", built.port
             # A `raw` send is byte-exact by contract (P7), so the request line here can hold
             # any octet the caller typed — scrub the ECHO without touching the wire bytes.
-            j.field "method", Serialize.text(parts[0]? || "")
-            j.field "target", Serialize.text(parts[1]? || "/")
-            j.field "http_version", http2 ? "HTTP/2" : Serialize.text(parts[2]? || "HTTP/1.1")
+            j.field "method", Serialize.text(method)
+            j.field "target", Serialize.text(target)
+            # NULL, not a substituted "HTTP/1.1", when the request line carried no version.
+            # This field's contract is "what actually went out": a `verbatim` send of
+            # `GET /old09\r\n\r\n` is the HTTP/0.9 handling probe, and answering it with a
+            # version that was never on the wire tells the agent its own test did not happen.
+            j.field "http_version", http2 ? "HTTP/2" : parts[2]?.try { |v| Serialize.text(v) }
           end
         end
+      end
+
+      # The FAITHFUL field list a field-native send put on the wire, in order, pseudo-headers
+      # and duplicates included — the report `H2Engine.field_dump` used to carry by being the
+      # stored head. It moved here because History and the Repeater have to hold a REPLAYABLE
+      # projection (see `replayable_field_head`), and that projection cannot show a duplicate
+      # `:method` or a `:scheme` disagreeing with the connection. `history_head_projected`
+      # says so out loud, so an agent reading the recorded flow back never mistakes the
+      # projection for the wire.
+      private def emit_sent_h2_fields(j : JSON::Builder, h2_fields : Array({String, String})?) : Nil
+        return unless fields = h2_fields
+        j.field "sent_h2_fields" do
+          j.array do
+            fields.each do |(n, v)|
+              j.array { j.string Serialize.text(n); j.string Serialize.text(v) }
+            end
+          end
+        end
+        j.field "history_head_projected", true
+        j.field "history_head_note",
+          "the recorded flow / saved repeater holds the HTTP/1.1 projection of these fields " \
+          "(so it can be replayed); `sent_h2_fields` above is what went on the wire"
       end
 
       # Resolve + validate the optional issue_id for a save-linked send. Returns
@@ -117,12 +190,14 @@ module Gori
       #
       # Layer 2 (`Repeater::Sender#refusal`) is Sandbox mode, a hard containment gate that
       # allow_unscoped does NOT lift — the TUI and `gori run repeater` have always enforced
-      # it that way, and MCP used to let allow_unscoped:true walk straight past it.
+      # it that way, and MCP used to let allow_unscoped:true walk straight past it. It also
+      # carries the unbound-binding rule, which is NOT a scope decision at all — hence
+      # `refusal_blocked` rather than a direct `sandbox_blocked`.
       private def send_gate(ob : Outbound, plan : Repeater::Plan) : ScopeCheck | Result
         sc = ob.check(request_scope_url(plan), plan.host)
         return scope_blocked(sc) if sc.blocked?
         if reason = plan.refusal
-          return sandbox_blocked(reason, plan.host, "url")
+          return refusal_blocked(plan, reason, plan.host, "url")
         end
         sc
       end
@@ -133,25 +208,82 @@ module Gori
         int(h, "timeout_ms").try(&.clamp(1_i64, 600_000_i64).milliseconds)
       end
 
+      # Substrings that identify a DETERMINISTIC protocol refusal in gori's own error text —
+      # a message gori (or the origin) will produce identically on every retry.
+      #
+      # The list used to stop at malformed/framing/interim/chunk, which left the sharpest
+      # finding a tester can get filed as an "other" transient error: two conflicting
+      # `Content-Length` headers — a response-splitting/desync condition — came back as
+      # `error_kind:"other", error_code:"NETWORK_ERROR", retryable:true`, so an agent LOOPS on
+      # it instead of reporting it. Every phrase here is raised by gori's own framing guards
+      # (`Codec::Body`, `Codec::Http1`, the h2 assembler/engine), never by a socket.
+      PROTOCOL_ERROR_PHRASES = {
+        "malformed", "framing", "interim", "chunk",
+        "conflicting content-length", "ambiguous framing", "obfuscated",
+        "transfer-encoding", "content-length", "invalid header", "invalid status",
+        "http/2", "h2 ", "hpack", "response head", "status line",
+      }
+
+      # h2/RFC 9113 §7 conditions that are TRANSIENT even though the sentence naming them
+      # trips PROTOCOL_ERROR_PHRASES (every one of them says "h2 "). Keyed on the SPEC
+      # ERROR-CODE NAMES, not on gori's sentence: the names are fixed by the RFC and the
+      # engine renders them straight out of `H2Engine::GOAWAY_ERRORS`, so matching
+      # `refused_stream` survives any rewording of the sentence carrying it — which is the
+      # failure mode a whole-sentence literal would have.
+      #
+      # §8.7 makes REFUSED_STREAM an explicit RETRY instruction ("the request was not
+      # processed") and ENHANCE_YOUR_CALM is a rate signal, not a malformed message. Coding
+      # either as a non-retryable PROTOCOL_ERROR tells an agent to stop and file a finding
+      # where the correct action is to send the request again on a fresh connection.
+      RETRYABLE_H2_PHRASES = {"refused_stream", "enhance_your_calm"}
+
+      # "gori got no response frame at all" — the category `no_response` exists for. These
+      # also say "h2 ", so PROTOCOL_ERROR_PHRASES used to claim them and report an origin
+      # that simply closed the connection as a non-retryable framing refusal. A protocol
+      # verdict means gori can PROVE the message malformed; silence is not that.
+      NO_RESPONSE_PHRASES = {"no h2 response", "no response"}
+
       # Coarse category for a send's network error, from the engine's error text
       # (gori's own controlled strings). "connect" (the dialer collapses DNS /
       # refused / connect-timeout / TLS-verify into one failure — finer split would
-      # need dialer changes), "timeout" (idle read/write), "protocol" (framing /
-      # malformed response), "no_response", else "other". Advisory.
+      # need dialer changes), "timeout" (idle read/write), "protocol" (a deterministic
+      # framing/protocol refusal — see PROTOCOL_ERROR_PHRASES), "no_response", else "other".
+      #
+      # A pure function of the engine's sentence, so it is `self.` and directly testable: the
+      # retry policy an agent applies hangs off it, and the sentences it reads are written in
+      # another module. Pinning them in a spec is what keeps a reword there from silently
+      # flipping a retryable condition into "stop and report a finding".
       private def network_error_kind(message : String?) : String?
+        Tools.network_error_kind(message)
+      end
+
+      def self.network_error_kind(message : String?) : String?
         return nil unless message
         m = message.downcase
         return "connect" if m.starts_with?("connect failed")
         return "timeout" if m.includes?("timed out") || m.includes?("timeout")
-        return "protocol" if m.includes?("malformed") || m.includes?("framing") ||
-                             m.includes?("interim") || m.includes?("chunk")
-        return "no_response" if m.includes?("no response") || m.includes?("closed")
+        # Both ahead of PROTOCOL_ERROR_PHRASES on purpose — see their own comments.
+        return "other" if RETRYABLE_H2_PHRASES.any? { |p| m.includes?(p) }
+        return "no_response" if NO_RESPONSE_PHRASES.any? { |p| m.includes?(p) }
+        return "protocol" if PROTOCOL_ERROR_PHRASES.any? { |p| m.includes?(p) }
+        return "no_response" if m.includes?("closed")
         "other"
+      end
+
+      # The structured-error pair for a failed send. A "protocol" kind is gori refusing a
+      # message it can prove is malformed, so it is NOT retryable and is not a network fault:
+      # retrying reproduces it exactly, and the refusal itself is the finding. Everything else
+      # keeps the transient NETWORK_ERROR contract callers already apply policy against.
+      private def emit_send_error_code(j : JSON::Builder, kind : String?) : Nil
+        protocol = kind == "protocol"
+        j.field "error_code", protocol ? "PROTOCOL_ERROR" : "NETWORK_ERROR"
+        j.field "retryable", !protocol
       end
 
       private def persist_send_repeater(h, save : Bool, built : RequestBuilder::Built,
                                         http2 : Bool, result : Repeater::Result,
-                                        issue_id : Int64?, recorded_flow_id : Int64?) : Int64?
+                                        issue_id : Int64?, recorded_flow_id : Int64?,
+                                        h2_fields : Array({String, String})? = nil) : Int64?
         return nil unless save
         port_suffix = ((built.scheme == "https" && built.port == 443) ||
                        (built.scheme == "http" && built.port == 80)) ? "" : ":#{built.port}"
@@ -160,7 +292,13 @@ module Gori
         # the Repeater tab to the newly recorded History evidence.
         flow_id = int(h, "flow_id") || recorded_flow_id
         masked_target = Env.mask_secrets(target_url)
-        masked_req = Env.mask_secrets(String.new(built.bytes))
+        # Same reason as `record_outbound_request`: a saved session is a REPLAY source before
+        # it is a display, and no surface can send `H2Engine.field_dump` back. Saving the dump
+        # produced a session (`#5 [H2] fieldnative`) that could never be sent again from any
+        # surface — the CLI refused it with the pseudo-header message and MCP read its method
+        # back as `":method:"`. See `replayable_field_head`.
+        saved_bytes = replayable_field_head(h2_fields, built, built.bytes)
+        masked_req = Env.mask_secrets(String.new(saved_bytes))
         repeater_id = store.insert_repeater(
           target: masked_target,
           request: masked_req.to_slice,
@@ -189,17 +327,64 @@ module Gori
         repeater_id
       end
 
-      private def record_outbound_request(built : RequestBuilder::Built, http2 : Bool) : Int64
-        head, body = split_wire_request(built.bytes)
-        parsed = Proxy::Codec::Http1.parse_request_head(head)
+      # The bytes to PERSIST for a field-native h2 send: `HeadCodec.synth_request`'s h1
+      # projection plus the body, not `H2Engine.field_dump`.
+      #
+      # The dump is the faithful REPORT of the fields and it stays that, in `sent_h2_fields`
+      # on this call's own result. It must not be the stored head, because History and the
+      # Repeater are not only a display — they are a REPLAY SOURCE, and the dump's first line
+      # is `:method: POST`, not a request line. Replaying such a row over h2 was refused with
+      # gori blaming the operator for bytes gori itself wrote; over `--http1` it put a request
+      # with NO REQUEST LINE on the wire (every header shifted by one) and reported `200`; and
+      # MCP's own echo read the row back as `method: ":method:", target: "POST"`.
+      #
+      # The projection is lossy — a duplicate pseudo and `:scheme` do not survive it, which is
+      # exactly what `field_dump` exists to show — but it is lossy in the one direction that
+      # keeps the evidence usable, and it is the same projection the h2 CAPTURE path stores
+      # for every intercepted h2 request. Evidence gori writes must be replayable by gori.
+      # Nil `fields` means this was never a field-native send, so the bytes are already the
+      # operator's own text and pass through — that way no caller needs a branch of its own.
+      private def replayable_field_head(fields : Array({String, String})?,
+                                        built : RequestBuilder::Built, wire : Bytes) : Bytes
+        return wire unless fields
+        authority = Proxy::H2::HeadCodec.pseudo(fields, ":authority") ||
+                    "#{built.host}:#{built.port}"
+        head = Proxy::H2::HeadCodec.synth_request(fields, authority)
+        _, body = split_wire_request(wire)
+        return head if body.nil? || body.empty?
+        joined = Bytes.new(head.size + body.size)
+        head.copy_to(joined)
+        body.copy_to(joined + head.size)
+        joined
+      end
+
+      # `wire` — not `built.bytes` — is the evidence: History is what `run show --format raw`
+      # and `get_flow` replay from, and on h2 the source text is not what went out. See
+      # `wire_request`.
+      private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool,
+                                          h2_fields : Array({String, String})? = nil) : Int64
+        head, body = split_wire_request(replayable_field_head(h2_fields, built, wire))
+        # Field-native: `head` is the h1 PROJECTION, not the pseudo-explicit dump, so the
+        # method/target COLUMNS (list_history / QL / sitemap read them) come off the FIELDS a
+        # receiver routes on and agree with the head text. See `replayable_field_head`.
+        if fields = h2_fields
+          method = Repeater::H2Engine.pseudo_field(fields, ":method") || ""
+          target = Repeater::H2Engine.pseudo_field(fields, ":path") || "/"
+          version = "HTTP/2"
+        else
+          # `authored_start_line`, not `parse_request_head`: these bytes are the caller's, and
+          # under `verbatim` a bare-LF terminator is the payload. See its comment for why the
+          # shared parser must stay strict.
+          method, target, version = Proxy::Codec::Http1.authored_start_line(head)
+        end
         captured = Store::CapturedRequest.new(
           created_at: Time.utc.to_unix_ms * 1000_i64,
           scheme: built.scheme,
           host: built.host,
           port: built.port,
-          method: parsed.method,
-          target: parsed.target,
-          http_version: http2 ? "HTTP/2" : parsed.version,
+          method: method,
+          target: target,
+          http_version: http2 ? "HTTP/2" : version,
           head: head,
           body: body,
           body_size: body.try(&.size.to_i64),
@@ -239,6 +424,11 @@ module Gori
       # and re-sync Content-Length. Response-side rules are intentionally NOT applied. Returns
       # the (possibly rewritten) request and whether a rule actually changed the bytes.
       private def maybe_apply_request_rules(h, plan : Repeater::Plan) : {Repeater::Plan, Bool}
+        # Match&Replace parity operates on h1 head TEXT; a field-native plan has none (its
+        # `bytes` is only the synthetic scope line), so applying rules would rewrite that line
+        # and never the fields on the wire. A field list is byte-exact by construction — the
+        # reason apply_rules is opt-in at all — so it is simply not offered here.
+        return {plan, false} if plan.h2_fields
         return {plan, false} unless bool_arg(h, "apply_rules", false)
         rules = Gori::Rules.load(store)
         return {plan, false} unless rules.active?
@@ -250,13 +440,16 @@ module Gori
 
       private def send_result_json(result : Repeater::Result, recorded_flow_id : Int64?,
                                    repeater_id : Int64?, include_sensitive_headers : Bool,
-                                   sc : ScopeCheck, built : RequestBuilder::Built, http2 : Bool,
+                                   sc : ScopeCheck, built : RequestBuilder::Built, wire : Bytes,
+                                   http2 : Bool,
                                    ignored : Array(String), body_cap : Int32, body_omit : Bool,
-                                   applied_rules : Bool = false) : String
+                                   applied_rules : Bool = false,
+                                   h2_fields : Array({String, String})? = nil) : String
         JSON.build do |j|
           j.object do
             emit_scope(j, sc)
-            emit_effective_request(j, built, http2)
+            emit_effective_request(j, built, wire, http2, h2_fields)
+            emit_sent_h2_fields(j, h2_fields)
             j.field "match_replace_applied", true if applied_rules
             unless ignored.empty?
               j.field("ignored_fields") { j.array { ignored.each { |f| j.string f } } }
@@ -266,13 +459,13 @@ module Gori
             j.field "recorded_flow_id", recorded_flow_id
             j.field "saved_repeater_id", repeater_id if repeater_id && repeater_id > 0
             unless result.ok?
+              kind = network_error_kind(result.error)
               j.field "error", result.error
-              j.field "error_kind", network_error_kind(result.error)
+              j.field "error_kind", kind
               # Structured-error contract inside the payload (the payload IS the
-              # structuredContent): a network failure is coded + retryable so a
-              # caller can apply policy without string-matching the message.
-              j.field "error_code", "NETWORK_ERROR"
-              j.field "retryable", true
+              # structuredContent) so a caller can apply policy without string-matching the
+              # message — including "do not retry this, report it" (see emit_send_error_code).
+              emit_send_error_code(j, kind)
             end
             if response = result.response
               j.field "status", response.status
@@ -288,7 +481,15 @@ module Gori
                     redacted ||= sensitive
                     j.object do
                       j.field "name", Serialize.text(header.name)
-                      j.field "value", sensitive ? "[REDACTED]" : Serialize.text(header.value)
+                      if sensitive
+                        j.field "value", "[REDACTED]"
+                      else
+                        # The BODY already had a base64 fallback for bytes JSON cannot carry;
+                        # a header value did not, so an 8-bit byte here came back as `�` and
+                        # was unrecoverable through MCP entirely — two different invalid bytes
+                        # rendered identically. Header values are remote bytes too.
+                        Serialize.emit_lossy_text(j, "value", header.value)
+                      end
                     end
                   end
                 end
@@ -300,6 +501,14 @@ module Gori
             Serialize.emit_body(j, "body", result.head, result.body, false, body_cap, body_omit)
           end
         end
+      end
+
+      # A CLOSE frame's status code (RFC 6455 §5.5.1), or nil for any other frame. Not
+      # `WsMessage#close_code` because a transcript row is a `WsEngine::Message`, which never
+      # went through the store.
+      private def ws_close_code(m : Repeater::WsEngine::Message) : Int32?
+        return nil unless m.opcode == 8 && m.payload.size >= 2
+        (m.payload[0].to_i << 8) | m.payload[1].to_i
       end
 
       # One redaction policy across Flow, Repeater, and send_request responses.
@@ -330,34 +539,42 @@ module Gori
         return Result.new(id_error(h, "idle_ms"), is_error: true) if idle_ms.nil? && present?(h, "idle_ms")
         idle = (idle_ms || 3000_i64).clamp(100_i64, 60_000_i64).milliseconds
 
-        out_messages = if present?(h, "messages")
-                         arr = h["messages"]?.try(&.as_a?)
-                         return Result.new("invalid 'messages' (expected an array of strings)", is_error: true) unless arr
-                         texts = [] of String
-                         arr.each do |item|
-                           text = item.as_s?
-                           return Result.new("invalid 'messages' (expected an array of strings)", is_error: true) unless text
-                           texts << text
-                         end
-                         if e = ws_unresolved_env_error(texts, "messages")
-                           return e
-                         end
-                         texts.map { |t| Repeater::WsEngine::OutMsg.new(1, Env.expand(t).to_slice) }
-                       else
-                         stored = store.ws_messages_for_repeater(repeater_id).select { |m| m.direction == "out" }
-                         if e = ws_unresolved_env_error(stored.select(&.text?).map { |m| String.new(m.payload).scrub },
-                              "repeater_id")
-                           return e
-                         end
-                         stored.map do |m|
-                           payload = m.text? ? Env.expand(String.new(m.payload).scrub).to_slice : m.payload
-                           Repeater::WsEngine::OutMsg.new(m.opcode, payload)
-                         end
-                       end
+        # ONE list, whether it came from the call or from the session, so the shape handling
+        # below cannot diverge between them. `messages` now accepts every form
+        # `ws_out_messages` does — a bare string is still a plain TEXT frame, and the object /
+        # `WsFrameSpec` forms are what make a PING, a CLOSE with a chosen code, an unmasked
+        # client frame or a lying length header expressible from MCP at all. Until now every
+        # entry became `OutMsg.new(1, …)`, so this tool could send exactly one frame shape.
+        source = [] of Store::WsOutMessage
+        field = "repeater_id"
+        if present?(h, "messages")
+          arr = h["messages"]?.try(&.as_a?)
+          return Result.new("invalid 'messages' (expected an array of strings or objects)", is_error: true) unless arr
+          arr.each do |item|
+            msg, perr = ws_out_message_item(item)
+            return Result.new(ws_entry_error("messages", item, perr), is_error: true) unless msg
+            source << msg
+          end
+          field = "messages"
+        else
+          source = store.ws_messages_for_repeater(repeater_id).select { |m| m.direction == "out" }
+            .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
+        end
+        if e = ws_unresolved_env_error(source.select(&.text?).map { |m| String.new(m.payload) }, field)
+          return e
+        end
+        # No `.scrub`: `Env.expand` scans BYTES and copies every span that is not a matched
+        # token through unchanged, so an invalid-UTF-8 TEXT payload — the §8.1/§5.6 validation
+        # test case — reaches the wire as the operator captured it. Scrubbing rewrote it to
+        # U+FFFD, changing 9 bytes into 13, and sent that with no warning.
+        out_messages = source.map do |m|
+          payload = m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload
+          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape)
+        end
 
         # Scope gate before the outbound handshake (same policy as send_request).
-        ob = outbound(bool(h, "allow_unscoped") || false)
-        verify = @verify_upstream && !(bool(h, "insecure") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
+        verify = @verify_upstream && !bool_arg(h, "insecure", false)
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([repeater.request],
             default_target: repeater.target, sni: repeater.sni, verify: verify,
@@ -373,14 +590,17 @@ module Gori
         return scope_blocked(sc) if sc.blocked?
         # Layer 2 (Sandbox) — allow_unscoped does not lift it; refuse before the link write.
         if reason = plan.refusal
-          return sandbox_blocked(reason, host, "repeater_id")
+          return refusal_blocked(plan, reason, host, "repeater_id")
         end
         # Scope passed — now it's safe to persist the issue link.
         if issue_id
           store.add_link(Store::LinkOwnerKind::Issue, issue_id,
             Store::LinkRefKind::Repeater, repeater_id)
         end
-        result = plan.send_ws(out_messages, idle)
+        # The session's stored setting, overridable per call — a handshake test wants to run
+        # it both ways against the same session without editing the session.
+        keep_key = present?(h, "keep_sec_websocket_key") ? (bool(h, "keep_sec_websocket_key") || false) : repeater.ws_keep_key?
+        result = plan.send_ws(out_messages, idle, keep_key)
 
         store.update_repeater_response(repeater_id, result.handshake_head, Bytes.empty,
           result.error, result.duration_us)
@@ -395,10 +615,10 @@ module Gori
             j.field "close_code", result.close_code if result.close_code
             j.field "note", Env.mask_secrets(result.note.not_nil!) if result.note
             if err = result.error
+              kind = network_error_kind(err)
               j.field "error", Env.mask_secrets(err)
-              j.field "error_kind", network_error_kind(err)
-              j.field "error_code", "NETWORK_ERROR"
-              j.field "retryable", true
+              j.field "error_kind", kind
+              emit_send_error_code(j, kind)
             end
             unless result.handshake_head.empty?
               response = begin
@@ -415,8 +635,25 @@ module Gori
                     j.field "direction", message.direction
                     j.field "opcode", message.opcode
                     j.field "type", Serialize.ws_frame_type(message.opcode)
+                    # What was actually FRAMED, not just what was meant. An agent driving a
+                    # §5.1/§5.2/§5.4 test has to be able to read back that the unmasked frame,
+                    # the RSV1 bit or the lying length header really went out — a transcript
+                    # that only echoes the payload is asking to be taken on trust.
+                    j.field "frame", Store::WsOutMessage.new(message.opcode, message.payload, message.shape).shape_label(message.direction == "out")
+                    if code = ws_close_code(message)
+                      j.field "close_code", code
+                      reason = message.payload[2, message.payload.size - 2]
+                      j.field "close_reason", Serialize.text(String.new(reason).scrub) unless reason.empty?
+                    end
                     if message.opcode == 1
                       j.field "payload", Env.mask_secrets(String.new(message.payload).scrub)
+                      # JSON-RPC has no way to carry a byte that is not valid UTF-8, so
+                      # `payload` above is U+FFFD-substituted for exactly the payload an
+                      # §8.1/§5.6 test is about. The real bytes go beside it instead of
+                      # being unreadable on every surface (they are in the BLOB column).
+                      unless String.new(message.payload).valid_encoding?
+                        j.field "payload_base64", Base64.strict_encode(message.payload)
+                      end
                     else
                       j.field "binary", true
                       j.field "payload_base64", Base64.strict_encode(message.payload)
@@ -455,7 +692,8 @@ module Gori
       # parsing, SNI, host overrides, the gated dialer); everything left here is MCP's own
       # argument parsing.
       private def build_send_plan(h, ob : Outbound) : Repeater::Plan | Result
-        Repeater::Plan.build(send_plan_options(h), ob)
+        opts = present?(h, "h2_fields") ? field_native_plan_options(h) : send_plan_options(h)
+        Repeater::Plan.build(opts, ob)
       rescue ex : Repeater::PlanError
         send_plan_error(ex, "url")
       end
@@ -479,11 +717,66 @@ module Gori
       # (flow_id), or builds from url/raw/method args — normalized to the one option set
       # `Repeater::Plan` consumes. Raises `Gori::Error` on bad arguments (`send_request`
       # turns that into a clean message).
+      # Parse the `h2_fields` argument into the exact HPACK field list to encode. Accepts a
+      # JSON array of two-element `[name, value]` arrays (or a JSON-encoded string of the same,
+      # since LLM clients vary). NOTHING is normalized — a leading colon (`:scheme`), a leading
+      # space in a value, an uppercase name, a repeated pseudo are all kept verbatim: they are
+      # the payload. Raises `Gori::Error` (a clean message) on a shape that is not a pair list.
+      private def parse_h2_fields(h) : Array({String, String})
+        raw = h["h2_fields"]?
+        arr = raw.try(&.as_a?)
+        if arr.nil? && (s = raw.try(&.as_s?))
+          arr = (JSON.parse(s).as_a? rescue nil)
+        end
+        raise Gori::Error.new("'h2_fields' must be an array of [name, value] pairs") unless arr
+        fields = [] of {String, String}
+        arr.each do |item|
+          pair = item.as_a?
+          raise Gori::Error.new("each 'h2_fields' entry must be a [name, value] pair") unless pair && pair.size == 2
+          name = pair[0].as_s?
+          value = pair[1].as_s?
+          raise Gori::Error.new("'h2_fields' names and values must both be strings") if name.nil? || value.nil?
+          fields << {name, value}
+        end
+        raise Gori::Error.new("'h2_fields' must not be empty") if fields.empty?
+        fields
+      end
+
+      # The request body for a field-native send: `body` as UTF-8, or `body_base64` for raw
+      # bytes (a body an operator wants to send exactly, e.g. a protobuf/gRPC frame). Verbatim
+      # — no `$VAR` expansion, matching the "the fields ARE the message" contract of this path.
+      private def h2_body_arg(h) : Bytes?
+        if b64 = str(h, "body_base64")
+          return Base64.decode(b64) rescue raise Gori::Error.new("'body_base64' is not valid base64")
+        end
+        str(h, "body").try(&.to_slice)
+      end
+
+      # The option set for a field-native h2 send — dispatched from `build_send_plan` so it is
+      # NOT another branch inside `send_plan_options`. `url` still resolves the DIAL origin
+      # (host/port/scheme), but every pseudo-header and field goes on the wire as given — so a
+      # `:scheme` that disagrees with the connection, a duplicate `:method`, an out-of-order or
+      # unknown pseudo, `:protocol` and a leading-space value are all sendable, none of which
+      # the h1-text carrier can hold (F7/F8/F11). It cannot ride with a stored source
+      # (flow_id/repeater_id replay their own bytes).
+      private def field_native_plan_options(h) : Repeater::PlanOptions
+        if present?(h, "flow_id") || present?(h, "repeater_id")
+          raise Gori::Error.new("h2_fields cannot be combined with flow_id or repeater_id")
+        end
+        fields = parse_h2_fields(h)
+        scheme, host, port = RequestBuilder.origin(h)
+        Repeater::PlanOptions.new(
+          h2_fields: fields, h2_body: h2_body_arg(h),
+          origin: Repeater::Origin.new(scheme, host, port),
+          http2: true, verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          timeout: send_timeout(h), overrides: HostOverrides.load(store))
+      end
+
       private def send_plan_options(h) : Repeater::PlanOptions
         if present?(h, "flow_id") && present?(h, "repeater_id")
           raise Gori::Error.new("pass only one of flow_id or repeater_id")
         end
-        verify = @verify_upstream && !(bool(h, "insecure") || false)
+        verify = @verify_upstream && !bool_arg(h, "insecure", false)
         timeout = send_timeout(h)
         # Honor the project's host overrides on the direct-dial path (parity with the live
         # proxy). nil/empty is behaviorally identical to no override.
@@ -516,7 +809,31 @@ module Gori
           # `false || flow.http2` kept h2). Carry the captured SNI so an origin where
           # SNI ≠ Host (domain fronting / multi-cert vhost) presents the right certificate,
           # matching `gori run repeater`.
+          # `auto_content_length` is deliberately OFF here (it used to default ON, silently):
+          # this tool documents a flow replay as byte-exact, and a captured
+          # `Content-Length: 99` over a 2-byte body is the CL-desync probe the operator
+          # wants re-sent, not a mistake to correct. `resync_cl_after_expansion` keeps the
+          # one case that must still recompute — a `$KEY` in the body changing its length.
+          #
+          # `expand_request` and `refuse_unresolved_env` are BOTH off here, for the one reason
+          # `auto_content_length` already was: a captured flow's bytes are EVIDENCE, and the
+          # operator authored none of them. Both were draft-time policies running on a
+          # recording.
+          #   * `refuse_unresolved_env` made a flow whose head merely CONTAINS a `$NAME` token
+          #     unsendable: OData (`$filter`, `$top`, `$select`), MongoDB (`$where`, `$gt`),
+          #     JSONPath, a `;cat$IFS/etc/passwd` shell probe and any app that puts `$` in a
+          #     cookie all land here, and the refusal's own remedy — "set it with set_env_var" —
+          #     is worse than the refusal, because it makes the replay send a DIFFERENT request.
+          #   * `expand_request` ran `Env.expand_wire`, whose head pass PROMOTES a bare LF to
+          #     CRLF. A bare-LF header terminator is a front-end/back-end desync primitive gori
+          #     can already produce (`verbatim`) and stores byte-exact; replay silently
+          #     destroyed it and still reported a clean send.
+          # With expansion off there is no expansion to resync a Content-Length after, so
+          # `resync_cl_after_expansion` goes with it: the stored framing ships exactly as
+          # captured, which is what a CL/TE desync capture is for.
           Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
+            expand_request: false, refuse_unresolved_env: false,
+            auto_content_length: false,
             http2: bool_arg(h, "http2", flow.http2), sni: flow.sni, verify: verify,
             timeout: timeout, overrides: overrides)
         else
@@ -525,8 +842,22 @@ module Gori
           # pre-resolved and the bytes are taken verbatim (a second `Env.expand_wire` would
           # double-expand a `$KEY` whose value itself looks like a token).
           built = RequestBuilder.build(h)
+          # ONE reading of "these bytes are literal", `RequestBuilder`'s — which also treats
+          # `raw_base64` as verbatim, since encoding octets IS saying they are the message.
+          # Reading `verbatim` again through `bool_arg` here let the builder and this gate
+          # disagree about the same call.
+          verbatim = RequestBuilder.verbatim?(h)
           Repeater::PlanOptions.new([built.bytes], expand_request: false,
             auto_content_length: false,
+            # `verbatim:true` means the operator's bytes ARE the message (RequestBuilder
+            # already skipped expansion for it), so a leftover `$user.name` / `$IFS` is the
+            # SSTI/shell payload and must not be refused here. Non-verbatim callers keep the
+            # refusal: RequestBuilder expanded, so a surviving `$KEY` really is unresolved.
+            refuse_unresolved_env: !verbatim,
+            # The h2 half of the same promise: `verbatim` means the bytes ARE the message, so
+            # an uppercase field name is the RFC 9113 §8.2.1 conformance probe and not a
+            # copy-paste artifact to repair. See `PlanOptions#preserve_field_case?`.
+            preserve_field_case: verbatim,
             origin: Repeater::Origin.new(built.scheme, built.host, built.port),
             http2: bool_arg(h, "http2", false), verify: verify,
             timeout: timeout, overrides: overrides)
@@ -539,6 +870,12 @@ module Gori
       # all, the most dangerous case since there is no guardrail — is refused unless the
       # caller passed allow_unscoped:true, which becomes a NAMED Unscoped(Operator) decision
       # that still leaves Layer 2 (Sandbox / exclude) in force.
+      #
+      # Every caller reads the flag through `bool_arg`, not `bool(…) || false`. The `|| false`
+      # form erased the difference between "absent" and "unintelligible", so `allow_unscoped: 1`
+      # came back as a SCOPE_BLOCKED whose remedy was the flag the caller had just passed, and
+      # `insecure: 1` came back as a retryable NETWORK_ERROR — sending an agent into a retry
+      # loop over an argument mistake. Same reasoning as `RequestBuilder.verbatim?`.
       private def outbound(allow_unscoped : Bool) : Outbound
         Outbound.agent(Scope.load(store), allow_unscoped)
       end
@@ -548,7 +885,7 @@ module Gori
       # or pass allow_unscoped:true.
       private def scope_blocked(sc : ScopeCheck) : Result
         reason = sc.unscoped? ? "no scope is configured for this project, so active requests are refused by default" : "target host #{sc.host} is outside the project's configured scope"
-        err("#{reason}; add a scope include rule or pass allow_unscoped:true to override",
+        err("#{reason}; #{Outbound.remedy(sc, "allow_unscoped:true")}",
           "SCOPE_BLOCKED", field: "url",
           details: JSON.parse({"scope_decision" => sc.decision, "host" => sc.host}.to_json))
       end
@@ -562,6 +899,19 @@ module Gori
         err("#{reason} — Sandbox mode blocks every request outside the scope allowlist; turn Sandbox off or add a scope include rule",
           "SCOPE_BLOCKED", field: field,
           details: JSON.parse({"scope_decision" => "sandbox", "host" => host}.to_json))
+      end
+
+      # `Plan#refusal` folds two unrelated rules into one string, and this gate used to label
+      # ALL of them a Sandbox block — so an unbound `$SESSION` came back as SCOPE_BLOCKED with
+      # `scope_decision:"sandbox"` on a project whose scope said `in_scope` and whose Sandbox
+      # was never on. The advice was not merely wrong but unfollowable: no scope rule can bind
+      # a session value. The remedy is to run whatever request the extract rule reads from.
+      private def refusal_blocked(plan : Repeater::Plan, reason : String, host : String, field : String) : Result
+        return sandbox_blocked(reason, host, field) unless plan.unbound_refusal?
+        err("#{reason} — send a request that the extract rule matches first (or set the value with set_env_var); " \
+            "this is not a scope or Sandbox block",
+          "UNBOUND_BINDING", field: field,
+          details: JSON.parse({"scope_decision" => "in_scope", "host" => host}.to_json))
       end
 
       # The request-target (path) from the first line of a raw request, for

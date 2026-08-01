@@ -30,7 +30,8 @@ private class RecSink < Gori::Proxy::FlowSink
     @responses << resp
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
   end
 end
 
@@ -225,7 +226,23 @@ describe Gori::Proxy::H2::Assembler do
     sink.responses.size.should eq(1)
     resp = sink.responses.first
     resp.status.should eq(200)
-    String.new(resp.head).should contain("grpc-status: 0") # trailer merged into the head
+    head = String.new(resp.head)
+    head.should contain("grpc-status: 0") # trailer merged into the head — that merge is why
+    # grpc-status is reachable at all, and it is also why a trailer used to be
+    # INDISTINGUISHABLE from a header the origin sent in the head. For gRPC the trailer IS
+    # the call's real status, and whether a target treats a trailer as a header is itself a
+    # test — so the merge stays and the head now names which fields came from a trailer.
+    head.should contain("X-Gori-Trailers: grpc-status")
+  end
+
+  it "does not name a trailer when the response had no trailing HEADERS block" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
+    assembler.feed("in", data_frame(1_u32, Frame::END_STREAM, "body"))
+    String.new(sink.responses.first.head).should_not contain("X-Gori-Trailers")
   end
 
   it "captures a server push (PUSH_PROMISE → promised-stream flow + response)" do

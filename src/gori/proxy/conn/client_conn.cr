@@ -87,9 +87,14 @@ module Gori::Proxy
       # allocation per body. Lazily allocated on the first body copy.
       @copy_buf = nil.as(Bytes?)
       # Why the most recent upstream dial failed, set by `open_upstream` and read only when a
-      # dial returned nil — lets a failed HTTPS flow distinguish unreachable from a TLS/verify
-      # rejection (the #323 case, whose fix is --insecure-upstream). See `upstream_error_message`.
-      @last_tls_dial_error = nil.as(Upstream::TlsDialError?)
+      # dial returned nil — lets a failed flow distinguish unreachable from a TLS/verify
+      # rejection (the #323 case, whose fix is --insecure-upstream) and from an upstream proxy
+      # that refused the tunnel outright. See `upstream_error_message`.
+      @last_dial_error = nil.as(Upstream::DialError?)
+      # Did gori remove THIS request's `Sec-WebSocket-Extensions` offer (#518)? Set per
+      # request by `strip_ws_extension_offer`, read by the 101 path: an acceptance is only
+      # gori's to remove when gori is the reason nothing was offered. See `WS::Handshake`.
+      @ws_offer_stripped = false
     end
 
     # The address every upstream dial on THIS connection is pinned to, or nil when nothing
@@ -303,11 +308,20 @@ module Gori::Proxy
       # faithfully — the codec raises to force a close. But the attempt must stay
       # VISIBLE in History (this smuggling-shape traffic is exactly what a pentester
       # wants to see); previously the raise unwound to `run`'s blanket rescue and no
-      # flow was recorded at all. Record an error flow, then close.
+      # flow was recorded at all. Record an error flow, answer 400, then close.
+      #
+      # The 400 matters as much as the History row: closing with ZERO bytes is
+      # indistinguishable from the ORIGIN hanging up, so an operator probing a
+      # smuggling shape through gori cannot tell whose refusal they just measured —
+      # and would score gori's own defense as a target finding. RFC 9112 §6.3 has a
+      # proxy respond 400 here. Mirrors `write_sandbox_block`'s distinct-answer
+      # rationale one gate above; `X-Gori-Error` is the machine-readable half.
       begin
         req_framing, req_len = Codec::Body.request_framing(req)
       rescue ex : Gori::Error
-        record_error(sent_req, scheme, host, port, created_at, "request framing rejected: #{ex.message}")
+        reason = ex.message || "ambiguous request framing"
+        record_error(sent_req, scheme, host, port, created_at, "request framing rejected: #{reason}")
+        write_framing_reject(reason)
         return false
       end
 
@@ -403,7 +417,10 @@ module Gori::Proxy
     # all, because `Codec::Body.request_framing` rejects the whole request just below.
     private def strip_ws_extension_offer(req : Codec::RawRequest,
                                          forward_head : Bytes) : {Bytes, Bytes, Codec::RawRequest}
-      return {req.raw_head, forward_head, req} unless WS::Handshake.offers_extensions?(req.headers)
+      # Reset per request: this connection is keep-alive, and the answer belongs to the
+      # handshake in hand, not to the one before it.
+      @ws_offer_stripped = WS::Handshake.offers_extensions?(req.headers)
+      return {req.raw_head, forward_head, req} unless @ws_offer_stripped
       client_head = WS::Handshake.strip_extensions(req.raw_head)
       {client_head, WS::Handshake.strip_extensions(forward_head), Codec::Http1.parse_request_head(client_head)}
     end
@@ -651,6 +668,15 @@ module Gori::Proxy
           sent_resp = Codec::Http1.parse_response_head(sent_resp_head)
         end
       end
+      # The `Sec-WebSocket-Extensions` half of a 101 (#518): removed when it answers an offer
+      # gori itself removed, kept when it answers one the origin really received. Either way
+      # the operator gets told, on the flow and not only in gori.log. Runs on the head that
+      # goes to the CLIENT; framing below still keys off the original response.
+      ws_notice = nil.as(String?)
+      if websocket_upgrade?(resp)
+        sent_resp_head, sent_resp, ws_notice =
+          settle_ws_extensions(sent_resp_head, sent_resp, sent_req, sent_head, host)
+      end
       # Body framing must reflect the method the ORIGIN actually received (HEAD/CONNECT
       # are bodyless per RFC 7230 §3.3.3). A Match&Replace / intercept edit can rewrite
       # the request-line method, so key off sent_req, not the client's original req.
@@ -718,7 +744,6 @@ module Gori::Proxy
         SocketTuning.relax(@io)
         SocketTuning.relax(upstream)
         if websocket_upgrade?(resp)
-          warn_unoffered_ws_extension(resp, host, sent_req.target)
           # `@rewriter` carries Match & Replace (#500 step 1) and `@interceptor` the message
           # hold (step 2) into the tunnel; `ctx` is the 101 handshake's identity, which both
           # scope on — a WebSocket message has no authority, scheme or path of its own. The
@@ -726,7 +751,8 @@ module Gori::Proxy
           # answers "no" to both keeps the byte-exact pump (P6/P7).
           ws_ctx = WS::Context.new(host: host, port: port, scheme: scheme,
             method: sent_req.method, target: sent_req.target)
-          WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor) # frames until close
+          # frames until close
+          WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor, notice: ws_notice)
         else
           Pump.blind_tunnel(@io, upstream) # non-WS upgrade: raw pipe until close
         end
@@ -1153,23 +1179,53 @@ module Gori::Proxy
       end
     end
 
-    # A 101 whose `Sec-WebSocket-Extensions` acceptance answers an offer gori removed
-    # (#518). The accept is relayed UNTOUCHED — see `WS::Handshake` for why removing it
-    # is the worse half — so the two peers still agree and the socket works; what is
-    # wrong is gori's own store, because `WS::Relay` records the extension's encoded
-    # bytes as the message. Nothing else on the path can tell, so say it here.
+    # The `Sec-WebSocket-Extensions` half of a 101 (#518). Returns the head and projection
+    # the CLIENT should receive, plus an advisory for the flow's WebSocket message stream —
+    # a `gori.log` line is where an operator does not look, and this is a fact about the
+    # socket they are about to read frames from.
     #
-    # Reaching this means either an origin that accepted an extension it was not offered
-    # (a protocol violation, RFC 6455 §4.1) or an operator who put the offer back with a
-    # Match&Replace rule. The consequence for capture is the same in both cases.
-    private def warn_unoffered_ws_extension(resp : Codec::RawResponse, host : String, target : String) : Nil
-      accepted = resp.headers.get?("Sec-WebSocket-Extensions")
-      return if accepted.nil? || accepted.blank?
-      ::Log.warn do
-        "ws #{host}#{target}: origin accepted extension #{accepted.inspect} — captured frames on " \
-        "this socket are that extension's encoded bytes, not the messages (gori removes the " \
-        "client's Sec-WebSocket-Extensions offer; see #518)"
+    # Two cases, and the code already knows which it is in:
+    #
+    #   * gori removed the offer and nothing put it back on the wire — then the origin was
+    #     never offered anything, its acceptance answers a header it did not receive, and
+    #     relaying it is what CREATES a desync: the client turns permessage-deflate on and
+    #     sends RSV1 frames the origin must fail the connection over (RFC 6455 §5.2). Both
+    #     halves go, and History stops reading as "the origin sent an unsolicited accept".
+    #   * the origin really was offered it — an operator's Match&Replace rule put the offer
+    #     back, or the origin accepted one nobody offered (§4.1). Here the two peers DO
+    #     agree, so removing the accept is the manufactured desync the old policy warned
+    #     about. The bytes are left alone and the store is what suffers, which is what the
+    #     advisory says.
+    private def settle_ws_extensions(head : Bytes, resp : Codec::RawResponse,
+                                     sent_req : Codec::RawRequest, sent_head : Bytes,
+                                     host : String) : {Bytes, Codec::RawResponse, String?}
+      accepted = resp.headers.get?(WS::Handshake::EXTENSIONS_NAME)
+      return {head, resp, nil} if accepted.nil? || accepted.blank?
+      label = ws_log_label(host, sent_req.target)
+      # `sent_head` and not `sent_req`: the strip runs before Match&Replace so a rule CAN put
+      # the offer back, and when it does the origin really was offered the extension.
+      if @ws_offer_stripped && !WS::Handshake.carries_extensions?(sent_head)
+        stripped = WS::Handshake.strip_extensions(head)
+        note = "removed the origin's #{accepted.inspect} acceptance from the 101 — gori had " \
+               "already removed the client's Sec-WebSocket-Extensions offer, so the origin " \
+               "negotiated no extension and a client acting on that accept would have sent " \
+               "it frames it cannot read (#518)"
+        ::Log.info { "ws #{label}: #{note}" }
+        return {stripped, Codec::Http1.parse_response_head(stripped), note}
       end
+      note = "origin accepted extension #{accepted.inspect} that gori did not remove — the " \
+             "captured frames on this socket are that extension's encoded bytes, not the " \
+             "messages (#518)"
+      ::Log.warn { "ws #{label}: #{note}" }
+      {head, resp, note}
+    end
+
+    # `host` + `target` for a log line. On the plaintext forward-proxy path `target` is
+    # ABSOLUTE-form — that is how a proxy client writes a request line — so concatenating
+    # produced `ws 127.0.0.1http://127.0.0.1:19251/ws`. An absolute-form target already
+    # names the authority, leaving the host nothing to add.
+    private def ws_log_label(host : String, target : String) : String
+      target.starts_with?("http://") || target.starts_with?("https://") ? target : "#{host}#{target}"
     end
 
     private def websocket_upgrade?(resp : Codec::RawResponse) : Bool
@@ -1300,7 +1356,7 @@ module Gori::Proxy
     # for the rare LAN that has a real box called "gori"; that mirrors why addresses_self?
     # skips override resolution — a mapping the user wrote down is a statement of intent.
     private def reserved_self_host?(host : String) : Bool
-      SelfPage.magic_host?(host) && @host_overrides.try(&.connect_ip(host)).nil?
+      SelfPage.magic_host?(host) && @host_overrides.try(&.connect_address(host)).nil?
     end
 
     # The plaintext half of the reserved-host route. Returns true when the request was
@@ -1352,31 +1408,39 @@ module Gori::Proxy
       if @tls_upstream
         sock, err = Upstream.dial_tls_result(host, port, verify: @verify_upstream,
           overrides: @host_overrides, pin: dial_pin)
-        @last_tls_dial_error = err
+        @last_dial_error = err
         sock
       else
-        @last_tls_dial_error = nil # plaintext forward-proxy dial: no TLS leg to classify
-        Upstream.dial(host, port, overrides: @host_overrides, pin: dial_pin)
+        # A plaintext forward-proxy dial has no TLS leg to classify, but it DOES go through the
+        # upstream proxy (gori CONNECT-tunnels even http:// targets), so it can be refused by
+        # one — which is why this branch now asks for the reason too instead of clearing it.
+        sock, err = Upstream.dial_result(host, port, overrides: @host_overrides, pin: dial_pin)
+        @last_dial_error = err
+        sock
       end
     end
 
     # The error text for a failed upstream acquire/send. A nil `upstream` is a DIAL failure,
-    # split into unreachable (connect) vs. a TLS/verify rejection — the #323 case, whose fix is
-    # --insecure-upstream, so the recorded flow points there instead of at reachability. A
-    # non-nil `upstream` means the socket was live but the mid-request write failed.
+    # split into unreachable (connect), a TLS/verify rejection — the #323 case, whose fix is
+    # --insecure-upstream, so the recorded flow points there instead of at reachability — and
+    # a refusal by the configured upstream proxy, where the origin was never contacted at all.
+    # A non-nil `upstream` means the socket was live but the mid-request write failed.
     private def upstream_error_message(host : String, port : Int32, upstream : IO?) : String
       return "upstream write failed: #{host}:#{port}" unless upstream.nil?
-      case @last_tls_dial_error
-      when Upstream::TlsDialError::Tls
-        if @verify_upstream
-          "upstream TLS verification failed: #{host}:#{port} — origin certificate not trusted; " \
-          "retry with --insecure-upstream or set SSL_CERT_FILE"
-        else
-          "upstream TLS handshake failed: #{host}:#{port}"
-        end
-      else
-        "upstream connect failed: #{host}:#{port}"
+      err = @last_dial_error
+      if err && err.tls?
+        return "upstream TLS verification failed: #{host}:#{port} — origin certificate not trusted; " \
+               "retry with --insecure-upstream or set SSL_CERT_FILE" if @verify_upstream
+        return "upstream TLS handshake failed: #{host}:#{port}"
       end
+      # A detail REPLACES the host-shaped sentence rather than decorating it. Every detail the
+      # dialer sets is about a proxy — either one that refused the tunnel or one gori could not
+      # reach — and in both cases the origin was never contacted, so naming it here is exactly
+      # what used to send operators to debug DNS on a machine that was fine.
+      if detail = err.try(&.detail)
+        return "upstream connect failed: #{detail}"
+      end
+      "upstream connect failed: #{host}:#{port}"
     end
 
     private def resolve_forward(req : Codec::RawRequest) : {String, Int32, String, Bytes}
@@ -1533,6 +1597,30 @@ module Gori::Proxy
     # closes right after: no keep-alive on a blocked connection.
     private def write_sandbox_block : Nil
       @io.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\nX-Gori-Sandbox: blocked\r\n\r\n".to_slice)
+      @io.flush
+    rescue
+    end
+
+    # Answer a request whose framing gori refused to forward (CL+TE, non-final
+    # chunked, obfuscated framing header, bad Content-Length). Self-framed and
+    # `Connection: close`, because the body boundary is exactly what we could not
+    # determine — whatever remains in the socket is unread on purpose.
+    #
+    # `reason` is one of `Codec::Body`'s static literals today, but a CR/LF reaching
+    # a header value would turn gori's own diagnostic into the response split it is
+    # refusing, so it is scrubbed at the boundary rather than trusted upstream.
+    private def write_framing_reject(reason : String) : Nil
+      safe = reason.gsub(/[\r\n]+/, " ").strip
+      safe = "ambiguous request framing" if safe.empty?
+      body = "gori refused to forward this request: #{safe}\n"
+      @io.write(String.build do |s|
+        s << "HTTP/1.1 400 Bad Request\r\n"
+        s << "Content-Type: text/plain; charset=utf-8\r\n"
+        s << "Content-Length: " << body.bytesize << "\r\n"
+        s << "Connection: close\r\n"
+        s << "X-Gori-Error: request-framing\r\n\r\n"
+        s << body
+      end.to_slice)
       @io.flush
     rescue
     end

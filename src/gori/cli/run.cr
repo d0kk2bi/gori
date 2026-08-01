@@ -365,9 +365,97 @@ module Gori
       # `Fuzz::Sender`/`Repeater::Sender` regardless of --allow-unscoped.
       private def self.guard_outbound(outbound : Gori::Outbound, scheme : String, host : String,
                                       target : String, cmd : String) : Nil
-        return unless outbound.check_request(scheme, host, target).blocked?
+        verdict = outbound.check_request(scheme, host, target)
+        return unless verdict.blocked?
         outbound.close
-        abort "#{cmd}: #{host} is out of the project scope — add a scope include rule or pass --allow-unscoped"
+        abort "#{cmd}: #{host} is out of the project scope — #{Gori::Outbound.remedy(verdict, "--allow-unscoped")}"
+      end
+
+      # ── session bindings, headless ───────────────────────────────────────────────────
+      #
+      # A session binding lives in the MEMORY of the gori that observed it and is never
+      # persisted (`Bindings`: a restored token is stale by construction, and re-extracting
+      # costs one request). Only `Repeater::Sender` and the proxy write the table — a sweep
+      # deliberately does not, because a response echoing an attack payload back could
+      # otherwise rebind the operator's session to it.
+      #
+      # In the TUI and over MCP that is fine: one process holds a send and the sweep that
+      # follows. `gori run` is ONE-SHOT per process and had no command that sends first, so a
+      # `$SESSION` in a headless fuzz/mine/sequence template could never acquire a value and
+      # every request was refused — 100% of them, against every authenticated target. The
+      # refusal said "nothing has extracted it yet", which reads as "wait, or retry".
+      #
+      # `--bind-from FLOW-ID` is the missing step, and it is deliberately a REPLAY rather than
+      # persistence: it puts the deliberate send and the sweep inside one process, which is
+      # exactly the shape that already works everywhere else. Persisting the value instead
+      # would ship a token minutes-to-days stale into the run and produce the page of 401s the
+      # feature exists to remove.
+
+      # Replay flow `flow_id` through `Repeater::Sender` — the one extraction source — so its
+      # response can fill the binding table before the sweep starts. Aborts on anything that
+      # leaves the table unfilled: a seed that silently did nothing would hand the operator
+      # back the same 100%-refused run, one flag later.
+      private def self.seed_bindings(flow_id : Int64, project_name : String?, db_path : String?,
+                                     outbound : Gori::Outbound, insecure : Bool, cmd : String) : Nil
+        # open_store also installs the project's extract rules as `Env.layer` (see its
+        # comment) — the seed depends on that having happened, which is why it reads the flow
+        # through the same helper rather than opening the DB by hand.
+        store = open_store(resolve_read_project(project_name, db_path))
+        detail, overrides = begin
+          {store.get_flow(flow_id), Gori::HostOverrides.load(store)}
+        ensure
+          store.close
+        end
+        abort "#{cmd}: --bind-from: no flow ##{flow_id}" unless detail
+        built = Repeater::FlowRequest.build(detail)
+        scheme, host, port = Repeater::FlowRequest.parse_target(built.target)
+        bindings = Env.layer.as?(Gori::Bindings)
+        if bindings.nil? || bindings.declared.empty?
+          abort "#{cmd}: --bind-from: this project declares no extract rules, so a replay has " \
+                "nothing to bind — add one with `gori run rewriter extract add`"
+        end
+        sender = Repeater::Sender.new(outbound, scheme: scheme, host: host, port: port,
+          verify: !insecure, http2: built.http2, sni: built.sni, overrides: overrides)
+        result = sender.send(built.bytes)
+        if err = result.error
+          abort "#{cmd}: --bind-from: replaying flow ##{flow_id} failed: #{err}"
+        end
+        bound = bindings.values.keys
+        if bound.empty?
+          abort "#{cmd}: --bind-from: flow ##{flow_id} replayed (HTTP #{result.response.try(&.status) || "?"}) " \
+                "but no extract rule matched its response, so nothing was bound — check the rule's " \
+                "host glob, condition and selector with `gori run rewriter extract`"
+        end
+        STDERR.puts "bind-from: flow ##{flow_id} replayed → bound #{Env.token_list(bound)}"
+      end
+
+      # What a headless operator has to know when a send is refused for an unbound binding:
+      # that no amount of retrying will help, and which flag does. `Env.unbound_error` is the
+      # shared FACT ("unbound session binding $SESS"); this is `gori run`'s own prescription,
+      # the #525 shape.
+      private def self.bindings_headless_hint(cmd : String) : String
+        "#{cmd} runs as ONE process and holds no bindings from a previous invocation — " \
+        "a binding is never persisted. Replay the flow that mints the token first with " \
+        "--bind-from FLOW-ID, or drive the two steps over one `gori mcp` session."
+      end
+
+      # An engine's `blocked_reason` with `gori run`'s own prescription attached when — and
+      # only when — the refusal is the unbound-binding one. A binding can also come UNSTUCK
+      # mid-run (a token rotated, an operator cleared it), which the pre-flight cannot see, so
+      # the hint has to exist on this end of the run too.
+      private def self.blocked_reason_line(reason : String?, cmd : String) : String?
+        return nil unless reason
+        reason.starts_with?(Env::UNBOUND_PREFIX) ? "#{reason}. #{bindings_headless_hint(cmd)}" : reason
+      end
+
+      # Refuse BEFORE the sweep when the template names a declared-but-unbound binding and no
+      # --bind-from was given. Without this the run still starts and every single row comes
+      # back refused, which reads like a target problem rather than a missing step.
+      private def self.preflight_bindings(text : String, bind_from : Int64?, cmd : String) : Nil
+        return if bind_from
+        unbound = Env.unbound(text)
+        return if unbound.empty?
+        abort "#{cmd}: #{Env.unbound_error(unbound)}. #{bindings_headless_hint(cmd)}"
       end
 
       # One sentence for every `gori run` tool whose builder refused an env token that
@@ -503,7 +591,7 @@ module Gori
           j.field field_name, nil
           return
         end
-        decoded, note = Proxy::Codec::ContentDecode.decode(head, body)
+        decoded, note, complete = Proxy::Codec::ContentDecode.decode_full(head, body)
         bytes = decoded || body
         s = String.new(bytes)
         j.field field_name do
@@ -522,11 +610,48 @@ module Gori
             end
             j.field "wire_truncated", true if wire_truncated
             j.field "note", note if note
+            # A coding that stopped mid-stream. Distinct from `truncated`/`wire_truncated`,
+            # which are about the CAPTURE cap: this one says the decoder never reached the
+            # end of the encoded stream, so the text/base64 above is a prefix of what the
+            # origin meant to send. Silence here read as "decoded: gzip, all of it".
+            j.field "decode_truncated", true unless complete
+            emit_trailers_json(j, head, body)
           end
         end
       end
 
-      private def self.print_message_text(head : Bytes?, body : Bytes?) : Nil
+      # The chunked message's TRAILER fields (RFC 7230 §4.1.2), beside the de-chunked body.
+      # `ContentDecode.dechunk` stops at the terminating 0-chunk and the rendered `head`
+      # stops at the blank line before the body, so a trailer was captured by NEITHER half
+      # while the origin's `Trailer:` announcement was still echoed in the head — the one
+      # reading an operator can draw from that is "the origin sent none". `repeater send`
+      # persists no flow, so on that path there was no `show --format raw` to fall back to.
+      # Same field name and shape as MCP's `Serialize.emit_trailers`.
+      private def self.emit_trailers_json(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
+        trailers = Proxy::Codec::ContentDecode.trailers(head, body)
+        return if trailers.empty?
+        j.field "trailers" do
+          j.array do
+            trailers.each do |(name, value)|
+              j.object do
+                j.field "name", name.scrub
+                j.field "value", value.scrub
+                # A trailer value is remote bytes; `scrub` above is lossy, so hand back the
+                # exact octets whenever it changed them (mirrors the binary-body fallback).
+                unless value.valid_encoding?
+                  j.field "value_base64", Base64.strict_encode(value.to_slice)
+                  j.field "value_lossy", true
+                end
+              end
+            end
+          end
+        end
+      end
+
+      # `body` is the DECODED body (de-chunked/inflated) that the operator reads; `wire_body`
+      # is the stored wire form the trailers still live in, and is optional only because a
+      # caller with no chunked wire form has nothing to pass.
+      private def self.print_message_text(head : Bytes?, body : Bytes?, wire_body : Bytes? = nil) : Nil
         # Neutralize ANSI/OSC/CSI escapes in captured (attacker-controlled) head/body
         # before writing to the live terminal; `binary_body?` only sniffs for NUL, so an
         # escape-only payload would otherwise pass through. `--format raw` stays exact.
@@ -538,6 +663,36 @@ module Gori
           else
             STDOUT.puts(CLI::Output.term_safe_multiline(String.new(body).scrub))
           end
+        end
+        print_decode_note(head, wire_body)
+        print_trailers_text(head, wire_body)
+      end
+
+      # Name the derivation under a body that IS one. The text view prints a de-gzipped,
+      # de-chunked body under a head that still says `Content-Encoding: gzip` /
+      # `Transfer-Encoding: chunked` / a Content-Length that no longer matches, and said
+      # nothing about it — while `--format json` and MCP both emit the same fact as `note`.
+      # A truncated stream is the case that matters most: the note is where "(stream
+      # truncated)" lands, so text and JSON now agree that the decode did not finish.
+      private def self.print_decode_note(head : Bytes?, wire_body : Bytes?) : Nil
+        return if wire_body.nil? || wire_body.empty?
+        _, note = Proxy::Codec::ContentDecode.decode(head, wire_body)
+        return unless note
+        STDOUT.puts ""
+        STDOUT.puts "[note] #{CLI::Output.term_safe(note)}"
+      end
+
+      # Trailers under their own heading, after the body. The decoded text view drops
+      # everything past the terminating 0-chunk, so a trailer the origin really sent showed
+      # up in neither the head nor the body — see emit_trailers_json. Labelled, never merged
+      # into the head: whether the far side treats a trailer as a header is the test.
+      private def self.print_trailers_text(head : Bytes?, wire_body : Bytes?) : Nil
+        trailers = Proxy::Codec::ContentDecode.trailers(head, wire_body)
+        return if trailers.empty?
+        STDOUT.puts ""
+        STDOUT.puts "--- trailers ---"
+        trailers.each do |(name, value)|
+          STDOUT.puts(CLI::Output.term_safe_multiline("#{name}: #{value}".scrub))
         end
       end
 

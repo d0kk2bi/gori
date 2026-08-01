@@ -1,4 +1,5 @@
 require "../store"
+require "./ws/frame"
 
 module Gori::Proxy
   # The boundary a connection writes captured flows to. Abstracting it (vs.
@@ -9,8 +10,11 @@ module Gori::Proxy
     abstract def on_request(req : Store::CapturedRequest) : Int64
     # Fill in the response (or error) for an existing flow.
     abstract def on_response(resp : Store::CapturedResponse) : Nil
-    # Record a captured WebSocket message for a flow (post-101).
-    abstract def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+    # Record a captured WebSocket message for a flow (post-101). `shape` is the frame
+    # header the payload arrived in (V7); it defaults so a sink double that does not care
+    # about framing — and every pre-V7 caller — needs no change.
+    abstract def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                               shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
 
     # --- HTTP/2 (raw-frame fidelity) -----------------------------------------
     # Default no-ops so non-h2 sinks (and test doubles) need not implement them.
@@ -40,9 +44,10 @@ module Gori::Proxy
       @store.update_response(resp)
     end
 
-    def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+    def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                      shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
       return if flow_id <= 0
-      @store.insert_ws_message(flow_id, direction, opcode, payload)
+      @store.insert_ws_message(flow_id, direction, opcode, payload, shape: shape)
     end
 
     def on_h2_open(host : String, port : Int32, alpn : String) : Int64

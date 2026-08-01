@@ -108,6 +108,58 @@ private def start_mcp_http_origin(body : String, extra_headers = "") : Int32
   port
 end
 
+# One-shot origin that writes RAW response bytes (framing and all), so a test can hand the
+# engine a chunked body with a trailer section, an 8-bit header value, or two conflicting
+# Content-Length lines — shapes `start_mcp_http_origin` cannot express.
+private def start_mcp_raw_origin(response : Bytes) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Gori::Proxy::Codec::Http1.read_head(conn)
+    conn.write(response)
+    conn.flush
+    conn.close
+    origin.close
+  rescue
+    origin.close rescue nil
+  end
+  port
+end
+
+# One-shot origin that RECORDS the exact request bytes it received into `sink`, then replies
+# 204. The recorded bytes — not gori's echo — are the evidence for a byte-exact send.
+private def start_mcp_recording_origin(sink : Channel(Bytes)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    buf = IO::Memory.new
+    begin
+      if conn = origin.accept?
+        # Read RAW to an idle timeout — no HTTP parsing. The whole point of these sends is
+        # bytes a parser might reject, so a parsing origin could not record them.
+        conn.read_timeout = 300.milliseconds
+        tmp = Bytes.new(4096)
+        begin
+          while (n = conn.read(tmp)) > 0
+            buf.write(tmp[0, n])
+          end
+        rescue
+          # idle — the client has sent everything it is going to send
+        end
+        conn << "HTTP/1.1 204 No Content\r\n\r\n" rescue nil
+        conn.flush rescue nil
+        conn.close rescue nil
+      end
+    ensure
+      origin.close rescue nil
+      sink.send(buf.to_slice) rescue nil
+    end
+  end
+  port
+end
+
 private INIT = %({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
 
 # Output pipe that dies on the first write (client process vanished). Counts write
@@ -1261,6 +1313,107 @@ describe Gori::MCP::Server do
       end
     end
 
+    # An origin's trailer used to appear NOWHERE in the result while the `Trailer:`
+    # announcement was echoed among the headers — which reads as "the origin sent none". A
+    # trailer is where a trailer-smuggling / gRPC-over-h1 test's whole answer lives.
+    it "surfaces a chunked response's trailers, separately from the headers" do
+      with_store do |store|
+        port = start_mcp_raw_origin(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-T\r\n" \
+                                     "Connection: close\r\n\r\n5\r\nhello\r\n0\r\nX-T: gotcha\r\n\r\n").to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"url":"http://127.0.0.1:#{port}/t","allow_unscoped":true}}})
+        payload = tool_payload(drive(store, call, verify_upstream: false)[0])
+        payload["body"]["text"].as_s.should eq("hello")
+        payload["body"]["trailers"].as_a.map { |t| {t["name"].as_s, t["value"].as_s} }
+          .should eq([{"X-T", "gotcha"}])
+        # and it is NOT laundered into the header list, where it would be indistinguishable
+        # from a header the origin actually sent in the head
+        payload["headers"].as_a.map { |h| h["name"].as_s }.should_not contain("X-T")
+      end
+    end
+
+    # The BODY had a base64 fallback for bytes JSON cannot carry; a header VALUE did not, so
+    # `X-Bin: \x80\xff` came back as `X-Bin: ��` and the real octets were unrecoverable
+    # through MCP entirely.
+    it "hands back the exact bytes of a response header value it had to scrub" do
+      with_store do |store|
+        resp = IO::Memory.new
+        resp << "HTTP/1.1 200 OK\r\nX-Bin: "
+        resp.write(Bytes[0x80, 0xff])
+        resp << "\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        port = start_mcp_raw_origin(resp.to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"url":"http://127.0.0.1:#{port}/h","allow_unscoped":true}}})
+        payload = tool_payload(drive(store, call, verify_upstream: false)[0])
+        hdr = payload["headers"].as_a.find { |h| h["name"].as_s == "X-Bin" }.not_nil!
+        hdr["value_lossy"].as_bool.should be_true
+        Base64.decode(hdr["value_base64"].as_s).should eq(Bytes[0x80, 0xff])
+      end
+    end
+
+    # Two conflicting Content-Length headers is a response-splitting condition — arguably the
+    # single most interesting result a tester can get — and it came back as
+    # `error_kind:"other", error_code:"NETWORK_ERROR", retryable:true`, so an agent loops on
+    # it forever instead of reporting a finding. gori raises this itself; a retry reproduces
+    # it exactly.
+    it "reports a deterministic protocol refusal as PROTOCOL_ERROR, not a retryable network error" do
+      with_store do |store|
+        port = start_mcp_raw_origin(("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n" \
+                                     "Connection: close\r\n\r\nhello").to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"url":"http://127.0.0.1:#{port}/s","allow_unscoped":true}}})
+        payload = tool_payload(drive(store, call, verify_upstream: false)[0])
+        payload["error"].as_s.should contain("Content-Length")
+        payload["error_kind"].as_s.should eq("protocol")
+        payload["error_code"].as_s.should eq("PROTOCOL_ERROR")
+        payload["retryable"].as_bool.should be_false
+      end
+    end
+
+    it "still reports a genuine connect failure as a retryable NETWORK_ERROR" do
+      with_store do |store|
+        closed = TCPServer.new("127.0.0.1", 0)
+        port = closed.local_address.port
+        closed.close
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"url":"http://127.0.0.1:#{port}/x","allow_unscoped":true}}})
+        payload = tool_payload(drive(store, call, verify_upstream: false)[0])
+        payload["error_kind"].as_s.should eq("connect")
+        payload["error_code"].as_s.should eq("NETWORK_ERROR")
+        payload["retryable"].as_bool.should be_true
+      end
+    end
+
+    # A JSON string reaches the socket as its UTF-8 ENCODING, so `raw` could never put a raw
+    # 0x00/0x80-0xFF byte on the wire — and `isError:false` plus an echo of the intended text
+    # meant the caller never learned. The ORIGIN's recorded bytes are the evidence.
+    it "puts raw_base64's exact octets on the wire (0x00, 0x80-0xFF, a lone surrogate)" do
+      with_store do |store|
+        sink = Channel(Bytes).new(1)
+        port = start_mcp_recording_origin(sink)
+        wire = IO::Memory.new
+        wire << "POST /b HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\nX-Bin: "
+        wire.write(Bytes[0x80, 0x81, 0xfe, 0xff])
+        wire << "\r\nContent-Length: 6\r\n\r\n"
+        wire.write(Bytes[0x00, 0x80, 0xff, 0xed, 0xa0, 0x80]) # NUL, high bytes, a lone surrogate
+        bytes = wire.to_slice
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":) +
+               %({"url":"http://127.0.0.1:#{port}/","raw_base64":"#{Base64.strict_encode(bytes)}","allow_unscoped":true}}})
+        drive(store, call, verify_upstream: false)
+        sink.receive.should eq(bytes)
+      end
+    end
+
+    it "puts body_base64's exact octets on the wire with a byte-accurate Content-Length" do
+      with_store do |store|
+        sink = Channel(Bytes).new(1)
+        port = start_mcp_recording_origin(sink)
+        body = Bytes[0x00, 0x80, 0xff]
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":) +
+               %({"url":"http://127.0.0.1:#{port}/p","method":"POST","body_base64":"#{Base64.strict_encode(body)}","allow_unscoped":true}}})
+        drive(store, call, verify_upstream: false)
+        got = sink.receive
+        String.new(got).should contain("Content-Length: 3")
+        got[(got.size - 3)..].should eq(body)
+      end
+    end
+
     it "allows an explicit unaudited send and an explicit sensitive-header response" do
       with_store do |store|
         port = start_mcp_http_origin("ok", "Set-Cookie: session=visible\r\n")
@@ -1551,8 +1704,17 @@ describe Gori::MCP::Server do
         payload["upgraded"].as_bool.should be_true
         payload["handshake_status"].as_i.should eq(101)
         payload["close_code"].as_i.should eq(1000)
-        payload["messages"].as_a.map { |message| {message["direction"].as_s, message["payload"].as_s} }
-          .should eq([{"out", "ping"}, {"in", "ping"}])
+        # The origin's CLOSE frame is now a transcript row of its own, not just a
+        # `close_code` field — its REASON is where a server explains itself, and until V7 the
+        # frame was dropped before anything above the relay could see it.
+        payload["messages"].as_a.map { |message| {message["direction"].as_s, message["type"].as_s} }
+          .should eq([{"out", "text"}, {"in", "text"}, {"in", "close"}])
+        payload["messages"].as_a[0]["payload"].as_s.should eq("ping")
+        payload["messages"].as_a[1]["payload"].as_s.should eq("ping")
+        payload["messages"].as_a[2]["close_code"].as_i.should eq(1000)
+        # `frame` reports what was FRAMED, so a shape test can be read back instead of taken
+        # on trust. The default send is still an ordinary masked TEXT frame.
+        payload["messages"].as_a[0]["frame"].as_s.should eq("TEXT")
         store.repeaters.find(&.id.==(repeater_id)).not_nil!.response_head.should_not be_nil
       end
     end
@@ -2163,6 +2325,69 @@ describe Gori::MCP::Serialize do
     text.valid_encoding?.should be_true
     text.should contain("A")
   end
+
+  # `note:"de-chunked"` was the only trace a trailer section could exist: the head stops
+  # before the body and the de-chunk stops at the 0-chunk, so `X-T: gotcha` appeared nowhere
+  # while the origin's `Trailer:` announcement was echoed — which reads as "none was sent".
+  it "surfaces a chunked response's trailers beside the de-chunked body" do
+    head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-T\r\n\r\n".to_slice
+    body = "5\r\nhello\r\n0\r\nX-T: gotcha\r\n\r\n".to_slice
+    out = JSON.parse(JSON.build { |j| j.object { Gori::MCP::Serialize.emit_body(j, "body", head, body, false) } })
+    out["body"]["text"].as_s.should eq("hello")
+    out["body"]["trailers"].as_a.size.should eq(1)
+    out["body"]["trailers"][0]["name"].as_s.should eq("X-T")
+    out["body"]["trailers"][0]["value"].as_s.should eq("gotcha")
+  end
+
+  it "omits `trailers` entirely when the message has none" do
+    head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_slice
+    out = JSON.parse(JSON.build { |j| j.object { Gori::MCP::Serialize.emit_body(j, "body", head, "hi".to_slice, false) } })
+    out["body"].as_h.has_key?("trailers").should be_false
+  end
+
+  # The body had a base64 fallback and a header VALUE did not, so an 8-bit byte there came
+  # back as `�` and was unrecoverable through MCP — two different invalid bytes rendered the
+  # same. Trailers are header values too, and share the contract.
+  it "hands back the exact bytes of a value scrubbing had to change" do
+    res = JSON.parse(JSON.build { |j|
+      j.object { Gori::MCP::Serialize.emit_lossy_text(j, "value", String.new(Bytes[0x80, 0xff])) }
+    })
+    res["value"].as_s.valid_encoding?.should be_true
+    Base64.decode(res["value_base64"].as_s).should eq(Bytes[0x80, 0xff])
+    res["value_lossy"].as_bool.should be_true
+  end
+
+  it "adds no base64 twin for a value that survived scrubbing intact" do
+    out = JSON.parse(JSON.build { |j| j.object { Gori::MCP::Serialize.emit_lossy_text(j, "value", "plain") } })
+    out["value"].as_s.should eq("plain")
+    out.as_h.has_key?("value_base64").should be_false
+    out.as_h.has_key?("value_lossy").should be_false
+  end
+
+  # base64 is encoding, not redaction — the raw head carries the Authorization/Cookie bytes
+  # `response_head` carefully redacts, so the bytes are gated the way intercept_item_detail's
+  # `raw_base64` is. The LOSSY FLAG is not gated: a caller must always learn that the text it
+  # was handed is not the whole truth.
+  it "flags a lossy head always, and emits its bytes only under include_sensitive" do
+    head = Bytes[0x58, 0x3a, 0x20, 0x80, 0xff]
+    gated = JSON.parse(JSON.build { |j|
+      j.object { Gori::MCP::Serialize.emit_head_base64(j, "response_head", head, false) }
+    })
+    gated["response_head_lossy"].as_bool.should be_true
+    gated.as_h.has_key?("response_head_base64").should be_false
+
+    opened = JSON.parse(JSON.build { |j|
+      j.object { Gori::MCP::Serialize.emit_head_base64(j, "response_head", head, true) }
+    })
+    Base64.decode(opened["response_head_base64"].as_s).should eq(head)
+  end
+
+  it "adds nothing for a head that is valid UTF-8" do
+    out = JSON.parse(JSON.build { |j|
+      j.object { Gori::MCP::Serialize.emit_head_base64(j, "response_head", "HTTP/1.1 200 OK\r\n\r\n".to_slice, true) }
+    })
+    out.as_h.should be_empty
+  end
 end
 
 describe Gori::MCP::RequestBuilder do
@@ -2225,6 +2450,56 @@ describe Gori::MCP::RequestBuilder do
   it "raises when the url has no host" do
     args = JSON.parse(%({"url":"/relative"})).as_h
     expect_raises(Gori::Error) { Gori::MCP::RequestBuilder.build(args) }
+  end
+
+  # JSON-RPC arguments are UTF-8 text, so `raw`/`body` reach the socket as their UTF-8
+  # ENCODING: `é` went out as `\xc3\xa9` and a raw 0x00/0x80-0xFF byte was unreachable from
+  # this surface entirely (with isError:false and an echo of the intended text, so the caller
+  # never learned). base64 is the byte route.
+  describe "base64 byte input" do
+    it "puts the exact octets of raw_base64 on the wire" do
+      wire = Bytes[0x47, 0x45, 0x54, 0x20, 0x2f, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2f, 0x31, 0x2e, 0x31,
+        0x0d, 0x0a, 0x58, 0x2d, 0x42, 0x3a, 0x20, 0x00, 0x80, 0xfe, 0xff, 0x0d, 0x0a, 0x0d, 0x0a]
+      args = JSON.parse({"url" => "http://h.test/", "raw_base64" => Base64.strict_encode(wire)}.to_json).as_h
+      Gori::MCP::RequestBuilder.build(args).bytes.should eq(wire)
+    end
+
+    it "does NOT promote a bare LF or expand a $VAR in raw_base64 (base64 IS verbatim)" do
+      wire = "GET /v HTTP/1.1\nX-T: $NOPE\n\n".to_slice
+      args = JSON.parse({"url" => "http://h.test/", "raw_base64" => Base64.strict_encode(wire)}.to_json).as_h
+      Gori::MCP::RequestBuilder.build(args).bytes.should eq(wire)
+      Gori::MCP::RequestBuilder.verbatim?(args).should be_true
+    end
+
+    it "sends body_base64 byte-exact with a matching Content-Length" do
+      body = Bytes[0x00, 0x80, 0xff, 0xed, 0xa0, 0x80] # NUL, high bytes, a lone surrogate's UTF-8
+      args = JSON.parse({"url" => "http://h.test/p", "method" => "POST",
+                         "body_base64" => Base64.strict_encode(body)}.to_json).as_h
+      built = Gori::MCP::RequestBuilder.build(args).bytes
+      String.new(built).should start_with("POST /p HTTP/1.1\r\nHost: h.test\r\nContent-Length: 6\r\n\r\n")
+      built[(built.size - 6)..].should eq(body)
+    end
+
+    it "prefers raw_base64 over raw and body_base64 over body" do
+      args = JSON.parse({"url" => "http://h.test/", "raw" => "GET /text HTTP/1.1\r\n\r\n",
+                         "raw_base64" => Base64.strict_encode("GET /bytes HTTP/1.1\r\n\r\n".to_slice)}.to_json).as_h
+      String.new(Gori::MCP::RequestBuilder.build(args).bytes).should eq("GET /bytes HTTP/1.1\r\n\r\n")
+
+      args = JSON.parse({"url" => "http://h.test/", "method" => "POST", "body" => "text",
+                         "body_base64" => Base64.strict_encode("bytes".to_slice)}.to_json).as_h
+      String.new(Gori::MCP::RequestBuilder.build(args).bytes).should end_with("\r\n\r\nbytes")
+    end
+
+    it "refuses invalid base64 instead of quietly sending different bytes" do
+      args = JSON.parse(%({"url":"http://h.test/","raw_base64":"!!!not base64!!!"})).as_h
+      expect_raises(Gori::Error, /raw_base64.*not valid base64/) { Gori::MCP::RequestBuilder.build(args) }
+    end
+
+    it "treats an empty/absent base64 argument as absent (the text route still works)" do
+      args = JSON.parse(%({"url":"http://h.test/","raw_base64":"","raw":"GET /t HTTP/1.1\\r\\n\\r\\n"})).as_h
+      String.new(Gori::MCP::RequestBuilder.build(args).bytes).should eq("GET /t HTTP/1.1\r\n\r\n")
+      Gori::MCP::RequestBuilder.verbatim?(args).should be_false
+    end
   end
 
   it "raises a clean Gori::Error (not a leaked URI::Error) for a malformed authority" do
@@ -3426,5 +3701,112 @@ describe "MCP per-project network overrides" do
       Gori::Settings.project_upstream_proxy = nil
       Gori::Settings.project_capture_max_mib = nil
     end
+  end
+end
+
+# A WS origin that upgrades, then reads until the client stops — so a multi-frame send
+# (unlike start_mcp_ws_origin's single read-then-close) is not racing a shut socket.
+private def start_mcp_ws_sink_origin : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 2.seconds
+    head = Gori::Proxy::Codec::Http1.read_head(conn).not_nil!
+    key = String.new(head).each_line
+      .find(&.downcase.starts_with?("sec-websocket-key:"))
+      .try { |line| line.split(':', 2)[1].strip } || ""
+    accept = Base64.strict_encode(Digest::SHA1.digest(key + Gori::Repeater::WsEngine::GUID))
+    conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
+            "Connection: Upgrade\r\nSec-WebSocket-Accept: #{accept}\r\n\r\n"
+    conn.flush
+    buf = Bytes.new(4096)
+    loop { break if conn.read(buf) == 0 }
+  rescue
+  ensure
+    conn.try(&.close) rescue nil
+    origin.close rescue nil
+  end
+  port
+end
+
+describe "Gori::MCP::Server WebSocket frame shapes" do
+  # `messages` was typed "array of strings" and every entry became `OutMsg.new(1, …)`, so
+  # opcode 1 / FIN=1 / RSV=0 / masked / honest-length was the only frame this tool could ever
+  # produce. A bare string still means exactly that; everything else is opt-in.
+  it "accepts the object form and the WsFrameSpec string form, and reports what it framed" do
+    with_store do |store|
+      port = start_mcp_ws_sink_origin
+      request = "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+      repeater_id = store.insert_repeater("ws://127.0.0.1:#{port}", request.to_slice, false, true, nil, 0)
+      msgs = %([{"opcode":9,"text":"ping-shaped"},) +
+             %({"opcode":1,"rsv":4,"text":"rsv1"},) +
+             %({"opcode":1,"mask":false,"text":"bare"},) +
+             %({"opcode":1,"declared_len":4096,"text":"lies"},) +
+             %("opcode=close,hex=03ea627965",) +
+             %("plain string is still just text"])
+      call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_websocket","arguments":) +
+             %({"repeater_id":#{repeater_id},"messages":#{msgs},"idle_ms":100,"allow_unscoped":true}}})
+      resp = drive(store, call, verify_upstream: false)[0]
+      resp["result"]["isError"].as_bool.should be_false
+      out = tool_payload(resp)["messages"].as_a.select { |m| m["direction"].as_s == "out" }
+      out.map { |m| m["frame"].as_s }.should eq([
+        "PING", "TEXT rsv=4", "TEXT unmasked", "TEXT len=4096", "CLOSE", "TEXT",
+      ])
+      out[4]["close_code"].as_i.should eq(1002)
+      out[4]["close_reason"].as_s.should eq("bye")
+      out[5]["payload"].as_s.should eq("plain string is still just text")
+    end
+  end
+
+  it "persists a shaped ws_out_messages entry and the key toggle on create_repeater" do
+    with_store do |store|
+      call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_repeater","arguments":) +
+             %({"target":"ws://127.0.0.1:1","request":"GET /ws HTTP/1.1\\r\\nHost: h\\r\\nUpgrade: websocket\\r\\n\\r\\n",) +
+             %("ws_keep_key":true,"ws_out_messages":[{"opcode":9,"text":"p"},{"opcode":1,"rsv":4,"text":"r"}]}}})
+      resp = drive(store, call)[0]
+      resp["result"]["isError"].as_bool.should be_false
+      id = JSON.parse(resp["result"]["content"][0]["text"].as_s)["id"].as_i64
+      rows = store.ws_messages_for_repeater(id)
+      rows.map(&.opcode).should eq([9, 1])
+      rows[1].shape.rsv.should eq(4)
+      store.get_repeater(id).not_nil!.ws_keep_key?.should be_true
+    end
+  end
+end
+
+# MCP `get_flow`'s ws_messages projection, and the V7 shape reaching it.
+#
+# `gori run show --format json` has emitted the shape since the shape existed; MCP did not,
+# so the AGENT surface — the one that cannot look at the wire itself — was the single place a
+# captured RSV1 frame, an unmasked client frame, or a CLOSE's code was invisible. Both
+# projections now call one emitter, so they cannot drift again.
+describe "MCP ws_messages shape projection" do
+  it "emits fin/rsv/masked/frames only when they differ from an ordinary frame" do
+    plain = Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "out", 1, "hi".to_slice)
+    json = JSON.build { |j| j.object { Gori::MCP::Serialize.emit_ws_messages(j, [plain]) } }
+    json.should_not contain("\"fin\"")
+    json.should_not contain("\"rsv\"")
+    json.should_not contain("\"masked\"")
+    json.should_not contain("\"frames\"")
+  end
+
+  it "emits the shape for a frame an operator would come here to see" do
+    shaped = Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "out", 1, "x".to_slice,
+      Gori::Store::WsShape.new(fin: false, rsv: 4, masked: false, frames: 2))
+    json = JSON.build { |j| j.object { Gori::MCP::Serialize.emit_ws_messages(j, [shaped]) } }
+    json.should contain("\"fin\":false")
+    json.should contain("\"rsv\":4")
+    json.should contain("\"masked\":false")
+    json.should contain("\"frames\":2")
+  end
+
+  it "emits a CLOSE's code and reason — the most diagnostic frame there is" do
+    payload = Bytes[0x03, 0xEA] + "bye-reason".to_slice
+    close = Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "in", 8, payload)
+    json = JSON.build { |j| j.object { Gori::MCP::Serialize.emit_ws_messages(j, [close]) } }
+    json.should contain("\"close_code\":1002")
+    json.should contain("\"close_reason\":\"bye-reason\"")
+    json.should contain("\"type\":\"close\"")
   end
 end

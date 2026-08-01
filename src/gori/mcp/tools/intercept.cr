@@ -101,12 +101,22 @@ module Gori
         return err(id_error(h, "item_id"), "INVALID_ARGUMENT", field: "item_id") unless id
         edited = intercept_edit_bytes(h)
         return edited if edited.is_a?(Result)
-        # Sync Content-Length to the edited body. Bytes are LITERAL — no Env.expand_wire, so a
-        # remote agent's $SECRET references are never expanded into forwarded traffic; and no
-        # smuggling guard, because byte-exact forwarding of arbitrary edits is the whole point of
-        # an intercept editor in a security tool (matches the human forward_bytes contract).
-        bytes = Fuzz::ContentLength.sync(edited, add_when_missing: true)
-        enqueue_intercept("forward_edit", item_id: id, bytes: bytes)
+        # Bytes are LITERAL — no Env.expand_wire, so a remote agent's $SECRET references are
+        # never expanded into forwarded traffic; and no smuggling guard, because byte-exact
+        # forwarding of arbitrary edits is the whole point of an intercept editor in a security
+        # tool (matches the human forward_bytes contract).
+        #
+        # Content-Length sync is now a DECLARED argument, default on. It used to be
+        # unconditional, one line under that very comment — which made a CL desync (CL shorter
+        # than the body, CL longer than the body, CL+TE), *the* canonical reason to hold a
+        # request, unexpressible, and made the advertised byte-exact `raw_base64` channel not
+        # byte-exact. Default on keeps the ordinary edit ("I changed the body, frame it for
+        # me") working; `update_content_length:false` is the desync switch, and the result
+        # says which one ran so the caller never has to assume.
+        sync = bool_arg(h, "update_content_length", true)
+        bytes = sync ? Fuzz::ContentLength.sync(edited, add_when_missing: true) : edited
+        enqueue_intercept("forward_edit", item_id: id, bytes: bytes,
+          extra: {"content_length_synced" => JSON::Any.new(sync && bytes != edited)})
       end
 
       # The replacement wire message. `raw_base64` is the byte-exact channel — a JSON string
@@ -161,7 +171,13 @@ module Gori
       # Enqueue one command for the live capturing instance, then bounded-poll its ack so the
       # agent gets a real outcome (forwarded/dropped/no_such_item/…) rather than assuming success
       # on a write that may have been dropped or never drained.
-      private def enqueue_intercept(verb : String, *, item_id : Int64? = nil, bytes : Bytes? = nil, arg : String? = nil) : Result
+      # `extra` rides onto the SUCCESS envelope so a verb can report what it did to the
+      # caller's bytes — see `intercept_forward_edit`'s Content-Length switch. Reporting a
+      # transformation is not optional: a surface that shows a value which did not go out is
+      # itself the defect.
+      private def enqueue_intercept(verb : String, *, item_id : Int64? = nil, bytes : Bytes? = nil,
+                                    arg : String? = nil,
+                                    extra : Hash(String, JSON::Any)? = nil) : Result
         bridge = intercept_bridge_state
         unless bridge && intercept_live?(bridge)
           return busy("no live capturing gori instance is draining intercept commands (open the project's TUI with intercept on)")
@@ -169,13 +185,13 @@ module Gori
         token = bridge["session_token"]?.try(&.as_s?)
         id = store.enqueue_intercept_command(token, verb, item_id: item_id, bytes: bytes, arg: arg)
         return busy("could not enqueue intercept command (store write dropped); retry") if id == 0
-        await_intercept_ack(id)
+        await_intercept_ack(id, extra)
       end
 
-      private def await_intercept_ack(id : Int64) : Result
+      private def await_intercept_ack(id : Int64, extra : Hash(String, JSON::Any)? = nil) : Result
         INTERCEPT_ACK_POLLS.times do
           if st = store.command_status(id)
-            return intercept_ack_result(st[0], st[1]) unless st[0] == "pending"
+            return intercept_ack_result(st[0], st[1], extra) unless st[0] == "pending"
           end
           sleep INTERCEPT_ACK_SLEEP
         end
@@ -183,14 +199,15 @@ module Gori
           "NOT_CONFIRMED", retryable: true)
       end
 
-      private def intercept_ack_result(status : String, detail : String?) : Result
+      private def intercept_ack_result(status : String, detail : String?,
+                                       extra : Hash(String, JSON::Any)? = nil) : Result
         case status
         when "forwarded"
-          Result.new(JSON.build { |j| j.object { j.field "status", "forwarded"; j.field "detail", detail } })
+          Result.new(JSON.build { |j| j.object { j.field "status", "forwarded"; j.field "detail", detail; emit_extra(j, extra) } })
         when "dropped"
           Result.new(JSON.build { |j| j.object { j.field "status", "dropped"; j.field "detail", detail } })
         when "edited"
-          Result.new(JSON.build { |j| j.object { j.field "status", "forwarded"; j.field "edited", true; j.field "detail", detail } })
+          Result.new(JSON.build { |j| j.object { j.field "status", "forwarded"; j.field "edited", true; j.field "detail", detail; emit_extra(j, extra) } })
         when "toggled", "filter_set", "direction_set"
           Result.new(JSON.build { |j| j.object { j.field "status", status; j.field "detail", detail } })
         when "no_such_item"
@@ -200,6 +217,10 @@ module Gori
         else
           err("intercept command #{status}: #{detail}", "INTERNAL")
         end
+      end
+
+      private def emit_extra(j : JSON::Builder, extra : Hash(String, JSON::Any)?) : Nil
+        extra.try &.each { |k, v| j.field k, v }
       end
     end
   end

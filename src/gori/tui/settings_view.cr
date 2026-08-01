@@ -42,7 +42,7 @@ module Gori::Tui
         "per-host routing / SOCKS5 / proxy auth — edit with `gori settings --edit` (network.upstream_rules)",
         readonly: true),
       Field.new("Outbound TLS",
-        "per-host client certificates + protocol floor — edit with `gori settings --edit` (outbound_tls)",
+        "per-host client certificates + protocol range — edit with `gori settings --edit` (outbound_tls)",
         readonly: true),
       Field.new("Hostname overrides", "↵ to edit the global IP→host map (a /etc/hosts for this proxy)", opener: :hosts),
     ]

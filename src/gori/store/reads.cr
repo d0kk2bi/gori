@@ -91,12 +91,37 @@ module Gori
     end
 
     # A representative flow id for a (host, method, target) Sitemap node — prefers a
-    # completed flow (one with a response), newest first. Used by the Sitemap "Send to
-    # Repeater" action, whose node carries no flow id (it's a distinct-tuple aggregate).
+    # completed flow (one with a response), newest first. Used by the Sitemap "Open flow" /
+    # "Send to Repeater" / "Send to Sequencer" / "Discover here" actions, whose node carries
+    # no flow id (it's a distinct-tuple aggregate).
+    #
+    # `target` arrives NORMALIZED: `Sitemap.build` runs every `flows.target` through
+    # `Sitemap.normalize_path` before stamping it on a node, so an absolute-form capture
+    # ("http://h:19501/crtest") becomes the bare path ("/crtest"). The column it is compared
+    # against is not normalized, and this used to be a bare `target = ?` — so the two agreed
+    # only when the capture happened to store origin-form: HTTPS (inside a CONNECT tunnel)
+    # or a request gori itself rewrote. A proxy client sends ABSOLUTE-form for plaintext
+    # HTTP, so every ordinary `http://` capture was unreachable from the tree that was
+    # displaying it, and the refusal blamed the operator ("capture it" — it was captured).
+    #
+    # Two statements rather than one normalizing predicate, because normalizing in SQL means
+    # a `LIKE '%…'` that no index can serve and that matches on a bare suffix ("/panel"
+    # would resolve "/admin/panel"). The exact match stays the fast path and is served by
+    # `idx_flows_sitemap`; only when it misses does the fallback scan this host+method's
+    # ABSOLUTE-form rows (the only ones that can normalize to something else) and compare
+    # through the very function that built the tree — one definition of "same endpoint",
+    # used by both sides.
     def representative_flow_id(host : String, method : String, target : String) : Int64?
       @db.query("SELECT id FROM flows WHERE host = ? AND method = ? AND target = ? ORDER BY (status IS NOT NULL) DESC, id DESC LIMIT 1",
         host, method, target) do |rs|
         return rs.read(Int64) if rs.move_next
+      end
+      @db.query("SELECT id, target FROM flows WHERE host = ? AND method = ? AND instr(target, '://') > 0 ORDER BY (status IS NOT NULL) DESC, id DESC",
+        host, method) do |rs|
+        rs.each do
+          id = rs.read(Int64)
+          return id if Sitemap.normalize_path(rs.read(String)) == target
+        end
       end
       nil
     end

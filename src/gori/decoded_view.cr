@@ -47,8 +47,19 @@ module Gori
         j.field "graphql" do
           j.object do
             j.field "operation", op.operation
+            # WHICH GraphQL request shape this is (json/query/batch/persisted/multipart/
+            # document). A batch's `query` is a rendering of several operations and a
+            # persisted query has no document at all, so a reader that assumed one document
+            # per request would misread both; `editable` says whether the rendering is a
+            # faithful inverse of the bytes (see Graphql::Op#editable?).
+            j.field "form", op.form.to_s.downcase
+            j.field "editable", op.editable?
             emit_text(j, "query", op.query.scrub, clip)
             j.field "variables", op.variables.try(&.scrub)
+            # `form:"invalid"` + why. A GraphQL-carrying request that did not parse used to
+            # emit no `graphql` key at all — byte-identical to "this flow is not GraphQL",
+            # for the one request most worth looking at.
+            j.field "parse_error", op.note if op.note
           end
         end
       end

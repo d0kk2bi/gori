@@ -57,7 +57,7 @@ describe Gori::Graphql do
   describe ".from_query" do
     it "decodes query/operationName/variables from a GET target" do
       op = GQL.from_query("p?query=%7Bme%7D&operationName=Op&variables=%7B%22x%22%3A1%7D")
-      op.should eq(GQL::Op.new("Op", "{me}", "{\n  \"x\": 1\n}"))
+      op.should eq(GQL::Op.new("Op", "{me}", "{\n  \"x\": 1\n}", GQL::Form::Query))
     end
 
     it "requires an open-brace in the decoded query" do
@@ -75,12 +75,12 @@ describe Gori::Graphql do
 
     it "falls back to the raw variables text when it is not valid JSON" do
       op = GQL.from_query("p?query=%7Bme%7D&variables=notjson")
-      op.should eq(GQL::Op.new(nil, "{me}", "notjson"))
+      op.should eq(GQL::Op.new(nil, "{me}", "notjson", GQL::Form::Query))
     end
 
     it "ignores a valueless (no '=') pair" do
       op = GQL.from_query("p?query=%7Bme%7D&flag")
-      op.should eq(GQL::Op.new(nil, "{me}", nil))
+      op.should eq(GQL::Op.new(nil, "{me}", nil, GQL::Form::Query))
     end
   end
 
@@ -287,14 +287,14 @@ describe Gori::Graphql do
 
     it "falls through to the GET query string when the body is non-GraphQL JSON" do
       op = GQL.from_flow("p?query=%7Bme%7D", nil, %({"query":"shoes"}).to_slice)
-      op.should eq(GQL::Op.new(nil, "{me}", nil))
+      op.should eq(GQL::Op.new(nil, "{me}", nil, GQL::Form::Query))
     end
 
     it "falls through to the GET binding for an empty / nil / oversized body" do
-      GQL.from_flow("p?query=%7Bme%7D", nil, nil).should eq(GQL::Op.new(nil, "{me}", nil))
-      GQL.from_flow("p?query=%7Bme%7D", nil, Bytes.new(0)).should eq(GQL::Op.new(nil, "{me}", nil))
+      GQL.from_flow("p?query=%7Bme%7D", nil, nil).should eq(GQL::Op.new(nil, "{me}", nil, GQL::Form::Query))
+      GQL.from_flow("p?query=%7Bme%7D", nil, Bytes.new(0)).should eq(GQL::Op.new(nil, "{me}", nil, GQL::Form::Query))
       big = Bytes.new(Gori::Graphql::MAX_BODY + 1, 0x7b_u8)
-      GQL.from_flow("p?query=%7Bme%7D", nil, big).should eq(GQL::Op.new(nil, "{me}", nil))
+      GQL.from_flow("p?query=%7Bme%7D", nil, big).should eq(GQL::Op.new(nil, "{me}", nil, GQL::Form::Query))
     end
 
     # The false positive that mattered: `location` answers `:query` for anything `from_flow`
@@ -322,11 +322,167 @@ describe Gori::Graphql do
     it "still falls through for a GET carrying a stray body (what the fallback was for)" do
       head = "GET /g?query=%7Bme%7D HTTP/1.1\r\n\r\n".to_slice
       GQL.from_flow("/g?query=%7Bme%7D", head, %({"foo":1}).to_slice)
-        .should eq(GQL::Op.new(nil, "{me}", nil))
+        .should eq(GQL::Op.new(nil, "{me}", nil, GQL::Form::Query))
     end
 
     it "returns nil when neither the body nor the target is GraphQL" do
       GQL.from_flow("/rest/path", nil, %({"foo":1}).to_slice).should be_nil
+    end
+  end
+
+  # Only two of the six shapes an operator actually meets were ever recognised. `from_json`
+  # required `json.as_h?` (so a BATCHED array was never GraphQL — the shape a batching-abuse /
+  # rate-limit-bypass test uses), required a top-level string `query` containing `{` (so a
+  # PERSISTED query, which by definition sends no document, was never GraphQL), and
+  # JSON-parsed the whole body regardless of Content-Type (so a MULTIPART upload mutation and
+  # an `application/graphql` document were never GraphQL either).
+  describe "the request shapes a real API exposes" do
+    it "recognises a batched array and says how many operations it carries" do
+      op = GQL.from_json(%([{"query":"{a}"},{"query":"{b}","operationName":"B"}])).not_nil!
+      op.form.should eq(GQL::Form::Batch)
+      op.query.should contain("# batch of 2 operations")
+      op.query.should contain("{a}")
+      op.query.should contain("{b}")
+      op.query.should contain("# operationName: B")
+    end
+
+    it "recognises a persisted query, which sends no document at all" do
+      body = %({"operationName":"Q","variables":{"id":1},) +
+             %("extensions":{"persistedQuery":{"version":1,"sha256Hash":"abc123"}}})
+      op = GQL.from_json(body).not_nil!
+      op.form.should eq(GQL::Form::Persisted)
+      op.operation.should eq("Q")
+      op.query.should contain("# persisted query — no document was sent")
+      op.query.should contain("sha256Hash: abc123")
+      op.variables.not_nil!.should contain("\"id\": 1")
+    end
+
+    it "recognises an application/graphql body as the document itself" do
+      head = "POST /graphql HTTP/1.1\r\nContent-Type: application/graphql\r\n\r\n".to_slice
+      op = GQL.from_flow("/graphql", head, "{ me { id } }".to_slice).not_nil!
+      op.form.should eq(GQL::Form::Document)
+      op.query.should eq("{ me { id } }")
+    end
+
+    it "recognises a multipart upload mutation via its `operations` part" do
+      b = "----X"
+      body = ["--#{b}",
+              %(Content-Disposition: form-data; name="operations"),
+              "",
+              %({"query":"mutation($f: Upload!){ upload(file: $f){ id } }","variables":{"f":null}}),
+              "--#{b}",
+              %(Content-Disposition: form-data; name="map"),
+              "",
+              %({"0":["variables.f"]}),
+              "--#{b}--", ""].join("\r\n")
+      head = %(POST /graphql HTTP/1.1\r\nContent-Type: multipart/form-data; boundary="#{b}"\r\n\r\n).to_slice
+      op = GQL.from_flow("/graphql", head, body.to_slice).not_nil!
+      op.form.should eq(GQL::Form::Multipart)
+      op.query.should contain("mutation(")
+      op.variables.not_nil!.should contain("\"f\": null")
+    end
+
+    it "still refuses a plain JSON array / non-GraphQL body (no hijacking)" do
+      GQL.from_json(%([{"id":1},{"id":2}])).should be_nil
+      GQL.from_json(%([{"query":"{a}"},{"id":2}])).should be_nil # one stray element ⇒ not a batch
+      GQL.from_json("[]").should be_nil
+      GQL.from_json(%({"variables":{"x":1}})).should be_nil # no query, no persistedQuery
+    end
+
+    it "does not read a multipart/application-graphql body as JSON" do
+      head = "POST /u HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n".to_slice
+      GQL.from_flow("/u", head, %({"query":"{ me }"}).to_slice).should be_nil
+    end
+  end
+
+  # REGRESSION PIN. Making the four new shapes parse is what creates the hazard: `location`
+  # drives which side the Repeater RE-ENCODES on send, so answering `:body` would recompose a
+  # batch array into a single object and answering `:query` would rewrite the query STRING of
+  # a request whose payload is in the body. Either one sends a request the operator never
+  # wrote, on the strength of a projection. This guards the decision that only the two
+  # invertible shapes are editable, and that the other four re-encode nothing at all.
+  describe "the re-encode gate" do
+    it "marks only the two invertible shapes editable" do
+      GQL.from_json(%({"query":"{ me }"})).not_nil!.editable?.should be_true
+      GQL.from_query("p?query=%7Bme%7D").not_nil!.editable?.should be_true
+      GQL.from_json(%([{"query":"{a}"}])).not_nil!.editable?.should be_false
+      GQL.from_json(%({"extensions":{"persistedQuery":{"sha256Hash":"h"}}})).not_nil!.editable?.should be_false
+    end
+
+    it "answers :none — never :body or :query — for a shape it cannot re-encode" do
+      GQL.location(%([{"query":"{a}"},{"query":"{b}"}]).to_slice).should eq(:none)
+      GQL.location(%({"extensions":{"persistedQuery":{"sha256Hash":"h"}}}).to_slice).should eq(:none)
+      doc_head = "POST /g HTTP/1.1\r\nContent-Type: application/graphql\r\n\r\n".to_slice
+      GQL.location("{ me }".to_slice, doc_head).should eq(:none)
+      mp_head = "POST /g HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n".to_slice
+      mp_body = ["--zz", %(Content-Disposition: form-data; name="operations"), "",
+                 %({"query":"{ me }"}), "--zz--", ""].join("\r\n").to_slice
+      GQL.location(mp_body, mp_head).should eq(:none)
+    end
+
+    it "still answers :body / :query for the two shapes that round-trip" do
+      GQL.location(%({"query":"{ me }"}).to_slice).should eq(:body)
+      GQL.location(nil).should eq(:query)
+    end
+  end
+
+  # A GraphQL-carrying request that did NOT parse used to be reported byte-identically to
+  # "this flow is not GraphQL" — no `graphql` key, no `=== GRAPHQL ===` section — for the one
+  # request most worth looking at. Same treatment `fix(grpc): report a framing failure instead
+  # of deleting the gRPC view` gave gRPC.
+  describe ".from_flow — a parse failure is reported, not deleted" do
+    private_head = "POST /gql HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+
+    it "reports invalid JSON that is still obviously a GraphQL envelope" do
+      op = GQL.from_flow("/gql", private_head.to_slice, %({"query":"{broken}",).to_slice).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+      op.note.not_nil!.should contain("not valid JSON")
+      op.editable?.should be_false
+      GQL.display(op).should contain("GraphQL parse failed")
+    end
+
+    it "reports a batch envelope that was cut mid-body" do
+      op = GQL.from_flow("/gql", private_head.to_slice, %([{"query":"{a}"},{"que).to_slice).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+    end
+
+    it "reports an application/graphql document with no selection set" do
+      head = "POST /g HTTP/1.1\r\nContent-Type: application/graphql\r\n\r\n".to_slice
+      op = GQL.from_flow("/g", head, "not a document".to_slice).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+      op.note.not_nil!.should contain("no selection set")
+    end
+
+    it "reports a multipart upload whose `operations` part is not an envelope" do
+      head = "POST /g HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n".to_slice
+      body = ["--zz", %(Content-Disposition: form-data; name="operations"), "",
+              "{not json", "--zz--", ""].join("\r\n").to_slice
+      op = GQL.from_flow("/g", head, body).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+      op.note.not_nil!.should contain("operations")
+    end
+
+    # The guard that keeps this from hijacking ordinary traffic: "opens like an envelope" is
+    # not "is one". A body that PARSES and was rejected is a REST call carrying a string
+    # `query` field, and it must keep getting no GraphQL section at all.
+    it "stays silent for a REST body that parses but is not GraphQL" do
+      GQL.from_flow("/api", private_head.to_slice, %({"query":"shoes","page":2}).to_slice).should be_nil
+    end
+
+    it "stays silent for an unrelated malformed JSON body" do
+      GQL.from_flow("/api", private_head.to_slice, %({"page":2,).to_slice).should be_nil
+    end
+
+    it "stays silent for a plain multipart upload with no `operations` part" do
+      head = "POST /u HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n".to_slice
+      body = ["--zz", %(Content-Disposition: form-data; name="file"; filename="a.bin"), "",
+              "bytes", "--zz--", ""].join("\r\n").to_slice
+      GQL.from_flow("/u", head, body).should be_nil
+    end
+
+    # `from_body` is unchanged, so the Repeater re-encode target never becomes :body for one.
+    it "leaves the re-encode gate answering :query for an unparseable body" do
+      GQL.location(%({"query":"{broken}",).to_slice).should eq(:query)
     end
   end
 end

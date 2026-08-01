@@ -283,6 +283,14 @@ module Gori
         "repeater.toggle-http2", "Toggle HTTP/2 (h2)", "Send this request over HTTP/2 or HTTP/1.1, overriding the captured protocol",
         Verb::Scope::Repeater, [Verb::Chord.new("v", ctrl: true)],
         available: in_repeater, mnemonic: 'h', section: :request) { |ctx| ctx.repeater_toggle_http2; nil }
+      # WebSocket handshake only. No chord: `Sec-WebSocket-Key` regeneration is a per-session
+      # decision an operator makes once and then forgets, not a key they reach for mid-edit,
+      # and the ctrl- space in Repeater is already dense. The HANDSHAKE REQUEST pane carries a
+      # KEY badge either way, so the state is visible without opening the menu.
+      r.register Verb::Definition.new(
+        "repeater.toggle-ws-key", "Toggle Sec-WebSocket-Key reuse",
+        "WebSocket: send the handshake's OWN Sec-WebSocket-Key instead of a fresh one — the only way to test an absent, short, duplicated or non-base64 key (off by default: a fresh key avoids a server's replay guard)",
+        Verb::Scope::Repeater, available: in_repeater, mnemonic: 'K', section: :request) { |ctx| ctx.repeater_toggle_ws_key; nil }
       r.register Verb::Definition.new(
         "repeater.send-group", "Send group (one connection)",
         "Pipeline every request (split on a lone %%% line) over ONE keep-alive connection — active request-smuggling / keep-alive reuse — and show each response",

@@ -69,6 +69,10 @@ module Gori::Tui
       # by an MCP peer, reaped, released) — at which point a lookup would fall back to the
       # HTTP path and splice a `Content-Length:` line into a payload with no head.
       @loaded_ws = false
+      # "Update Content-Length" (Burp's option name), default ON — see
+      # `toggle_content_length_sync`. Session-wide rather than per-item: it is a property of
+      # how the operator is working, and an intercept queue is transient anyway.
+      @sync_content_length = true
       # Cached highlight of the selected held item's bytes (read-only detail pane).
       # Held bytes are immutable, so the item id + theme is the base cache key —
       # recomputed only when the selection/theme changes, not every render. The loaded
@@ -382,8 +386,10 @@ module Gori::Tui
     # Content-Length recomputed to match the edited body (Burp's "update
     # Content-Length", default on; add_when_missing: true so adding a body to a GET
     # that had none still gets framed). The proxy itself stays byte-exact — the
-    # update-CL decision lives here, in the human's editor, not the wire path. (An edit
-    # still normalizes line endings — a text-editor limitation shared with Repeater.)
+    # update-CL decision lives here, in the human's editor, not the wire path. An edit now
+    # keeps every line's ORIGINAL terminator (TextArea#wire_text), so editing the head leaves
+    # the body byte-identical; only the head is normalized to CRLF, which is where CRLF is
+    # required. The one thing an edit still changes on its own is Content-Length, deliberately.
     def forward_bytes(it : Interceptor::Item) : Bytes
       edit = pending_edit
       (edit && edit[0] == it.id) ? edit[1] : it.raw
@@ -410,13 +416,75 @@ module Gori::Tui
     def pending_edit : {Int64, Bytes}?
       id = @loaded_id
       return nil unless id && @editor_dirty
-      # `text` (LF-joined), NOT `to_bytes` — that one joins with CRLF because it exists for
-      # WIRE text, and a WS payload is not wire text.
-      return {id, @editor.text.to_slice} if @loaded_ws
+      # `wire_text`, NOT `text` — a WS payload is opaque bytes with no line structure at all,
+      # so it has to come back exactly as it was loaded. (`to_bytes` would be worse still: it
+      # joins with CRLF because it exists for wire HEADS.)
+      return {id, @editor.wire_bytes} if @loaded_ws
+      # `wire_text` again, for the same reason the Repeater's send path reads it: `text` is the
+      # LF projection, so an edit to a HEADER used to rewrite the BODY — every CR deleted and
+      # Content-Length silently resynced down to match. That is the "I only changed one header"
+      # case, which is most intercept edits, and it shipped different bytes to a live target.
       # `Env.expand_wire` (gsub `/\r?\n/`) not `split('\n').join("\r\n")`: a `$KEY` value
       # carrying a CRLF would otherwise double into `\r\r\n` and corrupt the forwarded bytes.
-      raw = Env.expand_wire(@editor.text)
+      raw = Env.expand_wire(@editor.wire_text)
+      # `@sync_content_length` (^L) — see its toggle. When it is OFF the operator's declared
+      # value goes out as written. When it is on the rewrite has ALREADY been reflected into
+      # the visible buffer by `reflect_content_length_in_editor`, so the call below is
+      # normally a no-op that only catches a `$KEY` whose expansion changed the body length.
+      return {id, raw} unless @sync_content_length
       {id, Fuzz::ContentLength.sync(raw, add_when_missing: true)}
+    end
+
+    # Whether a forward recomputes `Content-Length` from the edited body (Burp's "Update
+    # Content-Length"; default on).
+    #
+    # It had no switch at all, and it is unconditional the moment the editor is dirty — so
+    # the one edit an intercept editor exists for could not be made. A CL/body desync (CL
+    # shorter than the body, CL longer, CL beside a `Transfer-Encoding`) is *the* canonical
+    # reason to hold a request, and gori answered every such edit by silently putting its own
+    # number on the wire: the pane read `Content-Length: 5`, the origin received `16`, and
+    # the status line said `forwarded`. A refusal that names nothing is bad; a rewrite that
+    # names nothing is worse.
+    getter? sync_content_length : Bool
+
+    def toggle_content_length_sync : Bool
+      @sync_content_length = !@sync_content_length
+      reflect_content_length_in_editor
+      @sync_content_length
+    end
+
+    # Put the Content-Length that will actually be SENT into the visible buffer.
+    #
+    # The other half of the defect above: even with the rewrite left default-on, a pane that
+    # keeps showing the operator's `5` while the wire carries gori's `16` is a display lie
+    # about a live request. So the rewrite is applied where the operator can see it and undo
+    # it, exactly as the Repeater's auto-CL does — after which `pending_edit`'s own sync has
+    # nothing left to change and display and wire agree by construction.
+    #
+    # `replace_line` (not `set_text`) keeps the caret and the undo stack, so this can run on
+    # every keystroke. The CL line is located in the RAW editor head BY CONTENT rather than
+    # by transplanting the expanded-space index: a multi-line `$KEY` expansion earlier in the
+    # head shifts the line count, and the index would then overwrite an unrelated header.
+    private def reflect_content_length_in_editor : Nil
+      return unless @editing && @editor_dirty && @sync_content_length
+      return if @loaded_ws # no head to update — see pending_edit
+      raw = Env.expand_wire(@editor.wire_text)
+      synced = Fuzz::ContentLength.sync(raw, add_when_missing: true)
+      return if synced == raw # already agrees (or chunked / no boundary — sync no-ops)
+      synced_head = String.new(synced).split("\r\n\r\n", limit: 2).first
+      new_line = synced_head.split("\r\n").find { |l| content_length_line?(l) } || return
+      lines = @editor.lines_snapshot
+      head_end = lines.index(&.empty?) || lines.size
+      if idx = (0...head_end).find { |i| content_length_line?(lines[i]) }
+        @editor.replace_line(idx, new_line) unless lines[idx] == new_line
+      end
+      # A head with NO Content-Length line got one spliced in by `add_when_missing`. Leave
+      # the buffer alone rather than inserting a line under the caret mid-keystroke; the
+      # forward still adds it, and the operator's head is unchanged either way.
+    end
+
+    private def content_length_line?(line : String) : Bool
+      line.lstrip.downcase.starts_with?("content-length:")
     end
 
     # The env tokens in a pending edit that resolve to nothing — what `pending_edit`'s
@@ -476,26 +544,35 @@ module Gori::Tui
       return unless @editing
       before = @editor.edits
       @editor.undo
-      @editor_dirty = true if @editor.edits != before
+      mark_editor_edit if @editor.edits != before
     end
 
     def edit_insert(ch : Char) : Nil
       return unless @editing
       @editor.insert(ch)
-      @editor_dirty = true
+      mark_editor_edit
     end
 
     def edit_newline : Nil
       return unless @editing
       @editor.insert_newline
-      @editor_dirty = true
+      mark_editor_edit
     end
 
     def edit_backspace : Nil
       return unless @editing
       before = @editor.edits
       @editor.backspace
-      @editor_dirty = true if @editor.edits != before
+      mark_editor_edit if @editor.edits != before
+    end
+
+    # A real content edit: the held bytes are now the operator's, and the visible
+    # Content-Length is brought in line with what a forward would send (see
+    # `reflect_content_length_in_editor`). Every edit path funnels through here so the pane
+    # and the wire cannot drift.
+    private def mark_editor_edit : Nil
+      @editor_dirty = true
+      reflect_content_length_in_editor
     end
 
     def edit_move(dr : Int32, dc : Int32) : Nil
@@ -516,7 +593,7 @@ module Gori::Tui
       return unless @editing
       before = @editor.edits
       @editor.delete
-      @editor_dirty = true if @editor.edits != before
+      mark_editor_edit if @editor.edits != before
     end
 
     # ^G go-to-line / ^F search in the held-message editor (only while editing).
@@ -535,7 +612,7 @@ module Gori::Tui
     def edit_replace_matches(query : String, replacement : String) : Int32
       return 0 unless @editing
       n = @editor.replace_matches(query, replacement)
-      @editor_dirty = true if n > 0
+      mark_editor_edit if n > 0
       n
     end
 
@@ -543,16 +620,29 @@ module Gori::Tui
       @editor.search_hl = q
     end
 
+    # The buffer handed to the external editor (^E). `wire_text`, NOT `text`, for the same
+    # reason `pending_edit` reads it: `text` is the LF projection, so `^E` handed `$EDITOR` a
+    # DIFFERENT message than the one being held — every CRLF in the head and the body flat
+    # gone — and `replace_editor` then wrote that LF-only projection back over the buffer,
+    # destroying the terminators for good. `Fuzz::ContentLength.sync` resyncing down to the
+    # shortened body is what hid it: nothing hung, nothing errored, and a smuggling / CL-TE /
+    # binary-body test simply stopped being that test. `ExternalEditor` was hardened to keep
+    # wire bytes byte-exact (its `WIRE_KINDS` trailing-newline rule); that invariant was
+    # defeated one layer up, here.
     def editor_text : String
-      @editor.text
+      @editor.wire_text
     end
 
     # Replace the held item's editable bytes (e.g. from the external editor); only
     # while editing — forward_bytes then sends the edited text.
+    #
+    # `set_text` is the exact inverse of the `wire_text` above (`TextArea#split_wire`
+    # round-trips every terminator, including a lone CR), so ^E is a byte-exact round trip
+    # for a file the editor left alone.
     def replace_editor(text : String) : Nil
       return unless @editing
       @editor.set_text(text)
-      @editor_dirty = true
+      mark_editor_edit
     end
 
     # --- focus ring (driven by the Runner's Tab/Shift-Tab) ---
@@ -887,13 +977,7 @@ module Gori::Tui
       # a muted hint while previewing, so the edit affordance rides the border. A binary WS
       # message says READ-ONLY there instead: the affordance must not advertise an edit the
       # TextArea round trip would corrupt.
-      if it
-        if it.binary?
-          read_only_badge(screen, rect, rect.x + title.size + 4)
-        else
-          Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + title.size + 4, "e", "EDIT", @editing)
-        end
-      end
+      render_detail_badges(screen, rect, it, rect.x + title.size + 4) if it
       inner = rect.inset(1, 1)
       unless it
         screen.text(inner.x, inner.y, "—", Theme.muted)
@@ -920,6 +1004,22 @@ module Gori::Tui
         end
         Frame.scroll_gauge(screen, inner, total, @detail_scroll, focused)
       end
+    end
+
+    # The right-aligned chip cluster on the detail card's top border, drawn right to left.
+    #
+    # `^l`:CL is "Update Content-Length" (Burp's option name) and rides beside EDIT whenever
+    # the editor is open on something with a head. Without it the rewrite was both invisible
+    # and unswitchable: the operator's deliberate CL/body desync — the canonical reason to
+    # hold a request at all — went out as gori's own number, with no toast, no badge and no
+    # setting anywhere in the product.
+    private def render_detail_badges(screen : Screen, rect : Rect, it : Interceptor::Item,
+                                     min_x : Int32) : Nil
+      return read_only_badge(screen, rect, min_x) if it.binary?
+      x = Frame.toggle_badge(screen, rect.right - 1, rect.y, min_x, "e", "EDIT", @editing)
+      return unless @editing
+      return if @loaded_ws # a WS payload has no head — the sync never runs on it
+      Frame.toggle_badge(screen, x, rect.y, min_x, "^l", "CL", @sync_content_length)
     end
 
     # Where `e`:EDIT would ride, for a message the editor must not open. Right-aligned with

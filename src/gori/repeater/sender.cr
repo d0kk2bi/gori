@@ -31,7 +31,8 @@ module Gori
 
       def initialize(@outbound : Gori::Outbound, *, @scheme : String, @host : String, @port : Int32,
                      @verify : Bool, @http2 : Bool = false, @sni : String? = nil,
-                     @timeout : Time::Span? = nil, @overrides : Gori::HostOverrides? = nil)
+                     @timeout : Time::Span? = nil, @overrides : Gori::HostOverrides? = nil,
+                     @preserve_field_case : Bool = false)
       end
 
       # The reason this request may not go out, or nil to proceed. Two rules stop a
@@ -65,6 +66,17 @@ module Gori
         nil
       end
 
+      # Whether a refusal, if there is one, comes from the UNBOUND-BINDING rule rather than
+      # from Sandbox. `refusal` folds both into one String because the TUI and CLI only ever
+      # print it — but the two have OPPOSITE remedies, and MCP labelled every refusal a
+      # Sandbox block, so an agent told "turn Sandbox off or add a scope include rule" for an
+      # unbound `$SESSION` would keep widening the scope of a project whose scope was never
+      # the problem. Asked separately rather than by re-typing `refusal`, so the surfaces that
+      # correctly treat it as one string stay untouched.
+      def unbound_refusal?(requests : Array(Bytes)) : Bool
+        requests.any? { |b| Gori::Env.unbound(b).present? }
+      end
+
       def send(bytes : Bytes) : Result
         if reason = refusal(bytes)
           return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
@@ -73,12 +85,30 @@ module Gori
         result =
           if @http2
             H2Engine.send(bytes, scheme: @scheme, host: @host, port: @port,
-              verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
+              verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
+              preserve_field_case: @preserve_field_case)
           else
             Engine.send(bytes, scheme: @scheme, host: @host, port: @port,
               verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
           end
         extract(bytes, result)
+        result
+      end
+
+      # Send a field-native h2 request: the operator's exact HPACK field list plus body, with
+      # no h1-text carrier in between (see `H2Engine.send_fields`). Gated identically to `send`
+      # — Sandbox / exclude on a request line synthesized from `:method`/`:path`, so a
+      # field-native send can no more reach a blocked host than a byte-authored one. The
+      # unbound-`$NAME` half of `refusal` is harmless here: it scans only that synthetic line,
+      # which carries no operator token, so a field-native path is never expanded or injected.
+      def send_fields(fields : Array({String, String}), body : Bytes?) : Result
+        scope = H2Engine.field_scope_line(fields)
+        if reason = refusal(scope)
+          return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
+        end
+        result = H2Engine.send_fields(fields, body, scheme: @scheme, host: @host, port: @port,
+          verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
+        extract(scope, result)
         result
       end
 
@@ -97,7 +127,8 @@ module Gori
       end
 
       def send_ws(upgrade : Bytes, messages : Array(WsEngine::OutMsg),
-                  idle : Time::Span = WsEngine::DEFAULT_IDLE) : WsEngine::Result
+                  idle : Time::Span = WsEngine::DEFAULT_IDLE,
+                  keep_key : Bool = false) : WsEngine::Result
         if reason = refusal(upgrade)
           return WsEngine::Result.new(Bytes.new(0), [] of WsEngine::Message, 0_i64, reason)
         end
@@ -114,7 +145,7 @@ module Gori
         end
         WsEngine.send(Gori::Env.expand_bindings(upgrade), expand_messages(messages),
           scheme: @scheme, host: @host, port: @port, verify_upstream: @verify, sni: @sni,
-          idle: idle, overrides: @overrides)
+          idle: idle, overrides: @overrides, keep_key: keep_key)
       end
 
       # The first declared-but-unbound name across the outgoing frames, as a refusal.
@@ -131,7 +162,10 @@ module Gori
       private def expand_messages(messages : Array(WsEngine::OutMsg)) : Array(WsEngine::OutMsg)
         messages.map do |m|
           expanded = Gori::Env.expand_bindings(String.new(m.payload), guard_boundary: false).to_slice
-          expanded == m.payload ? m : WsEngine::OutMsg.new(m.opcode, expanded)
+          # `m.shape` rides along. Rebuilding without it silently reset every frame a binding
+          # touched back to FIN=1/RSV=0/fresh-mask — the exact shape this round exists to stop
+          # being the only one.
+          expanded == m.payload ? m : WsEngine::OutMsg.new(m.opcode, expanded, m.shape)
         end
       end
 

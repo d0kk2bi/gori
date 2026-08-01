@@ -44,6 +44,24 @@ module Gori::Fuzz
     abstract def send(bytes : Bytes) : Repeater::Result
     abstract def origin : Origin
 
+    # Sends this backend REFUSED before the socket — Sandbox, an explicit exclude rule, or
+    # a session binding nothing has bound yet. Zero for a backend with no gate.
+    #
+    # Counting these was never the problem; not REPORTING them was. A refused send still
+    # produces a Result with an error, so it lands in `errors` and vanishes into a number
+    # that also covers timeouts and 500s — and a run where every single send was refused
+    # came back as `sent:N, matched:0` with an empty result list, which reads as "the
+    # payloads were tried and nothing matched". For a security tool that is the worst
+    # possible failure mode: a false negative that looks like a clean bill of health.
+    def blocked : Int64
+      0_i64
+    end
+
+    # The first refusal, verbatim, so a surface can SAY why rather than only count.
+    def blocked_reason : String?
+      nil
+    end
+
     # Release any transport a backend is holding open (the keep-alive pool's parked
     # sockets). Called once when a run ends. A no-op by default so the spec doubles and
     # the connection-per-send backends stay three-line classes.
@@ -64,6 +82,7 @@ module Gori::Fuzz
     getter origin : Origin
     # Sends refused by the scope gate — never put on the wire.
     getter blocked : Int64 = 0_i64
+    getter blocked_reason : String? = nil
     # The HTTP/1.1 keep-alive pool, or nil for connection-per-send (h2, or keep_alive off).
     # Exposed so a surface can report how many handshakes a run actually paid for.
     getter pool : ConnPool?
@@ -95,7 +114,9 @@ module Gori::Fuzz
       # argument the comment below makes for the scope gate. The refusal names the binding.
       if (unbound = Gori::Env.unbound(bytes)).present?
         @blocked += 1
-        return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, Gori::Env.unbound_error(unbound))
+        reason = Gori::Env.unbound_error(unbound)
+        @blocked_reason ||= reason
+        return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
       end
       # BEFORE the scope gate, because the gate keys on the target actually sent — the same
       # rule `ClientConn` states for Match&Replace on the proxy path.
@@ -106,6 +127,7 @@ module Gori::Fuzz
       # hops — one accounting path, not two.
       if err = @outbound.sweep_block(@origin.scheme, @origin.host, Gori::Outbound.request_target(bytes))
         @blocked += 1
+        @blocked_reason ||= err
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err)
       end
       if @http2
@@ -146,6 +168,16 @@ module Gori::Fuzz
       (c = @cap) && c > 0 ? @sent >= c : false
     end
 
+    # Delegated, not defaulted: this wrapper is what the Engine holds, so a Backend#blocked
+    # that stopped at the outermost layer would report 0 for every gated run there is.
+    def blocked : Int64
+      @inner.blocked
+    end
+
+    def blocked_reason : String?
+      @inner.blocked_reason
+    end
+
     def send(bytes : Bytes) : Repeater::Result
       return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR) if cap_reached?
       @sent += 1
@@ -163,6 +195,7 @@ module Gori::Fuzz
   # `Outbound#sweep_block` decision, so the gate can't drift between the two paths.
   class GatedBackend < Backend
     getter blocked : Int64 = 0_i64
+    getter blocked_reason : String? = nil
 
     def initialize(@inner : Backend, @outbound : Gori::Outbound)
     end
@@ -175,6 +208,7 @@ module Gori::Fuzz
       o = origin
       if err = @outbound.sweep_block(o.scheme, o.host, Gori::Outbound.request_target(bytes))
         @blocked += 1
+        @blocked_reason ||= err
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err)
       end
       @inner.send(bytes)
@@ -509,7 +543,7 @@ module Gori::Fuzz
     end
 
     private def snapshot : Progress
-      Progress.new(@sent, total, @matched, @errors)
+      Progress.new(@sent, total, @matched, @errors, @backend.blocked, @backend.blocked_reason)
     end
   end
 end

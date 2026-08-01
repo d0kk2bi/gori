@@ -15,7 +15,7 @@ module Gori
       # --- fuzz tools (gated, async job model) --------------------------------
 
       private def fuzz_start(h) : Result
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         engine, origin, total, http2 = build_fuzz_job(h, ob)
         # Scope gate before launching any real send (host-level: fuzz sweeps many
         # paths against one origin, so evaluate the origin host).
@@ -102,12 +102,12 @@ module Gori
       # fuzz Result. Stored raw; get_flow redacts sensitive headers on read.
       private def record_fuzz_flow(request : Bytes, origin : Fuzz::Origin, http2 : Bool, r : Fuzz::Result) : Int64?
         head, body = split_wire_request(request)
-        parsed = Proxy::Codec::Http1.parse_request_head(head)
+        method, target, version = Proxy::Codec::Http1.authored_start_line(head)
         fid = store.insert_flow(Store::CapturedRequest.new(
           created_at: Time.utc.to_unix_ms * 1000_i64,
           scheme: origin.scheme, host: origin.host, port: origin.port,
-          method: parsed.method, target: parsed.target,
-          http_version: http2 ? "HTTP/2" : parsed.version,
+          method: method, target: target,
+          http_version: http2 ? "HTTP/2" : version,
           head: head, body: body, body_size: body.try(&.size.to_i64)))
         return nil if fid <= 0
         rhead = r.head
@@ -137,6 +137,8 @@ module Gori
         fjob.sent = p.sent
         fjob.matched = p.matched
         fjob.errors = p.errors
+        fjob.blocked = p.blocked
+        fjob.blocked_reason = p.blocked_reason
       end
 
       private def store_fuzz_result(fjob : FuzzJob, r : Fuzz::Result, flow_id : Int64?) : Nil
@@ -161,6 +163,15 @@ module Gori
             j.field "candidates_remaining", (t = fjob.total) ? {0_i64, t - fjob.sent}.max : nil
             j.field "matched", fjob.matched
             j.field "errors", fjob.errors
+            # A refused send never reached the network, but it does produce an errored
+            # Result — so a fully-refused run used to report `sent:N, matched:0, errors:N,
+            # error:null` with an empty result list, which an agent reads as "the payloads
+            # were tried and nothing matched". `blocked` + the verbatim reason are what
+            # separate "no findings" from "no requests"; `all_blocked` says it outright so
+            # a caller cannot miss it by only reading `matched`.
+            j.field "blocked", fjob.blocked
+            j.field "blocked_reason", fjob.blocked_reason
+            j.field "all_blocked", fjob.sent > 0 && fjob.blocked >= fjob.sent
             j.field "stored_results", fjob.results.size
             j.field "results_truncated", fjob.truncated?
             j.field "record_history", fjob.record_history.to_s
@@ -233,7 +244,11 @@ module Gori
           # Defense-in-depth alongside the job-start Layer-1 check: that check only covers
           # the origin once, not a path a template mutates per-request. The Outbound re-reads
           # the scope periodically, so a mid-run EXCLUDE / Sandbox toggle stops the sweep.
-          verify: @verify_upstream && !(bool(h, "insecure") || false),
+          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
+          # `Fuzz::PlanOptions` and the CLI have always carried it; MCP's only route to it was
+          # create_repeater{sni} → send_request{repeater_id}, i.e. not a sweep at all.
+          sni: str(h, "sni"),
           overrides: HostOverrides.load(store))
         plan = Fuzz::Plan.build(options, ob)
         {plan.engine, plan.origin, plan.total, use_h2}
@@ -414,6 +429,13 @@ module Gori
       private def fuzz_source_from(obj : Hash(String, JSON::Any), spec : JSON::Any) : Fuzz::PayloadSource
         if list = obj["list"]?.try(&.as_a?)
           Fuzz::InlineList.new(list.map { |x| x.as_s? || x.to_s })
+        elsif b64 = obj["list_base64"]?.try(&.as_a?)
+          # The byte-exact payload list. `list` entries are JSON strings put on the wire as
+          # their UTF-8 encoding, so `é` went out as 2 bytes and a byte-level set (0x00-0xFF,
+          # overlong/invalid UTF-8, a raw binary blob) could not be expressed at all — the
+          # only escape hatch was a `wordlist` FILE on the server's disk. Crystal Strings are
+          # byte buffers, so the decoded octets survive the whole render path unchanged.
+          Fuzz::InlineList.new(b64.map { |x| fuzz_payload_bytes(x) })
         elsif wl = obj["wordlist"]?.try(&.as_s?)
           Fuzz::WordlistFile.new(wl)
         elsif nums = obj["numbers"]?
@@ -423,7 +445,19 @@ module Gori
         elsif br = obj["brute"]?
           fuzz_brute(br)
         else
-          raise FuzzArgError.new("unknown payload set #{spec} (use list/wordlist/numbers/null/brute)")
+          raise FuzzArgError.new("unknown payload set #{spec} (use list/list_base64/wordlist/numbers/null/brute)")
+        end
+      end
+
+      # One base64 payload → its exact octets. Invalid base64 is a hard error, not a skip: a
+      # caller using this set asked for specific bytes, and fuzzing with different ones is
+      # worse than not fuzzing at all.
+      private def fuzz_payload_bytes(x : JSON::Any) : String
+        s = x.as_s? || raise FuzzArgError.new("each 'list_base64' entry must be a base64 string")
+        begin
+          String.new(Base64.decode(s))
+        rescue
+          raise FuzzArgError.new("invalid base64 in 'list_base64': #{x}")
         end
       end
 
@@ -542,7 +576,7 @@ module Gori
         # that halts the dispatcher at request 0); fall back to the hard ceiling.
         caller_cap = int(h, "max_requests").try { |m| m > 0 ? m : nil }
         cap = [caller_cap, FUZZ_MAX_REQUESTS].compact.min
-        Fuzz::Config.new(mode: mode,
+        cfg = Fuzz::Config.new(mode: mode,
           concurrency: clamp(int(h, "concurrency"), 20, FUZZ_MAX_CONCURRENCY),
           rps: (rate && rate > 0 ? rate : nil),
           retries: (int(h, "retries") || 0_i64).clamp(0_i64, 1000_i64).to_i,
@@ -551,6 +585,18 @@ module Gori
           max_requests: cap,
           # Absent ⇒ the Config default (on); only an explicit `false` opts out.
           keep_alive: bool_arg(h, "keep_alive", true))
+        # Knobs the Config and the CLI have both always had, and MCP could not reach. Set
+        # after construction rather than added to the already-nine-argument ctor.
+        #
+        # `follow_redirects` is the one that changes RESULTS, not just cost: against an
+        # endpoint that 302s, every status/size/words/lines/regex match runs against the
+        # redirect stub, so an agent-driven run reported uniform "no differences" on exactly
+        # the sweeps the CLI found hits in.
+        cfg.follow_redirects = bool_arg(h, "follow_redirects", cfg.follow_redirects?)
+        int(h, "max_redirects").try { |v| cfg.max_redirects = v.clamp(0_i64, 50_i64).to_i }
+        cfg.auto_calibrate = bool_arg(h, "auto_calibrate", cfg.auto_calibrate?)
+        int(h, "throttle_ms").try { |v| cfg.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
+        cfg
       end
     end
   end

@@ -40,16 +40,16 @@ module Gori::Tui
       @repeaters = [] of RepeaterTab
       @host.session.store.repeaters.each do |r|
         view = RepeaterView.new
-        ws_msgs = nil.as(Array(String)?)
+        ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         request_text = String.new(r.request)
         if Repeater::WsEngine.upgrade_request?(request_text)
           ws_msgs = @host.session.store.ws_messages_for_repeater(r.id).compact_map do |m|
-            m.direction == "out" ? String.new(m.payload) : nil
+            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload, m.shape) : nil
           end
         end
         view.restore(r.target, request_text, r.http2?, r.auto_content_length?,
           r.response_head, r.response_body, r.response_error, r.response_duration_us,
-          sni: r.sni || "", ws_messages: ws_msgs)
+          sni: r.sni || "", ws_messages: ws_msgs, ws_keep_key: r.ws_keep_key?)
         view.name = r.name                       # custom sub-tab label survives reopen
         view.tags = Repeater::Tags.parse(r.tags) # flat tags survive reopen (V31)
         seed_repeater_original(view, r.flow_id)
@@ -381,8 +381,16 @@ module Gori::Tui
 
     # The GraphQL operation a request carries (POST JSON body or GET ?query=), or nil —
     # drives the split GraphQL repeater (envelope + readable query/variables).
+    #
+    # EDITABLE ops only. `from_flow` also recognises batched, persisted-query, multipart-
+    # upload and `application/graphql` requests now, and those render but do not round-trip
+    # (`Op#editable?`): opening one in the split editor would offer an edit that `recompose`
+    # can only write back as a DIFFERENT request. They still get the read-only GraphQL pane
+    # everywhere it is a display — History detail, `gori run show`, MCP `decoded` — and here
+    # they open as an ordinary raw-bytes repeater tab, which can send them exactly.
     private def graphql_op(detail : Store::FlowDetail) : Graphql::Op?
-      Graphql.from_flow(detail.row.target, detail.request_head, detail.request_body)
+      op = Graphql.from_flow(detail.row.target, detail.request_head, detail.request_body)
+      op if op && op.editable?
     end
 
     # ^T is context-sensitive: a decode tab or WS tab toggles the envelope/decoded split;
@@ -475,6 +483,25 @@ module Gori::Tui
         h2 = view.toggle_http2
         @host.status(h2 ? "transport: HTTP/2 (h2)" : "transport: HTTP/1.1")
       end
+    end
+
+    # Send the handshake's OWN `Sec-WebSocket-Key` rather than a fresh one.
+    #
+    # Off is the default and stays it: a replayed handshake that reuses a captured key looks
+    # to a server exactly like the replay a repeater guard is watching for. But the editor
+    # SHOWS a key line that gori was silently dropping and re-appending at the end of the
+    # block, so the key on the wire was never the key in the pane, header order was not the
+    # operator's, and an absent / short / duplicated / non-base64 key — the handshake tests —
+    # could not be sent at all.
+    def repeater_toggle_ws_key : Nil
+      return unless view = current_view
+      unless view.ws_mode?
+        @host.status("Sec-WebSocket-Key reuse applies to a WebSocket handshake only")
+        return
+      end
+      on = view.toggle_ws_keep_key
+      @host.status(on ? "Sec-WebSocket-Key: sending the one in the editor (accept verification degrades to a note)" \
+                         : "Sec-WebSocket-Key: regenerated per send (the key in the editor is not the one on the wire)")
     end
 
     def repeater_pretty_request : Nil
@@ -991,19 +1018,19 @@ module Gori::Tui
         # Only re-apply when the PERSISTED request side actually changed (data_version
         # also bumps on capture/response writes, so most polls touch an identical row).
         next if v.request_side_matches?(row.target, String.new(row.request), row.http2?,
-                  row.auto_content_length?, row.sni)
+                  row.auto_content_length?, row.sni, row.ws_keep_key?)
         # Soft sync: request/target/flags only. Full restore() would reset focus to
         # :target and clear @result (no response BLOBs on this path) — that is the
         # "send then response vanishes / focus jumps to Target" bug.
-        ws_msgs = nil.as(Array(String)?)
+        ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
         if Repeater::WsEngine.upgrade_request?(row_request_text)
           ws_msgs = @host.session.store.ws_messages_for_repeater(row.id).compact_map do |m|
-            m.direction == "out" ? String.new(m.payload) : nil
+            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload, m.shape) : nil
           end
         end
         v.apply_peer_request(row.target, row_request_text, row.http2?, row.auto_content_length?,
-          sni: row.sni || "", ws_messages: ws_msgs)
+          sni: row.sni || "", ws_messages: ws_msgs, ws_keep_key: row.ws_keep_key?)
         seed_repeater_original(v, row.flow_id) # baseline may need re-seed if it was empty
       end
 
@@ -1011,15 +1038,15 @@ module Gori::Tui
       rows.each do |row|
         next if local_ids.includes?(row.id)
         view = RepeaterView.new
-        ws_msgs = nil.as(Array(String)?)
+        ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
         if Repeater::WsEngine.upgrade_request?(row_request_text)
           ws_msgs = @host.session.store.ws_messages_for_repeater(row.id).compact_map do |m|
-            m.direction == "out" ? String.new(m.payload) : nil
+            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload, m.shape) : nil
           end
         end
         view.restore(row.target, row_request_text, row.http2?, row.auto_content_length?,
-          sni: row.sni || "", ws_messages: ws_msgs)
+          sni: row.sni || "", ws_messages: ws_msgs, ws_keep_key: row.ws_keep_key?)
         seed_repeater_original(view, row.flow_id)
         @repeaters << RepeaterTab.new(view, row.flow_id, row.id)
       end
@@ -1055,18 +1082,21 @@ module Gori::Tui
       return unless detail = @host.session.store.get_flow(id)
       view = RepeaterView.new
       if detail.row.status == 101
-        # WebSocket: seed the editor with recorded client→server TEXT messages. The
-        # tab is session-only (db_id nil) — WS transcripts aren't persisted/synced.
+        # WebSocket: seed the editor with the recorded client→server messages. The tab is
+        # session-only (db_id nil) — WS transcripts aren't persisted/synced.
         all_out = @host.session.store.ws_messages(id).select { |m| m.direction == "out" }
-        out_msgs = all_out.select(&.text?).map { |m| String.new(m.payload).scrub }
-        view.load_ws(detail, out_msgs)
+        view.load_ws(detail, all_out.map { |m| Store::WsOutMessage.new(m.opcode, m.payload, CLI::Run.seed_shape(m.shape)) })
         @repeaters << RepeaterTab.new(view, id, nil)
-        # The WS message editor is text-only (one message per line), so binary outbound frames
-        # can't be represented/edited and are omitted from the seed — say so in the status line
-        # rather than letting them vanish from the replay without a trace.
-        dropped = all_out.size - out_msgs.size
-        omitted = dropped > 0 ? " — #{dropped} binary frame#{dropped == 1 ? "" : "s"} omitted (text editor can't replay them)" : ""
-        @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{omitted} · ^R send · esc back")
+        # The pane is text-only (one message per line), so a frame it cannot represent is not
+        # shown and not editable — but it is still in the seed and still replays, as long as
+        # the list is left alone. Say which, rather than letting the operator guess.
+        #
+        # "cannot represent" is now more than binary: a PING, a PONG, a CLOSE with a code, an
+        # RSV1 frame and a FIN=0 fragment are all capturable since V7, and a line of text
+        # cannot say which of those it is.
+        unshown = view.ws_unshown_seed
+        note = unshown.empty? ? "" : " — #{unshown.size} frame#{unshown.size == 1 ? "" : "s"} not shown (#{unshown.join(", ")}); #{unshown.size == 1 ? "it replays" : "they replay"} unless you edit the list"
+        @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{note} · ^R send · esc back")
       elsif grpc_flow?(detail)
         # gRPC: head editable as text; a unary call's message payload is hex-editable (^X)
         # and reframed on send. Session-only (db_id nil) — the binary body can't round-trip
@@ -1142,7 +1172,8 @@ module Gori::Tui
                 persist_new_repeater(view, nil)
               end
       if (id = db_id) && view.ws_mode?
-        @host.session.store.update_repeater_ws_messages(id, view.ws_out_texts_raw)
+        @host.session.store.update_repeater_ws_messages(id, view.ws_out_messages_raw)
+        view.ws_out_persisted
       end
       @repeaters << RepeaterTab.new(view, nil, db_id)
       @current_repeater_idx = @repeaters.size - 1
@@ -1326,10 +1357,11 @@ module Gori::Tui
         return
       end
       messages = view.ws_out_messages
+      keep_key = view.ws_keep_key?
       view.inflight = true
       @host.status("ws sending → #{plan.host}:#{plan.port} (#{messages.size} msg#{messages.size == 1 ? "" : "s"})…")
       spawn(name: "gori-ws-repeater") do
-        result = plan.send_ws(messages)
+        result = plan.send_ws(messages, Repeater::WsEngine::DEFAULT_IDLE, keep_key)
         select
         when results.send({view, result})
         else
@@ -1453,13 +1485,14 @@ module Gori::Tui
       return unless (id = tab.db_id) && tab.view.dirty?
       v = tab.view
       if v.ws_mode?
-        # Persist the RAW handshake text (request_text = the editor's `$KEY` tokens, LF),
-        # NOT ws_upgrade_bytes (env-expanded + CRLF): baking the expanded form in would
-        # write secrets to the DB and defeat the reconcile guard (which compares LF text).
+        # Persist the RAW handshake text (request_text = the editor's `$KEY` tokens, in the
+        # line endings the editor holds), NOT ws_upgrade_bytes (env-expanded): baking the
+        # expanded form in would write secrets to the DB and defeat the reconcile guard.
         @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
-          v.sni_override)
+          v.sni_override, ws_keep_key: v.ws_keep_key?)
         # Raw message lines too — the store masks secrets; env tokens re-expand on send.
-        @host.session.store.update_repeater_ws_messages(id, v.ws_out_texts_raw)
+        @host.session.store.update_repeater_ws_messages(id, v.ws_out_messages_raw)
+        v.ws_out_persisted
       else
         @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
           v.sni_override)

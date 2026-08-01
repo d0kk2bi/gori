@@ -32,13 +32,13 @@ module Gori
     # (potentially multi-MB) response on each cross-session commit.
     def repeaters : Array(RepeaterRecord)
       list = [] of RepeaterRecord
-      @db.query("SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, response_head, response_body, response_error, response_duration_us, name, sni, tags FROM repeaters ORDER BY position, id") do |rs|
+      @db.query("SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, response_head, response_body, response_error, response_duration_us, name, sni, tags, ws_keep_key FROM repeaters ORDER BY position, id") do |rs|
         rs.each do
           list << RepeaterRecord.new(
             rs.read(Int64), rs.read(String), rs.read(Bytes),
             rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
             rs.read(Bytes?), rs.read(Bytes?), rs.read(String?), rs.read(Int64?), rs.read(String?), rs.read(String?),
-            tags: rs.read(String?))
+            tags: rs.read(String?), ws_keep_key: rs.read(Int32) != 0)
         end
       end
       list
@@ -49,12 +49,12 @@ module Gori
     # response (responses are personal per session). Response fields stay nil.
     def get_repeater(id : Int64) : RepeaterRecord?
       @db.query(
-        "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, name FROM repeaters WHERE id = ?",
+        "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, name, ws_keep_key FROM repeaters WHERE id = ?",
         id) do |rs|
         return RepeaterRecord.new(
           rs.read(Int64), rs.read(String), rs.read(Bytes),
           rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
-          sni: rs.read(String?), name: rs.read(String?)) if rs.move_next
+          sni: rs.read(String?), name: rs.read(String?), ws_keep_key: rs.read(Int32) != 0) if rs.move_next
       end
       nil
     end
@@ -65,14 +65,14 @@ module Gori
     def get_repeater_full(id : Int64) : RepeaterRecord?
       @db.query(
         "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, " \
-        "response_head, response_body, response_error, response_duration_us, name, sni, tags " \
+        "response_head, response_body, response_error, response_duration_us, name, sni, tags, ws_keep_key " \
         "FROM repeaters WHERE id = ?", id) do |rs|
         if rs.move_next
           return RepeaterRecord.new(
             rs.read(Int64), rs.read(String), rs.read(Bytes),
             rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
             rs.read(Bytes?), rs.read(Bytes?), rs.read(String?), rs.read(Int64?), rs.read(String?), rs.read(String?),
-            tags: rs.read(String?))
+            tags: rs.read(String?), ws_keep_key: rs.read(Int32) != 0)
         end
       end
       nil
@@ -80,12 +80,12 @@ module Gori
 
     def repeaters_meta : Array(RepeaterRecord)
       list = [] of RepeaterRecord
-      @db.query("SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni FROM repeaters ORDER BY position, id") do |rs|
+      @db.query("SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, ws_keep_key FROM repeaters ORDER BY position, id") do |rs|
         rs.each do
           list << RepeaterRecord.new(
             rs.read(Int64), rs.read(String), rs.read(Bytes),
             rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
-            sni: rs.read(String?))
+            sni: rs.read(String?), ws_keep_key: rs.read(Int32) != 0)
         end
       end
       list
@@ -97,13 +97,14 @@ module Gori
       list = [] of RepeaterRecord
       @db.query(
         "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, " \
-        "name, tags, response_head, response_error, response_duration_us FROM repeaters ORDER BY position, id") do |rs|
+        "name, tags, response_head, response_error, response_duration_us, ws_keep_key FROM repeaters ORDER BY position, id") do |rs|
         rs.each do
           list << RepeaterRecord.new(
             rs.read(Int64), rs.read(String), rs.read(Bytes),
             rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
             sni: rs.read(String?), name: rs.read(String?), tags: rs.read(String?),
-            response_head: rs.read(Bytes?), response_error: rs.read(String?), response_duration_us: rs.read(Int64?))
+            response_head: rs.read(Bytes?), response_error: rs.read(String?), response_duration_us: rs.read(Int64?),
+            ws_keep_key: rs.read(Int32) != 0)
         end
       end
       list
@@ -112,21 +113,22 @@ module Gori
     # Returns the new row id (or 0 if the store is closing — the caller normalizes
     # 0 → nil so a later update never targets a bogus row).
     def insert_repeater(target : String, request : Bytes, http2 : Bool,
-                        auto_cl : Bool, flow_id : Int64?, position : Int32, sni : String? = nil) : Int64
+                        auto_cl : Bool, flow_id : Int64?, position : Int32, sni : String? = nil,
+                        ws_keep_key : Bool = false) : Int64
       ts = now_us
       exec_task ->(c : DB::Connection) {
-        c.exec("INSERT INTO repeaters (created_at, updated_at, target, request, http2, auto_content_length, flow_id, position, sni) VALUES (?,?,?,?,?,?,?,?,?)",
-          ts, ts, target, request, http2 ? 1 : 0, auto_cl ? 1 : 0, flow_id, position, sni)
+        c.exec("INSERT INTO repeaters (created_at, updated_at, target, request, http2, auto_content_length, flow_id, position, sni, ws_keep_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+          ts, ts, target, request, http2 ? 1 : 0, auto_cl ? 1 : 0, flow_id, position, sni, ws_keep_key ? 1 : 0)
         nil
       }
     end
 
     # Returns whether the write committed (false = store busy/locked/closing).
     def update_repeater(id : Int64, target : String, request : Bytes, http2 : Bool, auto_cl : Bool,
-                        sni : String? = nil) : Bool
+                        sni : String? = nil, ws_keep_key : Bool = false) : Bool
       exec_task_ok ->(c : DB::Connection) {
-        c.exec("UPDATE repeaters SET target = ?, request = ?, http2 = ?, auto_content_length = ?, sni = ?, updated_at = ? WHERE id = ?",
-          target, request, http2 ? 1 : 0, auto_cl ? 1 : 0, sni, now_us, id)
+        c.exec("UPDATE repeaters SET target = ?, request = ?, http2 = ?, auto_content_length = ?, sni = ?, ws_keep_key = ?, updated_at = ? WHERE id = ?",
+          target, request, http2 ? 1 : 0, auto_cl ? 1 : 0, sni, ws_keep_key ? 1 : 0, now_us, id)
         nil
       }
     end
@@ -186,21 +188,33 @@ module Gori
       }
     end
 
-    def update_repeater_ws_messages(id : Int64, messages : Array(String)) : Nil
+    # Replace a repeater session's outbound WebSocket messages.
+    #
+    # `Env.mask_secrets` is byte-level (it scans `to_slice`, never `String#chars`), so the
+    # String round-trip through it is lossless for a payload that is not valid UTF-8 — which
+    # is the whole reason this can take raw bytes at all. `String#scrub` was the lossy step,
+    # and it lived in the callers, not here.
+    #
+    # The V7 shape columns ride along, through the same `bind_ws_shape` the capture writer
+    # uses. A session is the only place a `declared_len` can live at all — a length header
+    # that disagrees with its payload cannot be read back off a wire, so it is authored once
+    # and has to survive the round trip through here or it is not expressible twice.
+    def update_repeater_ws_messages(id : Int64, messages : Array(WsOutMessage)) : Nil
       exec_task ->(conn : DB::Connection) {
         conn.exec("DELETE FROM ws_messages WHERE repeater_id = ?", id)
-        messages.each do |msg_text|
-          masked_msg = Env.mask_secrets(msg_text)
+        messages.each do |msg|
           ts = now_us
           # See insert_ws_one: an empty payload binds SQL NULL and violates the NOT NULL
           # column (an empty repeater message text hits this), so store X'' for it.
-          slice = masked_msg.to_slice
+          slice = Env.mask_secrets(String.new(msg.payload)).to_slice
           empty = slice.empty?
-          args = [0_i64, id, ts, "out", 1] of DB::Any
+          args = [0_i64, id, ts, "out", msg.opcode] of DB::Any
           args << slice unless empty
+          Store.bind_ws_shape(args, msg.shape)
           conn.exec(
-            "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload) " \
-            "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"})", args: args
+            "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
+            "fin, rsv, masked, mask_key, frames, declared_len) " \
+            "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"},?,?,?,?,?,?)", args: args
           )
         end
         nil

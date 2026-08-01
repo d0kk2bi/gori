@@ -12,6 +12,144 @@ module Gori::Proxy::WS
   # overflowing `len.to_i` (Int32) or allocating unbounded memory.
   MAX_FRAME = 16_u64 * 1024 * 1024
 
+  # The RSV1..RSV3 nibble of the first header octet (RFC 6455 §5.2), shifted down so
+  # RSV1 = 4, RSV2 = 2, RSV3 = 1. Parsing used to read `b0 & 0x80` and `b0 & 0x0f` and
+  # nothing between them, so the three extension bits existed nowhere above the socket:
+  # a `permessage-deflate` frame and a plain one produced identical capture rows, and an
+  # operator probing §5.2 ("what does this server do with RSV1 on a socket that negotiated
+  # no extension?") had no way to see the answer, let alone send the question.
+  RSV_MASK  = 0x70_u8
+  RSV_SHIFT =       4
+
+  # The frame-header facts a WebSocket MESSAGE carries beside its payload — everything
+  # `ws_messages` could not say before V7, in one value so a capture row, a repeater
+  # session row and a send instruction all speak the same shape.
+  #
+  # Capture fills these in from the wire. `fin` is the LAST frame's FIN (0 means the
+  # message ended without one: a §5.4 violation, a teardown mid-fragment), `rsv` is the
+  # FIRST frame's RSV nibble (§5.2 puts an extension's flags there), `frames` is how many
+  # frames the message spanned — the only way to tell a two-fragment message from the
+  # single frame its reassembled row otherwise looks exactly like — and `masked`/`mask_key`
+  # are the first frame's, which is how an UNMASKED client frame (§5.1 violation, and the
+  # most common WebSocket hardening probe) becomes visible at all.
+  #
+  # `declared_len` is the one field capture can never produce: a frame whose length header
+  # disagrees with its payload is not readable back, because the reader believes the header.
+  # It exists only on the SEND side and must therefore be persisted, not derived.
+  #
+  # Every field defaults to what gori has always done, so a `Shape.new` send is byte-for-byte
+  # the frame the encoder emitted before this struct existed. `masked` is NILABLE for the
+  # same reason: a pre-V7 row genuinely does not know, and "mask with a fresh key" (the send
+  # default) is a different statement from "the wire said masked".
+  record Shape,
+    fin : Bool = true,
+    rsv : Int32 = 0,
+    masked : Bool? = nil,
+    mask_key : Bytes? = nil,
+    frames : Int32 = 1,
+    declared_len : Int32? = nil do
+    DEFAULT = new
+
+    # Nothing here departs from the encoder's own defaults, so a sender can take the
+    # untouched path. `frames` is capture-only metadata and deliberately not consulted.
+    def default? : Bool
+      fin && rsv == 0 && masked.nil? && mask_key.nil? && declared_len.nil?
+    end
+
+    # As `default?`, but for a frame READ off the wire, where §5.1 fixes what "ordinary"
+    # means per direction: a server→client frame is REQUIRED to be unmasked, so `masked:
+    # false` is the norm there and not a departure at all. Without this every inbound row
+    # in a repeater transcript is "not default", so it renders as `[TEXT unmasked] …` and
+    # the plain `← ABCD` line is unreachable — a marker that fires on every frame is one
+    # an operator learns to read past, which is the opposite of what §5.1 needs it for.
+    def default?(to_server : Bool) : Bool
+      return default? if to_server
+      fin && rsv == 0 && masked != true && mask_key.nil? && declared_len.nil?
+    end
+  end
+
+  # One message's own wire frames, in the two forms a hold can need them.
+  #
+  # `interleaved` is exactly what arrived — every data fragment plus any PING/PONG that sat
+  # BETWEEN them (RFC 6455 §5.4 permits that), in arrival order. It is what goes on the wire
+  # whenever the message is written through, and it is what makes "a message neither stage
+  # changed goes out as the peer's own frames" true about ORDER and not only about bytes.
+  # Whether a peer tolerates a control frame between fragments is a standard hardening
+  # question, so a relay that removes the interleave removes the property under test.
+  #
+  # `data_only` is the same message with the control frames taken back out, and `controls`
+  # is those frames alone. The pair exists for the one case where the interleave genuinely
+  # cannot survive: a message PARKED on an intercept hold. A PONG cannot wait for a human
+  # (see `MessageGate`'s header), so there the controls go out immediately and the message's
+  # own frames follow whenever the operator releases them. With nothing interleaved — every
+  # message on a socket whose peers do not ping mid-message — the two byte slices are the
+  # same one and `controls` is nil, so the split costs nothing in the common case.
+  record RawFrames, interleaved : Bytes, data_only : Bytes, controls : Bytes? = nil
+
+  # Accumulates the frame-header facts of the message currently being reassembled, so the
+  # row that records it can say what its frames looked like (V7).
+  #
+  # First frame vs last is not arbitrary. RFC 6455 §5.2 puts an extension's RSV flags on
+  # the FIRST frame of a message, and the mask key that matters for a §5.1 question is the
+  # first one too; FIN is only interesting on the LAST frame, where 0 means the message
+  # never ended (a §5.4 violation, or a teardown mid-fragment). `frames` is the count,
+  # which is the only thing that distinguishes a two-fragment message from the single frame
+  # its reassembled row otherwise reads as exactly.
+  #
+  # It lives HERE, beside `Shape`, and not inside `Relay` because three reassemblers have to
+  # agree about identical bytes: the byte-exact pump, the assembling pump, and
+  # `Repeater::WsEngine.drain`. The repeater kept its own hand-rolled copy of the accounting
+  # and was missing both of the flushes the pumps have, so an origin that violated §5.4 was
+  # reported as one well-formed message that never existed. Sharing the accumulator is what
+  # makes the three agree by construction rather than by three parallel implementations.
+  class MessageShape
+    @fin = true
+    @rsv = 0
+    @masked : Bool? = nil
+    @mask_key : Bytes? = nil
+    @frames = 0
+
+    # How many frames of the CURRENT message have been noted. Zero means nothing is being
+    # reassembled, which is the only honest test for "is there a fragment still owed a row?"
+    # — the payload buffer cannot answer it, because a leading fragment may be empty.
+    getter frames
+
+    def reset : Nil
+      @fin = true
+      @rsv = 0
+      @masked = nil
+      @mask_key = nil
+      @frames = 0
+    end
+
+    def note(fin : Bool, rsv : UInt8, masked : Bool, mask_key : Bytes?) : Nil
+      if @frames == 0
+        @rsv = rsv.to_i
+        @masked = masked
+        @mask_key = mask_key
+      end
+      @fin = fin
+      @frames += 1
+    end
+
+    def note(h : Header) : Nil
+      note(h.fin?, h.rsv, h.masked?, h.masked? ? h.mask_key.dup : nil)
+    end
+
+    def note(f : Frame) : Nil
+      note(f.fin?, f.rsv, f.masked?, f.mask_key)
+    end
+
+    # The accumulated shape, and start over. `frames` floors at 1: a caller emitting a
+    # message with nothing noted (the oversized-frame marker) still describes one frame.
+    def take : Shape
+      s = Shape.new(fin: @fin, rsv: @rsv, masked: @masked, mask_key: @mask_key,
+        frames: @frames < 1 ? 1 : @frames)
+      reset
+      s
+    end
+  end
+
   # A parsed WebSocket frame. `payload` is unmasked (for capture); `raw` is the
   # exact wire bytes (for byte-faithful forwarding, P7).
   struct Frame
@@ -19,8 +157,12 @@ module Gori::Proxy::WS
     getter opcode : UInt8
     getter payload : Bytes
     getter raw : Bytes
+    getter rsv : UInt8
+    getter? masked : Bool
+    getter mask_key : Bytes?
 
-    def initialize(@fin : Bool, @opcode : UInt8, @payload : Bytes, @raw : Bytes)
+    def initialize(@fin : Bool, @opcode : UInt8, @payload : Bytes, @raw : Bytes,
+                   @rsv : UInt8 = 0_u8, @masked : Bool = false, @mask_key : Bytes? = nil)
     end
 
     def data? : Bool
@@ -29,6 +171,12 @@ module Gori::Proxy::WS
 
     def close? : Bool
       opcode == OP_CLOSE
+    end
+
+    # This frame as a one-frame message shape — what capture records for a control frame,
+    # which has no reassembly to accumulate across.
+    def shape : Shape
+      Shape.new(fin: fin?, rsv: rsv.to_i, masked: masked?, mask_key: mask_key, frames: 1)
     end
   end
 
@@ -42,8 +190,10 @@ module Gori::Proxy::WS
     getter? masked : Bool
     getter len : UInt64
     getter bytes : Bytes
+    getter rsv : UInt8
 
-    def initialize(@fin : Bool, @opcode : UInt8, @masked : Bool, @len : UInt64, @bytes : Bytes)
+    def initialize(@fin : Bool, @opcode : UInt8, @masked : Bool, @len : UInt64, @bytes : Bytes,
+                   @rsv : UInt8 = 0_u8)
     end
 
     def data? : Bool
@@ -58,6 +208,13 @@ module Gori::Proxy::WS
     def mask_key : Bytes
       masked? ? bytes[bytes.size - 4, 4] : Bytes.empty
     end
+
+    # This header as a one-frame message shape (what capture records for a control
+    # frame, and the seed for a data message's first frame).
+    def shape(frames : Int32 = 1) : Shape
+      Shape.new(fin: fin?, rsv: rsv.to_i, masked: masked?,
+        mask_key: masked? ? mask_key.dup : nil, frames: frames)
+    end
   end
 
   # Reads only a frame header (RFC 6455 §5.2). Returns nil on EOF / truncated
@@ -70,6 +227,7 @@ module Gori::Proxy::WS
     b0 = hs[0]
     b1 = hs[1]
     fin = (b0 & 0x80_u8) != 0
+    rsv = (b0 & RSV_MASK) >> RSV_SHIFT
     opcode = b0 & 0x0f_u8
     masked = (b1 & 0x80_u8) != 0
     len = (b1 & 0x7f_u8).to_u64
@@ -90,7 +248,7 @@ module Gori::Proxy::WS
       return nil unless io.read_fully?(hs[hlen, 4])
       hlen += 4
     end
-    Header.new(fin, opcode, masked, len, hs[0, hlen].dup)
+    Header.new(fin, opcode, masked, len, hs[0, hlen].dup, rsv)
   end
 
   # Reads a header-plus-payload frame from `io`, buffering the whole payload.
@@ -125,7 +283,8 @@ module Gori::Proxy::WS
         buf[hlen, n] # zero-copy view into the wire buffer (already unmasked)
       end
 
-    Frame.new(h.fin?, h.opcode, payload, buf)
+    Frame.new(h.fin?, h.opcode, payload, buf, h.rsv, h.masked?,
+      h.masked? ? h.mask_key.dup : nil)
   end
 
   # Unmask `src` into `dst` (RFC 6455 §5.3: `dst[i] = src[i] ^ key[i % 4]`). Every
@@ -174,29 +333,80 @@ module Gori::Proxy::WS
   # by the WS repeater engine (the live relay only forwards `raw` bytes verbatim, so
   # it never needs to build a frame). Control frames (close/ping/pong) carry ≤125
   # bytes and so always take the short length path.
-  def self.encode(opcode : UInt8, payload : Bytes, *, mask : Bool = true, fin : Bool = true) : Bytes
+  #
+  # Every keyword defaults to what this method has always emitted, so an untouched call is
+  # byte-identical. The four that are new exist because the repeater could express exactly
+  # one frame shape — TEXT/BIN, FIN=1, RSV=0, masked with a fresh key, length equal to the
+  # payload — and every WebSocket test that is not "does the app echo my string" lives
+  # outside it:
+  #
+  #   * `rsv` — §5.2. Setting RSV1 on a socket that negotiated no extension is the
+  #     extension-confusion / decompression-bomb probe, and there was no parameter for it.
+  #   * `mask_key` — a repeated or all-zero masking key. §5.3 wants it unpredictable; a
+  #     server that caches on it, or an intermediary that assumes it varies, is testable
+  #     only if the operator picks the bytes.
+  #   * `mask: false` — a client frame with no mask at all. §5.1 says the server MUST fail
+  #     the connection; whether it does is the single most common hardening question, and
+  #     the flag existed but nothing above it could reach it.
+  #   * `declared_len` — the length HEADER, decoupled from the payload actually written.
+  #     A receiver believes the header, so this shape can never be captured off a wire and
+  #     can only ever be authored. Under-declaring truncates the frame from the receiver's
+  #     point of view and leaves the remainder to be parsed as the next header; over-
+  #     declaring makes it wait for bytes that are not coming. Both are framing tests.
+  #
+  # Nothing here is validated. A control frame over 125 bytes, an RSV bit on a socket with
+  # no extension, a length that lies: those are the payloads, and a send path that refuses
+  # them is a send path that cannot ask the question (P0/P7).
+  def self.encode(opcode : UInt8, payload : Bytes, *, mask : Bool = true, fin : Bool = true,
+                  rsv : Int32 = 0, mask_key : Bytes? = nil, declared_len : Int32? = nil) : Bytes
     n = payload.size
+    # The header advertises `declared_len`; the body is always the payload as handed in.
+    adv = declared_len || n
     io = IO::Memory.new(n + 14)
-    io.write_byte((fin ? 0x80_u8 : 0_u8) | (opcode & 0x0f_u8))
+    io.write_byte((fin ? 0x80_u8 : 0_u8) |
+                  ((rsv.to_u8! << RSV_SHIFT) & RSV_MASK) |
+                  (opcode & 0x0f_u8))
     mb = mask ? 0x80_u8 : 0_u8
-    if n < 126
-      io.write_byte(mb | n.to_u8)
-    elsif n <= 0xFFFF
+    if adv < 126
+      io.write_byte(mb | adv.to_u8)
+    elsif adv <= 0xFFFF
       io.write_byte(mb | 126_u8)
-      io.write_byte((n >> 8).to_u8!)
-      io.write_byte(n.to_u8!)
+      io.write_byte((adv >> 8).to_u8!)
+      io.write_byte(adv.to_u8!)
     else
       io.write_byte(mb | 127_u8)
-      len = n.to_u64
+      len = adv.to_u64
       (0..7).each { |i| io.write_byte((len >> (56 - i * 8)).to_u8!) }
     end
     if mask
-      key = Random::Secure.random_bytes(4)
+      # A key the operator chose, else a fresh random one. Short/long input is folded to
+      # exactly 4 bytes rather than refused — `mask_key: Bytes[0]` means "all-zero key", the
+      # degenerate case worth testing, and demanding they spell out four zeroes helps nobody.
+      key = mask_key ? fixed_key(mask_key) : Random::Secure.random_bytes(4)
       io.write(key)
       n.times { |i| io.write_byte(payload[i] ^ key[i & 3]) }
     else
       io.write(payload)
     end
     io.to_slice
+  end
+
+  # Exactly 4 bytes from whatever the operator supplied: zero-padded when short, truncated
+  # when long. An empty slice is an all-zero key.
+  private def self.fixed_key(key : Bytes) : Bytes
+    return key if key.size == 4
+    fixed = Bytes.new(4) # `out` is a Crystal keyword, hence the name
+    key[0, {key.size, 4}.min].copy_to(fixed) unless key.empty?
+    fixed
+  end
+
+  # `encode` driven by a `Shape`. `masked` nil means "the caller's own default" — which is
+  # `mask`, i.e. what the direction requires — so a pre-V7 row and a fresh `Shape.new` both
+  # keep today's behaviour.
+  def self.encode(opcode : UInt8, payload : Bytes, shape : Shape, *, mask : Bool = true) : Bytes
+    m = shape.masked
+    encode(opcode, payload, mask: m.nil? ? mask : m,
+      fin: shape.fin, rsv: shape.rsv, mask_key: shape.mask_key,
+      declared_len: shape.declared_len)
   end
 end
