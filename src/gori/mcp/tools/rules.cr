@@ -256,7 +256,7 @@ module Gori
       private def set_rule_enabled(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) unless id
-        enabled = bool(h, "enabled")
+        enabled = optional_bool_arg(h, "enabled")
         return Result.new("missing required 'enabled' (true|false)", is_error: true) if enabled.nil?
         return not_found("no rule with id #{id}") unless rule_exists?(id)
         return busy("enable/disable NOT applied (store busy or unwritable); the rule is unchanged and may still be rewriting live traffic") unless store.set_rule_enabled(id, enabled)
@@ -455,7 +455,7 @@ module Gori
       private def set_extract_rule_enabled(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) unless id
-        enabled = bool(h, "enabled")
+        enabled = optional_bool_arg(h, "enabled")
         return Result.new("missing required 'enabled' (true|false)", is_error: true) if enabled.nil?
         return not_found("no extract rule with id #{id}") unless store.extract_rules.any?(&.id.==(id))
         return busy("enable/disable NOT applied (store busy or unwritable); the extract rule is unchanged") unless store.set_extract_rule_enabled(id, enabled)

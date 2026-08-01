@@ -498,6 +498,52 @@ describe "MCP network-error classification" do
       Gori::MCP::Tools.network_error_kind(s).should eq("other")
     end
   end
+
+  # RFC 9113 §8.1 lets an origin answer while the request body is still going out — the 413
+  # every upload / body-size probe is looking for. The send comes back with a REAL response
+  # (status 413, full head and body) and `ok:false`; only the REQUEST is partial. Reported as
+  # a network error it was `retryable:true`, which tells an agent to re-send the whole body to
+  # a server that already rejected it.
+  #
+  # The engine's sentence is pinned here AS DATA, not produced by a live origin, so this holds
+  # whatever order the h2 change and this one land in.
+  it "does not tell an agent to retry a body the origin already rejected" do
+    truncated = "the request body was truncated at 4096 of 20000 bytes (the origin ended the " \
+                "stream before the body finished, which RFC 9113 §8.1 permits). " \
+                "The request was NOT fully sent."
+    Gori::MCP::Tools.network_error_kind(truncated).should eq("truncated_request")
+    Gori::MCP::Tools.send_error_code("truncated_request").should eq("REQUEST_TRUNCATED")
+
+    # The two siblings that must keep the verdict they already earn. The flow-control stall is
+    # the reason this cannot key on "NOT fully sent": that sentence ALREADY ends with it, and
+    # it is a genuine stall with no response at all.
+    stall = "h2 flow control: only 16384 of 70000 request body bytes could be sent — the " \
+            "origin never granted flow-control window for the rest (RFC 9113 §6.9): its " \
+            "connection window is 0 and its stream window 0. The request was NOT fully sent."
+    Gori::MCP::Tools.network_error_kind(stall).should eq("protocol")
+
+    # A GOAWAY/RST_STREAM reason APPENDS the truncation clause rather than replacing it, so
+    # each keeps the verdict its own error code earns: REFUSED_STREAM stays retryable, CANCEL
+    # stays a protocol verdict — the clause must not capture either.
+    refused = "h2 RST_STREAM REFUSED_STREAM on stream 1 from a.example:443 — #{truncated}"
+    Gori::MCP::Tools.network_error_kind(refused).should eq("other")
+    cancel = "h2 RST_STREAM CANCEL on stream 1 from a.example:443 — #{truncated}"
+    Gori::MCP::Tools.network_error_kind(cancel).should eq("protocol")
+    goaway = "h2 GOAWAY INTERNAL_ERROR from a.example:443 — #{truncated}"
+    Gori::MCP::Tools.network_error_kind(goaway).should eq("protocol")
+  end
+
+  # `retryable` is the field a caller branches on, so no kind may reach it by accident.
+  it "keeps exactly the transient kinds retryable" do
+    retryable = {"connect", "timeout", "no_response", "other", nil}
+    final = {"protocol", "truncated_request"}
+    retryable.each do |k|
+      Gori::MCP::Tools.send_error_code(k).should eq("NETWORK_ERROR")
+    end
+    final.each do |k|
+      Gori::MCP::Tools.send_error_code(k).should_not eq("NETWORK_ERROR")
+    end
+  end
 end
 
 describe "MCP WebSocket and gRPC projections in get_flow" do

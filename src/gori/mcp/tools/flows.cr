@@ -67,7 +67,7 @@ module Gori
         # A WebSocket flow (101) carries a separate message log; fetch it so get_flow
         # surfaces the frames (parity with `gori run show`). Non-WS flows skip the query.
         ws_msgs = detail.row.status == 101 ? store.ws_messages(id) : [] of Store::WsMessage
-        include_sensitive = bool(h, "include_sensitive") || false
+        include_sensitive = bool_arg(h, "include_sensitive", false)
         cap, omit = body_return_opts(h)
         Result.new(Serialize.flow_detail_json(detail, ws_msgs, include_sensitive, cap, omit))
       end
@@ -187,7 +187,7 @@ module Gori
       # mis-issued call cannot silently empty a capture session.
       private def clear_history(h) : Result
         n = store.count
-        unless bool(h, "confirm")
+        unless bool_arg(h, "confirm", false)
           return err("refusing to delete #{n} flow#{n == 1 ? "" : "s"} without confirm:true — this cannot be undone",
             "CONFIRM_REQUIRED", field: "confirm",
             details: JSON.parse({"flows" => n}.to_json))

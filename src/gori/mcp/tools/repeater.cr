@@ -28,11 +28,18 @@ module Gori
           end
         end
 
-        http2_val = bool(h, "http2")
+        # Three-state on purpose: `http2` absent means "inherit from the seed flow" (below),
+        # which is not the same as `http2:false`. `auto_content_length` has no seed to inherit
+        # from, so it is a plain default-on flag.
+        http2_val = optional_bool_arg(h, "http2")
         http2 = http2_val || false
-        auto_cl_val = bool(h, "auto_content_length")
-        auto_cl = (auto_cl_val.nil? && !present?(h, "auto_content_length")) ? true : !!auto_cl_val
+        auto_cl = bool_arg(h, "auto_content_length", true)
+        # Read here rather than at its one use below, so an unintelligible value is refused on
+        # EVERY call and not only on the flow-seeded ones — an argument that is validated in
+        # one branch and ignored in another is the same silent-substitution trap one level up.
+        keep_request_line = bool_arg(h, "keep_request_line", false)
         ws_messages_override = nil.as(Array(Store::WsOutMessage)?)
+        rewrote_request_line = false
 
         if flow_id
           flow = store.get_flow(flow_id)
@@ -52,10 +59,23 @@ module Gori
           #     verbatim to an origin that expects origin-form.
           #   * `build_target` — this was a third hand-rolled copy of the authority formula,
           #     without the ws/wss default-port fold or IPv6 re-bracketing the shared one has.
-          built = Repeater::FlowRequest.build(flow)
+          #
+          # `origin_form_bytes` is also the one of the three that is not always housekeeping:
+          # on a flow gori recorded from a DIRECT send the absolute-form line is the routing /
+          # cache-poisoning / SSRF payload, and baking the rewrite in here made the loss
+          # PERMANENT — the stored session no longer holds the line, so not even
+          # `send_repeater --verbatim` can recover it. `keep_request_line` turns it off and
+          # `request_line_rewritten` reports it when it fires, matching
+          # `gori run repeater --keep-request-line` and `send_request`.
+          built = Repeater::FlowRequest.build(flow, rewrite_absolute_form: !keep_request_line)
 
           target = built.target if target.nil? || target.empty?
-          request = String.new(built.bytes) if request.nil? || request.empty?
+          if request.nil? || request.empty?
+            request = String.new(built.bytes)
+            # Only when the SEEDED bytes are the ones being stored: an explicit `request`
+            # argument was never rewritten.
+            rewrote_request_line = built.rewrote_request_line
+          end
           http2 = built.http2 if http2_val.nil?
           # `built.sni` is deliberately NOT seeded here: `gori run repeater create --flow`
           # takes SNI from the operator's flag alone, and this tool is its MCP twin.
@@ -109,7 +129,7 @@ module Gori
           flow_id: flow_id,
           position: position.to_i32,
           sni: masked_sni,
-          ws_keep_key: bool(h, "ws_keep_key") || false
+          ws_keep_key: bool_arg(h, "ws_keep_key", false)
         )
 
         return busy("failed to persist repeater (store busy or unwritable)") if id == 0
@@ -144,6 +164,10 @@ module Gori
             j.field "target", masked_target
             j.field "summary", summary
             j.field "position", position
+            # Only when it FIRED, and it is worth more here than on `send_request`: the stored
+            # session no longer carries the absolute-form line, so this is the only record
+            # that it was ever there.
+            j.field "request_line_rewritten", true if rewrote_request_line
             # How many frames were actually stored, so an agent authoring a multi-frame
             # sequence can assert on it rather than take the count on trust.
             j.field "ws_out_message_count", ws_count if ws_count
@@ -298,20 +322,11 @@ module Gori
         return Result.new("target must not be empty", is_error: true) if target.empty?
         return Result.new("request must not be empty", is_error: true) if request.empty?
 
-        http2 = if present?(h, "http2")
-                  bool(h, "http2") || false
-                else
-                  existing.http2?
-                end
-
-        auto_cl = if present?(h, "auto_content_length")
-                    bool(h, "auto_content_length") || false
-                  else
-                    existing.auto_content_length?
-                  end
+        http2 = bool_arg(h, "http2", existing.http2?)
+        auto_cl = bool_arg(h, "auto_content_length", existing.auto_content_length?)
 
         sni = present?(h, "sni") ? str(h, "sni") : existing.sni
-        ws_keep_key = present?(h, "ws_keep_key") ? (bool(h, "ws_keep_key") || false) : existing.ws_keep_key?
+        ws_keep_key = bool_arg(h, "ws_keep_key", existing.ws_keep_key?)
 
         masked_target = Env.mask_secrets(target)
         masked_request = Env.mask_secrets(request)

@@ -163,12 +163,12 @@ module Gori
         int(h, "throttle_ms").try { |v| config.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
         options = Miner::PlanOptions.new(text,
           default_target: default_target, target: str(h, "url"),
-          http2: (bool(h, "http2") || false) || src_h2,
+          http2: bool_arg(h, "http2", false) || src_h2,
           locations: mine_locations(h), bucket: mine_bucket(h), config: config,
           # Defense-in-depth alongside the job-start Layer-1 check: that check only covers the
           # origin once, not a path mining mutates per-request. The Outbound re-reads the scope
           # periodically, so a mid-run EXCLUDE / Sandbox toggle stops the sweep.
-          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
           # `Miner::PlanOptions` and `gori run mine --sni` have always carried it; MCP had no
           # route to it at all, so a param-mine against a vhost whose SNI must differ from the

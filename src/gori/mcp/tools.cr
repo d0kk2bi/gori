@@ -1113,8 +1113,13 @@ module Gori
               "always includes `effective_request` (the scheme/host/port/method/target/" \
               "http_version actually sent). " \
               "Host + Content-Length are auto-added when omitted on the url path. " \
-              "Match & Replace rules are NOT applied unless apply_rules:true." do |s|
+              "Match & Replace rules are NOT applied unless apply_rules:true. " \
+              "On a failed send, branch on `retryable`: PROTOCOL_ERROR (gori proved the message " \
+              "malformed) and REQUEST_TRUNCATED (the origin answered — status/head/body are all " \
+              "here — before the request body finished, which RFC 9113 §8.1 permits) are both " \
+              "final; re-sending a truncated body puts the whole body back on the wire." do |s|
               s.field "flow_id", intprop("resend a captured flow by id (no url needed; like the TUI Repeater)")
+              s.field "keep_request_line", boolprop("flow_id only: send the STORED request line as captured instead of rewriting an absolute-form line (GET http://h/p) to origin-form (GET /p). Default false, because a proxy capture's absolute form is a proxy artifact — but on a flow recorded from a direct send it is the routing / cache-poisoning / SSRF payload. `request_line_rewritten:true` comes back whenever the rewrite fired")
               s.field "repeater_id", intprop("execute a saved HTTP repeater by id (no url needed; respects its target/http2/sni/auto-Content-Length)")
               s.field "url", strprop("absolute URL incl. scheme+host, e.g. https://api.example.com/v1/x (required unless flow_id/repeater_id is given)")
               s.field "method", strprop("HTTP method (default GET)")
@@ -1160,6 +1165,7 @@ module Gori
               s.field "http2", boolprop("use HTTP/2 (default false)")
               s.field "auto_content_length", boolprop("auto-calculate Content-Length header (default true)")
               s.field "flow_id", intprop("optional original flow id this repeater stems from")
+              s.field "keep_request_line", boolprop("flow_id/issue_id seeding only: store the captured request line as-is instead of rewriting an absolute-form line (GET http://h/p) to origin-form (GET /p). Default false. The rewrite is PERMANENT once stored — not even send_request --verbatim can recover the line — so pass true when the absolute form is the payload. `request_line_rewritten:true` comes back whenever it fired")
               s.field "issue_id", intprop("optional issue id to populate target/request/messages from")
               s.field "position", intprop("tab position order index (optional, defaults to appending at end)")
               s.field "sni", strprop("optional TLS Server Name Indication override")
@@ -1342,6 +1348,7 @@ module Gori
               s.field "repeater_id", intprop("repeater database id (`id` is accepted as an alias — the sibling repeater tools spell it that way)"), required: true
               s.field "id", intprop("alias for repeater_id")
               s.field "apply", boolprop("write the minimized request back into the session (default false)")
+              s.field "verbatim", boolprop("search with the stored bytes EXACTLY, as send_request/--verbatim would send them: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync (so body params stop being removal candidates). Use it for a session seeded from a capture, where an unresolved $filter/$top/$where is stored evidence rather than a typo — without it such a session is either refused by name or minimized against substituted bytes. Default false")
               s.field "allow_unscoped", boolprop("minimize even when the target host is outside — or without — a configured scope (default false)")
             end
 
@@ -1554,13 +1561,16 @@ module Gori
               s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED for an out-of-scope target, or when no scope is configured")
             end
 
-            tool j, "discover_status", "Counts + state of a discover job (running|done|stopped|error), " \
-                                       "including the FP/FN figures (calibrated_out / *_suppressed)." do |s|
+            tool j, "discover_status", "Counts + state of a discover job (running|done|budget_exhausted|stopped|error), " \
+                                       "including the FP/FN figures (calibrated_out / *_suppressed). " \
+                                       "budget_exhausted means max_requests halted the run with tasks still queued — a " \
+                                       "partial sweep, NOT an exhaustive one; see incomplete_reason and queued." do |s|
               s.field "job_id", strprop("id from discover_start"), required: true
             end
 
             tool j, "discover_results",
-              "Paged discovered endpoints for a discover job (url, method, status, length, content_type, source, depth, confidence)." do |s|
+              "Paged discovered endpoints for a discover job (url, method, status, length, content_type, source, depth, confidence). " \
+              "has_more is about THIS page; incomplete_reason says whether the RUN covered everything it queued." do |s|
               s.field "job_id", strprop("id from discover_start"), required: true
               s.field "offset", intprop("start row (default 0)")
               s.field "limit", intprop("max rows (default 100, max 1000)")
@@ -1634,7 +1644,7 @@ module Gori
       # bury the outbound ones it exists to surface.
       private def agent_action?(name : String, h) : Bool
         return true if AGENT_ACTION_TOOLS.includes?(name)
-        name == "probe_scan" && (bool(h, "active") || false)
+        name == "probe_scan" && bool_arg(h, "active", false)
       end
 
       # #124 — record a completed agent mutation/send into the store event feed so the AI's
@@ -2143,8 +2153,19 @@ module Gori
         value.clamp(min, max)
       end
 
-      private def bool(h, key : String) : Bool?
-        v = h[key]?
+      # Coerce ONE already-looked-up JSON value to a boolean, or nil when it is neither.
+      #
+      # This deliberately takes the VALUE and not `(h, key)`. The old `(h, key)` form invited
+      # `bool(h, "x") || false`, which collapses "absent" and "unintelligible" into the same
+      # answer — so `probe_scan{active: 1}` ran a PASSIVE scan and reported it as a clean
+      # active one, `create_repeater{auto_content_length: 1}` stored the OPPOSITE of the
+      # absent-default, and `discover_start{spider: 0}` crawled anyway while slipping past the
+      # "at least one technique" guard `spider: false` correctly trips. That shape was fixed
+      # twice on three flags and survived on fifteen others, so the shape itself is gone:
+      # there is no longer any `(h, key)` boolean reader that can silently fall back.
+      # `bool_arg` (absent → a stated default) and `optional_bool_arg` (absent → nil) are the
+      # only two, and both NAME the argument when the value is unintelligible.
+      private def bool_value(v : JSON::Any?) : Bool?
         return nil unless v
         return v.as_bool? unless v.as_bool?.nil?
         # Clients/LLMs often serialize tool args as strings (the schema's "boolean" is
@@ -2157,12 +2178,24 @@ module Gori
         end
       end
 
+      # The boolean argument, or `default` when the caller did not pass it. Raises on a value
+      # that is neither a JSON boolean nor "true"/"false" — a lenient coercion is fine, a
+      # SILENT one is not, and the alternative is running a different test than the one asked
+      # for. Mirrors `bounded_int_arg`'s contract for integers.
       private def bool_arg(h, key : String, default : Bool) : Bool
-        value = bool(h, key)
+        value = optional_bool_arg(h, key)
+        value.nil? ? default : value
+      end
+
+      # The boolean argument as a THREE-state answer: true / false / nil for absent, for the
+      # tools where "not passed" is a distinct outcome (keep the stored value, refuse as a
+      # missing required arg, inherit from the seed flow). Unintelligible still raises.
+      private def optional_bool_arg(h, key : String) : Bool?
+        value = bool_value(h[key]?)
         if present?(h, key) && value.nil?
           raise Gori::Error.new("invalid '#{key}' (expected true or false)")
         end
-        value.nil? ? default : value
+        value
       end
 
       private def clamp(n : Int64?, default : Int32, max : Int32) : Int32

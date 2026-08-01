@@ -14,7 +14,7 @@ module Gori
         # Same reason as list_history: a `body:` query reads the off-commit trigram index
         # (Store V4), and an agent can't distinguish "absent" from "not indexed yet".
         store.index_pending! if filter.uses_fts?
-        return collapsed_sitemap(filter, limit) if bool(h, "collapse_transport") || false
+        return collapsed_sitemap(filter, limit) if bool_arg(h, "collapse_transport", false)
         entries = store.sitemap_entries_detailed(filter, limit)
         tags = store.sitemap_tags
         Result.new(JSON.build do |j|
