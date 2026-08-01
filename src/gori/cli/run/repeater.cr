@@ -714,7 +714,7 @@ module Gori
         if format == :json
           puts repeater_json(result, diff)
         elsif result.ok?
-          STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (incomplete — origin closed before the framed body finished)" : ""}"
+          STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result)})" : ""}"
           if d = diff
             print_diff(d)
             n = Repeater::Diff.change_count(d)
@@ -724,6 +724,32 @@ module Gori
           end
         else
           STDERR.puts "repeater failed: #{result.error}"
+          # An error and a RESPONSE are not exclusive. The engine deliberately keeps the head
+          # for exactly this case (`engine.cr` — "must NOT throw the head away as a bare error
+          # string"), and two shapes reach here with both: a framing error over a head gori
+          # read fine (conflicting Content-Lengths), and an h2 stream RST after a partial
+          # response — status 200, real head, real body, plus a named RST code. `--format json`
+          # and MCP render both halves; the default text view printed one sentence and dropped
+          # the head, so the answer that IS the finding was visible on every rendering except
+          # the default one.
+          unless result.head.empty?
+            STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result)})" : ""}"
+            print_message_text(result.head, new_body, result.body)
+          end
+        end
+      end
+
+      # WHY the captured response is short. `Result#incomplete?` conflates two causes — the
+      # origin closed before the framed body finished, and gori's own capture ceiling stopping
+      # the read — and the one sentence this printed named only the first, so gori blamed the
+      # target for something gori did. The two are told apart by the only evidence available
+      # here: a body sitting exactly at the ceiling was cut by the ceiling.
+      private def self.incomplete_reason(result : Repeater::Result) : String
+        cap = Proxy::Codec::Body::CAPTURE_READ_MAX
+        if (b = result.body) && b.size >= cap
+          "incomplete — gori stopped reading at its #{cap // (1024 * 1024)} MiB capture ceiling"
+        else
+          "incomplete — origin closed before the framed body finished"
         end
       end
 
@@ -752,11 +778,24 @@ module Gori
                                                  headers : Array(String), body_override : String?,
                                                  target_override : String?,
                                                  removed_headers : Array(String) = [] of String) : {Bytes, Bool}
+        # No flag edits the message: hand back the stored bytes untouched rather than take
+        # them apart and put them back. A captured head is EVIDENCE — it may be terminated
+        # with bare LFs (a front-end/back-end desync primitive gori stores byte-exact) or
+        # carry no terminating blank line at all, and a rebuild would quietly re-terminate it
+        # into a different request. Reassembly is only owed where an override asked for it.
+        if headers.empty? && removed_headers.empty? && body_override.nil? && target_override.nil?
+          return {combine_head_body(head_bytes, body_bytes), false}
+        end
+
         head_str = String.new(head_bytes)
-        first_crlf = head_str.index("\r\n") || head_str.size
-        request_line = head_str[0, first_crlf]
-        # Header lines between the request line and the terminating blank line, each verbatim.
-        raw_lines = head_str[first_crlf..].split("\r\n").reject(&.empty?)
+        entries = head_lines(head_str)
+        request_line, request_eol = entries.first? || {head_str, "\r\n"}
+        # Header lines between the request line and the terminating blank line, each verbatim
+        # and each carrying the terminator IT arrived with.
+        raw_lines = entries[1..]?.try(&.reject { |(l, _)| l.empty? }) || [] of {String, String}
+        # The blank line that ends the head, with the terminator it arrived with. Falls back
+        # to the request line's spelling for a head that never had one.
+        head_terminator = entries.last?.try { |(l, e)| l.empty? ? e : nil } || request_eol
 
         # -H overrides: lower-name → the values given for it, IN FLAG ORDER, plus the
         # flag-cased name in flag order for appends.
@@ -766,6 +805,14 @@ module Gori
         # lines — and duplicate-header handling is itself a thing operators come here to
         # test. Now n flags for one name emit n lines. A single `-H` still replaces (the
         # common case is unchanged); only repeating it adds.
+        #
+        # The stored value is the operator's spelling of everything AFTER the first colon,
+        # verbatim. `--header`'s own help advertises an explicit Content-Length as honored
+        # verbatim for CL-mismatch testing, but `Content-Length:\t5`, `Content-Length: 5 ` and
+        # `Content-Length:0011` are the OWS-obfuscation half of that same probe class (RFC
+        # 9112 §5.1) — stripping the whitespace and re-inserting exactly one space after the
+        # colon made all three unreachable. Only the KEY is folded, so dedup/override still
+        # matches the captured header regardless of how either side spelled it.
         custom_headers = {} of String => Array(String)
         custom_order = [] of {String, String}
         headers.each do |h_str|
@@ -773,8 +820,8 @@ module Gori
           name, _, val = h_str.partition(':')
           next if name.strip.empty?
           lname = name.strip.downcase
-          custom_order << {lname, name.strip} unless custom_headers.has_key?(lname)
-          (custom_headers[lname] ||= [] of String) << val.strip
+          custom_order << {lname, name} unless custom_headers.has_key?(lname)
+          (custom_headers[lname] ||= [] of String) << val
         end
         # --rm-header: drop every line with this name. Distinct from `-H "X:"`, which sends
         # X with an EMPTY value — both are real tests and neither can express the other.
@@ -791,8 +838,8 @@ module Gori
         # h2 request's repeated cookie:/set-cookie: lines aren't left half-overridden), and
         # keep every other line — including colon-less ones — byte-exact.
         applied = Set(String).new
-        new_lines = [] of String
-        raw_lines.each do |line|
+        new_lines = [] of {String, String}
+        raw_lines.each do |(line, eol)|
           name = line_name.call(line)
           lname = name.strip.downcase
           if !lname.empty? && dropped.includes?(lname)
@@ -800,14 +847,16 @@ module Gori
           elsif !lname.empty? && (vals = custom_headers[lname]?)
             next if applied.includes?(lname)
             applied << lname
-            vals.each { |v| new_lines << "#{name}: #{v}" }
+            # The operator's own spelling, on the terminator the captured line used.
+            orig = custom_order.find { |(k, _)| k == lname }.try(&.[1]) || name
+            vals.each { |v| new_lines << {"#{orig}:#{v}", eol} }
           else
-            new_lines << line
+            new_lines << {line, eol}
           end
         end
         custom_order.each do |(lname, orig)|
           next if applied.includes?(lname)
-          custom_headers[lname].each { |v| new_lines << "#{orig}: #{v}" }
+          custom_headers[lname].each { |v| new_lines << {"#{orig}:#{v}", request_eol} }
         end
 
         final_body = if b_over = body_override
@@ -816,13 +865,13 @@ module Gori
                        body_bytes
                      end
 
-        has_te = new_lines.any? { |l| line_name.call(l).compare("Transfer-Encoding", case_insensitive: true) == 0 }
+        has_te = new_lines.any? { |(l, _)| line_name.call(l).compare("Transfer-Encoding", case_insensitive: true) == 0 }
         # RFC 7230 §3.3.3 forbids sending Transfer-Encoding and Content-Length together.
         # When the original request was chunked (TE present, no override), keep its wire
         # framing byte-exact and don't inject a Content-Length. When the body is replaced
         # via -b, drop Transfer-Encoding and self-frame the new bytes with Content-Length.
         if has_te && body_override
-          new_lines.reject! { |l| line_name.call(l).compare("Transfer-Encoding", case_insensitive: true) == 0 }
+          new_lines.reject! { |(l, _)| line_name.call(l).compare("Transfer-Encoding", case_insensitive: true) == 0 }
           has_te = false
         end
         # An explicit `-H "Content-Length: N"` is an intentional CL, so it is honored VERBATIM.
@@ -842,11 +891,12 @@ module Gori
         # draft. (A capture TRUNCATED mid-body is re-framed earlier, by
         # `FlowRequest.resync_truncated_head` — not here.)
         if !explicit_cl && !has_te && body_override
-          cl_idx = new_lines.index { |l| line_name.call(l).compare("Content-Length", case_insensitive: true) == 0 }
+          cl_idx = new_lines.index { |(l, _)| line_name.call(l).compare("Content-Length", case_insensitive: true) == 0 }
           if cl_idx
-            new_lines[cl_idx] = "#{line_name.call(new_lines[cl_idx])}: #{final_body.size}"
+            line, eol = new_lines[cl_idx]
+            new_lines[cl_idx] = {"#{line_name.call(line)}: #{final_body.size}", eol}
           else
-            new_lines << "Content-Length: #{final_body.size}"
+            new_lines << {"Content-Length: #{final_body.size}", request_eol}
           end
         end
 
@@ -861,24 +911,77 @@ module Gori
           # for the same session. It also never re-bracketed an IPv6 literal (parse_target
           # returns it bracket-free), emitting the malformed `Host: ::1:8443`.
           host_hdr_val = Repeater::FlowRequest.authority(scheme_part, host_part, port_part)
-          host_idx = new_lines.index { |l| line_name.call(l).compare("Host", case_insensitive: true) == 0 }
+          host_idx = new_lines.index { |(l, _)| line_name.call(l).compare("Host", case_insensitive: true) == 0 }
           if host_idx
-            new_lines[host_idx] = "#{line_name.call(new_lines[host_idx])}: #{host_hdr_val}"
+            line, eol = new_lines[host_idx]
+            new_lines[host_idx] = {"#{line_name.call(line)}: #{host_hdr_val}", eol}
           else
-            new_lines << "Host: #{host_hdr_val}"
+            new_lines << {"Host: #{host_hdr_val}", request_eol}
           end
         end
 
+        # Re-emit each line with ITS OWN terminator. Re-terminating everything as CRLF would
+        # promote a captured bare-LF head — the front-end/back-end desync primitive the store
+        # keeps byte-exact — into an ordinary conformant request, i.e. quietly stop being the
+        # test the operator asked to replay, on a path whose whole point is faithfulness.
         new_head_str = String.build do |io|
-          io << request_line << "\r\n"
-          new_lines.each { |l| io << l << "\r\n" }
-          io << "\r\n"
+          io << request_line << request_eol
+          new_lines.each { |(l, eol)| io << l << eol }
+          io << head_terminator
         end
 
         # The post-expansion Content-Length resync (a `$KEY` in the body changes its length, and
         # the CL above was framed over the pre-expansion bytes) happens in `Repeater::Plan`,
         # gated by the `explicit_cl` flag returned here.
         {new_head_str.to_slice + final_body, explicit_cl}
+      end
+
+      # A head split into {line, the terminator that followed it} pairs, so a rebuild can put
+      # every line back on the ending it arrived with. The captured head may be CRLF, bare-LF
+      # or MIXED (each is a real request-smuggling shape), and `String#split("\r\n")` — what
+      # this replaced — could see only the first of the three.
+      private def self.head_lines(head : String) : Array({String, String})
+        out = [] of {String, String}
+        pos = 0
+        while pos < head.size
+          nl = head.index('\n', pos)
+          unless nl
+            out << {head[pos..], ""} # no terminator at all — the head just ends
+            break
+          end
+          line = head[pos, nl - pos]
+          out << (line.ends_with?('\r') ? {line.rchop, "\r\n"} : {line, "\n"})
+          pos = nl + 1
+        end
+        out
+      end
+
+      # Refuse a flow replay whose OPERATOR-TYPED parts still name a variable that resolves to
+      # nothing. `Repeater::Plan` runs this over the whole wire for a draft; a flow replay
+      # marks its wire as evidence, so the drafts have to be checked on their own or a typo'd
+      # `-H "Authorization: Bearer $TOKN"` would ship the token's own characters, the origin
+      # would answer 401, and the operator would read that as the target rejecting a token
+      # (#519). Same sentence `Plan` produces, so the two cannot drift.
+      private def self.refuse_unresolved_overrides(headers : Array(String), body_override : String?,
+                                                   target_override : String?, sni_override : String?) : Nil
+        names = [] of String
+        headers.each { |h| names.concat(Env.unresolved(h)) }
+        body_override.try { |b| names.concat(Env.unresolved(b)) }
+        target_override.try { |t| names.concat(Env.unresolved(t, deferred: nil)) }
+        sni_override.try { |s| names.concat(Env.unresolved(s, deferred: nil)) }
+        names.uniq!
+        return if names.empty?
+        abort "gori run repeater: unresolved env #{Env.token_list(names)} in -H/-b/--target/--sni — " \
+              "set it with `gori run project env set KEY value`, or remove the token. " \
+              "(Tokens in the CAPTURED bytes are replayed literally; only your overrides are checked.)"
+      end
+
+      private def self.combine_head_body(head : Bytes, body : Bytes) : Bytes
+        return head if body.empty?
+        io = IO::Memory.new(head.size + body.size)
+        io.write(head)
+        io.write(body)
+        io.to_slice
       end
 
       private def self.cmd_repeater_single(args : Array(String)) : Nil
@@ -899,6 +1002,7 @@ module Gori
         removed_headers = [] of String
         body_override : String? = nil
         allow_unscoped = false
+        keep_request_line = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -921,6 +1025,7 @@ module Gori
           p.on("-HHEADER", "--header=HEADER", "Custom header to overwrite/add. Repeat the SAME name to send duplicate header lines. An explicit Content-Length is honored verbatim (no auto-resync) for CL-mismatch testing") { |v| headers << v }
           p.on("--rm-header=NAME", "Delete every header with this name (repeatable). Removing Content-Length suppresses the auto-resync; removing Host suppresses the --target sync") { |v| removed_headers << v }
           p.on("-bBODY", "--body=BODY", "Request body override") { |v| body_override = v }
+          p.on("--keep-request-line", "Send the stored request line as-is — do not rewrite an absolute-form line (\"GET http://h/p\") to origin-form") { keep_request_line = true }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -968,7 +1073,7 @@ module Gori
         if detail.request_body_truncated?
           cap_mib = Settings.effective_capture_max_mib
           STDERR.puts "gori run repeater: request body was truncated at the #{cap_mib} MiB capture cap — resending the stored (shorter) body with a corrected Content-Length"
-        elsif detail.row.state.error? || detail.row.state.aborted?
+        elsif Repeater::FlowRequest.request_short_of_framing?(detail.request_head, detail.request_body)
           # A capture that never completed can hold a Content-Length larger than the body it
           # actually stored — the client hung up mid-upload. Replay is byte-exact now (a
           # stored CL is evidence, not a draft), which is right when that mismatch IS the
@@ -976,27 +1081,57 @@ module Gori
           # bytes that no longer exist. The truncation branch above cannot cover this — it
           # keys on the CAPTURE CAP column, which a mid-upload abort never sets. So say it,
           # rather than quietly picking one of the two intentions.
-          STDERR.puts "gori run repeater: flow ##{id} was captured incomplete (#{detail.row.state}) — " \
-                      "its Content-Length is resent verbatim and may exceed the stored body. " \
+          #
+          # The trigger is the REQUEST being short of the framing IT declares, computed from
+          # the stored head and body. It used to be `row.state.error? || row.state.aborted?`,
+          # which is the whole FLOW's state and is set by response-side failures too — so the
+          # warning fired on essentially every flow whose response failed (the exact
+          # population an operator replays), on bodyless GETs with no Content-Length at all,
+          # and its advice would have destroyed the test case if followed. The state is worth
+          # saying; it just is not the fact.
+          STDERR.puts "gori run repeater: flow ##{id}'s stored request body is shorter than the framing " \
+                      "its head declares (flow state: #{detail.row.state}) — the Content-Length / chunked " \
+                      "framing is resent verbatim, so the origin may wait for bytes that no longer exist. " \
                       "Use -b/--body to reframe, or --rm-header Content-Length to send without one."
         end
 
-        built = Repeater::FlowRequest.build(detail)
-
-        raw_bytes = built.bytes
-        crlf_crlf_idx = -1
-        limit = raw_bytes.size - 4
-        (0..limit).each do |i|
-          if raw_bytes[i] == 0x0d_u8 && raw_bytes[i + 1] == 0x0a_u8 && raw_bytes[i + 2] == 0x0d_u8 && raw_bytes[i + 3] == 0x0a_u8
-            crlf_crlf_idx = i
-            break
-          end
+        # A stored absolute-form request line is a PROXY artifact on a proxy capture and the
+        # PAYLOAD on a flow recorded from a direct send (routing / cache-poisoning / SSRF
+        # probes are written that way), and nothing on the row tells the two apart. So the
+        # rewrite stays the default — every plaintext-HTTP capture needs it — but it is now
+        # reported, and `--keep-request-line` turns it off.
+        built = begin
+          Repeater::FlowRequest.build(detail, rewrite_absolute_form: !keep_request_line)
+        rescue ex : Repeater::FlowRequest::PseudoHeaderHead
+          abort "gori run repeater: flow ##{id} cannot be replayed over HTTP/1.1 — #{ex.message}"
+        end
+        if built.rewrote_request_line
+          # One line, because on a plaintext-HTTP capture this fires on EVERY replay (a proxy
+          # client always sends absolute-form) and a paragraph there is noise the operator
+          # learns to skip. It still has to be said: the same rewrite silently defuses a
+          # routing / cache-poisoning / SSRF probe recorded from a direct send.
+          STDERR.puts "gori run repeater: request line rewritten to origin-form " \
+                      "(absolute-form is a proxy artifact; --keep-request-line keeps it)"
         end
 
-        abort "gori run repeater: malformed request bytes in captured flow" if crlf_crlf_idx == -1
+        raw_bytes = built.bytes
+        # `Env.head_body_boundary`, not a hand-rolled CRLFCRLF scan: a captured head may be
+        # terminated with bare LFs, which is a front-end/back-end desync primitive gori can
+        # already produce and stores byte-exact. Scanning for CRLFCRLF alone made replaying
+        # one impossible and blamed the capture for it ("malformed request bytes in captured
+        # flow") — a refusal that names the evidence rather than the cause (P7). The shared
+        # helper answers the same question for every other surface.
+        boundary = Env.head_body_boundary(raw_bytes)
+        head_bytes = raw_bytes[0, boundary]
+        body_bytes = raw_bytes[boundary..]
 
-        head_bytes = raw_bytes[0, crlf_crlf_idx + 4]
-        body_bytes = raw_bytes[crlf_crlf_idx + 4..]
+        # An unresolved `$KEY` in an operator-typed OVERRIDE is still a typo worth refusing —
+        # but one in the CAPTURED bytes is evidence. OData (`$filter`/`$top`), MongoDB
+        # (`$where`), `$IFS` shell probes and `$user.name` SSTI payloads all live in stored
+        # heads, and the builder's blanket refusal made every one of them unreplayable while
+        # offering a "remedy" (`project env set filter …`) that would have SUBSTITUTED a value
+        # and sent a different request. So the check moves here, onto the drafts alone.
+        refuse_unresolved_overrides(headers, body_override, target_override, sni_override)
 
         wire, explicit_cl = build_single_flow_request(head_bytes, body_bytes, headers, body_override, target_override, removed_headers)
         outbound = project_outbound(project_name, db_path, allow_unscoped)
@@ -1008,6 +1143,8 @@ module Gori
             target: target_override, default_target: built.target,
             http2: use_http2, sni: sni_override.presence || built.sni,
             auto_content_length: false, resync_cl_after_expansion: !explicit_cl,
+            # These bytes are stored EVIDENCE, not a draft — see `PlanOptions#evidence?`.
+            evidence: true,
             verify: !insecure, overrides: host_overrides), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater", ex)
@@ -1040,8 +1177,23 @@ module Gori
             j.field "status", result.response.try(&.status)
             j.field "duration_us", result.duration_us
             j.field "error", result.error
-            j.field "incomplete", true if result.incomplete? # origin closed before the framed body finished
+            # …and WHY it is incomplete. `incomplete` alone conflates an origin that closed
+            # early with gori's own capture ceiling; a reader that assumed the first blamed
+            # the target for something gori did.
+            if result.incomplete?
+              j.field "incomplete", true
+              j.field "incomplete_reason", incomplete_reason(result)
+            end
+            # The head is REMOTE bytes: an 8-bit octet in a header value (the standard
+            # header-parsing probe) does not survive `scrub`, which replaces it with U+FFFD.
+            # `gori run repeater` writes no History row and has no `--format raw`, so those
+            # octets were unrecoverable from this surface entirely. Same shape MCP uses for a
+            # lossy value (`<field>_lossy` + `<field>_base64`) so the two agree.
             j.field "head", scrub(result.head)
+            unless String.new(result.head).valid_encoding?
+              j.field "head_lossy", true
+              j.field "head_base64", Base64.strict_encode(result.head)
+            end
             emit_body_json(j, "body", result.head, result.body, false)
             if d = diff
               j.field "changed_lines", Repeater::Diff.change_count(d)

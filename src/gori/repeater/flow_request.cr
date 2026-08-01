@@ -1,6 +1,7 @@
 require "uri"
 require "../env"
 require "../store"
+require "../proxy/codec/content_decode"
 
 module Gori
   module Repeater
@@ -15,24 +16,65 @@ module Gori
     # The result feeds Repeater::Engine.send / Repeater::H2Engine.send, which take
     # `request, scheme:, host:, port:, verify_upstream:`.
     module FlowRequest
-      record Built, target : String, bytes : Bytes, http2 : Bool, sni : String?
+      # `rewrote_request_line` records that `origin_form_bytes` turned an absolute-form
+      # request line into origin-form. A surface that reports the send must SAY so: for a
+      # proxy capture the absolute form is a proxy artifact and the rewrite is invisible
+      # housekeeping, but for a flow gori recorded from a DIRECT send it is the payload
+      # (routing / cache-poisoning / SSRF probes are written that way), and a replay that
+      # advertises itself as byte-exact must not change the line and stay quiet about it.
+      record Built, target : String, bytes : Bytes, http2 : Bool, sni : String?,
+        rewrote_request_line : Bool = false
 
-      def self.build(detail : Store::FlowDetail) : Built
+      # A stored head that opens with an HTTP/2 PSEUDO-HEADER cannot be replayed over h1: the
+      # h1 `Engine` puts the head on the wire verbatim, so `:method: POST` becomes the start
+      # line, every later header is off by one, and an origin that answers anything at all
+      # makes gori report a status for a request it never sent. The producer is an h2 FIELD
+      # dump recorded as if it were HTTP/1.1 head text. Refusing here is the BACKSTOP; the
+      # recording side is where the dump must stop being written.
+      class PseudoHeaderHead < Gori::Error
+      end
+
+      def self.build(detail : Store::FlowDetail, *, rewrite_absolute_form : Bool = true) : Built
         row = detail.row
         head = detail.request_head
         body = detail.request_body
+        refuse_pseudo_header_head(head)
         # The captured body is capped at CAPTURE_MAX. If it was truncated, a faithful
         # h1 repeater would BLOCK the origin waiting for bytes that no longer exist (a
         # Content-Length over-promising, or a chunked stream cut before its 0-chunk). Byte-
         # exactness is already lost at the cap, so re-frame the head to a fixed Content-Length
         # over the bytes we actually send, so the repeater terminates instead of hanging.
         head = resync_truncated_head(head, body.try(&.size) || 0) if detail.request_body_truncated?
+        bytes, rewrote = rewrite_absolute_form ? origin_form_bytes(head, body) : {combine(head, body), false}
         Built.new(
           target: build_target(row.scheme, row.host, row.port),
-          bytes: origin_form_bytes(head, body),
+          bytes: bytes,
           http2: detail.http_version == "HTTP/2",
           sni: detail.sni,
+          rewrote_request_line: rewrote,
         )
+      end
+
+      # Refuse a head that OPENS WITH AN HTTP/2 PSEUDO-HEADER, and nothing else.
+      #
+      # As narrow as it can be and still catch the field dump, because P7 ("malformed input
+      # IS the payload") owns everything else here: an empty head, a head that is not HTTP at
+      # all, a two-token HTTP/0.9 line, a doubled space, a raw space inside the target, a
+      # NUL — every one of those is somebody's test case and is replayed byte-for-byte (see
+      # spec/cli/run/replay_reconstruct_spec.cr). A leading ':' is different in kind: the
+      # METHOD is an RFC 9110 §5.6.2 token and ':' is not a tchar, so no request line can
+      # begin with one, and the only thing that produces this shape is gori's own h2 field
+      # dump. Shipping it is not "sending the operator's bytes" — it is sending a message
+      # whose first header gori turned into a start line, and then reporting the status.
+      private def self.refuse_pseudo_header_head(head : Bytes) : Nil
+        return unless head.size > 0 && head[0] == 0x3A_u8 # ':'
+        nl = head.index(0x0A_u8)
+        line = String.new(nl ? head[0, nl] : head).rstrip('\r')
+        raise PseudoHeaderHead.new(
+          "the stored request head starts with an HTTP/2 pseudo-header, not a request line " \
+          "(first line: #{line[0, 60].inspect}). It is an h2 field list recorded as HTTP/1.1 head " \
+          "text; sending it would put that field on the wire AS the start line and leave every " \
+          "later header off by one. Re-send it field-natively (`gori run repeater h2 --fields`).")
       end
 
       # Make a TRUNCATED request self-framed so the repeater can't hang. Used ONLY when the
@@ -70,6 +112,15 @@ module Gori
       # over/under-reads. Never ADDS a header (GETs stay clean) and leaves chunked/h2
       # bodies (no Content-Length) untouched. Shared by the TUI Repeater editor and the
       # headless CLI/MCP repeater-send paths so they can't disagree.
+      #
+      # A head carrying `Transfer-Encoding` is left ALONE, Content-Length or not. RFC 7230
+      # §3.3.3 forbids sending both, so a message with both is a CL.TE / TE.CL smuggling
+      # probe — the two headers disagreeing IS the test — and "correcting" the CL over the
+      # chunked wire form turns it into a different probe with no notice. This is the rule
+      # `build_single_flow_request` already applies on the sibling flow-replay path
+      # (`!explicit_cl && !has_te && body_override`); it was missing here, so `repeater
+      # create` + `send` under the default auto-CL rewrote exactly the requests it exists
+      # to replay.
       def self.resync_content_length(bytes : Bytes) : Bytes
         text = String.new(bytes)
         sep = text.index("\r\n\r\n")
@@ -77,6 +128,7 @@ module Gori
         head = text[0, sep]
         body = text[(sep + 4)..]
         lines = head.split("\r\n")
+        return bytes if lines.any? { |l| l.lstrip[0, 18]?.try(&.downcase) == "transfer-encoding:" }
         idx = lines.index { |l| l.lstrip.downcase.starts_with?("content-length:") }
         return bytes unless idx
         lines[idx] = "Content-Length: #{body.bytesize}"
@@ -110,6 +162,43 @@ module Gori
         sep = text.index("\r\n\r\n")
         return nil unless sep
         text[(sep + 4)..].bytesize
+      end
+
+      # Is the STORED request body shorter than the framing its own head declares?
+      #
+      # The request-side fact behind the "captured incomplete" replay warning. It has to be
+      # computed from the head and the body, not read off `FlowRow#state`: that column is the
+      # whole flow's, and a RESPONSE-side failure (an origin that truncated its body, a
+      # conflicting-Content-Length answer) sets it too — which is exactly the population an
+      # operator replays, so keying the warning on it fired on nearly every replay and
+      # prescribed `-b/--body` on bodyless GETs that have no Content-Length at all.
+      #
+      # True when a declared `Content-Length` exceeds the stored bytes, or when a `chunked`
+      # body never reached its terminating 0-chunk. False for everything else, INCLUDING a
+      # body LONGER than its Content-Length: over-long is a legal-and-deliberate desync probe
+      # (the extra bytes are the smuggled prefix), not a truncated capture, and the origin
+      # will not block on it.
+      def self.request_short_of_framing?(head : Bytes, body : Bytes?) : Bool
+        size = body.try(&.size) || 0
+        te = nil.as(String?)
+        cl = nil.as(String?)
+        String.new(head).each_line do |raw|
+          line = raw.chomp
+          break if line.empty? # the blank line ends the head
+          idx = line.index(':') || next
+          name = line[0...idx].strip.downcase
+          te = line[(idx + 1)..].strip if name == "transfer-encoding"
+          cl = line[(idx + 1)..].strip if name == "content-length" && cl.nil?
+        end
+        # TE wins over CL when both are present, matching how a chunked message is framed
+        # on the wire (and how `resync_truncated_head` collapses the pair).
+        if t = te
+          return false unless t.split(',').map(&.strip.downcase).reject(&.empty?).last? == "chunked"
+          return false if size == 0 # no stored body at all is not a CUT chunked stream
+          return !Proxy::Codec::ContentDecode.chunked_complete?(body || Bytes.empty)
+        end
+        declared = cl.try(&.strip.to_i?) || return false
+        declared > size
       end
 
       # The default port for a scheme, **ws/wss included**.
@@ -166,7 +255,10 @@ module Gori
 
       # Rewrite the request-line to origin-form when it's absolute-form, keeping the
       # rest of the head + the body byte-exact; otherwise return head+body verbatim.
-      def self.origin_form_bytes(head : Bytes, body : Bytes?) : Bytes
+      # Returns {bytes, whether the request line was rewritten} — the caller REPORTS the
+      # rewrite, because an absolute-form line is a proxy artifact on one flow and the
+      # payload on the next and only the operator can tell those apart (see `Built`).
+      def self.origin_form_bytes(head : Bytes, body : Bytes?) : {Bytes, Bool}
         nl = head.index(0x0A_u8)
         if nl
           first = String.new(head[0, nl]).rstrip('\r')
@@ -179,10 +271,10 @@ module Gori
             rest_at = nl + 1
             io.write(head[rest_at, head.size - rest_at]) # remaining head bytes, exact
             io.write(body) if body && !body.empty?
-            return io.to_slice
+            return {io.to_slice, true}
           end
         end
-        combine(head, body)
+        {combine(head, body), false}
       end
 
       # Rewrite a request line's HTTP-version token to match the transport when the user
@@ -246,11 +338,21 @@ module Gori
       # BYTE (binary/compressed data), not a line ending, and rewriting it corrupts the
       # request. That reasoning still holds for every verbatim-bytes path (`Repeater::Plan`,
       # `Miner::Plan`, `Sequencer::Plan`, `FlowRequest.build`), which is why the fix lives
-      # here as an opt-in step rather than inside `expand_wire`. It is sound only where the
-      # CRs are already gone: the TUI editors hold the request as an LF-joined line buffer
-      # (`TextArea#set_text` strips \r off every line), so a multipart body typed or pasted
-      # there cannot reach the wire intact by any other route. ^X hex mode remains the
-      # byte-exact escape hatch for a multipart body with binary parts.
+      # here as an opt-in step rather than inside `expand_wire`.
+      #
+      # It USED to be justified by "the CRs are already gone anyway": `TextArea#set_text`
+      # stripped \r off every line, so a multipart body could not reach the wire with its
+      # delimiters intact by any route. That premise is now FALSE — `set_text`/`wire_text`
+      # round-trip each line's own terminator exactly (`text_area.cr`), so the step that used
+      # to RESTORE missing delimiters would instead CORRUPT surviving ones: a captured upload
+      # whose part data is LF-terminated file content came back three bytes longer, with
+      # auto-Content-Length re-framing the body so nothing hung and nothing said a word.
+      #
+      # So it now runs only where its premise still holds — a body with NO CRLF in it at all,
+      # which is what a freshly TYPED multipart looks like (every line's terminator is the
+      # editor's default LF). A captured multipart always carries CRLF (RFC 2046 §5.1.1
+      # delimits parts with it and the part headers are CRLF-terminated), so it is left
+      # byte-exact. ^X hex mode remains the byte-exact escape hatch either way.
       def self.normalize_multipart_body(bytes : Bytes) : Bytes
         text = String.new(bytes)
         sep = text.index("\r\n\r\n")
@@ -258,12 +360,25 @@ module Gori
         body_at = sep + 4
         return bytes if body_at >= bytes.size
         return bytes unless multipart_head?(text[0, sep])
+        body = bytes[body_at..]
+        return bytes if crlf?(body) # already wire-form — these bytes are evidence, not a draft
         head = bytes[0, body_at]
-        body = Env.normalize_crlf(bytes[body_at..])
-        io = IO::Memory.new(head.size + body.size)
+        normalized = Env.normalize_crlf(body)
+        io = IO::Memory.new(head.size + normalized.size)
         io.write(head)
-        io.write(body)
+        io.write(normalized)
         io.to_slice
+      end
+
+      # Does this span contain a CRLF? Byte-level: the body may be binary, and a Regex or a
+      # char-indexed `String#index` cannot take it as a subject.
+      private def self.crlf?(bytes : Bytes) : Bool
+        i = 0
+        while i < bytes.size - 1
+          return true if bytes[i] == 0x0D_u8 && bytes[i + 1] == 0x0A_u8
+          i += 1
+        end
+        false
       end
 
       # True when the head declares a `multipart/*` Content-Type. Case-insensitive on both

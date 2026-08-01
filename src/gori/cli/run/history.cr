@@ -362,7 +362,14 @@ module Gori
         end
         if op = Graphql.from_flow(tgt, rh, rb)
           puts ""
-          puts "=== GRAPHQL ==="
+          # The parse-failure heading also names the capture cap when that is what cut the
+          # body — `detail` knows it and `Graphql` (which sees only bytes) cannot.
+          if note = op.note
+            capped = detail.request_body_truncated? ? "; body truncated at the capture cap" : ""
+            puts CLI::Output.term_safe("=== GRAPHQL (parse failed: #{note}#{capped}) ===")
+          else
+            puts "=== GRAPHQL ==="
+          end
           puts CLI::Output.term_safe_multiline(Graphql.display(op).scrub)
         end
         if fields = FormData.from_flow(tgt, rh, rb)

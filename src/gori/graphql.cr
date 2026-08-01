@@ -32,13 +32,20 @@ module Gori
       Persisted # POST {"extensions":{"persistedQuery":{…}}} — no document on the wire
       Multipart # multipart/form-data upload mutation (GraphQL multipart request spec)
       Document  # Content-Type: application/graphql — the body IS the document
+      Invalid   # GraphQL-carrying by Content-Type / body shape, but it did not parse
     end
 
     record Op,
       operation : String?, # operationName
       query : String,      # the GraphQL document (de-escaped)
       variables : String?, # pretty-printed JSON variables, or nil when absent
-      form : Form = Form::Json do
+      form : Form = Form::Json,
+      # Why this projection is not the operation (Form::Invalid only). A request that is
+      # obviously GraphQL and did not parse must SAY so rather than vanish — reporting it as
+      # "not GraphQL" is byte-identical to the answer for an ordinary REST call, and the
+      # request most worth looking at is the malformed one. Same treatment gRPC got for a
+      # framing failure.
+      note : String? = nil do
       # Whether `display(op)` → edit → `recompose` can put the operator's edit back into the
       # exact request it came from. True ONLY for the two shapes that round-trip: a plain
       # POST JSON body and a GET `?query=`.
@@ -64,13 +71,59 @@ module Gori
     # strength of a misdetection. A GET carrying a stray body still falls through, which is
     # what the fallback was written for.
     def from_flow(target : String, req_head : Bytes?, req_body : Bytes?) : Op?
-      if (b = req_body) && !b.empty? && b.size <= MAX_BODY
-        if op = from_body(b, content_type(req_head))
-          return op
+      ct = content_type(req_head)
+      if (b = req_body) && !b.empty?
+        if b.size <= MAX_BODY
+          if op = from_body(b, ct)
+            return op
+          end
+        end
+        # It did not parse. If the request is GraphQL-CARRYING by its Content-Type or by the
+        # shape of its body, report the failure instead of deleting the view.
+        if reason = unparsed_reason(b, ct)
+          return Op.new(nil, "", nil, Form::Invalid, reason)
         end
       end
       return nil if (b = req_body) && !b.empty? && body_bearing?(req_head)
       from_query(target)
+    end
+
+    # A body that opens as a GraphQL envelope: `{"query":` or a batch's `[{"query":`, with the
+    # whitespace either side that a pretty-printed client emits. Anchored, and only the first
+    # bytes are examined, so an ordinary JSON body that merely CONTAINS the word never matches.
+    ENVELOPE_RE = /\A\s*\[?\s*\{\s*"query"\s*:/
+
+    # Why a GraphQL-carrying request did not parse, or nil when it is not GraphQL-carrying at
+    # all (an ordinary REST body, which must keep getting no GraphQL section).
+    #
+    # Deliberately narrow: a Content-Type the GraphQL-over-HTTP spec defines, or a body that
+    # opens as the envelope. A `multipart/form-data` POST is NOT enough on its own — that is
+    # every ordinary file upload — so it qualifies only once its `operations` part is present.
+    private def unparsed_reason(body : Bytes, content_type : String?) : String?
+      folded = (content_type || "").downcase
+      over = body.size > MAX_BODY
+      if folded.starts_with?("application/graphql")
+        return over ? too_big : "Content-Type is application/graphql but the body carries no selection set"
+      end
+      if folded.starts_with?("multipart/form-data")
+        boundary = multipart_boundary(content_type || "") || return nil
+        return nil unless multipart_part(body, boundary, "operations")
+        return over ? too_big : "the multipart `operations` part is not a valid GraphQL envelope"
+      end
+      head = String.new(body[0, {body.size, 256}.min]).scrub
+      return nil unless ENVELOPE_RE.matches?(head.lchop('\u{FEFF}'))
+      return too_big if over
+      # It opens as an envelope — but "opens like one" is not "is one". A body that PARSES as
+      # JSON and was still rejected is an ordinary REST call carrying a string `query` field
+      # (`{"query":"shoes","page":2}`), which must keep getting no GraphQL section at all;
+      # only a body that does not parse is the truncated/mangled envelope worth reporting.
+      return nil if json?(String.new(body))
+      "the body opens as a GraphQL envelope but is not valid JSON"
+    end
+
+    private def too_big : String
+      "the body is larger than the #{MAX_BODY // (1024 * 1024)} MiB decode ceiling — " \
+      "it may also have been cut at the capture cap"
     end
 
     # The request BODY's GraphQL projection, dispatched on Content-Type. The body used to be
@@ -247,6 +300,10 @@ module Gori
     # variables block (each present only when set). This is the editable form shown in
     # the Repeater DECODED pane; parse_display is its inverse.
     def display(op : Op) : String
+      # A failed parse has no document to show, so the pane shows WHY. Rendered here rather
+      # than at each of the five call sites (History detail, the Fuzzer pane, `gori run show`,
+      # `get_flow`, the Repeater's read-only view) so none of them can render an empty box.
+      return "# GraphQL parse failed: #{op.note}" if op.form.invalid?
       String.build do |io|
         if name = op.operation
           io << "# operationName: " << name << "\n\n"

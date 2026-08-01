@@ -591,7 +591,7 @@ module Gori
           j.field field_name, nil
           return
         end
-        decoded, note = Proxy::Codec::ContentDecode.decode(head, body)
+        decoded, note, complete = Proxy::Codec::ContentDecode.decode_full(head, body)
         bytes = decoded || body
         s = String.new(bytes)
         j.field field_name do
@@ -610,6 +610,11 @@ module Gori
             end
             j.field "wire_truncated", true if wire_truncated
             j.field "note", note if note
+            # A coding that stopped mid-stream. Distinct from `truncated`/`wire_truncated`,
+            # which are about the CAPTURE cap: this one says the decoder never reached the
+            # end of the encoded stream, so the text/base64 above is a prefix of what the
+            # origin meant to send. Silence here read as "decoded: gzip, all of it".
+            j.field "decode_truncated", true unless complete
             emit_trailers_json(j, head, body)
           end
         end
@@ -659,7 +664,22 @@ module Gori
             STDOUT.puts(CLI::Output.term_safe_multiline(String.new(body).scrub))
           end
         end
+        print_decode_note(head, wire_body)
         print_trailers_text(head, wire_body)
+      end
+
+      # Name the derivation under a body that IS one. The text view prints a de-gzipped,
+      # de-chunked body under a head that still says `Content-Encoding: gzip` /
+      # `Transfer-Encoding: chunked` / a Content-Length that no longer matches, and said
+      # nothing about it — while `--format json` and MCP both emit the same fact as `note`.
+      # A truncated stream is the case that matters most: the note is where "(stream
+      # truncated)" lands, so text and JSON now agree that the decode did not finish.
+      private def self.print_decode_note(head : Bytes?, wire_body : Bytes?) : Nil
+        return if wire_body.nil? || wire_body.empty?
+        _, note = Proxy::Codec::ContentDecode.decode(head, wire_body)
+        return unless note
+        STDOUT.puts ""
+        STDOUT.puts "[note] #{CLI::Output.term_safe(note)}"
       end
 
       # Trailers under their own heading, after the body. The decoded text view drops

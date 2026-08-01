@@ -175,18 +175,34 @@ module Gori
               # any ANSI/OSC/CSI escapes before they hit the live terminal (see its doc
               # comment; same discipline as flow_row_text/print_message_text).
               method = CLI::Output.term_safe(r.method.ljust(6))
-              scheme = CLI::Output.term_safe(r.scheme)
-              host = CLI::Output.term_safe(r.host)
-              target = CLI::Output.term_safe(r.target)
-              # A forward-proxy request is held in ABSOLUTE form (`http://host:port/path` —
-              # the wire truth, P7), so prefixing scheme+host doubled it into
-              # `http://127.0.0.1http://127.0.0.1:19160/ws`. `FlowRow.absolute_form?` is the
-              # canonical test for exactly this and its own doc comment names this failure;
-              # this call site simply was not wired to it.
-              url = Store::FlowRow.absolute_form?(target) ? target : "#{scheme}://#{host}#{target}"
-              puts "##{r.item_id}  [#{r.kind}]  #{method} #{url}  (#{body.size}b body)"
+              puts "##{r.item_id}  [#{r.kind}]  #{method} #{CLI::Output.term_safe(intercept_row_where(r))}  (#{body.size}b body)"
             end
           end
+        end
+      end
+
+      # WHERE a held item is, for one text row. The escape-neutralizing wrap is the caller's;
+      # this is the pure shape so a spec can pin it.
+      #
+      # `HeldRow#target` carries TWO different things depending on `kind`: a request's target
+      # (origin- or absolute-form), or a RESPONSE's status reason (the Item's dual meaning —
+      # see `intercept_view#effective_method_target`). The row builder never branched on the
+      # kind, so a held response rendered as `http://127.0.0.1200 OK`: a string that looks
+      # like a URL, is not one, drops the port, and leaves several held responses to different
+      # paths indistinguishable. The flow id is the disambiguator the row has (the request's
+      # own path is not carried on a response row), so it is named.
+      def self.intercept_row_where(r : Store::HeldRow) : String
+        authority = Repeater::FlowRequest.authority(r.scheme, r.host, r.port)
+        if r.kind == "response"
+          "#{r.scheme}://#{authority} → #{r.target}#{r.flow_id.try { |f| "  (flow ##{f})" }}"
+        elsif Store::FlowRow.absolute_form?(r.target)
+          # A forward-proxy request is held in ABSOLUTE form (`http://host:port/path` — the
+          # wire truth, P7), so prefixing scheme+host doubled it into
+          # `http://127.0.0.1http://127.0.0.1:19160/ws`. `FlowRow.absolute_form?` is the
+          # canonical test for exactly this.
+          r.target
+        else
+          "#{r.scheme}://#{authority}#{r.target}"
         end
       end
 
@@ -331,8 +347,9 @@ module Gori
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run intercept edit <item-id> (--raw=RAW | --raw-file=PATH) [options]\n\n" \
                      "Forward a held item with EDITED bytes: the full replacement wire message\n" \
-                     "(whichever leg — request or response — is held). Bytes are forwarded\n" \
-                     "VERBATIM (no $KEY expansion); Content-Length is resynced to the new body."
+                     "(whichever leg — request or response — is held). The BODY is forwarded\n" \
+                     "VERBATIM (no $KEY expansion, no line-ending rewrite); header lines are\n" \
+                     "CRLF-terminated and Content-Length is resynced to the new body."
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--raw=RAW", "Verbatim replacement wire message") { |v| raw = v }
@@ -358,13 +375,34 @@ module Gori
                   end
         abort "gori run intercept edit: replacement message must not be empty" if content.empty?
 
-        # Byte-level CRLF normalize, not `.gsub(/\r?\n/, "\r\n")` — content may be
-        # an arbitrary binary body read from --raw-file (invalid UTF-8), which a
-        # Regex subject cannot accept and would crash on.
-        wire = Env.normalize_crlf(content.to_slice)
-        bytes = Fuzz::ContentLength.sync(wire, add_when_missing: true)
+        # CRLF-normalize the HEAD ALONE, bounded by `Env.head_body_boundary` — the split
+        # every other edit path on this branch already uses (`Env.expand_wire`, the TUI's
+        # `intercept_view`). Only HTTP header lines require CRLF termination; a raw 0x0A in
+        # the BODY is a byte (binary data, or a bare LF the operator deliberately wrote), and
+        # rewriting it contradicted this subcommand's own "forwarded VERBATIM" contract —
+        # `--raw-file` is its only byte-exact channel, and an `alpha\rbeta\ngamma` body came
+        # out a byte longer with the LF promoted.
+        #
+        # Byte-level, not `.gsub(/\r?\n/, "\r\n")`: content may be an arbitrary binary body
+        # read from --raw-file (invalid UTF-8), which a Regex subject cannot accept.
+        bytes = Fuzz::ContentLength.sync(normalize_head_crlf(content.to_slice), add_when_missing: true)
         status, detail = enqueue_intercept(project_name, db_path, "forward_edit", item_id: item_id, bytes: bytes)
         emit_intercept_ack(status, detail, format)
+      end
+
+      # `Env.normalize_crlf` over the HEAD only — through and including the blank-line
+      # separator `Env.head_body_boundary` locates — with the body copied through byte for
+      # byte. The same shape as `Env.expand_wire`, minus the `$KEY` expansion this subcommand
+      # deliberately does not do. Public so a spec can pin the bytes.
+      def self.normalize_head_crlf(raw : Bytes) : Bytes
+        boundary = Env.head_body_boundary(raw)
+        head = Env.normalize_crlf(raw[0, boundary])
+        return head if boundary >= raw.size
+        body = raw[boundary..]
+        buf = IO::Memory.new(head.size + body.size)
+        buf.write(head)
+        buf.write(body)
+        buf.to_slice
       end
 
       private def self.cmd_intercept_toggle(enable : Bool, args : Array(String)) : Nil
