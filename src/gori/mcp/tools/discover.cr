@@ -12,7 +12,7 @@ module Gori
         # ONE Outbound for the whole call: the builder derives the crawl-time ScopePolicy
         # from it (see Discover::Plan.resolve_policy) and the Layer-1 check below reads the
         # same decision, so `allow_unscoped` cannot be honoured by one and not the other.
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         plan = build_discover_plan(h, ob)
         # Matched on the SEED URL (path included), not its bare origin: a project scoped to
         # `https://acme.test/api/` should be crawlable from `https://acme.test/api/v1`.
@@ -42,7 +42,7 @@ module Gori
       # builder's. Raises FuzzArgError (clean message) on any malformed input.
       private def build_discover_plan(h, ob : Outbound) : Discover::Plan
         options = Discover::PlanOptions.new(str(h, "url") || "", config: discover_config(h),
-          verify: @verify_upstream && !(bool(h, "insecure") || false),
+          verify: @verify_upstream && !bool_arg(h, "insecure", false),
           overrides: HostOverrides.load(store))
         Discover::Plan.build(options, ob)
       rescue ex : Discover::PlanError
@@ -61,6 +61,9 @@ module Gori
         Discover::Config.new(
           concurrency: clamp(int(h, "concurrency"), 20, DISCOVER_MAX_CONCURRENCY),
           rps: int(h, "rate").try(&.to_f64),
+          # `rate` bounds THROUGHPUT; a target that rate-limits on the inter-request GAP needs
+          # this instead (`gori run discover --throttle`). Declared on fuzz_start only until now.
+          throttle_ms: int(h, "throttle_ms").try(&.clamp(0_i64, 600_000_i64).to_i),
           timeout: discover_timeout(h),
           retries: (int(h, "retries") || 1_i64).clamp(0_i64, 1000_i64).to_i,
           max_requests: cap ? {cap, DISCOVER_MAX_REQUESTS}.min : DISCOVER_MAX_REQUESTS,

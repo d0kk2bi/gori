@@ -64,7 +64,13 @@ module Gori
         root = begin
           JSON.parse(line)
         rescue ex : JSON::ParseException
-          return write_error(nil, -32700, "Parse error: #{ex.message}")
+          # Answer with the request's OWN id when the line still carries a readable one.
+          # A perfectly legal JSON number outside Int64 range (`{"limit": 1e30}` spelled out,
+          # which an LLM emits for "no limit") makes Crystal's parser reject the whole line —
+          # so a request that is only an ARGUMENT mistake used to come back `id: null`, and a
+          # strict client with a pending promise for that id never resolved it. The agent hung
+          # instead of seeing the error. See `recover_id`.
+          return write_error(recover_id(line), -32700, "Parse error: #{ex.message}")
         end
 
         obj = root.as_h?
@@ -250,6 +256,24 @@ module Gori
       # when we have none (e.g. a parse error before we could read it).
       private def emit_id(j : JSON::Builder, id : JSON::Any?) : Nil
         j.field("id") { id ? id.to_json(j) : j.null }
+      end
+
+      # A TOP-LEVEL `"id"` scraped out of a line the JSON parser refused, so a parse error can
+      # still be correlated by the client that sent it. Deliberately textual and deliberately
+      # narrow: the line is by definition not parseable, so there is no structure to walk. The
+      # anchor is `{"jsonrpc":…,"id":…` — the id must appear before `"method"`/`"params"`,
+      # which is where every client this speaks to puts it, and which keeps an `"id"` nested
+      # inside a tool ARGUMENT (get_flow's own `id`, an issue id, …) from being mistaken for
+      # the envelope's. Nil when nothing matches: a wrong id is worse than none.
+      private def recover_id(line : String) : JSON::Any?
+        head = line[0, {line.index(%("method")) || line.size, line.index(%("params")) || line.size}.min]
+        m = head.match(/"id"\s*:\s*(?:(-?\d{1,18})|"([^"\\]{0,128})")/)
+        return nil unless m
+        if n = m[1]?
+          n.to_i64?.try { |i| JSON::Any.new(i) }
+        else
+          m[2]?.try { |s| JSON::Any.new(s) }
+        end
       end
 
       # Last line of defence for the transport's UTF-8 contract. Every emit site that

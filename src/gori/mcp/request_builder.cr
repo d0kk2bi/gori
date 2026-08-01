@@ -107,13 +107,26 @@ module Gori
       # no other way to write one — so demanding `verbatim:true` alongside it would mean a
       # caller who forgot the flag got its bytes silently LF-promoted and env-expanded, which
       # is precisely what encoding them was meant to prevent.
+      #
+      # A value it cannot read RAISES, it does not fall back to false. The fallback was the
+      # sharper half of the same bug: `verbatim: 1` — the shape an LLM emits as readily as
+      # `true` — silently selected the mode that PROMOTES the operator's bare-LF header
+      # terminator to CRLF, destroying the desync primitive `verbatim` exists to deliver, and
+      # reported a clean send. Every sibling flag on the same tool (`apply_rules`,
+      # `record_history`, `save_as_repeater`, `http2`, `include_sensitive_headers`) already
+      # refuses an unintelligible value through `Tools#bool_arg`; this one now does too.
+      # `Gori::Error` is what the tools rescue into a clean caller-facing message.
       def self.verbatim?(args : Hash(String, JSON::Any)) : Bool
         return true if args["raw_base64"]?.try(&.as_s?).try { |s| !s.empty? }
         v = args["verbatim"]?
-        return false unless v
+        return false if v.nil? || v.raw.nil?
         b = v.as_bool?
         return b unless b.nil?
-        v.as_s?.try(&.downcase) == "true"
+        case v.as_s?.try(&.downcase)
+        when "true"  then true
+        when "false" then false
+        else              raise Gori::Error.new("invalid 'verbatim' (expected true or false)")
+        end
       end
 
       # Decode a `*_base64` argument into the exact bytes it names, or nil when absent/empty.

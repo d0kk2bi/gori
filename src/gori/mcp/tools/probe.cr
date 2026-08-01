@@ -27,7 +27,7 @@ module Gori
         return category if category.is_a?(Result)
 
         active = bool(h, "active") || false
-        allow_unscoped = bool(h, "allow_unscoped") || false
+        allow_unscoped = bool_arg(h, "allow_unscoped", false)
         # --aggressive implies unsafe (it also raises caps + widens bypass sets).
         aggressive = bool(h, "aggressive") || false
         unsafe = (bool(h, "unsafe") || false) || aggressive
@@ -46,7 +46,11 @@ module Gori
         # The budget is built here so `capped` can report whether it actually STOPPED a send,
         # rather than guessing from the pre-filter id count — see `Scan::Budget#exhausted?`.
         budget = Probe::Scan::Budget.new(active ? PROBE_ACTIVE_MAX_FLOWS : nil)
-        dets, repeater_n = Probe::Scan.scan_all(store, ids, active: active, verify_upstream: @verify_upstream,
+        # `insecure` is the ACTIVE path's `gori run probe -k`: a lab / staging origin with a
+        # self-signed certificate is the ordinary case for a scan, and without this the active
+        # checks simply failed there with a TLS error that named nothing actionable.
+        verify_upstream = @verify_upstream && !bool_arg(h, "insecure", false)
+        dets, repeater_n = Probe::Scan.scan_all(store, ids, active: active, verify_upstream: verify_upstream,
           scope: scope, allow_unscoped: allow_unscoped, opts: opts, active_budget: budget,
           on_error: ->(_where : String, _ex : Exception) { scan_errors += 1; nil })
         capped = budget.exhausted?

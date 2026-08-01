@@ -30,7 +30,7 @@ module Gori
         # Layer 1's policy is chosen here (`Outbound.agent`) and handed to the builder — the
         # builder must never pick it, or MCP's strict "no scope ⇒ refuse" default would
         # silently become whichever policy got hard-coded there (DESIGN.md §7).
-        ob = outbound(bool(h, "allow_unscoped") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
         plan = build_send_plan(h, ob)
         return plan if plan.is_a?(Result)
         # OPT-IN Match&Replace parity (before the scope gate + History write so the
@@ -59,7 +59,7 @@ module Gori
         Log.info { "send_request #{built.scheme}://#{built.host}:#{built.port} http2=#{http2} scope=#{sc.decision} flow_id=#{recorded_flow_id || "none"} -> #{result.ok? ? "ok" : result.error}" }
 
         repeater_id = persist_send_repeater(h, save, built, http2, result,
-          issue_id, recorded_flow_id)
+          issue_id, recorded_flow_id, plan.h2_fields)
 
         body_cap, body_omit = body_return_opts(h)
         Result.new(send_result_json(result, recorded_flow_id, repeater_id,
@@ -133,9 +133,35 @@ module Gori
             # any octet the caller typed — scrub the ECHO without touching the wire bytes.
             j.field "method", Serialize.text(method)
             j.field "target", Serialize.text(target)
-            j.field "http_version", http2 ? "HTTP/2" : Serialize.text(parts[2]? || "HTTP/1.1")
+            # NULL, not a substituted "HTTP/1.1", when the request line carried no version.
+            # This field's contract is "what actually went out": a `verbatim` send of
+            # `GET /old09\r\n\r\n` is the HTTP/0.9 handling probe, and answering it with a
+            # version that was never on the wire tells the agent its own test did not happen.
+            j.field "http_version", http2 ? "HTTP/2" : parts[2]?.try { |v| Serialize.text(v) }
           end
         end
+      end
+
+      # The FAITHFUL field list a field-native send put on the wire, in order, pseudo-headers
+      # and duplicates included — the report `H2Engine.field_dump` used to carry by being the
+      # stored head. It moved here because History and the Repeater have to hold a REPLAYABLE
+      # projection (see `replayable_field_head`), and that projection cannot show a duplicate
+      # `:method` or a `:scheme` disagreeing with the connection. `history_head_projected`
+      # says so out loud, so an agent reading the recorded flow back never mistakes the
+      # projection for the wire.
+      private def emit_sent_h2_fields(j : JSON::Builder, h2_fields : Array({String, String})?) : Nil
+        return unless fields = h2_fields
+        j.field "sent_h2_fields" do
+          j.array do
+            fields.each do |(n, v)|
+              j.array { j.string Serialize.text(n); j.string Serialize.text(v) }
+            end
+          end
+        end
+        j.field "history_head_projected", true
+        j.field "history_head_note",
+          "the recorded flow / saved repeater holds the HTTP/1.1 projection of these fields " \
+          "(so it can be replayed); `sent_h2_fields` above is what went on the wire"
       end
 
       # Resolve + validate the optional issue_id for a save-linked send. Returns
@@ -198,18 +224,49 @@ module Gori
         "http/2", "h2 ", "hpack", "response head", "status line",
       }
 
+      # h2/RFC 9113 §7 conditions that are TRANSIENT even though the sentence naming them
+      # trips PROTOCOL_ERROR_PHRASES (every one of them says "h2 "). Keyed on the SPEC
+      # ERROR-CODE NAMES, not on gori's sentence: the names are fixed by the RFC and the
+      # engine renders them straight out of `H2Engine::GOAWAY_ERRORS`, so matching
+      # `refused_stream` survives any rewording of the sentence carrying it — which is the
+      # failure mode a whole-sentence literal would have.
+      #
+      # §8.7 makes REFUSED_STREAM an explicit RETRY instruction ("the request was not
+      # processed") and ENHANCE_YOUR_CALM is a rate signal, not a malformed message. Coding
+      # either as a non-retryable PROTOCOL_ERROR tells an agent to stop and file a finding
+      # where the correct action is to send the request again on a fresh connection.
+      RETRYABLE_H2_PHRASES = {"refused_stream", "enhance_your_calm"}
+
+      # "gori got no response frame at all" — the category `no_response` exists for. These
+      # also say "h2 ", so PROTOCOL_ERROR_PHRASES used to claim them and report an origin
+      # that simply closed the connection as a non-retryable framing refusal. A protocol
+      # verdict means gori can PROVE the message malformed; silence is not that.
+      NO_RESPONSE_PHRASES = {"no h2 response", "no response"}
+
       # Coarse category for a send's network error, from the engine's error text
       # (gori's own controlled strings). "connect" (the dialer collapses DNS /
       # refused / connect-timeout / TLS-verify into one failure — finer split would
       # need dialer changes), "timeout" (idle read/write), "protocol" (a deterministic
       # framing/protocol refusal — see PROTOCOL_ERROR_PHRASES), "no_response", else "other".
+      #
+      # A pure function of the engine's sentence, so it is `self.` and directly testable: the
+      # retry policy an agent applies hangs off it, and the sentences it reads are written in
+      # another module. Pinning them in a spec is what keeps a reword there from silently
+      # flipping a retryable condition into "stop and report a finding".
       private def network_error_kind(message : String?) : String?
+        Tools.network_error_kind(message)
+      end
+
+      def self.network_error_kind(message : String?) : String?
         return nil unless message
         m = message.downcase
         return "connect" if m.starts_with?("connect failed")
         return "timeout" if m.includes?("timed out") || m.includes?("timeout")
+        # Both ahead of PROTOCOL_ERROR_PHRASES on purpose — see their own comments.
+        return "other" if RETRYABLE_H2_PHRASES.any? { |p| m.includes?(p) }
+        return "no_response" if NO_RESPONSE_PHRASES.any? { |p| m.includes?(p) }
         return "protocol" if PROTOCOL_ERROR_PHRASES.any? { |p| m.includes?(p) }
-        return "no_response" if m.includes?("no response") || m.includes?("closed")
+        return "no_response" if m.includes?("closed")
         "other"
       end
 
@@ -225,7 +282,8 @@ module Gori
 
       private def persist_send_repeater(h, save : Bool, built : RequestBuilder::Built,
                                         http2 : Bool, result : Repeater::Result,
-                                        issue_id : Int64?, recorded_flow_id : Int64?) : Int64?
+                                        issue_id : Int64?, recorded_flow_id : Int64?,
+                                        h2_fields : Array({String, String})? = nil) : Int64?
         return nil unless save
         port_suffix = ((built.scheme == "https" && built.port == 443) ||
                        (built.scheme == "http" && built.port == 80)) ? "" : ":#{built.port}"
@@ -234,7 +292,13 @@ module Gori
         # the Repeater tab to the newly recorded History evidence.
         flow_id = int(h, "flow_id") || recorded_flow_id
         masked_target = Env.mask_secrets(target_url)
-        masked_req = Env.mask_secrets(String.new(built.bytes))
+        # Same reason as `record_outbound_request`: a saved session is a REPLAY source before
+        # it is a display, and no surface can send `H2Engine.field_dump` back. Saving the dump
+        # produced a session (`#5 [H2] fieldnative`) that could never be sent again from any
+        # surface — the CLI refused it with the pseudo-header message and MCP read its method
+        # back as `":method:"`. See `replayable_field_head`.
+        saved_bytes = replayable_field_head(h2_fields, built, built.bytes)
+        masked_req = Env.mask_secrets(String.new(saved_bytes))
         repeater_id = store.insert_repeater(
           target: masked_target,
           request: masked_req.to_slice,
@@ -263,16 +327,46 @@ module Gori
         repeater_id
       end
 
+      # The bytes to PERSIST for a field-native h2 send: `HeadCodec.synth_request`'s h1
+      # projection plus the body, not `H2Engine.field_dump`.
+      #
+      # The dump is the faithful REPORT of the fields and it stays that, in `sent_h2_fields`
+      # on this call's own result. It must not be the stored head, because History and the
+      # Repeater are not only a display — they are a REPLAY SOURCE, and the dump's first line
+      # is `:method: POST`, not a request line. Replaying such a row over h2 was refused with
+      # gori blaming the operator for bytes gori itself wrote; over `--http1` it put a request
+      # with NO REQUEST LINE on the wire (every header shifted by one) and reported `200`; and
+      # MCP's own echo read the row back as `method: ":method:", target: "POST"`.
+      #
+      # The projection is lossy — a duplicate pseudo and `:scheme` do not survive it, which is
+      # exactly what `field_dump` exists to show — but it is lossy in the one direction that
+      # keeps the evidence usable, and it is the same projection the h2 CAPTURE path stores
+      # for every intercepted h2 request. Evidence gori writes must be replayable by gori.
+      # Nil `fields` means this was never a field-native send, so the bytes are already the
+      # operator's own text and pass through — that way no caller needs a branch of its own.
+      private def replayable_field_head(fields : Array({String, String})?,
+                                        built : RequestBuilder::Built, wire : Bytes) : Bytes
+        return wire unless fields
+        authority = Proxy::H2::HeadCodec.pseudo(fields, ":authority") ||
+                    "#{built.host}:#{built.port}"
+        head = Proxy::H2::HeadCodec.synth_request(fields, authority)
+        _, body = split_wire_request(wire)
+        return head if body.nil? || body.empty?
+        joined = Bytes.new(head.size + body.size)
+        head.copy_to(joined)
+        body.copy_to(joined + head.size)
+        joined
+      end
+
       # `wire` — not `built.bytes` — is the evidence: History is what `run show --format raw`
       # and `get_flow` replay from, and on h2 the source text is not what went out. See
       # `wire_request`.
       private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool,
                                           h2_fields : Array({String, String})? = nil) : Int64
-        head, body = split_wire_request(wire)
-        # Field-native: `head` is the pseudo-explicit dump, not an HTTP/1.1 request line, so the
+        head, body = split_wire_request(replayable_field_head(h2_fields, built, wire))
+        # Field-native: `head` is the h1 PROJECTION, not the pseudo-explicit dump, so the
         # method/target COLUMNS (list_history / QL / sitemap read them) come off the FIELDS a
-        # receiver routes on. The stored `head` blob stays the faithful dump, so `run show
-        # --format raw` renders `:scheme` and every duplicate pseudo — the whole point of F5/F11.
+        # receiver routes on and agree with the head text. See `replayable_field_head`.
         if fields = h2_fields
           method = Repeater::H2Engine.pseudo_field(fields, ":method") || ""
           target = Repeater::H2Engine.pseudo_field(fields, ":path") || "/"
@@ -355,6 +449,7 @@ module Gori
           j.object do
             emit_scope(j, sc)
             emit_effective_request(j, built, wire, http2, h2_fields)
+            emit_sent_h2_fields(j, h2_fields)
             j.field "match_replace_applied", true if applied_rules
             unless ignored.empty?
               j.field("ignored_fields") { j.array { ignored.each { |f| j.string f } } }
@@ -456,8 +551,8 @@ module Gori
           arr = h["messages"]?.try(&.as_a?)
           return Result.new("invalid 'messages' (expected an array of strings or objects)", is_error: true) unless arr
           arr.each do |item|
-            msg = ws_out_message_item(item)
-            return Result.new("invalid 'messages' entry #{item.to_json}", is_error: true) unless msg
+            msg, perr = ws_out_message_item(item)
+            return Result.new(ws_entry_error("messages", item, perr), is_error: true) unless msg
             source << msg
           end
           field = "messages"
@@ -478,8 +573,8 @@ module Gori
         end
 
         # Scope gate before the outbound handshake (same policy as send_request).
-        ob = outbound(bool(h, "allow_unscoped") || false)
-        verify = @verify_upstream && !(bool(h, "insecure") || false)
+        ob = outbound(bool_arg(h, "allow_unscoped", false))
+        verify = @verify_upstream && !bool_arg(h, "insecure", false)
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([repeater.request],
             default_target: repeater.target, sni: repeater.sni, verify: verify,
@@ -673,7 +768,7 @@ module Gori
         Repeater::PlanOptions.new(
           h2_fields: fields, h2_body: h2_body_arg(h),
           origin: Repeater::Origin.new(scheme, host, port),
-          http2: true, verify: @verify_upstream && !(bool(h, "insecure") || false),
+          http2: true, verify: @verify_upstream && !bool_arg(h, "insecure", false),
           timeout: send_timeout(h), overrides: HostOverrides.load(store))
       end
 
@@ -681,7 +776,7 @@ module Gori
         if present?(h, "flow_id") && present?(h, "repeater_id")
           raise Gori::Error.new("pass only one of flow_id or repeater_id")
         end
-        verify = @verify_upstream && !(bool(h, "insecure") || false)
+        verify = @verify_upstream && !bool_arg(h, "insecure", false)
         timeout = send_timeout(h)
         # Honor the project's host overrides on the direct-dial path (parity with the live
         # proxy). nil/empty is behaviorally identical to no override.
@@ -719,8 +814,26 @@ module Gori
           # `Content-Length: 99` over a 2-byte body is the CL-desync probe the operator
           # wants re-sent, not a mistake to correct. `resync_cl_after_expansion` keeps the
           # one case that must still recompute — a `$KEY` in the body changing its length.
+          #
+          # `expand_request` and `refuse_unresolved_env` are BOTH off here, for the one reason
+          # `auto_content_length` already was: a captured flow's bytes are EVIDENCE, and the
+          # operator authored none of them. Both were draft-time policies running on a
+          # recording.
+          #   * `refuse_unresolved_env` made a flow whose head merely CONTAINS a `$NAME` token
+          #     unsendable: OData (`$filter`, `$top`, `$select`), MongoDB (`$where`, `$gt`),
+          #     JSONPath, a `;cat$IFS/etc/passwd` shell probe and any app that puts `$` in a
+          #     cookie all land here, and the refusal's own remedy — "set it with set_env_var" —
+          #     is worse than the refusal, because it makes the replay send a DIFFERENT request.
+          #   * `expand_request` ran `Env.expand_wire`, whose head pass PROMOTES a bare LF to
+          #     CRLF. A bare-LF header terminator is a front-end/back-end desync primitive gori
+          #     can already produce (`verbatim`) and stores byte-exact; replay silently
+          #     destroyed it and still reported a clean send.
+          # With expansion off there is no expansion to resync a Content-Length after, so
+          # `resync_cl_after_expansion` goes with it: the stored framing ships exactly as
+          # captured, which is what a CL/TE desync capture is for.
           Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
-            auto_content_length: false, resync_cl_after_expansion: true,
+            expand_request: false, refuse_unresolved_env: false,
+            auto_content_length: false,
             http2: bool_arg(h, "http2", flow.http2), sni: flow.sni, verify: verify,
             timeout: timeout, overrides: overrides)
         else
@@ -757,6 +870,12 @@ module Gori
       # all, the most dangerous case since there is no guardrail — is refused unless the
       # caller passed allow_unscoped:true, which becomes a NAMED Unscoped(Operator) decision
       # that still leaves Layer 2 (Sandbox / exclude) in force.
+      #
+      # Every caller reads the flag through `bool_arg`, not `bool(…) || false`. The `|| false`
+      # form erased the difference between "absent" and "unintelligible", so `allow_unscoped: 1`
+      # came back as a SCOPE_BLOCKED whose remedy was the flag the caller had just passed, and
+      # `insecure: 1` came back as a retryable NETWORK_ERROR — sending an agent into a retry
+      # loop over an argument mistake. Same reasoning as `RequestBuilder.verbatim?`.
       private def outbound(allow_unscoped : Bool) : Outbound
         Outbound.agent(Scope.load(store), allow_unscoped)
       end

@@ -5,6 +5,8 @@ require "../issues_export"
 require "../repeater/engine"
 require "../fuzz"
 require "../proxy/codec/content_decode"
+require "../proxy/h2/grpc"
+require "../protobuf"
 
 module Gori
   module MCP
@@ -259,8 +261,87 @@ module Gori
           emit_body(j, "response_body", detail.response_head, detail.response_body, detail.response_body_truncated?, body_cap, body_omit)
           emit_sse_events(j, detail)
           emit_ws_messages(j, ws_msgs)
+          emit_grpc_messages(j, "request_grpc_messages", detail.request_head, detail.request_body)
+          emit_grpc_messages(j, "response_grpc_messages", detail.response_head, detail.response_body)
           emit_decoded(j, detail)
         end
+      end
+
+      GRPC_MSGS_MAX  =  200 # cap gRPC messages serialised for an LLM client
+      GRPC_BYTES_MAX = 8192 # cap the base64 of one compressed/opaque message
+
+      # The gRPC framing view of a message body, mirroring `gori run show --format json`'s
+      # `grpc_messages`. MCP had NO gRPC projection at all: an agent got the raw body and had
+      # to reframe the 5-byte length prefixes itself, and a FRAMING FAILURE — a length prefix
+      # claiming more than arrived, the standard gRPC parser test — was invisible on the one
+      # surface that cannot look at the wire.
+      #
+      # `Grpc.scan`, not `Grpc.messages`: the residual is the whole point. `messages` throws
+      # it away, so a deliberately-wrong prefix rendered as "no messages", which reads
+      # identically to "this flow is not gRPC".
+      def self.emit_grpc_messages(j : JSON::Builder, field_name : String,
+                                  head : Bytes?, body : Bytes?) : Nil
+        return if head.nil? || body.nil? || body.empty?
+        return unless Proxy::H2::Grpc.grpc?(grpc_content_type(head))
+        msgs, residual = Proxy::H2::Grpc.scan(body)
+        return if msgs.empty? && residual == 0
+        j.field field_name do
+          j.object do
+            j.field "count", msgs.size
+            if residual > 0
+              j.field "residual_bytes", residual
+              j.field "framing_error",
+                "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
+                "a length prefix claiming more than arrived, or a body cut short"
+            end
+            j.field "truncated", true if msgs.size > GRPC_MSGS_MAX
+            j.field "messages" do
+              j.array do
+                msgs.first(GRPC_MSGS_MAX).each_with_index do |m, i|
+                  j.object do
+                    j.field "index", i
+                    j.field "compressed", m.compressed
+                    j.field "trailer", m.trailer
+                    j.field "size", m.data.size
+                    if m.trailer
+                      # grpc-web TRAILER frame: ASCII headers, not protobuf — and for gRPC the
+                      # trailer IS the call's real status.
+                      j.field "headers" do
+                        j.object do
+                          Proxy::H2::Grpc.trailer_headers(m.data).each { |k, v| j.field k, text(v) }
+                        end
+                      end
+                    elsif m.compressed
+                      # Honour the 0x01 flag: compressed bytes are not a protobuf message until
+                      # the caller inflates them (the encoding is named by grpc-encoding, not us).
+                      j.field "note", "compressed payload — not decoded as protobuf"
+                      emit_grpc_bytes(j, m.data)
+                    else
+                      j.field "protobuf" { Protobuf.decode(m.data).to_json(j) }
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      private def self.emit_grpc_bytes(j : JSON::Builder, data : Bytes) : Nil
+        cut = data.size > GRPC_BYTES_MAX
+        j.field "bytes", Base64.strict_encode(cut ? data[0, GRPC_BYTES_MAX] : data)
+        j.field "bytes_truncated", true if cut
+      end
+
+      # Content-Type value from a message head (case-insensitive name, any spacing after the
+      # colon), nil when there is none.
+      private def self.grpc_content_type(head : Bytes) : String?
+        String.new(head).scrub.each_line do |line|
+          idx = line.index(':') || next
+          next unless line[0, idx].strip.compare("content-type", case_insensitive: true) == 0
+          return line[(idx + 1)..].strip
+        end
+        nil
       end
 
       WS_MSGS_MAX    =  500 # cap WS messages serialised for an LLM client
@@ -307,10 +388,24 @@ module Gori
                     # produces. Shared emitter, so the two projections cannot drift.
                     CLI::Output.emit_ws_shape_json(j, m)
                     if m.text?
-                      s = String.new(m.payload).scrub
+                      raw = String.new(m.payload)
+                      s = raw.scrub
                       cut = s.size > WS_PAYLOAD_MAX
                       j.field "text", cut ? s[0, WS_PAYLOAD_MAX] : s
                       j.field "text_truncated", true if cut
+                      # RFC 6455 §8.1/§5.6 UTF-8 validation is a standard WebSocket test, so a
+                      # TEXT frame carrying invalid UTF-8 is the PAYLOAD, not an accident — and
+                      # `scrub` renders two different invalid bytes identically. A clip at
+                      # WS_PAYLOAD_MAX loses the tail the same way, and `get_response_body_chunk`
+                      # covers HTTP bodies, not `ws_messages`. `gori run show --format json` has
+                      # emitted this companion all along; the AGENT surface, the one that cannot
+                      # look at the wire itself, was the one place the bytes were unrecoverable.
+                      if cut || !raw.valid_encoding?
+                        j.field "text_lossy", true
+                        b64cut = m.payload.size > MAX_B64
+                        j.field "base64", Base64.strict_encode(b64cut ? m.payload[0, MAX_B64] : m.payload)
+                        j.field "base64_truncated", true if b64cut
+                      end
                     else
                       j.field "binary", true
                       j.field "size", m.payload.size
