@@ -425,4 +425,64 @@ describe Gori::Graphql do
       GQL.location(nil).should eq(:query)
     end
   end
+
+  # A GraphQL-carrying request that did NOT parse used to be reported byte-identically to
+  # "this flow is not GraphQL" — no `graphql` key, no `=== GRAPHQL ===` section — for the one
+  # request most worth looking at. Same treatment `fix(grpc): report a framing failure instead
+  # of deleting the gRPC view` gave gRPC.
+  describe ".from_flow — a parse failure is reported, not deleted" do
+    private_head = "POST /gql HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+
+    it "reports invalid JSON that is still obviously a GraphQL envelope" do
+      op = GQL.from_flow("/gql", private_head.to_slice, %({"query":"{broken}",).to_slice).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+      op.note.not_nil!.should contain("not valid JSON")
+      op.editable?.should be_false
+      GQL.display(op).should contain("GraphQL parse failed")
+    end
+
+    it "reports a batch envelope that was cut mid-body" do
+      op = GQL.from_flow("/gql", private_head.to_slice, %([{"query":"{a}"},{"que).to_slice).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+    end
+
+    it "reports an application/graphql document with no selection set" do
+      head = "POST /g HTTP/1.1\r\nContent-Type: application/graphql\r\n\r\n".to_slice
+      op = GQL.from_flow("/g", head, "not a document".to_slice).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+      op.note.not_nil!.should contain("no selection set")
+    end
+
+    it "reports a multipart upload whose `operations` part is not an envelope" do
+      head = "POST /g HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n".to_slice
+      body = ["--zz", %(Content-Disposition: form-data; name="operations"), "",
+              "{not json", "--zz--", ""].join("\r\n").to_slice
+      op = GQL.from_flow("/g", head, body).not_nil!
+      op.form.should eq(GQL::Form::Invalid)
+      op.note.not_nil!.should contain("operations")
+    end
+
+    # The guard that keeps this from hijacking ordinary traffic: "opens like an envelope" is
+    # not "is one". A body that PARSES and was rejected is a REST call carrying a string
+    # `query` field, and it must keep getting no GraphQL section at all.
+    it "stays silent for a REST body that parses but is not GraphQL" do
+      GQL.from_flow("/api", private_head.to_slice, %({"query":"shoes","page":2}).to_slice).should be_nil
+    end
+
+    it "stays silent for an unrelated malformed JSON body" do
+      GQL.from_flow("/api", private_head.to_slice, %({"page":2,).to_slice).should be_nil
+    end
+
+    it "stays silent for a plain multipart upload with no `operations` part" do
+      head = "POST /u HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n".to_slice
+      body = ["--zz", %(Content-Disposition: form-data; name="file"; filename="a.bin"), "",
+              "bytes", "--zz--", ""].join("\r\n").to_slice
+      GQL.from_flow("/u", head, body).should be_nil
+    end
+
+    # `from_body` is unchanged, so the Repeater re-encode target never becomes :body for one.
+    it "leaves the re-encode gate answering :query for an unparseable body" do
+      GQL.location(%({"query":"{broken}",).to_slice).should eq(:query)
+    end
+  end
 end

@@ -53,7 +53,9 @@ describe "gori run repeater — -H / --rm-header" do
   end
 
   it "still distinguishes an EMPTY value from a deletion" do
-    build(["X-Dup:"]).should contain("X-Dup: \r\n")
+    # `-H "X-Dup:"` is now emitted with the operator's exact spelling — colon, nothing after
+    # it — instead of gori inserting a space it was never given. See the OWS example below.
+    build(["X-Dup:"]).should contain("X-Dup:\r\n")
     build([] of String, ["X-Dup"]).should_not contain("X-Dup")
   end
 
@@ -85,6 +87,77 @@ describe "gori run repeater — -H / --rm-header" do
   it "ignores an empty / whitespace-only --rm-header name" do
     out = build([] of String, ["", "   "])
     out.should contain("X-Dup: one\r\nX-Dup: two\r\n")
+  end
+end
+
+# `--header`'s own help advertises an explicit Content-Length as honored verbatim for
+# CL-mismatch testing — but `Content-Length:\t5`, `Content-Length: 5 ` and `Content-Length:5`
+# are the OWS-obfuscation half of that same probe class (RFC 9112 §5.1), and stripping the
+# whitespace and re-inserting exactly one space after the colon made all three unreachable
+# from this flag. Only the dedup/override KEY is folded, so a captured header is still found
+# and replaced regardless of how either side spelled it.
+describe "gori run repeater — -H keeps the operator's spelling" do
+  it "keeps surrounding OWS in the value, and the absence of it" do
+    out = build(["Content-Length:  0011  ", "X-NoSpace:tight"])
+    out.should contain("Content-Length:  0011  \r\n")
+    out.should contain("X-NoSpace:tight\r\n")
+  end
+
+  it "keeps a TAB after the colon" do
+    build(["X-Tab:\tv"]).should contain("X-Tab:\tv\r\n")
+  end
+
+  it "keeps the operator's NAME casing when it replaces a differently-cased captured line" do
+    out = build(["content-length: 7"])
+    out.should contain("content-length: 7\r\n")
+    out.should_not contain("Content-Length: 5")
+  end
+
+  it "still keys the override on the folded name, so the captured line is replaced not doubled" do
+    out = build(["  CoNtEnT-lEnGtH  : 7"])
+    out.scan(/[Cc]ontent-[Ll]ength/i).size.should eq(1)
+    out.should contain("  CoNtEnT-lEnGtH  : 7\r\n")
+  end
+end
+
+# A captured head may be terminated with bare LFs (a front-end/back-end desync primitive the
+# store keeps byte-exact) or MIXED. Re-emitting everything as CRLF quietly promoted the probe
+# into an ordinary conformant request on a path whose whole point is faithfulness.
+private LF_HEAD = "POST /lf HTTP/1.1\nHost: h\nContent-Length: 5\n\n"
+
+describe "gori run repeater — head terminators survive an edit" do
+  it "hands back the stored bytes untouched when no flag edits the message" do
+    wire, explicit = Gori::CLI::Run.build_single_flow_request_for_spec(
+      LF_HEAD.to_slice, "hello".to_slice, [] of String, nil, nil, [] of String)
+    String.new(wire).should eq(LF_HEAD + "hello")
+    explicit.should be_false
+  end
+
+  it "keeps every surviving line's own terminator when a flag DOES edit the message" do
+    wire, _ = Gori::CLI::Run.build_single_flow_request_for_spec(
+      LF_HEAD.to_slice, "hello".to_slice, ["X-New: 1"], nil, nil, [] of String)
+    out = String.new(wire)
+    out.should start_with("POST /lf HTTP/1.1\nHost: h\nContent-Length: 5\n")
+    out.should contain("X-New: 1\n")
+    out.should_not contain("\r\n")
+    out.should end_with("\n\nhello")
+  end
+
+  # P7 again: a head with no terminating blank line, or none at all, is somebody's test case.
+  # The rebuild would put a terminator on it that the capture never had.
+  it "hands back a head with no terminator, and an EMPTY head, exactly as stored" do
+    ["GET / HTTP/1.1", ""].each do |head|
+      wire, _ = Gori::CLI::Run.build_single_flow_request_for_spec(
+        head.to_slice, Bytes.empty, [] of String, nil, nil, [] of String)
+      String.new(wire).should eq(head)
+    end
+  end
+
+  it "keeps a MIXED head mixed" do
+    head = "POST /m HTTP/1.1\r\nHost: h\nX-Old: a\r\n\r\n"
+    wire, _ = Gori::CLI::Run.build_single_flow_request_for_spec(
+      head.to_slice, Bytes.empty, ["X-Old: b"], nil, nil, [] of String)
+    String.new(wire).should eq("POST /m HTTP/1.1\r\nHost: h\nX-Old: b\r\n\r\n")
   end
 end
 

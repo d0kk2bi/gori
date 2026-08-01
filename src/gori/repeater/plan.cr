@@ -96,6 +96,28 @@ module Gori::Repeater
     # and must keep recomputing unconditionally. A flow's bytes are evidence, not a draft.
     property? resync_cl_after_expansion : Bool
 
+    # PROVENANCE: these request bytes are stored EVIDENCE (a captured flow, or a flow gori
+    # recorded from a direct send), not a request the operator is DRAFTING in an editor.
+    #
+    # One signal rather than several, because every draft-time policy on this path is off for
+    # the same reason and they had already drifted apart across the surfaces:
+    #
+    #   * the unresolved-`$KEY` refusal. A stored head is full of `$` that no one typed —
+    #     OData `$filter`/`$top`, MongoDB `$where`, `$IFS` shell probes, `$user.name` SSTI,
+    #     a PHP/JS cookie — and refusing them made those captures unreplayable, while the
+    #     refusal's own remedy ("set the variable") would have SUBSTITUTED a value and sent a
+    #     different request. A surface still checks its OPERATOR-TYPED parts itself.
+    #   * the head's CRLF normalization. It exists because the TUI/Miner editors hold a
+    #     request as a line buffer whose fresh lines end in LF; a captured head is already
+    #     exact wire bytes, so normalizing can only CHANGE them — promoting a bare-LF
+    #     terminator (a front-end/back-end desync primitive gori stores byte-exact) into an
+    #     ordinary conformant request.
+    #
+    # Env expansion itself still runs (`expand_request?`), because a surface may have merged
+    # operator-typed overrides into these bytes; `expand_request: false` remains the separate
+    # "already final, do not expand" knob.
+    property? evidence : Bool
+
     # Whether an unresolved `$VAR` left in the request is a refusal. ON everywhere by
     # default — a typo'd `$KEY` that ships literally is almost always a mistake, and this is
     # the last look before a socket. A surface turns it OFF only when the operator has said
@@ -131,6 +153,7 @@ module Gori::Repeater
                    @expand_request : Bool = true,
                    @auto_content_length : Bool = true,
                    @resync_cl_after_expansion : Bool = false,
+                   @evidence : Bool = false,
                    @refuse_unresolved_env : Bool = true,
                    @preserve_field_case : Bool = false,
                    @h2_fields : Array({String, String})? = nil,
@@ -264,12 +287,14 @@ module Gori::Repeater
       scheme, host, port = resolve_origin(options)
 
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if options.requests.empty?
+      # The two DRAFT-TIME policies, both off for evidence — see `PlanOptions#evidence?`.
+      draft = !options.evidence?
       # Checked on `options.requests` REGARDLESS of `expand_request?`, and that is the
       # point: when it is false the surface expanded already (MCP's `RequestBuilder`, the
       # TUI editor's byte modes), so an unresolved token is sitting in the bytes it handed
       # over and this is still the last place anyone looks before they reach a socket.
-      refuse_unresolved(options.requests.flat_map { |b| Env.unresolved_wire(String.new(b)) }.uniq!) if options.refuse_unresolved_env?
-      wires = options.expand_request? ? options.requests.map { |b| Env.expand_wire(String.new(b)) } : options.requests
+      refuse_unresolved(options.requests.flat_map { |b| Env.unresolved_wire(String.new(b)) }.uniq!) if draft && options.refuse_unresolved_env?
+      wires = expand_requests(options, draft)
 
       # Detect the upgrade on the FINAL wire, not the stored text: the bytes that decide
       # which engine runs must be the bytes that go out, or a `$KEY` expanding into the
@@ -327,6 +352,23 @@ module Gori::Repeater
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
         http2: options.http2?, websocket: websocket, sni: sni,
         preserve_field_case: options.preserve_field_case?)
+    end
+
+    # The request wires with `$KEY` expansion applied, or the originals when the surface says
+    # it already expanded (`expand_request: false` — MCP's pre-expanded `raw`, the TUI's byte
+    # modes, `--verbatim`).
+    #
+    # `expand_wire` for a DRAFT, plain `expand` for EVIDENCE. The only difference between them
+    # is that `expand_wire` re-terminates the HEAD with CRLF, which a line-buffer editor owes
+    # the wire and a stored capture does not: promoting a captured bare-LF terminator destroys
+    # a front-end/back-end desync primitive gori stores byte-exact. See `PlanOptions#evidence?`.
+    private def self.expand_requests(options : PlanOptions, draft : Bool) : Array(Bytes)
+      return options.requests unless options.expand_request?
+      if draft
+        options.requests.map { |b| Env.expand_wire(String.new(b)) }
+      else
+        options.requests.map { |b| Env.expand(String.new(b)).to_slice }
+      end
     end
 
     # A field-native h2 send: dial origin + SNI resolution, then a `Sender` whose `send` will
