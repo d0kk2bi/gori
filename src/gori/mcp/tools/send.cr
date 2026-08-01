@@ -39,10 +39,20 @@ module Gori
         gate = send_gate(ob, plan)
         return gate if gate.is_a?(Result)
         sc = gate
-        built = RequestBuilder::Built.new(plan.bytes, plan.scheme, plan.host, plan.port)
+        # A field-native send has no h1-text source: its `built.bytes` is the FAITHFUL
+        # pseudo-explicit dump (`H2Engine.field_dump`), so the recorded/reported request shows
+        # `:scheme` and every duplicate pseudo the h1 projection drops (F11). The byte path is
+        # untouched — `plan.bytes` is still the operator's text there.
+        built =
+          if fields = plan.h2_fields
+            RequestBuilder::Built.new(Repeater::H2Engine.field_dump(fields, plan.h2_body),
+              plan.scheme, plan.host, plan.port)
+          else
+            RequestBuilder::Built.new(plan.bytes, plan.scheme, plan.host, plan.port)
+          end
         http2 = plan.http2?
         wire = wire_request(plan, built)
-        recorded_flow_id = record_history ? record_outbound_request(built, wire, http2) : nil
+        recorded_flow_id = record_history ? record_outbound_request(built, wire, http2, plan.h2_fields) : nil
         result = plan.send
         record_outbound_response(recorded_flow_id, result) if recorded_flow_id
         # Audit trail on STDERR — never STDOUT (reserved for JSON-RPC).
@@ -53,7 +63,7 @@ module Gori
 
         body_cap, body_omit = body_return_opts(h)
         Result.new(send_result_json(result, recorded_flow_id, repeater_id,
-          include_sensitive_headers, sc, built, wire, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules),
+          include_sensitive_headers, sc, built, wire, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules, plan.h2_fields),
           is_error: !result.ok?)
       rescue ex : Gori::Error
         # Bad input (missing/invalid url, illegal header, …) — return a clean
@@ -84,6 +94,9 @@ module Gori
       # Falls back to the source when the encoding raises: `plan.send` hits the same refusal
       # and reports it as the error, and a report is not the place to raise a second time.
       private def wire_request(plan : Repeater::Plan, built : RequestBuilder::Built) : Bytes
+        # Field-native: `built.bytes` is already the faithful field dump — the fields go on the
+        # wire verbatim, so there is no h1-text to re-encode and nothing to project away.
+        return built.bytes if plan.h2_fields
         return built.bytes unless plan.http2?
         Repeater::H2Engine.encoded_request(built.bytes, scheme: built.scheme, host: built.host,
           port: built.port, preserve_field_case: plan.preserve_field_case?)
@@ -95,10 +108,22 @@ module Gori
       # a caller can confirm scheme/host/port/method/target/version independently
       # of which inputs it supplied (flow_id vs url/raw).
       private def emit_effective_request(j : JSON::Builder, built : RequestBuilder::Built,
-                                         wire : Bytes, http2 : Bool) : Nil
+                                         wire : Bytes, http2 : Bool,
+                                         h2_fields : Array({String, String})? = nil) : Nil
+        # Field-native: the wire is a pseudo-explicit dump whose first line is `:method: …`,
+        # not a request line — derive method/target from the FIELDS a receiver routes on (the
+        # first `:method`/`:path`), so `effective_request` describes the shape actually sent
+        # rather than mis-reading the dump's leading pseudo line.
         # `split` (no arg) collapses whitespace runs so a malformed request line with a
         # doubled space still reports the real method/target/version (see Outbound.request_target).
         parts = (String.new(wire).each_line.first? || "").split
+        if fields = h2_fields
+          method = Repeater::H2Engine.pseudo_field(fields, ":method") || ""
+          target = Repeater::H2Engine.pseudo_field(fields, ":path") || "/"
+        else
+          method = parts[0]? || ""
+          target = parts[1]? || "/"
+        end
         j.field "effective_request" do
           j.object do
             j.field "scheme", built.scheme
@@ -106,8 +131,8 @@ module Gori
             j.field "port", built.port
             # A `raw` send is byte-exact by contract (P7), so the request line here can hold
             # any octet the caller typed — scrub the ECHO without touching the wire bytes.
-            j.field "method", Serialize.text(parts[0]? || "")
-            j.field "target", Serialize.text(parts[1]? || "/")
+            j.field "method", Serialize.text(method)
+            j.field "target", Serialize.text(target)
             j.field "http_version", http2 ? "HTTP/2" : Serialize.text(parts[2]? || "HTTP/1.1")
           end
         end
@@ -216,12 +241,23 @@ module Gori
       # `wire` — not `built.bytes` — is the evidence: History is what `run show --format raw`
       # and `get_flow` replay from, and on h2 the source text is not what went out. See
       # `wire_request`.
-      private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool) : Int64
+      private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool,
+                                          h2_fields : Array({String, String})? = nil) : Int64
         head, body = split_wire_request(wire)
-        # `authored_start_line`, not `parse_request_head`: these bytes are the caller's, and
-        # under `verbatim` a bare-LF terminator is the payload. See its comment for why the
-        # shared parser must stay strict.
-        method, target, version = Proxy::Codec::Http1.authored_start_line(head)
+        # Field-native: `head` is the pseudo-explicit dump, not an HTTP/1.1 request line, so the
+        # method/target COLUMNS (list_history / QL / sitemap read them) come off the FIELDS a
+        # receiver routes on. The stored `head` blob stays the faithful dump, so `run show
+        # --format raw` renders `:scheme` and every duplicate pseudo — the whole point of F5/F11.
+        if fields = h2_fields
+          method = Repeater::H2Engine.pseudo_field(fields, ":method") || ""
+          target = Repeater::H2Engine.pseudo_field(fields, ":path") || "/"
+          version = "HTTP/2"
+        else
+          # `authored_start_line`, not `parse_request_head`: these bytes are the caller's, and
+          # under `verbatim` a bare-LF terminator is the payload. See its comment for why the
+          # shared parser must stay strict.
+          method, target, version = Proxy::Codec::Http1.authored_start_line(head)
+        end
         captured = Store::CapturedRequest.new(
           created_at: Time.utc.to_unix_ms * 1000_i64,
           scheme: built.scheme,
@@ -269,6 +305,11 @@ module Gori
       # and re-sync Content-Length. Response-side rules are intentionally NOT applied. Returns
       # the (possibly rewritten) request and whether a rule actually changed the bytes.
       private def maybe_apply_request_rules(h, plan : Repeater::Plan) : {Repeater::Plan, Bool}
+        # Match&Replace parity operates on h1 head TEXT; a field-native plan has none (its
+        # `bytes` is only the synthetic scope line), so applying rules would rewrite that line
+        # and never the fields on the wire. A field list is byte-exact by construction — the
+        # reason apply_rules is opt-in at all — so it is simply not offered here.
+        return {plan, false} if plan.h2_fields
         return {plan, false} unless bool_arg(h, "apply_rules", false)
         rules = Gori::Rules.load(store)
         return {plan, false} unless rules.active?
@@ -283,11 +324,12 @@ module Gori
                                    sc : ScopeCheck, built : RequestBuilder::Built, wire : Bytes,
                                    http2 : Bool,
                                    ignored : Array(String), body_cap : Int32, body_omit : Bool,
-                                   applied_rules : Bool = false) : String
+                                   applied_rules : Bool = false,
+                                   h2_fields : Array({String, String})? = nil) : String
         JSON.build do |j|
           j.object do
             emit_scope(j, sc)
-            emit_effective_request(j, built, wire, http2)
+            emit_effective_request(j, built, wire, http2, h2_fields)
             j.field "match_replace_applied", true if applied_rules
             unless ignored.empty?
               j.field("ignored_fields") { j.array { ignored.each { |f| j.string f } } }
@@ -498,7 +540,8 @@ module Gori
       # parsing, SNI, host overrides, the gated dialer); everything left here is MCP's own
       # argument parsing.
       private def build_send_plan(h, ob : Outbound) : Repeater::Plan | Result
-        Repeater::Plan.build(send_plan_options(h), ob)
+        opts = present?(h, "h2_fields") ? field_native_plan_options(h) : send_plan_options(h)
+        Repeater::Plan.build(opts, ob)
       rescue ex : Repeater::PlanError
         send_plan_error(ex, "url")
       end
@@ -522,6 +565,61 @@ module Gori
       # (flow_id), or builds from url/raw/method args — normalized to the one option set
       # `Repeater::Plan` consumes. Raises `Gori::Error` on bad arguments (`send_request`
       # turns that into a clean message).
+      # Parse the `h2_fields` argument into the exact HPACK field list to encode. Accepts a
+      # JSON array of two-element `[name, value]` arrays (or a JSON-encoded string of the same,
+      # since LLM clients vary). NOTHING is normalized — a leading colon (`:scheme`), a leading
+      # space in a value, an uppercase name, a repeated pseudo are all kept verbatim: they are
+      # the payload. Raises `Gori::Error` (a clean message) on a shape that is not a pair list.
+      private def parse_h2_fields(h) : Array({String, String})
+        raw = h["h2_fields"]?
+        arr = raw.try(&.as_a?)
+        if arr.nil? && (s = raw.try(&.as_s?))
+          arr = (JSON.parse(s).as_a? rescue nil)
+        end
+        raise Gori::Error.new("'h2_fields' must be an array of [name, value] pairs") unless arr
+        fields = [] of {String, String}
+        arr.each do |item|
+          pair = item.as_a?
+          raise Gori::Error.new("each 'h2_fields' entry must be a [name, value] pair") unless pair && pair.size == 2
+          name = pair[0].as_s?
+          value = pair[1].as_s?
+          raise Gori::Error.new("'h2_fields' names and values must both be strings") if name.nil? || value.nil?
+          fields << {name, value}
+        end
+        raise Gori::Error.new("'h2_fields' must not be empty") if fields.empty?
+        fields
+      end
+
+      # The request body for a field-native send: `body` as UTF-8, or `body_base64` for raw
+      # bytes (a body an operator wants to send exactly, e.g. a protobuf/gRPC frame). Verbatim
+      # — no `$VAR` expansion, matching the "the fields ARE the message" contract of this path.
+      private def h2_body_arg(h) : Bytes?
+        if b64 = str(h, "body_base64")
+          return Base64.decode(b64) rescue raise Gori::Error.new("'body_base64' is not valid base64")
+        end
+        str(h, "body").try(&.to_slice)
+      end
+
+      # The option set for a field-native h2 send — dispatched from `build_send_plan` so it is
+      # NOT another branch inside `send_plan_options`. `url` still resolves the DIAL origin
+      # (host/port/scheme), but every pseudo-header and field goes on the wire as given — so a
+      # `:scheme` that disagrees with the connection, a duplicate `:method`, an out-of-order or
+      # unknown pseudo, `:protocol` and a leading-space value are all sendable, none of which
+      # the h1-text carrier can hold (F7/F8/F11). It cannot ride with a stored source
+      # (flow_id/repeater_id replay their own bytes).
+      private def field_native_plan_options(h) : Repeater::PlanOptions
+        if present?(h, "flow_id") || present?(h, "repeater_id")
+          raise Gori::Error.new("h2_fields cannot be combined with flow_id or repeater_id")
+        end
+        fields = parse_h2_fields(h)
+        scheme, host, port = RequestBuilder.origin(h)
+        Repeater::PlanOptions.new(
+          h2_fields: fields, h2_body: h2_body_arg(h),
+          origin: Repeater::Origin.new(scheme, host, port),
+          http2: true, verify: @verify_upstream && !(bool(h, "insecure") || false),
+          timeout: send_timeout(h), overrides: HostOverrides.load(store))
+      end
+
       private def send_plan_options(h) : Repeater::PlanOptions
         if present?(h, "flow_id") && present?(h, "repeater_id")
           raise Gori::Error.new("pass only one of flow_id or repeater_id")

@@ -16,6 +16,35 @@ module Gori
 
       # `args` is the tool's `arguments` object (a parsed JSON hash).
       def self.build(args : Hash(String, JSON::Any)) : Built
+        uri, scheme, host, port = parse_origin(args)
+
+        bytes =
+          if (raw = args["raw"]?.try(&.as_s?)) && !raw.empty?
+            # `verbatim` means the operator's bytes ARE the message: no `$VAR` expansion and no
+            # bare-LF promotion. `normalize_raw` exists so a hand-typed request still frames,
+            # but a bare-LF header terminator is a standard front-end/back-end desync
+            # primitive, so promoting it removes a payload class from this surface — the TUI's
+            # byte modes have always been able to send it. An unresolved `$VAR` is NOT refused
+            # under `verbatim` — see `PlanOptions#refuse_unresolved_env?`; the literal `$` is
+            # the SSTI/shell payload the flag exists to deliver.
+            raw_bytes(raw, args)
+          else
+            build_from_parts(uri, scheme, host, port, args)
+          end
+
+        Built.new(bytes, scheme, host, port)
+      end
+
+      # The dialed origin (scheme, host, port) from `url`, with every check `build` runs — a
+      # missing/malformed host, a non-http scheme, a CR/LF in the authority, an out-of-range
+      # port. Extracted so the FIELD-NATIVE send path (`h2_fields`) resolves the same origin
+      # without also building request bytes it will never send: the fields are the message.
+      def self.origin(args : Hash(String, JSON::Any)) : {String, String, Int32}
+        _, scheme, host, port = parse_origin(args)
+        {scheme, host, port}
+      end
+
+      private def self.parse_origin(args : Hash(String, JSON::Any)) : {URI, String, String, Int32}
         url = args["url"]?.try(&.as_s?)
         raise Gori::Error.new("'url' is required") if url.nil? || url.empty?
         url = Env.expand(url)
@@ -53,22 +82,7 @@ module Gori
         # out-of-range ":99999" would otherwise reach the dialer as a doomed connect.
         # Reject it up front with a clean message (a valid TCP port is 1..65535).
         raise Gori::Error.new("invalid port #{port} in url (expected 1..65535)") unless 1 <= port <= 65535
-
-        bytes =
-          if (raw = args["raw"]?.try(&.as_s?)) && !raw.empty?
-            # `verbatim` means the operator's bytes ARE the message: no `$VAR` expansion and no
-            # bare-LF promotion. `normalize_raw` exists so a hand-typed request still frames,
-            # but a bare-LF header terminator is a standard front-end/back-end desync
-            # primitive, so promoting it removes a payload class from this surface — the TUI's
-            # byte modes have always been able to send it. An unresolved `$VAR` is NOT refused
-            # under `verbatim` — see `PlanOptions#refuse_unresolved_env?`; the literal `$` is
-            # the SSTI/shell payload the flag exists to deliver.
-            raw_bytes(raw, args)
-          else
-            build_from_parts(uri, scheme, host, port, args)
-          end
-
-        Built.new(bytes, scheme, host, port)
+        {uri, scheme, host, port}
       end
 
       # `verbatim` means the operator's bytes ARE the message. Kept out of `build` so that

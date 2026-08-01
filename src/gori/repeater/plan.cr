@@ -115,6 +115,17 @@ module Gori::Repeater
     # Ignored on the h1 path, which has always been byte-exact.
     property? preserve_field_case : Bool
 
+    # h2 ONLY: the EXACT HPACK field list to encode, bypassing the h1-text carrier entirely.
+    # When set it WINS over `requests` and forces http2 — the operator supplies :method,
+    # :path, :scheme, :authority and every regular field verbatim, so the shapes h1 head text
+    # cannot hold (a duplicate pseudo-header, a pseudo AFTER a regular field, a :scheme that
+    # disagrees with the connection, :protocol per RFC 8441, an unknown pseudo, a leading-space
+    # value — `HeadCodec.h1_faithful?` is the loss set) become sendable. The body rides in
+    # `h2_body`. None of the byte-path normalization (env expansion, Content-Length resync,
+    # version-line downgrade, field-case fold) applies: the fields are the message.
+    property h2_fields : Array({String, String})?
+    property h2_body : Bytes?
+
     def initialize(@requests : Array(Bytes) = [] of Bytes,
                    *,
                    @expand_request : Bool = true,
@@ -122,6 +133,8 @@ module Gori::Repeater
                    @resync_cl_after_expansion : Bool = false,
                    @refuse_unresolved_env : Bool = true,
                    @preserve_field_case : Bool = false,
+                   @h2_fields : Array({String, String})? = nil,
+                   @h2_body : Bytes? = nil,
                    @origin : Origin? = nil,
                    @target : String? = nil,
                    @default_target : String? = nil,
@@ -169,9 +182,18 @@ module Gori::Repeater
     # send will — MCP's `effective_request` is derived that way.
     getter? preserve_field_case : Bool
 
+    # The field-native request (see `PlanOptions#h2_fields`), or nil for the ordinary byte
+    # path. When present, `send` encodes THESE fields rather than `bytes`, and the surfaces
+    # that REPORT the wire render the faithful `H2Engine.field_dump` off them rather than the
+    # lossy h1 projection. `requests` still holds one synthetic scope line so `refusal`, the
+    # scope gate and `unbound_refusal?` work unchanged.
+    getter h2_fields : Array({String, String})?
+    getter h2_body : Bytes?
+
     def initialize(@sender : Sender, @requests : Array(Bytes), @scheme : String,
                    @host : String, @port : Int32, @http2 : Bool,
-                   @websocket : Bool, @sni : String?, @preserve_field_case : Bool = false)
+                   @websocket : Bool, @sni : String?, @preserve_field_case : Bool = false,
+                   @h2_fields : Array({String, String})? = nil, @h2_body : Bytes? = nil)
     end
 
     # The single request's wire bytes (the first, for a group).
@@ -193,7 +215,11 @@ module Gori::Repeater
     end
 
     def send : Result
-      @sender.send(bytes)
+      if fields = @h2_fields
+        @sender.send_fields(fields, @h2_body)
+      else
+        @sender.send(bytes)
+      end
     end
 
     def send_group : Array(Result)
@@ -223,6 +249,13 @@ module Gori::Repeater
     end
 
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
+      # Field-native is a separate assembly with no bytes to expand, re-frame or version-fix —
+      # kept fully off the byte path below so an ordinary `--http2` send is byte-for-byte what
+      # it was, and a field list never accidentally acquires a normalization it opted out of.
+      if fields = options.h2_fields
+        return build_field_native(options, outbound, fields)
+      end
+
       scheme, host, port = resolve_origin(options)
 
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if options.requests.empty?
@@ -289,6 +322,30 @@ module Gori::Repeater
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
         http2: options.http2?, websocket: websocket, sni: sni,
         preserve_field_case: options.preserve_field_case?)
+    end
+
+    # A field-native h2 send: dial origin + SNI resolution, then a `Sender` whose `send` will
+    # encode the fields verbatim. `requests` carries ONE synthetic scope line
+    # (`H2Engine.field_scope_line`) so `refusal`/`unbound_refusal?`/the scope gate — all of
+    # which key off a request line — work with no special case. The scheme check and the SNI
+    # expansion mirror the byte path; everything the byte path does to the WIRE bytes (env
+    # expansion, Content-Length, version-line, field-case) is deliberately absent, because a
+    # field list is already the exact message.
+    private def self.build_field_native(options : PlanOptions, outbound : Gori::Outbound,
+                                        fields : Array({String, String})) : Plan
+      scheme, host, port = resolve_origin(options)
+      unless scheme.in?("http", "https")
+        raise PlanError.new(PlanError::Reason::UnsupportedScheme,
+          "unsupported target scheme #{scheme.inspect}", scheme)
+      end
+      options.sni.try { |s| refuse_unresolved(Env.unresolved(s, deferred: nil)) }
+      sni = options.sni.try { |s| Env.expand(s).presence }
+      sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
+        verify: options.verify?, http2: true, sni: sni,
+        timeout: options.timeout, overrides: options.overrides)
+      new(sender: sender, requests: [H2Engine.field_scope_line(fields)], scheme: scheme,
+        host: host, port: port, http2: true, websocket: false, sni: sni,
+        h2_fields: fields, h2_body: options.h2_body)
     end
 
     # The pre-resolved origin when the surface has one, else the explicit target, else the
