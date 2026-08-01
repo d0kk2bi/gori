@@ -726,6 +726,37 @@ describe Gori::Tui::HistoryView do
     end
   end
 
+  # `Grpc.scan`'s residual is the finding in a gRPC parser test — a length prefix claiming
+  # more than arrived is one of the standard probes. This pane called `Grpc.messages`, which
+  # throws the residual away, so it rendered as "(no complete gRPC messages)" with no byte
+  # count: indistinguishable from a body that simply is not gRPC, while `gori run show
+  # --format json` reported the whole thing.
+  it "reports gRPC bytes that are not a complete frame instead of showing nothing" do
+    tmp_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "grpc.test", port: 443,
+        method: "POST", target: "/svc/Method", http_version: "HTTP/2",
+        head: "POST /svc/Method HTTP/2\r\ncontent-type: application/grpc\r\n\r\n".to_slice, body: nil))
+      # a length prefix claiming 9999 bytes with 5 arriving: 10 unframeable tail bytes
+      gbody = IO::Memory.new
+      gbody.write(Bytes[0x00, 0x00, 0x00, 0x27, 0x0f])
+      gbody << "short"
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200,
+        head: "HTTP/2 200\r\ncontent-type: application/grpc\r\n\r\n".to_slice, body: gbody.to_slice))
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.toggle_pane # request -> response (gRPC body)
+
+      backend = MemoryBackend.new(120, 14)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 120, 14))
+      backend.contains?("10 bytes are not a complete gRPC frame").should be_true
+      backend.contains?("no complete gRPC messages").should be_false
+    end
+  end
+
   it "opens detail and renders the raw request bytes" do
     tmp_store do |store|
       add_flow(store, "GET", "/secret", 200)

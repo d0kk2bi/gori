@@ -13,13 +13,17 @@ module Gori
     # `Repeater::Result` the h1 engine produces (so the diff/view path is shared).
     #
     # One-shot and intentionally minimal: empty client SETTINGS (ACK on receipt),
-    # PING answered. The RESPONSE side is flow-controlled — each DATA frame is
-    # credited straight back with a WINDOW_UPDATE on the connection + stream, so
-    # responses past the 65535-byte default window stream fine. The REQUEST side is
-    # not flow-controlled (a >64 KiB request body could stall — fine for the
-    # workbench; repeater bodies are typically small).
+    # PING answered. BOTH directions are flow-controlled. Response side: each DATA frame
+    # is credited straight back with a WINDOW_UPDATE on the connection + stream, so
+    # responses past the 65535-byte default window stream fine. Request side: the peer's
+    # SETTINGS is read before the first DATA frame and inbound WINDOW_UPDATEs are applied
+    # while the body is written, so a body larger than the peer's window blocks for credit
+    # instead of overrunning it (see `SendFlow`).
     module H2Engine
       MAX_FRAME = 16384
+      # RFC 9113 §6.9.2: the connection and every new stream start with a 65535-byte
+      # flow-control window in each direction, until the peer says otherwise.
+      DEFAULT_WINDOW = 65_535
       # Caps for the one-shot response read, mirroring the live assembler. Without
       # them a hostile/large origin could OOM the workbench: HEADERS/CONTINUATION
       # are NOT flow-controlled, so a CONTINUATION flood grows the header block
@@ -36,6 +40,59 @@ module Gori
       private alias Frame = Proxy::H2::Frame
       private alias HPACK = Proxy::H2::HPACK
       private alias HeadCodec = Proxy::H2::HeadCodec
+
+      # Request-direction (send-side) flow control, plus the frames the WRITER read while
+      # waiting for window — `read_response` drains them first so nothing is lost.
+      #
+      # h2 flow control is bidirectional and this engine only ever implemented the receive
+      # half. The send half was fire-and-forget: `write_data` blasted the whole body in
+      # MAX_FRAME chunks with no accounting, so any request body past the peer's window drew
+      # GOAWAY(FLOW_CONTROL_ERROR) — and the report named the ORIGIN for a violation that was
+      # gori's own. Upload fuzzing, large JSON/GraphQL batches, protobuf payloads and
+      # body-size probes are the ordinary work of this tool, so the old note that "repeater
+      # bodies are typically small" was never true: no gori surface could send a >64 KiB h2
+      # request body against any conformant origin.
+      private class SendFlow
+        property conn : Int64 = DEFAULT_WINDOW.to_i64
+        property stream : Int64 = DEFAULT_WINDOW.to_i64
+        # The peer's SETTINGS_INITIAL_WINDOW_SIZE as last applied. §6.9.2 makes a change a
+        # DELTA against this value on every open stream, not an assignment — and the result
+        # may legitimately go negative when the peer shrinks it after we have already sent.
+        property initial : Int64 = DEFAULT_WINDOW.to_i64
+        property? settings_seen = false
+        # Stream 1 (or the whole connection) was closed by the peer — stop writing DATA and
+        # go read what it said, rather than pushing a body at a stream that is already gone.
+        property? closed = false
+        # A read reached a clean EOF: nothing more will ever arrive on this socket.
+        property? eof = false
+        property goaway : String? = nil
+        property rst : String? = nil
+        getter pending = [] of Frame::Header
+        # Shared with `read_response` so the MAX_FRAMES hostile-origin ceiling counts the
+        # frames absorbed during the write too.
+        property frames = 0
+
+        # Bytes the peer will accept on stream 1 right now. Never negative: §6.9.2 lets a
+        # SETTINGS shrink drive a window below zero, and that simply means "send nothing".
+        def available : Int64
+          m = conn < stream ? conn : stream
+          m < 0 ? 0_i64 : m
+        end
+      end
+
+      # What one response read produced. A record rather than a widening tuple: the read now
+      # carries the peer's own stated reason (GOAWAY *or* RST_STREAM), which fields arrived in
+      # a TRAILING header block, and how the read ended — and every one of those is a distinct
+      # sentence the operator needs.
+      private record Reply,
+        status : Int32,
+        headers : Array({String, String}),
+        body : Bytes?,
+        clean_eos : Bool,
+        goaway : String?,
+        rst : String?,
+        trailers : Array(String)?,
+        timed_out : Bool
 
       def self.send(request : Bytes, *, scheme : String, host : String, port : Int32,
                     verify_upstream : Bool, sni : String? = nil,
@@ -91,17 +148,40 @@ module Gori
       # same exchange — the fields differ, the framing and reassembly do not.
       private def self.exchange(upstream : IO, headers : Array({String, String}), body : Bytes?,
                                 host : String, port : Int32, started : Time::Instant) : Result
-        write_request(upstream, headers, body)
-        status, resp_headers, resp_body, complete, goaway = read_response(upstream)
-        if status == 0 && resp_headers.empty?
-          # A GOAWAY is the origin naming the reason it hung up (RFC 9113 §6.8) and it is
-          # usually about the bytes GORI sent — reporting it as "no h2 response" sent the
-          # operator looking at the origin. Prefer it over the generic sentence.
-          return failure(goaway ? "#{goaway} from #{host}:#{port}" : "no h2 response from #{host}:#{port}", started)
-        end
-        head = synth_head(status, resp_headers)
+        flow = SendFlow.new
+        write_request(upstream, headers, body, flow)
+        reply = read_response(upstream, flow)
+        return failure(no_response(reply, host, port), started) if reply.status == 0 && reply.headers.empty?
+        head = synth_head(reply)
         resp = Proxy::Codec::Http1.parse_response_head(head)
-        Result.new(head, resp_body, resp, elapsed(started), incomplete: !complete)
+        # A stream the peer RESET or a connection it sent GOAWAY on still produced bytes here,
+        # and the cause must not be dropped just because a partial response arrived: a
+        # RST_STREAM(CANCEL) after a 200 + half a body used to render as
+        # "incomplete — origin closed before the framed body finished", which names the wrong
+        # event entirely. The head and body stay on the Result; the reason rides alongside.
+        reason = reply.rst || reply.goaway
+        Result.new(head, reply.body, resp, elapsed(started),
+          error: reason ? "#{reason} from #{host}:#{port}" : nil,
+          incomplete: !reply.clean_eos, delivered: true)
+      end
+
+      # The one sentence that names why an h2 exchange produced no response.
+      #
+      # Seven distinct causes used to collapse into "no h2 response from HOST:PORT": each
+      # RST_STREAM error code, a GOAWAY, an idle read timeout, and a socket that closed. A
+      # WAF / rate-limiter test is MADE of telling ENHANCE_YOUR_CALM from REFUSED_STREAM from
+      # a dead socket, and REFUSED_STREAM in particular is an explicit "retry on a new
+      # connection" instruction (RFC 9113 §8.7) that was being reported as a flat refusal.
+      # RST_STREAM is preferred over GOAWAY: it is about OUR stream, the GOAWAY that usually
+      # follows is about the connection.
+      private def self.no_response(reply : Reply, host : String, port : Int32) : String
+        if reason = reply.rst || reply.goaway
+          return "#{reason} from #{host}:#{port}"
+        end
+        # "sent nothing before the read timed out" is the genuinely retryable outcome and
+        # "closed" is not; they had the same wording, so no consumer could tell them apart.
+        return "no h2 response from #{host}:#{port} — the origin sent nothing before the read timed out" if reply.timed_out
+        "no h2 response from #{host}:#{port} — the connection closed before a response frame arrived"
       end
 
       private def self.open(scheme : String, host : String, port : Int32, verify : Bool,
@@ -124,7 +204,8 @@ module Gori
         end
       end
 
-      private def self.write_request(io : IO, headers : Array({String, String}), body : Bytes?) : Nil
+      private def self.write_request(io : IO, headers : Array({String, String}), body : Bytes?,
+                                     flow : SendFlow) : Nil
         io.write(Frame::PREFACE)
         # SETTINGS_ENABLE_PUSH=0 (id 0x2): a one-shot repeater never wants server push, and
         # pushed DATA on a non-1 stream would consume the connection flow-control window
@@ -134,8 +215,106 @@ module Gori
         io.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, no_push).to_bytes)
         block = HPACK::Encoder.new.encode(headers)
         write_header_block(io, block, body.nil? || body.empty?)
-        write_data(io, body) if body && !body.empty?
         io.flush
+        return if body.nil? || body.empty?
+        await_settings(io, flow)
+        write_data(io, body, flow)
+        io.flush
+      end
+
+      # Read the peer's SETTINGS before the FIRST DATA frame.
+      #
+      # RFC 9113 §3.4 makes SETTINGS the first frame a server sends, and §6.9.2 lets its
+      # SETTINGS_INITIAL_WINDOW_SIZE put the stream window BELOW the 65535 default. Writing
+      # DATA before reading it is how a 20 KB body went out against an advertised 16384-byte
+      # window — the request was already over the limit before the first WINDOW_UPDATE could
+      # have mattered, so no amount of blocking later would have helped.
+      #
+      # Exactly ONE frame, and every failure is tolerated: a peer that opens with something
+      # else has told us it will not send SETTINGS first, and a peer that sends nothing at all
+      # costs one idle timeout that the response read was going to spend anyway. Neither is a
+      # reason to fail a send — the RFC defaults still apply.
+      private def self.await_settings(io : IO, flow : SendFlow) : Nil
+        pump_once(io, flow) unless flow.settings_seen?
+      end
+
+      # Read and dispatch ONE frame from the peer while the request is still being written.
+      # SETTINGS/PING/WINDOW_UPDATE are handled here (they are the write loop's business);
+      # everything else is stashed for `read_response`, which drains `pending` before it
+      # touches the socket. Returns false once the socket goes quiet.
+      private def self.pump_once(io : IO, flow : SendFlow) : Bool
+        frame = begin
+          Frame.read(io)
+        rescue IO::TimeoutError
+          return false # idle, not dead — the caller decides whether that is fatal
+        rescue IO::Error
+          flow.eof = true
+          return false
+        end
+        if frame.nil?
+          flow.eof = true
+          return false
+        end
+        flow.frames += 1
+        return false if flow.frames > MAX_FRAMES
+        case frame.frame_type
+        when Frame::Type::Settings
+          unless frame.ack?
+            apply_settings(frame, flow)
+            flow.settings_seen = true
+            ack(io, Frame::Type::Settings, Bytes.empty)
+          end
+        when Frame::Type::Ping
+          ack(io, Frame::Type::Ping, frame.payload) unless frame.ack?
+        when Frame::Type::WindowUpdate
+          credit(frame, flow)
+        when Frame::Type::Goaway
+          flow.goaway = goaway_reason(frame)
+          flow.closed = true
+          flow.pending << frame
+        when Frame::Type::RstStream
+          if frame.stream_id == 1
+            flow.rst = rst_reason(frame)
+            flow.closed = true
+          end
+          flow.pending << frame
+        else
+          # The peer answered before we finished the body (a 413/431 rejection, say). The
+          # stream is over: stop writing at it and go read what it said.
+          flow.closed = true if frame.stream_id == 1 && frame.end_stream? && frame.end_headers?
+          flow.pending << frame
+        end
+        true
+      end
+
+      # Apply a peer SETTINGS frame's SETTINGS_INITIAL_WINDOW_SIZE (id 0x4) to the send-side
+      # stream window. §6.9.2: the new value is a DELTA against the previous initial size
+      # applied to every open stream, not an assignment — space already consumed stays
+      # consumed, and the window may end up negative.
+      private def self.apply_settings(frame : Frame::Header, flow : SendFlow) : Nil
+        payload = frame.payload
+        i = 0
+        while i + 6 <= payload.size
+          id = IO::ByteFormat::BigEndian.decode(UInt16, payload[i, 2])
+          value = IO::ByteFormat::BigEndian.decode(UInt32, payload[i + 2, 4]).to_i64
+          if id == 0x4_u16
+            flow.stream += value - flow.initial
+            flow.initial = value
+          end
+          i += 6
+        end
+      end
+
+      # Credit an inbound WINDOW_UPDATE to the connection (stream 0) or our stream (1). The
+      # read loop dispatched this frame type only to DISCARD it, which is why the send window
+      # could never reopen.
+      private def self.credit(frame : Frame::Header, flow : SendFlow) : Nil
+        return if frame.payload.size < 4
+        inc = (IO::ByteFormat::BigEndian.decode(UInt32, frame.payload[0, 4]) & 0x7fffffff_u32).to_i64
+        case frame.stream_id
+        when 0_u32 then flow.conn += inc
+        when 1_u32 then flow.stream += inc
+        end
       end
 
       # HEADERS, then CONTINUATION for every 16 KiB after the first.
@@ -164,55 +343,101 @@ module Gori
         end
       end
 
-      private def self.write_data(io : IO, body : Bytes) : Nil
+      # The request body as DATA frames, never exceeding the peer's send window (§6.9.1).
+      # When the window is exhausted the writer blocks reading frames until a WINDOW_UPDATE
+      # reopens it; the bound is the socket's own idle timeout, after which the stall is
+      # reported for what it is rather than left to the origin's GOAWAY.
+      private def self.write_data(io : IO, body : Bytes, flow : SendFlow) : Nil
         offset = 0
         while offset < body.size
-          n = Math.min(MAX_FRAME, body.size - offset)
+          while flow.available <= 0 && !flow.closed?
+            io.flush # the peer cannot grant window for frames still sitting in our buffer
+            break unless pump_once(io, flow)
+          end
+          break if flow.closed?
+          raise Gori::Error.new(flow_stalled(offset, body.size, flow)) if flow.available <= 0
+          n = Math.min(Math.min(MAX_FRAME.to_i64, (body.size - offset).to_i64), flow.available).to_i
           last = offset + n >= body.size
           flags = last ? Frame::END_STREAM : 0_u8
           io.write(Frame::Header.new(Frame::Type::Data.value, flags, 1_u32, body[offset, n]).to_bytes)
+          flow.conn -= n
+          flow.stream -= n
           offset += n
         end
       end
 
-      # Reads frames until stream 1 closes; returns {status, headers, body,
-      # clean_eos, goaway}. clean_eos is true only when the stream ended on a real
-      # END_STREAM — false when it was cut by GOAWAY/RST_STREAM, a mid-stream
-      # connection drop, or a MAX_BODY truncation, so the caller can flag the
-      # response as incomplete (mirrors the h1 engine's premature-EOF signal).
-      # `goaway` is the origin's stated reason for hanging up, when it gave one.
-      private def self.read_response(io : IO) : {Int32, Array({String, String}), Bytes?, Bool, String?}
+      # Why the body could not be finished. Names the flow-control window — gori's own
+      # accounting — rather than blaming the origin for a refusal it never made, and says
+      # plainly that the request did NOT go out whole, so no status is read as a verdict on
+      # the payload the operator meant to send.
+      private def self.flow_stalled(sent : Int32, total : Int32, flow : SendFlow) : String
+        base = "h2 flow control: only #{sent} of #{total} request body bytes could be sent"
+        if flow.eof?
+          "#{base} — the origin closed the connection before granting window for the rest " \
+          "(RFC 9113 §6.9). The request was NOT fully sent."
+        else
+          "#{base} — the origin never granted flow-control window for the rest (RFC 9113 §6.9): " \
+          "its connection window is #{flow.conn} and its stream window #{flow.stream}. " \
+          "The request was NOT fully sent."
+        end
+      end
+
+      # Reads frames until stream 1 closes. `clean_eos` is true only when the stream ended on
+      # a real END_STREAM — false when it was cut by GOAWAY/RST_STREAM, a mid-stream
+      # connection drop, or a MAX_BODY truncation, so the caller can flag the response as
+      # incomplete (mirrors the h1 engine's premature-EOF signal). `goaway`/`rst` are the
+      # origin's own stated reasons, when it gave one.
+      #
+      # Starts by draining `flow.pending` — the frames the WRITE side had to read off the
+      # socket while waiting for flow-control window. They arrived before anything read here
+      # and must be processed in that order.
+      private def self.read_response(io : IO, flow : SendFlow) : Reply
         decoder = HPACK::Decoder.new
         header_buf = IO::Memory.new
         body = IO::Memory.new
         headers = [] of {String, String}
         status = 0
         done = false
-        clean_eos = false          # a genuine END_STREAM closed the stream
-        goaway = nil.as(String?)   # the origin's stated reason for hanging up
+        clean_eos = false    # a genuine END_STREAM closed the stream
+        goaway = flow.goaway # the origin's stated reason for hanging up
+        rst = flow.rst       # the origin's stated reason for killing the stream
+        trailers = nil.as(Array(String)?)
+        final_seen = false         # the final (non-interim) response header block is absorbed
         end_stream_pending = false # END_STREAM seen on a HEADERS frame whose block isn't closed yet
-        frames = 0                 # every frame counted (incl. ping/priority) — bounds a junk-frame flood
+        timed_out = false          # the read ended on an idle timeout, not on a closed socket
+        pending = flow.pending
+        at = 0
 
         until done
-          # An IO error mid-response (connection reset — e.g. an origin that closed
-          # right after a non-END_STREAM DATA) is end-of-data, not a hard failure:
-          # treat it like a clean EOF and return what arrived, flagged incomplete
-          # (mirrors the h1 engine). A Gori::Error from Frame.read (oversized/corrupt
-          # frame — a real protocol violation) is NOT swallowed: it propagates to the
-          # outer rescue and surfaces as a failed repeater, since the workbench exists to
-          # reveal exactly that.
-          frame = begin
-            Frame.read(io)
-          rescue IO::Error
-            nil
+          if at < pending.size
+            frame = pending[at]
+            at += 1
+          else
+            # An IO error mid-response (connection reset — e.g. an origin that closed
+            # right after a non-END_STREAM DATA) is end-of-data, not a hard failure:
+            # treat it like a clean EOF and return what arrived, flagged incomplete
+            # (mirrors the h1 engine). A Gori::Error from Frame.read (oversized/corrupt
+            # frame — a real protocol violation) is NOT swallowed: it propagates to the
+            # outer rescue and surfaces as a failed repeater, since the workbench exists to
+            # reveal exactly that. An idle TIMEOUT is separated from a closed socket: "the
+            # origin sent nothing" and "the origin hung up" are different findings and only
+            # one of them is worth retrying.
+            frame = begin
+              Frame.read(io)
+            rescue IO::TimeoutError
+              timed_out = true
+              nil
+            rescue IO::Error
+              nil
+            end
+            break if frame.nil?
+            # Count EVERY frame, not just data/headers: an origin flooding PING/PRIORITY/
+            # WINDOW_UPDATE without ever sending END_STREAM trips no byte cap and no idle
+            # timeout, so this ceiling is what guarantees the loop terminates. On trip the
+            # stream is left un-closed → the response is flagged incomplete.
+            flow.frames += 1
+            break if flow.frames > MAX_FRAMES
           end
-          break if frame.nil?
-          # Count EVERY frame, not just data/headers: an origin flooding PING/PRIORITY/
-          # WINDOW_UPDATE without ever sending END_STREAM trips no byte cap and no idle
-          # timeout, so this ceiling is what guarantees the loop terminates. On trip the
-          # stream is left un-closed → the response is flagged incomplete.
-          frames += 1
-          break if frames > MAX_FRAMES
           case frame.frame_type
           when Frame::Type::Settings
             ack(io, Frame::Type::Settings, Bytes.empty) unless frame.ack?
@@ -222,7 +447,13 @@ module Gori
             goaway = goaway_reason(frame)
             done = true
           when Frame::Type::RstStream
-            done = true if frame.stream_id == 1
+            if frame.stream_id == 1
+              # The 4-byte error code used to be read only as "stop looping", so
+              # REFUSED_STREAM, CANCEL and ENHANCE_YOUR_CALM were indistinguishable from a
+              # dead socket — see `no_response`.
+              rst = rst_reason(frame)
+              done = true
+            end
           when Frame::Type::Headers
             next unless frame.stream_id == 1
             chunk = header_block(frame)
@@ -234,7 +465,9 @@ module Gori
             # status). Defer completion until END_HEADERS.
             end_stream_pending = frame.end_stream?
             if frame.end_headers?
-              status = absorb(header_buf, decoder, headers, status)
+              status, names = absorb(header_buf, decoder, headers, status)
+              trailers = note_trailers(trailers, names, final_seen)
+              final_seen ||= !interim?(status)
               done = clean_eos = true if end_stream_pending
               headers.clear if !end_stream_pending && interim?(status)
             end
@@ -243,7 +476,9 @@ module Gori
             break if header_buf.bytesize + frame.payload.size > MAX_HEADER_BLOCK # flood — abort
             header_buf.write(frame.payload)
             if frame.end_headers?
-              status = absorb(header_buf, decoder, headers, status)
+              status, names = absorb(header_buf, decoder, headers, status)
+              trailers = note_trailers(trailers, names, final_seen)
+              final_seen ||= !interim?(status)
               done = clean_eos = true if end_stream_pending
               headers.clear if !end_stream_pending && interim?(status)
             end
@@ -266,12 +501,27 @@ module Gori
           end
         end
 
-        {status, headers, body.size == 0 ? nil : body.to_slice, clean_eos, goaway}
+        Reply.new(status, headers, body.size == 0 ? nil : body.to_slice, clean_eos,
+          goaway, rst, trailers, timed_out)
+      end
+
+      # Names decoded from a header block that arrived AFTER the final response block are
+      # TRAILERS. `Assembler` records exactly this for a captured h2 flow; the repeater built
+      # its own head and lost it, so a gRPC "Trailers-Only" response (grpc-status in the
+      # initial HEADERS) and a real trailers response rendered byte-identically — and whether
+      # a gateway/CDN/WAF/service-mesh promotes a trailer into a header, or collapses a real
+      # trailers response into Trailers-Only, is a first-class gRPC test.
+      private def self.note_trailers(trailers : Array(String)?, names : Array(String),
+                                     final_seen : Bool) : Array(String)?
+        return trailers if !final_seen || names.empty?
+        (trailers ||= [] of String).concat(names)
+        trailers
       end
 
       # RFC 9113 §7 error codes, by their spec names — the operator is going to search for
-      # the name, not the integer.
-      GOAWAY_ERRORS = {
+      # the name, not the integer. Shared by GOAWAY (§6.8) and RST_STREAM (§7): the code
+      # space is one registry.
+      ERROR_CODES = {
         0 => "NO_ERROR", 1 => "PROTOCOL_ERROR", 2 => "INTERNAL_ERROR", 3 => "FLOW_CONTROL_ERROR",
         4 => "SETTINGS_TIMEOUT", 5 => "STREAM_CLOSED", 6 => "FRAME_SIZE_ERROR", 7 => "REFUSED_STREAM",
         8 => "CANCEL", 9 => "COMPRESSION_ERROR", 10 => "CONNECT_ERROR", 11 => "ENHANCE_YOUR_CALM",
@@ -286,39 +536,45 @@ module Gori
         payload = frame.payload
         return "h2 GOAWAY (no error code)" if payload.size < 8
         code = IO::ByteFormat::BigEndian.decode(UInt32, payload[4, 4]).to_i
-        name = GOAWAY_ERRORS[code]? || "error code #{code}"
+        name = ERROR_CODES[code]? || "error code #{code}"
         debug = payload.size > 8 ? String.new(payload[8..]).scrub.strip : ""
         debug.empty? ? "h2 GOAWAY #{name}" : "h2 GOAWAY #{name} (#{debug})"
       end
 
-      # Decode a completed header block, splitting :status from regular headers.
+      # A RST_STREAM payload as a sentence (§6.4: a single 4-octet error code). The sibling
+      # of `goaway_reason`, one `case` arm away and written for the same reason: the code
+      # names WHY the stream died, and REFUSED_STREAM (§8.7) is not a failure at all but an
+      # instruction to retry on a new connection.
+      private def self.rst_reason(frame : Frame::Header) : String
+        payload = frame.payload
+        return "h2 RST_STREAM on stream #{frame.stream_id} (no error code)" if payload.size < 4
+        code = IO::ByteFormat::BigEndian.decode(UInt32, payload[0, 4]).to_i
+        name = ERROR_CODES[code]? || "error code #{code}"
+        "h2 RST_STREAM #{name} on stream #{frame.stream_id}"
+      end
+
+      # Decode a completed header block, splitting :status from regular headers. Returns the
+      # status and the REGULAR field names this block contributed, so the caller can tell a
+      # trailing block's fields from the response head's (see `note_trailers`).
       private def self.absorb(buf : IO::Memory, decoder : HPACK::Decoder,
-                              headers : Array({String, String}), status : Int32) : Int32
+                              headers : Array({String, String}), status : Int32) : {Int32, Array(String)}
+        names = [] of String
         decoder.decode(buf.to_slice).each do |(name, value)|
           if name == ":status"
             status = value.to_i? || status
           elsif !name.starts_with?(':')
-            headers << {visualize_field(name), visualize_field(value)}
+            headers << {name, value}
+            names << name
           end
         end
         buf.clear
-        status
+        {status, names}
       end
 
       # An interim (informational) response: its header fields precede — and are not part
       # of — the final response (RFC 9110 §15.2), so they're dropped, not merged.
       private def self.interim?(status : Int32) : Bool
         100 <= status < 200
-      end
-
-      # RFC 9113 §8.2.1 forbids CR/LF in an h2 field name/value. If a non-compliant origin
-      # smuggles one in, ESCAPE it (don't drop the header) so it can't fold into a phantom
-      # line of the synthesized HTTP/1 head while STILL SHOWING the tester the injection
-      # attempt — a malformed response header is a security issue, not noise to hide. gori
-      # is a security-testing proxy: it must surface bad bytes, not silently swallow them.
-      private def self.visualize_field(s : String) : String
-        return s unless s.includes?('\r') || s.includes?('\n')
-        s.gsub('\r', "\\r").gsub('\n', "\\n")
       end
 
       private def self.ack(io : IO, type : Frame::Type, payload : Bytes) : Nil
@@ -380,6 +636,17 @@ module Gori
         # dropped and `:authority` always came from the dialed target. The connection
         # target is unchanged: you still connect to `host`, but can CLAIM a different
         # authority. Falls back to the dialed host when no Host line is present.
+        #
+        # The FIRST `Host:` becomes `:authority`; every SUBSEQUENT one is carried as a
+        # regular `host` field. `authority_override` used to be a single slot each line
+        # overwrote, so `Host: first` + `Host: second` went out as one `:authority: second`
+        # and the first vanished with no notice — a duplicate `Host:` is a standard
+        # host-header-confusion / cache-poisoning / h2-downgrade-desync probe, and h1 puts
+        # both lines on the wire for the identical bytes. Carrying rather than refusing is
+        # deliberate: the TUI Repeater has no field-native escape hatch, so a refusal would
+        # strand that surface, and `:authority` alongside an explicit `host` is legal to emit
+        # (it is the very shape `HeadCodec.resolve_authority` preserves in the other
+        # direction) — and it is what a host-confusion probe wants on the wire.
         authority_override = nil
         regular = [] of {String, String}
         lines[1..]?.try &.each do |field_line|
@@ -387,9 +654,13 @@ module Gori
           pair = HeadCodec.header_field(field_line)
           raise Gori::Error.new(unencodable_line(field_line)) unless pair
           raw_name, value = pair
-          if raw_name.compare("host", case_insensitive: true) == 0
-            authority_override = value unless value.empty?
-            next # folded into :authority below; a literal `host` header is illegal in h2
+          if raw_name.compare("host", case_insensitive: true) == 0 && authority_override.nil?
+            # An EMPTY `Host:` maps to an empty `:authority`, not to the dial target: the
+            # operator asked for a request with no authority (the missing-authority probe),
+            # and quietly substituting gori's own connection target answered a question they
+            # did not ask.
+            authority_override = value
+            next
           end
           regular << {preserve_field_case ? raw_name : raw_name.downcase, value}
         end
@@ -558,12 +829,19 @@ module Gori
         finish <= 1 ? Bytes.empty : frame.payload[1...finish]
       end
 
-      private def self.synth_head(status : Int32, headers : Array({String, String})) : Bytes
-        String.build do |io|
-          io << "HTTP/2 " << status << "\r\n"
-          headers.each { |(n, v)| io << n << ": " << v << "\r\n" }
-          io << "\r\n"
-        end.to_slice
+      # The response head, through the SAME projection the capture path uses.
+      #
+      # This used to be a local `String.build` that concatenated the final and the trailing
+      # header blocks with no record of which arrived where — so `HeadCodec`'s
+      # `X-Gori-Trailers` marker, which `Assembler` has emitted on every captured h2 flow,
+      # never reached the Repeater. Reusing `synth_response` is the point of `HeadCodec`
+      # existing: the repeater projection and the capture projection now cannot drift, and
+      # the CR/LF escaping that used to live here as `visualize_field` is `line_safe`'s job,
+      # which additionally disambiguates a literal backslash from an injected one.
+      private def self.synth_head(reply : Reply) : Bytes
+        fields = [{":status", reply.status.to_s}]
+        fields.concat(reply.headers)
+        HeadCodec.synth_response(fields, reply.trailers)
       end
 
       private def self.failure(message : String, started : Time::Instant) : Result
@@ -573,13 +851,18 @@ module Gori
       # A nil socket here means no usable HTTP/2 connection — could be unreachable,
       # an origin that doesn't offer h2 over ALPN, or (for verified https) a cert that
       # failed verification. Spell that out instead of a bare "connect failed".
+      #
+      # The two conditions are SEPARATE. The guard used to be `scheme == "https" && verify`,
+      # so `-k` / MCP `insecure:true` / `gori mcp --insecure-upstream` routed an **https**
+      # target into the h2c `else` and reported a cleartext prior-knowledge diagnosis for a
+      # failed ALPN negotiation — sending the operator after a problem that does not exist,
+      # on the branch they hit most (`-k` is the normal mode against a lab origin). The
+      # transport decides the ALPN wording; verification only adds a clause.
       private def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool) : String
         base = "h2 connect failed (no h2 negotiated): #{host}:#{port}"
-        if scheme == "https" && verify
-          "#{base} — host unreachable, the origin doesn't offer HTTP/2 via ALPN, or its TLS certificate failed verification"
-        else
-          "#{base} — host unreachable or the origin doesn't offer HTTP/2 (h2c) here"
-        end
+        return "#{base} — host unreachable or the origin doesn't offer HTTP/2 (h2c) here" unless scheme == "https"
+        cert = verify ? ", or its TLS certificate failed verification" : ""
+        "#{base} — host unreachable, the origin doesn't offer HTTP/2 via ALPN#{cert}"
       end
 
       private def self.elapsed(started : Time::Instant) : Int64

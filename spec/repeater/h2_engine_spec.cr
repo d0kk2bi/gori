@@ -4,8 +4,16 @@ require "socket"
 private alias Frame = Gori::Proxy::H2::Frame
 private alias HPACK = Gori::Proxy::H2::HPACK
 
-# A minimal cleartext-h2 origin: reads the preface + request, records the decoded
-# request line and body, then replies SETTINGS + HEADERS(:status) + DATA.
+# The SERVER connection preface: RFC 9113 §3.4 makes a (possibly empty) SETTINGS frame the
+# FIRST frame a server sends. These origins used to hold it back until they had read the whole
+# request, which no real stack does — and the client now reads it before writing the request
+# body, because §6.9.2 lets SETTINGS_INITIAL_WINDOW_SIZE put the send window below the 65535
+# default. `settings` carries the id/value pairs (empty = defaults).
+private def send_server_preface(conn : IO, settings : Bytes = Bytes.empty) : Nil
+  conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, settings).to_bytes)
+  conn.flush
+end
+
 # An origin that accepts the TCP connection and nothing more. The refusal examples below never
 # write a request, so the h2-speaking origin's `read_preface` would hit EOF and print an
 # unhandled-spawn backtrace into the spec output — noise that reads like a failure. All these
@@ -20,6 +28,8 @@ private def start_quiet_origin : Int32
   port
 end
 
+# A minimal cleartext-h2 origin: reads the preface + request, records the decoded
+# request line and body, then replies HEADERS(:status) + DATA.
 private def start_h2_origin(status : Int32, body : String, seen : Channel(String)) : Int32
   origin = TCPServer.new("127.0.0.1", 0)
   port = origin.local_address.port
@@ -27,6 +37,7 @@ private def start_h2_origin(status : Int32, body : String, seen : Channel(String
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     dec = HPACK::Decoder.new
     method = path = ""
     req_body = IO::Memory.new
@@ -53,7 +64,6 @@ private def start_h2_origin(status : Int32, body : String, seen : Channel(String
     end
     seen.send("#{method} #{path} body=#{req_body}")
 
-    conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty).to_bytes)
     status_block = HPACK::Encoder.new.encode([{":status", status.to_s}, {"server", "gori-test"}])
     conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, status_block).to_bytes)
     conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, body.to_slice).to_bytes)
@@ -73,6 +83,7 @@ private def start_h2_origin_authority(status : Int32, seen : Channel(String)) : 
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     dec = HPACK::Decoder.new
     authority = "(none)"
     loop do
@@ -86,7 +97,6 @@ private def start_h2_origin_authority(status : Int32, seen : Channel(String)) : 
       end
     end
     seen.send(authority)
-    conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty).to_bytes)
     sb = HPACK::Encoder.new.encode([{":status", status.to_s}])
     conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
     conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "ok".to_slice).to_bytes)
@@ -107,12 +117,12 @@ private def start_h2_origin_truncated(status : Int32, partial : String) : Int32
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     loop do
       f = Frame.read(conn)
       break if f.nil?
       break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
     end
-    conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty).to_bytes)
     block = HPACK::Encoder.new.encode([{":status", status.to_s}])
     conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, block).to_bytes)
     # DATA WITHOUT END_STREAM, then close mid-stream.
@@ -134,13 +144,13 @@ private def start_h2_origin_flow_controlled(status : Int32, body : Bytes) : Int3
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     # drain to the request's END_STREAM (a body-less GET)
     loop do
       f = Frame.read(conn)
       break if f.nil?
       break if f.frame_type == Frame::Type::Headers && f.stream_id == 1 && f.end_stream?
     end
-    conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty).to_bytes)
     sb = HPACK::Encoder.new.encode([{":status", status.to_s}])
     conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
     conn.flush
@@ -183,12 +193,12 @@ private def start_h2_origin_pings(status : Int32, body : String, pings : Int32) 
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     loop do
       f = Frame.read(conn)
       break if f.nil?
       break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
     end
-    conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty).to_bytes)
     pings.times { conn.write(Frame::Header.new(Frame::Type::Ping.value, 0_u8, 0_u32, Bytes.new(8)).to_bytes) }
     sb = HPACK::Encoder.new.encode([{":status", status.to_s}])
     conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
@@ -212,6 +222,7 @@ private def start_h2_origin_recording(seen : Channel({Array({String, String}), A
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     dec = HPACK::Decoder.new
     block = IO::Memory.new
     shape = [] of {String, Int32}
@@ -240,7 +251,6 @@ private def start_h2_origin_recording(seen : Channel({Array({String, String}), A
     end
     seen.send({fields, shape})
 
-    conn.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty).to_bytes)
     sb = HPACK::Encoder.new.encode([{":status", "200"}])
     conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
     conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "ok".to_slice).to_bytes)
@@ -260,6 +270,7 @@ private def start_h2_origin_goaway(code : UInt32, debug : String) : Int32
     next unless conn = origin.accept?
     conn.read_timeout = 5.seconds
     Frame.read_preface(conn)
+    send_server_preface(conn)
     loop do
       f = Frame.read(conn)
       break if f.nil?
@@ -272,6 +283,200 @@ private def start_h2_origin_goaway(code : UInt32, debug : String) : Int32
       conn.flush
       break
     end
+    conn.close
+  end
+  port
+end
+
+# A cleartext-h2 origin that enforces RECEIVE-side flow control the way nginx/envoy/Go do:
+# it advertises `init_window` as SETTINGS_INITIAL_WINDOW_SIZE, tracks the connection and
+# stream windows, and answers a client that overruns them with GOAWAY(FLOW_CONTROL_ERROR)
+# — the frame that made every h2 request body past the peer's window unsendable.
+#
+# `grant: false` never replenishes: the client must stop at the window and time out on its
+# own side (the socket is HELD OPEN, so a stall is distinguishable from a hangup). Reports
+# the body bytes it received, or -1 when the client overran the window.
+private def start_h2_origin_window(init_window : Int32, grant : Bool, seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    settings = IO::Memory.new
+    settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian) # SETTINGS_INITIAL_WINDOW_SIZE
+    settings.write_bytes(init_window.to_u32, IO::ByteFormat::BigEndian)
+    send_server_preface(conn, settings.to_slice)
+
+    win = init_window
+    got = 0
+    overran = false
+    finished = false
+    until finished
+      if win <= 0
+        # The window is spent, so a client that respects §6.9.1 must WAIT right here. Probe
+        # for exactly that: anything that arrives during this idle slice was sent past the
+        # window. Crediting eagerly per DATA frame would hide the defect entirely — the
+        # window is back before the overrunning frame is even read.
+        conn.read_timeout = 200.milliseconds
+        stray = begin
+          Frame.read(conn)
+        rescue IO::TimeoutError
+          nil
+        end
+        conn.read_timeout = 5.seconds
+        if stray && stray.frame_type == Frame::Type::Data && stray.payload.size > 0
+          overran = true
+          break
+        end
+        break unless grant
+        inc = Bytes.new(4)
+        IO::ByteFormat::BigEndian.encode(init_window.to_u32, inc)
+        {0_u32, 1_u32}.each do |sid|
+          conn.write(Frame::Header.new(Frame::Type::WindowUpdate.value, 0_u8, sid, inc).to_bytes)
+        end
+        conn.flush
+        win += init_window
+      end
+      f = begin
+        Frame.read(conn)
+      rescue IO::Error
+        nil
+      end
+      break if f.nil?
+      case f.frame_type
+      when Frame::Type::Headers
+        finished = true if f.stream_id == 1 && f.end_stream?
+      when Frame::Type::Data
+        next unless f.stream_id == 1
+        win -= f.payload.size
+        got += f.payload.size
+        finished = true if f.end_stream?
+      else
+        # SETTINGS ack / PING / WINDOW_UPDATE from the client
+      end
+    end
+    seen.send(overran ? -1 : got)
+    if overran
+      payload = IO::Memory.new
+      payload.write_bytes(1_u32, IO::ByteFormat::BigEndian) # last-stream-id
+      payload.write_bytes(3_u32, IO::ByteFormat::BigEndian) # FLOW_CONTROL_ERROR
+      conn.write(Frame::Header.new(Frame::Type::Goaway.value, 0_u8, 0_u32, payload.to_slice).to_bytes)
+      conn.flush
+    elsif finished
+      sb = HPACK::Encoder.new.encode([{":status", "200"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
+      conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "ok".to_slice).to_bytes)
+      conn.flush
+      sleep 0.2.seconds
+    else
+      sleep 3.seconds # grant:false — hold the socket so the client times out, not sees an EOF
+    end
+    conn.close
+  end
+  port
+end
+
+# A cleartext-h2 origin that answers with RST_STREAM(`code`) on stream 1 — optionally after
+# a complete response head and a partial body, which is how a server aborts a response it
+# already began (CANCEL / INTERNAL_ERROR) and the case where the cause used to vanish.
+private def start_h2_origin_rst(code : UInt32, after_headers : Bool = false) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    loop do
+      f = Frame.read(conn)
+      break if f.nil?
+      break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
+    end
+    if after_headers
+      sb = HPACK::Encoder.new.encode([{":status", "200"}, {"content-type", "text/plain"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
+      conn.write(Frame::Header.new(Frame::Type::Data.value, 0_u8, 1_u32, "partial".to_slice).to_bytes)
+    end
+    payload = Bytes.new(4)
+    IO::ByteFormat::BigEndian.encode(code, payload)
+    conn.write(Frame::Header.new(Frame::Type::RstStream.value, 0_u8, 1_u32, payload).to_bytes)
+    conn.flush
+    sleep 0.2.seconds
+    conn.close
+  end
+  port
+end
+
+# A cleartext-h2 origin that completes its own preface and then says NOTHING — the idle
+# read timeout, which is a different finding from a socket that hung up.
+private def start_h2_origin_mute : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    sleep 3.seconds
+    conn.close
+  end
+  port
+end
+
+# A cleartext-h2 origin that reads the request and then HANGS UP without a single response
+# frame — the dead-socket case.
+private def start_h2_origin_hangup : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    loop do
+      f = Frame.read(conn)
+      break if f.nil?
+      break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
+    end
+    conn.close
+  end
+  port
+end
+
+# A gRPC origin in one of the two structurally different shapes an operator has to be able to
+# tell apart: `trailers_only` puts grpc-status in the INITIAL HEADERS block (the gRPC
+# "Trailers-Only" response), otherwise it arrives in a real TRAILING HEADERS block after the
+# message. Both render the same fields — only WHERE they arrived differs.
+private def start_h2_origin_grpc(trailers_only : Bool) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    loop do
+      f = Frame.read(conn)
+      break if f.nil?
+      break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
+    end
+    enc = HPACK::Encoder.new
+    if trailers_only
+      blk = enc.encode([{":status", "200"}, {"content-type", "application/grpc"},
+                        {"grpc-status", "5"}, {"grpc-message", "not found"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value,
+        Frame::END_HEADERS | Frame::END_STREAM, 1_u32, blk).to_bytes)
+    else
+      blk = enc.encode([{":status", "200"}, {"content-type", "application/grpc"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, blk).to_bytes)
+      conn.write(Frame::Header.new(Frame::Type::Data.value, 0_u8, 1_u32, Bytes[0, 0, 0, 0, 2, 0x68, 0x69]).to_bytes)
+      tb = enc.encode([{"grpc-status", "5"}, {"grpc-message", "not found"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value,
+        Frame::END_HEADERS | Frame::END_STREAM, 1_u32, tb).to_bytes)
+    end
+    conn.flush
+    sleep 0.2.seconds
     conn.close
   end
   port
@@ -686,6 +891,175 @@ describe Gori::Repeater::H2Engine do
       fields = [{":method", "POST"}, {":path", "/p"}, {":scheme", "https"}, {":authority", "h"}]
       dump = String.new(Gori::Repeater::H2Engine.field_dump(fields, "hello".to_slice))
       dump.should end_with("\r\n\r\nhello")
+    end
+  end
+
+  # F2. The send direction had no flow-control accounting at all: `write_data` blasted the
+  # whole body in MAX_FRAME chunks, so every conformant origin answered GOAWAY
+  # FLOW_CONTROL_ERROR — and the report named the ORIGIN for gori's own violation. Upload
+  # fuzzing, large JSON/protobuf bodies and body-size probes were unsendable over h2 from
+  # EVERY surface (repeater, run repeater, MCP send_request, fuzz, mine, discover).
+  describe "request-direction flow control" do
+    it "sends a body larger than the peer's window, blocking for WINDOW_UPDATE" do
+      seen = Channel(Int32).new(1)
+      port = start_h2_origin_window(65_535, grant: true, seen: seen)
+      body = ("A" * 200_000).to_slice
+      result = Gori::Repeater::H2Engine.send_fields(
+        [{":method", "POST"}, {":path", "/big"}, {":scheme", "http"}, {":authority", "h"},
+         {"content-length", body.size.to_s}], body,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        timeout: 5.seconds)
+
+      seen.receive.should eq(200_000) # -1 would mean gori overran the window
+      result.error.should be_nil
+      result.response.try(&.status).should eq(200)
+    end
+
+    it "honours a peer SETTINGS_INITIAL_WINDOW_SIZE below the 65535 default" do
+      seen = Channel(Int32).new(1)
+      # 20 000 bytes against a 16384 window: the whole body fits under the DEFAULT window,
+      # so only reading the peer's SETTINGS before the first DATA frame can catch this.
+      port = start_h2_origin_window(16_384, grant: true, seen: seen)
+      body = ("B" * 20_000).to_slice
+      result = Gori::Repeater::H2Engine.send_fields(
+        [{":method", "POST"}, {":path", "/k20"}, {":scheme", "http"}, {":authority", "h"}], body,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        timeout: 5.seconds)
+
+      seen.receive.should eq(20_000)
+      result.error.should be_nil
+    end
+
+    it "names the flow-control stall instead of blaming the origin, and says the body did not go out" do
+      seen = Channel(Int32).new(1)
+      port = start_h2_origin_window(65_535, grant: false, seen: seen)
+      body = ("C" * 200_000).to_slice
+      result = Gori::Repeater::H2Engine.send_fields(
+        [{":method", "POST"}, {":path", "/stall"}, {":scheme", "http"}, {":authority", "h"}], body,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+        timeout: 500.milliseconds)
+
+      seen.receive.should eq(65_535) # exactly the window, not a byte more
+      error = result.error.should_not be_nil
+      error.should contain("h2 flow control")
+      error.should contain("only 65535 of 200000 request body bytes")
+      error.should contain("never granted flow-control window")
+      error.should contain("NOT fully sent")
+    end
+  end
+
+  # F3. Seven distinct causes collapsed into one "no h2 response from HOST" sentence. A
+  # WAF / rate-limiter test is MADE of telling these apart, and REFUSED_STREAM is an explicit
+  # retry-on-a-new-connection instruction (RFC 9113 §8.7), not a flat refusal.
+  describe "RST_STREAM and silence reporting" do
+    it "names the RST_STREAM error code" do
+      {7_u32 => "REFUSED_STREAM", 11_u32 => "ENHANCE_YOUR_CALM", 8_u32 => "CANCEL"}.each do |code, name|
+        port = start_h2_origin_rst(code)
+        result = Gori::Repeater::H2Engine.send(
+          "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, timeout: 5.seconds)
+        error = result.error.should_not be_nil
+        error.should contain("h2 RST_STREAM #{name} on stream 1")
+        error.should contain("127.0.0.1:#{port}")
+      end
+    end
+
+    it "keeps the RST_STREAM reason on a result that already carries a partial response" do
+      port = start_h2_origin_rst(8_u32, after_headers: true)
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, timeout: 5.seconds)
+
+      result.response.try(&.status).should eq(200) # the head and body survive
+      String.new(result.body.not_nil!).should eq("partial")
+      result.incomplete?.should be_true
+      # ...and the cause is not lost to "origin closed before the framed body finished",
+      # which names an event that never happened.
+      result.error.should_not be_nil
+      result.error.not_nil!.should contain("h2 RST_STREAM CANCEL on stream 1")
+    end
+
+    it "tells an idle read timeout apart from a connection that closed" do
+      mute = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: start_h2_origin_mute,
+        verify_upstream: false, timeout: 500.milliseconds)
+      mute.error.not_nil!.should contain("the origin sent nothing before the read timed out")
+
+      hangup = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: start_h2_origin_hangup,
+        verify_upstream: false, timeout: 5.seconds)
+      hangup.error.not_nil!.should contain("the connection closed before a response frame arrived")
+    end
+  end
+
+  # F4. `synth_head` concatenated the final and the trailing header blocks with no record of
+  # which arrived where, so a gRPC Trailers-Only response and a real trailers response were
+  # byte-identical in the Repeater — while the capture path has carried `X-Gori-Trailers`
+  # since #492. Whether a gateway/CDN/WAF promotes a trailer into a header is a first-class
+  # gRPC test, and the Repeater is where it is run.
+  describe "trailing header blocks" do
+    it "marks the fields that arrived in a real TRAILING block" do
+      result = Gori::Repeater::H2Engine.send(
+        "POST /svc/M HTTP/2\r\nHost: h\r\ncontent-type: application/grpc\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: start_h2_origin_grpc(trailers_only: false),
+        verify_upstream: false, timeout: 5.seconds)
+      head = String.new(result.head)
+      head.should contain("grpc-status: 5")
+      head.should contain("#{Gori::Proxy::H2::HeadCodec::TRAILER_MARKER}: grpc-status, grpc-message")
+    end
+
+    it "does NOT mark a Trailers-Only response, whose status arrived in the response head" do
+      result = Gori::Repeater::H2Engine.send(
+        "POST /svc/M HTTP/2\r\nHost: h\r\ncontent-type: application/grpc\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: start_h2_origin_grpc(trailers_only: true),
+        verify_upstream: false, timeout: 5.seconds)
+      head = String.new(result.head)
+      head.should contain("grpc-status: 5")
+      head.should_not contain(Gori::Proxy::H2::HeadCodec::TRAILER_MARKER)
+    end
+  end
+
+  # F5. The guard was `scheme == "https" && verify`, so `-k` / MCP `insecure:true` routed an
+  # https target into the h2c branch and reported a cleartext prior-knowledge diagnosis for a
+  # failed ALPN negotiation — on the branch operators hit most against a lab origin.
+  it "reports the ALPN diagnosis for an https target even with verification off" do
+    port = start_quiet_origin # accepts TCP, never completes a TLS handshake
+    result = Gori::Repeater::H2Engine.send(
+      "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+      scheme: "https", host: "127.0.0.1", port: port, verify_upstream: false,
+      timeout: 2.seconds)
+    error = result.error.should_not be_nil
+    error.should contain("doesn't offer HTTP/2 via ALPN")
+    error.should_not contain("h2c")
+    error.should_not contain("certificate") # verification was off — don't invent a clause
+  end
+
+  # F6. `authority_override` was one slot each `Host:` line overwrote, so the first vanished
+  # with no notice — a duplicate `Host:` is a standard host-header-confusion / cache-poisoning
+  # / h2-downgrade-desync probe, and h1 puts both lines on the wire for the same bytes.
+  describe "duplicate and empty Host on the h1-text path" do
+    it "carries a second Host: as a regular `host` field instead of dropping the first" do
+      seen = Channel({Array({String, String}), Array({String, Int32})}).new(1)
+      port = start_h2_origin_recording(seen)
+      Gori::Repeater::H2Engine.send(
+        "GET /dup HTTP/2\r\nHost: first.example\r\nHost: second.example\r\nX-A: 1\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, timeout: 5.seconds)
+      fields, _ = seen.receive
+      fields.should contain({":authority", "first.example"})
+      fields.should contain({"host", "second.example"})
+    end
+
+    it "maps an EMPTY Host: to an empty :authority, not to gori's dial target" do
+      seen = Channel({Array({String, String}), Array({String, Int32})}).new(1)
+      port = start_h2_origin_recording(seen)
+      Gori::Repeater::H2Engine.send(
+        "GET /e HTTP/2\r\nHost: \r\nX-A: 1\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, timeout: 5.seconds)
+      fields, _ = seen.receive
+      fields.should contain({":authority", ""})
+      fields.map(&.[1]).should_not contain("127.0.0.1:#{port}")
     end
   end
 end

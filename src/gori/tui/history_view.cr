@@ -2262,9 +2262,16 @@ module Gori::Tui
 
     # Renders a gRPC body as framed messages with a hex preview (protobuf is
     # opaque without the .proto schema — hex is the honest view).
+    #
+    # `scan`, not `messages`: the tail bytes that could NOT be framed are the finding in a
+    # gRPC parser test, and `messages` drops them. A body whose length prefix claims more
+    # than arrived rendered here as "(no complete gRPC messages)" with no byte count —
+    # indistinguishable from a body that simply is not gRPC, while `gori run show
+    # --format json` reported it in full.
     private def grpc_lines(body : Bytes) : Array(String)
-      msgs = Proxy::H2::Grpc.messages(body)
-      return ["(no complete gRPC messages — streaming or partial)"] if msgs.empty?
+      msgs, residual = Proxy::H2::Grpc.scan(body)
+      note = Proxy::H2::Grpc.framing_error(residual)
+      return ["(no complete gRPC messages — streaming or partial)"] if msgs.empty? && note.nil?
       lines = [] of String
       msgs.each_with_index do |m, i|
         if m.trailer
@@ -2275,6 +2282,7 @@ module Gori::Tui
           lines.concat(hex_preview(m.data))
         end
       end
+      lines << "⚠ #{note}" if note
       lines
     end
 

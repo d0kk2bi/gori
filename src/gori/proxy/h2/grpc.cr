@@ -103,5 +103,16 @@ module Gori::Proxy::H2
       end
       {msgs, body.size - pos}
     end
+
+    # `scan`'s residual as the sentence every surface should show, or nil when the body
+    # framed cleanly. One implementation because the surfaces kept drifting: `gori run show
+    # --format json` reported the framing failure while the TUI panes called `messages`,
+    # threw the residual away, and rendered a deliberately-wrong length prefix as
+    # "(no complete gRPC messages)" — which reads identically to "this is not gRPC".
+    def self.framing_error(residual : Int32) : String?
+      return nil unless residual > 0
+      "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
+      "a length prefix claiming more than arrived, or a body cut short"
+    end
   end
 end
