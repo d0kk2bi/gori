@@ -76,14 +76,35 @@ private def preface_refusal(origin_port : Int32, dir : String) : String
   proxy.start
   begin
     raw = TCPSocket.new("127.0.0.1", proxy.port)
+    raw.read_timeout = 10.seconds
     raw << "CONNECT localhost:#{origin_port} HTTP/1.1\r\nHost: localhost:#{origin_port}\r\n\r\n"
     raw.flush
     Codec::Http1.read_head(raw).not_nil!
     tls = h2_offering_client(raw, dir)
     tls << "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
     tls.flush
+    # Drain to EOF before closing, the way a real client does. Closing straight after the write
+    # raced the proxy on Linux: the peer's close was observed first, the connection was torn
+    # down before the refusal was written and recorded, and no response ever reached the sink.
+    # macOS timing hid it, so the suite passed locally and hung in CI.
+    begin
+      buf = Bytes.new(4096)
+      while (n = tls.read(buf)) > 0
+      end
+    rescue
+    end
     tls.close rescue nil
-    done.receive
+    # NEVER a bare `receive` here. This example drives a real proxy over a real socket, so
+    # "the response was not captured" is a plausible outcome of a platform difference — and a
+    # bare receive turns that into a suite that hangs with no output instead of one example
+    # that says what happened. It cost a CI run to learn: `crystal spec` block-buffers its
+    # dots under Actions, so a hang leaves nothing behind to read.
+    select
+    when done.receive
+      # captured
+    when timeout(20.seconds)
+      raise "no response was captured within 20s — the proxy never completed the flow"
+    end
     sink.responses.first.error.not_nil!
   ensure
     proxy.stop
