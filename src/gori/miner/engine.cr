@@ -367,6 +367,28 @@ module Gori::Miner
       end
     end
 
+    # {location, how many wordlist names it cannot carry}, for the locations this run
+    # actually mines and only where something WAS dropped.
+    #
+    # The rejection itself is right — a header/cookie name must be an RFC 7230 token, and
+    # `Content-Length`/`Host` would break framing — but it was invisible: `total_names` sums
+    # the FILTERED sizes, so the operator's only signal was that the same wordlist produced
+    # "444 names" against the query and "435 names" against headers, and only if they ran
+    # both and compared. Coverage was incomplete and the run reported clean. `probe` already
+    # publishes a `skipped` count for exactly this reason; this is the same fact.
+    def skipped_names : Array({Location, Int32})
+      @config.locations.compact_map do |loc|
+        n = @names.size - valid_names_for(loc).size
+        n > 0 ? {loc, n} : nil
+      end
+    end
+
+    # The wordlist size BEFORE any per-location filtering — the denominator a `skipped`
+    # count is only meaningful against.
+    def candidate_names : Int32
+      @names.size
+    end
+
     # ── counters / events ───────────────────────────────────────────────────────────
 
     private def report : Baseline::Report

@@ -213,6 +213,7 @@ module Gori
         flow_id : Int64? = nil
         sni : String? = nil
         ws_keep_key = false
+        keep_request_line = false
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run repeater create [options]"
@@ -231,6 +232,7 @@ module Gori
           p.on("--no-http2", "Alias for --http1") { http2 = false; http2_given = true }
           p.on("--no-auto-cl", "Do not auto-calculate Content-Length header") { auto_cl = false }
           p.on("--flow=ID", "Optional original flow ID this repeater stems from") { |v| flow_id = parse_flow_id(v, "gori run repeater create") }
+          p.on("--keep-request-line", "With --flow: store the flow's request line as-is — do not rewrite an absolute-form line (\"GET http://h/p\") to origin-form") { keep_request_line = true }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
           p.on("--ws-keep-key", "WebSocket: send the request's own Sec-WebSocket-Key instead of a fresh one (lets an absent/short/duplicate/non-base64 key be tested)") { ws_keep_key = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -262,7 +264,13 @@ module Gori
           if fid = flow_id
             detail = store.get_flow(fid)
             abort "gori run repeater create: no flow ##{fid} to clone" unless detail
-            built = Repeater::FlowRequest.build(detail)
+            # The rewrite is PERSISTED here, so this is the one door where it cannot be
+            # undone later: `repeater send --verbatim` sends the stored row, and by then the
+            # absolute-form line is gone. `gori run repeater <flow-id>` grew
+            # `--keep-request-line` for the direct replay; this is the same flag on the
+            # workbench door, and the rewrite is reported either way (see `Built`).
+            built = Repeater::FlowRequest.build(detail, rewrite_absolute_form: !keep_request_line)
+            warn_request_line_rewrite(built, "gori run repeater create")
             # Only seed the request from the flow when the user didn't hand one in: --flow
             # doubles as provenance (the flow_id column) for a custom --request-raw/-file,
             # so an explicit request must NOT be silently overwritten by the flow's bytes.
@@ -771,10 +779,21 @@ module Gori
       # post-expansion resync overwrites it (parity with `repeater create --no-auto-cl` + `send`,
       # the only other path that could do this before).
       #
-      # Returns the PRE-expansion wire plus whether an explicit CL was pinned. Env expansion and
-      # the post-expansion Content-Length resync are `Repeater::Plan`'s job — `explicit_cl` is
-      # exactly the session store's `auto_content_length` toggle inverted, so both ways of
-      # pinning a CL reach the builder as one knob instead of two open-coded branches.
+      # `$KEY` EXPANSION HAPPENS HERE, on the operator's overrides ALONE. `Repeater::Plan`
+      # used to run it over the whole merged wire, which meant a project var whose name
+      # collided with a token in the CAPTURE (`$filter`, `$top`, `$where`, `$token`, `$user`
+      # — ordinary names) rewrote the stored request and re-framed its Content-Length to
+      # match, silently. The captured bytes are evidence and are now passed through untouched
+      # (`PlanOptions#evidence?`), so the only place left that still knows which bytes the
+      # operator typed is this merge — hence the expansion moved here with them. An
+      # UNRESOLVED token in an override is refused before this runs
+      # (`refuse_unresolved_overrides`), so nothing reaches `Env.expand` that it would leave
+      # literal — except a DECLARED session binding, which `Env.expand` deliberately leaves
+      # for `Env.expand_bindings` at the send seam.
+      #
+      # Returns the wire plus whether an explicit CL was pinned. `explicit_cl` is exactly the
+      # session store's `auto_content_length` toggle inverted, so both ways of pinning a CL
+      # reach the builder as one knob instead of two open-coded branches.
       private def self.build_single_flow_request(head_bytes : Bytes, body_bytes : Bytes,
                                                  headers : Array(String), body_override : String?,
                                                  target_override : String?,
@@ -822,7 +841,10 @@ module Gori
           next if name.strip.empty?
           lname = name.strip.downcase
           custom_order << {lname, name} unless custom_headers.has_key?(lname)
-          (custom_headers[lname] ||= [] of String) << val
+          # The VALUE is the operator's draft, so it expands; the NAME is not (a `$` is not
+          # a tchar, so a token there could only ever be a typo, and folding it into the
+          # dedup key would make `-H '$H: a' -H 'X: b'` collide once `$H` resolved to `X`).
+          (custom_headers[lname] ||= [] of String) << Env.expand(val)
         end
         # --rm-header: drop every line with this name. Distinct from `-H "X:"`, which sends
         # X with an EMPTY value — both are real tests and neither can express the other.
@@ -860,8 +882,11 @@ module Gori
           custom_headers[lname].each { |v| new_lines << {"#{orig}:#{v}", request_eol} }
         end
 
+        # `-b` is a draft too, and it expands BEFORE the Content-Length below is framed over
+        # it — which is why `Repeater::Plan`'s post-expansion resync is now a no-op on this
+        # path rather than the thing that quietly re-lengthed the CAPTURED body.
         final_body = if b_over = body_override
-                       b_over.to_slice
+                       Env.expand(b_over).to_slice
                      else
                        body_bytes
                      end
@@ -905,7 +930,10 @@ module Gori
         # host-header-confusion / vhost test deliberately pairs --target (where to connect)
         # with a different claimed Host, so that override must win.
         if (override = target_override) && !custom_headers.has_key?("host") && !dropped.includes?("host")
-          scheme_part, host_part, port_part = Repeater::FlowRequest.parse_target(override)
+          # Expanded, like every other override here: `Repeater::Plan` expands `--target` for
+          # the DIAL, so a `$HOST` left literal in the derived `Host:` header would send a
+          # request whose claimed authority disagreed with the socket it went down.
+          scheme_part, host_part, port_part = Repeater::FlowRequest.parse_target(Env.expand(override))
           # FlowRequest.authority, not a local formula: the two it replaced were both wrong.
           # This one omitted `wss` from the default-port test, so a `wss://h` target — which
           # parse_target resolves to port 443 — got `Host: h:443` while the TUI wrote `Host: h`
@@ -975,6 +1003,27 @@ module Gori
         abort "gori run repeater: unresolved env #{Env.token_list(names)} in -H/-b/--target/--sni — " \
               "set it with `gori run project env set KEY value`, or remove the token. " \
               "(Tokens in the CAPTURED bytes are replayed literally; only your overrides are checked.)"
+      end
+
+      # Say that `FlowRequest.build` turned the capture's absolute-form request line into
+      # origin-form. ONE line, because on a plaintext-HTTP capture it fires on EVERY use of
+      # that flow (a proxy client always sends absolute-form) and a paragraph there is noise
+      # the operator learns to skip. It still has to be said: the same rewrite silently
+      # defuses a routing / cache-poisoning / SSRF probe recorded from a DIRECT send, and
+      # nothing on the row tells the two apart.
+      #
+      # Shared because `Built#rewrote_request_line` was computed at all thirteen call sites
+      # and read at exactly one — the classic "a guard wired at one call site" shape. Every
+      # `gori run` command that seeds itself from a flow now reports it; `--keep-request-line`
+      # exists on the two doors where the stored line is the whole message (`gori run repeater
+      # <flow-id>` and `repeater create`, which persists the rewrite into the session row so
+      # no later flag can recover it).
+      protected def self.warn_request_line_rewrite(built : Repeater::FlowRequest::Built,
+                                                   prefix : String,
+                                                   remedy : String = "--keep-request-line keeps it") : Nil
+        return unless built.rewrote_request_line
+        STDERR.puts "#{prefix}: request line rewritten to origin-form " \
+                    "(absolute-form is a proxy artifact; #{remedy})"
       end
 
       private def self.combine_head_body(head : Bytes, body : Bytes) : Bytes
@@ -1106,14 +1155,7 @@ module Gori
         rescue ex : Repeater::FlowRequest::PseudoHeaderHead
           abort "gori run repeater: flow ##{id} cannot be replayed over HTTP/1.1 — #{ex.message}"
         end
-        if built.rewrote_request_line
-          # One line, because on a plaintext-HTTP capture this fires on EVERY replay (a proxy
-          # client always sends absolute-form) and a paragraph there is noise the operator
-          # learns to skip. It still has to be said: the same rewrite silently defuses a
-          # routing / cache-poisoning / SSRF probe recorded from a direct send.
-          STDERR.puts "gori run repeater: request line rewritten to origin-form " \
-                      "(absolute-form is a proxy artifact; --keep-request-line keeps it)"
-        end
+        warn_request_line_rewrite(built, "gori run repeater")
 
         raw_bytes = built.bytes
         # `Env.head_body_boundary`, not a hand-rolled CRLFCRLF scan: a captured head may be
@@ -1145,6 +1187,9 @@ module Gori
             http2: use_http2, sni: sni_override.presence || built.sni,
             auto_content_length: false, resync_cl_after_expansion: !explicit_cl,
             # These bytes are stored EVIDENCE, not a draft — see `PlanOptions#evidence?`.
+            # That now includes `$KEY` expansion: `build_single_flow_request` expanded the
+            # operator's OWN `-H`/`-b`/`--target` above, so nothing downstream needs to (and
+            # nothing downstream can still tell the operator's bytes from the capture's).
             evidence: true,
             verify: !insecure, overrides: host_overrides), outbound)
         rescue ex : Repeater::PlanError

@@ -59,6 +59,13 @@ module Gori::Miner
     # `Env.expand` is byte-safe: a captured flow's binary body survives the round trip
     # unchanged (see its doc comment), so `String.new(bytes)` here loses nothing.
     property request : String
+    # PROVENANCE: this request is a CAPTURED FLOW's stored bytes, not one the operator typed.
+    # Same flag, same meaning and same consequences as `Fuzz::PlanOptions#evidence?` and
+    # `Repeater::PlanOptions#evidence?` — with it off, seeding the miner from a capture
+    # refused any head carrying an OData/Mongo `$token` and promoted a bare-LF head to CRLF
+    # on every one of the run's probes, while `gori run repeater <same-flow>` replayed it
+    # byte-exact. `--request FILE` / stdin / the TUI editor keep the draft behaviour.
+    property? evidence : Bool
     # The origin the seeding flow implies, when there is one (nil for --request/stdin).
     property default_target : String?
     # An explicit target, which wins over `default_target` when non-blank.
@@ -88,6 +95,7 @@ module Gori::Miner
 
     def initialize(@request : String = "",
                    *,
+                   @evidence : Bool = false,
                    @default_target : String? = nil,
                    @target : String? = nil,
                    @http2 : Bool = false,
@@ -168,8 +176,13 @@ module Gori::Miner
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
       # ONE `Env.expand_wire` over the request, before anything reads it — and first, a
       # refusal when a token in the HEAD resolves to nothing (see `refuse_unresolved`).
-      refuse_unresolved(Env.unresolved_wire(options.request))
-      request = Env.expand_wire(options.request)
+      # Both are DRAFT-time passes and are skipped for EVIDENCE — see `PlanOptions#evidence?`.
+      request = if options.evidence?
+                  options.request.to_slice
+                else
+                  refuse_unresolved(Env.unresolved_wire(options.request))
+                  Env.expand_wire(options.request)
+                end
       request_target = Gori::Outbound.request_target(request)
       origin = resolve_origin(options)
 

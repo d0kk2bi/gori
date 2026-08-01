@@ -87,7 +87,7 @@ module Gori
         # literally. Explicit and identical to cmd_fuzz, rather than relying on the store that
         # `cli_host_overrides` happens to open below (see run.cr's open_store).
         hydrate_project_env(project_name, db_path) if (project_name || db_path) && flow_id.nil?
-        bytes, default_target, src_h2 = sequence_source(flow_id, request_file, project_name, db_path)
+        bytes, default_target, src_h2, evidence = sequence_source(flow_id, request_file, project_name, db_path)
         token_loc = build_token_loc(k, selector)
 
         config = Sequencer::Config.new(mode: Sequencer::Mode::LiveReplay, token_loc: token_loc, goal: count, concurrency: concurrency)
@@ -96,7 +96,10 @@ module Gori
         config.timeout = timeout
         config.retries = retries
         config.max_requests = max_requests
-        options = Sequencer::PlanOptions.new(bytes, default_target: default_target,
+        options = Sequencer::PlanOptions.new(bytes,
+          # A `--flow` request is CAPTURED; --request/stdin is a draft the operator authored.
+          # See `Sequencer::PlanOptions#evidence?`.
+          evidence: evidence, default_target: default_target,
           target: target_override, http2: force_h2 || src_h2, config: config,
           verify: !insecure, sni: sni,
           overrides: cli_host_overrides(project_name, db_path, flow_id))
@@ -168,14 +171,17 @@ module Gori
         end
       end
 
-      # {raw request bytes, the seeding flow's target, http2} from the chosen source.
-      # Deliberately UNEXPANDED: `Sequencer::Plan.build` owns `Env.expand`, and expanding
-      # here as well would resolve a var whose value itself contains a `$TOKEN` twice.
+      # {raw request bytes, the seeding flow's target, http2, is-evidence} from the chosen
+      # source. Deliberately UNEXPANDED: `Sequencer::Plan.build` owns `Env.expand`, and
+      # expanding here as well would resolve a var whose value itself contains a `$TOKEN`
+      # twice. The last element is PROVENANCE, not a knob: only the `--flow` branch hands back
+      # captured bytes, and only that branch may skip the draft-time passes (see
+      # `Sequencer::PlanOptions#evidence?`).
       private def self.sequence_source(flow_id : Int64?, request_file : String?,
-                                       project_name : String?, db_path : String?) : {Bytes, String?, Bool}
+                                       project_name : String?, db_path : String?) : {Bytes, String?, Bool, Bool}
         if file = request_file
           abort "gori run sequence: not a readable file: #{file}" unless File.exists?(file) && !File.directory?(file)
-          {File.read(file).to_slice, nil, false}
+          {File.read(file).to_slice, nil, false, false}
         elsif id = flow_id
           store = open_store(resolve_read_project(project_name, db_path))
           detail = begin
@@ -185,9 +191,13 @@ module Gori
           end
           abort "gori run sequence: no flow ##{id}" unless detail
           built = Repeater::FlowRequest.build(detail)
-          {built.bytes, built.target, built.http2}
+          # Every replay in the collection carries a request line gori changed — see
+          # `warn_request_line_rewrite`.
+          warn_request_line_rewrite(built, "gori run sequence",
+            "replay it with `gori run repeater #{id} --keep-request-line` to keep it")
+          {built.bytes, built.target, built.http2, true}
         elsif !STDIN.tty?
-          {STDIN.gets_to_end.to_slice, nil, false}
+          {STDIN.gets_to_end.to_slice, nil, false, false}
         else
           abort "gori run sequence: no source — give a <flow-id>, --request FILE, or pipe a request on stdin"
         end
@@ -229,7 +239,11 @@ module Gori
 
       private def self.sequence_done(ev : Sequencer::DoneEvent, collected : Int32) : Nil
         STDERR.print "\r" if STDERR.tty?
-        STDERR.puts "done · #{collected} collected · #{ev.sent} sent#{ev.stopped ? " (stopped)" : ""}"
+        # `requests` only when it DIFFERS from the replay count — `--retries` is what makes
+        # them diverge, and a run without one should not grow a second number that says the
+        # same thing twice. See `Sequencer::ProgressEvent#requests`.
+        extra = ev.requests > ev.sent ? " · #{ev.requests} requests on the wire" : ""
+        STDERR.puts "done · #{collected} collected · #{ev.sent} sent#{extra}#{ev.stopped ? " (stopped)" : ""}"
       end
 
       # In jsonl mode the samples already streamed, so append the final report as a JSON

@@ -268,3 +268,71 @@ describe Gori::Repeater::Minimize do
     capped.sent.should eq(3)
   end
 end
+
+# `gori run repeater minimize --verbatim`'s resolver.
+#
+# `repeater send` grew `--verbatim` precisely because a session can hold EVIDENCE; minimize
+# is a search over that same request and had no such knob, so a session seeded from a capture
+# was either refused outright (an OData `$top` in the head) or minimized against bytes that
+# differ from what `repeater send --verbatim` puts on the wire ($where substituted, the CL
+# re-framed 22 → 19). The resolver is the whole difference, so it is asserted directly.
+#
+# The catch this exists to pin: `Minimize.run` hands its `resolve` proc the request
+# LF-NORMALIZED (its text helpers are written against that form) and restores the operator's
+# terminator only on the REPORT — so a resolver that simply took the bytes put a CRLF-stored
+# session on the wire bare-LF, inventing the very desync primitive the flag preserves, and one
+# that blindly re-CRLF'd produced `\r\r\n` on the report call.
+module Gori::CLI::Run
+  def self.restore_head_crlf_for_spec(text : String) : Bytes
+    restore_head_crlf(text)
+  end
+
+  def self.mixed_line_endings_for_spec?(text : String) : Bool
+    mixed_line_endings?(text)
+  end
+end
+
+describe "gori run repeater minimize --verbatim — the resolver" do
+  it "puts CRLF back on the HEAD and leaves the body byte-exact" do
+    lf = "POST /bk HTTP/1.1\nHost: h\nContent-Length: 22\n\n{\"q\":\"$where 1==1 ab\"}\n"
+    String.new(Gori::CLI::Run.restore_head_crlf_for_spec(lf)).should eq(
+      "POST /bk HTTP/1.1\r\nHost: h\r\nContent-Length: 22\r\n\r\n{\"q\":\"$where 1==1 ab\"}\n")
+  end
+
+  it "is idempotent, so the already-restored report text does not become \\r\\r\\n" do
+    crlf = "POST /bk HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi"
+    String.new(Gori::CLI::Run.restore_head_crlf_for_spec(crlf)).should eq(crlf)
+  end
+
+  it "does not substitute a $KEY, and does not re-frame the Content-Length" do
+    saved = Gori::Settings.env_vars
+    saved_x = Gori::Settings.env_prefix
+    begin
+      Gori::Settings.env_prefix = "$"
+      Gori::Settings.env_vars = [{"where", "XX"}]
+      out = String.new(Gori::CLI::Run.restore_head_crlf_for_spec(
+        "POST /bk HTTP/1.1\nHost: h\nContent-Length: 22\n\n{\"q\":\"$where 1==1 ab\"}\n"))
+      out.should contain("$where 1==1 ab")     # the capture, not the project's value
+      out.should contain("Content-Length: 22") # over a 23-byte body: the CL-desync evidence
+    ensure
+      Gori::Settings.env_vars = saved || [] of {String, String}
+      Gori::Settings.env_prefix = saved_x || "$"
+    end
+  end
+
+  describe "the mixed-terminator notice" do
+    it "fires only when the HEAD really mixes CRLF and bare LF" do
+      Gori::CLI::Run.mixed_line_endings_for_spec?(
+        "POST /m HTTP/1.1\r\nHost: h\nX: 1\r\n\r\nhi").should be_true
+    end
+
+    it "does not fire for an all-CRLF head, an all-LF head, or a body full of LFs" do
+      Gori::CLI::Run.mixed_line_endings_for_spec?("GET / HTTP/1.1\r\nHost: h\r\n\r\n").should be_false
+      Gori::CLI::Run.mixed_line_endings_for_spec?("GET / HTTP/1.1\nHost: h\n\n").should be_false
+      # A raw 0x0A in a BODY is a byte, not a line ending — judging the whole request would
+      # flag every binary upload.
+      Gori::CLI::Run.mixed_line_endings_for_spec?(
+        "POST / HTTP/1.1\r\nHost: h\r\n\r\nline1\nline2\n").should be_false
+    end
+  end
+end

@@ -201,6 +201,20 @@ describe Gori::Sequencer::Plan do
       # Head normalized, BODY left byte-for-byte (a body's LFs are payload, not framing).
       String.new(plan.request).should eq("GET /p HTTP/1.1\r\nHost: t.test\r\n\r\nbody\nkeeps\nLF")
     end
+
+    # …for a DRAFT. The example above is the editor case its title names — a line buffer whose
+    # fresh lines end in LF owes the wire a CRLF — and it does NOT generalise to a capture,
+    # whose head is already exact wire bytes. A bare-LF terminator is a front-end/back-end
+    # desync primitive gori stores byte-exact and `gori run repeater <flow-id>` replays
+    # byte-exact; sending the same flow to the sequencer used to quietly un-desync it and then
+    # report a clean collection. See `PlanOptions#evidence?`.
+    it "leaves a CAPTURED bare-LF head exactly as captured" do
+      raw = "GET /p HTTP/1.1\nHost: t.test\n\nbody\nkeeps\nLF"
+      plan = Q::Plan.build(Q::PlanOptions.new(raw.to_slice, evidence: true,
+        target: "http://t.test",
+        config: live_config(Q::TokenLoc.cookie("SID"), 5), verify: false), ungated)
+      String.new(plan.request).should eq(raw)
+    end
   end
 
   describe "analyse-only (manual) plans" do

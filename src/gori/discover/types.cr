@@ -121,7 +121,15 @@ module Gori
     record BaselineEvent, dir : String, kind : String, note : String?
     record FindingEvent, finding : Finding
     record ProgressEvent, progress : Progress
-    record DoneEvent, progress : Progress, stats : RunStats, stopped : Bool
+    # `budget_exhausted` — the run STOPPED SHORT because `max_requests` ran out, as opposed to
+    # having simply reached its cap on the last thing it had to do. Fuzz and mine let a
+    # consumer derive this (`sent < total`, `names_done < names_total`); discover has no
+    # stable denominator to derive it from — `est_total` is a moving estimate — so the engine
+    # has to say it. Without it, `status:"done", job_complete:true, has_more:false` came back
+    # with 275 of 283 wordlist tasks unsent, and both the CLI and an agent read that as a
+    # finished directory sweep.
+    record DoneEvent, progress : Progress, stats : RunStats, stopped : Bool,
+      budget_exhausted : Bool = false
     record ErrorEvent, message : String
 
     alias Event = BaselineEvent | FindingEvent | ProgressEvent | DoneEvent | ErrorEvent

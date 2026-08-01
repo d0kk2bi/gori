@@ -55,6 +55,13 @@ module Gori::Sequencer
     # The raw request to replay, BEFORE `Env.expand_wire` — the builder owns the expansion
     # so it happens exactly once (see `Plan.build`). Empty for a manual (analyse-only) run.
     property request : Bytes
+    # PROVENANCE: this request is a CAPTURED FLOW's stored bytes, not one the operator typed.
+    # Same flag, same meaning and same consequences as `Fuzz::PlanOptions#evidence?` and
+    # `Repeater::PlanOptions#evidence?` — with it off, sequencing a capture refused any head
+    # carrying an OData/Mongo `$token` and promoted a bare-LF head to CRLF on every replay in
+    # the collection, while `gori run repeater <same-flow>` sent it byte-exact.
+    # `--request FILE` / stdin / the TUI editor keep the draft behaviour.
+    property? evidence : Bool
     # The origin the seeding flow implies, when there is one (nil for --request/stdin).
     property default_target : String?
     # An explicit target, which wins over `default_target` when non-blank.
@@ -75,6 +82,7 @@ module Gori::Sequencer
 
     def initialize(@request : Bytes = Bytes.empty,
                    *,
+                   @evidence : Bool = false,
                    @default_target : String? = nil,
                    @target : String? = nil,
                    @http2 : Bool = false,
@@ -155,8 +163,13 @@ module Gori::Sequencer
       # their source reader, and doing it there AND here would resolve a var whose value
       # itself contains a `$TOKEN` twice. A token in the HEAD that resolves to nothing
       # refuses the run first (see `refuse_unresolved`).
-      refuse_unresolved(Env.unresolved_wire(String.new(options.request)))
-      request = Env.expand_wire(String.new(options.request))
+      # Both are DRAFT-time passes and are skipped for EVIDENCE — see `PlanOptions#evidence?`.
+      request = if options.evidence?
+                  options.request
+                else
+                  refuse_unresolved(Env.unresolved_wire(String.new(options.request)))
+                  Env.expand_wire(String.new(options.request))
+                end
       sender = Fuzz::Sender.new(origin, outbound, http2: options.http2?, verify: options.verify?,
         sni: options.sni, timeout: config.timeout, overrides: options.overrides)
       new(engine: Engine.new(request, options.http2?, sender, config), config: config,

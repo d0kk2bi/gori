@@ -272,4 +272,56 @@ describe Gori::Fuzz::Plan do
       ex.reason.should eq(F::PlanError::Reason::NoTarget)
     end
   end
+
+  # The Content-Length knob `Fuzz::Config` has always carried and no surface ever wrote.
+  #
+  # A fuzz template's framing headers are operator-authored evidence, not a draft to be
+  # tidied (P7 / "malformed input IS the payload" names the fuzz path explicitly): a
+  # `Content-Length: 5` over a ten-byte body IS the CL-desync probe. With the resync welded
+  # on, every variation went out with the header corrected, the run reported `0 errors`, and
+  # the desync class was unreachable from the Fuzzer on all three surfaces — while the
+  # Repeater right next to it has `--verbatim` and Intercept documents the same switch as
+  # "the desync switch, and the reason to hold a request at all".
+  describe "update_content_length" do
+    desync_tpl = "POST /x?p=\u00A7S\u00A7 HTTP/1.1\r\nHost: t.test\r\nContent-Length: 5\r\n\r\nAAAAAAAAAA"
+
+    it "sends the operator's declared Content-Length when the knob is off" do
+      plan = F::Plan.build(F::PlanOptions.new(desync_tpl, target: "http://t.test",
+        sources: [F::InlineList.new(["aa"])] of F::PayloadSource,
+        config: F::Config.new(update_content_length: false)), ungated)
+      String.new(plan.generator.baseline_request).should contain("Content-Length: 5\r\n")
+    end
+
+    it "still recomputes it by default (the knob is opt-OUT, not a behaviour change)" do
+      plan = F::Plan.build(F::PlanOptions.new(desync_tpl, target: "http://t.test",
+        sources: [F::InlineList.new(["aa"])] of F::PayloadSource), ungated)
+      String.new(plan.generator.baseline_request).should contain("Content-Length: 10\r\n")
+    end
+
+    # …and when it is about to rewrite framing the operator authored, the surface has to say
+    # so. `rewrites_content_length?` is that fact, computed ONCE at plan-build rather than
+    # discovered per request, so a surface can name the flag before the sweep starts.
+    it "flags a template whose declared CL already disagrees with its own body" do
+      F::Plan.build(F::PlanOptions.new(desync_tpl, target: "http://t.test",
+        sources: [F::InlineList.new(["aa"])] of F::PayloadSource), ungated)
+        .rewrites_content_length?.should be_true
+    end
+
+    it "does NOT flag a template whose CL is correct, one with no body, or one under --verbatim" do
+      correct = "POST /y HTTP/1.1\r\nHost: t.test\r\nContent-Length: 1\r\n\r\n\u00A7S\u00A7"
+      bodiless = "GET /z?q=\u00A7S\u00A7 HTTP/1.1\r\nHost: t.test\r\n\r\n"
+      # `Transfer-Encoding` present: `ContentLength.sync` bails, so nothing is rewritten and
+      # there is nothing to warn about — the one shape that was already verbatim.
+      chunked = "POST /c HTTP/1.1\r\nHost: t.test\r\nTransfer-Encoding: chunked\r\n" \
+                "Content-Length: 99\r\n\r\n1\r\n\u00A7S\u00A7\r\n0\r\n\r\n"
+      src = [F::InlineList.new(["a"])] of F::PayloadSource
+      {correct, bodiless, chunked}.each do |tpl|
+        F::Plan.build(F::PlanOptions.new(tpl, target: "http://t.test", sources: src), ungated)
+          .rewrites_content_length?.should be_false
+      end
+      F::Plan.build(F::PlanOptions.new(desync_tpl, target: "http://t.test", sources: src,
+        config: F::Config.new(update_content_length: false)), ungated)
+        .rewrites_content_length?.should be_false
+    end
+  end
 end

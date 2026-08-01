@@ -25,8 +25,10 @@ module Gori
         throttle : Int32? = nil
         timeout : Time::Span? = nil
         retries = 0
+        max_requests : Int64? = nil
         follow = false
         keep_alive = true
+        update_cl = true
         auto_cal = false
         format = :text
         force = false
@@ -65,8 +67,16 @@ module Gori
           p.on("--throttle=MS", "Fixed delay between requests (ms)") { |v| throttle = parse_nonneg(v, "--throttle") }
           p.on("--timeout=SEC", "Per-request connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("--retries=N", "Retries on a network error") { |v| retries = parse_nonneg(v, "--retries") }
+          # Counted against REAL sends, not payloads: retries, redirect hops and baseline
+          # calibration all charge it (Fuzz::CappedBackend), matching mine/discover/sequence
+          # and MCP's `max_requests`, which honoured this knob while the CLI had no way to set it.
+          p.on("--max-requests=N", "Hard cap on total requests sent (retries and redirect hops count)") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
           p.on("--follow-redirects", "Follow same-origin redirects") { follow = true }
           p.on("--no-keep-alive", "Dial a fresh connection for every request (default: reuse)") { keep_alive = false }
+          # The Repeater's `--verbatim` and Intercept's `update_content_length:false` by the
+          # same name and for the same reason: a CL/CL-TE desync template is the payload, and
+          # recomputing its Content-Length swept a different request than the one written.
+          p.on("--verbatim", "Send the template's Content-Length as written — no auto-resync after payload substitution (for CL / CL-TE desync payloads)") { update_cl = false }
           p.on("--mc=SPEC", "Match status (e.g. 200,302,500-599,2xx)") { |v| matcher.match_status = v }
           p.on("--fc=SPEC", "Filter out status") { |v| matcher.filter_status = v }
           p.on("--ms=SPEC", "Match response size (e.g. 1500,>1000)") { |v| matcher.match_size = v }
@@ -95,16 +105,20 @@ module Gori
         flow_id ||= positional.first?.try { |s| parse_flow_id(s, "gori run fuzz") }
 
         hydrate_project_env(project_name, db_path) if (project_name || db_path) && flow_id.nil?
-        text, default_target, src_h2 = fuzz_source(flow_id, request_file, project_name, db_path)
+        text, default_target, src_h2, evidence = fuzz_source(flow_id, request_file, project_name, db_path)
         http2 = force_h2 || src_h2
 
         options = Fuzz::PlanOptions.new(text,
+          # A `--flow` template is a CAPTURED request; --request/stdin is a draft the operator
+          # authored. See `Fuzz::PlanOptions#evidence?`.
+          evidence: evidence,
           default_target: default_target, target: target_override,
           auto_mark: auto, marks: marks, http2: http2,
           sources: sources, processors: processors,
           config: Fuzz::Config.new(mode: mode, concurrency: concurrency, rps: rate, throttle_ms: throttle,
             retries: retries, timeout: timeout, follow_redirects: follow, auto_calibrate: auto_cal,
-            keep_bodies: :none, keep_alive: keep_alive),
+            keep_bodies: :none, keep_alive: keep_alive, max_requests: max_requests,
+            update_content_length: update_cl),
           matcher: matcher, verify: !insecure, sni: sni,
           overrides: cli_host_overrides(project_name, db_path, flow_id))
         # Gate outbound traffic through the ONE seam every surface shares (Gori::Outbound):
@@ -120,6 +134,7 @@ module Gori
           abort "gori run fuzz: #{fuzz_plan_error(ex)}"
         end
         warn_fuzz_marks(plan)
+        warn_fuzz_content_length(plan)
         origin = plan.origin
         unless origin.scheme.in?("http", "https")
           outbound.close
@@ -134,7 +149,8 @@ module Gori
           (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run fuzz")
           preflight_bindings(text, bind_from, "gori run fuzz")
           plan.engine.calibrate_baseline if auto_cal
-          run_fuzz_stream(plan.engine, mode, origin.scheme, origin.host, origin.port, format, force, fail_if_no_matches, plan.pool)
+          run_fuzz_stream(plan.engine, mode, origin.scheme, origin.host, origin.port, format, force,
+            fail_if_no_matches, plan.pool, max_requests)
         ensure
           outbound.close
         end
@@ -167,12 +183,25 @@ module Gori
         end
       end
 
-      # {template text, default target (nil for file/stdin), http2} from the chosen source.
+      # The template declares a Content-Length that disagrees with its own body BEFORE any
+      # payload is substituted — so the auto-resync is about to rewrite framing the operator
+      # authored deliberately, on every variation, and the sweep would report a clean
+      # CL-desync run that never put a CL desync on the wire. Once, up front, naming the flag.
+      private def self.warn_fuzz_content_length(plan : Fuzz::Plan) : Nil
+        return unless plan.rewrites_content_length?
+        STDERR.puts "gori run fuzz: note: the template's Content-Length disagrees with its own body " \
+                    "and is being recomputed on every request — pass --verbatim to send it as written"
+      end
+
+      # {template text, default target (nil for file/stdin), http2, is-evidence} from the
+      # chosen source. The last element is PROVENANCE, not a knob: only the `--flow` branch
+      # hands back captured bytes, and only that branch may therefore skip the draft-time
+      # passes (see `Fuzz::PlanOptions#evidence?`).
       private def self.fuzz_source(flow_id : Int64?, request_file : String?,
-                                   project_name : String?, db_path : String?) : {String, String?, Bool}
+                                   project_name : String?, db_path : String?) : {String, String?, Bool, Bool}
         if file = request_file
           abort "gori run fuzz: not a readable file: #{file}" unless File.exists?(file) && !File.directory?(file)
-          {File.read(file), nil, false}
+          {File.read(file), nil, false, false}
         elsif id = flow_id
           store = open_store(resolve_read_project(project_name, db_path))
           detail = begin
@@ -182,9 +211,15 @@ module Gori
           end
           abort "gori run fuzz: no flow ##{id}" unless detail
           built = Repeater::FlowRequest.build(detail)
-          {String.new(built.bytes).scrub, built.target, built.http2}
+          # The sweep runs against a request line gori changed, so say so — see
+          # `warn_request_line_rewrite`. No flag here: unlike the repeater there is no
+          # single request to keep verbatim, and a fuzz template that dials one origin
+          # while its line names another needs its own design, not a boolean.
+          warn_request_line_rewrite(built, "gori run fuzz",
+            "replay it with `gori run repeater #{id} --keep-request-line` to keep it")
+          {String.new(built.bytes).scrub, built.target, built.http2, true}
         elsif !STDIN.tty?
-          {STDIN.gets_to_end, nil, false}
+          {STDIN.gets_to_end, nil, false, false}
         else
           abort "gori run fuzz: no source — give a <flow-id>, --request FILE, or pipe a request on stdin"
         end
@@ -192,7 +227,8 @@ module Gori
 
       private def self.run_fuzz_stream(engine : Fuzz::Engine, mode : Fuzz::Mode, scheme : String,
                                        host : String, port : Int32, format : Symbol, force : Bool,
-                                       fail_if_no_matches : Bool, pool : Fuzz::ConnPool? = nil) : Nil
+                                       fail_if_no_matches : Bool, pool : Fuzz::ConnPool? = nil,
+                                       max_requests : Int64? = nil) : Nil
         total = fuzz_preflight(engine, mode, scheme, host, port, force)
         matched = 0
         errored = 0
@@ -206,7 +242,7 @@ module Gori
             if emit_fuzz_result(r, format, buffer)
               r.matched? ? (matched += 1) : (errored += 1)
             end
-          when Fuzz::DoneEvent  then fuzz_done(ev, matched + errored, pool)
+          when Fuzz::DoneEvent  then fuzz_done(ev, matched + errored, pool, max_requests)
           when Fuzz::ErrorEvent then had_error = true; STDERR.puts "fuzz error: #{ev.message}"
           end
         end
@@ -241,9 +277,27 @@ module Gori
         STDERR.flush
       end
 
-      private def self.fuzz_done(ev : Fuzz::DoneEvent, emitted : Int32, pool : Fuzz::ConnPool?) : Nil
+      # A cap that HALTED the run is not the same run as one that finished — say which, and
+      # how much was left untried. Keyed on the TRUE wire count (`requests`, what the cap is
+      # enforced against), and only claimed when payloads really were left: a sweep that
+      # happened to land exactly on its budget with nothing remaining is complete.
+      private def self.warn_fuzz_budget(p : Fuzz::Progress, max_requests : Int64?) : Nil
+        return unless (cap = max_requests) && p.requests >= cap
+        return unless (total = p.total) && p.sent < total
+        STDERR.puts "budget exhausted · stopped at --max-requests #{cap} with " \
+                    "#{total - p.sent} of #{total} payloads untried"
+      end
+
+      private def self.fuzz_done(ev : Fuzz::DoneEvent, emitted : Int32, pool : Fuzz::ConnPool?,
+                                 max_requests : Int64? = nil) : Nil
         STDERR.print "\r" if STDERR.tty? # clear the in-place meter (none was drawn when piped)
-        STDERR.puts "done · #{ev.progress.sent} sent · #{emitted} shown · #{ev.progress.errors} errors#{ev.stopped ? " (stopped)" : ""}"
+        # `requests` only when it DIFFERS from the payload count — retries and redirect hops
+        # are the two things that make them diverge, and a run with neither should not grow a
+        # second number that says the same thing twice. See `Fuzz::Progress#requests`.
+        p = ev.progress
+        extra = p.requests > p.sent ? " · #{p.requests} requests on the wire" : ""
+        STDERR.puts "done · #{p.sent} sent#{extra} · #{emitted} shown · #{p.errors} errors#{ev.stopped ? " (stopped)" : ""}"
+        warn_fuzz_budget(p, max_requests)
         # Sends stopped BEFORE the socket (Sandbox, an exclude rule, an unbound binding). They
         # already appear as per-row errors, but a run that is 100% refused reads as "the
         # target is down" unless the gate is named once, with its remedy.
