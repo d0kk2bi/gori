@@ -41,7 +41,8 @@ module Gori
         sc = gate
         built = RequestBuilder::Built.new(plan.bytes, plan.scheme, plan.host, plan.port)
         http2 = plan.http2?
-        recorded_flow_id = record_history ? record_outbound_request(built, http2) : nil
+        wire = wire_request(plan, built)
+        recorded_flow_id = record_history ? record_outbound_request(built, wire, http2) : nil
         result = plan.send
         record_outbound_response(recorded_flow_id, result) if recorded_flow_id
         # Audit trail on STDERR — never STDOUT (reserved for JSON-RPC).
@@ -52,7 +53,7 @@ module Gori
 
         body_cap, body_omit = body_return_opts(h)
         Result.new(send_result_json(result, recorded_flow_id, repeater_id,
-          include_sensitive_headers, sc, built, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules),
+          include_sensitive_headers, sc, built, wire, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules),
           is_error: !result.ok?)
       rescue ex : Gori::Error
         # Bad input (missing/invalid url, illegal header, …) — return a clean
@@ -70,13 +71,34 @@ module Gori
         {"url", "method", "headers", "body", "raw"}.select { |f| present?(h, f) }.to_a
       end
 
-      # The request actually put on the wire, parsed back from the built bytes, so
+      # The bytes that actually reach the origin, as head text.
+      #
+      # On h1 they ARE `built.bytes` — `Engine` writes them byte-exact (P7). On h2 the bytes
+      # are only the SOURCE: `H2Engine` resolves `:path` from the request line, folds `Host:`
+      # into `:authority` and (unless `verbatim`) lowercases field names. Deriving the report
+      # and the History row from the source therefore described a request gori never sent —
+      # MCP answered `target: "/mcp-noversion"` with `Transfer-Encoding` in the recorded head
+      # while `GET /` went out, and `run show <id> --format raw` printed those bytes back. An
+      # agent-driven scan reads exactly this.
+      #
+      # Falls back to the source when the encoding raises: `plan.send` hits the same refusal
+      # and reports it as the error, and a report is not the place to raise a second time.
+      private def wire_request(plan : Repeater::Plan, built : RequestBuilder::Built) : Bytes
+        return built.bytes unless plan.http2?
+        Repeater::H2Engine.encoded_request(built.bytes, scheme: built.scheme, host: built.host,
+          port: built.port, preserve_field_case: plan.preserve_field_case?)
+      rescue Gori::Error
+        built.bytes
+      end
+
+      # The request actually put on the wire, parsed back from the encoded bytes, so
       # a caller can confirm scheme/host/port/method/target/version independently
       # of which inputs it supplied (flow_id vs url/raw).
-      private def emit_effective_request(j : JSON::Builder, built : RequestBuilder::Built, http2 : Bool) : Nil
+      private def emit_effective_request(j : JSON::Builder, built : RequestBuilder::Built,
+                                         wire : Bytes, http2 : Bool) : Nil
         # `split` (no arg) collapses whitespace runs so a malformed request line with a
         # doubled space still reports the real method/target/version (see Outbound.request_target).
-        parts = (String.new(built.bytes).each_line.first? || "").split
+        parts = (String.new(wire).each_line.first? || "").split
         j.field "effective_request" do
           j.object do
             j.field "scheme", built.scheme
@@ -191,8 +213,11 @@ module Gori
         repeater_id
       end
 
-      private def record_outbound_request(built : RequestBuilder::Built, http2 : Bool) : Int64
-        head, body = split_wire_request(built.bytes)
+      # `wire` — not `built.bytes` — is the evidence: History is what `run show --format raw`
+      # and `get_flow` replay from, and on h2 the source text is not what went out. See
+      # `wire_request`.
+      private def record_outbound_request(built : RequestBuilder::Built, wire : Bytes, http2 : Bool) : Int64
+        head, body = split_wire_request(wire)
         # `authored_start_line`, not `parse_request_head`: these bytes are the caller's, and
         # under `verbatim` a bare-LF terminator is the payload. See its comment for why the
         # shared parser must stay strict.
@@ -255,13 +280,14 @@ module Gori
 
       private def send_result_json(result : Repeater::Result, recorded_flow_id : Int64?,
                                    repeater_id : Int64?, include_sensitive_headers : Bool,
-                                   sc : ScopeCheck, built : RequestBuilder::Built, http2 : Bool,
+                                   sc : ScopeCheck, built : RequestBuilder::Built, wire : Bytes,
+                                   http2 : Bool,
                                    ignored : Array(String), body_cap : Int32, body_omit : Bool,
                                    applied_rules : Bool = false) : String
         JSON.build do |j|
           j.object do
             emit_scope(j, sc)
-            emit_effective_request(j, built, http2)
+            emit_effective_request(j, built, wire, http2)
             j.field "match_replace_applied", true if applied_rules
             unless ignored.empty?
               j.field("ignored_fields") { j.array { ignored.each { |f| j.string f } } }
@@ -543,6 +569,10 @@ module Gori
             # SSTI/shell payload and must not be refused here. Non-verbatim callers keep the
             # refusal: RequestBuilder expanded, so a surviving `$KEY` really is unresolved.
             refuse_unresolved_env: !bool_arg(h, "verbatim", false),
+            # The h2 half of the same promise: `verbatim` means the bytes ARE the message, so
+            # an uppercase field name is the RFC 9113 §8.2.1 conformance probe and not a
+            # copy-paste artifact to repair. See `PlanOptions#preserve_field_case?`.
+            preserve_field_case: bool_arg(h, "verbatim", false),
             origin: Repeater::Origin.new(built.scheme, built.host, built.port),
             http2: bool_arg(h, "http2", false), verify: verify,
             timeout: timeout, overrides: overrides)

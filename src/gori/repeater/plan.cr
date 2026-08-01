@@ -105,12 +105,23 @@ module Gori::Repeater
     # (The refusal was already inconsistent — `${jndi:…}` and `$(id)` passed it.)
     property? refuse_unresolved_env : Bool
 
+    # h2 ONLY: put field names on the wire with the case the operator typed. Off by default
+    # because the h1 head text is both a wire format and the paste buffer — a request copied
+    # from Burp or curl is conventionally title-cased and h2 requires lowercase (RFC 9113
+    # §8.2.1), so verbatim case would kill the stream of every ordinary `--http2` send. A
+    # surface turns it on exactly where `refuse_unresolved_env?` goes off, and for the same
+    # reason: under `--verbatim` / MCP `verbatim:true` the bytes ARE the message, and an
+    # uppercase name is then the §8.2.1 conformance probe rather than a paste artifact.
+    # Ignored on the h1 path, which has always been byte-exact.
+    property? preserve_field_case : Bool
+
     def initialize(@requests : Array(Bytes) = [] of Bytes,
                    *,
                    @expand_request : Bool = true,
                    @auto_content_length : Bool = true,
                    @resync_cl_after_expansion : Bool = false,
                    @refuse_unresolved_env : Bool = true,
+                   @preserve_field_case : Bool = false,
                    @origin : Origin? = nil,
                    @target : String? = nil,
                    @default_target : String? = nil,
@@ -153,10 +164,14 @@ module Gori::Repeater
     getter? websocket : Bool
     # The expanded SNI host, or nil to present the dialed host.
     getter sni : String?
+    # See `PlanOptions#preserve_field_case?`. Carried on the plan (not only inside the
+    # `Sender`) so a surface that REPORTS the wire request can encode the same fields the
+    # send will — MCP's `effective_request` is derived that way.
+    getter? preserve_field_case : Bool
 
     def initialize(@sender : Sender, @requests : Array(Bytes), @scheme : String,
                    @host : String, @port : Int32, @http2 : Bool,
-                   @websocket : Bool, @sni : String?)
+                   @websocket : Bool, @sni : String?, @preserve_field_case : Bool = false)
     end
 
     # The single request's wire bytes (the first, for a group).
@@ -203,7 +218,8 @@ module Gori::Repeater
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if requests.empty?
       Plan.new(sender: @sender, requests: requests, scheme: @scheme, host: @host,
         port: @port, http2: @http2,
-        websocket: WsEngine.upgrade_request?(String.new(requests.first)), sni: @sni)
+        websocket: WsEngine.upgrade_request?(String.new(requests.first)), sni: @sni,
+        preserve_field_case: @preserve_field_case)
     end
 
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
@@ -268,9 +284,11 @@ module Gori::Repeater
       sni = options.sni.try { |s| Env.expand(s).presence }
       sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
         verify: options.verify?, http2: options.http2?, sni: sni,
-        timeout: options.timeout, overrides: options.overrides)
+        timeout: options.timeout, overrides: options.overrides,
+        preserve_field_case: options.preserve_field_case?)
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
-        http2: options.http2?, websocket: websocket, sni: sni)
+        http2: options.http2?, websocket: websocket, sni: sni,
+        preserve_field_case: options.preserve_field_case?)
     end
 
     # The pre-resolved origin when the surface has one, else the explicit target, else the

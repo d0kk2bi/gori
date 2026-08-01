@@ -1,6 +1,7 @@
 require "../proxy/upstream"
 require "../proxy/h2/frame"
 require "../proxy/h2/hpack"
+require "../proxy/h2/head_codec"
 require "../proxy/codec/http1"
 require "./engine"
 
@@ -34,23 +35,26 @@ module Gori
 
       private alias Frame = Proxy::H2::Frame
       private alias HPACK = Proxy::H2::HPACK
-
-      # Request headers that are connection-specific and illegal in h2 (RFC 7540
-      # §8.1.2.2); `host` is replaced by `:authority`.
-      FORBIDDEN = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "host"}
+      private alias HeadCodec = Proxy::H2::HeadCodec
 
       def self.send(request : Bytes, *, scheme : String, host : String, port : Int32,
                     verify_upstream : Bool, sni : String? = nil,
                     timeout : Time::Span? = nil,
-                    overrides : Gori::HostOverrides? = nil) : Result
+                    overrides : Gori::HostOverrides? = nil,
+                    preserve_field_case : Bool = false) : Result
         started = Time.instant
         upstream = open(scheme, host, port, verify_upstream, sni, timeout, overrides)
         return failure(connect_error(scheme, host, port, verify_upstream), started) unless upstream
         begin
-          headers, body = parse_request(request, scheme, host, port)
+          headers, body = parse_request(request, scheme, host, port, preserve_field_case)
           write_request(upstream, headers, body)
-          status, resp_headers, resp_body, complete = read_response(upstream)
-          return failure("no h2 response from #{host}:#{port}", started) if status == 0 && resp_headers.empty?
+          status, resp_headers, resp_body, complete, goaway = read_response(upstream)
+          if status == 0 && resp_headers.empty?
+            # A GOAWAY is the origin naming the reason it hung up (RFC 9113 §6.8) and it is
+            # usually about the bytes GORI sent — reporting it as "no h2 response" sent the
+            # operator looking at the origin. Prefer it over the generic sentence.
+            return failure(goaway ? "#{goaway} from #{host}:#{port}" : "no h2 response from #{host}:#{port}", started)
+          end
           head = synth_head(status, resp_headers)
           resp = Proxy::Codec::Http1.parse_response_head(head)
           Result.new(head, resp_body, resp, elapsed(started), incomplete: !complete)
@@ -90,11 +94,35 @@ module Gori
         no_push = Bytes[0x00_u8, 0x02_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8]
         io.write(Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, no_push).to_bytes)
         block = HPACK::Encoder.new.encode(headers)
-        end_stream = body.nil? || body.empty?
-        flags = Frame::END_HEADERS | (end_stream ? Frame::END_STREAM : 0_u8)
-        io.write(Frame::Header.new(Frame::Type::Headers.value, flags, 1_u32, block).to_bytes)
+        write_header_block(io, block, body.nil? || body.empty?)
         write_data(io, body) if body && !body.empty?
         io.flush
+      end
+
+      # HEADERS, then CONTINUATION for every 16 KiB after the first.
+      #
+      # The old code wrote the whole block as one frame, on the belief that `MAX_FRAME` was a
+      # DATA-only concern (`write_data` was its only reader). RFC 9113 §4.2 caps EVERY frame at
+      # the peer's SETTINGS_MAX_FRAME_SIZE, so a 30 KB header value went out as a 22530-byte
+      # HEADERS and any origin that enforces the default answered GOAWAY(FRAME_SIZE_ERROR) —
+      # making a header-size probe, an HPACK test, and any request with a large cookie jar or
+      # JWT unsendable over h2.
+      #
+      # Splitting at `MAX_FRAME` needs no round trip to learn the peer's setting: §6.5.2 fixes
+      # the initial value at 2^14 and forbids a smaller one, so 16384 is legal against every
+      # peer, and gori writes the block before the peer's SETTINGS has even arrived. END_STREAM
+      # belongs on the HEADERS frame, END_HEADERS on the last CONTINUATION (§6.10).
+      private def self.write_header_block(io : IO, block : Bytes, end_stream : Bool) : Nil
+        head = Math.min(MAX_FRAME, block.size)
+        flags = (head >= block.size ? Frame::END_HEADERS : 0_u8) | (end_stream ? Frame::END_STREAM : 0_u8)
+        io.write(Frame::Header.new(Frame::Type::Headers.value, flags, 1_u32, block[0, head]).to_bytes)
+        offset = head
+        while offset < block.size
+          n = Math.min(MAX_FRAME, block.size - offset)
+          cont = offset + n >= block.size ? Frame::END_HEADERS : 0_u8
+          io.write(Frame::Header.new(Frame::Type::Continuation.value, cont, 1_u32, block[offset, n]).to_bytes)
+          offset += n
+        end
       end
 
       private def self.write_data(io : IO, body : Bytes) : Nil
@@ -109,11 +137,12 @@ module Gori
       end
 
       # Reads frames until stream 1 closes; returns {status, headers, body,
-      # clean_eos}. clean_eos is true only when the stream ended on a real
+      # clean_eos, goaway}. clean_eos is true only when the stream ended on a real
       # END_STREAM — false when it was cut by GOAWAY/RST_STREAM, a mid-stream
       # connection drop, or a MAX_BODY truncation, so the caller can flag the
       # response as incomplete (mirrors the h1 engine's premature-EOF signal).
-      private def self.read_response(io : IO) : {Int32, Array({String, String}), Bytes?, Bool}
+      # `goaway` is the origin's stated reason for hanging up, when it gave one.
+      private def self.read_response(io : IO) : {Int32, Array({String, String}), Bytes?, Bool, String?}
         decoder = HPACK::Decoder.new
         header_buf = IO::Memory.new
         body = IO::Memory.new
@@ -121,6 +150,7 @@ module Gori
         status = 0
         done = false
         clean_eos = false          # a genuine END_STREAM closed the stream
+        goaway = nil.as(String?)   # the origin's stated reason for hanging up
         end_stream_pending = false # END_STREAM seen on a HEADERS frame whose block isn't closed yet
         frames = 0                 # every frame counted (incl. ping/priority) — bounds a junk-frame flood
 
@@ -150,6 +180,7 @@ module Gori
           when Frame::Type::Ping
             ack(io, Frame::Type::Ping, frame.payload) unless frame.ack?
           when Frame::Type::Goaway
+            goaway = goaway_reason(frame)
             done = true
           when Frame::Type::RstStream
             done = true if frame.stream_id == 1
@@ -196,7 +227,29 @@ module Gori
           end
         end
 
-        {status, headers, body.size == 0 ? nil : body.to_slice, clean_eos}
+        {status, headers, body.size == 0 ? nil : body.to_slice, clean_eos, goaway}
+      end
+
+      # RFC 9113 §7 error codes, by their spec names — the operator is going to search for
+      # the name, not the integer.
+      GOAWAY_ERRORS = {
+        0 => "NO_ERROR", 1 => "PROTOCOL_ERROR", 2 => "INTERNAL_ERROR", 3 => "FLOW_CONTROL_ERROR",
+        4 => "SETTINGS_TIMEOUT", 5 => "STREAM_CLOSED", 6 => "FRAME_SIZE_ERROR", 7 => "REFUSED_STREAM",
+        8 => "CANCEL", 9 => "COMPRESSION_ERROR", 10 => "CONNECT_ERROR", 11 => "ENHANCE_YOUR_CALM",
+        12 => "INADEQUATE_SECURITY", 13 => "HTTP_1_1_REQUIRED",
+      }
+
+      # A GOAWAY payload as a sentence (§6.8: last-stream-id, error code, optional debug data).
+      # The code was previously read only as "stop looping", so an origin that told gori
+      # exactly what it disliked about gori's own frames — FRAME_SIZE_ERROR, COMPRESSION_ERROR,
+      # ENHANCE_YOUR_CALM — was reported as "no h2 response", pointing at the network.
+      private def self.goaway_reason(frame : Frame::Header) : String
+        payload = frame.payload
+        return "h2 GOAWAY (no error code)" if payload.size < 8
+        code = IO::ByteFormat::BigEndian.decode(UInt32, payload[4, 4]).to_i
+        name = GOAWAY_ERRORS[code]? || "error code #{code}"
+        debug = payload.size > 8 ? String.new(payload[8..]).scrub.strip : ""
+        debug.empty? ? "h2 GOAWAY #{name}" : "h2 GOAWAY #{name} (#{debug})"
       end
 
       # Decode a completed header block, splitting :status from regular headers.
@@ -248,19 +301,37 @@ module Gori
         # the loop. Don't let a dead-socket write fail an otherwise-usable response.
       end
 
-      private def self.parse_request(request : Bytes, scheme : String, host : String,
-                                     port : Int32) : {Array({String, String}), Bytes?}
+      # The h1-form head text an operator typed, as the h2 fields that go on the wire.
+      #
+      # gori has TWO h2 request encoders and they used to disagree. The proxy's intercept-edit
+      # path (`HeadCodec.parse_request` → `append_regular`) forwards `transfer-engineering`-class
+      # connection headers, trailing-space values and duplicates; this one — which EVERY scripted
+      # surface uses (repeater, fuzz, miner, active probe, discover, MCP) — dropped them. So the
+      # h2.TE / h2.CL downgrade desync, the single most important h2 test there is, was
+      # expressible only by hand-editing a live intercepted request in the TUI, and gori reported
+      # the resulting `200` as though the header had been sent.
+      #
+      # This side now converges on the capable one: `HeadCodec.request_line` and
+      # `HeadCodec.header_lines` ARE the rules, and the field list is passed through. What is
+      # left is only what h2 has no representation for at all (`reject_uncarriable`), and that
+      # refuses loudly.
+      #
+      # `preserve_field_case` is the one remaining normalization, and it is opt-out rather than
+      # gone because the h1 text is BOTH a wire format and the paste buffer: a request copied
+      # from Burp or curl is conventionally title-cased, and h2 requires lowercase (§8.2.1), so
+      # sending `Content-Type` verbatim would RST the stream of every ordinary send. A surface
+      # turns it on where the operator has said the bytes ARE the message (`--verbatim`, MCP
+      # `verbatim:true`), because then an uppercase name is the conformance probe.
+      def self.parse_request(request : Bytes, scheme : String, host : String,
+                             port : Int32, preserve_field_case : Bool = false) : {Array({String, String}), Bytes?}
         head_bytes, body = split_head_body(request)
         lines = String.new(head_bytes).split('\n').map(&.rstrip('\r'))
-        # The path may contain a raw (unencoded) space — common in fuzzer / smuggling
-        # captures — so bound it by the FIRST and LAST space rather than taking the
-        # second whitespace-split token (which would truncate at the first inner space).
         line = lines[0]? || "GET / HTTP/2"
-        first_sp = line.index(' ')
-        last_sp = line.rindex(' ')
-        method = first_sp ? line[0...first_sp] : line
-        path = (first_sp && last_sp && last_sp > first_sp) ? line[(first_sp + 1)...last_sp] : "/"
-        path = "/" if path.empty?
+        parsed_method, parsed_path = HeadCodec.request_line(line)
+        # No space at all is not a request line; keep the whole token as the method rather
+        # than inventing one, which is what a `:method` probe (`GET\r\n…`) would want to see.
+        method = parsed_method || line
+        path = parsed_path || "/"
 
         # An explicit `Host:` header maps to `:authority` (RFC 9113 §8.3.1 — h2 has no
         # Host field). Honor its value so editing the request's host (a vhost /
@@ -272,32 +343,16 @@ module Gori
         # authority. Falls back to the dialed host when no Host line is present.
         authority_override = nil
         regular = [] of {String, String}
-        lines[1..]?.try &.each do |line|
-          next if line.empty?
-          colon = line.index(':')
-          # A non-empty line that is not a header field means this text has no faithful h2
-          # form, and skipping it SILENTLY sent a different request than the operator wrote.
-          # It is what a payload carrying a bare LF produces: `x-fuzz: be\naf` splits here, the
-          # `af` tail lands on a line with no colon, and the field went out as `x-fuzz: be`
-          # while the Fuzzer labelled the result row with the whole `be\naf` payload — a status
-          # measured against a request gori never sent. h1 carries those bytes verbatim (P7,
-          # malformed input IS the payload); h2 has no encoding for them, so the honest answer
-          # is to refuse the send and say so, exactly as the proxy's `HeadCodec.h1_faithful?`
-          # refuses the same shape on the rewrite path. A CRLF that yields two WELL-FORMED
-          # fields is left alone deliberately: that is indistinguishable from the operator
-          # typing two headers, and h1 puts two headers on the wire for it too.
-          raise Gori::Error.new(
-            "cannot send over h2: #{line.inspect} is not a header field. A CR, LF or NUL " \
-            "inside a header value has no HTTP/2 representation (RFC 9113 §8.2.1) — h1 " \
-            "carries those bytes verbatim, h2 cannot.") unless colon && colon > 0
-          name = line[0...colon].strip.downcase
-          value = line[(colon + 1)..].strip
-          if name == "host"
+        lines[1..]?.try &.each do |field_line|
+          next if field_line.empty?
+          pair = HeadCodec.header_field(field_line)
+          raise Gori::Error.new(unencodable_line(field_line)) unless pair
+          raw_name, value = pair
+          if raw_name.compare("host", case_insensitive: true) == 0
             authority_override = value unless value.empty?
             next # folded into :authority below; a literal `host` header is illegal in h2
           end
-          next if FORBIDDEN.includes?(name)
-          regular << {name, value}
+          regular << {preserve_field_case ? raw_name : raw_name.downcase, value}
         end
 
         headers = [{":method", method}, {":path", path}, {":scheme", scheme},
@@ -305,6 +360,58 @@ module Gori
         headers.concat(regular)
         headers.each { |(n, v)| reject_uncarriable(n, v) }
         {headers, body}
+      end
+
+      # Why a head line has no h2 form.
+      #
+      # A non-empty line that is not a header field means this text has no faithful h2 form,
+      # and skipping it SILENTLY sent a different request than the operator wrote. It is what
+      # a payload carrying a bare LF produces: `x-fuzz: be\naf` splits here, the `af` tail lands
+      # on a line with no colon, and the field went out as `x-fuzz: be` while the Fuzzer
+      # labelled the result row with the whole `be\naf` payload — a status measured against a
+      # request gori never sent. h1 carries those bytes verbatim (P7, malformed input IS the
+      # payload); h2 has no encoding for them, so the honest answer is to refuse and say so,
+      # exactly as `HeadCodec.h1_faithful?` refuses the same shape on the rewrite path. A CRLF
+      # that yields two WELL-FORMED fields is left alone deliberately: that is indistinguishable
+      # from the operator typing two headers, and h1 puts two headers on the wire for it too.
+      #
+      # Two shapes get here and they need different sentences. The old message blamed a CR, LF
+      # or NUL for both — so an operator who typed `:scheme: http` (`colon == 0`, a pseudo-header
+      # this encoder derives rather than reads) was sent hunting for an invisible control byte
+      # in a line that had none.
+      private def self.unencodable_line(line : String) : String
+        if line.starts_with?(':')
+          "cannot send over h2: #{line.inspect} looks like a pseudo-header. gori derives " \
+          ":method, :path, :scheme and :authority from the request line and the dialed target " \
+          "— they cannot be set from the head text."
+        else
+          "cannot send over h2: #{line.inspect} is not a header field. A bare CR or LF inside " \
+          "a header value splits it into a line with no name, which has no HTTP/2 representation " \
+          "(RFC 9113 §8.2.1) — h1 carries those bytes verbatim, h2 cannot."
+        end
+      end
+
+      # The h1-text projection of the fields this engine WILL encode — the same projection
+      # `Proxy::H2::Assembler` stores for a captured h2 flow, so a repeater send and a proxied
+      # request render identically in History.
+      #
+      # It exists because every report of "the request actually put on the wire" was derived
+      # from the operator's TEXT, which on the h2 path is only an input: the encoder resolves
+      # `:path` from the request line, folds `Host:` into `:authority` and lowercases names.
+      # MCP's `effective_request` therefore described a request to `/mcp-noversion` carrying
+      # `Transfer-Encoding` when `GET /` had gone out, and `run show --format raw` printed the
+      # same bytes back. Lossy in the way the capture projection is documented to be lossy
+      # (`:scheme` and a duplicate pseudo-header have nowhere to go, `head_codec.cr:24-32`),
+      # but it is the fields, not the source text.
+      def self.encoded_request(request : Bytes, *, scheme : String, host : String, port : Int32,
+                               preserve_field_case : Bool = false) : Bytes
+        fields, body = parse_request(request, scheme, host, port, preserve_field_case)
+        head = HeadCodec.synth_request(fields, HeadCodec.pseudo(fields, ":authority") || "")
+        return head unless body && !body.empty?
+        joined = Bytes.new(head.size + body.size)
+        head.copy_to(joined)
+        body.copy_to(joined + head.size)
+        joined
       end
 
       # RFC 9113 §8.2.1: a field name or value may carry no CR, LF or NUL. `rstrip('\r')`

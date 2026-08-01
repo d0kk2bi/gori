@@ -31,7 +31,8 @@ module Gori
 
       def initialize(@outbound : Gori::Outbound, *, @scheme : String, @host : String, @port : Int32,
                      @verify : Bool, @http2 : Bool = false, @sni : String? = nil,
-                     @timeout : Time::Span? = nil, @overrides : Gori::HostOverrides? = nil)
+                     @timeout : Time::Span? = nil, @overrides : Gori::HostOverrides? = nil,
+                     @preserve_field_case : Bool = false)
       end
 
       # The reason this request may not go out, or nil to proceed. Two rules stop a
@@ -84,7 +85,8 @@ module Gori
         result =
           if @http2
             H2Engine.send(bytes, scheme: @scheme, host: @host, port: @port,
-              verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
+              verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
+              preserve_field_case: @preserve_field_case)
           else
             Engine.send(bytes, scheme: @scheme, host: @host, port: @port,
               verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)

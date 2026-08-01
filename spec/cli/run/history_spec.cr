@@ -306,6 +306,54 @@ describe "gori run show --format json" do
       m["headers"]["grpc-message"].as_s.should eq("not found")
     end
 
+    # A length prefix that lies about the payload size is one of the standard gRPC parser
+    # tests. The guard used to be `msgs.empty?`, so the whole object vanished — which reads
+    # identically to "this flow is not gRPC", and the operator concludes the probe was never
+    # framed as gRPC at all.
+    it "reports a lying length prefix as a framing error instead of omitting the object" do
+      body = Bytes[0x00, 0x00, 0x00, 0x00, 0x63, 0x0a, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f] # claims 99, has 7
+      head = "POST /S/M HTTP/2\r\nHost: api.test\r\ncontent-type: application/grpc\r\n\r\n"
+      row = Gori::Store::FlowRow.new(
+        id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "api.test", port: 443,
+        target: "/S/M", status: nil, size: 0_i64, state: Gori::Store::FlowState::Pending)
+      detail = Gori::Store::FlowDetail.new(row, "HTTP/2", head.to_slice, body, nil, nil)
+      msgs = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, false))["request"]["grpc_messages"]
+      msgs["count"].as_i.should eq(0)
+      msgs["residual_bytes"].as_i.should eq(12)
+      msgs["framing_error"].as_s.should contain("not a complete gRPC frame")
+    end
+
+    # A clean message followed by a truncated one: the good message must still decode AND the
+    # leftover must be counted, not dropped without trace.
+    it "counts the residual bytes of a trailing partial frame" do
+      good = grpc_frame_for_spec(Bytes[0x0a, 0x02, 0x68, 0x69])
+      partial = Bytes[0x00, 0x00, 0x00, 0x00, 0x09, 0x61, 0x62] # claims 9, has 2
+      body = Bytes.new(good.size + partial.size)
+      good.copy_to(body)
+      partial.copy_to(body + good.size)
+      head = "POST /S/M HTTP/2\r\nHost: api.test\r\ncontent-type: application/grpc\r\n\r\n"
+      row = Gori::Store::FlowRow.new(
+        id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "api.test", port: 443,
+        target: "/S/M", status: nil, size: 0_i64, state: Gori::Store::FlowState::Pending)
+      detail = Gori::Store::FlowDetail.new(row, "HTTP/2", head.to_slice, body, nil, nil)
+      msgs = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, false))["request"]["grpc_messages"]
+      msgs["count"].as_i.should eq(1)
+      msgs["residual_bytes"].as_i.should eq(7)
+    end
+
+    # The complement, pinned so the residual field never becomes noise on a healthy body.
+    it "omits residual_bytes when the body frames cleanly" do
+      body = grpc_frame_for_spec(Bytes[0x0a, 0x02, 0x68, 0x69])
+      head = "POST /S/M HTTP/2\r\nHost: api.test\r\ncontent-type: application/grpc\r\n\r\n"
+      row = Gori::Store::FlowRow.new(
+        id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "api.test", port: 443,
+        target: "/S/M", status: nil, size: 0_i64, state: Gori::Store::FlowState::Pending)
+      detail = Gori::Store::FlowDetail.new(row, "HTTP/2", head.to_slice, body, nil, nil)
+      msgs = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, false))["request"]["grpc_messages"].as_h
+      msgs.has_key?("residual_bytes").should be_false
+      msgs.has_key?("framing_error").should be_false
+    end
+
     it "omits grpc_messages on a non-gRPC flow" do
       detail = flow_detail("https", "x", 443, "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
         response_head: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",

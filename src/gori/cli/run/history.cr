@@ -386,16 +386,27 @@ module Gori
       # `Proxy::H2::Grpc.messages`, then each non-trailer / non-compressed payload
       # is decoded by `Gori::Protobuf`. Compressed payloads stay opaque (not
       # protobuf until inflated); grpc-web trailer frames become header maps.
-      # Omitted entirely when the head is not gRPC or the body has no complete
-      # frames — so ordinary HTTP flows stay free of an empty shell.
+      # Omitted entirely when the head is not gRPC — so ordinary HTTP flows stay free of an
+      # empty shell. A gRPC head whose body does NOT frame is a different thing and is now
+      # reported: the guard used to be `msgs.empty?`, so a deliberately-wrong length prefix
+      # (one of the standard gRPC parser tests) made the whole object VANISH, which reads
+      # identically to "this flow is not gRPC". A trailing partial frame went the same way,
+      # with no count of what was left over. The raw body was stored correctly either way
+      # (P7) — this was only the report the operator reads.
       private def self.emit_grpc_messages_json(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
         return if head.nil? || body.nil? || body.empty?
         return unless Proxy::H2::Grpc.grpc?(content_type_of(head))
-        msgs = Proxy::H2::Grpc.messages(body)
-        return if msgs.empty?
+        msgs, residual = Proxy::H2::Grpc.scan(body)
+        return if msgs.empty? && residual == 0
         j.field "grpc_messages" do
           j.object do
             j.field "count", msgs.size
+            if residual > 0
+              j.field "residual_bytes", residual
+              j.field "framing_error",
+                "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
+                "a length prefix claiming more than arrived, or a body cut short"
+            end
             j.field "messages" do
               j.array do
                 msgs.each_with_index do |m, i|

@@ -73,6 +73,18 @@ module Gori::Proxy::H2
     # Frames a DATA body into messages. A trailing partial frame (incomplete on a
     # still-streaming capture) is left out rather than guessed at.
     def self.messages(body : Bytes) : Array(Message)
+      scan(body)[0]
+    end
+
+    # `messages` plus the count of tail bytes it could NOT frame — a length prefix claiming
+    # more than arrived, or fewer than 5 bytes left over.
+    #
+    # The residual used to be dropped on the floor, and a reporting surface that only saw
+    # the message array could not tell "this is not a gRPC body" from "the first length
+    # prefix is a lie". A deliberately-wrong prefix is one of the standard gRPC parser tests,
+    # so the count has to be reachable — the raw body was always stored correctly (P7), it
+    # was only invisible in the views.
+    def self.scan(body : Bytes) : {Array(Message), Int32}
       msgs = [] of Message
       pos = 0
       while pos + 5 <= body.size
@@ -89,7 +101,7 @@ module Gori::Proxy::H2
         msgs << Message.new(compressed, body[msg_start, count], trailer)
         pos = msg_start + count
       end
-      msgs
+      {msgs, body.size - pos}
     end
   end
 end

@@ -108,7 +108,12 @@ module Gori
           p.on("-rRAW", "--request-raw=RAW", "Verbatim raw HTTP request string") { |v| request_raw = v }
           p.on("--name=NAME", "Custom repeater tab name") { |v| name = v }
           p.on("--tags=TAGS", "Free-text tags for grouping tabs (the TUI subtab label)") { |v| tags = v }
-          p.on("--http2", "Use HTTP/2 (default: false)") { http2 = true; http2_given = true }
+          p.on("--http2", "Use HTTP/2 (default: false, or how --flow was captured)") { http2 = true; http2_given = true }
+          # The other half of the toggle: without it a session cloned from an h2 flow
+          # (`--flow=N`) inherited h2 and `repeater send` had no way to override it, so an
+          # h2 capture could never be replayed as h1 from the CLI at all.
+          p.on("--http1", "Use HTTP/1.1 — overrides an h2-captured --flow (alias: --no-http2)") { http2 = false; http2_given = true }
+          p.on("--no-http2", "Alias for --http1") { http2 = false; http2_given = true }
           p.on("--no-auto-cl", "Do not auto-calculate Content-Length header") { auto_cl = false }
           p.on("--flow=ID", "Optional original flow ID this repeater stems from") { |v| flow_id = parse_flow_id(v, "gori run repeater create") }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
@@ -252,6 +257,11 @@ module Gori
           # not a mistake to refuse. Without this the flag could not send the SSTI/shell
           # probes (`$user.name`, `$IFS`) that are the reason to leave a `$` unexpanded.
           refuse_unresolved_env: !verbatim,
+          # …and on an h2 session it used to change NOTHING the encoder does: the flag
+          # promised "the stored bytes EXACTLY" while `H2Engine` still lowercased every field
+          # name. Field case is the one normalization left on that path, so this is what
+          # `--verbatim` means for h2.
+          preserve_field_case: verbatim,
           auto_content_length: !verbatim && rec.auto_content_length?, verify: !insecure,
           overrides: overrides)
       end
@@ -319,7 +329,7 @@ module Gori
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
           p.on("--diff", "Diff the new response against the session's last stored response") { do_diff = true }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
-          p.on("--verbatim", "Send the stored bytes EXACTLY: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync, no HTTP/2→1.1 version fix") { verbatim = true }
+          p.on("--verbatim", "Send the stored bytes EXACTLY: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync, no HTTP/2→1.1 version fix, and on h2 no field-name lowercasing") { verbatim = true }
           p.on("--message=TEXT", "WebSocket: outbound text message (repeatable; replaces the session's stored messages)") { |v| ws_messages << v }
           p.on("--idle-ms=N", "WebSocket: server-silence timeout after the first inbound frame (100-60000, default 3000)") { |v| idle_ms = parse_count(v, "--idle-ms").to_i64 }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
@@ -675,7 +685,12 @@ module Gori
         project_name : String? = nil
         target_override : String? = nil
         sni_override : String? = nil
-        force_h2 = false
+        # nil = follow the capture. `--http2` was the ONLY version flag, so an h2-captured
+        # flow was pinned to h2 forever here — `--target http://…` still sent the h2 preface
+        # at a cleartext origin and reported "unexpected EOF mid-frame" rather than a missing
+        # flag. MCP has done the downgrade since `http2:false` landed and the TUI has ^V;
+        # this was the one surface that could not run the h1-vs-h2 back-end comparison.
+        http2_override : Bool? = nil
         insecure = false
         do_diff = false
         format = :text
@@ -695,7 +710,9 @@ module Gori
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("--target=URL", "Send to this origin (scheme://host[:port]) instead of the captured one; path/query kept") { |v| target_override = v }
-          p.on("--http2", "Force HTTP/2 (default follows how the flow was captured)") { force_h2 = true }
+          p.on("--http2", "Force HTTP/2 (default follows how the flow was captured)") { http2_override = true }
+          p.on("--http1", "Force HTTP/1.1 — downgrades an h2-captured flow (default follows how the flow was captured)") { http2_override = false }
+          p.on("--no-http2", "Alias for --http1") { http2_override = false }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni_override = v }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
           p.on("--diff", "Diff the new response against the captured one") { do_diff = true }
@@ -770,10 +787,13 @@ module Gori
 
         wire, explicit_cl = build_single_flow_request(head_bytes, body_bytes, headers, body_override, target_override, removed_headers)
         outbound = project_outbound(project_name, db_path, allow_unscoped)
+        # Copied out of the closure-captured var first — Crystal keeps that one `Bool?`.
+        forced = http2_override
+        use_http2 = forced.nil? ? built.http2 : forced
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([wire],
             target: target_override, default_target: built.target,
-            http2: force_h2 || built.http2, sni: sni_override.presence || built.sni,
+            http2: use_http2, sni: sni_override.presence || built.sni,
             auto_content_length: false, resync_cl_after_expansion: !explicit_cl,
             verify: !insecure, overrides: host_overrides), outbound)
         rescue ex : Repeater::PlanError
