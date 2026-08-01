@@ -24,12 +24,18 @@ module Gori::Tui
     getter focus : Symbol
     getter config : Sequencer::Config
     property job_id : Int32
+    # PROVENANCE: `@request` is a CAPTURED FLOW's stored bytes, not a request the operator
+    # drafted. Like MinerView this session has NO editor — `@request` is only ever assigned
+    # from a seed or from the store — so the flag is decided once, at load, and there is no
+    # draft interpretation to fall back to. See `Sequencer::PlanOptions#evidence?`.
+    getter? evidence : Bool
 
     def initialize
       @target = ""
       @request = Bytes.empty
       @http2 = false
       @sni = ""
+      @evidence = false
       @config = Sequencer::Config.new
       @last_synced_config = ""
       @name = nil.as(String?)
@@ -39,6 +45,7 @@ module Gori::Tui
       @stop_requested = false
       @collected = 0
       @sent = 0
+      @requests = 0_i64
       @errors = 0
       @goal_display = 0
       @samples = [] of Sequencer::Sample
@@ -58,12 +65,16 @@ module Gori::Tui
     end
 
     # --- seed / restore ---
-    def load(target : String, request : Bytes, http2 : Bool, sni : String?, config : Sequencer::Config) : Nil
+    # `evidence` is the seed's `flow_id` having been non-nil (a History/Sitemap/Issues
+    # flow); a Repeater-sourced or current-session seed is a draft.
+    def load(target : String, request : Bytes, http2 : Bool, sni : String?,
+             config : Sequencer::Config, evidence : Bool = false) : Nil
       @target = target
       @request = request
       @http2 = http2
       @sni = sni || ""
       @config = config
+      @evidence = evidence
       @dirty = true
     end
 
@@ -85,6 +96,9 @@ module Gori::Tui
       @request = rec.request
       @http2 = rec.http2?
       @sni = rec.sni || ""
+      # Provenance survives a restart: `flow_id` is what `insert_sequencer_session`
+      # already stored for a flow-seeded session and nothing else sets it.
+      @evidence = !rec.flow_id.nil?
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -96,6 +110,7 @@ module Gori::Tui
       @request = rec.request
       @http2 = rec.http2?
       @sni = rec.sni || ""
+      @evidence = !rec.flow_id.nil? # see restore
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -287,11 +302,36 @@ module Gori::Tui
       @samples_rev += 1
     end
 
-    def apply_progress(collected : Int32, sent : Int32, goal : Int32, errors : Int32) : Nil
+    # `requests` is the TRUE wire count (`Fuzz::CappedBackend#sent`, what `max_requests` is
+    # enforced against); `sent` counts collection attempts, and a retry charges only the
+    # former. Both are shown, and only when they differ — see `results_count_label` in
+    # FuzzerView for the same rule.
+    def apply_progress(collected : Int32, sent : Int32, goal : Int32, errors : Int32,
+                       requests : Int64 = 0_i64) : Nil
       @collected = collected
       @sent = sent
       @goal_display = goal
       @errors = errors
+      @requests = requests
+    end
+
+    # Errored sends so far — `DoneEvent` does not carry an error count, so the terminal
+    # apply reuses the last one the progress stream reported.
+    def errors_count : Int32
+      @errors
+    end
+
+    # A FINISHED collection that fell short of its goal because the request cap ran out.
+    # Guarded on `max_requests` so a hand-stopped (^X) or error-ended run is not relabelled.
+    def budget_exhausted? : Bool
+      return false if @running
+      return false unless @config.max_requests
+      @goal_display > 0 && @collected < @goal_display
+    end
+
+    def budget_note : String
+      "budget exhausted · #{@collected} of #{@goal_display} tokens collected — " \
+      "raise max requests to finish (the verdict below rests on this sample)"
     end
 
     def collected_count : Int32
@@ -334,7 +374,12 @@ module Gori::Tui
     # so a caller has to say what it means rather than inherit that bug back.
     def build_engine(verify : Bool, scope : Gori::Scope,
                      overrides : Gori::HostOverrides?) : {Sequencer::Engine?, String?}
-      options = Sequencer::PlanOptions.new(@request, target: @target, http2: @http2,
+      # `evidence` skips the draft-time passes for a captured seed: with it off, sequencing
+      # a capture whose head carried `$filter`/`$top` was refused outright, and setting the
+      # variables the refusal named rewrote the request on the wire. `gori run sequence
+      # --flow N` never did either.
+      options = Sequencer::PlanOptions.new(@request, evidence: @evidence,
+        target: @target, http2: @http2,
         config: @config, verify: verify, sni: sni_override, overrides: overrides)
       {Sequencer::Plan.build(options, Gori::Outbound.interactive(scope)).engine, nil}
     rescue ex : Sequencer::PlanError
@@ -369,6 +414,7 @@ module Gori::Tui
           j.field "pos_start", loc.pos_start
           j.field "pos_end", loc.pos_end
           j.field "goal", @config.goal
+          j.field "max_requests", @config.max_requests
           j.field "concurrency", @config.concurrency
           j.field "notify", @config.notify.token
         end
@@ -385,6 +431,8 @@ module Gori::Tui
       pend = any["pos_end"]?.try(&.as_i?) || 0
       @config.token_loc = Sequencer::TokenLoc.new(kind, selector, pstart, pend)
       any["goal"]?.try(&.as_i?).try { |n| @config.goal = n }
+      # Absent (an older row) reads as nil => uncapped, which is what those runs were.
+      @config.max_requests = any["max_requests"]?.try(&.as_i64?)
       any["concurrency"]?.try(&.as_i?).try { |n| @config.concurrency = n }
       any["notify"]?.try(&.as_s?).try { |t| Sequencer::NotifyMode.parse?(t) }.try { |m| @config.notify = m }
     rescue
@@ -440,8 +488,13 @@ module Gori::Tui
       end
       y += 1
       if y < rect.bottom - 1
-        line = "#{@collected}/#{@goal_display <= 0 ? "?" : @goal_display.to_s} collected · #{@sent} sent · #{@errors} err"
+        wire = @requests > @sent ? " · #{@requests} requests" : ""
+        line = "#{@collected}/#{@goal_display <= 0 ? "?" : @goal_display.to_s} collected · #{@sent} sent#{wire} · #{@errors} err"
         screen.text(x, y, line, Theme.muted, Theme.bg, width: rect.w - 4)
+      end
+      y += 1
+      if budget_exhausted? && y < rect.bottom - 1
+        screen.text(x, y, budget_note, Theme.yellow, Theme.bg, width: rect.w - 4)
       end
     end
 

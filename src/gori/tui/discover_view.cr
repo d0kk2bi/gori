@@ -12,7 +12,12 @@ module Gori::Tui
     getter config : Discover::Config
     property id : Int32 = 0
     property job_id : Int32 = 0
-    property status : Symbol = :idle # :idle | :running | :paused | :done | :stopped | :error
+    # :idle | :running | :paused | :done | :budget_exhausted | :stopped | :error.
+    # `:budget_exhausted` is its own state, not a flavour of :done: a crawl that ran out of
+    # `max_requests` left `queued` candidates it never looked at, and rendering that as
+    # "done" is what let `5 found` stand for a 283-candidate wordlist of which 275 were
+    # never sent.
+    property status : Symbol = :idle
     getter findings = [] of Discover::Finding
     property stats : Discover::RunStats? = nil
     property sent = 0_i64
@@ -30,6 +35,11 @@ module Gori::Tui
 
     def running? : Bool
       @status == :running || @status == :paused
+    end
+
+    # True when a cap halted the crawl with candidates still in the frontier.
+    def budget_exhausted? : Bool
+      @status == :budget_exhausted
     end
 
     def paused? : Bool
@@ -181,12 +191,17 @@ module Gori::Tui
       screen.text(x, y, hdr, Theme.text_bright, Theme.bg, Attribute::Bold, width: rect.w - 4)
       y += 1
       if y < rect.bottom - 1
-        screen.text(x, y, "#{r.techniques} · #{r.config.containment.label} · depth #{r.config.max_depth}",
+        cap = r.config.max_requests.try { |m| " · cap #{m}" } || ""
+        screen.text(x, y, "#{r.techniques} · #{r.config.containment.label} · depth #{r.config.max_depth}#{cap}",
           Theme.muted, Theme.bg, width: rect.w - 4)
       end
       y += 1
       if y < rect.bottom - 1
-        st = r.status == :error ? "error: #{r.error_msg}" : r.status.to_s
+        st = case r.status
+             when :error            then "error: #{r.error_msg}"
+             when :budget_exhausted then "budget exhausted · #{r.queued} queued unexplored — raise max requests to finish"
+             else                        r.status.to_s
+             end
         screen.text(x, y, st, status_hue(r.status), Theme.bg, width: rect.w - 4)
       end
       y += 1
@@ -203,11 +218,12 @@ module Gori::Tui
 
     private def status_hue(s : Symbol) : Color
       case s
-      when :running then Theme.accent
-      when :paused  then Theme.yellow
-      when :error   then Theme.red
-      when :stopped then Theme.muted
-      else               Theme.green
+      when :running          then Theme.accent
+      when :paused           then Theme.yellow
+      when :error            then Theme.red
+      when :budget_exhausted then Theme.yellow
+      when :stopped          then Theme.muted
+      else                        Theme.green
       end
     end
 
@@ -218,7 +234,17 @@ module Gori::Tui
       inner = rect.inset(1, 1)
       return unless r
       if r.findings.empty?
-        msg = r.running? ? "discovering… endpoints appear here" : (r.stats ? "no endpoints found" : "no run yet — ^R to run")
+        # "no endpoints found" over a crawl that stopped on its budget is the claim this
+        # tab must never make — it did not look.
+        msg = if r.running?
+                "discovering… endpoints appear here"
+              elsif r.budget_exhausted?
+                "none found in the #{r.sent} requests the budget allowed — #{r.queued} candidates unexplored"
+              elsif r.stats
+                "no endpoints found"
+              else
+                "no run yet — ^R to run"
+              end
         screen.text(inner.x + 1, inner.y, msg, Theme.muted, Theme.bg)
         return
       end

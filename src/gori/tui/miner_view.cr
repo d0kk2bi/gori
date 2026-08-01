@@ -22,12 +22,19 @@ module Gori::Tui
     getter focus : Symbol
     getter config : Miner::Config
     property job_id : Int32
+    # PROVENANCE: `@request` is a CAPTURED FLOW's stored bytes (a History/Sitemap/Issues
+    # seed), not something the operator drafted. This view has NO editor at all —
+    # `@request` is only ever assigned from a seed or from the store — so the flag is
+    # decided once, at load, and there is no draft interpretation to fall back to.
+    # See `Miner::PlanOptions#evidence?`.
+    getter? evidence : Bool
 
     def initialize
       @target = ""
       @request = Bytes.empty
       @http2 = false
       @sni = ""
+      @evidence = false
       @config = Miner::Config.new
       @last_synced_config = "" # last store config blob applied (reconcile equality)
       @name = nil.as(String?)
@@ -47,13 +54,17 @@ module Gori::Tui
       @job_id = 0
     end
 
-    # Seed a fresh session from the config overlay.
-    def load(target : String, request : Bytes, http2 : Bool, sni : String?, config : Miner::Config) : Nil
+    # Seed a fresh session from the config overlay. `evidence` is the seed's `flow_id`
+    # having been non-nil (a History/Sitemap/Issues flow); a Repeater-sourced seed is
+    # editor text the operator authored and stays a draft.
+    def load(target : String, request : Bytes, http2 : Bool, sni : String?,
+             config : Miner::Config, evidence : Bool = false) : Nil
       @target = target
       @request = request
       @http2 = http2
       @sni = sni || ""
       @config = config
+      @evidence = evidence
       @dirty = true
     end
 
@@ -62,6 +73,9 @@ module Gori::Tui
       @request = rec.request
       @http2 = rec.http2?
       @sni = rec.sni || ""
+      # Provenance survives a restart: `flow_id` is what `insert_miner_session` already
+      # stored for a flow-seeded session and nothing else sets it.
+      @evidence = !rec.flow_id.nil?
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -75,6 +89,7 @@ module Gori::Tui
       @request = rec.request
       @http2 = rec.http2?
       @sni = rec.sni || ""
+      @evidence = !rec.flow_id.nil? # see restore
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -96,6 +111,7 @@ module Gori::Tui
       @request = src.@request.dup
       @http2 = src.@http2
       @sni = src.@sni
+      @evidence = src.evidence? # the same bytes carry the same provenance
       apply_config_json(src.config_json)
       @name = SubtabClone.copy_name(src.name)
       @dirty = true
@@ -264,6 +280,23 @@ module Gori::Tui
       @progress = p
     end
 
+    # A FINISHED mine that left candidate names untested because the request cap ran out.
+    # Derived rather than carried, the way `gori run mine` and MCP derive it: the engine
+    # already publishes both halves on `Miner::Progress`. Guarded on `max_requests` being
+    # set so a run STOPPED by hand (^X) is not relabelled as a budget hit.
+    def budget_exhausted? : Bool
+      return false if @running
+      return false unless @config.max_requests
+      @progress.names_total > 0 && @progress.names_done < @progress.names_total
+    end
+
+    # "N of M names untested" — what a budget-halted mine actually did, for the surfaces
+    # that would otherwise say "0 found" over a wordlist it never opened.
+    def budget_note : String
+      "budget exhausted · #{@progress.names_total - @progress.names_done} of " \
+      "#{@progress.names_total} names untested — raise max requests to finish"
+    end
+
     def apply_baseline(ev : Miner::BaselineEvent) : Nil
       @baseline_stable = ev.stable
       @baseline_warning = ev.warning
@@ -293,8 +326,13 @@ module Gori::Tui
     def build_engine(verify : Bool, scope : Gori::Scope,
                      overrides : Gori::HostOverrides?) : {Miner::Engine?, String?}
       # @request / @target keep their `$VAR` tokens (that is what gets persisted and what
-      # the operator sees); Miner::Plan expands both exactly once, at build time.
-      options = Miner::PlanOptions.new(String.new(@request), target: @target, http2: @http2,
+      # the operator sees); Miner::Plan expands both exactly once, at build time — unless
+      # these bytes are EVIDENCE, in which case it expands neither and refuses neither.
+      # A flow-seeded mine of `?$filter=…&$top=10` was refused outright ("unresolved env
+      # $filter, $top"), and once the operator followed that advice every probe went out
+      # with the PARAMETER NAMES rewritten. `gori run mine --flow N` never did either.
+      options = Miner::PlanOptions.new(String.new(@request), evidence: @evidence,
+        target: @target, http2: @http2,
         locations: @config.locations, config: @config, verify: verify, sni: sni_override,
         overrides: overrides)
       plan = Miner::Plan.build(options, Gori::Outbound.interactive(scope))
@@ -330,6 +368,7 @@ module Gori::Tui
             j.array { @config.locations.each { |l| j.string l.label } }
           end
           j.field "concurrency", @config.concurrency
+          j.field "max_requests", @config.max_requests
           j.field "notify", @config.notify.token
           j.field "stability_rounds", @config.stability_rounds
           j.field "confirm_rounds", @config.confirm_rounds
@@ -351,6 +390,8 @@ module Gori::Tui
         @config.locations = parsed unless parsed.empty?
       end
       any["concurrency"]?.try(&.as_i?).try { |n| @config.concurrency = n }
+      # Absent (an older row) reads as nil ⇒ uncapped, which is what those runs were.
+      @config.max_requests = any["max_requests"]?.try(&.as_i64?)
       any["notify"]?.try(&.as_s?).try { |s| Miner::NotifyMode.parse?(s) }.try { |m| @config.notify = m }
       any["stability_rounds"]?.try(&.as_i?).try { |n| @config.stability_rounds = n }
       any["confirm_rounds"]?.try(&.as_i?).try { |n| @config.confirm_rounds = n }
@@ -403,6 +444,10 @@ module Gori::Tui
         screen.text(x, y, line, Theme.muted, Theme.bg, width: rect.w - 4)
       end
       y += 1
+      if budget_exhausted? && y < rect.bottom - 1
+        screen.text(x, y, budget_note, Theme.yellow, Theme.bg, width: rect.w - 4)
+        y += 1
+      end
       if (w = @baseline_warning) && y < rect.bottom - 1
         screen.text(x, y, "⚠ #{w}", Theme.yellow, Theme.bg, width: rect.w - 4)
       end
@@ -421,8 +466,12 @@ module Gori::Tui
       if @results.empty?
         # Distinguish never-run from a completed run that found nothing, using the
         # same signal the status line does (names_total > 0 ⇒ a run happened).
+        # "no hidden parameters found" over a wordlist the budget never opened is the one
+        # claim this pane must not make — it did not look.
         msg = if @running
                 "mining… discovered parameters appear here"
+              elsif budget_exhausted?
+                "none found in the #{@progress.names_done} of #{@progress.names_total} names the budget allowed"
               elsif @progress.names_total > 0
                 "no hidden parameters found"
               else

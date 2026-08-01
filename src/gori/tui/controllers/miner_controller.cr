@@ -346,7 +346,12 @@ module Gori::Tui
     # --- start a session (called by the Runner after the config overlay confirms) ---
     def start_session(seed : MineSeed, config : Miner::Config) : Nil
       view = MinerView.new
-      view.load(seed.target, seed.request, seed.http2, seed.sni, config)
+      # `flow_id != nil` IS the provenance test: `build_seed_from_flow` is the only
+      # constructor that sets it, and its bytes come straight from `FlowRequest.build`.
+      # `build_seed_from_request` (the Repeater path) leaves it nil and its bytes are
+      # editor text. Same one-line test `gori run mine` makes on `--flow`.
+      view.load(seed.target, seed.request, seed.http2, seed.sni, config,
+        evidence: !seed.flow_id.nil?)
       open_session(view, seed.flow_id) # NB: NO goto_tab — the job runs in the background
       start_run(view)
     end
@@ -497,7 +502,14 @@ module Gori::Tui
       #                                         engine's trailing DoneEvent must not log/notify success
       n = v.found_count
       @host.jobs.finish(v.job_id, :done, "#{n} found")
-      msg = "Miner: #{n} param#{n == 1 ? "" : "s"} found on #{v.summary}#{ev.stopped ? " (stopped)" : ""}"
+      tail = if ev.stopped
+               " (stopped)"
+             elsif v.budget_exhausted?
+               " — #{v.budget_note}"
+             else
+               ""
+             end
+      msg = "Miner: #{n} param#{n == 1 ? "" : "s"} found on #{v.summary}#{tail}"
       level = n > 0 ? :success : :info
       log_event(v, level, msg)
       push_mine_notification(v, level, msg, found: n)

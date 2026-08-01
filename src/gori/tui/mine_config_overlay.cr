@@ -28,6 +28,14 @@ module Gori::Tui
     CONC_CHOICES   = [5, 10, 20, 40]
     NOTIFY_CHOICES = Miner::NotifyMode.values
 
+    # Hard ceiling on REQUESTS the run may put on the target (retries and redirect hops
+    # each charge it — `Fuzz::CappedBackend`, the same counter `--max-requests` and MCP's
+    # `max_requests` are enforced against). nil = uncapped, which is what every TUI run
+    # used to be: there was no way to cap one from the primary surface at all, while
+    # `gori run` and MCP both had the knob. A cycler, not a text field, because this
+    # overlay deliberately has none (no IME plumbing).
+    MAX_REQ_CHOICES = [nil, 100, 250, 500, 1000, 2500, 5000, 10000] of Int32?
+
     getter seed : MineSeed
     # Additional flows this one config starts a session for — History's multi-select (#442).
     # The CHECKBOXES come from `seed` (the first target), because locations are per-request;
@@ -40,6 +48,7 @@ module Gori::Tui
       @seed.applicable.each { |l| @checked[l] = @seed.default.includes?(l) }
       @conc_idx = CONC_CHOICES.index(10) || 1
       @notify_idx = NOTIFY_CHOICES.index(Miner::NotifyMode::WhenFound) || 0
+      @maxreq_idx = 0
       @selected = 0
       restore_saved_prefs
     end
@@ -65,21 +74,26 @@ module Gori::Tui
       end
     end
 
-    # Rows: one per applicable location, then concurrency + notification cyclers, then Start.
+    # Rows: one per applicable location, then max-requests + concurrency + notification
+    # cyclers, then Start.
     private def row_count : Int32
-      @seed.applicable.size + 3
+      @seed.applicable.size + 4
     end
 
-    private def conc_row : Int32
+    private def maxreq_row : Int32
       @seed.applicable.size
     end
 
-    private def notify_row : Int32
+    private def conc_row : Int32
       @seed.applicable.size + 1
     end
 
-    private def start_row : Int32
+    private def notify_row : Int32
       @seed.applicable.size + 2
+    end
+
+    private def start_row : Int32
+      @seed.applicable.size + 3
     end
 
     def on_start_row? : Bool
@@ -143,6 +157,7 @@ module Gori::Tui
 
     def adjust(d : Int32) : Nil
       case @selected
+      when maxreq_row then @maxreq_idx = (@maxreq_idx + d) % MAX_REQ_CHOICES.size
       when conc_row   then @conc_idx = (@conc_idx + d) % CONC_CHOICES.size
       when notify_row then @notify_idx = (@notify_idx + d) % NOTIFY_CHOICES.size
       end
@@ -153,7 +168,7 @@ module Gori::Tui
       if @selected < @seed.applicable.size
         loc = @seed.applicable[@selected]
         @checked[loc] = !(@checked[loc]? || false)
-      elsif @selected == conc_row || @selected == notify_row
+      elsif @selected == maxreq_row || @selected == conc_row || @selected == notify_row
         adjust(1)
       end
     end
@@ -163,6 +178,7 @@ module Gori::Tui
       c.locations = @seed.applicable.select { |l| @checked[l]? }
       c.concurrency = CONC_CHOICES[@conc_idx]
       c.notify = NOTIFY_CHOICES[@notify_idx]
+      c.max_requests = MAX_REQ_CHOICES[@maxreq_idx].try(&.to_i64)
       c
     end
 
@@ -222,16 +238,27 @@ module Gori::Tui
         on = @checked[loc]? || false
         screen.text(x, py, on ? "[x]" : "[ ]", on ? Theme.green : Theme.muted, bg)
         screen.text(x + 4, py, "#{loc.label} mining", sel ? Theme.text_bright : Theme.text, bg)
-      elsif i == conc_row
-        screen.text(x, py, "concurrency:", Theme.muted, bg)
-        screen.text(x + 13, py, "#{CONC_CHOICES[@conc_idx]}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
-      elsif i == notify_row
-        screen.text(x, py, "notification:", Theme.muted, bg)
-        screen.text(x + 14, py, "#{NOTIFY_CHOICES[@notify_idx].label}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
-      else
+      elsif i == start_row
         label = any_checked? ? "[ Start mining ]" : "[ select a location ]"
         screen.text(x, py, label, any_checked? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
+      else
+        draw_cycler(screen, x, py, bg, sel, i)
       end
+    end
+
+    # The three ←/›-cycled rows, split out of draw_row so adding a knob does not keep
+    # growing one branch chain.
+    private def draw_cycler(screen : Screen, x : Int32, py : Int32, bg : Color, sel : Bool, i : Int32) : Nil
+      label, value =
+        if i == maxreq_row
+          {"max requests:", MAX_REQ_CHOICES[@maxreq_idx].try(&.to_s) || "uncapped"}
+        elsif i == conc_row
+          {"concurrency:", CONC_CHOICES[@conc_idx].to_s}
+        else
+          {"notification:", NOTIFY_CHOICES[@notify_idx].label}
+        end
+      screen.text(x, py, label, Theme.muted, bg)
+      screen.text(x + label.size + 1, py, "#{value}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?

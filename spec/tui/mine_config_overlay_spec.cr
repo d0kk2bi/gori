@@ -30,9 +30,13 @@ describe Gori::Tui::MineConfigOverlay do
     ov.build_config.locations.should eq([Gori::Miner::Location::Query, Gori::Miner::Location::Headers])
   end
 
-  it "cycles concurrency and notification on their rows and reports the Start row" do
+  it "cycles max-requests, concurrency and notification on their rows and reports the Start row" do
     ov = MineConfigOverlay.new(seed([Gori::Miner::Location::Query], [Gori::Miner::Location::Query]))
-    # rows: [0]=query, [1]=concurrency, [2]=notification, [3]=start
+    # rows: [0]=query, [1]=max requests, [2]=concurrency, [3]=notification, [4]=start
+    ov.build_config.max_requests.should be_nil # uncapped is the first choice, and the default
+    ov.move(1)                                 # max requests row
+    ov.adjust(1)
+    ov.build_config.max_requests.should eq(100_i64)
     ov.move(1) # concurrency row
     ov.adjust(1)
     ov.build_config.concurrency.should eq(20) # default 10 → next choice
