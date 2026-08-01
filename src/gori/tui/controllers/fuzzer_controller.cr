@@ -937,7 +937,7 @@ module Gori::Tui
       request_text : String,
       http2 : Bool,
       sni : String?,
-      label : String,  # sub-tab chip + toast ("#index payload")
+      label : String,      # sub-tab chip + toast ("#index payload")
       note : String? = nil # provenance when request_text is NOT the retained wire bytes
 
     # True when the focused session has a result row under the cursor (gates space →
