@@ -1,5 +1,6 @@
 require "../tab_controller"
 require "../decoder_view"
+require "../decoder_sessions"
 require "../text_area"
 require "../input_mode"
 require "../text_read_state"
@@ -41,7 +42,10 @@ module Gori::Tui
   # mnemonics never collide with literal text (`:` stays literal) — they're reached
   # only from the space menu + palette. A runner-owned sub-tab strip appears from the
   # first session (^N new · ^W close · ^1-9/←→ switch · r rename); open sessions persist
-  # to the global settings.json.
+  # to THIS project's store (`Store::DECODER_SESSIONS_KEY`), so switching projects opens a
+  # clean workbench instead of carrying the previous engagement's material across. The
+  # named chains a conversion can load stay in the global settings.json — a chain spec is
+  # tool config, reusable everywhere; what was run THROUGH it is project data.
   class DecoderController < TabController
     SEPS = {'>', '|', ','}
 
@@ -56,8 +60,9 @@ module Gori::Tui
       @prompt_buf = ""
       @chain_pre = "" # IME preedit for the focused CHAIN field
       @dirty = false  # session set changed since the last persist
-      # Restore open sub-tabs. Always ≥1 (a blank session when nothing was persisted).
-      src = Settings.decoder_sessions
+      # Restore this project's open sub-tabs. Always ≥1 (a blank session when nothing was
+      # persisted).
+      src = restore_sessions
       src = [{"", "", ""}] if src.empty?
       @sessions = src.map { |(input, chain, name)| make_session(input, chain, name.empty? ? nil : name) }
       @idx = 0
@@ -448,16 +453,53 @@ module Gori::Tui
       recompute
     end
 
+    # Stays dirty when the write did not commit (store busy/locked/closing) so the next
+    # leave/quit retries instead of silently dropping the conversion.
     def commit : Nil
       return unless @dirty
-      Settings.decoder_sessions = session_tuples
-      Settings.save
-      @dirty = false
+      @dirty = false if persist_sessions
     end
 
     # The persisted form of the open sub-tabs ({input, chain, name}).
     private def session_tuples : Array({String, String, String})
       @sessions.map { |s| {s.input.text, s.chain, s.view.name || ""} }
+    end
+
+    private def store : Store
+      @host.session.store
+    end
+
+    # Write the open sub-tabs into THIS project's store. Returns whether the write committed.
+    private def persist_sessions : Bool
+      store.set_setting(Store::DECODER_SESSIONS_KEY, DecoderSessions.to_json(session_tuples))
+    end
+
+    # This project's persisted sub-tabs — or, for a store that has none yet, the one-time
+    # adoption of the legacy GLOBAL settings.json block. The legacy sessions are cleared from
+    # settings.json as they move, so the FIRST project opened after the upgrade inherits the
+    # workbench and every later one starts clean (leaving them in place would seed the very
+    # cross-project carry-over this split exists to stop). A blank legacy block is dropped
+    # rather than migrated: there is nothing to inherit, and writing an empty row would only
+    # mark the project as "already migrated" for no gain.
+    private def restore_sessions : Array({String, String, String})
+      if raw = store.setting(Store::DECODER_SESSIONS_KEY)
+        return DecoderSessions.parse(raw)
+      end
+      none = [] of {String, String, String}
+      legacy = Settings.decoder_sessions
+      if DecoderSessions.blank?(legacy)
+        Settings.decoder_sessions = none # nothing to inherit; keep later projects clean
+        return none
+      end
+      # Adopt into the store FIRST, and only drop the settings.json copy once that write
+      # committed — a busy store must not cost the operator the sessions it failed to take.
+      # Either way the workbench opens with them; a failed adoption just means the next open
+      # retries the migration.
+      if store.set_setting(Store::DECODER_SESSIONS_KEY, DecoderSessions.to_json(legacy))
+        Settings.decoder_sessions = none
+        Settings.drop_legacy_decoder_sessions
+      end
+      legacy
     end
 
     # ---- output actions (also the space-menu verbs, via the runner) ----
@@ -822,12 +864,12 @@ module Gori::Tui
       chains = Settings.decoder_chains.reject { |(n, _)| n == name }
       chains << {name, cur.chain}
       Settings.decoder_chains = chains
-      # ^S writes settings.json now (before the next commit), so flush the live sessions
-      # too — otherwise this save persists a stale/empty `sessions` block and an
-      # in-progress conversion is lost if the process dies before a normal leave/quit.
-      Settings.decoder_sessions = session_tuples
+      # ^S is a save gesture, so flush the live sessions at the same moment — otherwise an
+      # in-progress conversion is lost if the process dies before a normal leave/quit. Two
+      # destinations now: the named chain goes to settings.json (global), the sessions to
+      # this project's store, and each reports its own success.
+      @dirty = false if @dirty && persist_sessions
       if Settings.save
-        @dirty = false
         @host.status(existing ? "updated chain \"#{name}\"" : "saved chain \"#{name}\"")
       else
         @host.status("could not save chain")

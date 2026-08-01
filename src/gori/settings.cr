@@ -324,8 +324,10 @@ module Gori
     # it is written, with no second list to keep in step.
     #
     # Sections holding SECRETS or machine-local scratch, excluded from an export unless the
-    # operator names them explicitly. `env` carries token VALUES and `decoder` carries the last
-    # input plus saved sessions; the point of an export is that it can be committed or shared.
+    # operator names them explicitly. `env` carries token VALUES; `decoder` now carries only
+    # the named chain SPECS (the open sub-tabs moved to each project's store), but a spec can
+    # still describe how an engagement's tokens are unwrapped — and the point of an export is
+    # that it can be committed or shared, so it stays opt-in.
     # Note `upstream_rules` is deliberately NOT here — it stores only a username and an
     # environment-variable NAME, never a password (see settings/upstream_rules.cr).
     SECRET_SECTIONS = ["env", "decoder"]

@@ -1,19 +1,61 @@
 require "json"
 
-# DECODER section: Decoder tab scratch state (global, not project data). See
-# settings.cr for the module-level overview and the load/save/serialize orchestration.
+# DECODER section: the Decoder tab's named chain specs. See settings.cr for the
+# module-level overview and the load/save/serialize orchestration.
 module Gori::Settings
-  # Decoder tab scratch state (a global scratch tool, not project data). Each open
-  # sub-tab (an independent conversion session) is restored on restart as a
-  # {input, chain, name} tuple; decoder_chains are named, saved chain specs
-  # (name -> spec) the user can re-load. Written only on commit (Esc/quit),
-  # dirty-guarded, so an untouched Decoder tab never rewrites the file.
+  # LEGACY, READ-ONLY. Open Decoder sub-tabs used to live here, which carried one project's
+  # decoded material into the next one on a project switch. They now live in each project's
+  # own store (`Store::DECODER_SESSIONS_KEY`); this property only still parses so
+  # DecoderController#restore_sessions can adopt a pre-upgrade block once and clear it.
+  # Deliberately NOT serialized — writing it again would recreate the global block.
   class_property decoder_sessions : Array({String, String, String}) = [] of {String, String, String}
+
+  # Named, saved chain specs (name -> spec) the user can re-load with ^O. Global on purpose:
+  # a chain like "base64-decode > gunzip" is tool config, reusable in every project — only
+  # what was run THROUGH it is project data.
   class_property decoder_chains : Array({String, String}) = [] of {String, String}
 
-  # Tolerant sub-tab session parse: a non-array (or absent) node keeps the current
-  # value. Missing fields default to "" (a blank session is valid — an empty
-  # sub-tab). Mirrors parse_decoder_chains.
+  # Erase a pre-upgrade `decoder.sessions` block from settings.json, keeping every other
+  # section (including `decoder.chains`) byte-identical. Returns whether the file is now free
+  # of it. Called once, by DecoderController#restore_sessions, after the sessions have been
+  # adopted into a project store.
+  #
+  # `save` CANNOT do this. Its 3-way merge asks "did this process change the section?" by
+  # comparing its own serialization against the same serialization at load time — and since
+  # sessions are no longer serialized at all, `decoder` reads as unchanged on both sides and
+  # therefore YIELDS TO DISK. The block would survive every future save and re-seed the next
+  # project opened after every restart. So this rewrites the file it actually finds (never
+  # this process's in-memory picture, which would clobber a concurrent peer's sections),
+  # dropping exactly one field.
+  def self.drop_legacy_decoder_sessions : Bool
+    raw = load_raw
+    return true unless raw # no file yet — nothing to erase
+    root = (JSON.parse(raw).as_h? rescue nil)
+    return false unless root
+    dec = root["decoder"]?.try(&.as_h?)
+    return true unless dec && dec.has_key?("sessions")
+    kept = dec.reject("sessions")
+    doc = JSON.build(indent: "  ") do |j|
+      j.object do
+        root.each do |k, v|
+          next if k == "decoder"
+          j.field k, v
+        end
+        j.field "decoder", kept unless kept.empty?
+      end
+    end
+    tmp = "#{path}.tmp"
+    write_private(tmp, doc)
+    File.rename(tmp, path)
+    true
+  rescue
+    File.delete?("#{path}.tmp") rescue nil
+    false
+  end
+
+  # Tolerant sub-tab session parse (legacy blocks only — see decoder_sessions): a non-array
+  # (or absent) node keeps the current value. Missing fields default to "" (a blank session
+  # is valid — an empty sub-tab). Mirrors parse_decoder_chains.
   private def self.parse_decoder_sessions(node : JSON::Any?) : Array({String, String, String})
     arr = node.try(&.as_a?)
     return decoder_sessions unless arr
@@ -44,30 +86,17 @@ module Gori::Settings
     out
   end
 
-  # Omit the whole block when there's nothing worth persisting — no saved chains and
-  # every open session blank+unnamed — so an untouched OR cleared Decoder workbench
-  # never writes a "decoder" section. (`all?` is vacuously true for an empty array.)
+  # Omit the whole block when there are no saved chains, so an untouched OR cleared Decoder
+  # workbench never writes a "decoder" section. Open sub-tabs are NOT written here any more
+  # (they belong to the project store): a save that re-emitted them would put the
+  # cross-project carry-over straight back.
   private def self.serialize_decoder(j : JSON::Builder) : Nil
-    sessions_blank = decoder_sessions.all? { |(i, c, n)| i.empty? && c.empty? && n.empty? }
-    unless sessions_blank && decoder_chains.empty?
+    unless decoder_chains.empty?
       j.field "decoder" do
         j.object do
-          j.field "sessions" do
+          j.field "chains" do
             j.array do
-              decoder_sessions.each do |(input, chain, name)|
-                j.object do
-                  j.field "input", input
-                  j.field "chain", chain
-                  j.field "name", name unless name.empty?
-                end
-              end
-            end
-          end
-          unless decoder_chains.empty?
-            j.field "chains" do
-              j.array do
-                decoder_chains.each { |(name, spec)| j.object { j.field "name", name; j.field "spec", spec } }
-              end
+              decoder_chains.each { |(name, spec)| j.object { j.field "name", name; j.field "spec", spec } }
             end
           end
         end
