@@ -369,6 +369,28 @@ describe Gori::Export::Har do
     end
   end
 
+  # R4. An exported entry has to carry what gori has to SAY about the exchange — HAR 1.2
+  # gives `entry.comment` for exactly this. The pushed case matters most: a HAR reader has no
+  # other way to tell a request the ORIGIN invented from one the client sent.
+  it "carries the flow advisory as the entry comment, and omits it otherwise" do
+    with_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "shop.test", port: 443, method: "GET",
+        target: "/pushed", http_version: "HTTP/2",
+        head: "GET /pushed HTTP/2\r\nHost: shop.test\r\n\r\n".to_slice,
+        advisory: "server push: this request was invented by the origin"))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/2 200\r\nContent-Length: 0\r\n\r\n".to_slice,
+        advisory: "server push: this request was invented by the origin"))
+      har, _ = export([store.get_flow(id).not_nil!])
+      entry = JSON.parse(har)["log"]["entries"][0]
+      entry["comment"].as_s.should contain("invented by the origin")
+
+      plain, _ = export([capture_flow(store)])
+      JSON.parse(plain)["log"]["entries"][0].as_h.has_key?("comment").should be_false
+    end
+  end
+
   describe "flows with no HAR representation" do
     it "skips a WebSocket flow and says so, rather than emitting the handshake alone" do
       with_store do |store|

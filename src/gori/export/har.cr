@@ -215,6 +215,14 @@ module Gori
               j.field "comment", TIMINGS_NOTE
             end
           end
+          # HAR 1.2 §entry allows a `comment`, and this is what it is for: something the
+          # tool has to say about the exchange that the recorded request/response cannot.
+          # An exported flow keeps "Match&Replace was not applied to this head" and "the
+          # ORIGIN invented this request in a PUSH_PROMISE" — the second especially, since
+          # a HAR reader has no other way to tell a pushed entry from one the client sent.
+          # See `Store::FlowRow#advisory`.
+          advisories = row.advisories
+          j.field "comment", advisories.join("\n") unless advisories.empty?
         end
       end
 

@@ -435,6 +435,26 @@ module Gori::Tui
       {id, Fuzz::ContentLength.sync(raw, add_when_missing: true)}
     end
 
+    # Why gori would REFUSE the current pending edit, or nil when it would apply it.
+    #
+    # A QUERY beside `pending_edit`, the same shape as `unresolved_env` and for the same
+    # reason: the editor keeps showing what the operator typed, and only the FORWARD consults
+    # this. `Item#refuse_edit` is the single definition of the answer — the CLI/MCP drain
+    # (`Runner#apply_intercept_command`) has asked it since R3-F1, and this path did not, so a
+    # human editing an h2 message whose head has no HTTP/1.1 text form got `forwarded …` in
+    # the status bar while the ORIGINAL request went on the wire byte for byte.
+    #
+    # Nil when the editor is clean: an unedited forward is byte-exact, so there is no edit to
+    # refuse — inspecting a held message must never make it unforwardable.
+    def refused_edit : {Interceptor::Item, String}?
+      edit = pending_edit
+      return nil unless edit
+      item = item_by_id(edit[0])
+      return nil unless item
+      reason = item.refuse_edit(edit[1])
+      reason ? {item, reason} : nil
+    end
+
     # Whether a forward recomputes `Content-Length` from the edited body (Burp's "Update
     # Content-Length"; default on).
     #
@@ -891,13 +911,17 @@ module Gori::Tui
     # item); a WebSocket message shows the socket it rides on plus a preview of the payload,
     # because the handshake identity is shared by every message on that socket and the
     # payload is the only thing that tells two rows apart.
+    # `Item#label` composes the HTTP kinds — the ONE definition of "host + an overloaded
+    # target", which as three separate copies produced `POST 127.0.0.1200 OK` (reads as HTTP
+    # status 1200) on the ack path. It takes the EDITED method/target so a row still tracks
+    # what is about to be sent. A WebSocket row keeps its own tail: `Item#label` ends a WS
+    # message with its byte count, and here the PAYLOAD PREVIEW is the only thing that tells
+    # two messages on one socket apart.
     private def row_label(it : Interceptor::Item) : String
       method, raw_target = effective_method_target(it) # edited values for the loaded item
-      target = Url.origin_path(raw_target)             # strip scheme+authority for plaintext forward-proxy targets
       case it.kind
-      in .request?         then "#{method} #{it.host}#{target}"
-      in .response?        then "#{it.host} #{target}"
-      in .ws_out?, .ws_in? then "#{it.host}#{target}  #{ws_preview(it)}"
+      in .request?, .response? then it.label(method, raw_target)
+      in .ws_out?, .ws_in?     then "#{it.host}#{Url.origin_path(raw_target)}  #{ws_preview(it)}"
       end
     end
 

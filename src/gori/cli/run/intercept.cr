@@ -175,10 +175,22 @@ module Gori
               # any ANSI/OSC/CSI escapes before they hit the live terminal (see its doc
               # comment; same discipline as flow_row_text/print_message_text).
               method = CLI::Output.term_safe(r.method.ljust(6))
-              puts "##{r.item_id}  [#{r.kind}]  #{method} #{CLI::Output.term_safe(intercept_row_where(r))}  (#{body.size}b body)"
+              # `[no-edit]` marks a message an edit cannot be applied to, so the state is
+              # scannable down a queue listing the way `[stub]` is in History. The sentence
+              # itself is `intercept get`'s; a list row has no space for it.
+              chip = r.edit_warning ? "  [no-edit]" : ""
+              puts "##{r.item_id}  [#{r.kind}]  #{method} #{CLI::Output.term_safe(intercept_row_where(r))}  (#{body.size}b body)#{chip}"
             end
           end
         end
+      end
+
+      # "gori will not apply an edit to this message, and here is why" — printed before the
+      # head so the operator reads it before writing one. Silent when the message is editable.
+      private def self.emit_edit_warning(r : Store::HeldRow) : Nil
+        return unless warning = r.edit_warning
+        STDERR.puts "! edits cannot be applied to this message: #{CLI::Output.term_safe(warning)}"
+        STDERR.puts "! it stays held — forward it as it is, drop it, or replay it from the Repeater."
       end
 
       # WHERE a held item is, for one text row. The escape-neutralizing wrap is the caller's;
@@ -245,6 +257,11 @@ module Gori
           else
             head, body = MCP::Serialize.head_and_body(row.raw)
             redacted = MCP::Serialize.redact_head(head, include_sensitive)
+            # ABOVE the head, because this is the reason not to start typing one: an edit gori
+            # will not apply is decided when the message is HELD, and until it was carried on
+            # the row this command printed an ordinary editable message and let the operator
+            # find out from `intercept edit`'s exit code.
+            emit_edit_warning(row)
             puts CLI::Output.term_safe_multiline(redacted).rstrip
             unless body.empty?
               puts ""

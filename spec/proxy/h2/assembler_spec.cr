@@ -303,6 +303,13 @@ describe Gori::Proxy::H2::Assembler do
     # indistinguishable in History / QL / the Sitemap from one the client made — rows the
     # origin authored, inside the evidence an operator came to read.
     String.new(req.head).should contain("X-Gori-Pushed: server push promised on stream 1")
+    # R4: and as DATA on the row, not only as a line inside the head TEXT. History, QL, the
+    # Sitemap, MCP `get_flow` and a HAR export all read the row, and none of them parses a
+    # stored head looking for a marker.
+    req.advisory.not_nil!.should contain("server push")
+    req.advisory.not_nil!.should contain("PUSH_PROMISE on stream 1")
+    # The response half must not drop it: `update_one` writes the column outright.
+    sink.responses.first.advisory.not_nil!.should contain("server push")
   end
 
   # Complement: a request the client actually sent carries no push marker.
@@ -312,6 +319,32 @@ describe Gori::Proxy::H2::Assembler do
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     String.new(sink.requests.first.head).should_not contain("X-Gori-Pushed")
+    sink.requests.first.advisory.should be_nil
+  end
+
+  # `HeadRewrite` runs BEFORE the frame reaches `feed`, so an advisory can arrive for a stream
+  # this assembler has never seen. It has to open the entry the way `feed_locked` does, or the
+  # statement is dropped for exactly the messages it is about.
+  it "records an advisory that arrives BEFORE the stream's first frame" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.note_advisory(1_u32, "a rule could not run here")
+    assembler.note_advisory(1_u32, "a rule could not run here") # deduped, not doubled
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    sink.requests.first.advisory.should eq("a rule could not run here")
+  end
+
+  # The complement of "opens the entry": stream 0 is the CONNECTION, never a message, so an
+  # advisory keyed to it must not mint a phantom stream (`feed` already treats 0 as
+  # not-a-stream, and a Slot keyed 0 is the freeze D1 rule 1 forbids).
+  it "ignores an advisory for stream 0" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.note_advisory(0_u32, "not about any message")
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    sink.requests.first.advisory.should be_nil
   end
 
   # R5-F4. gori relays an RFC 8441 extended CONNECT byte-for-byte (it also relays the origin's

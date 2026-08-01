@@ -686,7 +686,34 @@ module Gori
         "ALTER TABLE repeaters ADD COLUMN ws_keep_key INTEGER NOT NULL DEFAULT 0",
       ]
 
-      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7]
+      # Two facts gori knew and could not SAY as data.
+      #
+      # `flows.advisory` — see `Store::FlowRow#advisory` for what it is and why it is a
+      # column rather than a rows table. It gives an HTTP flow what a WebSocket flow has had
+      # since #518 (the `[gori] …` rows `WS::Relay` writes into `ws_messages`): somewhere to
+      # record what gori did to a message that the message's own bytes cannot show. Its two
+      # first tenants both used to escape as a log line or a fabricated header — a
+      # Match&Replace head rule that structurally could not run on an h2 message with no
+      # HTTP/1.1 text form (a WARN on `gori run capture`'s STDERR, correlated with no flow),
+      # and a server PUSH_PROMISE (a synthesized `X-Gori-Pushed` line readable only by
+      # someone already looking at the head text). NULL on every existing row, which is the
+      # truth for them: gori recorded no advisory before this migration.
+      #
+      # `intercept_held.edit_refusal` / `.head_only` mirror the two facts
+      # `Interceptor::Item` has carried since #517/R3-F1 across the #123 bridge, so the MCP
+      # process and `gori run intercept get`/`list` can say "edits cannot be applied to this
+      # message: …" BEFORE the operator writes one. `intercept_held` is a per-session
+      # snapshot mirror that `clear_intercept_state!` wipes, so nothing has to be
+      # back-filled — but it is a released table, so the columns still arrive as a
+      # migration. `head_only` defaults 0: an h1 hold covers head+body, and every row a
+      # pre-V8 gori wrote came from a build whose h2 gate had not been written yet.
+      V8 = [
+        "ALTER TABLE flows ADD COLUMN advisory TEXT",
+        "ALTER TABLE intercept_held ADD COLUMN edit_refusal TEXT",
+        "ALTER TABLE intercept_held ADD COLUMN head_only INTEGER NOT NULL DEFAULT 0",
+      ]
+
+      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8]
 
       def self.migrate!(db : DB::Database) : Nil
         db.using_connection do |conn|

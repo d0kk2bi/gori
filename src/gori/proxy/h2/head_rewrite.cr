@@ -407,6 +407,7 @@ module Gori::Proxy::H2
       # `parse_*` refuses it anyway; checking here keeps the rules from running for nothing
       # and, more to the point, keeps the log from blaming a rule for the peer's bytes.
       if reason = HeadCodec.h1_unfaithful_reason(fields, request)
+        note_skipped(stream_id, reason)
         return warn_unfaithful(stream_id, request, reason)
       end
       # The BARE host, because that is what a rule's host glob is written against and what
@@ -451,6 +452,20 @@ module Gori::Proxy::H2
         "h2 #{@direction}: #{source} produced a head that is no longer parseable " \
         "(stream #{stream_id}) — forwarded the original head unchanged"
       end
+    end
+
+    # The same refusal as `warn_unfaithful`, recorded AGAINST THE FLOW instead of only in the
+    # log — `Store::FlowRow#advisory`, the HTTP twin of the `[gori] …` rows a WebSocket flow
+    # gets. The log line is once per direction per connection (a flood would be useless); this
+    # is once per MESSAGE, because "did my rule run on THIS request?" is a per-message
+    # question and the operator asking it is reading History, not tailing `gori.log`. Reached
+    # only with a head rule live, which is what makes the skip a fact worth recording; with no
+    # rules there is nothing that failed to fire.
+    private def note_skipped(stream_id : UInt32, reason : String) : Nil
+      @assembler.note_advisory(stream_id,
+        "Match&Replace was NOT applied to this #{@direction == "out" ? "request" : "response"} " \
+        "head: it has no HTTP/1.1 text form (#{reason}). The fields went out exactly as they " \
+        "arrived, and an intercept edit to it would be refused for the same reason (#517)")
     end
 
     # The mirror of `warn_unparseable` for a head the PEER sent that the h1 text cannot carry

@@ -2170,6 +2170,17 @@ module Gori::Tui
         trailer << Highlight::Line.new
         trailer << [Highlight::Span.new("— body truncated at capture limit (#{Settings.effective_capture_max_mib} MiB); full size in the list —", Theme.yellow)]
       end
+      # What gori has to say about this exchange that its bytes cannot (`FlowRow#advisory`).
+      # In the TRAILER, beside the truncation notice, and not spliced into the head: this is
+      # gori's sentence, and the panes above it are the wire's bytes (P7). Only on the
+      # REQUEST pane — an advisory is a property of the exchange, so printing it under both
+      # would read as two different findings.
+      if request
+        detail.row.advisories.each do |a|
+          trailer << Highlight::Line.new
+          trailer << [Highlight::Span.new("! #{a}", Theme.yellow)]
+        end
+      end
 
       # gRPC: bounded framed hex view — style eagerly into `head`. Flagged binary so the
       # reveal-whitespace path is gated off (like any other binary body): a gRPC body is

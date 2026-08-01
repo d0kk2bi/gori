@@ -84,8 +84,15 @@ module Gori::Proxy::H2
       # The stream whose PUSH_PROMISE invented this request, when the client never sent it.
       # A pushed flow was indistinguishable in History / QL / the Sitemap from one the client
       # made — the origin authoring rows in an operator's evidence — so the projection says so
-      # (`HeadCodec::PUSHED_MARKER`).
+      # (`HeadCodec::PUSHED_MARKER`, plus the `advisory` below, which is the half a reader who
+      # is NOT looking at the head text can see).
       property pushed_by : UInt32? = nil
+      # What gori has to say about this exchange that its bytes cannot — see
+      # `Store::FlowRow#advisory`. Accumulated here rather than passed straight through
+      # because the producers run at different moments (a request-direction advisory before
+      # `emit_request`, a response-direction one before `emit_response`) and the stream is
+      # the only thing that spans both.
+      getter advisories = [] of String
     end
 
     def initialize(@sink : FlowSink, @host : String, @port : Int32, @created_at : Int64,
@@ -129,6 +136,29 @@ module Gori::Proxy::H2
     # `Int64?`.
     def flow_id_of(stream_id : UInt32) : Int64?
       @mutex.synchronize { @streams[stream_id]?.try(&.flow_id) }
+    end
+
+    # Record one advisory against `stream_id`'s flow — something gori DID to this message (or
+    # structurally could not do to it) that neither the stored bytes nor `flows.error` can
+    # show. See `Store::FlowRow#advisory`.
+    #
+    # Called from `HeadRewrite`, which runs BEFORE the frame reaches `feed`, so the stream may
+    # not be tracked yet: this opens the entry the way `feed_locked` does, under the same
+    # MAX_LIVE_STREAMS ceiling (past it nothing is tracked and the advisory is dropped along
+    # with the projection it would have annotated — the raw frame log stays the truth, P7).
+    # De-duplicated because a per-message fact must not repeat when a message's head block is
+    # revisited, while it MUST still be recorded for every message — unlike the once-per-
+    # connection `::Log.warn` beside it, which is why they are separate statements.
+    def note_advisory(stream_id : UInt32, text : String) : Nil
+      return if stream_id == 0 || text.empty?
+      @mutex.synchronize do
+        stream = @streams[stream_id]?
+        if stream.nil?
+          next if @streams.size >= MAX_LIVE_STREAMS
+          stream = @streams[stream_id] = Stream.new
+        end
+        stream.advisories << text unless stream.advisories.includes?(text)
+      end
     end
 
     # A stream the operator DROPPED at the intercept gate, or one abandoned while held. Its
@@ -322,6 +352,11 @@ module Gori::Proxy::H2
       promised.req.headers = pre ? (pre.fields || raise Gori::Error.new("h2 push block failed to decode")) : decoder.decode(block)
       promised.req.ended = true
       promised.pushed_by = frame.stream_id
+      # As DATA on the flow row, not only as the `X-Gori-Pushed` line inside the projected
+      # head: History, QL, the Sitemap and every JSON feed read the row, and a row the ORIGIN
+      # authored must not be indistinguishable there from one the client sent.
+      promised.advisories << "server push: this request was invented by the origin in a " \
+                             "PUSH_PROMISE on stream #{frame.stream_id} — the client never sent it"
       emit_request(promised_id, promised)
     end
 
@@ -399,7 +434,8 @@ module Gori::Proxy::H2
         created_at: @created_at, scheme: scheme, host: host, port: port,
         method: method, target: path, http_version: "HTTP/2", head: head, body: body,
         body_truncated: cap.truncated?, body_size: cap.total,
-        h2_conn_id: @conn_id, h2_stream_id: stream_id.to_i64)
+        h2_conn_id: @conn_id, h2_stream_id: stream_id.to_i64,
+        advisory: advisory_of(stream))
       stream.flow_id = @sink.on_request(captured)
     end
 
@@ -421,7 +457,16 @@ module Gori::Proxy::H2
         flow_id: flow_id, status: status, head: head, body: body,
         body_truncated: cap.truncated?, body_size: cap.total,
         content_type: content_type, content_encoding: content_encoding, state: state, error: error,
-        ttfb_us: ttfb_us, duration_us: duration_us))
+        ttfb_us: ttfb_us, duration_us: duration_us, advisory: advisory_of(stream)))
+    end
+
+    # The stream's advisories as one newline-joined column value, or nil when there are none.
+    #
+    # The FULL accumulated set every time, request-side entries included: `update_one` writes
+    # the column outright (nil leaves it alone), so a response-direction advisory that carried
+    # only its own line would erase what `emit_request` already stored.
+    private def advisory_of(stream : Stream) : String?
+      stream.advisories.empty? ? nil : stream.advisories.join('\n')
     end
 
     # Flush a stream that ended abnormally (RST_STREAM or the connection closed at a

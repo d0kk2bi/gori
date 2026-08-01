@@ -1,3 +1,5 @@
+require "../url"
+
 module Gori::Tui
   # Small URL display helpers shared across views (History list, Intercept queue …).
   module Url
@@ -6,12 +8,13 @@ module Gori::Tui
     # scheme+authority so a path column / queue label reads like the HTTPS (origin-form)
     # rows instead of gluing the host onto a full URL ("example.comhttp://example.com/x").
     # Non-URL targets (e.g. a response's "405 Method Not Allowed") pass through unchanged.
+    #
+    # The rule itself now lives in core `Gori::Url` — `Interceptor::Item` is core and needed
+    # the same answer, and the two `target.starts_with?("http")` copies in `CLI::Output` and
+    # `Links` were a THIRD spelling that disagreed with this one on an uppercase scheme. This
+    # stays as the TUI's name for it so the eight call sites in `tui/` read unchanged.
     def self.origin_path(target : String) : String
-      return target unless target.starts_with?("http://") || target.starts_with?("https://")
-      scheme_end = target.index("://")
-      return target unless scheme_end
-      slash = target.index('/', scheme_end + 3)
-      slash ? target[slash..] : "/"
+      Gori::Url.origin_path(target)
     end
   end
 end

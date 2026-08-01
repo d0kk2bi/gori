@@ -96,6 +96,14 @@ module Gori
           # feed has no other way to tell a fabricated response from a real one, and an absent
           # field reads as "not applicable" rather than "false".
           j.field "short_circuited", row.short_circuited?
+          # What gori has to say about this flow that its bytes cannot — a rule it could not
+          # apply, a request the ORIGIN invented in a PUSH_PROMISE (`FlowRow#advisory`). An
+          # array, and only when non-empty: a model has no reason to reason about `null` on
+          # every ordinary row, and the absent field reads as "nothing to report".
+          advisories = row.advisories
+          unless advisories.empty?
+            j.field("advisory") { j.array { advisories.each { |a| j.string text(a) } } }
+          end
         end
       end
 
@@ -157,9 +165,22 @@ module Gori
           j.field "held_at_iso", unix_micros_iso(row.held_at_ms * 1000)
           j.field "age_seconds", ((now_ms - row.held_at_ms) // 1000)
           j.field "edited", row.edited
+          emit_edit_warning(j, row)
           j.field "body_size", body.size
           j.field "head_preview", preview
         end
+      end
+
+      # Why an EDIT to this held message would be refused, and whether the hold covers the
+      # head only — BEFORE the agent composes one. Both are decided when the message is held
+      # (`HeadCodec.h1_unfaithful_reason` is a pure function of the h2 block's fields), and
+      # without them here `intercept_get` described an ordinary editable message: the agent
+      # wrote an edit, called `intercept_forward_edit`, and only then got the refusal. That is
+      # the state a CRLF-injection probe INDUCES, so it is the normal case for the test an
+      # agent is most likely to be running. Emitted only when there is something to say.
+      def self.emit_edit_warning(j : JSON::Builder, row : Store::HeldRow) : Nil
+        j.field "head_only", true if row.head_only?
+        row.edit_warning.try { |w| j.field "edit_refusal", text(w) }
       end
 
       # Detail projection: full redacted head + body size. The FULL raw message base64 (for
@@ -181,6 +202,7 @@ module Gori
           j.field "held_at_ms", row.held_at_ms
           j.field "age_seconds", ((now_ms - row.held_at_ms) // 1000)
           j.field "edited", row.edited
+          emit_edit_warning(j, row)
           j.field "head", redact_head(head, include_sensitive)
           j.field "body_size", body.size
           j.field "raw_size", row.raw.size
@@ -251,6 +273,14 @@ module Gori
           # "`stub:false` is what you want before treating History as evidence"; the list
           # projection said so and the detail one dropped it.
           j.field "short_circuited", row.short_circuited?
+          # See `flow_row`. On the detail projection this is the one the agent reading BYTES
+          # as evidence needs: "Match&Replace was not applied to this head" and "the origin
+          # invented this request" are both statements about how much the bytes below can be
+          # trusted to be the operator's test case.
+          detail_advisories = row.advisories
+          unless detail_advisories.empty?
+            j.field("advisory") { j.array { detail_advisories.each { |a| j.string text(a) } } }
+          end
           j.field "error", text(detail.error)
           j.field "request_head", redact_head_opt(head_text(detail.request_head), include_sensitive)
           emit_head_base64(j, "request_head", detail.request_head, include_sensitive)
