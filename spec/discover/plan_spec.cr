@@ -389,6 +389,13 @@ describe Gori::Discover::Plan do
       # `Headers.parse_lines` refuses a hand-typed CRLF, but it only ever saw `$TOKEN`.
       # Without a second guard after expansion, an env var's value would splice extra
       # headers into every probe the crawl sends.
+      #
+      # This is the BACKSTOP, not the report. Dropping silently here is what made an
+      # authenticated sweep run unauthenticated and answer "found nothing" over the whole
+      # authenticated surface — so the surface now REFUSES the run up front, by name, off
+      # `Headers.unsafe_expanded` (see spec/discover/headers_spec.cr and
+      # `gori run discover`). The drop stays because this is the last look before the wire
+      # and a binding can resolve later than plan-build; it just is no longer the only look.
       Gori::Settings.env_vars = [{"TOKEN", "a\r\nX-Injected: 1"}]
       config = one_shot_config(D::Headers.parse_lines(["X-Auth: $TOKEN"]))
       _findings, seen = run_one do |port|
