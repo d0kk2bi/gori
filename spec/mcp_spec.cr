@@ -1704,8 +1704,17 @@ describe Gori::MCP::Server do
         payload["upgraded"].as_bool.should be_true
         payload["handshake_status"].as_i.should eq(101)
         payload["close_code"].as_i.should eq(1000)
-        payload["messages"].as_a.map { |message| {message["direction"].as_s, message["payload"].as_s} }
-          .should eq([{"out", "ping"}, {"in", "ping"}])
+        # The origin's CLOSE frame is now a transcript row of its own, not just a
+        # `close_code` field — its REASON is where a server explains itself, and until V7 the
+        # frame was dropped before anything above the relay could see it.
+        payload["messages"].as_a.map { |message| {message["direction"].as_s, message["type"].as_s} }
+          .should eq([{"out", "text"}, {"in", "text"}, {"in", "close"}])
+        payload["messages"].as_a[0]["payload"].as_s.should eq("ping")
+        payload["messages"].as_a[1]["payload"].as_s.should eq("ping")
+        payload["messages"].as_a[2]["close_code"].as_i.should eq(1000)
+        # `frame` reports what was FRAMED, so a shape test can be read back instead of taken
+        # on trust. The default send is still an ordinary masked TEXT frame.
+        payload["messages"].as_a[0]["frame"].as_s.should eq("TEXT")
         store.repeaters.find(&.id.==(repeater_id)).not_nil!.response_head.should_not be_nil
       end
     end
@@ -3691,6 +3700,77 @@ describe "MCP per-project network overrides" do
     ensure
       Gori::Settings.project_upstream_proxy = nil
       Gori::Settings.project_capture_max_mib = nil
+    end
+  end
+end
+
+# A WS origin that upgrades, then reads until the client stops — so a multi-frame send
+# (unlike start_mcp_ws_origin's single read-then-close) is not racing a shut socket.
+private def start_mcp_ws_sink_origin : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 2.seconds
+    head = Gori::Proxy::Codec::Http1.read_head(conn).not_nil!
+    key = String.new(head).each_line
+      .find(&.downcase.starts_with?("sec-websocket-key:"))
+      .try { |line| line.split(':', 2)[1].strip } || ""
+    accept = Base64.strict_encode(Digest::SHA1.digest(key + Gori::Repeater::WsEngine::GUID))
+    conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" \
+            "Connection: Upgrade\r\nSec-WebSocket-Accept: #{accept}\r\n\r\n"
+    conn.flush
+    buf = Bytes.new(4096)
+    loop { break if conn.read(buf) == 0 }
+  rescue
+  ensure
+    conn.try(&.close) rescue nil
+    origin.close rescue nil
+  end
+  port
+end
+
+describe "Gori::MCP::Server WebSocket frame shapes" do
+  # `messages` was typed "array of strings" and every entry became `OutMsg.new(1, …)`, so
+  # opcode 1 / FIN=1 / RSV=0 / masked / honest-length was the only frame this tool could ever
+  # produce. A bare string still means exactly that; everything else is opt-in.
+  it "accepts the object form and the WsFrameSpec string form, and reports what it framed" do
+    with_store do |store|
+      port = start_mcp_ws_sink_origin
+      request = "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+      repeater_id = store.insert_repeater("ws://127.0.0.1:#{port}", request.to_slice, false, true, nil, 0)
+      msgs = %([{"opcode":9,"text":"ping-shaped"},) +
+             %({"opcode":1,"rsv":4,"text":"rsv1"},) +
+             %({"opcode":1,"mask":false,"text":"bare"},) +
+             %({"opcode":1,"declared_len":4096,"text":"lies"},) +
+             %("opcode=close,hex=03ea627965",) +
+             %("plain string is still just text"])
+      call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_websocket","arguments":) +
+             %({"repeater_id":#{repeater_id},"messages":#{msgs},"idle_ms":100,"allow_unscoped":true}}})
+      resp = drive(store, call, verify_upstream: false)[0]
+      resp["result"]["isError"].as_bool.should be_false
+      out = tool_payload(resp)["messages"].as_a.select { |m| m["direction"].as_s == "out" }
+      out.map { |m| m["frame"].as_s }.should eq([
+        "PING", "TEXT rsv=4", "TEXT unmasked", "TEXT len=4096", "CLOSE", "TEXT",
+      ])
+      out[4]["close_code"].as_i.should eq(1002)
+      out[4]["close_reason"].as_s.should eq("bye")
+      out[5]["payload"].as_s.should eq("plain string is still just text")
+    end
+  end
+
+  it "persists a shaped ws_out_messages entry and the key toggle on create_repeater" do
+    with_store do |store|
+      call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_repeater","arguments":) +
+             %({"target":"ws://127.0.0.1:1","request":"GET /ws HTTP/1.1\\r\\nHost: h\\r\\nUpgrade: websocket\\r\\n\\r\\n",) +
+             %("ws_keep_key":true,"ws_out_messages":[{"opcode":9,"text":"p"},{"opcode":1,"rsv":4,"text":"r"}]}}})
+      resp = drive(store, call)[0]
+      resp["result"]["isError"].as_bool.should be_false
+      id = JSON.parse(resp["result"]["content"][0]["text"].as_s)["id"].as_i64
+      rows = store.ws_messages_for_repeater(id)
+      rows.map(&.opcode).should eq([9, 1])
+      rows[1].shape.rsv.should eq(4)
+      store.get_repeater(id).not_nil!.ws_keep_key?.should be_true
     end
   end
 end

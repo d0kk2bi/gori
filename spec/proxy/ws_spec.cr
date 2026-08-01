@@ -37,7 +37,8 @@ private class IntegSink < Gori::Proxy::FlowSink
   def on_response(resp : Gori::Store::CapturedResponse) : Nil
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
     @ws << {direction, String.new(payload)}
     @ws_chan.send(nil)
   end
@@ -54,7 +55,8 @@ private class WsSink < Gori::Proxy::FlowSink
   def on_response(resp : Gori::Store::CapturedResponse) : Nil
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
     @messages << {direction, opcode, String.new(payload)}
   end
 end
@@ -946,5 +948,185 @@ describe "Gori::Store WebSocket messages" do
       File.delete?("#{path}-wal")
       File.delete?("#{path}-shm")
     end
+  end
+end
+
+# --- V7: the frame SHAPE, and control frames, reach capture at all -----------------
+#
+# `ws_messages(direction, opcode, payload)` recorded a message's bytes and nothing about the
+# frames that carried them, and the relay never called the sink for a control frame at all.
+# Between them that lost the CLOSE code and reason — the most diagnostic thing a failed
+# WebSocket test produces, and something the repeater engine already reported, so the two
+# surfaces disagreed about the same protocol — plus the RSV bits (a deflate frame and a plain
+# one were the same row), an unmasked client frame (§5.1), and fragmentation.
+private class ShapeSink < Gori::Proxy::FlowSink
+  getter rows = [] of {String, Int32, String, Gori::Proxy::WS::Shape}
+
+  def on_request(req : Gori::Store::CapturedRequest) : Int64
+    1_i64
+  end
+
+  def on_response(resp : Gori::Store::CapturedResponse) : Nil
+  end
+
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
+    @rows << {direction, opcode, String.new(payload), shape}
+  end
+end
+
+# A client frame with an arbitrary header, so a spec can put an RSV bit or an unmasked client
+# frame on the wire — the shapes the raw recording origin logged for this round.
+private def client_frame(opcode : UInt8, payload : Bytes, *, fin : Bool = true,
+                         rsv : Int32 = 0, mask : Bytes? = Bytes[0x01, 0x02, 0x03, 0x04]) : Bytes
+  Gori::Proxy::WS.encode(opcode, payload, mask: !mask.nil?, fin: fin, rsv: rsv, mask_key: mask)
+end
+
+# Relay `bytes` client→upstream with both peers then at EOF, and hand back what capture saw.
+private def shape_capture(bytes : Bytes, rewriter = nil) : Array({String, Int32, String, Gori::Proxy::WS::Shape})
+  cs_r, cs_w = IO.pipe
+  ts_r, ts_w = IO.pipe
+  ss_r, ss_w = IO.pipe
+  tc_r, tc_w = IO.pipe
+  client = IO::Stapled.new(cs_r, tc_w)
+  upstream = IO::Stapled.new(ss_r, ts_w)
+  cs_w.write(bytes); cs_w.close
+  ss_w.close
+  sink = ShapeSink.new
+  Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink, rewriter,
+    rewriter ? WS_CTX : Gori::Proxy::WS::Context::NONE)
+  ts_w.close
+  _ = {ts_r, tc_r}
+  sink.rows
+end
+
+describe "Gori::Proxy::WS::Relay frame shape capture (V7)" do
+  it "records a PING, a PONG and a CLOSE — with its code and reason — as rows of their own" do
+    wire = client_frame(Gori::Proxy::WS::OP_PING, "ping-with-payload".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_PONG, "unsolicited-pong".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_CLOSE, Bytes[0x03, 0xEA] + "bye-reason".to_slice)
+    rows = shape_capture(wire)
+    rows.map { |r| {r[0], r[1]} }.should eq([{"out", 9}, {"out", 10}, {"out", 8}])
+    rows[0][2].should eq("ping-with-payload")
+    # The CLOSE row carries §5.5.1's 2-byte code AND its reason, which existed nowhere.
+    close = Gori::Store::WsMessage.new(0_i64, 1_i64, nil, 0_i64, "out", 8, rows[2][2].to_slice)
+    close.close_code.should eq(1002)
+    String.new(close.close_reason.not_nil!).should eq("bye-reason")
+  end
+
+  it "keeps the RSV nibble, so a §5.2 extension frame is not the same row as a plain one" do
+    wire = client_frame(Gori::Proxy::WS::OP_TEXT, "plain".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_TEXT, "rsv1".to_slice, rsv: 4)
+    shape_capture(wire).map { |r| {r[2], r[3].rsv} }.should eq([{"plain", 0}, {"rsv1", 4}])
+  end
+
+  it "records that a client frame arrived UNMASKED (§5.1), and the key when it did not" do
+    wire = client_frame(Gori::Proxy::WS::OP_TEXT, "masked".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_TEXT, "bare".to_slice, mask: nil)
+    rows = shape_capture(wire)
+    rows[0][3].masked.should be_true
+    rows[0][3].mask_key.not_nil!.should eq(Bytes[0x01, 0x02, 0x03, 0x04])
+    rows[1][3].masked.should be_false
+    rows[1][3].mask_key.should be_nil
+  end
+
+  it "counts the frames a reassembled message spanned" do
+    wire = client_frame(Gori::Proxy::WS::OP_TEXT, "frag1|".to_slice, fin: false) +
+           client_frame(Gori::Proxy::WS::OP_CONT, "frag2".to_slice)
+    rows = shape_capture(wire)
+    rows.size.should eq(1)
+    rows[0][2].should eq("frag1|frag2")
+    rows[0][3].frames.should eq(2) # ONE row, but two frames on the wire
+    rows[0][3].fin.should be_true  # ... and the last of them did FIN
+  end
+
+  it "marks a message that ended with no FIN at all" do
+    rows = shape_capture(client_frame(Gori::Proxy::WS::OP_TEXT, "never-ends".to_slice, fin: false))
+    rows.size.should eq(1)
+    rows[0][3].fin.should be_false
+  end
+
+  # Both pumps have to record the same facts about the same bytes, or a finding would depend
+  # on whether a Match&Replace rule happened to be live for some other host.
+  it "records the same shape on the ASSEMBLING pump as on the byte-exact one" do
+    wire = client_frame(Gori::Proxy::WS::OP_TEXT, "rsv1".to_slice, rsv: 4) +
+           client_frame(Gori::Proxy::WS::OP_PING, "p".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_TEXT, "a".to_slice, fin: false) +
+           client_frame(Gori::Proxy::WS::OP_CONT, "b".to_slice)
+    plain = shape_capture(wire).map { |r| {r[0], r[1], r[2], r[3].rsv, r[3].frames, r[3].fin} }
+    armed = shape_capture(wire, WsRewriter.new(to_server: {"absent", "x"}))
+      .map { |r| {r[0], r[1], r[2], r[3].rsv, r[3].frames, r[3].fin} }
+    armed.should eq(plain)
+    plain.map(&.[](1)).should eq([1, 9, 1])
+  end
+
+  # A REWRITTEN message goes out as gori's OWN single frame, so claiming the sender's RSV
+  # bits and fragment count on that row would be a claim about bytes nobody sent.
+  it "reports gori's OWN framing for a message a rule rewrote" do
+    wire = client_frame(Gori::Proxy::WS::OP_TEXT, "has-OLD".to_slice, rsv: 4)
+    rows = shape_capture(wire, WsRewriter.new(to_server: {"OLD", "NEW"}))
+    rows.size.should eq(1)
+    rows[0][2].should eq("has-NEW")
+    rows[0][3].rsv.should eq(0) # not the sender's 4 — gori re-framed it
+  end
+end
+
+describe "Gori::Proxy::WS.encode frame shapes" do
+  # Every one of these was inexpressible: `encode` had no `rsv`, no explicit mask key and no
+  # way to decouple the length header from the payload, and nothing above it plumbed `fin`.
+  it "sets the RSV nibble in the first header octet (RSV1=4)" do
+    Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "x".to_slice, mask: false, rsv: 4)[0]
+      .should eq(0xC1_u8) # FIN | RSV1 | TEXT
+  end
+
+  it "uses the mask key the caller chose, and folds a short one to 4 bytes" do
+    f = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "ab".to_slice,
+      mask_key: Bytes[0xDE, 0xAD, 0xBE, 0xEF])
+    f[2, 4].should eq(Bytes[0xDE, 0xAD, 0xBE, 0xEF])
+    Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "ab".to_slice, mask_key: Bytes[0x11])[2, 4]
+      .should eq(Bytes[0x11, 0x00, 0x00, 0x00])
+  end
+
+  it "emits an UNMASKED client frame when asked (the §5.1 hardening probe)" do
+    f = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "hi".to_slice, mask: false)
+    (f[1] & 0x80).should eq(0) # no MASK bit
+    f.should eq(Bytes[0x81, 0x02] + "hi".to_slice)
+  end
+
+  it "advertises `declared_len` while writing the real payload — a length that lies" do
+    f = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "abc".to_slice, mask: false,
+      declared_len: 99)
+    f[1].should eq(99_u8)   # the header promises 99
+    f.size.should eq(2 + 3) # ... and 3 bytes follow it
+    f[2, 3].should eq("abc".to_slice)
+  end
+
+  it "picks the length FORM from the declared length, not the payload's" do
+    # An over-declared 200 must take the 16-bit form even though the payload is 1 byte,
+    # or the receiver reads a different header than the one that was asked for.
+    f = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "z".to_slice, mask: false,
+      declared_len: 200)
+    f[1].should eq(126_u8)
+    ((f[2].to_i << 8) | f[3].to_i).should eq(200)
+  end
+
+  it "is byte-identical to the pre-shape encoder when the shape is the default" do
+    # The regression pin: the default send path must not have moved. `Shape::DEFAULT` says
+    # nothing, so the keyword form and the shape form have to agree with a fixed key.
+    key = Bytes[0x01, 0x02, 0x03, 0x04]
+    plain = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "hello".to_slice, mask_key: key)
+    shaped = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "hello".to_slice,
+      Gori::Proxy::WS::Shape.new(mask_key: key))
+    shaped.should eq(plain)
+    plain.should eq(Bytes[0x81, 0x85, 0x01, 0x02, 0x03, 0x04, 0x69, 0x67, 0x6f, 0x68, 0x6e]) # "hello" ^ key
+  end
+
+  it "lets a Shape's `masked` override the direction default, and nil defer to it" do
+    unmasked = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "h".to_slice,
+      Gori::Proxy::WS::Shape.new(masked: false), mask: true)
+    (unmasked[1] & 0x80).should eq(0)
+    deferred = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "h".to_slice,
+      Gori::Proxy::WS::Shape.new, mask: true)
+    (deferred[1] & 0x80).should eq(0x80)
   end
 end

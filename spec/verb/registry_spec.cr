@@ -248,6 +248,10 @@ private class FakeContext < ExecContext
     @calls << :repeater_toggle_auto_content_length
   end
 
+  def repeater_toggle_ws_key : Nil
+    @calls << :repeater_toggle_ws_key
+  end
+
   def repeater_toggle_http2 : Nil
     @calls << :repeater_toggle_http2
   end

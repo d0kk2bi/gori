@@ -18,7 +18,8 @@ private class RecSink < Gori::Proxy::FlowSink
     @responses << resp
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
   end
 
   # The raw h2 frame log — what an operator reads to diagnose a stalled connection. Every byte

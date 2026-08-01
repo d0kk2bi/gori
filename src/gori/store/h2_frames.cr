@@ -58,24 +58,35 @@ module Gori
       @db.scalar("SELECT COUNT(*) FROM h2_frames WHERE conn_id = ?", conn_id).as(Int64).to_i
     end
 
+    # The column list every `ws_messages` read shares, ending with the six V7 shape columns
+    # in `Store.read_ws_shape`'s order. It was spelled out three times, and a fourth omission
+    # here is how a reader silently starts handing back `Shape::DEFAULT` for a frame that had
+    # RSV1 set.
+    WS_MESSAGE_COLS = "id, flow_id, repeater_id, created_at, direction, opcode, payload, " \
+                      "fin, rsv, masked, mask_key, frames, declared_len"
+
+    private def read_ws_messages(q : String, args : Array(DB::Any)) : Array(WsMessage)
+      msgs = [] of WsMessage
+      @db.query(q, args: args) do |rs|
+        rs.each do
+          msgs << WsMessage.new(rs.read(Int64), rs.read(Int64), rs.read(Int64?), rs.read(Int64),
+            rs.read(String), rs.read(Int32), rs.read(Bytes), Store.read_ws_shape(rs))
+        end
+      end
+      msgs
+    end
+
     # The flow's captured WS message log. With `limit`, returns the MOST RECENT
     # `limit` messages (ascending for display) to bound the detail view; nil = all.
     def ws_messages(flow_id : Int64, limit : Int32? = nil) : Array(WsMessage)
-      msgs = [] of WsMessage
-      cols = "id, flow_id, repeater_id, created_at, direction, opcode, payload"
+      cols = WS_MESSAGE_COLS
       q, args = if lim = limit
                   {"SELECT * FROM (SELECT #{cols} FROM ws_messages WHERE flow_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id",
                    [flow_id, lim.to_i64] of DB::Any}
                 else
                   {"SELECT #{cols} FROM ws_messages WHERE flow_id = ? ORDER BY id", [flow_id] of DB::Any}
                 end
-      @db.query(q, args: args) do |rs|
-        rs.each do
-          msgs << WsMessage.new(rs.read(Int64), rs.read(Int64), rs.read(Int64?), rs.read(Int64),
-            rs.read(String), rs.read(Int32), rs.read(Bytes))
-        end
-      end
-      msgs
+      read_ws_messages(q, args)
     end
 
     # Frames on a flow with id AFTER `after_id`, OLDEST-first, up to `limit`. Lets the Probe WS
@@ -83,34 +94,20 @@ module Gori
     # even when more than a full window accumulated unscanned (a dropped-event burst) or the flow
     # was evicted from the analyzed-set and re-scanned.
     def ws_messages_after(flow_id : Int64, after_id : Int64, limit : Int32) : Array(WsMessage)
-      msgs = [] of WsMessage
-      cols = "id, flow_id, repeater_id, created_at, direction, opcode, payload"
-      @db.query("SELECT #{cols} FROM ws_messages WHERE flow_id = ? AND id > ? ORDER BY id LIMIT ?",
-        args: [flow_id, after_id, limit.to_i64] of DB::Any) do |rs|
-        rs.each do
-          msgs << WsMessage.new(rs.read(Int64), rs.read(Int64), rs.read(Int64?), rs.read(Int64),
-            rs.read(String), rs.read(Int32), rs.read(Bytes))
-        end
-      end
-      msgs
+      read_ws_messages(
+        "SELECT #{WS_MESSAGE_COLS} FROM ws_messages WHERE flow_id = ? AND id > ? ORDER BY id LIMIT ?",
+        [flow_id, after_id, limit.to_i64] of DB::Any)
     end
 
     def ws_messages_for_repeater(repeater_id : Int64, limit : Int32? = nil) : Array(WsMessage)
-      msgs = [] of WsMessage
-      cols = "id, flow_id, repeater_id, created_at, direction, opcode, payload"
+      cols = WS_MESSAGE_COLS
       q, args = if lim = limit
                   {"SELECT * FROM (SELECT #{cols} FROM ws_messages WHERE repeater_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id",
                    [repeater_id, lim.to_i64] of DB::Any}
                 else
                   {"SELECT #{cols} FROM ws_messages WHERE repeater_id = ? ORDER BY id", [repeater_id] of DB::Any}
                 end
-      @db.query(q, args: args) do |rs|
-        rs.each do
-          msgs << WsMessage.new(rs.read(Int64), rs.read(Int64), rs.read(Int64?), rs.read(Int64),
-            rs.read(String), rs.read(Int32), rs.read(Bytes))
-        end
-      end
-      msgs
+      read_ws_messages(q, args)
     end
 
     def count_ws_messages(flow_id : Int64) : Int32

@@ -66,7 +66,7 @@ module Gori
             # `.scrub` rewrote an invalid-UTF-8 TEXT payload to U+FFFD before it was stored —
             # so a §8.1/§5.6 test case could not be seeded into a repeater from MCP.
             ws_messages_override = store.ws_messages(flow_id).select { |m| m.direction == "out" }
-              .map { |m| Store::WsOutMessage.new(m.opcode, m.payload) }
+              .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, CLI::Run.seed_shape(m.shape)) }
           end
         end
 
@@ -99,7 +99,8 @@ module Gori
           auto_cl: auto_cl,
           flow_id: flow_id,
           position: position.to_i32,
-          sni: masked_sni
+          sni: masked_sni,
+          ws_keep_key: bool(h, "ws_keep_key") || false
         )
 
         return busy("failed to persist repeater (store busy or unwritable)") if id == 0
@@ -159,17 +160,68 @@ module Gori
         str_val.split('\n').compact_map { |l| l.strip.empty? ? nil : Store::WsOutMessage.text(l) }
       end
 
+      # One `ws_out_messages` / `messages` entry, in any form the schema advertises.
+      #
+      # A bare STRING stays a plain TEXT frame — that is the overwhelmingly common case and
+      # it must not acquire a syntax, because the moment a marker prefix means something a
+      # payload starting with it becomes unsendable. A string that carries a `=` in the
+      # `WsFrameSpec` grammar (`opcode=ping,text=hi`) is the scripted authoring form, shared
+      # verbatim with `gori run repeater send --message-frame`; the OBJECT form is the same
+      # fields spelled out, and is what a caller building JSON programmatically wants.
       private def ws_out_message_item(item : JSON::Any) : Store::WsOutMessage?
         if text = item.as_s?
-          return Store::WsOutMessage.text(text)
+          msg, _ = Repeater::WsFrameSpec.parse(text) if ws_frame_spec?(text)
+          return msg || Store::WsOutMessage.text(text)
         end
         return nil unless obj = item.as_h?
-        if b64 = obj["payload_base64"]?.try(&.as_s?)
-          decoded = Base64.decode(b64) rescue return nil
-          return Store::WsOutMessage.new(obj["opcode"]?.try(&.as_i?) || 2, decoded)
+        ws_out_message_object(obj)
+      end
+
+      # The OBJECT form. Split out so `ws_out_message_item` stays "which form is this?".
+      private def ws_out_message_object(obj : Hash(String, JSON::Any)) : Store::WsOutMessage?
+        shape = ws_shape_from(obj)
+        op = obj["opcode"]?.try(&.as_i?)
+        # A byte-encoded payload defaults to BINARY: a caller who reached for base64 or hex
+        # was not describing text.
+        if enc = obj["payload_base64"]?.try(&.as_s?) || obj["payload_hex"]?.try(&.as_s?)
+          bytes = decode_ws_payload(obj, enc) || return nil
+          return Store::WsOutMessage.new(op || 2, bytes, shape)
         end
-        text = obj["text"]?.try(&.as_s?) || return nil
-        Store::WsOutMessage.new(obj["opcode"]?.try(&.as_i?) || 1, text.to_slice)
+        text = obj["text"]?.try(&.as_s?)
+        # An object with a shape but NO payload is a legal, useful frame: a bare PING, a
+        # CLOSE with no code, a zero-length TEXT heartbeat. Refusing it would put those back
+        # out of reach for exactly the reason this round exists.
+        return nil if text.nil? && op.nil?
+        Store::WsOutMessage.new(op || 1, (text || "").to_slice, shape)
+      end
+
+      private def decode_ws_payload(obj : Hash(String, JSON::Any), enc : String) : Bytes?
+        if obj.has_key?("payload_base64")
+          Base64.decode(enc) rescue nil
+        else
+          enc.hexbytes rescue nil
+        end
+      end
+
+      # Does this string use the `WsFrameSpec` grammar? A leading `key=` in the known field
+      # set, and nothing else. Deliberately narrow: `hello=world` is a payload, not a spec,
+      # and misreading it would mean gori sending something other than what was asked for.
+      private def ws_frame_spec?(s : String) : Bool
+        s.matches?(/\A(opcode|fin|rsv|mask|mask_key|len|hex|b64|text)=/)
+      end
+
+      # The shape fields of an object-form message. Absent field = the encoder's own default,
+      # so an object that names none of them is byte-identical to the string form.
+      private def ws_shape_from(obj : Hash(String, JSON::Any)) : Store::WsShape
+        key = obj["mask_key"]?.try(&.as_s?).try { |k| (k.hexbytes rescue nil) }
+        masked = obj["mask"]?.try(&.as_bool?)
+        masked = true if masked.nil? && key
+        Store::WsShape.new(
+          fin: obj["fin"]?.try(&.as_bool?).nil? ? true : !!obj["fin"]?.try(&.as_bool?),
+          rsv: obj["rsv"]?.try(&.as_i?) || 0,
+          masked: masked,
+          mask_key: key,
+          declared_len: obj["declared_len"]?.try(&.as_i?))
       end
 
       private def update_repeater(h) : Result
@@ -199,6 +251,7 @@ module Gori
                   end
 
         sni = present?(h, "sni") ? str(h, "sni") : existing.sni
+        ws_keep_key = present?(h, "ws_keep_key") ? (bool(h, "ws_keep_key") || false) : existing.ws_keep_key?
 
         masked_target = Env.mask_secrets(target)
         masked_request = Env.mask_secrets(request)
@@ -211,7 +264,8 @@ module Gori
                  request: masked_request.to_slice,
                  http2: http2,
                  auto_cl: auto_cl,
-                 sni: masked_sni
+                 sni: masked_sni,
+                 ws_keep_key: ws_keep_key
                )
           return busy("repeater NOT updated (store busy or unwritable); it is unchanged")
         end

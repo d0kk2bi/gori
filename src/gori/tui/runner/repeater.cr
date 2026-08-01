@@ -90,6 +90,10 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     repeater_controller.repeater_toggle_http2
   end
 
+  def repeater_toggle_ws_key : Nil
+    repeater_controller.repeater_toggle_ws_key
+  end
+
   # Space-menu (:response) counterparts of the response pane's raw `d`/`x` keys —
   # same RepeaterView toggles, just reachable without memorizing the key.
   def repeater_toggle_resp_diff : Nil

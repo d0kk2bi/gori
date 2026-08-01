@@ -226,9 +226,14 @@ module Gori::Repeater
       @sender.send_group(@requests)
     end
 
+    # `keep_key` sends the operator's own `Sec-WebSocket-Key` header instead of a fresh one.
+    # A send-time argument rather than a `PlanOptions` field: it changes nothing about the
+    # target, the scope verdict or the assembled bytes — only which of the head's own lines
+    # survives — so it has no business in the builder the scope gate reads.
     def send_ws(messages : Array(WsEngine::OutMsg),
-                idle : Time::Span = WsEngine::DEFAULT_IDLE) : WsEngine::Result
-      @sender.send_ws(bytes, messages, idle)
+                idle : Time::Span = WsEngine::DEFAULT_IDLE,
+                keep_key : Bool = false) : WsEngine::Result
+      @sender.send_ws(bytes, messages, idle, keep_key)
     end
 
     # The same target and gated dialer carrying different wire bytes — for a surface that

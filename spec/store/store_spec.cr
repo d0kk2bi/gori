@@ -632,3 +632,70 @@ describe Gori::Store do
     end
   end
 end
+
+describe "Gori::Store::Schema V7 (WebSocket frame shape)" do
+  it "adds the shape columns to a pre-V7 db and defaults every existing row to today's meaning" do
+    # A V6 db built from the migration list itself, populated the way an existing user's is,
+    # then migrated. The point is not that CREATE TABLE works — it is that a row written
+    # before V7 reads back as exactly what gori assumed about it (FIN=1, RSV=0, one frame,
+    # masking unknown, no declared length), so no stored message changes meaning and no
+    # replay changes bytes.
+    path = File.tempname("gori-ws-v7", ".db")
+    db = DB.open("sqlite3:#{path}?journal_mode=wal&busy_timeout=5000")
+    begin
+      Gori::Store::Schema::MIGRATIONS[0, 6].each_with_index do |stmts, i|
+        stmts.each { |sql| db.exec(sql) }
+        db.exec("PRAGMA user_version = #{i + 1}")
+      end
+      db.scalar("PRAGMA user_version").as(Int64).should eq(6_i64)
+      ts = 1_i64
+      db.exec("INSERT INTO ws_messages (flow_id, created_at, direction, opcode, payload) VALUES (?,?,?,?,?)",
+        7_i64, ts, "out", 1, "old-row".to_slice)
+      db.exec("INSERT INTO repeaters (created_at, updated_at, target, request, http2, auto_content_length, position) VALUES (?,?,?,?,?,?,?)",
+        ts, ts, "ws://a.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, 0, 1, 0)
+
+      Gori::Store::Schema.migrate!(db)
+      db.scalar("PRAGMA user_version").as(Int64).should eq(Gori::Store::Schema::VERSION.to_i64)
+
+      fin, rsv, masked, key, frames, declared = db.query_one(
+        "SELECT fin, rsv, masked, mask_key, frames, declared_len FROM ws_messages WHERE flow_id = 7",
+        as: {Int64, Int64, Int64?, Bytes?, Int64, Int64?})
+      fin.should eq(1_i64) # every message gori captured complete
+      rsv.should eq(0_i64) # no extension bits recorded before V7
+      masked.should be_nil # NOT "unmasked": a pre-V7 row genuinely does not know
+      key.should be_nil
+      frames.should eq(1_i64)
+      declared.should be_nil # send-only, and nothing authored one yet
+      db.query_one("SELECT ws_keep_key FROM repeaters WHERE target = 'ws://a.test'", as: Int64)
+        .should eq(0_i64) # regeneration stays the behaviour of every existing session
+    ensure
+      db.close
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
+    end
+  end
+
+  it "round-trips a captured control frame, code and reason included" do
+    path = File.tempname("gori-ws-ctl", ".db")
+    store = Gori::Store.open(path)
+    begin
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "ws.test", port: 443,
+        method: "GET", target: "/ws", http_version: "HTTP/1.1",
+        head: "GET /ws HTTP/1.1\r\n\r\n".to_slice, body: nil))
+      store.insert_ws_message(id, "in", 8, Bytes[0x03, 0xEA] + "bye-reason".to_slice,
+        shape: Gori::Store::WsShape.new(masked: false))
+      msg = store.ws_messages(id)[0]
+      msg.control?.should be_true
+      msg.close_code.should eq(1002)
+      String.new(msg.close_reason.not_nil!).should eq("bye-reason")
+      msg.shape.masked.should be_false
+    ensure
+      store.close
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
+    end
+  end
+end

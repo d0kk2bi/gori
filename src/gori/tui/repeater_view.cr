@@ -157,6 +157,12 @@ module Gori::Tui
       # text. Same rule the WS relay keeps — gori's own framing only for what was changed.
       @ws_out_seed = [] of Store::WsOutMessage
       @ws_out_edited = false
+      # Send the handshake's own `Sec-WebSocket-Key` instead of a fresh one. Off, which is
+      # what this tab has always done — regenerating avoids a server's replay guard. On, the
+      # operator's header block goes out exactly as typed, key line and position included,
+      # which is the only way to ask what a server does with an absent, short, duplicated or
+      # non-base64 key. See `WsEngine.build_handshake`.
+      @ws_keep_key = false
       @saml_param = "SAMLResponse"
       @saml_binding = :post       # :post (base64) | :redirect (deflate+base64)
       @saml_location = :body      # :body (form) | :query (request line)
@@ -474,7 +480,8 @@ module Gori::Tui
     def load_ws(detail : Store::FlowDetail, out_messages : Array(Store::WsOutMessage)) : Nil
       @flow = detail
       @ws_mode = true
-      @http2 = false # WebSocket is HTTP/1.1
+      @ws_keep_key = false # a fresh capture: the regenerated key is the default (see the ivar)
+      @http2 = false       # WebSocket is HTTP/1.1
       @ws_upgrade = detail.request_head
       @ws_result = nil
       @ws_lines_cache = nil
@@ -514,7 +521,7 @@ module Gori::Tui
           # TEXT frame carrying invalid UTF-8 survives it; a BINARY frame is not expanded at
           # all, the same rule `gori run repeater send` and MCP `send_websocket` apply.
           Repeater::WsEngine::OutMsg.new(m.opcode,
-            m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload)
+            m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload, m.shape)
         end
       end
       @decoded.text.split('\n').compact_map do |line|
@@ -522,10 +529,42 @@ module Gori::Tui
       end
     end
 
+    # Send the operator's own `Sec-WebSocket-Key` rather than a fresh one. Persisted per
+    # session (`repeaters.ws_keep_key`) because it is a property of the handshake being
+    # tested, not of one keystroke — and off by default, so every existing tab keeps the
+    # regenerated key it has always sent.
+    getter? ws_keep_key : Bool
+
+    def toggle_ws_keep_key : Bool
+      return @ws_keep_key unless @ws_mode
+      @dirty = true
+      @ws_keep_key = !@ws_keep_key
+    end
+
     # Is the pane still showing exactly what the session was loaded with? An empty seed
     # means there is nothing to preserve, so a hand-typed list takes the text path.
     private def ws_out_seeded? : Bool
       !@ws_out_edited && !@ws_out_seed.empty?
+    end
+
+    # Can this message be shown as ONE LINE OF TEXT in the pane, with nothing lost?
+    #
+    # Only a plain TEXT frame in the default shape. A binary payload rendered into a TextArea
+    # is noise the operator cannot meaningfully edit — that part is old. The rest is new: a
+    # PING, a PONG and a CLOSE are not text lines at all, and a TEXT frame carrying RSV1, a
+    # cleared FIN, a pinned mask key or a declared length that disagrees with its payload
+    # would render as an ORDINARY line, so writing the pane back would silently discard
+    # exactly the shape the operator captured it for. Showing it and then losing it is worse
+    # than not showing it: the seed replays it verbatim.
+    def self.ws_line_renderable?(m : Store::WsOutMessage) : Bool
+      m.text? && m.shape.default?
+    end
+
+    # Short labels for the seeded frames the pane is NOT showing, for the badge on the
+    # MESSAGES border and the open-from-History status line. Empty when the pane shows
+    # everything, which is the ordinary case.
+    def ws_unshown_seed : Array(String)
+      @ws_out_seed.reject { |m| RepeaterView.ws_line_renderable?(m) }.map(&.shape_label)
     end
 
     # Install a session's outbound messages as both the seed and the pane's text. The pane
@@ -536,7 +575,7 @@ module Gori::Tui
     # so an UNSAVED local edit is left alone — the same guard the pane's `set_text` already
     # had. Adopting the peer's seed under it would send their messages while showing ours.
     private def seed_ws_out(messages : Array(Store::WsOutMessage)) : Nil
-      joined = messages.select(&.text?).join('\n') { |m| String.new(m.payload) }
+      joined = messages.select { |m| RepeaterView.ws_line_renderable?(m) }.join('\n') { |m| String.new(m.payload) }
       same = @decoded.text == TextArea.normalize_lf(joined)
       return if @ws_out_edited && !same
       @decoded.set_text(joined) unless same
@@ -603,6 +642,7 @@ module Gori::Tui
       j.field "summary", summary(80)
       j.field "http2", @http2
       j.field "auto_content_length", @auto_content_length
+      j.field "ws_keep_key", @ws_keep_key
       j.field "ws_mode", @ws_mode
       j.field "grpc_mode", @grpc_mode
       j.field "decode_mode", decode_mode?
@@ -1114,9 +1154,10 @@ module Gori::Tui
                 response_head : Bytes? = nil, response_body : Bytes? = nil,
                 response_error : String? = nil, response_duration_us : Int64? = nil,
                 sni : String = "",
-                ws_messages : Array(Store::WsOutMessage)? = nil) : Nil
+                ws_messages : Array(Store::WsOutMessage)? = nil,
+                ws_keep_key : Bool = false) : Nil
       @flow = nil
-      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages)
+      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
 
       @original_lines = [] of String
       # Rebuild the persisted result: a head (success) or an error (failed send)
@@ -1145,8 +1186,9 @@ module Gori::Tui
     # bump or a peer request edit looked like "send reset the response to Target".
     def apply_peer_request(target : String, request : String, http2 : Bool, auto_cl : Bool,
                            sni : String = "",
-                           ws_messages : Array(Store::WsOutMessage)? = nil) : Nil
-      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages)
+                           ws_messages : Array(Store::WsOutMessage)? = nil,
+                           ws_keep_key : Bool = false) : Nil
+      apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
       @req_hex_edit = nil
       # Leave @result / @prev_result / @focus / @scroll / @resp_mode / @original_lines alone.
       reflect_content_length_in_editor if @auto_content_length
@@ -1164,16 +1206,19 @@ module Gori::Tui
     # (FuzzerView#session_side_matches? still normalizes — its template is a document, not
     # a captured message, and it is persisted from `#text`.)
     def request_side_matches?(target : String, request : String, http2 : Bool, auto_cl : Bool,
-                              sni : String?) : Bool
+                              sni : String?, ws_keep_key : Bool = false) : Bool
       @target == target && request_text == request &&
         @http2 == http2 && @auto_content_length == auto_cl &&
+        @ws_keep_key == ws_keep_key &&
         (sni_override || "") == (sni || "")
     end
 
     # Shared request/target/flag write used by restore (full) and apply_peer_request (soft).
     private def apply_request_fields(target : String, request : String, http2 : Bool, auto_cl : Bool,
                                      sni : String,
-                                     ws_messages : Array(Store::WsOutMessage)?) : Nil
+                                     ws_messages : Array(Store::WsOutMessage)?,
+                                     ws_keep_key : Bool = false) : Nil
+      @ws_keep_key = ws_keep_key
       @http2 = http2
       @target = target
       @tcx = @target.size
@@ -1259,6 +1304,7 @@ module Gori::Tui
       @scx = @sni.size
       @target_field = :url
       @auto_content_length = src.@auto_content_length
+      @ws_keep_key = src.@ws_keep_key
       @name = SubtabClone.copy_name(src.@name)
 
       @ws_mode = src.@ws_mode
@@ -2659,6 +2705,19 @@ module Gori::Tui
                 "DECODED · GraphQL"
               end
       Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused))
+      if @ws_mode
+        # The seeded frames this pane cannot render as a line. Without this the operator sees
+        # an empty (or short) MESSAGES pane and has no way to know a PING, a CLOSE 1002 or an
+        # RSV1 frame is still in the seed and still going out — which is precisely the
+        # difference between reading a result and misreading one. `ws_line_renderable?` owns
+        # the rule; this only says so.
+        unshown = ws_unshown_seed
+        unless unshown.empty?
+          badge = " +#{unshown.size} not shown: #{unshown.join(", ")} "
+          bx = {rect.right - badge.size - 1, rect.x + label.size + 4}.max
+          screen.text(bx, rect.y, badge, Theme.text_bright, Theme.accent_bg) if bx > rect.x + label.size + 4
+        end
+      end
       if @decode_kind == :saml
         badge = " #{@saml_param} · #{@saml_binding == :redirect ? "redirect" : "post"} "
         bx = {rect.right - badge.size - 1, rect.x + label.size + 4}.max
@@ -2777,6 +2836,11 @@ module Gori::Tui
         return
       end
       if @ws_mode
+        # KEY names what happens to the `Sec-WebSocket-Key` line the operator is looking at.
+        # OFF (the default) means gori drops it and appends a fresh one, so the key in this
+        # editor is NOT the key on the wire — which is worth a badge on its own, because the
+        # pane otherwise reads as byte-exact. ON sends the block as written.
+        Frame.toggle_badge(screen, send_edge, rect.y, min_x, "␣K", "KEY", @ws_keep_key)
         @editor.conceal_spans = [] of {Int32, Int32} # WS messages aren't §-marker HTTP text — no stale concealment
         @editor.chain_peek_text = nil
         @editor.render(screen, rect.inset(1, 1), cursor: focused && request_insert?, highlight: :request, peek: focused, gauge: true, gauge_focused: focused)
@@ -2976,7 +3040,7 @@ module Gori::Tui
           r.messages.each do |m|
             arrow = m.direction == "out" ? "→" : "←"
             color = m.direction == "out" ? Theme.text : Theme.green
-            text = m.opcode == 2 ? "#{arrow} «binary #{m.payload.size}b»" : "#{arrow} #{String.new(m.payload).scrub}"
+            text = "#{arrow} #{ws_transcript_body(m)}"
             text.split('\n').each_with_index { |t, i| rows << {i.zero? ? t : "    #{t}", color} }
           end
           if err = r.error
@@ -2997,6 +3061,25 @@ module Gori::Tui
         end
         rows
       end
+    end
+
+    # One transcript row's body: the frame's shape when it departs from an ordinary masked
+    # TEXT frame, then the payload.
+    #
+    # A CLOSE row used to render its raw payload — `→ \x03\xEAbye-reason` — because the
+    # transcript only ever expected opcodes 1 and 2. §5.5.1's status code is two BINARY bytes
+    # in front of the reason, so the one row an operator reads when a WebSocket test fails
+    # was the one row that came out as mojibake.
+    private def ws_transcript_body(m : Repeater::WsEngine::Message) : String
+      msg = Store::WsOutMessage.new(m.opcode, m.payload, m.shape)
+      label = msg.shape_label
+      prefix = (m.opcode == 1 && m.shape.default?) ? "" : "[#{label}] "
+      if code = Store::WsMessage.new(0_i64, 0_i64, nil, 0_i64, m.direction, m.opcode, m.payload).close_code
+        reason = m.payload.size > 2 ? String.new(m.payload[2, m.payload.size - 2]).scrub : ""
+        return reason.empty? ? "#{prefix}code #{code}" : "#{prefix}code #{code} #{reason}"
+      end
+      return "#{prefix}«binary #{m.payload.size}b»" if m.opcode == 2
+      "#{prefix}#{String.new(m.payload).scrub}"
     end
 
     # The gRPC transcript as {text, colour} rows (cached): the request message count,

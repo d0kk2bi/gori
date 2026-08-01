@@ -458,11 +458,14 @@ module Gori
       # (scrubbed) payload; binary frames print a size + short hex preview.
       private def self.ws_message_text(m : Store::WsMessage) : String
         arrow = m.direction == "out" ? "→" : "←"
-        if m.text?
-          "#{arrow} #{CLI::Output.term_safe_multiline(String.new(m.payload).scrub)}"
+        shape = Output.ws_shape_note(m)
+        if m.control?
+          "#{arrow} #{shape} #{Output.ws_control_detail(m)}"
+        elsif m.text?
+          "#{arrow}#{shape.empty? ? "" : " #{shape}"} #{CLI::Output.term_safe_multiline(String.new(m.payload).scrub)}"
         else
           preview = m.payload[0, {m.payload.size, 16}.min].hexstring
-          "#{arrow} [binary #{m.payload.size}B] #{preview}#{m.payload.size > 16 ? "…" : ""}"
+          "#{arrow}#{shape.empty? ? "" : " #{shape}"} [binary #{m.payload.size}B] #{preview}#{m.payload.size > 16 ? "…" : ""}"
         end
       end
 
@@ -504,8 +507,12 @@ module Gori
                           j.object do
                             j.field "direction", m.direction
                             j.field "opcode", m.opcode
+                            Output.emit_ws_shape_json(j, m)
                             if m.text?
                               j.field "text", String.new(m.payload).scrub
+                              # See emit_ws_result: JSON cannot carry a byte that is not valid
+                              # UTF-8, and those bytes are the §8.1/§5.6 test case.
+                              j.field "base64", Base64.strict_encode(m.payload) unless String.new(m.payload).valid_encoding?
                             else
                               j.field "binary", true
                               j.field "size", m.payload.size

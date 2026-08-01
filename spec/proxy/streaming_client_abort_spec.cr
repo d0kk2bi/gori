@@ -26,7 +26,8 @@ private class StateSink < Gori::Proxy::FlowSink
     @done.send(nil)
   end
 
-  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes) : Nil
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
   end
 end
 

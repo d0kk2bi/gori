@@ -65,6 +65,74 @@ module Gori::Proxy::WS
     # setting would only let an operator hold a dead-peer tunnel open longer.
     CLOSE_TIMEOUT = 5.seconds
 
+    # PING/PONG frames recorded per direction, per socket, before capture stops.
+    #
+    # Control frames were not captured AT ALL until V7, which cost the operator the CLOSE
+    # code and reason — the single most diagnostic thing a failed WebSocket test produces,
+    # and something the repeater engine already reported (`Result#close_code`), so the two
+    # surfaces disagreed about the same protocol. A PING payload is a real covert channel
+    # and a real length-check bug site, and it was invisible too.
+    #
+    # But `insert_ws_message` BLOCKS until the write commits, and PING/PONG is the one frame
+    # type a peer can emit without bound and without the operator's app doing anything. An
+    # uncapped capture would throttle the relay to DB speed on a ping flood — a cost the
+    # forward path did not have before, on frames nobody asked to see. So keepalives are
+    # bounded and CLOSE is not: there is at most one CLOSE per direction, and it is the whole
+    # reason this exists. Crossing the bound writes one marker row rather than going quiet.
+    MAX_CONTROL_CAPTURE = 64
+
+    # Accumulates the frame-header facts of the message currently being reassembled, so the
+    # capture row can say what its frames looked like (V7).
+    #
+    # First frame vs last is not arbitrary. RFC 6455 §5.2 puts an extension's RSV flags on
+    # the FIRST frame of a message, and the mask key that matters for a §5.1 question is the
+    # first one too; FIN is only interesting on the LAST frame, where 0 means the message
+    # never ended (a §5.4 violation, or a teardown mid-fragment). `frames` is the count,
+    # which is the only thing that distinguishes a two-fragment message from the single frame
+    # its reassembled row otherwise reads as exactly.
+    class MessageShape
+      @fin = true
+      @rsv = 0
+      @masked : Bool? = nil
+      @mask_key : Bytes? = nil
+      @frames = 0
+
+      def reset : Nil
+        @fin = true
+        @rsv = 0
+        @masked = nil
+        @mask_key = nil
+        @frames = 0
+      end
+
+      def note(fin : Bool, rsv : UInt8, masked : Bool, mask_key : Bytes?) : Nil
+        if @frames == 0
+          @rsv = rsv.to_i
+          @masked = masked
+          @mask_key = mask_key
+        end
+        @fin = fin
+        @frames += 1
+      end
+
+      def note(h : WS::Header) : Nil
+        note(h.fin?, h.rsv, h.masked?, h.masked? ? h.mask_key.dup : nil)
+      end
+
+      def note(f : WS::Frame) : Nil
+        note(f.fin?, f.rsv, f.masked?, f.mask_key)
+      end
+
+      # The accumulated shape, and start over. `frames` floors at 1: a caller emitting a
+      # message with nothing noted (the oversized-frame marker) still describes one frame.
+      def take : WS::Shape
+        s = WS::Shape.new(fin: @fin, rsv: @rsv, masked: @masked, mask_key: @mask_key,
+          frames: @frames < 1 ? 1 : @frames)
+        reset
+        s
+      end
+    end
+
     # `rewriter` is the Match & Replace seam (#500 step 1) and `interceptor` the hold seam
     # (step 2); `ctx` is the 101 handshake's identity, which both scope on. All three default
     # to "off", so every caller that only relays keeps today's byte-exact path.
@@ -187,6 +255,8 @@ module Gori::Proxy::WS
       message_opcode = OP_TEXT
       scratch = Bytes.new(STREAM_CHUNK)
       clean_close = false
+      shape = MessageShape.new
+      controls = 0
       loop do
         h = WS.read_header(src) || break
         # A new data message arriving while the previous one never sent its FIN is an RFC 6455
@@ -197,7 +267,7 @@ module Gori::Proxy::WS
         # it too; the default pump, which every socket with no rule and no hold runs, did not —
         # so the two pumps disagreed about identical bytes. Capture only: the wire is untouched.
         if h.data? && h.opcode != OP_CONT
-          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode)
+          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode, shape)
           message_opcode = h.opcode
         end
 
@@ -205,7 +275,7 @@ module Gori::Proxy::WS
           # Flush any buffered leading fragments of this message before the oversized-frame
           # marker, so captured prefix bytes aren't dropped and a later small FIN fragment
           # can't be surfaced as if it were the whole message.
-          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode) if h.data?
+          assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode, shape) if h.data?
           break unless forward_oversized_frame(src, dst, h, direction, flow_id, sink, message_opcode, scratch)
           if h.close? # an oversized CLOSE still terminates the tunnel, like a normal one
             clean_close = true
@@ -217,7 +287,9 @@ module Gori::Proxy::WS
         frame = WS.read_body(src, h) || break
         dst.write(frame.raw)
         dst.flush
-        assembling = capture_frame(frame, assembling, direction, flow_id, sink, message_opcode)
+        controls = capture_control(frame, direction, flow_id, sink, controls)
+        shape.note(frame) if frame.data?
+        assembling = capture_frame(frame, assembling, direction, flow_id, sink, message_opcode, shape)
         if frame.close?
           clean_close = true
           break
@@ -235,7 +307,8 @@ module Gori::Proxy::WS
       # `ensure` types every body-assigned local as nilable (the raise could precede the
       # assignment), so bind it before asking.
       if buf = assembling
-        emit_pending(buf, direction, flow_id, sink, message_opcode || OP_TEXT) rescue nil
+        emit_pending(buf, direction, flow_id, sink, message_opcode || OP_TEXT,
+          shape || MessageShape.new) rescue nil
       end
     end
 
@@ -246,10 +319,37 @@ module Gori::Proxy::WS
     # copies and one omission between them, which is how the merged-row and dropped-bytes bugs
     # got in; `AssemblingPump` has the same three moments and its own equivalents.
     private def self.emit_pending(assembling : IO::Memory, direction : String, flow_id : Int64,
-                                  sink : FlowSink, message_opcode : UInt8) : IO::Memory
+                                  sink : FlowSink, message_opcode : UInt8,
+                                  shape : MessageShape) : IO::Memory
       return assembling if assembling.size == 0
-      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup)
+      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)
       assembling.size > RESET_THRESHOLD ? IO::Memory.new : assembling.tap(&.clear)
+    end
+
+    # Record a control frame (RFC 6455 §5.5). Returns the running PING/PONG count for this
+    # direction — see MAX_CONTROL_CAPTURE for why CLOSE is exempt from it.
+    #
+    # The forward already happened: this is capture only, and it runs AFTER the write for the
+    # same reason every other capture call here does — a blocking DB round-trip must never sit
+    # between a peer's frame and its delivery.
+    def self.capture_control(frame : WS::Frame, direction : String, flow_id : Int64,
+                             sink : FlowSink, seen : Int32) : Int32
+      return seen if frame.data?
+      if frame.close?
+        sink.on_ws_message(flow_id, direction, frame.opcode.to_i, frame.payload.dup, frame.shape)
+        return seen
+      end
+      n = seen + 1
+      if n <= MAX_CONTROL_CAPTURE
+        sink.on_ws_message(flow_id, direction, frame.opcode.to_i, frame.payload.dup, frame.shape)
+      elsif n == MAX_CONTROL_CAPTURE + 1
+        # One marker, then silence — but the operator is told which it is. A capture that
+        # simply stops looks exactly like a peer that stopped pinging.
+        marker = "[gori] more than #{MAX_CONTROL_CAPTURE} ping/pong frames on this direction; " \
+                 "the rest are forwarded but not recorded".to_slice
+        sink.on_ws_message(flow_id, direction, frame.opcode.to_i, marker, frame.shape)
+      end
+      n
     end
 
     # The assembling pump for ONE direction (#500). Only reached when a `part: ws` rule can
@@ -294,6 +394,11 @@ module Gori::Proxy::WS
       @raw = IO::Memory.new
       @raw_kept = true # ... and whether those bytes are still complete (see MAX_MESSAGE)
       @scratch : Bytes
+      # The V7 frame-shape accumulator and this direction's ping/pong capture budget. Both
+      # pumps have to record identical facts about identical bytes, or an operator's finding
+      # would depend on whether a rule happened to be live on some other host.
+      @shape = MessageShape.new
+      @controls = 0
 
       def initialize(@src : IO, @dst : IO, @direction : String, @flow_id : Int64,
                      @sink : FlowSink, @rewriter : HeadRewriter?, @ctx : Context,
@@ -378,6 +483,9 @@ module Gori::Proxy::WS
         else
           write_direct(ctl.raw)
         end
+        # After the forward, exactly like `Relay.pump` — the two pumps must record the same
+        # control frames or the CLOSE code would depend on whether a rule was live.
+        @controls = Relay.capture_control(ctl, @direction, @flow_id, @sink, @controls)
         true
       end
 
@@ -419,7 +527,7 @@ module Gori::Proxy::WS
         # the "[gori] N-byte … too large to capture" marker ABOVE the fragment it followed, so
         # the two pumps disagreed about an identical frame sequence.
         prefix = @buffer.size > 0 ? @buffer.to_slice.dup : nil
-        prefix.try { |p| @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, p) }
+        prefix.try { |p| @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, p, @shape.take) }
         forwarded = bypassing("a frame too large to buffer arrived") do
           flush_buffered unless @passthrough
           Relay.forward_oversized_frame(@src, @dst, h, @direction, @flow_id, @sink, @opcode, @scratch)
@@ -432,9 +540,10 @@ module Gori::Proxy::WS
       end
 
       private def handle_data(frame : WS::Frame) : Nil
+        @shape.note(frame)
         if @passthrough
           write_direct(frame.raw)
-          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode)
+          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode, @shape)
           return
         end
         # Outgrowing the buffer we are willing to hold. Put what we have on the wire and let
@@ -448,7 +557,7 @@ module Gori::Proxy::WS
           end
           @passthrough = true
           @rewritable = false
-          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode)
+          @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode, @shape)
           return
         end
         keep_raw(frame)
@@ -489,15 +598,21 @@ module Gori::Proxy::WS
         # The gate outlives this call and reuses its own buffers, so it gets a copy; the
         # direct write below is done with the bytes before `reset_buffer` runs and does not.
         reusable = @raw_kept && @raw.size > 0 && rewritten == payload
+        # The shape belongs to whatever goes on the wire, not to what arrived. Re-framing is
+        # the one moment gori's own framing replaces the sender's, so the row has to say so —
+        # otherwise a rewritten message would claim the RSV bits and the fragment count of the
+        # frames it just replaced.
+        arrived = @shape.take
+        emitted = reusable ? arrived : WS::Shape.new(masked: @mask)
         if gate = @gate
           # Never blocks: the gate either writes through or parks the message and waits on a
           # fiber of its own, so the next frame — including a PING — is read immediately.
-          gate.submit(@opcode, rewritten, reusable ? @raw.to_slice.dup : nil)
+          gate.submit(@opcode, rewritten, reusable ? @raw.to_slice.dup : nil, arrived)
         else
           write_direct(reusable ? @raw.to_slice : WS.encode(@opcode, rewritten, mask: @mask, fin: true))
           # Record what gori WROTE rather than what arrived, the way #513 keeps P7 on h2: the
           # capture has to be the bytes the peer actually sees.
-          @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, rewritten.dup)
+          @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, rewritten.dup, emitted)
         end
         # This message is over, so the NEXT data frame starts one — even a stray `OP_CONT`,
         # which does not go through `start_message`. Without `reset_buffer`'s reset of the
@@ -540,7 +655,7 @@ module Gori::Proxy::WS
       private def flush_withheld : Nil
         return if @buffer.size == 0
         flush_buffered unless @passthrough
-        @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, @buffer.to_slice.dup)
+        @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, @buffer.to_slice.dup, @shape.take)
         reset_buffer
       end
 
@@ -589,7 +704,8 @@ module Gori::Proxy::WS
     # own private scope) shares it — the fallback paths must capture exactly as this pump
     # does, not approximately.
     def self.capture_frame(frame : WS::Frame, assembling : IO::Memory, direction : String,
-                           flow_id : Int64, sink : FlowSink, message_opcode : UInt8) : IO::Memory
+                           flow_id : Int64, sink : FlowSink, message_opcode : UInt8,
+                           shape : MessageShape) : IO::Memory
       return assembling unless frame.data?
       remaining = MAX_MESSAGE - assembling.size
       if remaining > 0 && !frame.payload.empty?
@@ -597,7 +713,7 @@ module Gori::Proxy::WS
         assembling.write(frame.payload[0, take])
       end
       return assembling unless frame.fin?
-      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup)
+      sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)
       assembling.size > RESET_THRESHOLD ? IO::Memory.new : assembling.tap(&.clear)
     end
 
@@ -618,7 +734,10 @@ module Gori::Proxy::WS
       return false unless forwarded # peer died mid-payload
       if h.data?
         marker = "[gori] #{h.len}-byte WebSocket frame forwarded; too large to capture".to_slice
-        sink.on_ws_message(flow_id, direction, message_opcode.to_i, marker)
+        # The marker row still carries the frame's own header facts — its FIN, its RSV bits
+        # and its mask key are exactly what an operator is asking about when a frame is this
+        # size, and they are the part gori DID read.
+        sink.on_ws_message(flow_id, direction, message_opcode.to_i, marker, h.shape)
       end
       true
     end

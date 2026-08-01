@@ -1,5 +1,6 @@
 require "../ascii_bytes"
 require "../token_extract"
+require "../proxy/ws/frame"
 
 module Gori
   class Store
@@ -153,8 +154,16 @@ module Gori
       end
     end
 
+    # The frame-shape columns V7 added, shared with the proxy that fills them in. Aliased
+    # rather than redeclared: capture, persistence and the send path have to mean the same
+    # thing by "fin", or the round trip this whole feature is about silently stops being one.
+    alias WsShape = Gori::Proxy::WS::Shape
+
     # A captured WebSocket message belonging to a (101) flow. `direction` is
-    # "out" (client→server) or "in" (server→client); opcode 1=text, 2=binary.
+    # "out" (client→server) or "in" (server→client); opcode 1=text, 2=binary, and since V7
+    # also 8=close, 9=ping, 10=pong — control frames the relay used to forward without ever
+    # telling anyone, which is how the close code and reason existed nowhere on the proxy
+    # path while the repeater engine reported them.
     struct WsMessage
       getter id : Int64
       getter flow_id : Int64
@@ -163,12 +172,36 @@ module Gori
       getter direction : String
       getter opcode : Int32
       getter payload : Bytes
+      getter shape : WsShape
 
-      def initialize(@id, @flow_id, @repeater_id, @created_at, @direction, @opcode, @payload)
+      def initialize(@id, @flow_id, @repeater_id, @created_at, @direction, @opcode, @payload,
+                     @shape : WsShape = WsShape::DEFAULT)
       end
 
       def text? : Bool
         @opcode == 1
+      end
+
+      # RFC 6455 §5.5: opcodes 8..15 are control frames. Until V7 the relay never captured
+      # one, so no reader had to ask.
+      def control? : Bool
+        @opcode >= 8
+      end
+
+      # A CLOSE frame's status code (§5.5.1: 2 bytes, network order), or nil when the frame
+      # is not a CLOSE or carries no code. The single most diagnostic thing a failed
+      # WebSocket test produces, and it existed nowhere on the proxy path.
+      def close_code : Int32?
+        return nil unless @opcode == 8 && @payload.size >= 2
+        (@payload[0].to_i << 8) | @payload[1].to_i
+      end
+
+      # A CLOSE frame's reason (§5.5.1: UTF-8 after the code). Bytes, not String — the
+      # reason is where a server echoes something back, so it is exactly where invalid
+      # UTF-8 turns up.
+      def close_reason : Bytes?
+        return nil unless @opcode == 8 && @payload.size > 2
+        @payload[2, @payload.size - 2]
       end
     end
 
@@ -181,11 +214,11 @@ module Gori
     # SENT that. RFC 6455 §8.1/§5.6 UTF-8 validation is a standard WebSocket test, so those
     # bytes ARE the payload.
     #
-    # A record rather than a bare tuple so F-shaped frame fields (fin, rsv, an explicit mask
-    # key, a declared length that disagrees with the payload) can be added with defaults
-    # later without touching a caller. Nothing here validates the opcode: a store is not the
-    # place to decide which frame shapes an operator may keep.
-    record WsOutMessage, opcode : Int32, payload : Bytes do
+    # A record rather than a bare tuple so the frame-shape fields could be added with
+    # defaults without touching a caller — which is what `shape` now is (V7). Nothing here
+    # validates the opcode or the shape: a store is not the place to decide which frame
+    # shapes an operator may keep, and the illegal ones are the interesting ones.
+    record WsOutMessage, opcode : Int32, payload : Bytes, shape : WsShape = WsShape::DEFAULT do
       # The common case: a line the operator typed into an editor or a JSON string.
       def self.text(s : String) : WsOutMessage
         new(1, s.to_slice)
@@ -194,6 +227,25 @@ module Gori
       def text? : Bool
         @opcode == 1
       end
+
+      def control? : Bool
+        @opcode >= 8
+      end
+
+      # The frame this message asks for, in the notation the CLI's `--message-frame` and the
+      # TUI's seed notice use. Only the departures from the default are named, so an ordinary
+      # TEXT frame reads as just its opcode.
+      def shape_label : String
+        parts = [OPCODE_NAMES[@opcode]? || "op#{@opcode}"]
+        parts << "fin=0" unless shape.fin
+        parts << "rsv=#{shape.rsv}" if shape.rsv != 0
+        parts << "unmasked" if shape.masked == false
+        shape.mask_key.try { |k| parts << "mask=#{k.hexstring}" }
+        shape.declared_len.try { |l| parts << "len=#{l}" }
+        parts.join(' ')
+      end
+
+      OPCODE_NAMES = {0 => "CONT", 1 => "TEXT", 2 => "BIN", 8 => "CLOSE", 9 => "PING", 10 => "PONG"}
     end
 
     # Severity of an issue (stored as the enum value).
@@ -577,11 +629,15 @@ module Gori
       getter name : String? # custom sub-tab label (nil = derive from the request)
       getter sni : String?  # custom TLS SNI host (nil = present the target host)
       getter tags : String? # V31: space-joined flat tags (nil = untagged)
+      # Send the operator's own `Sec-WebSocket-Key` instead of a fresh one (Schema V7).
+      # Off by default — regeneration stays what every existing session does. See
+      # `WsEngine.build_handshake` for why this is opt-in and not simply fixed.
+      getter? ws_keep_key : Bool
 
       def initialize(@id, @target, @request, @http2, @auto_content_length, @flow_id, @position,
                      @response_head = nil, @response_body = nil, @response_error = nil,
                      @response_duration_us = nil, @name = nil, @sni = nil,
-                     @tags = nil)
+                     @tags = nil, @ws_keep_key = false)
       end
     end
 
