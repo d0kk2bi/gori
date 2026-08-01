@@ -3774,3 +3774,39 @@ describe "Gori::MCP::Server WebSocket frame shapes" do
     end
   end
 end
+
+# MCP `get_flow`'s ws_messages projection, and the V7 shape reaching it.
+#
+# `gori run show --format json` has emitted the shape since the shape existed; MCP did not,
+# so the AGENT surface — the one that cannot look at the wire itself — was the single place a
+# captured RSV1 frame, an unmasked client frame, or a CLOSE's code was invisible. Both
+# projections now call one emitter, so they cannot drift again.
+describe "MCP ws_messages shape projection" do
+  it "emits fin/rsv/masked/frames only when they differ from an ordinary frame" do
+    plain = Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "out", 1, "hi".to_slice)
+    json = JSON.build { |j| j.object { Gori::MCP::Serialize.emit_ws_messages(j, [plain]) } }
+    json.should_not contain("\"fin\"")
+    json.should_not contain("\"rsv\"")
+    json.should_not contain("\"masked\"")
+    json.should_not contain("\"frames\"")
+  end
+
+  it "emits the shape for a frame an operator would come here to see" do
+    shaped = Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "out", 1, "x".to_slice,
+      Gori::Store::WsShape.new(fin: false, rsv: 4, masked: false, frames: 2))
+    json = JSON.build { |j| j.object { Gori::MCP::Serialize.emit_ws_messages(j, [shaped]) } }
+    json.should contain("\"fin\":false")
+    json.should contain("\"rsv\":4")
+    json.should contain("\"masked\":false")
+    json.should contain("\"frames\":2")
+  end
+
+  it "emits a CLOSE's code and reason — the most diagnostic frame there is" do
+    payload = Bytes[0x03, 0xEA] + "bye-reason".to_slice
+    close = Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "in", 8, payload)
+    json = JSON.build { |j| j.object { Gori::MCP::Serialize.emit_ws_messages(j, [close]) } }
+    json.should contain("\"close_code\":1002")
+    json.should contain("\"close_reason\":\"bye-reason\"")
+    json.should contain("\"type\":\"close\"")
+  end
+end

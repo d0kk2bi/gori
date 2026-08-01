@@ -299,6 +299,13 @@ module Gori
                     j.field "type", ws_frame_type(m.opcode)
                     j.field "at", m.created_at
                     j.field "at_iso", unix_micros_iso(m.created_at)
+                    # The V7 shape (FIN / RSV / masked / frame count) and a CLOSE's code and
+                    # reason. `gori run show --format json` has emitted these since the shape
+                    # existed; MCP did not, so the agent surface was the one place a captured
+                    # RSV1 frame, an unmasked client frame, or a close code was invisible —
+                    # and a close code is the most diagnostic thing a failed WebSocket test
+                    # produces. Shared emitter, so the two projections cannot drift.
+                    CLI::Output.emit_ws_shape_json(j, m)
                     if m.text?
                       s = String.new(m.payload).scrub
                       cut = s.size > WS_PAYLOAD_MAX
