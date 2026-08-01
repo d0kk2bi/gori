@@ -523,11 +523,43 @@ module Gori
             end
             j.field "wire_truncated", true if wire_truncated
             j.field "note", note if note
+            emit_trailers_json(j, head, body)
           end
         end
       end
 
-      private def self.print_message_text(head : Bytes?, body : Bytes?) : Nil
+      # The chunked message's TRAILER fields (RFC 7230 §4.1.2), beside the de-chunked body.
+      # `ContentDecode.dechunk` stops at the terminating 0-chunk and the rendered `head`
+      # stops at the blank line before the body, so a trailer was captured by NEITHER half
+      # while the origin's `Trailer:` announcement was still echoed in the head — the one
+      # reading an operator can draw from that is "the origin sent none". `repeater send`
+      # persists no flow, so on that path there was no `show --format raw` to fall back to.
+      # Same field name and shape as MCP's `Serialize.emit_trailers`.
+      private def self.emit_trailers_json(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
+        trailers = Proxy::Codec::ContentDecode.trailers(head, body)
+        return if trailers.empty?
+        j.field "trailers" do
+          j.array do
+            trailers.each do |(name, value)|
+              j.object do
+                j.field "name", name.scrub
+                j.field "value", value.scrub
+                # A trailer value is remote bytes; `scrub` above is lossy, so hand back the
+                # exact octets whenever it changed them (mirrors the binary-body fallback).
+                unless value.valid_encoding?
+                  j.field "value_base64", Base64.strict_encode(value.to_slice)
+                  j.field "value_lossy", true
+                end
+              end
+            end
+          end
+        end
+      end
+
+      # `body` is the DECODED body (de-chunked/inflated) that the operator reads; `wire_body`
+      # is the stored wire form the trailers still live in, and is optional only because a
+      # caller with no chunked wire form has nothing to pass.
+      private def self.print_message_text(head : Bytes?, body : Bytes?, wire_body : Bytes? = nil) : Nil
         # Neutralize ANSI/OSC/CSI escapes in captured (attacker-controlled) head/body
         # before writing to the live terminal; `binary_body?` only sniffs for NUL, so an
         # escape-only payload would otherwise pass through. `--format raw` stays exact.
@@ -539,6 +571,21 @@ module Gori
           else
             STDOUT.puts(CLI::Output.term_safe_multiline(String.new(body).scrub))
           end
+        end
+        print_trailers_text(head, wire_body)
+      end
+
+      # Trailers under their own heading, after the body. The decoded text view drops
+      # everything past the terminating 0-chunk, so a trailer the origin really sent showed
+      # up in neither the head nor the body — see emit_trailers_json. Labelled, never merged
+      # into the head: whether the far side treats a trailer as a header is the test.
+      private def self.print_trailers_text(head : Bytes?, wire_body : Bytes?) : Nil
+        trailers = Proxy::Codec::ContentDecode.trailers(head, wire_body)
+        return if trailers.empty?
+        STDOUT.puts ""
+        STDOUT.puts "--- trailers ---"
+        trailers.each do |(name, value)|
+          STDOUT.puts(CLI::Output.term_safe_multiline("#{name}: #{value}".scrub))
         end
       end
 

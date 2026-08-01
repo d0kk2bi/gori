@@ -381,8 +381,16 @@ module Gori::Tui
 
     # The GraphQL operation a request carries (POST JSON body or GET ?query=), or nil —
     # drives the split GraphQL repeater (envelope + readable query/variables).
+    #
+    # EDITABLE ops only. `from_flow` also recognises batched, persisted-query, multipart-
+    # upload and `application/graphql` requests now, and those render but do not round-trip
+    # (`Op#editable?`): opening one in the split editor would offer an edit that `recompose`
+    # can only write back as a DIFFERENT request. They still get the read-only GraphQL pane
+    # everywhere it is a display — History detail, `gori run show`, MCP `decoded` — and here
+    # they open as an ordinary raw-bytes repeater tab, which can send them exactly.
     private def graphql_op(detail : Store::FlowDetail) : Graphql::Op?
-      Graphql.from_flow(detail.row.target, detail.request_head, detail.request_body)
+      op = Graphql.from_flow(detail.row.target, detail.request_head, detail.request_body)
+      op if op && op.editable?
     end
 
     # ^T is context-sensitive: a decode tab or WS tab toggles the envelope/decoded split;

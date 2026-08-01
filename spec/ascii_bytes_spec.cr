@@ -8,6 +8,10 @@ private def contains?(hay : String, needle : String) : Bool
   Gori::AsciiBytes.contains_ci?(hay.to_slice, needle.to_slice)
 end
 
+private def starts?(hay : String, needle : String) : Bool
+  Gori::AsciiBytes.starts_with_ci?(hay.to_slice, needle.to_slice)
+end
+
 describe Gori::AsciiBytes do
   describe ".contains_ci?" do
     describe "empty and size boundaries" do
@@ -160,6 +164,30 @@ describe Gori::AsciiBytes do
         hay = "A" * 100_000
         contains?(hay, "ab").should be_false
       end
+    end
+  end
+
+  # A byte-level prefix test exists so nothing that inspects a WIRE request line has to reach
+  # for a Regex: PCRE2 RAISES on invalid UTF-8 rather than not matching, and that raise killed
+  # a fuzz worker fiber mid-sweep the first time a payload carried a high byte.
+  describe ".starts_with_ci?" do
+    it "folds only A-Z and matches a prefix" do
+      starts?("HTTP://host/x", "http://").should be_true
+      starts?("HtTpS://host/x", "https://").should be_true
+      starts?("http://host", "https://").should be_false
+      starts?("ftp://host", "http://").should be_false
+    end
+
+    it "is true for an empty needle and false when the hay is shorter" do
+      starts?("", "").should be_true
+      starts?("ht", "http://").should be_false
+    end
+
+    it "does not raise on invalid UTF-8 (the whole reason it is not a Regex)" do
+      hay = Bytes[0xc3, 0x28, 0x80, 0x2f]
+      Gori::AsciiBytes.starts_with_ci?(hay, "http://".to_slice).should be_false
+      Gori::Store::FlowRow.absolute_form?(String.new(hay)).should be_false
+      Gori::Store::FlowRow.absolute_form?(String.new(Bytes[0x48, 0x54, 0x54, 0x50, 0x3a, 0x2f, 0x2f, 0x80])).should be_true
     end
   end
 end

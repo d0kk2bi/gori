@@ -130,6 +130,74 @@ describe Gori::Proxy::Codec::ContentDecode do
     decoded.should be_nil
     note.should be_nil
   end
+
+  # A chunked body's trailer section (RFC 7230 §4.1.2) used to be captured by NEITHER half of
+  # the projection: `dechunk` stops at the terminating 0-chunk and the rendered head stops at
+  # the blank line before the body. The `Trailer:` announcement was still echoed, so the loss
+  # read as "the origin sent none".
+  describe ".trailers" do
+    it "reads the fields after the terminating 0-chunk" do
+      body = "5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: gotcha\r\nX-Sum: 99\r\n\r\n".to_slice
+      trailers(body).should eq([{"X-T", "gotcha"}, {"X-Sum", "99"}])
+      # and the entity is unchanged — the trailers are a separate reading of the same bytes
+      Gori::Proxy::Codec::ContentDecode.dechunk(body).should eq("hello world".to_slice)
+    end
+
+    it "reads a trailer-only body (gRPC-over-h1: the status IS the trailer)" do
+      trailers("0\r\ngrpc-status: 7\r\ngrpc-message: denied\r\n\r\n".to_slice)
+        .should eq([{"grpc-status", "7"}, {"grpc-message", "denied"}])
+    end
+
+    it "keeps a trailer VALUE's exact bytes (it is remote data, not necessarily UTF-8)" do
+      body = Bytes.new(0)
+      io = IO::Memory.new
+      io << "0\r\nX-Bin: "
+      io.write(Bytes[0x80, 0xff])
+      io << "\r\n\r\n"
+      body = io.to_slice
+      t = trailers(body)
+      t.size.should eq(1)
+      t[0][1].to_slice.should eq(Bytes[0x80, 0xff])
+    end
+
+    it "stops at the blank line and ignores a non-field line" do
+      trailers("0\r\nnot-a-field\r\nX-A: 1\r\n\r\nX-B: 2\r\n".to_slice).should eq([{"X-A", "1"}])
+    end
+
+    it "is empty when the body never reaches a 0-chunk (truncated capture)" do
+      trailers("5\r\nhel".to_slice).should be_empty
+      trailers("".to_slice).should be_empty
+    end
+
+    it "tolerates a bare-LF wire form and an unterminated trailer section" do
+      trailers("0\nX-T: v\n".to_slice).should eq([{"X-T", "v"}])
+    end
+
+    it "is bounded so a hostile body cannot grow the projection without limit" do
+      io = IO::Memory.new
+      io << "0\r\n"
+      200.times { |i| io << "X-#{i}: v\r\n" }
+      io << "\r\n"
+      trailers(io.to_slice).size.should eq(Gori::Proxy::Codec::ContentDecode::MAX_TRAILERS)
+    end
+
+    # The head-gated overload: only a message whose head actually declares `chunked` framing
+    # is mined for fields, so a body that merely looks chunk-shaped is never misread.
+    it "only reads trailers when the HEAD declares chunked framing" do
+      wire = "0\r\nX-T: v\r\n\r\n".to_slice
+      Gori::Proxy::Codec::ContentDecode.trailers(head("HTTP/1.1 200 OK", "Transfer-Encoding: chunked"), wire)
+        .should eq([{"X-T", "v"}])
+      Gori::Proxy::Codec::ContentDecode.trailers(head("HTTP/1.1 200 OK", "Content-Length: 13"), wire)
+        .should be_empty
+      Gori::Proxy::Codec::ContentDecode.trailers(head("HTTP/1.1 200 OK", "Transfer-Encoding: gzip"), wire)
+        .should be_empty
+      Gori::Proxy::Codec::ContentDecode.trailers(nil, wire).should be_empty
+    end
+  end
+end
+
+private def trailers(body : Bytes)
+  Gori::Proxy::Codec::ContentDecode.trailers(body)
 end
 
 # Compress via the system CLI (decoder-only libs are linked; encoders aren't).

@@ -13,10 +13,45 @@ module Gori
 
     MAX_BODY = 4 * 1024 * 1024
 
+    # Which of the shapes a real GraphQL API exposes this request is in. Only two of them
+    # were ever recognised — a POST JSON object with a `query`, and a GET `?query=` — so a
+    # batched array, a persisted query, a multipart upload mutation and a raw
+    # `application/graphql` document got NO decoded pane, no variables pretty-print and no
+    # projection anywhere, which is precisely the set of shapes that carry the interesting
+    # attacks (batching abuse / rate-limit bypass, persisted-query allowlist bypass, upload
+    # mutations, content-type confusion).
+    #
+    # The distinction is not cosmetic: it decides whether the Repeater may RE-ENCODE the
+    # request from the edited pane. `display`/`recompose` round-trip an operationName + query
+    # + variables triple, which is a faithful inverse for Json and Query and for nothing else
+    # — so the other four are projections only. See `editable?`.
+    enum Form
+      Json      # POST {"query": …}
+      Query     # GET ?query=…
+      Batch     # POST [{"query": …}, …]
+      Persisted # POST {"extensions":{"persistedQuery":{…}}} — no document on the wire
+      Multipart # multipart/form-data upload mutation (GraphQL multipart request spec)
+      Document  # Content-Type: application/graphql — the body IS the document
+    end
+
     record Op,
       operation : String?, # operationName
       query : String,      # the GraphQL document (de-escaped)
-      variables : String?  # pretty-printed JSON variables, or nil when absent
+      variables : String?, # pretty-printed JSON variables, or nil when absent
+      form : Form = Form::Json do
+      # Whether `display(op)` → edit → `recompose` can put the operator's edit back into the
+      # exact request it came from. True ONLY for the two shapes that round-trip: a plain
+      # POST JSON body and a GET `?query=`.
+      #
+      # For the rest the display text is a rendering, not an inverse — re-encoding a batch
+      # from it would collapse the array into one object, a persisted query has no document
+      # to write back, and a multipart/`application/graphql` body is not JSON at all. Sending
+      # a request the operator did not write is worse than showing a read-only pane, so the
+      # projection exists and the re-encode does not.
+      def editable? : Bool
+        form.json? || form.query?
+      end
+    end
 
     # Parse the operation, or nil if the flow isn't GraphQL. Tries the POST JSON body
     # first, then the GET query string.
@@ -30,12 +65,83 @@ module Gori
     # what the fallback was written for.
     def from_flow(target : String, req_head : Bytes?, req_body : Bytes?) : Op?
       if (b = req_body) && !b.empty? && b.size <= MAX_BODY
-        if op = from_json(String.new(b))
+        if op = from_body(b, content_type(req_head))
           return op
         end
       end
       return nil if (b = req_body) && !b.empty? && body_bearing?(req_head)
       from_query(target)
+    end
+
+    # The request BODY's GraphQL projection, dispatched on Content-Type. The body used to be
+    # JSON-parsed unconditionally, which is why `application/graphql` (a raw document, the
+    # GraphQL-over-HTTP spec's other request form) and a multipart upload mutation could
+    # never be GraphQL: neither body is JSON.
+    def from_body(body : Bytes, content_type : String?) : Op?
+      ct = content_type || ""
+      # The MEDIA TYPE is case-insensitive; a PARAMETER value is not — `boundary=----X` and
+      # `boundary=----x` delimit different bodies, so only the type is folded for the match
+      # and `from_multipart` gets the original spelling.
+      folded = ct.downcase
+      return from_document(String.new(body)) if folded.starts_with?("application/graphql")
+      return from_multipart(body, ct) if folded.starts_with?("multipart/form-data")
+      from_json(String.new(body))
+    end
+
+    # The `Content-Type` header VALUE off a request head (media type + parameters), or nil.
+    # `from_flow` has always been handed the head and, before the shapes above, never had a
+    # reason to look at it.
+    private def content_type(req_head : Bytes?) : String?
+      head = req_head || return nil
+      String.new(head).each_line do |raw|
+        line = raw.chomp
+        break if line.empty? # the blank line ends the head
+        idx = line.index(':') || next
+        return line[(idx + 1)..].strip if line[0...idx].strip.compare("content-type", case_insensitive: true) == 0
+      end
+      nil
+    end
+
+    # `Content-Type: application/graphql` — the body IS the document, no JSON envelope
+    # (GraphQL-over-HTTP). The `{` test is the same selection-set check the JSON path uses.
+    private def from_document(body : String) : Op?
+      doc = strip(body)
+      return nil unless doc.includes?('{')
+      Op.new(nil, doc, nil, Form::Document)
+    end
+
+    # A GraphQL multipart request (the `operations`/`map`/`0…` upload convention): the
+    # `operations` part carries the ordinary JSON envelope, so parse that and keep the form
+    # so nothing tries to re-encode the multipart body from the pane.
+    private def from_multipart(body : Bytes, content_type : String) : Op?
+      boundary = multipart_boundary(content_type) || return nil
+      ops = multipart_part(body, boundary, "operations") || return nil
+      op = from_json(ops) || return nil
+      Op.new(op.operation, op.query, op.variables, Form::Multipart)
+    end
+
+    # `boundary=…` off a multipart Content-Type, quoted or bare. The parameter NAME is
+    # case-insensitive; its VALUE is not (`----X` and `----x` delimit different bodies).
+    BOUNDARY_RE = /boundary\s*=\s*(?:"([^"]*)"|([^;\s]+))/i
+
+    private def multipart_boundary(content_type : String) : String?
+      m = BOUNDARY_RE.match(content_type) || return nil
+      v = m[1]? || m[2]? || return nil
+      v.empty? ? nil : v
+    end
+
+    # The body of the multipart part named `name`, as text. Deliberately minimal: only the
+    # `operations` part is read, and only to hand its JSON to the ordinary parser.
+    private def multipart_part(body : Bytes, boundary : String, name : String) : String?
+      text = String.new(body)
+      needle = "name=\"#{name}\""
+      text.split("--#{boundary}") do |part|
+        next unless part.includes?(needle)
+        sep = part.index("\r\n\r\n") || part.index("\n\n") || next
+        skip = part[sep, 2] == "\r\n" ? 4 : 2
+        return part[(sep + skip)..].rstrip("\r\n")
+      end
+      nil
     end
 
     # Whether the request line names a method whose BODY carries the payload. Read off the
@@ -54,16 +160,71 @@ module Gori
     # A POST JSON body. A GraphQL document always has a selection set, so requiring a
     # `{` in the query string avoids hijacking an ordinary REST body that happens to
     # carry a string `query` field (e.g. `{"query":"shoes"}`).
+    #
+    # A top-level ARRAY is a batched request — the shape a batching-abuse / rate-limit-bypass
+    # test uses — and an object with no `query` but an `extensions.persistedQuery` is a
+    # persisted query, which by definition sends no document at all. `json.as_h?` used to
+    # reject the first and the `query` requirement the second, so neither was ever GraphQL.
     def from_json(body : String) : Op?
       json = JSON.parse(strip(body))
+      if arr = json.as_a?
+        return from_batch(arr)
+      end
       h = json.as_h? || return nil
-      q = h["query"]?.try(&.as_s?) || return nil
-      return nil unless q.includes?('{')
-      vars = h["variables"]?
-      Op.new(h["operationName"]?.try(&.as_s?), q.strip,
-        (vars && !vars.raw.nil?) ? vars.to_pretty_json : nil)
+      single_op(h)
     rescue
       nil
+    end
+
+    # One JSON envelope object → its op. Returns nil for an object that is neither a
+    # document-bearing request nor a persisted query.
+    private def single_op(h : Hash(String, JSON::Any)) : Op?
+      vars = h["variables"]?
+      vars_text = (vars && !vars.raw.nil?) ? vars.to_pretty_json : nil
+      name = h["operationName"]?.try(&.as_s?)
+      if (q = h["query"]?.try(&.as_s?)) && q.includes?('{')
+        return Op.new(name, q.strip, vars_text)
+      end
+      # No document. A `persistedQuery` extension says so explicitly — the server resolves
+      # the hash to a stored document — and nothing else in the wild carries that key, so it
+      # is a safe positive where a bare `{"variables":…}` would not be.
+      pq = h["extensions"]?.try(&.as_h?).try(&.["persistedQuery"]?).try(&.as_h?) || return nil
+      Op.new(name, persisted_text(pq), vars_text, Form::Persisted)
+    end
+
+    # The read-only rendering of a persisted query: there is no document on the wire, so the
+    # pane shows what WAS sent — the version and the hash the server will look up.
+    private def persisted_text(pq : Hash(String, JSON::Any)) : String
+      String.build do |io|
+        io << "# persisted query — no document was sent"
+        pq.each do |k, v|
+          io << "\n# " << k << ": " << (v.as_s? || v.to_json)
+        end
+      end
+    end
+
+    # A batched request. Every element must be an object that is itself an op — one stray
+    # element and this is not a GraphQL batch, and guessing would hijack an ordinary JSON
+    # array body.
+    private def from_batch(arr : Array(JSON::Any)) : Op?
+      return nil if arr.empty?
+      ops = [] of Op
+      arr.each do |item|
+        h = item.as_h? || return nil
+        ops << (single_op(h) || return nil)
+      end
+      Op.new(nil, batch_text(ops), nil, Form::Batch)
+    end
+
+    # The read-only rendering of a batch: each operation in order, under its index, so the
+    # operator can see how many calls one request carries and what each of them asks for.
+    private def batch_text(ops : Array(Op)) : String
+      String.build do |io|
+        io << "# batch of " << ops.size << " operation" << (ops.size == 1 ? "" : "s")
+        ops.each_with_index do |op, i|
+          io << "\n\n# --- [" << i << "] ---\n" << display(op)
+        end
+      end
     end
 
     # A GET `?query=…&operationName=…&variables=…` request.
@@ -77,7 +238,7 @@ module Gori
       q = params["query"]? || return nil
       return nil unless q.includes?('{')
       vars = params["variables"]?.try { |v| (JSON.parse(v).to_pretty_json rescue v) }
-      Op.new(params["operationName"]?, q.strip, vars)
+      Op.new(params["operationName"]?, q.strip, vars, Form::Query)
     rescue
       nil
     end
@@ -195,15 +356,19 @@ module Gori
       parts.join('&')
     end
 
-    # Where a flow carries its op: :body (a POST JSON body that parses as GraphQL) or
-    # :query (a GET `?query=…`). Drives which side the Repeater re-encode targets. Decided
-    # solely by whether the request body is a GraphQL JSON document.
-    def location(req_body : Bytes?) : Symbol
-      if (b = req_body) && !b.empty? && b.size <= MAX_BODY && from_json(String.new(b))
-        :body
-      else
-        :query
-      end
+    # Where a flow carries its op: :body (a POST JSON body that parses as GraphQL), :query
+    # (a GET `?query=…`), or :none. Drives which side the Repeater re-encode targets.
+    #
+    # `:none` is the answer for every shape `display` renders but `recompose` cannot invert
+    # (batch, persisted, multipart, raw document — see `Op#editable?`). It has to exist:
+    # once those shapes parse as GraphQL, answering `:body` would recompose a batch array
+    # into a single object and answering `:query` would rewrite the query STRING of a request
+    # whose payload is in the body. Either one sends a request the operator never wrote, on
+    # the strength of a projection.
+    def location(req_body : Bytes?, req_head : Bytes? = nil) : Symbol
+      op = ((b = req_body) && !b.empty? && b.size <= MAX_BODY) ? from_body(b, content_type(req_head)) : nil
+      return :query unless op # no body op at all — the GET `?query=` binding
+      op.editable? ? :body : :none
     end
 
     # `# operationName:` is ALSO a valid GraphQL source comment, so the same disambiguation the

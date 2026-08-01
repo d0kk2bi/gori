@@ -292,7 +292,7 @@ module Gori
                                  ws_msgs : Array(Store::WsMessage)) : Nil
         if req
           puts "=== REQUEST (#{detail.http_version}) ==="
-          print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body))
+          print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body), detail.request_body)
           puts "  [request body truncated]" if detail.request_body_truncated?
         end
         if resp
@@ -302,7 +302,7 @@ module Gori
             puts "error: #{err}"
           end
           if h = detail.response_head
-            print_message_text(h, display_body(h, detail.response_body))
+            print_message_text(h, display_body(h, detail.response_body), detail.response_body)
             puts "  [response body truncated]" if detail.response_body_truncated?
           elsif detail.error.nil?
             puts "(no response captured)"

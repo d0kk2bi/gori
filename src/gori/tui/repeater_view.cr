@@ -741,7 +741,7 @@ module Gori::Tui
       # Record the binding (POST body vs GET ?query=) so the re-encode targets the right place —
       # mirrors @saml_location. Without it a GET GraphQL edit would splice into a phantom body
       # while the origin reads the stale URL query (the decoded edit would never reach it).
-      @graphql_location = Graphql.location(detail.request_body)
+      @graphql_location = Graphql.location(detail.request_body, detail.request_head)
       seed_decode(detail, :graphql, Graphql.display(op))
     end
 
@@ -840,7 +840,7 @@ module Gori::Tui
           # Recompute the re-encode target too (mirrors SAML): an envelope edit that moves the
           # op from ?query=… (GET) to a JSON body (POST) must retarget the splice, else commit
           # rewrites the wrong side and the origin reads the old, unedited query.
-          @graphql_location = Graphql.location(body)
+          @graphql_location = Graphql.location(body, head)
           text = Graphql.display(op)
           @decoded.set_text(text) if text != @decoded.text
         end
@@ -892,6 +892,13 @@ module Gori::Tui
     end
 
     private def graphql_splice_text(env : String) : String
+      # `:none` — a batched / persisted / multipart / `application/graphql` request. Those
+      # shapes render but do not round-trip (`Graphql::Op#editable?`), so there is nothing to
+      # splice: send the envelope the operator sees, byte for byte. The controller already
+      # declines to open them split; this is the second gate, because `refresh_decoded` can
+      # move a tab into one of those shapes mid-edit and a re-encode from a projection is a
+      # request the operator never wrote.
+      return env if @graphql_location == :none
       if @graphql_location == :query # GET: rewrite the request-line query (no body), like SAML Redirect
         lines = env.split('\n')
         lines[0] = graphql_query_line(lines[0], @decoded.text) if lines[0]?

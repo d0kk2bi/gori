@@ -1,5 +1,6 @@
 require "./spec_helper"
 require "socket"
+require "base64"
 
 # The MCP fuzz tools run the engine in a background fiber, so they're driven here
 # through a Tools instance directly (with sleeps that yield to the job fiber)
@@ -119,6 +120,55 @@ describe "MCP fuzz tools" do
       _, bad = call_raw(tools, "fuzz_start",
         base.merge({"payloads" => %([{"numbers":{"to":100}}])}).to_json)
       bad.should be_true
+    end
+  end
+
+  # `list` entries are JSON strings, so a payload reached the wire as its UTF-8 ENCODING:
+  # `é` went out as `\xc3\xa9` and a byte-level set (0x00-0xFF, overlong/invalid UTF-8) could
+  # not be expressed at all — the only escape hatch was a `wordlist` FILE on the server disk.
+  it "list_base64 splices a payload's exact octets, which `list` cannot" do
+    port = start_origin
+    with_store do |store|
+      tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+      payload = Bytes[0xc3, 0x28, 0x80] # invalid UTF-8: an overlong-looking pair plus a bare 0x80
+      start = call_json(tools, "fuzz_start",
+        {"template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+         "url"            => "http://127.0.0.1:#{port}",
+         "payloads"       => %([{"list_base64":[#{Base64.strict_encode(payload).to_json}]}]),
+         "record_history" => "all",
+         "allow_unscoped" => true}.to_json)
+      job_id = start["job_id"].as_s
+
+      done = false
+      30.times do
+        sleep 0.02.seconds
+        status = call_json(tools, "fuzz_status", %({"job_id":#{job_id.to_json}}))
+        next if status["status"].as_s == "running"
+        done = true
+        break
+      end
+      done.should be_true
+
+      results = call_json(tools, "fuzz_results", %({"job_id":#{job_id.to_json}}))
+      fid = results["results"][0]["flow_id"].as_i64
+      head = store.get_flow(fid).not_nil!.request_head
+      # The RECORDED wire bytes, not the JSON echo: exactly the three octets, no re-encoding.
+      String.new(head).should_not contain("GET /?q=\u{FFFD}")
+      idx = head.index(0x71_u8).not_nil! # the 'q' of ?q=
+      head[(idx + 2), 3].should eq(payload)
+    end
+  end
+
+  it "refuses invalid base64 in list_base64 instead of fuzzing with different bytes" do
+    with_store do |store|
+      tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+      text, err = call_raw(tools, "fuzz_start",
+        {"template"       => "GET /?q=§x§ HTTP/1.1\r\n\r\n",
+         "url"            => "http://127.0.0.1:1",
+         "payloads"       => %([{"list_base64":["!!! not base64 !!!"]}]),
+         "allow_unscoped" => true}.to_json)
+      err.should be_true
+      text.should contain("list_base64")
     end
   end
 

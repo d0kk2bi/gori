@@ -1105,7 +1105,9 @@ module Gori
               s.field "method", strprop("HTTP method (default GET)")
               s.field "headers", objprop("header name->value map")
               s.field "body", strprop("request body, sent as-is")
+              s.field "body_base64", strprop("request body as base64 — the byte-exact form. Use for a binary body or any octet a JSON string cannot carry (0x00, 0x80-0xFF, invalid UTF-8); overrides 'body' and is NOT $VAR-expanded")
               s.field "raw", strprop("verbatim raw HTTP/1.1 request; overrides method/headers/body (scheme/host/port still come from url)")
+              s.field "raw_base64", strprop("the whole raw HTTP/1.1 request as base64 — the byte-exact form, and the only way to send a latin-1/invalid-UTF-8 header value or a binary body (a JSON string is sent as its UTF-8 encoding, so 'é' goes out as 2 bytes). Implies verbatim: no $VAR expansion, no bare-LF promotion")
               s.field "verbatim", boolprop("send 'raw' EXACTLY as given: no $VAR expansion and no bare-LF→CRLF promotion in the head (default false). Use for desync/smuggling tests where a bare LF header terminator IS the payload")
               s.field "http2", boolprop("use real HTTP/2; defaults to the flow's version when flow_id is set)")
               s.field "timeout_ms", intprop("per-operation connect + idle (read/write) timeout in milliseconds; a timeout surfaces as a network-error result with error_kind (1-600000)")
@@ -1137,6 +1139,7 @@ module Gori
             tool j, "create_repeater", "Create a new repeater tab/session in the database. Provide either ('target' and 'request') OR ('flow_id') OR ('issue_id')." do |s|
               s.field "target", strprop("absolute target URL (scheme+host+optional port), e.g. https://api.example.com")
               s.field "request", strprop("verbatim raw HTTP request bytes/text")
+              s.field "request_base64", strprop("the raw HTTP request as base64 — the byte-exact form; use it when the request carries an octet a JSON string cannot (0x00, 0x80-0xFF, invalid UTF-8, a binary body). Overrides 'request'")
               s.field "http2", boolprop("use HTTP/2 (default false)")
               s.field "auto_content_length", boolprop("auto-calculate Content-Length header (default true)")
               s.field "flow_id", intprop("optional original flow id this repeater stems from")
@@ -1151,6 +1154,7 @@ module Gori
               s.field "id", intprop("repeater database id"), required: true
               s.field "target", strprop("absolute target URL")
               s.field "request", strprop("verbatim raw HTTP request")
+              s.field "request_base64", strprop("the raw HTTP request as base64 — the byte-exact form (see create_repeater). Overrides 'request'")
               s.field "http2", boolprop("use HTTP/2")
               s.field "auto_content_length", boolprop("auto-calculate Content-Length")
               s.field "sni", strprop("TLS SNI override")
@@ -1376,7 +1380,7 @@ module Gori
               s.field "auto", boolprop("auto-mark every query/cookie/body param when the template has no § markers")
               s.field "marks", strarrprop("literal tokens to mark as §…§ positions (each occurrence, mirrors CLI --mark); alternative to embedding §…§ in template")
               s.field "mode", strprop("sniper (default) | batteringram | pitchfork | clusterbomb")
-              s.field "payloads", arrprop(%(array of payload sets, e.g. [{"list":["a","b"]},{"numbers":"1-100"},{"wordlist":"/p.txt"},{"null":5},{"brute":"abc:1-3"}] — JSON array, NOT a string. numbers/brute also accept a structured object: {"numbers":{"from":1,"to":100,"step":2}}, {"brute":{"charset":"abc","min":1,"max":3}}))
+              s.field "payloads", arrprop(%(array of payload sets, e.g. [{"list":["a","b"]},{"list_base64":["gA==","/w=="]},{"numbers":"1-100"},{"wordlist":"/p.txt"},{"null":5},{"brute":"abc:1-3"}] — JSON array, NOT a string. "list_base64" is the byte-exact list: use it for payloads a JSON string cannot carry (0x00, 0x80-0xFF, invalid/overlong UTF-8), since "list" entries go on the wire as their UTF-8 encoding. numbers/brute also accept a structured object: {"numbers":{"from":1,"to":100,"step":2}}, {"brute":{"charset":"abc","min":1,"max":3}}))
               s.field "processors", arrprop(%(ordered pipeline applied to EVERY payload before it's spliced in (mirrors CLI --prefix/--suffix/--encode/--case/--hash/--regex-replace) — e.g. [{"type":"encode","kind":"url"}]. A payload containing a raw space, CRLF, or other characters unsafe in the position it's marking (a query/body param value has no encoding applied by default — auto-mark finds the position but does NOT encode for it) will otherwise corrupt the request line/framing instead of reaching the app. Entries: {"type":"prefix","text":".."} {"type":"suffix","text":".."} {"type":"encode","kind":"url|urlall|base64|hex"} {"type":"case","kind":"upper|lower"} {"type":"hash","algo":"md5|sha1|sha256"} {"type":"regex_replace","pattern":"..","replacement":".."}))
               s.field "match", jsonprop(%(keep only responses matching, e.g. {"status":"200,500-599","size":">1000","regex":"err"} — object or JSON string))
               s.field "filter", jsonprop(%(drop responses matching, same shape as match — object or JSON string))
@@ -2018,6 +2022,25 @@ module Gori
 
       private def str(h, key : String) : String?
         h[key]?.try(&.as_s?)
+      end
+
+      # A `*_base64` argument decoded into the exact bytes it names, as a String (Crystal
+      # Strings are byte buffers, so an invalid-UTF-8 payload survives to the store and the
+      # wire — every path that has to RENDER it scrubs at the projection instead).
+      #
+      # JSON-RPC arguments are UTF-8 text, so a `request`/`body` string is put on the wire as
+      # its UTF-8 ENCODING: `é` leaves as `\xc3\xa9`. That made latin-1 payloads, invalid-UTF-8
+      # traversal bypasses and binary bodies inexpressible from MCP. Invalid base64 raises
+      # rather than falling back: a caller reaching for this argument wants exact bytes, and
+      # silently sending different ones is the failure it came here to avoid.
+      private def base64_str(h, key : String) : String?
+        s = h[key]?.try(&.as_s?)
+        return nil if s.nil? || s.empty?
+        begin
+          String.new(Base64.decode(s))
+        rescue
+          raise Gori::Error.new("'#{key}' is not valid base64")
+        end
       end
 
       # Whether `key` is present with a non-null value (a JSON null reads as

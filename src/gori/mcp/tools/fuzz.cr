@@ -429,6 +429,13 @@ module Gori
       private def fuzz_source_from(obj : Hash(String, JSON::Any), spec : JSON::Any) : Fuzz::PayloadSource
         if list = obj["list"]?.try(&.as_a?)
           Fuzz::InlineList.new(list.map { |x| x.as_s? || x.to_s })
+        elsif b64 = obj["list_base64"]?.try(&.as_a?)
+          # The byte-exact payload list. `list` entries are JSON strings put on the wire as
+          # their UTF-8 encoding, so `é` went out as 2 bytes and a byte-level set (0x00-0xFF,
+          # overlong/invalid UTF-8, a raw binary blob) could not be expressed at all — the
+          # only escape hatch was a `wordlist` FILE on the server's disk. Crystal Strings are
+          # byte buffers, so the decoded octets survive the whole render path unchanged.
+          Fuzz::InlineList.new(b64.map { |x| fuzz_payload_bytes(x) })
         elsif wl = obj["wordlist"]?.try(&.as_s?)
           Fuzz::WordlistFile.new(wl)
         elsif nums = obj["numbers"]?
@@ -438,7 +445,19 @@ module Gori
         elsif br = obj["brute"]?
           fuzz_brute(br)
         else
-          raise FuzzArgError.new("unknown payload set #{spec} (use list/wordlist/numbers/null/brute)")
+          raise FuzzArgError.new("unknown payload set #{spec} (use list/list_base64/wordlist/numbers/null/brute)")
+        end
+      end
+
+      # One base64 payload → its exact octets. Invalid base64 is a hard error, not a skip: a
+      # caller using this set asked for specific bytes, and fuzzing with different ones is
+      # worse than not fuzzing at all.
+      private def fuzz_payload_bytes(x : JSON::Any) : String
+        s = x.as_s? || raise FuzzArgError.new("each 'list_base64' entry must be a base64 string")
+        begin
+          String.new(Base64.decode(s))
+        rescue
+          raise FuzzArgError.new("invalid base64 in 'list_base64': #{x}")
         end
       end
 

@@ -251,8 +251,10 @@ module Gori
           j.field "short_circuited", row.short_circuited?
           j.field "error", text(detail.error)
           j.field "request_head", redact_head_opt(head_text(detail.request_head), include_sensitive)
+          emit_head_base64(j, "request_head", detail.request_head, include_sensitive)
           emit_body(j, "request_body", detail.request_head, detail.request_body, detail.request_body_truncated?, body_cap, body_omit)
           j.field "response_head", redact_head_opt(head_text(detail.response_head), include_sensitive)
+          emit_head_base64(j, "response_head", detail.response_head, include_sensitive)
           j.field "sensitive_headers_redacted", true unless include_sensitive
           emit_body(j, "response_body", detail.response_head, detail.response_body, detail.response_body_truncated?, body_cap, body_omit)
           emit_sse_events(j, detail)
@@ -394,6 +396,24 @@ module Gori
         head ? String.new(head).scrub : nil
       end
 
+      # The head's exact octets, when `head_text` above had to scrub them away. Without this
+      # an 8-bit byte in a captured header was unrecoverable through MCP: the body has a
+      # base64 fallback and the head had none, so `X-Bin: \x80\xff` read as `X-Bin: ��` with
+      # no way back and no signal that anything was lost.
+      #
+      # Gated on `include_sensitive` for `intercept_item_detail`'s reason: base64 is encoding,
+      # not redaction, so emitting the raw head by default would hand back exactly the
+      # Authorization/Cookie bytes the `*_head` field carefully redacts. Redacting INSIDE the
+      # base64 is not an option — it would no longer be the bytes.
+      def self.emit_head_base64(j : JSON::Builder, field_name : String, head : Bytes?,
+                                include_sensitive : Bool) : Nil
+        return if head.nil?
+        return if String.new(head).valid_encoding?
+        j.field "#{field_name}_lossy", true
+        return unless include_sensitive
+        j.field "#{field_name}_base64", Base64.strict_encode(head)
+      end
+
       # RFC3339 UTC for store timestamps (unix microseconds). Helps LLM clients
       # that can't interpret raw microsecond integers.
       def self.unix_micros_iso(us : Int64) : String
@@ -438,8 +458,45 @@ module Gori
             # cap) so the caller knows whether more is recoverable. Branch-independent.
             j.field "wire_truncated", true if wire_truncated
             j.field "note", note if note
+            emit_trailers(j, head, body)
           end
         end
+      end
+
+      # The chunked message's TRAILER fields, beside the de-chunked body rather than folded
+      # into `headers`. `note:"de-chunked"` used to be the only trace that a trailer section
+      # could even exist: the head stops before the body and the de-chunk stops at the
+      # 0-chunk, so `X-T: gotcha` after it appeared nowhere while the origin's `Trailer:`
+      # announcement was echoed — which reads as "the origin sent none". Whether a target
+      # treats a trailer as a header is itself a test, so they stay a separate list.
+      def self.emit_trailers(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
+        trailers = Proxy::Codec::ContentDecode.trailers(head, body)
+        return if trailers.empty?
+        j.field "trailers" do
+          j.array do
+            trailers.each do |(name, value)|
+              j.object do
+                j.field "name", text(name)
+                # A trailer value is remote bytes like any response header — same lossy
+                # contract, same base64 escape hatch (see `emit_lossy_text`).
+                emit_lossy_text(j, "value", value)
+              end
+            end
+          end
+        end
+      end
+
+      # A string that came off the wire, emitted so the caller can always recover the exact
+      # octets. `text` (i.e. `scrub`) is mandatory for JSON-RPC UTF-8 validity, but it is
+      # LOSSY and silently so: two different invalid bytes both render `�`, and the response
+      # BODY had a base64 fallback while a header VALUE did not — leaving those bytes
+      # unrecoverable through MCP entirely. Emit the raw bytes beside the scrubbed text
+      # whenever scrubbing actually changed something, and say that it did.
+      def self.emit_lossy_text(j : JSON::Builder, field_name : String, s : String) : Nil
+        j.field field_name, text(s)
+        return if s.valid_encoding?
+        j.field "#{field_name}_base64", Base64.strict_encode(s.to_slice)
+        j.field "#{field_name}_lossy", true
       end
 
       # Emit the (possibly capped) body bytes as text or base64. byte_slice can

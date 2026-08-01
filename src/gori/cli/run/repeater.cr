@@ -540,7 +540,7 @@ module Gori
             n = Repeater::Diff.change_count(d)
             STDERR.puts(n == 0 ? "no differences" : "#{n} line#{n == 1 ? "" : "s"} changed")
           else
-            print_message_text(result.head, new_body)
+            print_message_text(result.head, new_body, result.body)
           end
         else
           STDERR.puts "repeater failed: #{result.error}"
