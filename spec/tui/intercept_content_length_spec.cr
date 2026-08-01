@@ -1,0 +1,107 @@
+require "../spec_helper"
+require "../support/memory_backend"
+
+include Gori::Tui
+
+private def icl_interceptor(&)
+  path = File.tempname("gori-icl", ".db")
+  store = Gori::Store.open(path)
+  begin
+    ic = Gori::Interceptor.new(Gori::Scope.load(store))
+    ic.toggle # enable
+    yield ic
+  ensure
+    store.close
+    File.delete?(path)
+    File.delete?("#{path}-wal")
+    File.delete?("#{path}-shm")
+  end
+end
+
+# A CL/body desync — Content-Length shorter than the body, longer than it, or beside a
+# Transfer-Encoding — is *the* canonical reason to hold a request. gori answered every such
+# edit by putting its own number on the wire: the pane read `Content-Length: 5`, the origin
+# received `16`, and the status line said `forwarded`. There was no toggle, no key and no
+# setting; `ContentLength.sync` had two unconditional call sites and zero switches.
+describe "InterceptView Content-Length sync toggle" do
+  body = "alpha\rbeta\ngamma" # 16 bytes, with a bare CR and a bare LF inside
+  wire = "POST /held HTTP/1.1\r\nHost: 127.0.0.1:19501\r\n" \
+         "Content-Type: application/octet-stream\r\nContent-Length: #{body.bytesize}\r\n" \
+         "Connection: close\r\n\r\n#{body}"
+
+  # Open the editor on a single held request and put the caret on the Content-Length line.
+  def_edited = ->(ic : Gori::Interceptor) do
+    spawn do
+      ic.hold_request(wire.to_slice, method: "POST", target: "/held",
+        host: "127.0.0.1", port: 19501, scheme: "http")
+    end
+    Fiber.yield
+    view = InterceptView.new
+    view.reload(ic)
+    view.toggle_edit
+    view
+  end
+
+  it "defaults to ON and shows the value it is about to send, not the one that was typed" do
+    icl_interceptor do |ic|
+      view = def_edited.call(ic)
+      view.sync_content_length?.should be_true
+
+      # Edit "Content-Length: 16" → "Content-Length: 5": line 3, delete the "16", type "5".
+      3.times { view.edit_move(1, 0) }
+      view.edit_end
+      view.edit_backspace
+      view.edit_backspace
+      view.edit_insert('5')
+
+      # With the sync on, the pane must not go on displaying a value that will not go out.
+      view.editor_text.lines.should contain("Content-Length: #{body.bytesize}")
+      view.editor_text.should_not contain("Content-Length: 5\r")
+      String.new(view.pending_edit.not_nil![1]).should eq(wire)
+    end
+  end
+
+  it "forwards the operator's own Content-Length once the sync is toggled off" do
+    icl_interceptor do |ic|
+      view = def_edited.call(ic)
+      view.toggle_content_length_sync.should be_false
+
+      3.times { view.edit_move(1, 0) }
+      view.edit_end
+      view.edit_backspace
+      view.edit_backspace
+      view.edit_insert('5')
+
+      # Pane and wire agree on the desync the operator asked for.
+      view.editor_text.lines.should contain("Content-Length: 5")
+      sent = String.new(view.pending_edit.not_nil![1])
+      sent.should eq(wire.sub("Content-Length: 16", "Content-Length: 5"))
+      sent.should end_with(body) # the 16 body bytes still go out under the declared 5
+    end
+  end
+
+  it "re-syncs the visible header when the sync is switched back on" do
+    icl_interceptor do |ic|
+      view = def_edited.call(ic)
+      view.toggle_content_length_sync.should be_false
+      3.times { view.edit_move(1, 0) }
+      view.edit_end
+      view.edit_backspace
+      view.edit_backspace
+      view.edit_insert('5')
+      view.editor_text.lines.should contain("Content-Length: 5")
+
+      view.toggle_content_length_sync.should be_true
+      view.editor_text.lines.should contain("Content-Length: #{body.bytesize}")
+    end
+  end
+
+  it "puts the toggle on the detail card's border so it is discoverable" do
+    icl_interceptor do |ic|
+      view = def_edited.call(ic)
+      backend = MemoryBackend.new(120, 14)
+      view.render(Screen.new(backend), Rect.new(0, 0, 120, 14))
+      backend.contains?("^l:CL").should be_true
+    end
+  end
+end

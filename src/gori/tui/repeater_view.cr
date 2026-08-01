@@ -120,6 +120,7 @@ module Gori::Tui
       @grpc_mode = false
       @grpc_body = Bytes.empty # the pristine framed request message(s), sent verbatim
       @grpc_msg_count = 0      # deframed message count of @grpc_body (immutable → computed once)
+      @grpc_req_residual = 0   # …and the tail of @grpc_body that is NOT a complete frame
       # A SINGLE-message gRPC call (the unary common case) is reframable: its payload is
       # hex-editable (^X) and the 5-byte length prefix is recomputed on send. A 0- or
       # multi-message body isn't (boundaries are prefix-defined) — it stays verbatim.
@@ -371,8 +372,16 @@ module Gori::Tui
     # The buffer the external editor (^E) round-trips: the ACTIVE request sub-pane — the
     # envelope, or the decoded payload when it's the split's active pane (so you can edit
     # a big SAML XML / GraphQL query in $EDITOR). Non-decode tabs = the envelope, as before.
+    #
+    # `wire_text`, NOT `text` — the same distinction `request_text` above draws, and for the
+    # same reason. Handing `$EDITOR` the LF projection meant a captured request came back
+    # from a round trip with every CRLF in its BODY replaced by a bare LF, and auto-CL then
+    # resynced `Content-Length` down to the shortened body, so nothing errored and the
+    # smuggled `0\r\n\r\nGET /smuggled …` payload the operator was testing simply stopped
+    # being a payload. `set_text` (in `replace_edit_buffer`) is the exact inverse, so a file
+    # the editor left alone round-trips byte for byte.
     def edit_buffer_text : String
-      (h = @req_hex_edit) ? String.new(h.to_bytes) : req_editor.text
+      (h = @req_hex_edit) ? String.new(h.to_bytes) : req_editor.wire_text
     end
 
     def replace_edit_buffer(text : String) : Nil
@@ -508,24 +517,21 @@ module Gori::Tui
       @req_pane = :decoded
     end
 
-    # The editable outbound messages, parsed from the editor — one TEXT frame per
-    # non-empty line, with `$KEY` env tokens expanded at send time (parity with the
-    # handshake and every other outbound path). Uses @decoded.text (LF-joined) NOT
-    # to_bytes (CRLF-joined), else every frame but the last would carry a spurious
-    # trailing '\r'. (A captured frame with an embedded newline can't be represented
-    # one-per-line — a known v1 limit.)
+    # The outbound messages to SEND: exactly the list a save would persist
+    # (`ws_out_messages_raw`), with `$KEY` env tokens expanded (parity with the handshake and
+    # every other outbound path).
+    #
+    # Derived from `ws_out_messages_raw` rather than re-deriving the list itself, so the wire
+    # and the database can never disagree about which frames this tab holds. They did: this
+    # method used to fall back to its own LF-split of the pane the moment the pane was edited,
+    # while the badge on the pane's border kept naming the frames that fallback had dropped.
     def ws_out_messages : Array(Repeater::WsEngine::OutMsg)
-      if ws_out_seeded?
-        return @ws_out_seed.map do |m|
-          # `Env.expand` scans BYTES and copies every unmatched span through untouched, so a
-          # TEXT frame carrying invalid UTF-8 survives it; a BINARY frame is not expanded at
-          # all, the same rule `gori run repeater send` and MCP `send_websocket` apply.
-          Repeater::WsEngine::OutMsg.new(m.opcode,
-            m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload, m.shape)
-        end
-      end
-      @decoded.text.split('\n').compact_map do |line|
-        line.empty? ? nil : Repeater::WsEngine::OutMsg.new(1, Env.expand(line).to_slice)
+      ws_out_messages_raw.map do |m|
+        # `Env.expand` scans BYTES and copies every unmatched span through untouched, so a
+        # TEXT frame carrying invalid UTF-8 survives it; a BINARY frame is not expanded at
+        # all, the same rule `gori run repeater send` and MCP `send_websocket` apply.
+        Repeater::WsEngine::OutMsg.new(m.opcode,
+          m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload, m.shape)
       end
     end
 
@@ -556,15 +562,48 @@ module Gori::Tui
     # would render as an ORDINARY line, so writing the pane back would silently discard
     # exactly the shape the operator captured it for. Showing it and then losing it is worse
     # than not showing it: the seed replays it verbatim.
+    #
+    # The last two clauses apply that same rule to a payload whose BYTES defeat the one
+    # message = one line projection, which the shape fields do not describe:
+    #
+    #   * an embedded LF makes one frame render as two lines, and writing the pane back split
+    #     a captured `line1\nline2` into two frames on the wire — a real observed defect, not
+    #     a hypothetical (the origin logged `op=1 len=5` twice where the capture had one
+    #     `op=1 len=11`).
+    #   * invalid UTF-8 is a binary payload the pane happens to be displaying (RFC 6455 §5.6
+    #     makes UTF-8 the definition of a text frame), and a TextArea round-trip would scrub
+    #     it — the same reason `Store::WsOutMessage` exists at all.
+    #
+    # Both are frames the operator captured *for* those bytes, so they stay in the list and
+    # out of the pane, and the "+N not shown" badge names them.
     def self.ws_line_renderable?(m : Store::WsOutMessage) : Bool
-      m.text? && m.shape.default?
+      return false unless m.text? && m.shape.default?
+      return false if m.payload.includes?(0x0A_u8)
+      String.new(m.payload).valid_encoding?
     end
 
-    # Short labels for the seeded frames the pane is NOT showing, for the badge on the
-    # MESSAGES border and the open-from-History status line. Empty when the pane shows
-    # everything, which is the ordinary case.
+    # The badge/notice label for a frame the pane is not showing. `shape_label` names the
+    # frame SHAPE, which is the whole answer for a PING or an RSV1 frame and no answer at all
+    # for the two byte-level cases above — both are plain `TEXT` by shape, so the badge would
+    # have read "+2 not shown: TEXT, TEXT".
+    def self.ws_unshown_label(m : Store::WsOutMessage) : String
+      base = m.shape_label
+      return base unless m.text? && m.shape.default?
+      return "#{base} multiline" if m.payload.includes?(0x0A_u8)
+      "#{base} binary"
+    end
+
+    # Short labels for the frames the pane is NOT showing, for the badge on the MESSAGES
+    # border and the open-from-History status line. Empty when the pane shows everything,
+    # which is the ordinary case.
+    #
+    # Computed from the list actually going out / being written (`ws_out_messages_raw`), NOT
+    # from `@ws_out_seed`. It read the seed, which an edit never updates, so after the pane
+    # was edited the border went on advertising a PING and a BIN that the write-back had
+    # already deleted — the operator was told a binary frame was riding along when it was not.
     def ws_unshown_seed : Array(String)
-      @ws_out_seed.reject { |m| RepeaterView.ws_line_renderable?(m) }.map(&.shape_label)
+      ws_out_messages_raw.reject { |m| RepeaterView.ws_line_renderable?(m) }
+        .map { |m| RepeaterView.ws_unshown_label(m) }
     end
 
     # Install a session's outbound messages as both the seed and the pane's text. The pane
@@ -602,12 +641,11 @@ module Gori::Tui
     # such bytes roughly once per 1.2KB by chance (#519). Without this the pane refused a
     # real captured binary frame, naming the `$A` inside a JPEG.
     def ws_unresolved_env : Array(String)
-      texts = if ws_out_seeded?
-                @ws_out_seed.select(&.text?).map { |m| String.new(m.payload) }
-              else
-                @decoded.text.split('\n')
-              end
-      texts.select { |line| !line.empty? && line.valid_encoding? }
+      # The list that is actually going out (`ws_out_messages_raw`), for the same reason
+      # `ws_out_messages` reads it: a check run against a different list than the send is not
+      # a check. Pre-splice this branched on `ws_out_seeded?` and read the pane's raw lines.
+      ws_out_messages_raw.select(&.text?).map { |m| String.new(m.payload) }
+        .select { |line| !line.empty? && line.valid_encoding? }
         .flat_map { |line| Env.unresolved(line) }.uniq!
     end
 
@@ -617,9 +655,38 @@ module Gori::Tui
     #
     # An untouched pane hands back the seed, opcodes and bytes intact; that is what lets a
     # captured BINARY frame survive a save it had nothing to do with.
+    #
+    # An EDITED pane is a position-keyed SPLICE over that seed, not a replacement of it. It
+    # used to be a replacement — `@decoded.text.split('\n').reject(&.empty?)`, every line a
+    # fresh default-shape TEXT frame — so one keystroke anywhere in the pane deleted every
+    # frame the pane had never rendered. On a persisted session that is irreversible:
+    # `Store#update_repeater_ws_messages` opens with `DELETE FROM ws_messages`, and a PING, a
+    # binary payload, an empty frame, an RSV1 frame and an unmasked frame were gone from the
+    # database with no confirmation and no undo. The pane is a text VIEW of a list it cannot
+    # fully represent; an edit to the view may only touch what the view showed.
+    #
+    # `reject(&.empty?)` is off the mapped range for the same reason: a captured TEXT frame
+    # with an empty payload IS renderable (it is a blank line), so dropping blank lines ate
+    # it. Only a SURPLUS blank line — one past the end of the seed's renderable slots, which
+    # is what pressing Enter at the end of the pane produces — is still discarded.
     def ws_out_messages_raw : Array(Store::WsOutMessage)
       return @ws_out_seed if ws_out_seeded?
-      @decoded.text.split('\n').reject(&.empty?).map { |l| Store::WsOutMessage.text(l) }
+      lines = @decoded.text.split('\n')
+      out = @ws_out_seed.map { |m| m.as(Store::WsOutMessage?) }
+      # The seed positions this pane is showing, in pane order. `ws_line_renderable?` decides
+      # both this and what `seed_ws_out` joined into the pane, so line k IS slot slots[k].
+      slots = [] of Int32
+      @ws_out_seed.each_with_index { |m, i| slots << i if RepeaterView.ws_line_renderable?(m) }
+      slots.each_with_index do |idx, k|
+        # A line the operator deleted takes its slot with it; nil marks it for removal so the
+        # indices of the untouched slots stay valid while the rest are being written.
+        out[idx] = (line = lines[k]?) ? Store::WsOutMessage.text(line) : nil
+      end
+      messages = out.compact
+      # Lines with no slot are new: append them in order. Blank ones are the trailing newline
+      # an editor leaves behind, not a frame the operator asked for.
+      lines[slots.size..]?.try &.each { |l| messages << Store::WsOutMessage.text(l) unless l.empty? }
+      messages
     end
 
     # Persistence just wrote `ws_out_messages_raw` — those bytes ARE the session now, so the
@@ -721,7 +788,11 @@ module Gori::Tui
       @ws_mode = false
       @http2 = true # gRPC is HTTP/2
       @grpc_body = detail.request_body || Bytes.empty
-      msgs = Proxy::H2::Grpc.messages(@grpc_body)
+      # `scan`, not `messages`: the residual is the REQUEST side of the same report. A capture
+      # whose length prefix over-claims used to count as "0 messages" and be described in the
+      # transcript as `→ sent 0 request messages (10b)` — the byte count and the message count
+      # disagreeing, with nothing saying why.
+      msgs, @grpc_req_residual = Proxy::H2::Grpc.scan(@grpc_body)
       @grpc_msg_count = msgs.size
       # Reframable only when the body is EXACTLY one clean message: then a hex edit of the
       # payload can be re-length-prefixed unambiguously. (A partial trailing frame would
@@ -2079,10 +2150,20 @@ module Gori::Tui
       end
     end
 
+    # undo / backspace / forward-delete are NO-OPS on an empty undo stack, at buffer start and
+    # at end-of-buffer respectively (TextArea returns early without bumping @edits). A no-op
+    # must not mark the buffer edited. `intercept_view.cr` has carried this guard and the
+    # reason for it since #513; the Repeater's copy did not, and the consequence here is
+    # worse: `mark_req_edit` sets `@ws_out_edited`, so a single `Ctrl-Z` in READ mode on an
+    # untouched WebSocket tab took the pane off its seed and dropped every frame the pane was
+    # not showing — observed as a captured BIN frame vanishing from the wire between two
+    # otherwise identical replays. Gate on a real edit.
     def edit_undo : Nil
       return unless @focus == :request
-      req_editor.undo
-      mark_req_edit
+      ed = req_editor
+      before = ed.edits
+      ed.undo
+      mark_req_edit if ed.edits != before
     end
 
     def edit_insert(ch : Char) : Nil
@@ -2106,8 +2187,10 @@ module Gori::Tui
 
     def edit_backspace : Nil
       return unless @focus == :request
-      req_editor.backspace
-      mark_req_edit
+      ed = req_editor
+      before = ed.edits
+      ed.backspace
+      mark_req_edit if ed.edits != before # no-op at buffer start — see edit_undo
     end
 
     def edit_move(dr : Int32, dc : Int32) : Nil
@@ -2146,8 +2229,10 @@ module Gori::Tui
     # Forward-delete: a content edit → dirties (matches edit_backspace).
     def edit_delete : Nil
       return unless @focus == :request
-      req_editor.delete
-      mark_req_edit
+      ed = req_editor
+      before = ed.edits
+      ed.delete
+      mark_req_edit if ed.edits != before # no-op at end-of-buffer — see edit_undo
     end
 
     # --- marker structure guards (delimiter delete / nesting) --------------------
@@ -3096,6 +3181,7 @@ module Gori::Tui
           # Report the bytes actually put on the wire — a reframed (edited) unary payload
           # differs from the captured @grpc_body.
           rows << {"→ sent #{reqn} request message#{reqn == 1 ? "" : "s"} (#{grpc_send_body.size}b)", Theme.muted}
+          rows << {"⚠ #{RepeaterView.grpc_framing_error(@grpc_req_residual)}", Theme.yellow} if @grpc_req_residual > 0
           st = result.response.try(&.status) || 0
           rows << {"HTTP #{st}", st >= 400 ? Theme.red : Theme.text}
           grpc_response_rows(result).each { |r| rows << r }
@@ -3140,10 +3226,15 @@ module Gori::Tui
       end
     end
 
+    # `scan`, not `messages`: `messages` throws away the residual — the tail bytes that are
+    # not a complete frame — so a deliberately-wrong length prefix (a standard gRPC parser
+    # test) rendered as a bare "(no complete gRPC messages)" with no byte count, which reads
+    # identically to "this response is not gRPC at all". `gori run show --format json`
+    # already reports it; this is the pane that shows the same response.
     private def grpc_response_rows(result : Repeater::Result) : Array({String, Color})
       rows = [] of {String, Color}
-      msgs = Proxy::H2::Grpc.messages(result.body || Bytes.empty)
-      if msgs.empty?
+      msgs, residual = Proxy::H2::Grpc.scan(result.body || Bytes.empty)
+      if msgs.empty? && residual == 0
         rows << {"← (no complete gRPC messages)", Theme.muted}
       else
         msgs.each_with_index do |m, i|
@@ -3165,7 +3256,20 @@ module Gori::Tui
           end
         end
       end
+      rows << {"⚠ #{RepeaterView.grpc_framing_error(residual)}", Theme.yellow} if residual > 0
       rows
+    end
+
+    # The one wording every gRPC surface uses for a framing failure — byte-identical to
+    # `gori run show --format json`'s `framing_error` and to the History pane's row, so an
+    # operator comparing two surfaces on the same flow is reading the same sentence.
+    #
+    # NOTE (merge): this duplicates `Proxy::H2::Grpc.framing_error`, which lands on the
+    # `fix/b-h2-grpc` branch. Collapse this into a call to that helper once both are merged —
+    # the string is deliberately identical so the swap is a no-op.
+    def self.grpc_framing_error(residual : Int32) : String
+      "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
+      "a length prefix claiming more than arrived, or a body cut short"
     end
 
     # grpc-status/grpc-message arrive as response trailers (absorbed into the synth

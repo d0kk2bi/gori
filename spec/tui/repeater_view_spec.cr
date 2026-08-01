@@ -945,11 +945,16 @@ describe Gori::Tui::RepeaterView do
     end
   end
 
-  it "replays a captured BINARY message an untouched pane never showed, and drops it once edited" do
+  it "replays a captured BINARY message an untouched pane never showed, and KEEPS it once edited" do
     # The pane is a text projection — one message per line, LF-split — so it cannot carry a
     # binary payload. Sending the projection back was how a captured binary message became
     # an opcode-1 text one on every save, and how it vanished from every later replay. The
     # rule is the WS relay's: gori's own shape only for what the operator actually changed.
+    #
+    # That last sentence is why the "once edited" half of this spec inverted: an edit to a
+    # TEXT line is not a change to the BINARY frame beside it, and treating it as one deleted
+    # the frame from the wire and (on a persisted session) from the database. An edit is now
+    # a position-keyed splice over the seed, so the binary frame keeps its slot.
     bin = Bytes[0x00, 0xFF, 0x0A, 0x41]
     repeater_tmp_store do |store|
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
@@ -967,11 +972,13 @@ describe Gori::Tui::RepeaterView do
       view.ws_out_messages_raw.map(&.opcode).should eq([1, 2]) # what a save would persist
       view.ws_out_messages_raw[1].payload.should eq(bin)
 
-      # Editing the list makes it the operator's, and it is text.
+      # Editing the TEXT line changes that line and nothing else.
       view.edit_insert('X')
-      view.ws_out_messages.map(&.opcode).should eq([1])
+      view.ws_out_messages.map(&.opcode).should eq([1, 2])
       String.new(view.ws_out_messages[0].payload).should eq("Xfirst")
-      view.ws_out_messages_raw.map(&.opcode).should eq([1])
+      view.ws_out_messages[1].payload.should eq(bin)
+      view.ws_out_messages_raw.map(&.opcode).should eq([1, 2])
+      view.ws_out_messages_raw[1].payload.should eq(bin)
     end
   end
 
