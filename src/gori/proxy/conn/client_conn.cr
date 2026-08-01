@@ -20,6 +20,59 @@ require "../../flow_mapper"
 require "./self_page"
 
 module Gori::Proxy
+  # Why this connection is speaking HTTP/1.1 rather than HTTP/2 — the OBSERVED reason, stamped
+  # by whoever made the decision, rather than re-derived afterwards by whoever needs to explain
+  # it. `ClientConn` reads exactly one of these back when an h2/gRPC client's preface lands on
+  # the h1 path.
+  #
+  # It exists because re-deriving was wrong. The old message hard-coded two causes ("settings
+  # network.http2 is \"off\" or a Match&Replace body rule is live") and pointed at a
+  # `gori.log` line that names which — but `Tls::Tunnel#h2_candidate?` has FOUR such branches
+  # now, and the common case is none of them: the tunnel offered h2, the ORIGIN answered
+  # `http/1.1` at ALPN, `notice_downgrade` never ran, and nothing was ever written to
+  # `gori.log`. So the operator was told to change a setting that was already correct and to
+  # read a line that did not exist. A refusal that names the wrong reason costs more time than
+  # one that names none.
+  enum H2Offer
+    # No tunnel made this decision (the plaintext listener, a blind CONNECT). Says nothing
+    # about a cause, on purpose.
+    Unknown
+    # h2 was offered to the client and the client did not select it at ALPN (curl --http1.1,
+    # an old browser). Nothing is wrong; the client chose.
+    Offered
+    # A cleartext origin. ALPN lives inside a TLS handshake, so there was nothing to reflect
+    # and gori has no h2c of its own to offer.
+    Cleartext
+    # The four `h2_candidate?` downgrades. Each one DID write a `gori.log` line, so each one
+    # may point at it.
+    DisabledBySetting
+    BodyRule
+    ShortCircuitRule
+    ExtractRule
+    # The origin completed a TLS handshake and chose HTTP/1.1 at ALPN, so gori did not offer
+    # h2 to the client either (there is no h2↔h1 bridge — see `reflect_origin_h2`).
+    UpstreamDeclined
+    # The h2 ALPN probe to the origin never completed (unreachable, or a TLS/verify refusal),
+    # so gori could not learn what it speaks and kept the client on h1.
+    UpstreamUnreachable
+
+    # The sentence recorded on a flow when an h2/gRPC preface is refused on the h1 path. Only
+    # the branches that actually write to `gori.log` mention it.
+    def refusal_reason : String
+      case self
+      in Unknown             then "HTTP/2 was not negotiated on this connection"
+      in Offered             then "HTTP/2 was offered to this client and it selected HTTP/1.1 at ALPN, then spoke the HTTP/2 preface anyway"
+      in Cleartext           then "this origin is cleartext, and ALPN — the only way gori offers HTTP/2 — exists inside a TLS handshake; gori does not serve h2c prior-knowledge here"
+      in DisabledBySetting   then "HTTP/2 is switched off (settings network.http2; set it back to \"auto\" to keep h2) — gori.log has the matching \"h2 downgrade: <host> ...\" line"
+      in BodyRule            then "a Match&Replace BODY rule is live for this host and body rewriting on HTTP/2 is not implemented yet — gori.log has the matching \"h2 downgrade: <host> ...\" line"
+      in ShortCircuitRule    then "a Match&Replace short-circuit rule is live for this host and the h2 relay cannot answer a request locally — gori.log has the matching \"h2 downgrade: <host> ...\" line"
+      in ExtractRule         then "a session-binding extract rule reads the response BODY for this host and body extraction on HTTP/2 is not implemented yet — gori.log has the matching \"h2 downgrade: <host> ...\" line"
+      in UpstreamDeclined    then "the ORIGIN did not negotiate HTTP/2 (it chose HTTP/1.1 at ALPN), so gori did not offer h2 to this client either — gori does not translate between h2 and h1. Nothing on this proxy needs changing"
+      in UpstreamUnreachable then "gori's HTTP/2 ALPN probe to the origin did not complete (unreachable, or the upstream TLS handshake was refused), so it could not learn whether the origin speaks h2 and kept this client on HTTP/1.1"
+      end
+    end
+  end
+
   # Handles one client connection over an `IO` (a plaintext TCPSocket, or — after
   # the CONNECT/TLS handoff — a decrypted TLS socket; the same loop serves both,
   # which is why it is written against `IO`). Reads requests in a keep-alive
@@ -76,7 +129,8 @@ module Gori::Proxy
                    @default_port : Int32? = nil,
                    @origin_dst : {String, Int32}? = nil,
                    @rewrite_fixed_host : Bool = false,
-                   @extractor : ResponseExtract? = nil)
+                   @extractor : ResponseExtract? = nil,
+                   @h2_offer : H2Offer = H2Offer::Unknown)
       # Per-connection upstream reuse (see `acquire_upstream`). One live origin
       # connection kept across this client's keep-alive requests.
       @upstream = nil.as(IO?)
@@ -207,13 +261,13 @@ module Gori::Proxy
       #
       # The recorded reason names the SETTINGS to change rather than a private method the
       # operator cannot see (#492 step 4b, the same fix `Outbound#sweep_block` got in #491).
-      # It cannot name WHICH of the two applies — that decision was made per host in the
-      # Tunnel, before this connection existed — so it points at the gori.log line that can.
+      # It no longer GUESSES which cause applies: the Tunnel stamps what it observed on this
+      # connection (`H2Offer`), so the sentence is the true one and only the branches that
+      # write to gori.log point at it. See `H2Offer` for what went stale under the old
+      # "it cannot name which, so it points at the log" reasoning.
       if Codec::Http1.h2_preface?(req)
         record_error(req, @scheme, @fixed_host || req.host? || "", @fixed_port, created_at,
-          "rejected h2/gRPC client preface on the HTTP/1.1 path: HTTP/2 was not offered for " \
-          "this host, because settings network.http2 is \"off\" or a Match&Replace body rule " \
-          "is live — gori.log names which (\"h2 downgrade: <host> ...\")")
+          "rejected h2/gRPC client preface on the HTTP/1.1 path: #{@h2_offer.refusal_reason}")
         return false
       end
 

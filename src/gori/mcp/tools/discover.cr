@@ -42,7 +42,7 @@ module Gori
       # builder's. Raises FuzzArgError (clean message) on any malformed input.
       private def build_discover_plan(h, ob : Outbound) : Discover::Plan
         options = Discover::PlanOptions.new(str(h, "url") || "", config: discover_config(h),
-          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           overrides: HostOverrides.load(store))
         Discover::Plan.build(options, ob)
       rescue ex : Discover::PlanError
@@ -53,10 +53,6 @@ module Gori
       # able to ask for an unbounded crawl). `user_wordlist` lives on the Config like every
       # other knob — the builder reads it from there on all three surfaces.
       private def discover_config(h) : Discover::Config
-        spider = bool(h, "spider")
-        bruteforce = bool(h, "bruteforce")
-        spider = true if spider.nil?
-        bruteforce = true if bruteforce.nil?
         cap = int(h, "max_requests")
         Discover::Config.new(
           concurrency: clamp(int(h, "concurrency"), 20, DISCOVER_MAX_CONCURRENCY),
@@ -68,7 +64,11 @@ module Gori
           retries: (int(h, "retries") || 1_i64).clamp(0_i64, 1000_i64).to_i,
           max_requests: cap ? {cap, DISCOVER_MAX_REQUESTS}.min : DISCOVER_MAX_REQUESTS,
           keep_alive: bool_arg(h, "keep_alive", true),
-          spider: spider, bruteforce: bruteforce,
+          # Both default ON, and both must be readable as a NAMED refusal when the value is
+          # unintelligible: `spider: 0` used to come back as nil → `true`, so the crawl ran
+          # after the caller asked for it off AND slipped past the "at least one technique"
+          # guard that `spider: false` correctly trips.
+          spider: bool_arg(h, "spider", true), bruteforce: bool_arg(h, "bruteforce", true),
           max_depth: clamp(int(h, "max_depth"), 4, DISCOVER_MAX_DEPTH),
           user_wordlist: str(h, "wordlist").presence,
           extensions: discover_extensions(h), containment: discover_containment(h),
@@ -148,8 +148,18 @@ module Gori
           djob.sent = p.sent; djob.found = p.found; djob.errors = p.errors; djob.queued = p.queued
         when Discover::DoneEvent
           djob.sent = ev.progress.sent; djob.found = ev.progress.found; djob.errors = ev.progress.errors
+          # Read the FINAL queue depth off the Done event rather than leaving whatever the
+          # last ProgressEvent happened to carry — it is the number the status below reports.
+          djob.queued = ev.progress.queued
           djob.stats = ev.stats
-          djob.status = ev.stopped ? :stopped : :done
+          # Discover has no fixed candidate total (a live crawl's denominator moves), so the
+          # shortfall is read the other way round: tasks still QUEUED when the run ended mean
+          # max_requests halted it, exactly the :budget_exhausted fuzz and mine derive from
+          # `done_count < total`. Without this a budget-capped sweep that never sent 275 of
+          # 283 tasks reported `status:"done", job_complete:true, has_more:false` — an agent
+          # reads that as an exhaustive directory sweep and stops looking.
+          djob.status = terminal_status(djob.status, ev.stopped, 0_i64,
+            djob.queued > 0 ? djob.queued.to_i64 : nil)
           djob.ended_at_ms = Time.utc.to_unix_ms
         when Discover::ErrorEvent
           djob.status = :error
@@ -188,6 +198,9 @@ module Gori
             j.field "errors", djob.errors
             j.field "queued", djob.queued
             j.field "job_complete", djob.status != :running
+            # Parity with fuzz_status/mine_status: `job_complete` says the job ENDED, this
+            # says whether it ended having covered everything it queued.
+            j.field "incomplete_reason", incomplete_reason(djob.status)
             j.field "results_truncated", djob.truncated?
             j.field "error", djob.error_msg
             if s
@@ -216,7 +229,11 @@ module Gori
             j.field "offset", offset
             j.field "total_available", djob.results.size
             j.field "job_complete", djob.status != :running
+            # `has_more` is about this PAGE. A budget-capped run has no more stored findings
+            # and still is not an exhaustive answer — that is what incomplete_reason says.
             j.field "has_more", offset + page.size < djob.results.size
+            j.field "incomplete_reason", incomplete_reason(djob.status)
+            j.field "queued", djob.queued
             j.field "results_truncated", djob.truncated?
           end
         end)

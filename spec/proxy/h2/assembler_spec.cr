@@ -245,6 +245,37 @@ describe Gori::Proxy::H2::Assembler do
     String.new(sink.responses.first.head).should_not contain("X-Gori-Trailers")
   end
 
+  # R3-F5. The request side got the merge and not the marker, so `x-req-trailer` read exactly
+  # like a header the client sent in its head — a gRPC client-streaming call or a `TE: trailers`
+  # probe is the same test on this side as `grpc-status` is on the other.
+  it "names REQUEST trailers in the stored request head, as it already did for the response" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    assembler.feed("out", data_frame(1_u32, 0_u8, "body"))
+    trailer = IO::Memory.new
+    trailer.write_byte(0x00_u8)
+    trailer.write_byte(0x0d_u8)
+    trailer << "x-req-trailer"
+    trailer.write_byte(0x03_u8)
+    trailer << "yes"
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM, trailer.to_slice))
+
+    head = String.new(sink.requests.first.head)
+    head.should contain("x-req-trailer: yes")
+    head.should contain("X-Gori-Trailers: x-req-trailer")
+  end
+
+  # Complement: the same request WITHOUT a trailing block must be byte-identical to before.
+  it "does not name a trailer on a request that had no trailing HEADERS block" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    String.new(sink.requests.first.head).should_not contain("X-Gori-Trailers")
+  end
+
   it "captures a server push (PUSH_PROMISE → promised-stream flow + response)" do
     sink = RecSink.new
     assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
@@ -267,6 +298,57 @@ describe Gori::Proxy::H2::Assembler do
     sink.responses.size.should eq(1)
     sink.responses.first.status.should eq(200)
     String.new(sink.responses.first.body.not_nil!).should eq("pushed body")
+
+    # R3-F4. A promise is the ORIGIN inventing a request. Projected as an ordinary flow it was
+    # indistinguishable in History / QL / the Sitemap from one the client made — rows the
+    # origin authored, inside the evidence an operator came to read.
+    String.new(req.head).should contain("X-Gori-Pushed: server push promised on stream 1")
+  end
+
+  # Complement: a request the client actually sent carries no push marker.
+  it "does not mark an ordinary client request as pushed" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    String.new(sink.requests.first.head).should_not contain("X-Gori-Pushed")
+  end
+
+  # R5-F4. gori relays an RFC 8441 extended CONNECT byte-for-byte (it also relays the origin's
+  # SETTINGS verbatim, so a client facing an 8441 origin is entitled to send one) — but it
+  # decodes nothing on it: the WS transcript, the message gate, intercept and Match&Replace all
+  # live on the h1 Upgrade path. The flow used to end as a bare "h2 connection closed", which
+  # describes the symptom and not the fact.
+  it "names RFC 8441 extended CONNECT on the flow instead of only the symptom" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.test", 443, 1_i64)
+    block = IO::Memory.new
+    [{":method", "CONNECT"}, {":scheme", "https"}, {":authority", "ws.test"},
+     {":path", "/chat"}, {":protocol", "websocket"}].each do |(n, v)|
+      block.write_byte(0x00_u8)
+      block.write_byte(n.bytesize.to_u8)
+      block << n
+      block.write_byte(v.bytesize.to_u8)
+      block << v
+    end
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, block.to_slice))
+    assembler.finalize_all("h2 connection closed")
+
+    err = sink.responses.first.error.not_nil!
+    err.should contain("h2 connection closed")
+    err.should contain("RFC 8441 extended CONNECT")
+    err.should contain("websocket")
+    err.should contain("HTTP/1.1 Upgrade path")
+  end
+
+  # Complement: an ordinary stream torn down the same way keeps the bare reason.
+  it "leaves an ordinary aborted stream's reason alone" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    assembler.finalize_all("h2 connection closed")
+    sink.responses.first.error.should eq("h2 connection closed")
   end
 
   # #409: a CONTINUATION frame with no preceding un-terminated HEADERS is a protocol violation

@@ -102,6 +102,12 @@ module Gori::Tui
       # which the user may have edited (adding/removing §…§ markers) since the run.
       @run_template = nil.as(Fuzz::Template?)
       @pending_template = nil.as(Fuzz::Template?)
+      # {update_content_length?, add_content_length_when_missing?, keep_bodies} as of the run
+      # that produced @results — frozen alongside @run_template for the same reason: the
+      # reconstruction and the note that names the retention policy must describe THAT run,
+      # not whatever the CONFIG pane says now.
+      @run_policy = nil.as({Bool, Bool, Symbol}?)
+      @pending_policy = nil.as({Bool, Bool, Symbol}?)
       @sel = 0
       @scroll = 0
       @sort = :index
@@ -245,11 +251,12 @@ module Gori::Tui
       @tcx = @target.size
       @http2 = rec.http2?
       @sni = rec.sni || ""
-      # Normalized compare for the same reason as session_side_matches? below: set_text zeroes
-      # the caret/scroll and clears undo, so it must only run on a REAL text change. No writer
-      # puts CRLF in fuzz_sessions.template today (only the fuzzer controller writes it, always
-      # from @editor.text, already LF) — kept consistent so it can't rot if one ever does.
-      @editor.set_text(rec.template) if @editor.text != TextArea.normalize_lf(rec.template)
+      # set_text zeroes the caret/scroll and clears undo, so it must only run on a REAL text
+      # change. The compare is EXACT (`wire_text` is set_text's byte-for-byte inverse), the
+      # same test RepeaterView#apply_request_fields makes: the template is persisted in wire
+      # form now, so a normalized compare would be blind to a pure line-ending edit — which
+      # is a real edit on a message — while an exact one is never falsely unequal.
+      @editor.set_text(rec.template) if @editor.wire_text != rec.template
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -258,10 +265,11 @@ module Gori::Tui
     end
 
     # True when the live view matches a store row's request-side fields (reconcile skip).
-    # Template compare normalizes CRLF→LF (TextArea stores LF; the store may hold wire CRLF).
+    # The template compare is EXACT — see apply_peer_session above; `template_text` is wire
+    # form and is exactly what `update_fuzz_session` wrote, so the two can never disagree.
     def session_side_matches?(rec : Store::FuzzSessionRecord) : Bool
       @target == rec.target &&
-        template_text == TextArea.normalize_lf(rec.template) &&
+        template_text == rec.template &&
         @http2 == rec.http2? &&
         (sni_override || "") == (rec.sni || "") &&
         (@name || "") == (rec.name || "") &&
@@ -285,8 +293,13 @@ module Gori::Tui
     end
 
     # --- persistence accessors ----------------------------------------------
+    # `wire_text`, NOT `text`: this is what gets written to `fuzz_sessions.template`, so
+    # persisting the LF projection would make the loss of a captured body's CRLFs SURVIVE a
+    # restart — the run would then be wrong even after the send path was fixed. Wire form
+    # round-trips exactly (`set_text` is `wire_text`'s inverse), and it is also what
+    # `duplicate_from` and the reconstruction in `result_request` read.
     def template_text : String
-      @editor.text
+      @editor.wire_text
     end
 
     def sni_override : String?
@@ -483,7 +496,7 @@ module Gori::Tui
       # anchor — restoring the raw cursor could land inside a now-longer hidden chain.
       anchor = Fuzz::Template.marker_start_at(@editor.text, @chain_marker_cursor) || @chain_marker_cursor
       if updated = Fuzz::Template.set_chain(@editor.text, @chain_marker_cursor, @chain_pane.value)
-        @editor.set_text(updated)
+        @editor.set_text(restore_wire_eols(updated))
         @editor.place_at_offset(anchor) # back into the marker (set_text reset it) → tooltip stays up
         @dirty = true
       end
@@ -521,6 +534,32 @@ module Gori::Tui
     end
 
     # --- marking -------------------------------------------------------------
+    # Re-attach the buffer's ORIGINAL line terminators to the result of a marking transform.
+    #
+    # The § / ¦ helpers (auto_mark, mark_word, clear_markers, set_chain) all take the LF
+    # projection, because every offset they are given — `@editor.cursor_offset`, the cached
+    # `marked_spans` — indexes THAT string; handing them wire text would shift every offset by
+    # one per CRLF line and mark the wrong span. But they only ever insert or delete `§`/`¦`
+    # WITHIN a line, never a newline, so the line count is invariant and the terminators can
+    # simply be put back. Without this, `set_text(transformed)` stores the LF projection and a
+    # captured body's CRLFs are gone before the run even starts — which is how ^K (the marking
+    # chord the status line names on every fuzz session open) defeated a byte-exact send path.
+    #
+    # Falls back to `lf_text` unchanged when the line count did move: better a template that
+    # lost its CRLFs than one whose terminators were reattached to the wrong lines.
+    private def restore_wire_eols(lf_text : String) : String
+      wl = @editor.wire_lines
+      parts = lf_text.split('\n')
+      return lf_text unless parts.size == wl.size
+      return lf_text if wl.all? { |(_, eol)| eol == "\n" || eol.empty? } # nothing to restore
+      String.build do |io|
+        parts.each_with_index do |p, i|
+          io << p
+          io << wl[i][1]
+        end
+      end
+    end
+
     def auto_mark : String
       before = @editor.text
       text = Fuzz::Template.auto_mark(before)
@@ -532,7 +571,7 @@ module Gori::Tui
         n = Fuzz::Template.parse(before).position_count
         return n.zero? ? "nothing to auto-mark — no query, cookie or body values found" : "already marked (#{n} position#{n == 1 ? "" : "s"}) — Clear markers first to re-derive"
       end
-      @editor.set_text(text)
+      @editor.set_text(restore_wire_eols(text))
       @dirty = true
       n = Fuzz::Template.parse(text).position_count
       "auto-marked #{n} position#{n == 1 ? "" : "s"}"
@@ -553,17 +592,32 @@ module Gori::Tui
       @http2
     end
 
+    # Reformat the template's BODY. Reads `wire_text` and splices the head back verbatim: a
+    # pretty-print is an explicit request to rewrite the body, but it is not a licence to
+    # re-encode the head's terminators — this is the one marking-adjacent transform whose line
+    # count moves, so restore_wire_eols cannot cover it.
     def pretty_print_template : String?
-      text = @editor.text
-      env_sep = text.index("\n\n")
-      return "no request body" unless env_sep
+      text = @editor.wire_text
+      crlf = text.index("\r\n\r\n")
+      lf = text.index("\n\n")
+      # First blank line wins, whichever form it is (an LF head whose BODY holds a CRLFCRLF
+      # must not be split at the body's) — same rule as Fuzz::ContentLength.boundary.
+      sep, sep_w = if crlf && (lf.nil? || crlf <= lf)
+                     {crlf, 4}
+                   elsif lf
+                     {lf, 2}
+                   else
+                     {nil, 0}
+                   end
+      return "no request body" unless sep
 
-      head = text[0, env_sep]
-      body = text[env_sep + 2..]
+      head = text[0, sep]
+      eol = sep_w == 4 ? "\r\n" : "\n"
+      body = text[sep + sep_w..]
       return "request body is empty" if body.strip.empty?
 
       if formatted_body = Pretty.format_request(head, body)
-        new_text = "#{head}\n\n#{formatted_body}"
+        new_text = "#{head}#{eol}#{eol}#{formatted_body}"
         @editor.set_text(new_text)
         @dirty = true
         nil # success
@@ -577,7 +631,7 @@ module Gori::Tui
       before = @editor.text
       after = Fuzz::Template.mark_word(before, @editor.cursor_offset)
       return "no word at the cursor — place it on a token (or ^A to auto-mark)" if after == before
-      @editor.set_text(after)
+      @editor.set_text(restore_wire_eols(after))
       @dirty = true
       Fuzz::Template.parse(after).position_count < Fuzz::Template.parse(before).position_count ? "unmarked position" : "marked position"
     end
@@ -603,7 +657,7 @@ module Gori::Tui
     def clear_marks : String
       # clear_markers renders the defaults inline — drops both the § delimiters AND any
       # ¦chain (a naive gsub("§","") would leave a stray value¦chain behind).
-      @editor.set_text(Fuzz::Template.clear_markers(@editor.text))
+      @editor.set_text(restore_wire_eols(Fuzz::Template.clear_markers(@editor.text)))
       @dirty = true
       "cleared all § markers"
     end
@@ -670,6 +724,7 @@ module Gori::Tui
     def begin_run(total : Int64?) : Nil
       @results.clear
       @run_template = @pending_template # freeze the template these results are rendered against
+      @run_policy = @pending_policy     # ...and the CL knobs + retention its generator ran under
       @results_rev += 1
       # A fresh run reuses result indices from 0, so drop the {pane, index}-keyed detail
       # cache — otherwise an old row's lines could survive under a colliding new index.
@@ -947,11 +1002,27 @@ module Gori::Tui
       if err = regex_error
         return {nil, err} # don't silently run match-everything on a bad pattern
       end
-      options = Fuzz::PlanOptions.new(@editor.text, target: @target, http2: @http2,
+      # `wire_text`, NOT `text` — the same distinction the Repeater's send path draws
+      # (`RepeaterView#expanded_editor_bytes`) and for the same reason. `text` is the LF
+      # projection: it flattens every CRLF the capture carried, and since `ContentLength.sync`
+      # then resyncs the header DOWN to the shortened body, a captured request goes out one
+      # byte shorter per line with nothing erroring and nothing warning. A 0x0D 0x0A inside a
+      # BODY is data — a CL/TE desync probe, a multipart delimiter, part content, a
+      # CRLF-injection test — never a line ending the fuzzer may re-encode, and a sweep whose
+      # baseline is not the captured request produces results that mean nothing.
+      # `Plan.build`'s `Env.expand_wire` still promotes the HEAD to CRLF, and it is idempotent
+      # on a head that already carries CRLF (`Env.normalize_crlf` only inserts a CR before an
+      # LF that has none), so a wire-form template changes nothing downstream.
+      options = Fuzz::PlanOptions.new(@editor.wire_text, target: @target, http2: @http2,
         sources: @sets.map { |s| build_source(s) }, config: @config, matcher: @matcher,
         verify: verify, sni: sni_override, overrides: overrides)
       plan = Fuzz::Plan.build(options, Gori::Outbound.interactive(scope))
-      @pending_template = plan.template # committed to @run_template in begin_run (see result_request_bytes)
+      @pending_template = plan.template # committed to @run_template in begin_run (see result_request)
+      # Freeze the CL knobs + retention policy the same way: the reconstruction in
+      # `result_request` has to reproduce what THIS run's generator did, and its note has to
+      # name the retention THIS run used — not what the CONFIG pane says after a post-run edit.
+      @pending_policy = {@config.update_content_length?, @config.add_content_length_when_missing?,
+                         @matcher.keep_bodies}
       {plan.engine, nil}
     rescue ex : Fuzz::PlanError
       {nil, fuzz_plan_error(ex)}
@@ -1271,7 +1342,9 @@ module Gori::Tui
     # the freed value's end. One undoable edit, so prior edits stay undoable. Dirties the tab.
     def strip_marker_span(span : {Int32, Int32}) : Nil
       new_text, caret = Fuzz::Template.strip_marker(@editor.text, span)
-      @editor.replace_all(new_text, caret)
+      # `caret` is an offset into the LF projection, which is what `replace_all` →
+      # `place_at_offset` walks (@lines is CR-free), so restoring the terminators is caret-safe.
+      @editor.replace_all(restore_wire_eols(new_text), caret)
       @dirty = true
     end
 
@@ -2153,27 +2226,74 @@ module Gori::Tui
       styled
     end
 
-    # The wire request for a result — what the detail pane shows and what "Send to
-    # Repeater" hands over (see FuzzerController#selected_repeater_seed), so the two can
-    # never disagree. Public because the controller needs it for a row the operator
-    # picked in the results table, not just for the open detail.
+    # The wire request for a result, WITH its provenance — what the detail pane shows and
+    # what "Send to Repeater" hands over (see FuzzerController#selected_repeater_seed), so
+    # the two can never disagree, and neither can pass a reconstruction off as evidence.
     #
-    # `Result#request` is the byte-exact request the engine sent (Job#bytes: payload
-    # chains applied, Content-Length synced), retained under the run's keep_bodies
-    # policy. When it wasn't retained (:none, or :matched and this row missed) fall back
-    # to re-rendering the run's frozen template — env-expanded as sent, so a post-run
-    # edit to the live buffer can't truncate/garble it — which reproduces everything but
-    # the per-position chain transform and the CL sync.
-    def result_request_bytes(r : Fuzz::Result) : Bytes
+    # `reconstructed: false` means `bytes` is the exact octets the engine put on the socket
+    # (`Result#request` = `Job#bytes`), retained under the run's keep_bodies policy.
+    # `reconstructed: true` means nothing kept them and they were re-derived here.
+    record ResultRequest, bytes : Bytes, reconstructed : Bool
+
+    # The one sentence every surface uses for a reconstruction — kept next to the record so
+    # the detail pane, the copy buffer and the Repeater seed cannot word it differently, and
+    # deliberately shaped like the response pane's "(response not retained — …)" note, which
+    # sits beside it and would otherwise imply by contrast that the request pane is real.
+    def self.reconstruction_note(keep_bodies : Symbol) : String
+      "(reconstructed from the template — this row's request was not retained; keep_bodies: #{keep_bodies})"
+    end
+
+    # `Result#request` is the byte-exact request the engine sent. When it wasn't retained
+    # (:none, or :matched and this row missed — the TUI default, so this is EVERY
+    # non-matching row) re-render the run's frozen template: env-expanded as sent, so a
+    # post-run edit to the live buffer can't truncate/garble it, and now through the SAME
+    # two steps the generator applied — the per-position `¦chain` transform and the
+    # Content-Length sync (`Fuzz::Generator#emit`). Without those the pane showed a 31-byte
+    # body under the template's `Content-Length: 12`, a combination no socket ever carried
+    # and the single most consequential header to get wrong on a fuzzing surface.
+    #
+    # It is still a reconstruction, not evidence: a payload the engine sent through a set
+    # processor, a run whose template the buffer no longer matches, or anything the frozen
+    # template does not capture can still differ. Hence the flag — closeness is the
+    # consolation, saying so is the fix.
+    def result_request(r : Fuzz::Result) : ResultRequest
       if sent = r.request
-        return sent
+        return ResultRequest.new(sent, false)
       end
-      tmpl = @run_template || Fuzz::Template.parse(Env.expand(@editor.text), @http2)
-      tmpl.render(r.payloads)
+      tmpl = @run_template || Fuzz::Template.parse(String.new(Env.expand_wire(@editor.wire_text)), @http2)
+      payloads = tmpl.apply_chains(r.payloads, Decoder.shared_registry)
+      raw = tmpl.render(payloads)
+      sync, add, _ = run_policy
+      raw = Fuzz::ContentLength.sync(raw, add) if sync
+      ResultRequest.new(raw, true)
+    end
+
+    # The frozen {update_cl, add_cl_when_missing, keep_bodies} of the run that produced
+    # @results, falling back to the live config for a view whose results predate the freeze.
+    private def run_policy : {Bool, Bool, Symbol}
+      @run_policy || {@config.update_content_length?, @config.add_content_length_when_missing?,
+                      @matcher.keep_bodies}
+    end
+
+    # The provenance note for `r`, or nil when its request is retained evidence. Public: the
+    # controller stamps it on the Repeater seed so "Send to Repeater" carries the same caveat
+    # the detail pane shows.
+    def result_request_note(r : Fuzz::Result) : String?
+      return nil unless r.request.nil?
+      FuzzerView.reconstruction_note(run_policy[2])
+    end
+
+    # Bytes only — for callers that have already accounted for provenance (the decode strip,
+    # which only needs a shape to parse). Never use this where the bytes are shown or resent.
+    def result_request_bytes(r : Fuzz::Result) : Bytes
+      result_request(r).bytes
     end
 
     private def detail_request_lines(r : Fuzz::Result) : Array(String)
-      String.new(result_request_bytes(r)).scrub.split('\n').map(&.rstrip('\r'))
+      req = result_request(r)
+      lines = String.new(req.bytes).scrub.split('\n').map(&.rstrip('\r'))
+      lines.unshift(FuzzerView.reconstruction_note(run_policy[2])) if req.reconstructed
+      lines
     end
 
     private def detail_response_lines(r : Fuzz::Result) : Array(String)

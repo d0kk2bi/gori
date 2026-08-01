@@ -377,6 +377,220 @@ private def start_h2_origin_window(init_window : Int32, grant : Bool, seen : Cha
   port
 end
 
+# An origin that ANSWERS WHILE THE REQUEST BODY IS STILL GOING OUT — the 413 every upload /
+# body-size probe exists to find, and explicitly permitted by RFC 9113 §8.1. It advertises
+# `init_window`, never replenishes it, and once `after` body bytes have arrived replies
+# `status` either as HEADERS+DATA/END_STREAM (`with_body: true` — the ORDINARY shape of an
+# error response) or as a bodiless HEADERS/END_STREAM. Both are needed: END_HEADERS is a
+# HEADERS/CONTINUATION flag, so a detector that tests for it can only ever fire on the
+# bodiless one. Reports the body bytes it received.
+private def start_h2_origin_early_response(init_window : Int32, after : Int32, status : Int32,
+                                           with_body : Bool, seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    settings = IO::Memory.new
+    settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian) # SETTINGS_INITIAL_WINDOW_SIZE
+    settings.write_bytes(init_window.to_u32, IO::ByteFormat::BigEndian)
+    send_server_preface(conn, settings.to_slice)
+
+    got = 0
+    begin
+      until got >= after
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.frame_type == Frame::Type::Data && f.stream_id == 1
+        got += f.payload.size
+        break if f.end_stream?
+      end
+      sb = HPACK::Encoder.new.encode([{":status", status.to_s}, {"content-length", with_body ? "17" : "0"}])
+      flags = Frame::END_HEADERS | (with_body ? 0_u8 : Frame::END_STREAM)
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, flags, 1_u32, sb).to_bytes)
+      if with_body
+        conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32,
+          "request too large".to_slice).to_bytes)
+      end
+      conn.flush
+      sleep 0.3.seconds # hold the socket open: a stall must be distinguishable from a hangup
+    rescue
+    end
+    seen.send(got)
+    conn.close
+  end
+  port
+end
+
+# An origin that answers a tight window with an INTERIM 1xx and then expects the rest of the
+# body — the complement of `start_h2_origin_early_response`, and the shape that decides
+# whether "a header block on stream 1" may be read as "stop writing". It advertises
+# `init_window`, sends `100 Continue` (HEADERS, END_HEADERS, NO END_STREAM) once the window is
+# spent, then replenishes until the whole body has arrived and answers 200. A client that
+# stops writing at the 1xx starves here. Reports the body bytes it received.
+private def start_h2_origin_interim(init_window : Int32, total : Int32, seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 5.seconds
+    Frame.read_preface(conn)
+    settings = IO::Memory.new
+    settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian)
+    settings.write_bytes(init_window.to_u32, IO::ByteFormat::BigEndian)
+    send_server_preface(conn, settings.to_slice)
+
+    got = 0
+    sent_interim = false
+    begin
+      until got >= total
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.frame_type == Frame::Type::Data && f.stream_id == 1
+        got += f.payload.size
+        break if f.end_stream?
+        unless sent_interim
+          sent_interim = true
+          ib = HPACK::Encoder.new.encode([{":status", "100"}])
+          conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, ib).to_bytes)
+        end
+        inc = Bytes.new(4)
+        IO::ByteFormat::BigEndian.encode(init_window.to_u32, inc)
+        {0_u32, 1_u32}.each do |sid|
+          conn.write(Frame::Header.new(Frame::Type::WindowUpdate.value, 0_u8, sid, inc).to_bytes)
+        end
+        conn.flush
+      end
+      sb = HPACK::Encoder.new.encode([{":status", "200"}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
+      conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "ok".to_slice).to_bytes)
+      conn.flush
+      sleep 0.2.seconds
+    rescue
+    end
+    seen.send(got)
+    conn.close
+  end
+  port
+end
+
+# An origin whose FIRST frame is NOT SETTINGS — a PING or a connection WINDOW_UPDATE — with
+# its real SETTINGS (`init_window`) arriving `delay` later. RFC 9113 §3.4 says SETTINGS comes
+# first, but a client that reads exactly ONE frame draws the wrong conclusion from any other
+# opener and writes against the 65535-byte default. Enforces the advertised window and
+# answers an overrun with GOAWAY(FLOW_CONTROL_ERROR), reporting body bytes or -1 on overrun.
+private def start_h2_origin_late_settings(init_window : Int32, first : Symbol, delay : Time::Span,
+                                          seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 10.seconds
+    Frame.read_preface(conn)
+    if first == :ping
+      conn.write(Frame::Header.new(Frame::Type::Ping.value, 0_u8, 0_u32, Bytes.new(8)).to_bytes)
+    else
+      inc = Bytes.new(4)
+      IO::ByteFormat::BigEndian.encode(1_u32, inc)
+      conn.write(Frame::Header.new(Frame::Type::WindowUpdate.value, 0_u8, 0_u32, inc).to_bytes)
+    end
+    conn.flush
+    spawn do
+      sleep delay
+      settings = IO::Memory.new
+      settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian)
+      settings.write_bytes(init_window.to_u32, IO::ByteFormat::BigEndian)
+      send_server_preface(conn, settings.to_slice) rescue nil
+    end
+
+    win = init_window
+    got = 0
+    overran = false
+    begin
+      loop do
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.frame_type == Frame::Type::Data && f.stream_id == 1
+        if f.payload.size > win
+          overran = true
+          break
+        end
+        win -= f.payload.size
+        got += f.payload.size
+        break if f.end_stream?
+      end
+    rescue
+    end
+    seen.send(overran ? -1 : got)
+    if overran
+      payload = IO::Memory.new
+      payload.write_bytes(1_u32, IO::ByteFormat::BigEndian) # last-stream-id
+      payload.write_bytes(3_u32, IO::ByteFormat::BigEndian) # FLOW_CONTROL_ERROR
+      conn.write(Frame::Header.new(Frame::Type::Goaway.value, 0_u8, 0_u32, payload.to_slice).to_bytes)
+      conn.flush rescue nil
+    else
+      sleep 2.seconds
+    end
+    conn.close
+  end
+  port
+end
+
+# An origin that advertises `init_window`, NEVER grants more, and keeps the socket busy —
+# either with keepalive PINGs or with the RFC 9113 §6.9.1-illegal `WINDOW_UPDATE +0`. Both
+# reset the per-read idle timer without ever reopening the send window, which is how the
+# "bounded wait" turned out to be bounded by frame COUNT (MAX_FRAMES: ~55 hours at a 2 s
+# ping cadence) rather than by any wall clock. Reports the body bytes it received.
+private def start_h2_origin_busy_stall(init_window : Int32, filler : Symbol,
+                                       interval : Time::Span, seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 30.seconds
+    Frame.read_preface(conn)
+    settings = IO::Memory.new
+    settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian)
+    settings.write_bytes(init_window.to_u32, IO::ByteFormat::BigEndian)
+    send_server_preface(conn, settings.to_slice)
+
+    stop = false
+    spawn do
+      until stop
+        sleep interval
+        break if stop
+        begin
+          if filler == :ping
+            conn.write(Frame::Header.new(Frame::Type::Ping.value, 0_u8, 0_u32, Bytes.new(8)).to_bytes)
+          else
+            conn.write(Frame::Header.new(Frame::Type::WindowUpdate.value, 0_u8, 1_u32, Bytes.new(4)).to_bytes)
+          end
+          conn.flush
+        rescue
+          break
+        end
+      end
+    end
+
+    got = 0
+    begin
+      loop do
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.frame_type == Frame::Type::Data && f.stream_id == 1
+        got += f.payload.size
+        break if f.end_stream?
+      end
+    rescue
+    end
+    stop = true
+    seen.send(got)
+    conn.close rescue nil
+  end
+  port
+end
+
 # A cleartext-h2 origin that answers with RST_STREAM(`code`) on stream 1 — optionally after
 # a complete response head and a partial body, which is how a server aborts a response it
 # already began (CANCEL / INTERNAL_ERROR) and the case where the cause used to vanish.
@@ -945,6 +1159,208 @@ describe Gori::Repeater::H2Engine do
       error.should contain("only 65535 of 200000 request body bytes")
       error.should contain("never granted flow-control window")
       error.should contain("NOT fully sent")
+    end
+
+    # R1-F1. An origin that answers WHILE the body is still going out — the 413 every upload /
+    # body-size probe is looking for — was never detected. The early-stop test was
+    # `end_stream? && end_headers?`, but END_HEADERS is a HEADERS/CONTINUATION flag (on a DATA
+    # frame that bit means PADDED), so it could only fire for a response with NO body. With a
+    # body gori waited out the whole io_timeout and then RAISED from `write_data`, and the
+    # raise unwound before `read_response` ran — destroying the complete 413 that had been
+    # sitting in `flow.pending` the entire time.
+    #
+    # Both shapes are asserted here on purpose: the bodiless one is what round 2's fixer
+    # tested, and it is the ONLY one the old condition could satisfy.
+    describe "an origin that answers before the request body finishes (RFC 9113 §8.1)" do
+      it "reports the response WITH a body, and says the request body was cut short" do
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_early_response(4096, after: 4096, status: 413,
+          with_body: true, seen: seen)
+        body = ("A" * 20_000).to_slice
+        started = Time.instant
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/big"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 3.seconds)
+
+        seen.receive.should eq(4096)
+        # The response ARRIVED — it must survive the writer's disposition.
+        result.response.try(&.status).should eq(413)
+        String.new(result.head).should contain("413")
+        String.new(result.body || Bytes.empty).should eq("request too large")
+        # …and the send must not be reported as clean.
+        error = result.error.should_not be_nil
+        error.should contain("truncated at 4096 of 20000 bytes")
+        error.should contain("NOT fully sent")
+        # It must not spend the io_timeout: the answer was already on the socket.
+        (Time.instant - started).should be < 3.seconds
+      end
+
+      it "reports the same truncation for a BODILESS response, which used to come back clean" do
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_early_response(4096, after: 4096, status: 413,
+          with_body: false, seen: seen)
+        body = ("B" * 20_000).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/big"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 3.seconds)
+
+        seen.receive.should eq(4096)
+        result.response.try(&.status).should eq(413)
+        error = result.error.should_not be_nil # was `ok:true, error:null`
+        error.should contain("truncated at 4096 of 20000 bytes")
+      end
+
+      it "leaves a body that DID go out whole reporting clean" do
+        # The complement of the two above: same origin, a body that fits the window. Nothing
+        # was truncated, so nothing may be said about truncation.
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_early_response(65_535, after: 500, status: 200,
+          with_body: true, seen: seen)
+        body = ("C" * 500).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/small"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 3.seconds)
+
+        seen.receive.should eq(500)
+        result.response.try(&.status).should eq(200)
+        result.error.should be_nil
+      end
+
+      it "keeps writing the body through an interim 1xx on the same stream" do
+        # The complement that constrains the fix's SHAPE. "A header block arrived on stream 1"
+        # is NOT the end-of-write condition, because a 100 Continue is one — and an
+        # `Expect: 100-continue` origin sends it precisely to ask for the body. END_STREAM is,
+        # and it excludes the interim for free: a 1xx cannot end the stream.
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_interim(4096, 20_000, seen)
+        body = ("I" * 20_000).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/expect"}, {":scheme", "http"}, {":authority", "h"},
+           {"expect", "100-continue"}, {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 3.seconds)
+
+        seen.receive.should eq(20_000)               # the whole body, not 4096
+        result.response.try(&.status).should eq(200) # the FINAL status, not the 100
+        result.error.should be_nil                   # nothing was truncated
+      end
+    end
+
+    # R1-F2. `await_settings` read exactly ONE frame. `pump_once` ACKs a PING, credits a
+    # WINDOW_UPDATE and falls straight through a SETTINGS **ACK** without setting
+    # `settings_seen`, so an origin whose opening frame is any of those got the whole body
+    # written against the RFC default 65535-byte window — and the GOAWAY(FLOW_CONTROL_ERROR)
+    # it drew was reported as the ORIGIN misbehaving, the exact misattribution the send-side
+    # flow control was added to remove.
+    describe "an origin whose first frame is not SETTINGS" do
+      {:ping, :window_update}.each do |first|
+        it "waits for the real SETTINGS when the opener is a #{first}" do
+          seen = Channel(Int32).new(1)
+          port = start_h2_origin_late_settings(4096, first, 300.milliseconds, seen)
+          body = ("D" * 20_000).to_slice
+          result = Gori::Repeater::H2Engine.send_fields(
+            [{":method", "POST"}, {":path", "/late"}, {":scheme", "http"}, {":authority", "h"},
+             {"content-length", body.size.to_s}], body,
+            scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+            timeout: 2.seconds)
+
+          seen.receive.should eq(4096) # -1 = gori overran the window it was told about
+          # No window was ever granted, so this stalls — but on gori's OWN accounting, with
+          # no GOAWAY drawn and the origin never blamed.
+          error = result.error.should_not be_nil
+          error.should contain("h2 flow control")
+          error.should contain("only 4096 of 20000 request body bytes")
+          error.should_not contain("GOAWAY")
+        end
+      end
+
+      it "names gori's own overrun when it did proceed on the RFC defaults" do
+        # The complement: an origin that sends a non-SETTINGS opener and then NO SETTINGS at
+        # all within the budget. gori legitimately falls back to the §6.9.2 default — and the
+        # GOAWAY that follows must be attributed to gori, not handed over as the origin's fault.
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_late_settings(4096, :ping, 30.seconds, seen)
+        body = ("E" * 20_000).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/never"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 2.seconds)
+
+        seen.receive.should eq(-1) # gori overran, as the RFC default entitles it to
+        error = result.error.should_not be_nil
+        error.should contain("FLOW_CONTROL_ERROR")
+        error.should contain("gori's own accounting")
+        error.should contain("the origin's SETTINGS had not arrived")
+      end
+    end
+
+    # R1-F3. The stall's only exits were `flow.available > 0`, `flow.closed?` and a
+    # `pump_once` that returned false — which happens on an IDLE read, an EOF, or
+    # MAX_FRAMES. Any frame at all resets the idle timer, so a keepalive PING under the
+    # timeout left MAX_FRAMES (a COUNT) as the only ceiling: ~55 hours at 2 s, ~17 days at a
+    # 15 s gRPC keepalive. `WsEngine::DRAIN_DEADLINE` is the wall clock this loop was missing.
+    describe "a stall kept alive by frames that grant no window" do
+      it "gives up on the wall clock when the origin sends keepalive PINGs" do
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_busy_stall(1024, :ping, 150.milliseconds, seen)
+        body = ("F" * 20_000).to_slice
+        started = Time.instant
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/ping"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 1.second)
+        elapsed = Time.instant - started
+
+        seen.receive.should eq(1024)
+        elapsed.should be < 10.seconds # unbounded before: the PINGs reset the idle timer
+        error = result.error.should_not be_nil
+        error.should contain("only 1024 of 20000 request body bytes")
+        error.should contain("never granted flow-control window")
+      end
+
+      it "names the §6.9.1 violation when the filler is WINDOW_UPDATE +0" do
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_busy_stall(1024, :window_update, 50.milliseconds, seen)
+        body = ("G" * 20_000).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/wuzero"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 1.second)
+
+        seen.receive.should eq(1024)
+        error = result.error.should_not be_nil
+        error.should contain("WINDOW_UPDATE with a 0 increment")
+        error.should contain("§6.9.1")
+      end
+
+      it "still fails in ONE idle timeout when the origin sends nothing at all" do
+        # The complement of both: total silence. The deadline must not double the wall clock
+        # for the commonest failure — an origin that simply never grants window.
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_window(65_535, grant: false, seen: seen)
+        body = ("H" * 200_000).to_slice
+        started = Time.instant
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/silent"}, {":scheme", "http"}, {":authority", "h"}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 700.milliseconds)
+        elapsed = Time.instant - started
+
+        seen.receive.should eq(65_535)
+        result.error.should_not be_nil
+        # One patience budget, not two: the write stall must not be followed by a full
+        # response-read timeout on a socket that produced no frames.
+        elapsed.should be < 1600.milliseconds
+      end
     end
   end
 

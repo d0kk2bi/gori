@@ -78,12 +78,101 @@ module Gori
       # `.to_slice`, which is lossy on non-UTF-8 — a pre-existing sharp edge on an HTTP body
       # that WS makes the DEFAULT case, since opcode 2 is protobuf/msgpack/CBOR.
       getter? binary : Bool
+      # Why an EDIT to this message cannot be applied, or nil when it can.
+      #
+      # Known at hold time and not a moment later: on HTTP/2 the answer is
+      # `HeadCodec.h1_unfaithful_reason`, a pure function of the block's decoded fields, and
+      # the refusal it describes used to run on the gate's wait fiber — AFTER the surface had
+      # already acked the edit as applied. A CR/LF reflected into one header value (the shape
+      # a CRLF-injection probe INDUCES) made gori accept every subsequent edit to that message
+      # and apply none. Reading it here lets the surface refuse before the operator writes one.
+      # nil on h1, where the decision bytes are forwarded byte-exact.
+      getter edit_refusal : String?
+      # This hold covers the HEAD only, so a body typed into an edit has nowhere to go: the h2
+      # relay streams DATA past the gate untouched (#492 step 3, D2). h1 holds head+body and
+      # leaves this false.
+      getter? head_only : Bool
 
       def initialize(@id, @kind, @method, @host, @target, @port, @scheme, @raw, @held_at,
-                     @flow_id = nil, @binary = false)
+                     @flow_id = nil, @binary = false, @edit_refusal = nil, @head_only = false)
         @reply = Channel(Decision).new(1)
         @held_at_ms = Time.utc.to_unix_ms
       end
+
+      # Why gori will not apply THESE edited bytes to this message, or nil when it will.
+      #
+      # Asked by every surface that offers an edit, BEFORE it decides — because the settle side
+      # can only discard, and discarding after an ack is how "edited: GET 127.0.0.1/unf3" came
+      # to mean "the original request went on the wire byte for byte". Both facts are already
+      # known: `edit_refusal` was computed when the message was held, and the head/body split
+      # is `Interceptor.split_edit`, the same one the h2 gate encodes against.
+      #
+      # A refusal leaves the message HELD. Nothing was decided, so the operator can still
+      # forward it, drop it, or write a different edit.
+      def refuse_edit(bytes : Bytes) : String?
+        if reason = @edit_refusal
+          return reason
+        end
+        return nil unless head_only? && Interceptor.split_edit(bytes)[1]
+        "this HTTP/2 hold covers the HEAD only, so the body in this edit has nowhere to go — " \
+        "DATA frames stream past the intercept gate untouched (#492 step 3) and gori will not " \
+        "report having sent bytes it dropped. Edit the head, or replay the whole message from " \
+        "the Repeater"
+      end
+
+      # How this queue row is NAMED to a human or an agent — the ack for an irreversible
+      # forward/drop/edit, and the only record either gets of which message it just acted on.
+      #
+      # `target` is deliberately overloaded per kind (an h1 request's is the ABSOLUTE-form
+      # proxy request line, a response's is its status line, a WS message's is the handshake's),
+      # so the one expression `"#{method} #{host}#{target}"` produced
+      # `POST 127.0.0.1http://127.0.0.1:19201/held` for a proxied h1 request and
+      # `POST 127.0.0.1200 OK` for a held response — which reads as HTTP status 1200. Composing
+      # per kind is what `Tui::InterceptView#row_label`, `CLI::Output` and `Links` already do
+      # separately; this is the copy the settle paths use so they cannot drift again.
+      def label : String
+        case kind
+        in .request?  then "#{method} #{host}#{origin_form(target)}"
+        in .response? then "#{method} #{host} -> #{target}"
+        in .ws_out?   then "#{host}#{origin_form(target)} client->server #{raw.size}B"
+        in .ws_in?    then "#{host}#{origin_form(target)} server->client #{raw.size}B"
+        end
+      end
+
+      # A plaintext forward-proxy request is captured absolute-form (the wire truth, P7), and
+      # gluing the host onto one doubles the authority. Same rule as `Tui::Url.origin_path`,
+      # kept here because `Interceptor` is core and that helper is TUI-scoped.
+      private def origin_form(t : String) : String
+        return t unless t.starts_with?("http://") || t.starts_with?("https://")
+        scheme_end = t.index("://")
+        return t unless scheme_end
+        slash = t.index('/', scheme_end + 3)
+        slash ? t[slash..] : "/"
+      end
+    end
+
+    # Where the HEAD of a held message ends, and whether anything followed it.
+    #
+    # The EARLIEST blank line, in either spelling — `Rules#split_message`'s rule and for the
+    # same reason. `||` preferred the CRLF form wherever it appeared, so an operator whose
+    # edited head is LF-joined (the intercept editor's `TextArea#text` is) and whose BODY
+    # carries a CRLFCRLF got the boundary taken inside the body.
+    #
+    # Lives here rather than in `H2::StreamGate` because two callers need the same answer: the
+    # gate splits the bytes it is about to encode, and the settle surface has to know whether an
+    # edit added a body to a head-only hold BEFORE it acks the edit as applied.
+    def self.split_edit(bytes : Bytes) : {Bytes, Bool}
+      text = String.new(bytes)
+      crlf = text.index("\r\n\r\n")
+      lf = text.index("\n\n")
+      idx =
+        if crlf && (lf.nil? || crlf < lf)
+          crlf + 4
+        elsif lf
+          lf + 2
+        end
+      return {bytes, false} unless idx
+      {bytes[0, idx], idx < bytes.size}
     end
 
     @direction : Direction
@@ -328,14 +417,20 @@ module Gori
     # human cannot be the one reading frames (#492 step 3, D1) — it enqueues here and blocks
     # on `Item#reply` elsewhere. `hold_request`/`hold_response` are this plus the receive, so
     # the two paths cannot drift.
+    # `edit_refusal` / `head_only` are the h2 gate's — see `Item`. h1 leaves both at their
+    # defaults, which is what "an h1 decision is forwarded byte-exact" means.
     def enqueue_request(raw : Bytes, *, method : String, target : String,
-                        host : String, port : Int32, scheme : String) : Item?
-      enqueue(Kind::Request, raw, method, target, host, port, scheme, nil)
+                        host : String, port : Int32, scheme : String,
+                        edit_refusal : String? = nil, head_only : Bool = false) : Item?
+      enqueue(Kind::Request, raw, method, target, host, port, scheme, nil,
+        edit_refusal: edit_refusal, head_only: head_only)
     end
 
     def enqueue_response(raw : Bytes, *, flow_id : Int64?, method : String, target : String,
-                         host : String, port : Int32, scheme : String) : Item?
-      enqueue(Kind::Response, raw, method, target, host, port, scheme, flow_id)
+                         host : String, port : Int32, scheme : String,
+                         edit_refusal : String? = nil, head_only : Bool = false) : Item?
+      enqueue(Kind::Response, raw, method, target, host, port, scheme, flow_id,
+        edit_refusal: edit_refusal, head_only: head_only)
     end
 
     # Queue one reassembled WebSocket message (#500 step 2). `raw` is the payload as it would
@@ -354,12 +449,14 @@ module Gori
     end
 
     private def enqueue(kind, raw, method, target, host, port, scheme, flow_id,
-                        binary = false) : Item?
+                        binary = false, edit_refusal : String? = nil,
+                        head_only : Bool = false) : Item?
       return nil unless intercepts_host?(host)
       item = @mutex.synchronize do
         return nil if @shutting_down || !@enabled
         id = (@next_id += 1)
-        it = Item.new(id, kind, method, host, target, port, scheme, raw, Time.instant, flow_id, binary)
+        it = Item.new(id, kind, method, host, target, port, scheme, raw, Time.instant, flow_id,
+          binary, edit_refusal, head_only)
         @items[id] = it
         it
       end

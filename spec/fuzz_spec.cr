@@ -517,6 +517,32 @@ describe F::Engine do
     backend.sent.should eq(4)
     done.as(F::DoneEvent).progress.matched.should eq(4)
     done.as(F::DoneEvent).stopped.should be_false
+    # With no retries and no redirects the two counters agree, which is why nobody noticed
+    # them diverging (see the next example).
+    done.as(F::DoneEvent).progress.sent.should eq(4_i64)
+    done.as(F::DoneEvent).progress.requests.should eq(4_i64)
+  end
+
+  # `progress.sent` counts PAYLOADS — the numerator against `total`, so it must not run past
+  # it — and a retry or a redirect hop costs none of it. A 3-payload sweep with
+  # `--follow-redirects` against a redirect chain therefore reported "3 sent" for 18 real
+  # requests, and `--retries 2` reported 2 for 6: understatements of 6x and 3x of the load
+  # gori put on the target, on the one number a tester working inside an agreed request budget
+  # is actually watching. `CappedBackend#sent` was already the true count — it is what
+  # `max_requests` is enforced against — and miner/discover already publish it.
+  it "publishes the TRUE wire count as `requests`, separately from the payload count" do
+    set = F::PayloadSet.new(F::InlineList.new(["a", "b"]))
+    cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1, retries: 2,
+      retry_pause: Time::Span.zero)
+    gen = F::Generator.new(base, [set], cfg)
+    backend = FakeBackend.new(F::Origin.new("http", "h", 80)) do |_b|
+      Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, "no response from h:80")
+    end
+    _, done = drain(F::Engine.new(gen, F::Matcher.new, backend, cfg))
+    d = done.as(F::DoneEvent)
+    d.progress.sent.should eq(2_i64)     # payloads
+    d.progress.requests.should eq(6_i64) # 1 attempt + 2 retries each
+    backend.sent.should eq(6)            # …and that is what the origin really received
   end
 
   it "auto-calibration end-to-end: calibrate_baseline's synthetic sends capture EVERY shape " \

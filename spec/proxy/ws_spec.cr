@@ -652,6 +652,123 @@ describe Gori::Proxy::WS do
     # fragmentation is gone and there is no position left to hold the control frame at — so it
     # goes out AHEAD, which is what keeps the peer's ping timer answered. Both dispositions in
     # one place, because the boundary between them is the whole design.
+    # The parking ceiling (`MAX_PARKED_CONTROLS`) is a REORDER gori performs on the wire, and
+    # until now it told only `gori.log` — "which reaches only an operator who knew to tail it",
+    # the exact argument #518 used to move the `Sec-WebSocket-Extensions` advisory onto the
+    # flow's own `ws_messages` stream. Control rows are recorded at ARRIVAL and message rows at
+    # EMIT, so with the interleave preserved and with it given up the capture reads identically
+    # — History, `gori run show`, MCP `get_flow` and an export could not tell the two apart.
+    # Both sides of the ceiling are asserted here, because that is the only thing that makes
+    # the marker mean anything.
+    it "records the parking-ceiling reorder as a [gori] row, above the ceiling only" do
+      lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "AAA".to_slice, fin: false)
+      tail = masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice)
+      pings = (0...9).map do |i|
+        masked_op_frame(Gori::Proxy::WS::OP_PING, Bytes[0x70_u8, (0x30 + i).to_u8])
+      end
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(lead)
+      pings.each { |p| cs_w.write(p) }
+      cs_w.write(tail)
+      cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      # A rule that matches nothing: the message itself is still forwarded as the peer's own
+      # frames, so the ONLY thing gori changed about this socket is where the PINGs sit.
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      ts_w.close
+      # The documented hoist: the ninth PING trips the ceiling, everything parked goes out
+      # ahead of the fragments, and the message follows byte-exact.
+      ts_r.gets_to_end.to_slice.should eq(pings.reduce(Bytes.empty) { |a, p| a + p } + lead + tail)
+
+      notices = sink.messages.select { |(_, _, text)| text.starts_with?("[gori] ") }
+      notices.size.should eq(1) # once per direction per socket, like the warn
+      notices.first[0].should eq("out")
+      notices.first[2].should contain("more than 8 control frames arrived between the fragments")
+      # Its POSITION is what names the message: right where gori gave up, after the eight it
+      # had parked and before the one that broke the ceiling.
+      sink.messages.index(notices.first).should eq(8)
+      sink.messages.last.should eq({"out", 1, "AAABBB"})
+      _ = tc_r
+    end
+
+    # The complement, one frame BELOW the ceiling: eight parked controls still ride out inside
+    # the message at the offsets they arrived at, and nothing claims a reorder that did not
+    # happen. A marker that fires on both sides of a boundary carries no information.
+    it "keeps the interleave and writes no [gori] row one frame below the parking ceiling" do
+      lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "AAA".to_slice, fin: false)
+      tail = masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice)
+      pings = (0...8).map do |i|
+        masked_op_frame(Gori::Proxy::WS::OP_PING, Bytes[0x70_u8, (0x30 + i).to_u8])
+      end
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(lead)
+      pings.each { |p| cs_w.write(p) }
+      cs_w.write(tail)
+      cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      ts_w.close
+      ts_r.gets_to_end.to_slice
+        .should eq(lead + pings.reduce(Bytes.empty) { |a, p| a + p } + tail)
+      sink.messages.count { |(_, _, text)| text.starts_with?("[gori] ") }.should eq(0)
+      sink.messages.last.should eq({"out", 1, "AAABBB"})
+      _ = tc_r
+    end
+
+    # The same "a parked control frame must never be silently dropped" rule, at the other
+    # place it was broken: a LEADING FRAGMENT MAY BE EMPTY. `TEXT fin=0 ""` puts bytes in the
+    # raw accumulator and none in the payload buffer, so a PING parked inside that message sat
+    # in a message `start_message`'s `@buffer.size > 0` test called "not there" — and the
+    # `reset_raw` right after it discarded the PING with no wire write and no way to tell.
+    # `MessageShape#frames`' own comment names this hazard ("the payload buffer cannot answer
+    # it, because a leading fragment may be empty").
+    it "does not swallow a control frame parked inside a message whose leading fragment is empty" do
+      lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, Bytes.empty, fin: false)
+      ping = masked_op_frame(Gori::Proxy::WS::OP_PING, "pi".to_slice)
+      # A new data message while the previous one never FIN'd (RFC 6455 §5.4) — the exit that
+      # dropped it.
+      second = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "second".to_slice)
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(lead); cs_w.write(ping); cs_w.write(second); cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      ts_w.close
+      # The PING reaches the origin ahead of the message that displaced the one it was parked
+      # inside — was: never written at all.
+      ts_r.gets_to_end.to_slice.should eq(ping + second)
+      _ = tc_r
+    end
+
     it "hoists an interleaved PING only when the message is actually re-framed" do
       cs_r, cs_w = IO.pipe
       ts_r, ts_w = IO.pipe

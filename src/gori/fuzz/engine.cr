@@ -251,7 +251,10 @@ module Gori::Fuzz
 
     getter events : Channel(Event)
 
-    @backend : Backend
+    # The CAP WRAPPER, not the raw Backend the caller passed: the engine always wraps (a nil
+    # cap is a pass-through), and typing it as the wrapper is what lets `snapshot` publish
+    # `CappedBackend#sent` — the true wire count — without a runtime `is_a?` at every read.
+    @backend : CappedBackend
     @concurrency : Int32
     @state : State
     @wake : Channel(Nil)
@@ -372,7 +375,7 @@ module Gori::Fuzz
         # Soft job-count check (cheap) plus the hard real-send ceiling: retries/redirects
         # can exhaust CappedBackend mid-run while @dispatched is still under cap.
         raise Halt.new if (cap = @config.max_requests) && cap > 0 && @dispatched >= cap
-        raise Halt.new if (b = @backend).is_a?(CappedBackend) && b.cap_reached?
+        raise Halt.new if @backend.cap_reached?
         pace(interval)
         @jobs.send(job)
         @dispatched += 1
@@ -543,7 +546,8 @@ module Gori::Fuzz
     end
 
     private def snapshot : Progress
-      Progress.new(@sent, total, @matched, @errors, @backend.blocked, @backend.blocked_reason)
+      Progress.new(@sent, total, @matched, @errors, @backend.blocked, @backend.blocked_reason,
+        @backend.sent)
     end
   end
 end

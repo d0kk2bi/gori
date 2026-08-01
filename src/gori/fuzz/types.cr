@@ -83,6 +83,8 @@ module Gori
     # Live counters. `total` is nil when the run size is unknown (cluster bomb / brute
     # force overflowing Int64).
     record Progress,
+      # PAYLOADS completed — one per generated variation, and therefore the numerator that
+      # belongs against `total`. NOT the number of requests: see `requests`.
       sent : Int64,
       total : Int64?,
       matched : Int64,
@@ -92,7 +94,17 @@ module Gori
       # on the Backend because the surfaces that must not render a fully-refused run as
       # "0 matches" only ever see events. See `Fuzz::Backend#blocked`.
       blocked : Int64 = 0_i64,
-      blocked_reason : String? = nil
+      blocked_reason : String? = nil,
+      # REQUESTS actually put on the wire — `CappedBackend#sent`, the counter `max_requests`
+      # is enforced against. Retries and redirect hops each cost one here and NONE in `sent`,
+      # so the two diverge by up to `(retries + 1) * (max_redirects + 1)`: a 3-payload sweep
+      # with `--follow-redirects` against a redirect chain reported "3 sent" for 18 real
+      # requests. For a tester working inside an agreed request budget on a client's
+      # production system — or against anything that rate-limits or alerts on volume — this
+      # is the number that matters, and mine/discover have always published it as their own
+      # `sent`. Kept as a SECOND field rather than replacing `sent`, because `sent/total` is
+      # the progress meter's fraction and would otherwise run past 100%.
+      requests : Int64 = 0_i64
 
     # Engine → consumer events. A union (not a class hierarchy) so `Channel(Event)`
     # carries them without boxing surprises. Progress is droppable (latest wins);

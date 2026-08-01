@@ -65,7 +65,7 @@ module Gori
         # Explicit, as in cmd_fuzz: it used to fall out of cli_host_overrides opening a
         # store, and that helper ends in `rescue; nil`.
         hydrate_project_env(project_name, db_path) if (project_name || db_path) && flow_id.nil?
-        text, default_target, src_h2 = mine_source(flow_id, request_file, project_name, db_path)
+        text, default_target, src_h2, evidence = mine_source(flow_id, request_file, project_name, db_path)
 
         config = Miner::Config.new
         config.concurrency = concurrency
@@ -81,6 +81,9 @@ module Gori
           abort "gori run mine: --locations was empty — name at least one of query|form|multipart|json|headers|cookies (or omit it to auto-detect)"
         end
         options = Miner::PlanOptions.new(text,
+          # A `--flow` request is CAPTURED; --request/stdin is a draft the operator authored.
+          # See `Miner::PlanOptions#evidence?`.
+          evidence: evidence,
           default_target: default_target, target: target_override,
           http2: force_h2 || src_h2, bucket: bucket,
           # No --locations at all ⇒ nil, so the builder auto-detects what applies to this
@@ -144,12 +147,14 @@ module Gori
       end
 
       # {raw request text (byte-exact, BEFORE Env expansion — Miner::Plan owns that),
-      # default target, http2} from the chosen source.
+      # default target, http2, is-evidence} from the chosen source. The last element is
+      # PROVENANCE, not a knob: only the `--flow` branch hands back captured bytes, and only
+      # that branch may therefore skip the draft-time passes (see `Miner::PlanOptions#evidence?`).
       private def self.mine_source(flow_id : Int64?, request_file : String?,
-                                   project_name : String?, db_path : String?) : {String, String?, Bool}
+                                   project_name : String?, db_path : String?) : {String, String?, Bool, Bool}
         if file = request_file
           abort "gori run mine: not a readable file: #{file}" unless File.exists?(file) && !File.directory?(file)
-          {File.read(file), nil, false}
+          {File.read(file), nil, false, false}
         elsif id = flow_id
           store = open_store(resolve_read_project(project_name, db_path))
           detail = begin
@@ -159,9 +164,13 @@ module Gori
           end
           abort "gori run mine: no flow ##{id}" unless detail
           built = Repeater::FlowRequest.build(detail)
-          {String.new(built.bytes), built.target, built.http2}
+          # Every probe of the run carries a request line gori changed — see
+          # `warn_request_line_rewrite`.
+          warn_request_line_rewrite(built, "gori run mine",
+            "replay it with `gori run repeater #{id} --keep-request-line` to keep it")
+          {String.new(built.bytes), built.target, built.http2, true}
         elsif !STDIN.tty?
-          {STDIN.gets_to_end, nil, false}
+          {STDIN.gets_to_end, nil, false, false}
         else
           abort "gori run mine: no source — give a <flow-id>, --request FILE, or pipe a request on stdin"
         end
@@ -178,6 +187,14 @@ module Gori
                                        port : Int32, config : Miner::Config, format : Symbol) : Nil
         total = engine.total_names
         STDERR.puts "mining #{scheme}://#{host}:#{port} · #{config.locations.map(&.label).join("/")} · #{total} names"
+        # Names the wordlist supplied that this location cannot carry. Dropping them is
+        # correct; dropping them silently made the headline count differ between two runs of
+        # the same wordlist with no explanation anywhere. See `Miner::Engine#skipped_names`.
+        engine.skipped_names.each do |(loc, n)|
+          STDERR.puts "gori run mine: #{n} of #{engine.candidate_names} names are not valid at " \
+                      "#{loc.label} and were skipped (a name there must be an RFC 7230 token, " \
+                      "and framing headers are never injected)"
+        end
         findings = [] of Miner::Finding
         had_error = false
         engine.run do |ev|
@@ -185,7 +202,7 @@ module Gori
           when Miner::BaselineEvent then mine_baseline(ev)
           when Miner::FindingEvent  then findings << ev.finding; emit_mine_finding(ev.finding, format)
           when Miner::ProgressEvent then mine_progress(ev, total)
-          when Miner::DoneEvent     then mine_done(ev, findings.size)
+          when Miner::DoneEvent     then mine_done(ev, findings.size, config)
           when Miner::ErrorEvent    then had_error = true; STDERR.puts "mine error: #{ev.message}"
           end
         end
@@ -235,9 +252,24 @@ module Gori
         STDERR.flush
       end
 
-      private def self.mine_done(ev : Miner::DoneEvent, found : Int32) : Nil
+      private def self.mine_done(ev : Miner::DoneEvent, found : Int32, config : Miner::Config) : Nil
         STDERR.print "\r" if STDERR.tty? # clear the in-place meter (none was drawn when piped)
-        STDERR.puts "done · #{found} found · #{ev.progress.sent} sent · #{ev.progress.errors} errors#{ev.stopped ? " (stopped)" : ""}"
+        p = ev.progress
+        STDERR.puts "done · #{p.names_done}/#{p.names_total} names · #{found} found · " \
+                    "#{p.sent} sent · #{p.errors} errors#{ev.stopped ? " (stopped)" : ""}"
+        # A run that stopped on its budget must never read like one that finished. The engine
+        # has always known — `Progress` carries both counters and MCP `mine_status` prints
+        # `budget_exhausted` off them — but the terminal line showed neither, so
+        # `--max-requests 4` over 434 names ended in "done · 0 found" and exit 0, which reads
+        # as "there are no hidden parameters here". The \r meter that DID show them is
+        # `STDERR.tty?`-gated, so in CI or a pipe there was no counter anywhere.
+        return if ev.stopped || p.names_done >= p.names_total
+        left = p.names_total - p.names_done
+        # Name the CAP only when there is one: the same shortfall with no --max-requests set
+        # means the run ended some other way (a dead target), and pointing at a flag the
+        # operator never passed would send them after the wrong thing.
+        why = config.max_requests ? "budget exhausted — raise or drop --max-requests" : "incomplete"
+        STDERR.puts "#{why} · #{left} of #{p.names_total} names never tested"
       end
     end
   end

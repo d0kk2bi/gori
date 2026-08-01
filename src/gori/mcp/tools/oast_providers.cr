@@ -13,6 +13,7 @@ module Gori
       # inline every time — including the token, on every call.
       private def list_oast_providers(h) : Result
         configs = Oast.provider_configs(store)
+        include_sensitive = bool_arg(h, "include_sensitive", false)
         Result.new(JSON.build do |j|
           j.object do
             j.field("providers") do
@@ -26,8 +27,8 @@ module Gori
                     j.field "scope", c.scope
                     j.field "enabled", c.enabled
                     # A provider token is an auth credential — same treatment as list_env.
-                    j.field "token", c.token.nil? ? nil : "[REDACTED]" unless bool(h, "include_sensitive")
-                    j.field "token", c.token if bool(h, "include_sensitive")
+                    j.field "token", c.token.nil? ? nil : "[REDACTED]" unless include_sensitive
+                    j.field "token", c.token if include_sensitive
                   end
                 end
               end
@@ -72,8 +73,7 @@ module Gori
                 else
                   existing.token
                 end
-        enabled = bool(h, "enabled")
-        enabled = existing.enabled? if enabled.nil?
+        enabled = bool_arg(h, "enabled", existing.enabled?)
 
         return busy("provider NOT updated (store busy or unwritable); it is unchanged") unless store.update_oast_provider(row, name, kind.label, host, token, enabled)
         Result.new({"id" => "p_#{row}", "name" => name, "kind" => kind.label}.to_json)
@@ -82,7 +82,7 @@ module Gori
       private def set_oast_provider_enabled(h) : Result
         row = oast_provider_row(h)
         return row if row.is_a?(Result)
-        enabled = bool(h, "enabled")
+        enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled'", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
         return busy("enable/disable NOT applied (store busy or unwritable); the provider is unchanged") unless store.set_oast_provider_enabled(row, enabled)
         Result.new({"id" => "p_#{row}", "enabled" => enabled}.to_json)
@@ -123,8 +123,7 @@ module Gori
         host = str(h, "host").try(&.strip).presence ||
                Oast::Presets.all.find { |p| p.kind == kind }.try(&.host)
         return err("'host' is required for #{kind.label} (it has no default preset)", "INVALID_ARGUMENT", field: "host") unless host
-        enabled = bool(h, "enabled")
-        {name, kind.label, host, str(h, "token").try(&.strip).presence, enabled.nil? ? true : enabled}
+        {name, kind.label, host, str(h, "token").try(&.strip).presence, bool_arg(h, "enabled", true)}
       end
     end
   end

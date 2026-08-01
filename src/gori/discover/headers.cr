@@ -32,18 +32,44 @@ module Gori::Discover
     # Parse raw "Name: Value" lines (CLI `-H`, the TUI editor) into pairs, dropping
     # anything malformed or unsafe: a value may not contain CR/LF (header injection),
     # and a name must be a non-empty RFC 7230 token.
-    def self.parse_lines(lines : Array(String)) : Array({String, String})
+    #
+    # Pass `rejected` to learn WHICH lines were dropped. Refusing a CR/LF-carrying value is
+    # right — this is an automated crawler, not the repeater, and the value is spliced
+    # straight into every probe's header block — but refusing it SILENTLY is not: the drop
+    # took `Authorization` with it, so an authenticated sweep ran unauthenticated and reported
+    # "found nothing" over the whole authenticated surface, with a clean exit and nothing on
+    # stderr. An out-collector rather than a changed return type, so the three surfaces that
+    # call this can adopt the report one at a time.
+    def self.parse_lines(lines : Array(String),
+                         rejected : Array(String)? = nil) : Array({String, String})
       out = [] of {String, String}
       lines.each do |line|
+        # A BLANK line is not a header anyone asked for — the TUI overlay parses an editor
+        # buffer, which is full of them — so it is neither parsed nor reported. Everything
+        # else the operator typed is one or the other, never silently neither.
+        next if line.blank?
         name, sep, value = line.partition(':')
-        next if sep.empty?
         name = name.strip
         value = value.strip
-        next if name.empty? || !valid_name?(name)
-        next unless safe_value?(value)
+        if sep.empty? || name.empty? || !valid_name?(name) || !safe_value?(value)
+          rejected.try(&.<<(line))
+          next
+        end
         out << {name, value}
       end
       out
+    end
+
+    # The NAMES of already-parsed headers whose value stops being safe once `$VAR` is
+    # resolved — the realistic half of the same failure: the header the operator typed is
+    # fine, and `TOKEN` holds a value read from a file with a trailing newline in it.
+    #
+    # A QUERY, so a surface can refuse the run BEFORE any traffic. `expand` (below) still
+    # drops such a value at send time, and must: it is the last line before the wire and a
+    # binding can resolve later than plan-build. But a backstop that fires silently on every
+    # probe is not a report, and by then the crawl is already running.
+    def self.unsafe_expanded(pairs : Array({String, String})) : Array(String)
+      pairs.compact_map { |(name, value)| safe_value?(Env.expand(value).strip) ? nil : name }
     end
 
     # Headers reused from a captured History flow: parse the stored request head and

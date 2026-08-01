@@ -397,6 +397,96 @@ describe Gori::Proxy::WS::MessageGate do
     r.shutdown
   end
 
+  # #554's control-frame parking turned a DELIVERED keepalive into a lost one. `TEXT fin=0
+  # "SECRET"` / `PING` / a socket that ends with NO close frame is a half-sent-secret test,
+  # and both the byte-exact pump and the rewrite-only pump put both frames on the wire. On a
+  # GATED socket neither left: `AssemblingPump#run`'s `ensure` skipped the flush whenever a
+  # gate was armed, so `@parked` and `@buffer` were discarded — while capture still carried
+  # the arrival row for the PING that never went out and NO row for the fragment that did.
+  # The evidence was exactly inverted, and losing a keepalive on a gated socket is the very
+  # liveness failure `MAX_PARKED_CONTROLS` and this class's header exist to prevent.
+  #
+  # The condition here matches NOTHING, which is the worst case and the way an operator arms
+  # this by accident: they caught the socket for something else entirely.
+  it "delivers a parked control frame and the fragment it sat inside when a gated socket ends with no CLOSE" do
+    first = masked(WS::OP_TEXT, "SECRET".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws body:never-matches-this") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 60_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(ping)
+      # The arrival row proves the PING has been read and parked; only then is the teardown
+      # racing the thing under test.
+      wait_until("the PING to be parked") { sink.messages.size == 1 }
+      r.cs_w.close # the client vanishes mid-message: no CLOSE frame, no FIN
+
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.gets_to_end.to_slice.should eq(first + ping) # was: nothing at all
+      # ... and the capture now says what the wire says, in the same order.
+      sink.messages.should eq([{"out", 9, "zz"}, {"out", 1, "SECRET"}])
+      ic.pending_count.should eq(0)
+    end
+    r.shutdown
+  end
+
+  # The complement: the same frames on the same gated socket, ended by a real CLOSE. That
+  # path already flushed (via `forward_control`'s close branch) and must not now flush twice
+  # — the teardown pass is idempotent, and the CLOSE still comes last (§5.5.1).
+  it "still delivers the parked frame exactly once when the gated socket ends WITH a CLOSE" do
+    first = masked(WS::OP_TEXT, "SECRET".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    bye = masked(WS::OP_CLOSE, Bytes[0x03, 0xe8])
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws body:never-matches-this") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 61_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(ping)
+      r.cs_w.write(bye)
+
+      # Bounded read, not `gets_to_end`: a CLOSE is a CLEAN end, so `Relay.run` gives the
+      # other direction its CLOSE_TIMEOUT window before it closes this writer.
+      want = first + ping + bye
+      got = Bytes.new(want.size)
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.read_fully(got)
+      got.should eq(want)
+      sink.messages[0, 2].should eq([{"out", 9, "zz"}, {"out", 1, "SECRET"}])
+      sink.messages.size.should eq(3) # ... and the CLOSE, once
+    end
+    r.shutdown
+  end
+
+  # Ordering across the two teardown resolutions: a message a human really owns is released
+  # by `settle` FIRST, and the half-assembled fragments the pump is withholding — which
+  # arrived after it — follow. Getting this backwards would put later bytes on the wire ahead
+  # of earlier ones on the one socket where order is the whole guarantee.
+  it "releases a genuinely held message before the fragments still assembling behind it" do
+    tail = masked(WS::OP_TEXT, "TAIL".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::RequestOnly)
+      spawn { WS::Relay.run(r.client, r.upstream, 62_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(masked(WS::OP_TEXT, "HELD".to_slice))
+      wait_until("the hold") { ic.pending_count == 1 }
+      # A second message starts behind the hold and never FINs, with a PING inside it.
+      r.cs_w.write(tail)
+      r.cs_w.write(ping)
+      wait_until("the PING to be parked") { sink.messages.size == 1 }
+      r.cs_w.close
+
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      got = r.ts_r.gets_to_end.to_slice
+      got.should eq(masked(WS::OP_TEXT, "HELD".to_slice) + tail + ping)
+      sink.messages.should eq([{"out", 9, "zz"}, {"out", 1, "HELD"}, {"out", 1, "TAIL"}])
+    end
+    r.shutdown
+  end
+
   it "forwards a still-held message at teardown instead of destroying it" do
     # The socket ends while the operator still owns the message. `MessageGate#close` runs
     # from the pump's `ensure`, which is only reached AFTER `Relay.run` has closed both

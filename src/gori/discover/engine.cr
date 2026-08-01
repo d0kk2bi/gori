@@ -249,12 +249,20 @@ module Gori::Discover
     def initialize(@inner : Backend, @cap : Int64?)
     end
 
+    # Fetches the cap DENIED. Distinct from `cap_reached?`, which is also true for a run that
+    # happened to finish exactly on its budget: a non-zero count here is proof that work the
+    # run wanted to do did not happen. See `Engine#budget_exhausted?`.
+    getter refused : Int64 = 0_i64
+
     def cap_reached? : Bool
       (c = @cap) && c > 0 ? @sent >= c : false
     end
 
     def fetch(scheme : String, host : String, port : Int32, target : String) : Repeater::Result
-      return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR) if cap_reached?
+      if cap_reached?
+        @refused += 1
+        return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR)
+      end
       @sent += 1
       @inner.fetch(scheme, host, port, target)
     end
@@ -364,6 +372,11 @@ module Gori::Discover
     # consumer reads this and decides. ONE string, not a list — every send in a wholly-blocked
     # run fails for the same reason and the point is to name it, not to tally it.
     getter first_error : String? = nil
+    # Sends that reached an origin and came back without an error. `@capped.sent` cannot
+    # answer that — it is a BUDGET counter that charges an attempt before the fetch, so a run
+    # whose every send failed still has `sent > 0`. Same counter, same name and same purpose
+    # as `Miner::Engine#successful_sends`; see `wholly_refused_reason`.
+    getter successful_sends : Int64 = 0_i64
     @pages : Int32
     @crawl_enqueued : Int32
     @calibrated_out : Int32
@@ -541,7 +554,8 @@ module Gori::Discover
       if refusal
         @events.send(ErrorEvent.new(refusal))
       else
-        @events.send(DoneEvent.new(progress_snapshot, run_stats, @state == State::Stopped))
+        @events.send(DoneEvent.new(progress_snapshot, run_stats, @state == State::Stopped,
+          budget_exhausted?))
       end
       @events.close
     rescue ex
@@ -650,12 +664,31 @@ module Gori::Discover
       end
     end
 
-    # The reason this run produced nothing, or nil when it produced something. "Nothing" is
-    # deliberately `@found == 0 && @pages == 0`: a run that recorded a page or a finding got
-    # an answer from an origin, however many later sends were refused, and turning that into
-    # a terminal error would hide the results it did get.
+    # The run stopped SHORT of its work because `max_requests` ran out — not merely reached
+    # its cap on the last thing it had to do, which is an ordinary complete run. Both halves
+    # are needed and neither alone is right:
+    #   * `@frontier` non-empty — the orchestrator's `break if @capped.cap_reached?` leaves
+    #     every un-dispatched task sitting there (the 275-of-283 case);
+    #   * `@capped.refused > 0` — a Calibrate task whose bogus probes were all denied
+    #     consumed no frontier entry at all, so the frontier can drain while real work was
+    #     skipped.
+    private def budget_exhausted? : Bool
+      @capped.cap_reached? && (!@frontier.empty? || @capped.refused > 0)
+    end
+
+    # The reason this run produced nothing, or nil when it produced something.
+    #
+    # "Produced nothing" is `@found == 0 && @pages == 0` AND nothing got through
+    # (`@successful_sends == 0`) — the second clause is `Miner::Engine`'s predicate, added
+    # here for its reason and against the same failure: a target that accepts TCP and then
+    # answers nothing, under a budget small enough that only CALIBRATION probes ever ran,
+    # reported `done · 0 found · 9 sent · 0 errors` and exit 0. Nine requests went out, nine
+    # got no response. Calibration failures now reach `@first_error` too (see
+    # `send_with_retries`), which is what makes that run nameable at all; `successful_sends`
+    # is what stops the wider check from turning a target that answered fine but held nothing
+    # into a spurious terminal error.
     private def wholly_refused_reason : String?
-      return nil unless @found == 0 && @pages == 0
+      return nil unless @found == 0 && @pages == 0 && @successful_sends == 0
       @first_error.presence
     end
 
@@ -1106,6 +1139,17 @@ module Gori::Discover
           attempts += 1
           sleep @config.retry_pause
           next
+        end
+        # Book the outcome HERE — the one line every send passes — rather than in the two
+        # `handle_*` methods that used to do it. `handle_calibrate` never did, so a run whose
+        # whole budget went on CALIBRATION probes against a dead-silent origin recorded no
+        # error at all and reported `0 errors` on a run where nothing answered. The error
+        # COUNT stays in the handlers (a calibration miss is not a probe result and must not
+        # inflate it); only the "what went wrong / did anything work" facts move here.
+        if err = raw.error
+          @first_error ||= err.presence unless benign_error?(err)
+        else
+          @successful_sends += 1
         end
         return raw
       end

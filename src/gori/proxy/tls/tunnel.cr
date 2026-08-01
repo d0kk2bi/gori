@@ -119,7 +119,12 @@ module Gori::Proxy::Tls
       # Skipped entirely for a CLEARTEXT origin: reflection is an ALPN probe, and ALPN only
       # exists inside a TLS handshake. gori has no h2c support to reflect instead, so the
       # client is kept on h1 — which is what the nil path already means.
-      upstream = tls_upstream ? reflect_origin_h2(host, port, dial_addr) : nil
+      #
+      # `offer` is the OBSERVED outcome, carried into `ClientConn` rather than re-derived
+      # there. See `Proxy::H2Offer`: an h2/gRPC client whose preface lands on the h1 path used
+      # to be told the two causes this method knows nothing about, and pointed at a `gori.log`
+      # line the common path never writes.
+      upstream, offer = tls_upstream ? reflect_origin_h2(host, port, dial_addr) : {nil, Proxy::H2Offer::Cleartext}
 
       server_ctx = @ca.context_for(host, advertise_h2: !upstream.nil?)
       # sync_close: true is REQUIRED, not cosmetic. The h2/ws relays tear down by
@@ -165,6 +170,7 @@ module Gori::Proxy::Tls
           # listener — without it the setting was honoured or ignored depending on whether
           # the client happened to speak TLS, which is not a distinction the operator made.
           rewrite_fixed_host: rewrite_host,
+          h2_offer: offer,
         ).run
       end
     rescue
@@ -198,22 +204,31 @@ module Gori::Proxy::Tls
     # about the machine that answered: the same name reached at two different pinned addresses
     # is two origins, and sharing one entry between them would deny h2 to the second on
     # evidence gathered from the first.
+    #
+    # Returns the socket AND the observed reason, because the reason is the thing this method
+    # is uniquely able to know and every later surface was reduced to guessing at (`H2Offer`).
     private def reflect_origin_h2(host : String, port : Int32,
-                                  dial_addr : String? = nil) : OpenSSL::SSL::Socket::Client?
-      return nil unless h2_candidate?(host)
-      return nil if @h1_only_origins.includes?({host, port, dial_addr}) # known h1-only: skip the probe
+                                  dial_addr : String? = nil) : {OpenSSL::SSL::Socket::Client?, Proxy::H2Offer}
+      if downgrade = h2_downgrade_reason(host)
+        return {nil, downgrade}
+      end
+      # A cached h1-only origin is the same OBSERVATION as one made on this connection — it was
+      # made by a real handshake, just an earlier one — so it reports the same reason.
+      return {nil, Proxy::H2Offer::UpstreamDeclined} if @h1_only_origins.includes?({host, port, dial_addr})
       # Cap the connect wait so an unreachable origin doesn't burn the full timeout here before
       # the h1 fallback re-dials and waits again (never longer than the configured timeout).
       timeout = {Gori::Settings.connect_timeout, H2_PROBE_CONNECT_TIMEOUT}.min
       upstream = Proxy::Upstream.dial_tls(host, port, verify: @verify_upstream, alpn: "h2",
         connect_timeout: timeout, overrides: @host_overrides, pin: dial_addr)
-      return upstream if upstream && upstream.alpn_protocol == "h2"
+      return {upstream, Proxy::H2Offer::Offered} if upstream && upstream.alpn_protocol == "h2"
       # Remember a DEFINITIVE h1 negotiation (handshake completed, ALPN != h2) so repeat visits
       # skip the probe. Never cache a nil dial — that's a transient reach/verify failure, not a
       # statement about the origin's ALPN; caching it would wrongly pin a briefly-down origin.
-      @h1_only_origins << {host, port, dial_addr} if upstream && @h1_only_origins.size < H1_ONLY_CACHE_MAX
+      # The same distinction is what separates the two reasons below.
+      declined = !upstream.nil?
+      @h1_only_origins << {host, port, dial_addr} if declined && @h1_only_origins.size < H1_ONLY_CACHE_MAX
       upstream.try(&.close) rescue nil
-      nil
+      {nil, declined ? Proxy::H2Offer::UpstreamDeclined : Proxy::H2Offer::UpstreamUnreachable}
     end
 
     # Whether this host may take the fast h2 relay at all. FALSE — forcing HTTP/1.1, the
@@ -276,16 +291,20 @@ module Gori::Proxy::Tls
     # hand-rolled peer — but it is not impossible, so it is not left silent: `H2::HeadRewrite`
     # already computes the per-stream authority for rule scoping and logs once per connection
     # when a stream's authority differs from this host AND a body/stub rule matches it.
-    private def h2_candidate?(host : String) : Bool
+    #
+    # Returns the REASON (an `H2Offer` member) rather than a Bool, and nil for a candidate:
+    # every one of these branches writes a `gori.log` line, and `ClientConn` has to be able to
+    # say which one applied without re-deriving it from a rule table that has since changed.
+    private def h2_downgrade_reason(host : String) : Proxy::H2Offer?
       if Gori::Settings.http2_disabled?
         notice_downgrade(host, "HTTP/2 is switched off (settings network.http2; set it back to " \
                                "\"auto\" to keep h2)")
-        return false
+        return Proxy::H2Offer::DisabledBySetting
       end
       if @rewriter.try(&.rewrites_body_for_host?(host))
         notice_downgrade(host, "a Match&Replace BODY rule is live and body rewriting on HTTP/2 " \
                                "is not implemented yet (disable the body rule to keep h2)")
-        return false
+        return Proxy::H2Offer::BodyRule
       end
       # A SHORT-CIRCUIT rule (#511) earns the downgrade for the same reason a body rule does:
       # `HeadRewriter#short_circuit` is consulted in `ClientConn#handle_request`, and the h2
@@ -297,7 +316,7 @@ module Gori::Proxy::Tls
       if @rewriter.try(&.short_circuits_for_host?(host))
         notice_downgrade(host, "a Match&Replace short-circuit rule is live and the h2 relay " \
                                "cannot answer a request locally (disable the stub rule to keep h2)")
-        return false
+        return Proxy::H2Offer::ShortCircuitRule
       end
       # A BODY-scoped session-binding extract rule (#501 slice 2) earns the downgrade for
       # exactly the reason a body rewrite rule does: it needs the response ENTITY, and DATA
@@ -313,9 +332,9 @@ module Gori::Proxy::Tls
         notice_downgrade(host, "a session-binding extract rule reads the response BODY and body " \
                                "extraction on HTTP/2 is not implemented yet (a cookie / header " \
                                "descriptor works on h2 and costs nothing)")
-        return false
+        return Proxy::H2Offer::ExtractRule
       end
-      true
+      nil
     end
 
     # One gori.log line per host per reason, the discipline `Settings::PASSTHROUGH_NOTICE_MAX`

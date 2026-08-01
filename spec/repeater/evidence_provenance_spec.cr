@@ -79,15 +79,57 @@ describe "Gori::Repeater::PlanOptions#evidence?" do
           auto_content_length: false)).should eq("POST /lf HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello")
       end
     end
+  end
 
-    # Expansion is a SEPARATE knob: a surface may have merged operator-typed `-H` overrides
-    # into the evidence bytes, and those still have to expand.
-    it "still expands a resolvable $KEY in evidence bytes, without re-terminating the head" do
-      raw = "GET /a HTTP/1.1\nHost: h\nAuthorization: Bearer $TOK\n\n"
+  # The third draft-time policy, and the one round 2 left running: `$KEY` SUBSTITUTION.
+  #
+  # This block used to assert the opposite ("still expands a resolvable $KEY in evidence
+  # bytes"), on the theory that a surface might have merged operator-typed overrides into
+  # these bytes and those still had to expand. The theory was right and the seam was wrong:
+  # by the time the builder sees one merged wire, nothing can tell the operator's bytes from
+  # the capture's — so the expansion also ran over the CAPTURE, and a project that happened
+  # to define an ordinary name (`filter`, `top`, `where`, `token`, `user`) rewrote the stored
+  # request and re-framed its Content-Length to match, silently. Meanwhile MCP's flow path
+  # reached the intended end state by a DIFFERENT mechanism (`expand_request: false`) and did
+  # not, so the two headless surfaces sent different requests from the same flow id.
+  #
+  # A surface that merges overrides now expands them at ITS OWN merge seam, where it still
+  # knows whose bytes are whose — see `spec/cli/run/repeater_headers_spec.cr`.
+  describe "$KEY substitution" do
+    it "does not substitute a project value into evidence, even when the name resolves" do
+      raw = "GET /api?$filter=name%20eq%20x&$top=10 HTTP/1.1\r\nHost: h\r\n\r\n"
+      with_env_vars([{"filter", "PWNED"}, {"top", "9"}]) do
+        wire_of(R::PlanOptions.new([raw.to_slice], target: "http://h",
+          auto_content_length: false, evidence: true)).should eq(raw)
+      end
+    end
+
+    it "does not re-frame a captured Content-Length over a body it did not change" do
+      raw = "POST /bk HTTP/1.1\r\nHost: h\r\nContent-Length: 22\r\n\r\n{\"q\":\"$where 1==1 ab\"}\n"
+      with_env_vars([{"where", "XX"}]) do
+        wire_of(R::PlanOptions.new([raw.to_slice], target: "http://h",
+          auto_content_length: false, resync_cl_after_expansion: true, evidence: true)).should eq(raw)
+      end
+    end
+
+    it "still substitutes in a DRAFT, which is the whole point of the syntax there" do
+      raw = "GET /a HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer $TOK\r\n\r\n"
       with_env_vars([{"TOK", "s3cr3t"}]) do
         wire_of(R::PlanOptions.new([raw.to_slice], target: "http://h",
+          auto_content_length: false))
+          .should eq("GET /a HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer s3cr3t\r\n\r\n")
+      end
+    end
+
+    # `expand_request?` is still consulted for the version-line downgrade, which is NOT a
+    # draft policy — a captured h2 flow replayed down an h1 socket must not put `HTTP/2` on
+    # the request line whatever its provenance, and `evidence?` must not silently disable it.
+    it "still downgrades an h2 version line on evidence bytes" do
+      raw = "GET /a HTTP/2\r\nHost: h\r\n\r\n"
+      with_env_vars([] of {String, String}) do
+        wire_of(R::PlanOptions.new([raw.to_slice], target: "http://h",
           auto_content_length: false, evidence: true))
-          .should eq("GET /a HTTP/1.1\nHost: h\nAuthorization: Bearer s3cr3t\n\n")
+          .should eq("GET /a HTTP/1.1\r\nHost: h\r\n\r\n")
       end
     end
   end

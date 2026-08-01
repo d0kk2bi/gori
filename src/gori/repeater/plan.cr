@@ -112,10 +112,19 @@ module Gori::Repeater
     #     exact wire bytes, so normalizing can only CHANGE them — promoting a bare-LF
     #     terminator (a front-end/back-end desync primitive gori stores byte-exact) into an
     #     ordinary conformant request.
+    #   * `$KEY` SUBSTITUTION ITSELF. This one was left running, and it is the same argument
+    #     one step further: a project that happens to define `filter` (or `top`, `where`,
+    #     `token`, `user` — ordinary names) rewrote `GET /api?$filter=…` into
+    #     `GET /api?PWNED=…` on the wire and then re-framed Content-Length so the corrupted
+    #     request looked self-consistent, while MCP's flow path — which reaches the same
+    #     end state through `expand_request: false` — sent the stored bytes. Two surfaces,
+    #     one flow id, different requests. A capture is replayed as recorded or not at all.
     #
-    # Env expansion itself still runs (`expand_request?`), because a surface may have merged
-    # operator-typed overrides into these bytes; `expand_request: false` remains the separate
-    # "already final, do not expand" knob.
+    # A surface that merges OPERATOR-TYPED overrides into evidence bytes (`gori run
+    # repeater <flow-id>`'s `-H`/`-b`) must therefore expand those at ITS OWN merge seam,
+    # where it still knows which bytes are the operator's. `expand_request: false` remains
+    # the separate "already final, do not expand" knob for a surface whose bytes are a
+    # DRAFT it expanded itself (MCP's `RequestBuilder`, the TUI editor's byte modes).
     property? evidence : Bool
 
     # Whether an unresolved `$VAR` left in the request is a refusal. ON everywhere by
@@ -287,7 +296,8 @@ module Gori::Repeater
       scheme, host, port = resolve_origin(options)
 
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if options.requests.empty?
-      # The two DRAFT-TIME policies, both off for evidence — see `PlanOptions#evidence?`.
+      # The DRAFT-TIME policies — unresolved-`$KEY` refusal, head CRLF normalization, and
+      # `$KEY` substitution itself — all off for evidence. See `PlanOptions#evidence?`.
       draft = !options.evidence?
       # Checked on `options.requests` REGARDLESS of `expand_request?`, and that is the
       # point: when it is false the surface expanded already (MCP's `RequestBuilder`, the
@@ -307,7 +317,10 @@ module Gori::Repeater
         if options.auto_content_length?
           wires = wires.map { |b| FlowRequest.resync_content_length(b) }
         elsif options.resync_cl_after_expansion?
-          # Flow replay: byte-exact unless a `$KEY` in the body just changed its length.
+          # Byte-exact unless expansion just changed the body's length. A no-op whenever
+          # nothing expanded (`evidence?`, or `expand_request: false`), which is now every
+          # flow-replay caller — it stays wired because the flag means "the CL is not pinned",
+          # and a surface that DOES expand a merged draft body still needs it.
           # See `FlowRequest.resync_content_length_if_body_changed`.
           wires = wires.map_with_index { |b, i| FlowRequest.resync_content_length_if_body_changed(options.requests[i], b) }
         end
@@ -356,19 +369,21 @@ module Gori::Repeater
 
     # The request wires with `$KEY` expansion applied, or the originals when the surface says
     # it already expanded (`expand_request: false` — MCP's pre-expanded `raw`, the TUI's byte
-    # modes, `--verbatim`).
+    # modes, `--verbatim`) — or when the bytes are EVIDENCE, which is never expanded at all.
     #
-    # `expand_wire` for a DRAFT, plain `expand` for EVIDENCE. The only difference between them
-    # is that `expand_wire` re-terminates the HEAD with CRLF, which a line-buffer editor owes
-    # the wire and a stored capture does not: promoting a captured bare-LF terminator destroys
-    # a front-end/back-end desync primitive gori stores byte-exact. See `PlanOptions#evidence?`.
+    # `expand_wire` is the DRAFT pass and there is no evidence pass: a stored head is full of
+    # `$` nobody typed (OData `$filter`/`$top`, Mongo `$where`, `$IFS`, `$user.name`), and
+    # substituting a project value into one sends a request the operator never captured. This
+    # USED to run plain `Env.expand` for evidence, on the theory that only the head's CRLF
+    # promotion was a draft policy — but expansion is one too, and it was the one that could
+    # silently change the request line. See `PlanOptions#evidence?`.
+    #
+    # Left INSIDE `evidence?` rather than left to each surface to remember (via
+    # `expand_request: false`) precisely because that is how the two headless surfaces drifted:
+    # MCP turned expansion off and `gori run repeater` did not, and nothing compared them.
     private def self.expand_requests(options : PlanOptions, draft : Bool) : Array(Bytes)
-      return options.requests unless options.expand_request?
-      if draft
-        options.requests.map { |b| Env.expand_wire(String.new(b)) }
-      else
-        options.requests.map { |b| Env.expand(String.new(b)).to_slice }
-      end
+      return options.requests unless options.expand_request? && draft
+      options.requests.map { |b| Env.expand_wire(String.new(b)) }
     end
 
     # A field-native h2 send: dial origin + SNI resolution, then a `Sender` whose `send` will

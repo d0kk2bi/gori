@@ -51,9 +51,16 @@ module Gori
 
     # Live counters. `collected` counts successful extractions (the goal is met by
     # these); `sent` is the real request count (always ≥ collected — misses + retries).
-    record ProgressEvent, collected : Int32, sent : Int32, goal : Int32, errors : Int32
+    # `sent` is REPLAYS completed — one per collected sample slot, and the numerator that
+    # belongs against `goal`. `requests` is what actually went on the wire
+    # (`Fuzz::CappedBackend#sent`, the counter `max_requests` is enforced against): a retry
+    # costs one there and none in `sent`, so a `--retries 2` collection against a dead origin
+    # reported "6 sent" for 18 real requests. Both are published because they answer
+    # different questions — progress, and the load the run put on the target.
+    record ProgressEvent, collected : Int32, sent : Int32, goal : Int32, errors : Int32,
+      requests : Int64 = 0_i64
     record SampleEvent, sample : Sample
-    record DoneEvent, collected : Int32, sent : Int32, stopped : Bool
+    record DoneEvent, collected : Int32, sent : Int32, stopped : Bool, requests : Int64 = 0_i64
     record ErrorEvent, message : String
 
     # Engine → consumer events. A union of records (matches Fuzz/Miner so a

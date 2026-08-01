@@ -98,7 +98,7 @@ module Gori
       end
 
       private def set_scope_enabled(h) : Result
-        enabled = bool(h, "enabled")
+        enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled' (true or false)", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
         scope = Scope.load(store)
         committed = enabled ? scope.enable : scope.disable
@@ -112,7 +112,7 @@ module Gori
       # scope does not allow — with no include rule it blocks ALL captured traffic
       # (reported as blocks_all).
       private def set_sandbox(h) : Result
-        enabled = bool(h, "enabled")
+        enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled' (true or false)", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
         scope = Scope.load(store)
         # Scope's sandbox setters persist through the SAME settings write the TUI uses but

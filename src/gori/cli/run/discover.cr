@@ -39,7 +39,7 @@ module Gori
           p.on("--no-bruteforce", "Disable directory brute-forcing (crawl only)") { bruteforce = false }
           p.on("--wordlist=PATH", "Extra path wordlist (merged with the built-in list)") { |v| wordlist = v }
           p.on("--extensions=LIST", "Also probe these extensions (e.g. php,json,bak)") { |v| extensions = parse_extensions(v) }
-          p.on("-HHEADER", "--header=HEADER", "Custom request header on every probe, e.g. \"Authorization: Bearer …\" (repeatable)") { |v| headers << v }
+          p.on("-HHEADER", "--header=HEADER", "Custom request header on every probe, e.g. \"Authorization: Bearer …\" (repeatable). Host and Connection are owned by the crawler and ignored; a value carrying CR/LF is refused, not dropped") { |v| headers << v }
           p.on("--containment=MODE", "same-origin | scope-aware (default) | host+subdomains") { |v| containment = parse_containment(v) }
           p.on("--concurrency=N", "Parallel requests (default 20)") { |v| concurrency = parse_count(v, "--concurrency") }
           p.on("--rate=RPS", "Cap requests/sec (0 = unlimited)") { |v| rate = parse_rate(v) }
@@ -69,12 +69,25 @@ module Gori
         abort "gori run discover: #{discover_reason_error(Discover::PlanError::Reason::NoTechnique)}" unless spider || bruteforce
         abort "gori run discover: #{discover_reason_error(Discover::PlanError::Reason::NoTarget)}" if target_override.to_s.strip.empty?
 
+        # A `-H` gori will not send is a REFUSAL, and it aborts the run rather than quietly
+        # crawling without it. `Fuzz::Plan.build#refuse_unresolved` is the model: same class
+        # of problem (the operator asked for bytes gori will not put on the wire), opposite
+        # treatment until now. The stakes here are higher, not lower — the header this drops
+        # is `Authorization`, and the sweep then reports "found nothing" over the entire
+        # authenticated surface it never reached.
+        rejected = [] of String
+        parsed_headers = Discover::Headers.parse_lines(headers, rejected)
+        unless rejected.empty?
+          abort "gori run discover: header #{rejected.first.inspect} rejected — a header value may " \
+                "not contain CR or LF, and a header name must be an RFC 7230 token " \
+                "(#{rejected.size} of #{headers.size} -H arguments rejected)"
+        end
         config = Discover::Config.new(
           concurrency: concurrency, rps: rate, throttle_ms: throttle, timeout: timeout,
           retries: retries, max_requests: max_requests, keep_alive: keep_alive,
           spider: spider, bruteforce: bruteforce,
           max_depth: max_depth, user_wordlist: wordlist, extensions: extensions,
-          containment: containment, headers: Discover::Headers.parse_lines(headers))
+          containment: containment, headers: parsed_headers)
 
         project = resolve_discover_project(project_name, db_path)
         store = open_store(project)
@@ -82,6 +95,17 @@ module Gori
           # The store stays open for the whole run (findings are written through it), so the
           # Outbound does NOT take ownership of it — the ensure below is what closes it.
           outbound = Gori::Outbound.cli(Scope.load(store), allow_unscoped)
+          # The second half of the header check, and the realistic one: the line the operator
+          # typed is fine and the ENV VAR is not (`-H 'Authorization: Bearer $TOKEN'` where
+          # TOKEN was read from a file and kept its trailing newline). It has to run here
+          # rather than beside the parse above, because `open_store` is what hydrates the
+          # project's env — and before any traffic, because `Headers.expand`'s send-time
+          # backstop drops the header on every probe without a word.
+          unsafe = Discover::Headers.unsafe_expanded(config.headers)
+          unless unsafe.empty?
+            abort "gori run discover: header #{unsafe.first.inspect} rejected — its value contains " \
+                  "CR or LF after $VAR expansion, which would splice extra headers into every probe"
+          end
           # `.to_s` rather than `|| ""`: an OptionParser-closured var never narrows out of String?.
           options = Discover::PlanOptions.new(target_override.to_s, config: config,
             verify: !insecure, overrides: Gori::HostOverrides.load(store))
@@ -266,6 +290,14 @@ module Gori
         STDERR.puts "done · #{s.found} found · #{s.sent} sent · #{ev.progress.errors} errors" \
                     " · calibrated-out #{s.calibrated_out} · dedup #{s.dedup_suppressed}" \
                     " · template #{s.template_suppressed} · cluster #{s.cluster_suppressed}#{ev.stopped ? " (stopped)" : ""}"
+        # A sweep that stopped on its budget must never read like one that finished: with
+        # `--max-requests 8` against a 283-candidate wordlist this line said `5 found` and
+        # exited 0, and 275 of those candidates were never sent. `queued` is what is still
+        # sitting in the frontier — the number that says how much of the target was not looked at.
+        if ev.budget_exhausted
+          STDERR.puts "budget exhausted · #{ev.progress.queued} queued unexplored " \
+                      "— raise or drop --max-requests to finish the sweep"
+        end
         # Handshakes actually paid for — the one thing the request counts above cannot show.
         # `dialed ≈ sent` means the origin closed after every response, which is the usual
         # explanation for a run that took far longer than its request count suggests.

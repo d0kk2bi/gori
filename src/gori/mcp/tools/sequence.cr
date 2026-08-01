@@ -157,8 +157,8 @@ module Gori
         # The builder's sender carries the Outbound decision, so Sandbox / EXCLUDE hard-block
         # a collection run per send — sequence_start used to have only the job-start check.
         options = Sequencer::PlanOptions.new(bytes, default_target: default_target,
-          target: str(h, "url"), http2: (bool(h, "http2") || false) || src_h2, config: config,
-          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          target: str(h, "url"), http2: bool_arg(h, "http2", false) || src_h2, config: config,
+          verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           # SNI independent of the Host header is the vhost-confusion / domain-fronting test,
           # and a token-randomness sweep against such a vhost had NO route through MCP at all
           # (`send_request` at least has create_repeater{sni} → send_request{repeater_id}).
