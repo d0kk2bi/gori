@@ -202,7 +202,8 @@ module Gori
         return false unless found.zero? && engine.successful_sends.zero?
         reason = engine.first_error
         return false unless reason
-        STDERR.puts "mine: every request failed — #{reason}"
+        blocked = engine.blocked
+        STDERR.puts "mine: every request failed — #{reason}#{blocked > 0 ? " (#{blocked} refused before the socket)" : ""}"
         true
       end
 

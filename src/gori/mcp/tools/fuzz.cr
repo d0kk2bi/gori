@@ -137,6 +137,8 @@ module Gori
         fjob.sent = p.sent
         fjob.matched = p.matched
         fjob.errors = p.errors
+        fjob.blocked = p.blocked
+        fjob.blocked_reason = p.blocked_reason
       end
 
       private def store_fuzz_result(fjob : FuzzJob, r : Fuzz::Result, flow_id : Int64?) : Nil
@@ -161,6 +163,15 @@ module Gori
             j.field "candidates_remaining", (t = fjob.total) ? {0_i64, t - fjob.sent}.max : nil
             j.field "matched", fjob.matched
             j.field "errors", fjob.errors
+            # A refused send never reached the network, but it does produce an errored
+            # Result — so a fully-refused run used to report `sent:N, matched:0, errors:N,
+            # error:null` with an empty result list, which an agent reads as "the payloads
+            # were tried and nothing matched". `blocked` + the verbatim reason are what
+            # separate "no findings" from "no requests"; `all_blocked` says it outright so
+            # a caller cannot miss it by only reading `matched`.
+            j.field "blocked", fjob.blocked
+            j.field "blocked_reason", fjob.blocked_reason
+            j.field "all_blocked", fjob.sent > 0 && fjob.blocked >= fjob.sent
             j.field "stored_results", fjob.results.size
             j.field "results_truncated", fjob.truncated?
             j.field "record_history", fjob.record_history.to_s

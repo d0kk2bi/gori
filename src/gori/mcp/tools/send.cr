@@ -117,12 +117,14 @@ module Gori
       #
       # Layer 2 (`Repeater::Sender#refusal`) is Sandbox mode, a hard containment gate that
       # allow_unscoped does NOT lift — the TUI and `gori run repeater` have always enforced
-      # it that way, and MCP used to let allow_unscoped:true walk straight past it.
+      # it that way, and MCP used to let allow_unscoped:true walk straight past it. It also
+      # carries the unbound-binding rule, which is NOT a scope decision at all — hence
+      # `refusal_blocked` rather than a direct `sandbox_blocked`.
       private def send_gate(ob : Outbound, plan : Repeater::Plan) : ScopeCheck | Result
         sc = ob.check(request_scope_url(plan), plan.host)
         return scope_blocked(sc) if sc.blocked?
         if reason = plan.refusal
-          return sandbox_blocked(reason, plan.host, "url")
+          return refusal_blocked(plan, reason, plan.host, "url")
         end
         sc
       end
@@ -373,7 +375,7 @@ module Gori
         return scope_blocked(sc) if sc.blocked?
         # Layer 2 (Sandbox) — allow_unscoped does not lift it; refuse before the link write.
         if reason = plan.refusal
-          return sandbox_blocked(reason, host, "repeater_id")
+          return refusal_blocked(plan, reason, host, "repeater_id")
         end
         # Scope passed — now it's safe to persist the issue link.
         if issue_id
@@ -559,7 +561,7 @@ module Gori
       # or pass allow_unscoped:true.
       private def scope_blocked(sc : ScopeCheck) : Result
         reason = sc.unscoped? ? "no scope is configured for this project, so active requests are refused by default" : "target host #{sc.host} is outside the project's configured scope"
-        err("#{reason}; add a scope include rule or pass allow_unscoped:true to override",
+        err("#{reason}; #{Outbound.remedy(sc, "allow_unscoped:true")}",
           "SCOPE_BLOCKED", field: "url",
           details: JSON.parse({"scope_decision" => sc.decision, "host" => sc.host}.to_json))
       end
@@ -573,6 +575,19 @@ module Gori
         err("#{reason} — Sandbox mode blocks every request outside the scope allowlist; turn Sandbox off or add a scope include rule",
           "SCOPE_BLOCKED", field: field,
           details: JSON.parse({"scope_decision" => "sandbox", "host" => host}.to_json))
+      end
+
+      # `Plan#refusal` folds two unrelated rules into one string, and this gate used to label
+      # ALL of them a Sandbox block — so an unbound `$SESSION` came back as SCOPE_BLOCKED with
+      # `scope_decision:"sandbox"` on a project whose scope said `in_scope` and whose Sandbox
+      # was never on. The advice was not merely wrong but unfollowable: no scope rule can bind
+      # a session value. The remedy is to run whatever request the extract rule reads from.
+      private def refusal_blocked(plan : Repeater::Plan, reason : String, host : String, field : String) : Result
+        return sandbox_blocked(reason, host, field) unless plan.unbound_refusal?
+        err("#{reason} — send a request that the extract rule matches first (or set the value with set_env_var); " \
+            "this is not a scope or Sandbox block",
+          "UNBOUND_BINDING", field: field,
+          details: JSON.parse({"scope_decision" => "in_scope", "host" => host}.to_json))
       end
 
       # The request-target (path) from the first line of a raw request, for

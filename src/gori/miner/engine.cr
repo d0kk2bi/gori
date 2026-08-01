@@ -54,7 +54,24 @@ module Gori::Miner
     # reason nowhere on screen. Kept as ONE string rather than a list: every send in a
     # wholly-blocked run fails for the same reason, and the point is to name it, not to
     # tally it. The engine stays surface-free — consumers read it and decide (DESIGN.md §2.1).
-    getter first_error : String? = nil
+    #
+    # Falls back to the BACKEND's first refusal, and has to: baseline calibration dials the
+    # same backend, but its probe failures never pass through `process_bucket` and so never
+    # reach `@first_error`. A run whose whole budget was spent — and refused — inside
+    # calibration therefore had a reason that existed and was unreachable, `mine_all_refused?`
+    # could not fire, and the CLI printed "0 found" and exited 0. Which is the answer a
+    # security tool must never give for a run that sent nothing.
+    @first_error : String? = nil
+
+    def first_error : String?
+      @first_error || @backend.blocked_reason
+    end
+
+    # Attempts the gate refused before the socket, across the WHOLE run (calibration
+    # included) — the count that goes with the reason above.
+    def blocked : Int64
+      @backend.blocked
+    end
 
     # Mining sends that came back WITHOUT an error. `Progress#sent` counts attempts (and
     # includes Baseline's probes, whose failures never reach `@errors`), so `errors >= sent`

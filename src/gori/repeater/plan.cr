@@ -171,6 +171,12 @@ module Gori::Repeater
       @sender.group_refusal(@requests)
     end
 
+    # Whether `refusal` is the unbound-binding rule rather than Sandbox — see
+    # `Sender#unbound_refusal?`. Only a surface that must NAME the remedy asks this.
+    def unbound_refusal? : Bool
+      @sender.unbound_refusal?(@requests)
+    end
+
     def send : Result
       @sender.send(bytes)
     end

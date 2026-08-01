@@ -329,6 +329,11 @@ module Gori
         property sent = 0_i64
         property matched = 0_i64
         property errors = 0_i64
+        # Refused before the socket — see `Fuzz::Backend#blocked`. Tracked separately from
+        # `errors` because a caller cannot act on a number that mixes "the target timed out"
+        # with "gori never sent this".
+        property blocked = 0_i64
+        property blocked_reason : String? = nil
         property error_msg : String? = nil
         getter results = [] of Fuzz::Result
         # History flow ids for the stored (matched) results, index-aligned with

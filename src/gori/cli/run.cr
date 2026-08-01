@@ -365,9 +365,10 @@ module Gori
       # `Fuzz::Sender`/`Repeater::Sender` regardless of --allow-unscoped.
       private def self.guard_outbound(outbound : Gori::Outbound, scheme : String, host : String,
                                       target : String, cmd : String) : Nil
-        return unless outbound.check_request(scheme, host, target).blocked?
+        verdict = outbound.check_request(scheme, host, target)
+        return unless verdict.blocked?
         outbound.close
-        abort "#{cmd}: #{host} is out of the project scope — add a scope include rule or pass --allow-unscoped"
+        abort "#{cmd}: #{host} is out of the project scope — #{Gori::Outbound.remedy(verdict, "--allow-unscoped")}"
       end
 
       # One sentence for every `gori run` tool whose builder refused an env token that

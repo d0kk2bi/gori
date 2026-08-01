@@ -140,8 +140,9 @@ module Gori
       # a configured one refuses an out-of-scope seed unless --allow-unscoped); only the
       # sentence is ours.
       private def self.guard_discover_scope(plan : Discover::Plan, outbound : Gori::Outbound) : Nil
-        return unless outbound.check(plan.seed, plan.host).blocked?
-        abort "gori run discover: #{plan.seed} is out of the project scope — add a scope include rule or pass --allow-unscoped"
+        verdict = outbound.check(plan.seed, plan.host)
+        return unless verdict.blocked?
+        abort "gori run discover: #{plan.seed} is out of the project scope — #{Gori::Outbound.remedy(verdict, "--allow-unscoped")}"
       end
 
       private def self.parse_extensions(v : String) : Array(String)

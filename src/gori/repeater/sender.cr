@@ -65,6 +65,17 @@ module Gori
         nil
       end
 
+      # Whether a refusal, if there is one, comes from the UNBOUND-BINDING rule rather than
+      # from Sandbox. `refusal` folds both into one String because the TUI and CLI only ever
+      # print it — but the two have OPPOSITE remedies, and MCP labelled every refusal a
+      # Sandbox block, so an agent told "turn Sandbox off or add a scope include rule" for an
+      # unbound `$SESSION` would keep widening the scope of a project whose scope was never
+      # the problem. Asked separately rather than by re-typing `refusal`, so the surfaces that
+      # correctly treat it as one string stay untouched.
+      def unbound_refusal?(requests : Array(Bytes)) : Bool
+        requests.any? { |b| Gori::Env.unbound(b).present? }
+      end
+
       def send(bytes : Bytes) : Result
         if reason = refusal(bytes)
           return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)

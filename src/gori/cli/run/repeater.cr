@@ -213,16 +213,23 @@ module Gori
       # --allow-unscoped waiver, unlike the sibling fuzz/mine/sequence/discover CLIs and MCP's
       # send_gate (#406). DESIGN.md §3 lists repeater as gated on BOTH layers.
       private def self.abort_if_out_of_scope!(outbound : Gori::Outbound, plan : Repeater::Plan, prefix : String) : Nil
-        return unless repeater_out_of_scope?(outbound, plan)
+        verdict = repeater_scope_verdict(outbound, plan)
+        return unless verdict.blocked?
         outbound.close
-        abort "#{prefix}: #{plan.host} is out of the project scope — add a scope include rule or pass --allow-unscoped"
+        abort "#{prefix}: #{plan.host} is out of the project scope — #{Gori::Outbound.remedy(verdict, "--allow-unscoped")}"
       end
 
       # The Layer-1 verdict `abort_if_out_of_scope!` acts on, split out so it can be asserted
-      # without the process-exiting `abort`. True = the include list refuses this plan's origin.
-      private def self.repeater_out_of_scope?(outbound : Gori::Outbound, plan : Repeater::Plan) : Bool
+      # without the process-exiting `abort`. Returns the whole Verdict, not just `blocked?`,
+      # because the REMEDY differs by why it was refused (an EXCLUDE match cannot be undone
+      # by adding an include rule).
+      private def self.repeater_scope_verdict(outbound : Gori::Outbound, plan : Repeater::Plan) : Gori::Outbound::Verdict
         target = (bytes = plan.requests.first?) ? Gori::Outbound.request_target(bytes) : "/"
-        outbound.check_request(plan.scheme, plan.host, target).blocked?
+        outbound.check_request(plan.scheme, plan.host, target)
+      end
+
+      private def self.repeater_out_of_scope?(outbound : Gori::Outbound, plan : Repeater::Plan) : Bool
+        repeater_scope_verdict(outbound, plan).blocked?
       end
 
       # A saved repeater SESSION row IS the option set: its target, http2 toggle, SNI and
