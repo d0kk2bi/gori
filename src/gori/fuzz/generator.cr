@@ -58,8 +58,16 @@ module Gori::Fuzz
     # The unmodified base request (all positions = their defaults), CL-synced — used
     # to seed the matcher baseline for anomaly diffing.
     def baseline_request : Bytes
-      raw = @template.render(chained(@template.default_payloads))
+      raw = baseline_raw
       @config.update_content_length? ? ContentLength.sync(raw, @config.add_content_length_when_missing?) : raw
+    end
+
+    # The same request WITHOUT the Content-Length pass. Split out so a surface can ask
+    # whether the resync is about to REWRITE framing the operator authored — a template
+    # declaring `Content-Length: 5` over a ten-byte body is the CL-desync probe itself, and
+    # a sweep that silently corrects it tests something else and reports success.
+    def baseline_raw : Bytes
+      @template.render(chained(@template.default_payloads))
     end
 
     # `n` synthetic requests for auto-calibration (Engine#calibrate_baseline): each

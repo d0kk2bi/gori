@@ -161,6 +161,83 @@ describe "gori run repeater — head terminators survive an edit" do
   end
 end
 
+# The OPERATOR half of `PlanOptions#evidence?`.
+#
+# `Repeater::Plan` no longer expands anything on a flow replay, because it cannot tell the
+# capture's bytes from the operator's once they are one merged wire — a project defining an
+# ordinary name (`filter`, `top`, `where`) rewrote the STORED request and re-framed its
+# Content-Length to match. So expansion moved to the merge itself, which is the last point
+# where the two are still distinguishable. These pin that it really happens here, since the
+# builder will not do it any more: without them the `-H`/`-b`/`--target` values would ship
+# with their `$KEY` characters on the wire and the origin's 401 would look like a target
+# verdict rather than an unexpanded variable (#519's failure, one seam over).
+#
+# The refusal for an UNRESOLVED token in the same three flags is `refuse_unresolved_overrides`
+# and runs before this, so nothing that reaches `Env.expand` here can be left literal — except
+# a DECLARED session binding, which `Env.expand` leaves for `Env.expand_bindings` at the send.
+private def with_vars(pairs : Array({String, String}), &)
+  saved = Gori::Settings.env_vars
+  saved_p = Gori::Settings.project_env_vars
+  saved_x = Gori::Settings.env_prefix
+  Gori::Settings.env_vars = pairs
+  Gori::Settings.project_env_vars = [] of {String, String}
+  Gori::Settings.env_prefix = "$"
+  yield
+ensure
+  Gori::Settings.env_vars = saved || [] of {String, String}
+  Gori::Settings.project_env_vars = saved_p || [] of {String, String}
+  Gori::Settings.env_prefix = saved_x || "$"
+end
+
+describe "gori run repeater — operator overrides expand at the merge seam" do
+  it "expands a $KEY in a -H VALUE" do
+    with_vars([{"TOK", "s3cr3t"}]) do
+      build(["Authorization: Bearer $TOK"]).should contain("Authorization: Bearer s3cr3t")
+    end
+  end
+
+  it "expands a $KEY in -b AND frames Content-Length over the EXPANDED body" do
+    with_vars([{"TOK", "s3cr3t"}]) do
+      out = build([] of String, body_override: "tok=$TOK")
+      out.should end_with("tok=s3cr3t")
+      # 10 bytes, not the 9 of the pre-expansion `tok=$TOK`: the resync that used to happen
+      # in `Repeater::Plan` after a whole-wire expansion now has nothing left to correct.
+      out.should contain("Content-Length: 10\r\n")
+    end
+  end
+
+  it "expands a $KEY in --target before deriving the Host: header from it" do
+    with_vars([{"HOSTV", "api.test:8443"}]) do
+      build([] of String, target: "http://$HOSTV").should contain("Host: api.test:8443\r\n")
+    end
+  end
+
+  # The complement of every case above: the CAPTURED bytes are next to the merged overrides
+  # in the same wire, and none of this may touch them.
+  it "leaves a colliding $KEY in the CAPTURED head and body untouched" do
+    with_vars([{"Dup", "PWNED"}, {"TOK", "s3cr3t"}]) do
+      head = "POST /t HTTP/1.1\r\nHost: h\r\nX-Dup: $Dup\r\nContent-Length: 8\r\n\r\n"
+      wire, _ = Gori::CLI::Run.build_single_flow_request_for_spec(
+        head.to_slice, "b=$Dup\r\n".to_slice, ["Authorization: Bearer $TOK"], nil, nil,
+        [] of String)
+      out = String.new(wire)
+      out.should contain("X-Dup: $Dup\r\n")              # capture: literal
+      out.should end_with("b=$Dup\r\n")                  # capture: literal
+      out.should contain("Content-Length: 8\r\n")        # capture: not re-framed
+      out.should contain("Authorization: Bearer s3cr3t") # override: expanded
+      out.should_not contain("PWNED")
+    end
+  end
+
+  # A `$` in a header NAME can only ever be a typo — `$` is not a tchar — and folding it into
+  # the dedup key would make `-H '$H: a' -H 'X: b'` collide the moment `$H` resolved to `X`.
+  it "does not expand a $KEY in a header NAME" do
+    with_vars([{"H", "X-Dup"}]) do
+      build(["$H: v"]).should contain("$H: v\r\n")
+    end
+  end
+end
+
 # `gori run repeater h2 --fields FILE` accepts two shapes, and the BARE ARRAY is the one the
 # help text advertises first. Reading the optional body keys off `doc` unconditionally CRASHED
 # on it — `JSON::Any#[]?(String)` raises on an array rather than returning nil — so the

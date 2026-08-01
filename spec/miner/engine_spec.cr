@@ -243,4 +243,39 @@ describe Gori::Miner::Engine do
       engine.successful_sends.should be > 0
     end
   end
+
+  # Names the wordlist supplied that a location cannot carry. Dropping them is CORRECT — a
+  # header/cookie name must be an RFC 7230 token, and `Content-Length`/`Host` would break
+  # framing — but `total_names` sums the FILTERED sizes, so the drop surfaced nowhere: the
+  # operator's only signal was that one wordlist produced "444 names" against the query and
+  # "435 names" against headers, and only if they ran both and compared. `probe` publishes a
+  # `skipped` count for exactly this reason.
+  describe "#skipped_names" do
+    wl_names = ["normalname", "my param", "x=y", "arr[]", "Content-Length", "semi;colon"]
+
+    it "reports how many names each location cannot carry, and the pre-filter denominator" do
+      c = cfg
+      c.locations = [M::Location::Headers]
+      base = "GET /api?a=1 HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
+      engine = M::Engine.new(base, http2: false, names: wl_names,
+        backend: HiddenParamBackend.new(F::Origin.new("http", "h", 80), reflect: [] of String),
+        config: c)
+      engine.candidate_names.should eq(6)
+      engine.skipped_names.should eq([{M::Location::Headers, 5}])
+      engine.total_names.should eq(1_i64) # and the headline count agrees with the difference
+    end
+
+    # The complement: the query location accepts every one of those names (Inject
+    # percent-encodes what needs it), so there is nothing to report and nothing is printed.
+    it "reports nothing for a location that can carry every name" do
+      c = cfg
+      c.locations = [M::Location::Query]
+      base = "GET /api?a=1 HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
+      engine = M::Engine.new(base, http2: false, names: wl_names,
+        backend: HiddenParamBackend.new(F::Origin.new("http", "h", 80), reflect: [] of String),
+        config: c)
+      engine.skipped_names.should be_empty
+      engine.total_names.should eq(6_i64)
+    end
+  end
 end

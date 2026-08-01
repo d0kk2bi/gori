@@ -109,10 +109,10 @@ module Gori::Sequencer
       in Mode::Manual     then run_manual
       in Mode::LiveReplay then run_live
       end
-      @events.send(DoneEvent.new(@collected, @sent, @state.stopped?))
+      @events.send(DoneEvent.new(@collected, @sent, @state.stopped?, wire_requests))
     rescue ex
       @events.send(ErrorEvent.new(ex.message || "sequencer error"))
-      @events.send(DoneEvent.new(@collected, @sent, @state.stopped?))
+      @events.send(DoneEvent.new(@collected, @sent, @state.stopped?, wire_requests))
     ensure
       @events.close
     end
@@ -236,8 +236,14 @@ module Gori::Sequencer
 
     # ── counters / pacing ───────────────────────────────────────────────────────────
 
+    # Requests actually put on the wire, retries included — see `ProgressEvent#requests`.
+    # 0 on an analyse-only plan, which has no backend and opens no socket.
+    private def wire_requests : Int64
+      @backend.try(&.sent) || 0_i64
+    end
+
     private def emit_progress : Nil
-      ev = ProgressEvent.new(@collected, @sent, total, @errors)
+      ev = ProgressEvent.new(@collected, @sent, total, @errors, wire_requests)
       select
       when @events.send(ev)
       else

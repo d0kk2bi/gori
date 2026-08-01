@@ -122,6 +122,28 @@ describe Gori::Sequencer::Engine do
       done = ev if ev.is_a?(Q::DoneEvent)
     end
     done.not_nil!.collected.should eq(10) # lands exactly on the goal, no overshoot
+    # …and with no retries, the two send counters agree.
+    done.not_nil!.sent.should eq(10)
+    done.not_nil!.requests.should eq(10_i64)
+  end
+
+  # `sent` counts REPLAYS — the numerator against `goal` — and a retry costs none of it. So a
+  # collection against a dead origin with `--retries 2` reported "6 sent" for 18 real
+  # requests: a 3x understatement of the load gori put on the target, and `sent` is the number
+  # that matters to a tester working inside an agreed request budget on a client's production
+  # system. `Fuzz::CappedBackend#sent` was already the true count, already what `max_requests`
+  # is enforced against, and already published by miner and discover as their own `sent`.
+  it "publishes the TRUE wire count separately from the replay count under --retries" do
+    backend = BlockedBackend.new(F::Origin.new("http", "h", 80), "no response from h:80")
+    config = Q::Config.new(token_loc: Q::TokenLoc.cookie("SID"), goal: 2, concurrency: 1, retries: 2)
+    req = "GET / HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
+    done = nil.as(Q::DoneEvent?)
+    Q::Engine.new(req, http2: false, backend: backend, config: config).run do |ev|
+      done = ev if ev.is_a?(Q::DoneEvent)
+    end
+    d = done.not_nil!
+    d.requests.should eq((d.sent * 3).to_i64) # 1 attempt + 2 retries per replay
+    d.requests.should be > d.sent.to_i64
   end
 
   # A run that collects nothing because every replay was REFUSED is a failure, not a clean

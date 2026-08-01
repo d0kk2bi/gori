@@ -265,6 +265,69 @@ describe Gori::Discover::Engine do
     stats.sent.should be <= 5
   end
 
+  # …and SAYS it stopped short. Fuzz and mine let a consumer derive this (`sent < total`,
+  # `names_done < names_total`); discover's only denominator is `est_total`, a moving estimate
+  # that RISES as the crawl proceeds, so nothing downstream could tell a capped run from a
+  # complete one — `status:"done", job_complete:true, has_more:false` came back with 275 of
+  # 283 wordlist tasks unsent, and both the CLI and an agent read that as a finished sweep.
+  describe "budget_exhausted" do
+    it "is set when the cap left queued work behind" do
+      cfg = D::Config.new(spider: false, bruteforce: true, max_requests: 5_i64, calibrate_probes: 2,
+        concurrency: 1, retries: 0)
+      words = (1..50).map { |i| "path#{i}" }
+      done = nil.as(D::DoneEvent?)
+      D::Engine.new("http://t/", words, RouteBackend.new(->(_t : String) { notfound }), cfg)
+        .run { |ev| done = ev if ev.is_a?(D::DoneEvent) }
+      d = done.not_nil!
+      d.budget_exhausted.should be_true
+      d.progress.queued.should be > 0
+    end
+
+    # The complement, and the reason this is not just `cap_reached?`: a run with NO cap, and a
+    # run whose cap was never binding, both finished — saying "budget exhausted" there would
+    # send the operator after a flag that was not the reason for anything.
+    it "is NOT set for an uncapped run, nor for a cap the run never reached" do
+      words = ["admin", "login"]
+      {nil.as(Int64?), 500_i64}.each do |cap|
+        cfg = D::Config.new(spider: false, bruteforce: true, max_requests: cap, calibrate_probes: 1,
+          concurrency: 1, retries: 0)
+        done = nil.as(D::DoneEvent?)
+        D::Engine.new("http://t/", words, RouteBackend.new(->(_t : String) { notfound }), cfg)
+          .run { |ev| done = ev if ev.is_a?(D::DoneEvent) }
+        done.not_nil!.budget_exhausted.should be_false
+        done.not_nil!.progress.queued.should eq(0)
+      end
+    end
+  end
+
+  # Mine's `mine_all_refused?` backstop, brought over. A target that accepts TCP and then
+  # answers nothing, under a budget small enough that only CALIBRATION probes ever ran,
+  # reported `done · 0 found · 9 sent · 0 errors` and exit 0: nine requests went out, nine got
+  # no response, and `handle_calibrate` — unlike `handle_probe`/`handle_crawl` — never recorded
+  # a reason, so `wholly_refused_reason` had nothing to name.
+  it "names the reason when the whole budget went on failing CALIBRATION probes" do
+    cfg = D::Config.new(spider: false, bruteforce: true, max_requests: 3_i64, calibrate_probes: 3,
+      concurrency: 1, retries: 2)
+    dead = R.new(Bytes.new(0), nil, nil, 0_i64, "no response from t:80")
+    engine = D::Engine.new("http://t/", ["admin", "login"], RouteBackend.new(->(_t : String) { dead }), cfg)
+    kinds, messages = terminal_of(engine)
+    kinds.should eq([:error]) # terminal — no Done for a consumer to settle "0 found" over
+    messages.first.should contain("no response from t:80")
+  end
+
+  # The complement of `successful_sends == 0`: a target that ANSWERED is not a failed run even
+  # when it held nothing, so a stray later error must not turn "found nothing" into an error.
+  it "still ends Done when the target answered but nothing was found" do
+    cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 1, concurrency: 1, retries: 0)
+    seen = 0
+    backend = RouteBackend.new(->(_t : String) do
+      seen += 1
+      seen > 3 ? R.new(Bytes.new(0), nil, nil, 0_i64, "no response from t:80") : notfound
+    end)
+    kinds, _ = terminal_of(D::Engine.new("http://t/", ["admin", "login"], backend, cfg))
+    kinds.last.should eq(:done)
+  end
+
   it "survives a backend that raises without hanging (worker rescue keeps @pending balanced)" do
     cfg = D::Config.new(spider: true, bruteforce: true, concurrency: 2, retries: 0, calibrate_probes: 1)
     engine = D::Engine.new("http://t/", ["admin"], RaisingBackend.new, cfg)

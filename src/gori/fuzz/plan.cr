@@ -58,6 +58,24 @@ module Gori::Fuzz
     # Raw template text, BEFORE `Env.expand` — the builder owns the expansion so it happens
     # exactly once (see `Plan.build`).
     property template : String
+    # PROVENANCE: this template is a CAPTURED FLOW's stored bytes, not a request the operator
+    # typed or edited. Identical in meaning and consequence to `Repeater::PlanOptions#evidence?`,
+    # and it exists for the same reason that one does: "send this capture to the fuzzer" is
+    # the main consumer of a captured flow, and the draft-time passes the replay path stopped
+    # running were still running here. Concretely, with it OFF a capture was
+    #
+    #   * REFUSED outright when its head carried a `$` nobody typed — OData `$filter`/`$top`,
+    #     Mongo `$where`, an `$IFS` shell probe, `$user.name` SSTI — and the refusal's own
+    #     remedy ("set the variable") would have SUBSTITUTED a value and swept a different
+    #     request; and
+    #   * silently un-desynced when its head was bare-LF terminated, because `expand_wire`
+    #     re-terminates a head with CRLF. `gori run repeater 3` replays that capture
+    #     byte-exact; `gori run fuzz 3` promoted it and reported a clean run.
+    #
+    # A `--request FILE` / stdin / TUI-editor template keeps the draft behaviour: those bytes
+    # ARE a draft, the editor's fresh lines really do end in LF, and a `$KEY` there is a
+    # variable reference the operator meant.
+    property? evidence : Bool
     # The origin the seeding flow implies, when there is one (nil for --request/stdin).
     property default_target : String?
     # An explicit target, which wins over `default_target` when non-blank.
@@ -88,6 +106,7 @@ module Gori::Fuzz
 
     def initialize(@template : String = "",
                    *,
+                   @evidence : Bool = false,
                    @default_target : String? = nil,
                    @target : String? = nil,
                    @auto_mark : Bool = false,
@@ -134,11 +153,18 @@ module Gori::Fuzz
     # {token, occurrence count} per `--mark`, in the order the marks were applied — the
     # CLI warns when one token silently matched several spots (including in headers).
     getter mark_matches : Array({String, Int32})
+    # The `update_content_length` pass will REWRITE a Content-Length the operator authored —
+    # i.e. the template's declared CL already disagrees with its own body BEFORE any payload
+    # is substituted, which only happens on purpose. Computed here rather than discovered per
+    # request so a surface can say it ONCE, up front, and name the flag that turns it off.
+    # False when the knob is already off, or when the declared length was correct anyway.
+    getter? rewrites_content_length : Bool
 
     def initialize(@engine : Engine, @generator : Generator, @matcher : Matcher,
                    @config : Config, @origin : Origin, @template : Template,
                    @http2 : Bool, @request_target : String,
-                   @mark_matches : Array({String, Int32}), @pool : ConnPool? = nil)
+                   @mark_matches : Array({String, Int32}), @pool : ConnPool? = nil,
+                   @rewrites_content_length : Bool = false)
     end
 
     # Candidate request count, or nil when unknown / Int64-overflowing. Reads the payload
@@ -159,8 +185,18 @@ module Gori::Fuzz
       # in the same session, sent CRLF. A bare LF is itself a front-end/back-end desync
       # primitive, so it does not merely look untidy — it confounds every result the sweep
       # produces. The body is left byte-exact either way; `expand_wire` only touches the head.
-      refuse_unresolved(Env.unresolved_wire(options.template))
-      text = String.new(Env.expand_wire(options.template))
+      #
+      # BOTH steps are skipped for EVIDENCE (`PlanOptions#evidence?`): a captured head's `$`
+      # was not typed by anyone, and its terminators are already exact wire bytes. The
+      # marking, template parse and payload splice below are unchanged either way — a
+      # position is a position whether the operator marked it in an editor or `--auto`
+      # found it in a capture.
+      text = if options.evidence?
+               options.template
+             else
+               refuse_unresolved(Env.unresolved_wire(options.template))
+               String.new(Env.expand_wire(options.template))
+             end
       text = Template.auto_mark(text) if options.auto_mark?
       marker = Template::MARKER
       mark_matches = options.marks.map do |tok|
@@ -204,7 +240,9 @@ module Gori::Fuzz
       new(engine: Engine.new(generator, matcher, sender, config), generator: generator,
         matcher: matcher, config: config, origin: origin, template: template,
         http2: options.http2?, request_target: request_target, mark_matches: mark_matches,
-        pool: sender.pool)
+        pool: sender.pool,
+        rewrites_content_length: config.update_content_length? &&
+                                 generator.baseline_request != generator.baseline_raw)
     end
 
     # The explicit target when it has one, else the seeding flow's. Blank counts as absent

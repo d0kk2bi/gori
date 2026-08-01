@@ -164,6 +164,45 @@ describe "plan builders refuse an unresolved env token (#519)" do
     end
   end
 
+  # …and the complement, which is what those three were missing. "Send this capture to the
+  # fuzzer / miner / sequencer" is the MAIN consumer of a captured flow, and the refusal above
+  # made every OData / Mongo / SSTI capture unsweepable while `gori run repeater <same-flow>`
+  # replayed it fine. Same `evidence?` flag, same meaning and same two policies as
+  # `Repeater::PlanOptions#evidence?` — see spec/repeater/evidence_provenance_spec.cr.
+  it "Fuzz::Plan.build does NOT refuse, and does not substitute, on EVIDENCE" do
+    with_vars([{"filter", "PWNED"}]) do
+      options = Gori::Fuzz::PlanOptions.new(
+        "GET /a?$filter=§x§&$top=10 HTTP/1.1\r\nHost: t.test\r\nAuth: Bearer $SESSION\r\n\r\n",
+        evidence: true, target: "http://t.test",
+        sources: [Gori::Fuzz::InlineList.new(["p"])] of Gori::Fuzz::PayloadSource)
+      plan = Gori::Fuzz::Plan.build(options, ungated)
+      wire = String.new(plan.generator.baseline_request)
+      wire.should contain("$filter=")
+      wire.should contain("$top=10")
+      wire.should contain("Bearer $SESSION")
+      wire.should_not contain("PWNED")
+    end
+  end
+
+  it "Miner::Plan.build does NOT refuse, and keeps a bare-LF head, on EVIDENCE" do
+    with_vars([{"where", "XX"}]) do
+      raw = "POST /a HTTP/1.1\nHost: t.test\nContent-Length: 9\n\n{\"$where\"}"
+      options = Gori::Miner::PlanOptions.new(raw, evidence: true, target: "http://t.test")
+      String.new(Gori::Miner::Plan.build(options, ungated).request).should eq(raw)
+    end
+  end
+
+  it "Sequencer::Plan.build does NOT refuse, and keeps a bare-LF head, on EVIDENCE" do
+    with_vars([{"top", "9"}]) do
+      raw = "GET /a?$top=10 HTTP/1.1\nHost: t.test\nAuth: $SESSION\n\n"
+      loc = Gori::Sequencer::TokenLoc.new(kind: Gori::Sequencer::ExtractKind::Cookie, selector: "sid")
+      config = Gori::Sequencer::Config.new(mode: Gori::Sequencer::Mode::LiveReplay, token_loc: loc, goal: 10)
+      options = Gori::Sequencer::PlanOptions.new(raw.to_slice, evidence: true,
+        target: "http://t.test", config: config)
+      String.new(Gori::Sequencer::Plan.build(options, ungated).request).should eq(raw)
+    end
+  end
+
   it "Discover::Plan.build refuses an unresolved SEED and names the token" do
     with_vars([] of {String, String}) do
       options = Gori::Discover::PlanOptions.new("$SEED/api")
