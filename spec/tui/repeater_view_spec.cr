@@ -851,6 +851,25 @@ describe Gori::Tui::RepeaterView do
     end
   end
 
+  it "keeps an unsaved message edit when a peer's request-side change reconciles in" do
+    # `apply_peer_request` runs on every cross-session request-side change and re-seeds the
+    # message pane. Adopting the peer's messages under an unsaved local edit would send
+    # THEIRS while showing OURS — the pane's own `set_text` guard already refused to clobber
+    # the text, and the seed has to refuse alongside it.
+    view = RepeaterView.new
+    ws = "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n"
+    view.restore("https://ws.test", ws, false, true,
+      ws_messages: [Gori::Store::WsOutMessage.text("mine")])
+    view.focus_pane(:request) # restore lands on :target; the message pane is under :request
+    view.edit_insert('!')
+    String.new(view.ws_out_messages[0].payload).should eq("!mine")
+
+    view.apply_peer_request("https://ws.test", ws + "X-Peer: 1\r\n", false, true,
+      ws_messages: [Gori::Store::WsOutMessage.text("theirs")])
+    view.ws_out_messages.size.should eq(1)
+    String.new(view.ws_out_messages[0].payload).should eq("!mine")
+  end
+
   it "allows editing both handshake request and messages in ws_mode" do
     repeater_tmp_store do |store|
       id = store.insert_flow(Gori::Store::CapturedRequest.new(

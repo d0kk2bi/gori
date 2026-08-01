@@ -516,11 +516,17 @@ module Gori::Tui
     # Install a session's outbound messages as both the seed and the pane's text. The pane
     # shows the TEXT frames only — a binary payload rendered into a TextArea is noise the
     # operator cannot meaningfully edit, and writing it back was how it became opcode 1.
+    #
+    # A soft reconcile (`apply_peer_request`) reaches this on every peer request-side change,
+    # so an UNSAVED local edit is left alone — the same guard the pane's `set_text` already
+    # had. Adopting the peer's seed under it would send their messages while showing ours.
     private def seed_ws_out(messages : Array(Store::WsOutMessage)) : Nil
+      joined = messages.select(&.text?).join('\n') { |m| String.new(m.payload) }
+      same = @decoded.text == TextArea.normalize_lf(joined)
+      return if @ws_out_edited && !same
+      @decoded.set_text(joined) unless same
       @ws_out_seed = messages
       @ws_out_edited = false
-      joined = messages.select(&.text?).join('\n') { |m| String.new(m.payload) }
-      @decoded.set_text(joined) if @decoded.text != TextArea.normalize_lf(joined)
     end
 
     # The env tokens in the outbound message lines that resolve to nothing — what
