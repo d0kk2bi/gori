@@ -1127,7 +1127,8 @@ module Gori
               "ACTIVE: makes a real outbound connection. The handshake response is persisted on " \
               "the repeater, while the outbound message template is left unchanged." do |s|
               s.field "repeater_id", intprop("WebSocket repeater database id"), required: true
-              s.field "messages", strarrprop("optional outbound text-message override; stored repeater messages are used when absent")
+              s.field "messages", ws_out_messages_prop("optional outbound message override; stored repeater messages are used when absent")
+              s.field "keep_sec_websocket_key", boolprop("send the repeater request's OWN Sec-WebSocket-Key instead of a fresh one, so an absent/short/duplicate/non-base64 key can be tested (default: the repeater's stored setting, itself false)")
               s.field "idle_ms", intprop("server-silence timeout after the first inbound frame (100-60000 ms; default 3000)")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
               s.field "allow_unscoped", boolprop("connect even when the target host is outside (or without) a configured scope (default false)")
@@ -1145,6 +1146,7 @@ module Gori
               s.field "sni", strprop("optional TLS Server Name Indication override")
               s.field "name", strprop("optional custom name for the repeater tab")
               s.field "ws_out_messages", ws_out_messages_prop
+              s.field "ws_keep_key", boolprop("WebSocket: send this session's own Sec-WebSocket-Key instead of a fresh one (default false)")
             end
 
             tool j, "update_repeater", "Update an existing repeater tab's properties by database id." do |s|
@@ -1157,6 +1159,7 @@ module Gori
               s.field "name", strprop("custom name for the repeater tab")
               s.field "tags", strprop("free-text tags for grouping tabs (the TUI subtab label); empty string clears them")
               s.field "ws_out_messages", ws_out_messages_prop
+              s.field "ws_keep_key", boolprop("WebSocket: send this session's own Sec-WebSocket-Key instead of a fresh one")
             end
 
             tool j, "delete_repeater", "Delete a repeater tab by database id." do |s|
@@ -2183,15 +2186,23 @@ module Gori
         JSON.parse(%({"description":#{desc.to_json},"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]}))
       end
 
-      # `ws_out_messages`: the string forms are TEXT frames, and the object form is how a
-      # BINARY frame (protobuf/msgpack/CBOR/MQTT-over-WS) is expressed — the only shape this
-      # argument could carry before was opcode 1.
-      private def ws_out_messages_prop : JSON::Any
-        desc = "outbound WebSocket messages. A string (or an array of strings, or a " \
-               "newline-separated string) is a TEXT frame; an object " \
-               "{\"payload_base64\": \"…\"} is a BINARY frame, with an optional " \
-               "\"opcode\" to override the frame type"
-        JSON.parse(%({"description":#{desc.to_json},"oneOf":) +
+      # `ws_out_messages` / `send_websocket`'s `messages`. A plain string stays a plain TEXT
+      # frame and always will: the moment a marker prefix meant something, a payload starting
+      # with it would become unsendable, and being able to send the bytes you typed is P0 here.
+      # Everything else is opt-in — the object form for a caller building JSON, and the same
+      # `key=value` spec `gori run repeater send --message-frame` takes for a caller writing a
+      # string. Both exist because opcode 1 / FIN=1 / RSV=0 / masked / honest-length was the
+      # ONLY frame this argument could ever produce.
+      private def ws_out_messages_prop(desc : String? = nil) : JSON::Any
+        d = desc || "outbound WebSocket messages"
+        d += ". A plain string (or an array of them, or a newline-separated string) is a " \
+             "TEXT frame. For any other frame shape use either an object " \
+             "{opcode, text|payload_base64|payload_hex, fin, rsv, mask, mask_key, declared_len} " \
+             "or a spec string \"opcode=ping,text=hi\" (fields: opcode=text|bin|cont|close|" \
+             "ping|pong|0-15, fin=0|1, rsv=0-7 (RSV1=4), mask=0|1, mask_key=<hex>, " \
+             "len=<declared length>, and one of hex=|b64=|text=; text= runs to the end). " \
+             "declared_len/len sets the LENGTH HEADER independently of the payload"
+        JSON.parse(%({"description":#{d.to_json},"oneOf":) +
                    %([{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},{"type":"string"}]}))
       end
 

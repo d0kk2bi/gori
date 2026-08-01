@@ -333,6 +333,14 @@ module Gori
         end
       end
 
+      # A CLOSE frame's status code (RFC 6455 §5.5.1), or nil for any other frame. Not
+      # `WsMessage#close_code` because a transcript row is a `WsEngine::Message`, which never
+      # went through the store.
+      private def ws_close_code(m : Repeater::WsEngine::Message) : Int32?
+        return nil unless m.opcode == 8 && m.payload.size >= 2
+        (m.payload[0].to_i << 8) | m.payload[1].to_i
+      end
+
       # One redaction policy across Flow, Repeater, and send_request responses.
       private def sensitive_header?(name : String) : Bool
         Serialize.sensitive_header?(name)
@@ -361,35 +369,38 @@ module Gori
         return Result.new(id_error(h, "idle_ms"), is_error: true) if idle_ms.nil? && present?(h, "idle_ms")
         idle = (idle_ms || 3000_i64).clamp(100_i64, 60_000_i64).milliseconds
 
-        out_messages = if present?(h, "messages")
-                         arr = h["messages"]?.try(&.as_a?)
-                         return Result.new("invalid 'messages' (expected an array of strings)", is_error: true) unless arr
-                         texts = [] of String
-                         arr.each do |item|
-                           text = item.as_s?
-                           return Result.new("invalid 'messages' (expected an array of strings)", is_error: true) unless text
-                           texts << text
-                         end
-                         if e = ws_unresolved_env_error(texts, "messages")
-                           return e
-                         end
-                         texts.map { |t| Repeater::WsEngine::OutMsg.new(1, Env.expand(t).to_slice) }
-                       else
-                         stored = store.ws_messages_for_repeater(repeater_id).select { |m| m.direction == "out" }
-                         if e = ws_unresolved_env_error(stored.select(&.text?).map { |m| String.new(m.payload) },
-                              "repeater_id")
-                           return e
-                         end
-                         # No `.scrub`: `Env.expand` scans BYTES and copies every span that is
-                         # not a matched token through unchanged, so an invalid-UTF-8 TEXT
-                         # payload — the §8.1/§5.6 validation test case — reaches the wire as
-                         # the operator captured it. Scrubbing rewrote it to U+FFFD, changing
-                         # 9 bytes into 13, and sent that with no warning.
-                         stored.map do |m|
-                           payload = m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload
-                           Repeater::WsEngine::OutMsg.new(m.opcode, payload)
-                         end
-                       end
+        # ONE list, whether it came from the call or from the session, so the shape handling
+        # below cannot diverge between them. `messages` now accepts every form
+        # `ws_out_messages` does — a bare string is still a plain TEXT frame, and the object /
+        # `WsFrameSpec` forms are what make a PING, a CLOSE with a chosen code, an unmasked
+        # client frame or a lying length header expressible from MCP at all. Until now every
+        # entry became `OutMsg.new(1, …)`, so this tool could send exactly one frame shape.
+        source = [] of Store::WsOutMessage
+        field = "repeater_id"
+        if present?(h, "messages")
+          arr = h["messages"]?.try(&.as_a?)
+          return Result.new("invalid 'messages' (expected an array of strings or objects)", is_error: true) unless arr
+          arr.each do |item|
+            msg = ws_out_message_item(item)
+            return Result.new("invalid 'messages' entry #{item.to_json}", is_error: true) unless msg
+            source << msg
+          end
+          field = "messages"
+        else
+          source = store.ws_messages_for_repeater(repeater_id).select { |m| m.direction == "out" }
+            .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
+        end
+        if e = ws_unresolved_env_error(source.select(&.text?).map { |m| String.new(m.payload) }, field)
+          return e
+        end
+        # No `.scrub`: `Env.expand` scans BYTES and copies every span that is not a matched
+        # token through unchanged, so an invalid-UTF-8 TEXT payload — the §8.1/§5.6 validation
+        # test case — reaches the wire as the operator captured it. Scrubbing rewrote it to
+        # U+FFFD, changing 9 bytes into 13, and sent that with no warning.
+        out_messages = source.map do |m|
+          payload = m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload
+          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape)
+        end
 
         # Scope gate before the outbound handshake (same policy as send_request).
         ob = outbound(bool(h, "allow_unscoped") || false)
@@ -416,7 +427,10 @@ module Gori
           store.add_link(Store::LinkOwnerKind::Issue, issue_id,
             Store::LinkRefKind::Repeater, repeater_id)
         end
-        result = plan.send_ws(out_messages, idle)
+        # The session's stored setting, overridable per call — a handshake test wants to run
+        # it both ways against the same session without editing the session.
+        keep_key = present?(h, "keep_sec_websocket_key") ? (bool(h, "keep_sec_websocket_key") || false) : repeater.ws_keep_key?
+        result = plan.send_ws(out_messages, idle, keep_key)
 
         store.update_repeater_response(repeater_id, result.handshake_head, Bytes.empty,
           result.error, result.duration_us)
@@ -451,6 +465,16 @@ module Gori
                     j.field "direction", message.direction
                     j.field "opcode", message.opcode
                     j.field "type", Serialize.ws_frame_type(message.opcode)
+                    # What was actually FRAMED, not just what was meant. An agent driving a
+                    # §5.1/§5.2/§5.4 test has to be able to read back that the unmasked frame,
+                    # the RSV1 bit or the lying length header really went out — a transcript
+                    # that only echoes the payload is asking to be taken on trust.
+                    j.field "frame", Store::WsOutMessage.new(message.opcode, message.payload, message.shape).shape_label
+                    if code = ws_close_code(message)
+                      j.field "close_code", code
+                      reason = message.payload[2, message.payload.size - 2]
+                      j.field "close_reason", Serialize.text(String.new(reason).scrub) unless reason.empty?
+                    end
                     if message.opcode == 1
                       j.field "payload", Env.mask_secrets(String.new(message.payload).scrub)
                       # JSON-RPC has no way to carry a byte that is not valid UTF-8, so

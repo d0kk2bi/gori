@@ -72,8 +72,10 @@ module Gori
       getter opcode : Int32
       getter payload : Bytes
       getter reply : Channel(Nil)
+      getter shape : WsShape
 
-      def initialize(@flow_id, @repeater_id, @created_at, @direction, @opcode, @payload, @reply)
+      def initialize(@flow_id, @repeater_id, @created_at, @direction, @opcode, @payload, @reply,
+                     @shape : WsShape = WsShape::DEFAULT)
       end
     end
 
@@ -329,9 +331,11 @@ module Gori
 
     # Records one captured WebSocket message for a flow. Blocks until committed
     # (the forward already happened, so the peer is not delayed).
-    def insert_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes, repeater_id : Int64? = nil) : Nil
+    def insert_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                          repeater_id : Int64? = nil,
+                          shape : WsShape = WsShape::DEFAULT) : Nil
       reply = Channel(Nil).new(1) # buffered: the writer must never block sending a reply
-      @writes.send(InsertWs.new(flow_id, repeater_id, now_us, direction, opcode, payload, reply))
+      @writes.send(InsertWs.new(flow_id, repeater_id, now_us, direction, opcode, payload, reply, shape))
       reply.receive
     rescue Channel::ClosedError
       nil
@@ -842,9 +846,42 @@ module Gori
       empty = op.payload.empty?
       args = [op.flow_id, op.repeater_id, op.created_at, op.direction, op.opcode] of DB::Any
       args << op.payload unless empty
+      Store.bind_ws_shape(args, op.shape)
       conn.exec(
-        "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload) " \
-        "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"})", args: args)
+        "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
+        "fin, rsv, masked, mask_key, frames, declared_len) " \
+        "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"},?,?,?,?,?,?)", args: args)
+    end
+
+    # The six V7 shape columns, in the order every `ws_messages` INSERT lists them. Shared
+    # by the capture writer and `update_repeater_ws_messages` so a captured frame and the
+    # repeater row seeded from it cannot drift apart.
+    #
+    # An empty `mask_key` binds SQL NULL (an empty Bytes is a null pointer — the same trap
+    # `payload` has), which would read back as "no key" rather than "the all-zero key". A
+    # zero-length key is not a shape anything produces, so it is normalised to NULL here
+    # rather than given an X'' branch of its own.
+    def self.bind_ws_shape(args : Array(DB::Any), shape : WsShape) : Nil
+      args << (shape.fin ? 1_i64 : 0_i64)
+      args << shape.rsv.to_i64
+      args << shape.masked.try { |m| m ? 1_i64 : 0_i64 }
+      key = shape.mask_key
+      args << (key && !key.empty? ? key : nil)
+      args << shape.frames.to_i64
+      args << shape.declared_len.try(&.to_i64)
+    end
+
+    # The same six columns read back. `masked` stays nilable: a pre-V7 row genuinely does
+    # not know whether the frame was masked, which is not the same as knowing it was not.
+    def self.read_ws_shape(rs : DB::ResultSet) : WsShape
+      fin = rs.read(Int64) != 0
+      rsv = rs.read(Int64).to_i
+      masked = rs.read(Int64?).try { |m| m != 0 }
+      mask_key = rs.read(Bytes?)
+      frames = rs.read(Int64).to_i
+      declared = rs.read(Int64?).try(&.to_i)
+      WsShape.new(fin: fin, rsv: rsv, masked: masked, mask_key: mask_key,
+        frames: frames, declared_len: declared)
     end
 
     private def now_us : Int64

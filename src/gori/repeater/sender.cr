@@ -110,7 +110,8 @@ module Gori
       end
 
       def send_ws(upgrade : Bytes, messages : Array(WsEngine::OutMsg),
-                  idle : Time::Span = WsEngine::DEFAULT_IDLE) : WsEngine::Result
+                  idle : Time::Span = WsEngine::DEFAULT_IDLE,
+                  keep_key : Bool = false) : WsEngine::Result
         if reason = refusal(upgrade)
           return WsEngine::Result.new(Bytes.new(0), [] of WsEngine::Message, 0_i64, reason)
         end
@@ -127,7 +128,7 @@ module Gori
         end
         WsEngine.send(Gori::Env.expand_bindings(upgrade), expand_messages(messages),
           scheme: @scheme, host: @host, port: @port, verify_upstream: @verify, sni: @sni,
-          idle: idle, overrides: @overrides)
+          idle: idle, overrides: @overrides, keep_key: keep_key)
       end
 
       # The first declared-but-unbound name across the outgoing frames, as a refusal.
@@ -144,7 +145,10 @@ module Gori
       private def expand_messages(messages : Array(WsEngine::OutMsg)) : Array(WsEngine::OutMsg)
         messages.map do |m|
           expanded = Gori::Env.expand_bindings(String.new(m.payload), guard_boundary: false).to_slice
-          expanded == m.payload ? m : WsEngine::OutMsg.new(m.opcode, expanded)
+          # `m.shape` rides along. Rebuilding without it silently reset every frame a binding
+          # touched back to FIN=1/RSV=0/fresh-mask — the exact shape this round exists to stop
+          # being the only one.
+          expanded == m.payload ? m : WsEngine::OutMsg.new(m.opcode, expanded, m.shape)
         end
       end
 

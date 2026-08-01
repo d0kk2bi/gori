@@ -98,6 +98,7 @@ module Gori
         auto_cl = true
         flow_id : Int64? = nil
         sni : String? = nil
+        ws_keep_key = false
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run repeater create [options]"
@@ -117,6 +118,7 @@ module Gori
           p.on("--no-auto-cl", "Do not auto-calculate Content-Length header") { auto_cl = false }
           p.on("--flow=ID", "Optional original flow ID this repeater stems from") { |v| flow_id = parse_flow_id(v, "gori run repeater create") }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
+          p.on("--ws-keep-key", "WebSocket: send the request's own Sec-WebSocket-Key instead of a fresh one (lets an absent/short/duplicate/non-base64 key be tested)") { ws_keep_key = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.invalid_option { |f| abort "gori run repeater create: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run repeater create: missing value for #{f}" }
@@ -168,7 +170,7 @@ module Gori
               # non-toy WS apps), and a TEXT frame carrying invalid UTF-8 — the §8.1/§5.6
               # validation payload — was silently rewritten to U+FFFD before it was even stored.
               ws_messages = store.ws_messages(fid).select { |m| m.direction == "out" }
-                .map { |m| Store::WsOutMessage.new(m.opcode, m.payload) }
+                .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, Run.seed_shape(m.shape)) }
             end
           end
 
@@ -183,7 +185,8 @@ module Gori
             auto_cl: auto_cl,
             flow_id: flow_id,
             position: pos.to_i32,
-            sni: sni
+            sni: sni,
+            ws_keep_key: ws_keep_key
           )
 
           abort "gori run repeater create: failed to create repeater session" if id == 0
@@ -312,10 +315,14 @@ module Gori
         insecure = false
         do_diff = false
         format = :text
-        ws_messages = [] of String
+        # `--message` and `--message-frame` share ONE list so their relative ORDER is the send
+        # order. A WebSocket exchange is a sequence, and two lists merged afterwards would
+        # silently reorder a fragment ahead of the CONT that finishes it.
+        ws_messages = [] of Store::WsOutMessage
         idle_ms : Int64? = nil
         allow_unscoped = false
         verbatim = false
+        ws_keep_key = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -328,7 +335,9 @@ module Gori
           p.on("--diff", "Diff the new response against the session's last stored response") { do_diff = true }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--verbatim", "Send the stored bytes EXACTLY: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync, no HTTP/2→1.1 version fix, and on h2 no field-name lowercasing") { verbatim = true }
-          p.on("--message=TEXT", "WebSocket: outbound text message (repeatable; replaces the session's stored messages)") { |v| ws_messages << v }
+          p.on("--message=TEXT", "WebSocket: outbound text message (repeatable; replaces the session's stored messages)") { |v| ws_messages << Store::WsOutMessage.text(v) }
+          p.on("--message-frame=SPEC", "WebSocket: one outbound frame with an explicit shape (repeatable; mixes with --message in order). SPEC is comma-separated key=value: opcode=text|bin|cont|close|ping|pong|<0-15>, fin=0|1, rsv=0-7, mask=0|1, mask_key=<hex>, len=<declared length>, and one of hex=|b64=|text= (text= runs to the end of SPEC). Example: opcode=close,hex=03ea6279650a") { |v| ws_messages << parse_message_frame(v) }
+          p.on("--ws-keep-key", "WebSocket: send the request's own Sec-WebSocket-Key instead of a fresh one (overrides the session's stored setting for this send)") { ws_keep_key = true }
           p.on("--idle-ms=N", "WebSocket: server-silence timeout after the first inbound frame (100-60000, default 3000)") { |v| idle_ms = parse_count(v, "--idle-ms").to_i64 }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -366,7 +375,7 @@ module Gori
 
         if plan.websocket?
           cmd_repeater_send_ws(id, plan, project_name, db_path, idle_ms, ws_messages, outbound, format,
-            verbatim)
+            verbatim, ws_keep_key || rec.ws_keep_key?)
           return
         end
 
@@ -391,9 +400,9 @@ module Gori
       # script gets the same exchange whether it drives gori via CLI or MCP.
       private def self.cmd_repeater_send_ws(id : Int64, plan : Repeater::Plan, project_name : String?,
                                             db_path : String?, idle_ms : Int64?,
-                                            message_override : Array(String),
+                                            message_override : Array(Store::WsOutMessage),
                                             outbound : Gori::Outbound, format : Symbol,
-                                            verbatim : Bool) : Nil
+                                            verbatim : Bool, keep_key : Bool) : Nil
         abort_if_blocked!(plan, "gori run repeater send")
 
         store = open_store(resolve_read_project(project_name, db_path))
@@ -404,7 +413,7 @@ module Gori
         end
 
         idle = (idle_ms || 3000_i64).clamp(100_i64, 60_000_i64).milliseconds
-        result = plan.send_ws(out_messages, idle)
+        result = plan.send_ws(out_messages, idle, keep_key)
         outbound.close
 
         # Persist ONLY on success — parity with the TUI (repeater_controller#drain_results):
@@ -441,20 +450,49 @@ module Gori
       # that is not a matched token through unchanged (its own header says so), so a TEXT
       # frame carrying invalid UTF-8 survives to the wire; scrubbing it turned 9 bytes into
       # 13 and sent those instead, with no warning.
-      private def self.ws_out_messages(store : Store, id : Int64, override : Array(String),
+      private def self.ws_out_messages(store : Store, id : Int64,
+                                       override : Array(Store::WsOutMessage),
                                        verbatim : Bool = false) : Array(Repeater::WsEngine::OutMsg)
-        unless override.empty?
-          refuse_unresolved_ws(override, id) unless verbatim
-          return override.map do |t|
-            Repeater::WsEngine::OutMsg.new(1, verbatim ? t.to_slice : Env.expand(t).to_slice)
-          end
-        end
-        stored = store.ws_messages_for_repeater(id).select { |m| m.direction == "out" }
-        refuse_unresolved_ws(stored.select(&.text?).map { |m| String.new(m.payload) }, id) unless verbatim
-        stored.map do |m|
+        source = if override.empty?
+                   store.ws_messages_for_repeater(id).select { |m| m.direction == "out" }
+                     .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
+                 else
+                   override
+                 end
+        refuse_unresolved_ws(source.select(&.text?).map { |m| String.new(m.payload) }, id) unless verbatim
+        source.map do |m|
           payload = m.text? && !verbatim ? Env.expand(String.new(m.payload)).to_slice : m.payload
-          Repeater::WsEngine::OutMsg.new(m.opcode, payload)
+          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape)
         end
+      end
+
+      # `--message-frame`. The grammar is shared with MCP (`Repeater::WsFrameSpec`) so a
+      # script gets the same frame whichever surface it drives.
+      private def self.parse_message_frame(spec : String) : Store::WsOutMessage
+        msg, err = Repeater::WsFrameSpec.parse(spec)
+        return msg if msg
+        abort "gori run repeater send: #{err || "could not read --message-frame #{spec.inspect}"}"
+      end
+
+      # The shape a CAPTURED out-frame seeds a repeater session with.
+      #
+      # `rsv` and `fin` carry across — replaying an RSV1 frame as RSV1 is the whole point of
+      # recording it. The MASK KEY deliberately does not: a masking key is a nonce (§5.3
+      # wants it unpredictable), so pinning the captured one onto every future send of this
+      # session would be a fixed nonce nobody asked for. `frames` is capture-only — the
+      # repeater sends one frame per message, and claiming otherwise would be a lie the send
+      # path cannot honour.
+      #
+      # `masked` carries across ONLY when it is false. `masked: true` is the encoder's own
+      # default for a client frame, so seeding it states nothing — but it is not `nil`, so a
+      # `Shape#default?` reader (the TUI's "can this be one editable line?" test) called every
+      # ordinary captured TEXT frame unusual and pushed it out of the message pane. The built
+      # TUI is what showed that: `+7 not shown: TEXT, TEXT rsv=4, …` over an empty pane. A
+      # client frame that arrived UNMASKED is a real §5.1 violation and replaying it IS the
+      # test, so that one is stated.
+      def self.seed_shape(shape : Store::WsShape) : Store::WsShape
+        Store::WsShape.new(fin: shape.fin, rsv: shape.rsv,
+          masked: shape.masked == false ? false : nil)
       end
 
       # Refuse a WS send whose TEXT payloads still name a var that resolves to nothing,
@@ -475,6 +513,40 @@ module Gori
               env_unresolved_error(Env.token_list(names), " in a WebSocket message for session ##{id}")
       end
 
+      # One transcript row. An ordinary masked TEXT frame prints as bare text, exactly as it
+      # always did; anything else names its shape first, because the whole point of being able
+      # to send a PING or an unmasked frame is being able to read back that you did.
+      private def self.ws_transcript_line(m : Repeater::WsEngine::Message) : String
+        arrow = m.direction == "out" ? "→" : "←"
+        return "#{arrow} #{scrub(m.payload)}" if m.opcode == 1 && m.shape.default?
+        label = Store::WsOutMessage.new(m.opcode, m.payload, m.shape).shape_label
+        body =
+          case m.opcode
+          when 1 then scrub(m.payload)
+          when 2 then "#{m.payload.size} bytes 0x#{m.payload[0, {m.payload.size, 32}.min].hexstring}"
+          else
+            # A control frame. Until this round none of these reached a transcript at all, so
+            # the payload — a CLOSE's code and reason above all — is printed, not counted.
+            ws_control_payload_text(m.opcode, m.payload)
+          end
+        "#{arrow} [#{label}] #{body}"
+      end
+
+      # A control frame's payload for the text transcript: a CLOSE's 2-byte code plus its
+      # reason, else the bytes.
+      private def self.ws_control_payload_text(opcode : Int32, payload : Bytes) : String
+        return "(no payload)" if payload.empty?
+        # Only a CLOSE has a status code. Reading the first two bytes of a PING as one is how
+        # `PING "hi there"` would be reported as `close 26728`.
+        if opcode == 8 && payload.size >= 2
+          code = (payload[0].to_i << 8) | payload[1].to_i
+          rest = payload.size > 2 ? String.new(payload[2, payload.size - 2]).scrub : ""
+          return rest.empty? ? "code #{code}" : "code #{code} #{CLI::Output.term_safe(rest)}"
+        end
+        s = String.new(payload)
+        s.valid_encoding? ? CLI::Output.term_safe(s) : "0x#{payload.hexstring}"
+      end
+
       private def self.emit_ws_result(id : Int64, result : Repeater::WsEngine::Result, format : Symbol) : Nil
         if format == :json
           puts(JSON.build do |j|
@@ -491,6 +563,7 @@ module Gori
                     j.object do
                       j.field "direction", m.direction
                       j.field "opcode", m.opcode
+                      j.field "frame", Store::WsOutMessage.new(m.opcode, m.payload, m.shape).shape_label
                       if m.opcode == 1
                         j.field "text", scrub(m.payload)
                         # JSON has no way to carry a byte that is not valid UTF-8, so `text`
@@ -512,14 +585,7 @@ module Gori
         elsif result.ok?
           STDERR.puts "→ WebSocket upgraded=#{result.upgraded?} in #{CLI::Output.human_us(result.duration_us)}#{result.close_code ? " (close #{result.close_code})" : ""}"
           STDERR.puts "note: #{result.note}" if result.note
-          result.messages.each do |m|
-            arrow = m.direction == "out" ? "→" : "←"
-            if m.opcode == 1
-              puts "#{arrow} #{scrub(m.payload)}"
-            else
-              puts "#{arrow} [binary frame, #{m.payload.size} bytes]"
-            end
-          end
+          result.messages.each { |m| puts ws_transcript_line(m) }
         else
           STDERR.puts "repeater failed: #{result.error}"
         end

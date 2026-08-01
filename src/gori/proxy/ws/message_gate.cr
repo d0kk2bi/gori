@@ -91,7 +91,13 @@ module Gori::Proxy::WS
       # The queue entry, while a human still owns the decision.
       property item : Gori::Interceptor::Item?
 
-      def initialize(@opcode : UInt8, @payload : Bytes, @raw : Bytes?)
+      # The frame shape the message ARRIVED in (V7). Kept beside `raw` and released with it:
+      # an unedited forward puts the sender's own frames back on the wire, so the capture row
+      # must claim the sender's RSV bits and fragment count, and an edited one must not.
+      getter shape : WS::Shape
+
+      def initialize(@opcode : UInt8, @payload : Bytes, @raw : Bytes?,
+                     @shape : WS::Shape = WS::Shape::DEFAULT)
       end
     end
 
@@ -121,16 +127,17 @@ module Gori::Proxy::WS
     # `raw` is the sender's own frame bytes when they are still usable; `payload` is what
     # would go out. The pump owns both only until this returns, so anything the gate keeps is
     # duplicated here.
-    def submit(opcode : UInt8, payload : Bytes, raw : Bytes?) : Nil
+    def submit(opcode : UInt8, payload : Bytes, raw : Bytes?,
+               shape : WS::Shape = WS::Shape::DEFAULT) : Nil
       @mutex.synchronize do
         return if @closed
         held = holds?(payload)
         if !held && @queue.empty?
-          write_message(opcode, payload, raw)
+          write_message(opcode, payload, raw, shape)
           return
         end
         kept = payload.dup
-        slot = Slot.new(opcode, kept, raw)
+        slot = Slot.new(opcode, kept, raw, shape)
         item = held ? start_hold(opcode, kept) : nil
         if item
           slot.item = item
@@ -298,19 +305,22 @@ module Gori::Proxy::WS
       # An edit is re-framed as ONE frame: once the length changes the sender's fragmentation
       # cannot be reproduced, and a client → server frame is re-masked with a fresh key
       # (RFC 6455 §5.3), exactly as step 1's rewrite path already does.
-      @lost += 1 unless write_message(slot.opcode, bytes, bytes == slot.payload ? slot.raw : nil)
+      unedited = bytes == slot.payload
+      @lost += 1 unless write_message(slot.opcode, bytes, unedited ? slot.raw : nil,
+                          unedited ? slot.shape : WS::Shape.new(masked: @mask))
     end
 
     # True iff the bytes reached the socket. A failed write leaves NO capture row on purpose:
     # a `ws_messages` row is gori's claim that the peer saw these bytes, and inventing one for
     # a write that raised would be the same class of lie as the teardown line this replaced.
     # The teardown log counts the loss instead.
-    private def write_message(opcode : UInt8, payload : Bytes, raw : Bytes?) : Bool
+    private def write_message(opcode : UInt8, payload : Bytes, raw : Bytes?,
+                              shape : WS::Shape = WS::Shape::DEFAULT) : Bool
       @dst.write(raw || WS.encode(opcode, payload, mask: @mask, fin: true))
       @dst.flush
       # Record what gori WROTE, not what arrived — the same way step 1's rewrite path keeps
-      # P7. The capture has to be the bytes the peer actually sees.
-      @sink.on_ws_message(@flow_id, @direction, opcode.to_i, payload.dup)
+      # P7. The capture has to be the bytes the peer actually sees, framing included.
+      @sink.on_ws_message(@flow_id, @direction, opcode.to_i, payload.dup, shape)
       true
     rescue
       false

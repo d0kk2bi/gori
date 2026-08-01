@@ -640,7 +640,53 @@ module Gori
         SQL
       ]
 
-      MIGRATIONS = [V1, V2, V3, V4, V5, V6]
+      # WebSocket frame SHAPE, on both halves of `ws_messages` — the capture rows and the
+      # repeater-session rows that share the table.
+      #
+      # `ws_messages(direction, opcode, payload)` recorded a message's bytes and nothing about
+      # the frames that carried them, and the relay never called the sink for a control frame
+      # at all. Between them that lost the two most diagnostic facts a WebSocket test produces:
+      # the CLOSE code and reason (why did the socket go away — the repeater engine reports
+      # `close_code`, so the two surfaces disagreed about the same protocol), and the RSV bits
+      # (a `permessage-deflate` frame and a plain one were the same row). Fragmentation was
+      # invisible too: `TEXT fin=0 "frag1|"` + `CONT fin=1 "frag2"` is one row that looks
+      # exactly like one frame carrying "frag1|frag2".
+      #
+      # Column by column, and what each says on a row that came off the wire:
+      #   * `fin` — the LAST frame's FIN. 0 means the message never got one (a §5.4 violation,
+      #     or a teardown mid-fragment). Every message gori has ever captured complete is 1,
+      #     hence the default.
+      #   * `rsv` — the FIRST frame's RSV1..3 nibble (§5.2 puts an extension's flags there).
+      #   * `masked`/`mask_key` — the first frame's. NULLABLE on purpose: a pre-V7 row does
+      #     not know, and that is a different statement from "the wire said unmasked". This is
+      #     what makes an UNMASKED client frame (§5.1 violation) visible at all.
+      #   * `frames` — how many frames the message spanned. The only way to tell a reassembly
+      #     from the single frame it otherwise reads as.
+      #   * `declared_len` — the one field that is SEND-only. A frame whose length header
+      #     disagrees with its payload cannot be read back off a wire (the reader believes the
+      #     header), so it can only be authored, and therefore has to be stored rather than
+      #     derived from `LENGTH(payload)`.
+      #
+      # Existing rows default to `fin=1, rsv=0, frames=1` and NULL for the rest, which is
+      # exactly what gori assumed about them before — so no stored message changes meaning and
+      # no replay changes bytes.
+      #
+      # `repeaters.ws_keep_key` is the `Sec-WebSocket-Key` opt-in. `WsEngine.build_handshake`
+      # drops the operator's key line and appends a fresh one, deliberately (a fresh key
+      # avoids a server's repeater guard) — but that also means an absent, short, duplicated
+      # or non-base64 key cannot be sent, and those are the handshake tests. Off by default:
+      # regeneration stays the behaviour for every session that does not ask.
+      V7 = [
+        "ALTER TABLE ws_messages ADD COLUMN fin INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE ws_messages ADD COLUMN rsv INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ws_messages ADD COLUMN masked INTEGER",
+        "ALTER TABLE ws_messages ADD COLUMN mask_key BLOB",
+        "ALTER TABLE ws_messages ADD COLUMN frames INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE ws_messages ADD COLUMN declared_len INTEGER",
+        "ALTER TABLE repeaters ADD COLUMN ws_keep_key INTEGER NOT NULL DEFAULT 0",
+      ]
+
+      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7]
 
       def self.migrate!(db : DB::Database) : Nil
         db.using_connection do |conn|

@@ -478,7 +478,18 @@ end
 module Gori::CLI::Run
   def self.ws_out_messages_for_spec(store : Gori::Store, id : Int64, override : Array(String),
                                     verbatim : Bool = false) : Array(Gori::Repeater::WsEngine::OutMsg)
+    ws_out_messages(store, id, override.map { |t| Gori::Store::WsOutMessage.text(t) }, verbatim)
+  end
+
+  # `--message-frame` overrides carry a shape, so they cannot go through the String wrapper.
+  def self.ws_out_messages_shaped_for_spec(store : Gori::Store, id : Int64,
+                                           override : Array(Gori::Store::WsOutMessage),
+                                           verbatim : Bool = false) : Array(Gori::Repeater::WsEngine::OutMsg)
     ws_out_messages(store, id, override, verbatim)
+  end
+
+  def self.parse_message_frame_for_spec(spec : String) : Gori::Store::WsOutMessage
+    parse_message_frame(spec)
   end
 end
 
@@ -662,5 +673,136 @@ describe "Gori::CLI::Run.open_store per-project network overrides" do
       File.delete?("#{path}-wal")
       File.delete?("#{path}-shm")
     end
+  end
+end
+
+# --- `--message-frame` / WsFrameSpec, and the shape round trip through the session ---
+#
+# `--message TEXT` can only ever mean "TEXT, FIN=1, RSV=0, masked, honest length". A separate
+# flag rather than a prefix syntax on `--message`: a prefix would make some literal payload
+# unsendable the moment it started with the marker, which is the byte-exactness invariant
+# this codebase treats as P0.
+describe "Gori::Repeater::WsFrameSpec" do
+  it "parses every field, and `text=` runs to the end so a payload may hold commas and =" do
+    msg, err = Gori::Repeater::WsFrameSpec.parse(
+      "opcode=ping,fin=0,rsv=4,mask=0,mask_key=deadbeef,len=99,text=a,b=c,d")
+    err.should be_nil
+    m = msg.not_nil!
+    m.opcode.should eq(9)
+    String.new(m.payload).should eq("a,b=c,d")
+    m.shape.fin.should be_false
+    m.shape.rsv.should eq(4)
+    m.shape.masked.should be_false
+    m.shape.mask_key.should eq(Bytes[0xDE, 0xAD, 0xBE, 0xEF])
+    m.shape.declared_len.should eq(99)
+  end
+
+  it "reads `fin=0` and `mask=0` as FALSE, not as a parse error" do
+    # `b = bool(value) || return {nil, …}` took the error branch on a legitimate FALSE — the
+    # one value these two fields exist to express. Caught at the wire, not by the compiler.
+    Gori::Repeater::WsFrameSpec.parse("fin=0,text=x")[0].not_nil!.shape.fin.should be_false
+    Gori::Repeater::WsFrameSpec.parse("mask=0,text=x")[0].not_nil!.shape.masked.should be_false
+  end
+
+  it "defaults to TEXT for a bare shape and to BINARY for a hex/base64 payload" do
+    Gori::Repeater::WsFrameSpec.parse("fin=0,text=x")[0].not_nil!.opcode.should eq(1)
+    Gori::Repeater::WsFrameSpec.parse("hex=00ff")[0].not_nil!.opcode.should eq(2)
+    Gori::Repeater::WsFrameSpec.parse("b64=AP8=")[0].not_nil!.opcode.should eq(2)
+    # ... but a stated opcode always wins, so a CLOSE's code+reason goes in as hex.
+    close, _ = Gori::Repeater::WsFrameSpec.parse("opcode=close,hex=03ea627965")
+    close.not_nil!.opcode.should eq(8)
+    close.not_nil!.payload.should eq(Bytes[0x03, 0xEA, 0x62, 0x79, 0x65])
+  end
+
+  it "names the field it could not read instead of guessing" do
+    Gori::Repeater::WsFrameSpec.parse("opcode=nope,text=x")[1].not_nil!.should contain("bad opcode")
+    Gori::Repeater::WsFrameSpec.parse("rsv=9,text=x")[1].not_nil!.should contain("bad rsv")
+    Gori::Repeater::WsFrameSpec.parse("wat=1")[1].not_nil!.should contain("unknown")
+    Gori::Repeater::WsFrameSpec.parse("hex=0f0,text=x")[1].not_nil!.should contain("bad hex")
+  end
+
+  it "leaves a plain payload EXACTLY as typed — no shape, no opcode, nothing inferred" do
+    msg, err = Gori::Repeater::WsFrameSpec.parse("text=$IFS`id` --not-a-flag")
+    err.should be_nil
+    String.new(msg.not_nil!.payload).should eq("$IFS`id` --not-a-flag")
+    msg.not_nil!.shape.default?.should be_true
+  end
+end
+
+describe "gori run repeater — WebSocket frame shape round trip" do
+  it "stores and reads back every shape column on a repeater session" do
+    with_store do |store|
+      id = store.insert_repeater("ws://x.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      shape = Gori::Store::WsShape
+      store.update_repeater_ws_messages(id, [
+        Gori::Store::WsOutMessage.new(9, "p".to_slice),
+        Gori::Store::WsOutMessage.new(1, "r".to_slice, shape.new(rsv: 4)),
+        Gori::Store::WsOutMessage.new(1, "b".to_slice, shape.new(masked: false)),
+        Gori::Store::WsOutMessage.new(1, "k".to_slice, shape.new(mask_key: Bytes[1, 2, 3, 4])),
+        Gori::Store::WsOutMessage.new(1, "f".to_slice, shape.new(fin: false)),
+        # The one field capture can NEVER produce: a receiver believes the length header, so
+        # a frame whose header disagrees with its payload cannot be read back off a wire.
+        Gori::Store::WsOutMessage.new(1, "l".to_slice, shape.new(declared_len: 4096)),
+      ])
+      rows = store.ws_messages_for_repeater(id)
+      rows.map(&.opcode).should eq([9, 1, 1, 1, 1, 1])
+      rows[1].shape.rsv.should eq(4)
+      rows[2].shape.masked.should be_false
+      rows[3].shape.mask_key.should eq(Bytes[1, 2, 3, 4])
+      rows[4].shape.fin.should be_false
+      rows[5].shape.declared_len.should eq(4096)
+      # An untouched message keeps the encoder's own defaults, so nothing changes for a
+      # session that predates this.
+      rows[0].shape.fin.should be_true
+      rows[0].shape.rsv.should eq(0)
+      rows[0].shape.declared_len.should be_nil
+    end
+  end
+
+  it "carries the stored shape into the OutMsg the engine sends" do
+    with_store do |store|
+      id = store.insert_repeater("ws://x.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      store.update_repeater_ws_messages(id, [
+        Gori::Store::WsOutMessage.new(9, "ping".to_slice),
+        Gori::Store::WsOutMessage.new(1, "rsv".to_slice, Gori::Store::WsShape.new(rsv: 4)),
+      ])
+      msgs = Gori::CLI::Run.ws_out_messages_for_spec(store, id, [] of String)
+      msgs.map(&.opcode).should eq([9, 1])
+      msgs[1].shape.rsv.should eq(4)
+    end
+  end
+
+  it "carries a --message-frame override's shape too" do
+    with_store do |store|
+      id = store.insert_repeater("ws://x.test", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      override = [Gori::CLI::Run.parse_message_frame_for_spec("opcode=close,hex=03ea6279e5")]
+      msgs = Gori::CLI::Run.ws_out_messages_shaped_for_spec(store, id, override)
+      msgs.size.should eq(1)
+      msgs[0].opcode.should eq(8)
+      msgs[0].payload.should eq(Bytes[0x03, 0xEA, 0x62, 0x79, 0xE5])
+    end
+  end
+
+  it "seeds a captured frame's shape onto a session — but never its mask KEY" do
+    # rsv/fin carry across: replaying an RSV1 frame as RSV1 is the whole reason for recording
+    # it. A masking key is a NONCE (§5.3 wants it unpredictable), so pinning the captured one
+    # onto every future send would be a fixed nonce nobody asked for. `frames` is capture-only.
+    captured = Gori::Store::WsShape.new(rsv: 4, masked: false, fin: false,
+      mask_key: Bytes[9, 9, 9, 9], frames: 3)
+    seeded = Gori::CLI::Run.seed_shape(captured)
+    seeded.rsv.should eq(4)
+    seeded.masked.should be_false # a §5.1-violating unmasked client frame IS the test
+    seeded.fin.should be_false
+    seeded.mask_key.should be_nil
+    seeded.frames.should eq(1)
+  end
+
+  it "does NOT restate `masked: true` — it is the encoder's own default, and stating it lies" do
+    # Every captured client frame is masked, so seeding `masked: true` would make EVERY
+    # ordinary TEXT frame fail `Shape#default?` — and the TUI reads that to decide whether a
+    # message is one editable line. The built TUI showed the result: `+7 not shown: TEXT,
+    # TEXT rsv=4, …` over an empty MESSAGES pane, with nothing editable at all.
+    ordinary = Gori::Store::WsShape.new(masked: true, mask_key: Bytes[1, 2, 3, 4])
+    Gori::CLI::Run.seed_shape(ordinary).default?.should be_true
   end
 end

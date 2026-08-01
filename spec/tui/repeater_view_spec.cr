@@ -1557,3 +1557,77 @@ describe Gori::Tui::RepeaterView do
     end
   end
 end
+
+describe "RepeaterView WebSocket frame shapes (V7)" do
+  ws_head = "GET /ws HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\n\r\n"
+
+  # The pane is one message per LINE. Until V7 the only thing it could not render was a
+  # binary payload; now a PING, a PONG, a CLOSE with a code, an RSV1 frame, a cleared FIN, a
+  # pinned mask key and a declared length that disagrees with the payload are all capturable
+  # — and every one of them would render as an ORDINARY line of text, so writing the pane
+  # back would silently discard exactly the shape the operator captured it for. Showing it
+  # and then losing it is worse than not showing it: the seed replays it verbatim.
+  it "keeps a shaped or control frame OUT of the pane and IN the seed" do
+    view = RepeaterView.new
+    shape = Gori::Store::WsShape
+    view.restore("https://ws.test", ws_head, false, true, ws_messages: [
+      Gori::Store::WsOutMessage.text("plain"),
+      Gori::Store::WsOutMessage.new(9, "ping".to_slice),
+      Gori::Store::WsOutMessage.new(1, "rsv".to_slice, shape.new(rsv: 4)),
+      Gori::Store::WsOutMessage.new(8, Bytes[0x03, 0xEA]),
+      Gori::Store::WsOutMessage.text("also-plain"),
+    ])
+    # Only the two plain TEXT frames are lines the operator can edit …
+    view.ws_out_messages_raw.size.should eq(5)
+    # … and an untouched pane replays all five, shapes intact.
+    view.ws_out_messages.map(&.opcode).should eq([1, 9, 1, 8, 1])
+    view.ws_out_messages[2].shape.rsv.should eq(4)
+  end
+
+  # An empty (or short) pane with frames still in the seed is exactly the situation where an
+  # operator misreads a result: they see nothing and a PING, a CLOSE 1002 and an RSV1 frame
+  # go out anyway. The MESSAGES border badge and the open-from-History status line read this.
+  it "names the seeded frames the pane is not showing" do
+    view = RepeaterView.new
+    view.restore("https://ws.test", ws_head, false, true, ws_messages: [
+      Gori::Store::WsOutMessage.text("plain"),
+      Gori::Store::WsOutMessage.new(9, "ping".to_slice),
+      Gori::Store::WsOutMessage.new(1, "r".to_slice, Gori::Store::WsShape.new(rsv: 4)),
+      Gori::Store::WsOutMessage.new(1, "u".to_slice, Gori::Store::WsShape.new(masked: false)),
+      Gori::Store::WsOutMessage.new(8, Bytes[0x03, 0xEA] + "bye".to_slice),
+    ])
+    view.ws_unshown_seed.should eq(["PING", "TEXT rsv=4", "TEXT unmasked", "CLOSE"])
+  end
+
+  it "says nothing when every seeded frame IS a plain line" do
+    view = RepeaterView.new
+    view.restore("https://ws.test", ws_head, false, true,
+      ws_messages: ["a", "b"].map { |t| Gori::Store::WsOutMessage.text(t) })
+    view.ws_unshown_seed.should be_empty
+  end
+
+  it "persists and reconciles the Sec-WebSocket-Key toggle" do
+    # Off is the default and stays it: a replayed handshake reusing a captured key looks to a
+    # server exactly like the replay a repeater guard watches for. But the editor SHOWS a key
+    # line gori was silently dropping and re-appending, so the key on the wire was never the
+    # key in the pane.
+    view = RepeaterView.new
+    view.restore("https://ws.test", ws_head, false, true, ws_messages: [] of Gori::Store::WsOutMessage)
+    view.ws_keep_key?.should be_false
+    view.toggle_ws_keep_key.should be_true
+    view.ws_keep_key?.should be_true
+    view.dirty?.should be_true
+    # It is part of the request side, so a peer that flips it must not be skipped by the
+    # reconcile poll's "nothing changed" test.
+    view.request_side_matches?("https://ws.test", ws_head, false, true, nil, false).should be_false
+    view.request_side_matches?("https://ws.test", ws_head, false, true, nil, true).should be_true
+  end
+
+  it "refuses the toggle outside WebSocket mode rather than storing a meaningless flag" do
+    view = RepeaterView.new
+    view.restore("https://h.test", "GET / HTTP/1.1\r\nHost: h.test\r\n\r\n", false, true)
+    view.ws_mode?.should be_false
+    view.toggle_ws_keep_key.should be_false
+    view.ws_keep_key?.should be_false
+  end
+end

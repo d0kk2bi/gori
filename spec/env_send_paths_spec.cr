@@ -85,7 +85,7 @@ private WS_UPGRADE = "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\
 module Gori::CLI::Run
   def self.ws_out_messages_env_for_spec(store : Gori::Store, id : Int64,
                                         override : Array(String)) : Array(Gori::Repeater::WsEngine::OutMsg)
-    ws_out_messages(store, id, override)
+    ws_out_messages(store, id, override.map { |t| Gori::Store::WsOutMessage.text(t) })
   end
 end
 

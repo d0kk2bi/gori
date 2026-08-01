@@ -34,6 +34,12 @@ module Gori
       MAX_DRAIN_FRAMES  = 100_000             # hard ceiling on frames processed (ping/empty-fragment flood)
       DRAIN_DEADLINE    = 60.seconds          # wall-clock ceiling: a sub-idle ping/fragment cadence can't pin a tab for hours
       MAX_CONTROL_BYTES = 125                 # RFC 6455 §5.5: control-frame payload limit (caps Pong echo)
+      # Ping/pong rows kept in the transcript. A server's control frames were dropped
+      # entirely, which is why a CLOSE reason and a PING payload never reached the operator —
+      # but `recv_count` bounds DATA messages only, so an origin pinging under the idle
+      # timeout would grow the transcript to MAX_DRAIN_FRAMES rows of keepalive. A CLOSE is
+      # exempt from this: there is at most one, and it is the row that matters.
+      MAX_CONTROL_MESSAGES = 64
 
       # A request head declares a WebSocket upgrade. Matches the `Upgrade: websocket`
       # header case-insensitively (RFC 6455: the token is case-insensitive; browsers
@@ -50,12 +56,28 @@ module Gori
         request.scrub.matches?(UPGRADE_HEADER)
       end
 
-      # An outbound message to resend (opcode 1=text, 2=binary).
-      record OutMsg, opcode : Int32, payload : Bytes
+      # An outbound message to resend. `opcode` is the RFC 6455 opcode as-is — 0 CONT,
+      # 1 TEXT, 2 BIN, 8 CLOSE, 9 PING, 10 PONG, and anything else the operator names — and
+      # `shape` carries FIN, the RSV nibble, the masking decision and a declared length that
+      # may disagree with the payload.
+      #
+      # The engine used to fold every message to `opcode == 2 ? OP_BIN : OP_TEXT`, FIN=1,
+      # RSV=0, masked with a fresh key. That is one frame shape out of the dozen a WebSocket
+      # test needs, so a captured session of twelve distinct shapes replayed as seven
+      # identical ones and the difference was never reported.
+      record OutMsg, opcode : Int32, payload : Bytes,
+        shape : Proxy::WS::Shape = Proxy::WS::Shape::DEFAULT
 
       # One message in the replayed transcript. `direction` is "out" (we sent) or
-      # "in" (server sent); opcode 1=text, 2=binary.
-      record Message, direction : String, opcode : Int32, payload : Bytes
+      # "in" (server sent); `opcode` is the RFC 6455 opcode, no longer folded to 1 or 2.
+      #
+      # `shape` says how the frame was FRAMED. On an "out" row that is what gori put on the
+      # wire — including a FIN the operator cleared, RSV bits they set, a mask key they
+      # pinned, and a declared length that disagrees with the payload — so the transcript can
+      # be read as evidence instead of being taken on trust. On an "in" row it is the first
+      # frame's header as it arrived.
+      record Message, direction : String, opcode : Int32, payload : Bytes,
+        shape : Proxy::WS::Shape = Proxy::WS::Shape::DEFAULT
 
       struct Result
         getter handshake_head : Bytes # the server's upgrade response head (empty on connect failure)
@@ -79,7 +101,8 @@ module Gori
                     scheme : String, host : String, port : Int32,
                     verify_upstream : Bool, sni : String? = nil,
                     idle : Time::Span = DEFAULT_IDLE,
-                    overrides : Gori::HostOverrides? = nil) : Result
+                    overrides : Gori::HostOverrides? = nil,
+                    keep_key : Bool = false) : Result
         started = Time.instant
         # The connect + handshake reads get a generous io_timeout so a slow-but-valid
         # upgrade (cold start / auth / slow proxy) isn't mistaken for a dead origin;
@@ -91,7 +114,7 @@ module Gori
         return err("connect failed: #{host}:#{port}", started) unless upstream
 
         begin
-          handshake, key = build_handshake(upgrade_request)
+          handshake, keys = build_handshake(upgrade_request, keep_key)
           upstream.write(handshake)
           upstream.flush
           head = Proxy::Codec::Http1.read_head(upstream)
@@ -102,14 +125,20 @@ module Gori
             return Result.new(head, [] of Message, elapsed(started),
               error: "server did not upgrade (status #{resp.status})", upgraded: false)
           end
-          note = verify_accept(resp, key)
+          note = verify_accept(resp, keys)
 
           messages = [] of Message
-          # Send all recorded outbound messages first (masked client frames).
+          # Send all recorded outbound messages first. The opcode goes out AS GIVEN — the
+          # `m.opcode == 2 ? OP_BIN : OP_TEXT` fold that used to live here is why a PING, a
+          # PONG, a CLOSE with a chosen code and a lone CONT were inexpressible from every
+          # surface at once. `mask: true` is still the DEFAULT (§5.3 requires it of a client),
+          # but it is now only a default: `shape.masked == false` sends the unmasked client
+          # frame that §5.1 says the server must reject, which is the most common WebSocket
+          # hardening probe there is.
           out_messages.each do |m|
-            op = m.opcode == 2 ? Proxy::WS::OP_BIN : Proxy::WS::OP_TEXT
-            upstream.write(Proxy::WS.encode(op, m.payload, mask: true))
-            messages << Message.new("out", op.to_i, m.payload)
+            op = (m.opcode & 0x0f).to_u8
+            upstream.write(Proxy::WS.encode(op, m.payload, m.shape, mask: true))
+            messages << Message.new("out", op.to_i, m.payload, m.shape)
           end
           upstream.flush
 
@@ -117,7 +146,11 @@ module Gori
           # reply isn't a dead server); drain narrows to `idle` once frames flow.
           sent_count = messages.size
           close_code = drain(upstream, messages, idle)
-          send_close(upstream)
+          # Only when the operator did not send one themselves. §5.5.1 allows exactly one
+          # CLOSE per direction, so appending gori's after theirs would put a second one on
+          # the wire that they did not ask for — and the second frame, not the first, is what
+          # the server would be answering.
+          send_close(upstream) unless out_messages.last?.try(&.opcode) == Proxy::WS::OP_CLOSE.to_i
           # The "out" rows above are appended before the flush and with no delivery evidence —
           # WebSocket has no ack, so a transcript row means "gori wrote this", never "the peer
           # got it". When the origin closes right after the 101 the drain breaks at EOF and
@@ -153,6 +186,9 @@ module Gori
       private def self.drain(io : IO, messages : Array(Message), idle : Time::Span) : Int32?
         assembling = IO::Memory.new
         msg_opcode = Proxy::WS::OP_TEXT
+        msg_shape = Proxy::WS::Shape::DEFAULT
+        msg_frames = 0
+        ctl_count = 0
         recv_bytes = 0_i64
         recv_count = 0
         frames = 0
@@ -177,21 +213,45 @@ module Gori
           narrow_read_timeout(io, idle) if frames == 1
 
           if frame.data?
-            msg_opcode = frame.opcode if frame.opcode != Proxy::WS::OP_CONT
+            if frame.opcode != Proxy::WS::OP_CONT
+              msg_opcode = frame.opcode
+              msg_shape = frame.shape
+              msg_frames = 0
+            end
+            msg_frames += 1
             assembling.write(frame.payload)
             break if assembling.bytesize > MAX_RECV_BYTES # runaway fragmented message
             if frame.fin?
               payload = assembling.to_slice.dup
               recv_bytes += payload.size
               recv_count += 1
-              messages << Message.new("in", msg_opcode.to_i, payload)
+              # First frame's RSV/mask (§5.2 puts an extension's flags there), last frame's
+              # FIN, and how many frames it took — the same accounting the capture relay does,
+              # so the two agree about identical bytes.
+              messages << Message.new("in", msg_opcode.to_i, payload,
+                Proxy::WS::Shape.new(fin: true, rsv: msg_shape.rsv, masked: msg_shape.masked,
+                  mask_key: msg_shape.mask_key, frames: msg_frames))
               assembling = IO::Memory.new
+              msg_frames = 0
               break if recv_caps_hit?(recv_count, recv_bytes)
             end
-          elsif frame.opcode == Proxy::WS::OP_PING
-            send_pong(io, frame.payload)
           elsif frame.close?
+            # The CLOSE frame itself joins the transcript, not just its status code. The code
+            # was already reported; the REASON — the free-text half of §5.5.1, and where a
+            # server actually explains itself — was dropped on the floor, and a PING payload
+            # (a real covert channel, and a real length-check bug site) with it.
+            messages << Message.new("in", frame.opcode.to_i, frame.payload.dup, frame.shape)
             return close_status(frame.payload)
+          else
+            # PING/PONG, bounded: `recv_count` only counts DATA messages, so an origin
+            # pinging under the idle timeout would otherwise grow this array until
+            # MAX_DRAIN_FRAMES — 100k transcript rows for a keepalive. A CLOSE is exempt
+            # above; there is at most one, and it is the row that matters.
+            if ctl_count < MAX_CONTROL_MESSAGES
+              ctl_count += 1
+              messages << Message.new("in", frame.opcode.to_i, frame.payload.dup, frame.shape)
+            end
+            send_pong(io, frame.payload) if frame.opcode == Proxy::WS::OP_PING
           end
         end
         nil
@@ -230,17 +290,33 @@ module Gori
         # socket already gone — nothing to close gracefully
       end
 
-      # Rebuilds the upgrade request for repeater: origin-form request line, a FRESH
-      # Sec-WebSocket-Key (avoids any server repeater-guard), and Sec-WebSocket-
-      # Extensions stripped (no permessage-deflate → frames are plain). Everything
-      # else (Host, Cookie, Authorization, Origin, …) is kept so the repeater carries
-      # the original session. Header VALUE bytes are copied verbatim (only the ASCII
-      # request line + header NAMES are decoded) so a non-UTF-8-bearing cookie/auth
-      # token survives byte-exact, mirroring FlowRequest.origin_form_bytes. Returns
-      # {request bytes, the key we sent}.
-      private def self.build_handshake(head : Bytes) : {Bytes, String}
+      # Rebuilds the upgrade request for repeater: origin-form request line, Sec-WebSocket-
+      # Extensions stripped (no permessage-deflate → frames are plain), and — unless
+      # `keep_key` — a FRESH Sec-WebSocket-Key. Everything else (Host, Cookie,
+      # Authorization, Origin, …) is kept so the repeater carries the original session.
+      # Header VALUE bytes are copied verbatim (only the ASCII request line + header NAMES
+      # are decoded) so a non-UTF-8-bearing cookie/auth token survives byte-exact, mirroring
+      # FlowRequest.origin_form_bytes.
+      #
+      # Regenerating the key is the DEFAULT and stays the default: a replayed handshake that
+      # reuses a captured key looks to a server like a replay, which is what a repeater guard
+      # is watching for, and every session that does not ask keeps exactly today's bytes.
+      #
+      # But the key line was also DELETED and re-appended at the end of the block, so the
+      # operator could not send an absent key, a short one, a non-base64 one, two of them, or
+      # the same one twice — all handshake tests — and could not control header ORDER either,
+      # because their line moved. `keep_key` is the opt-in: their block goes out as written,
+      # untouched, key line and position included. It is opt-in rather than the new default
+      # because honouring the typed key also means `Sec-WebSocket-Accept` can no longer be
+      # asserted (see `verify_accept`), and losing that check silently on every session would
+      # trade one blind spot for another.
+      #
+      # Returns {request bytes, the Sec-WebSocket-Key VALUES actually on the wire}. That is a
+      # list and not a String because zero and two are both shapes an operator can now send,
+      # and the accept check has to be able to say which it saw.
+      private def self.build_handshake(head : Bytes, keep_key : Bool = false) : {Bytes, Array(String)}
         lines = head_lines(head)
-        key = Base64.strict_encode(Random::Secure.random_bytes(16))
+        keys = [] of String
 
         io = IO::Memory.new(head.size + 64)
         req_line = lines.empty? ? "GET / HTTP/1.1" : String.new(lines[0])
@@ -248,13 +324,21 @@ module Gori
         lines[1..].each do |line|
           next if line.empty?
           name = header_name(line)
-          next if name == "sec-websocket-key" || name == "sec-websocket-extensions"
+          next if name == "sec-websocket-extensions"
+          if name == "sec-websocket-key"
+            next unless keep_key
+            keys << header_value(line)
+          end
           io.write(line) # value bytes verbatim (never round-tripped through String)
           io << "\r\n"
         end
-        io << "Sec-WebSocket-Key: " << key << "\r\n"
+        unless keep_key
+          key = Base64.strict_encode(Random::Secure.random_bytes(16))
+          keys << key
+          io << "Sec-WebSocket-Key: " << key << "\r\n"
+        end
         io << "\r\n"
-        {io.to_slice, key}
+        {io.to_slice, keys}
       end
 
       # Splits a head into its lines (LF-delimited, trailing CR stripped per line) as
@@ -285,13 +369,37 @@ module Gori
         String.new(ci ? line[0, ci] : line).strip.downcase
       end
 
-      # The server's Sec-WebSocket-Accept must be base64(sha1(key + GUID)). A
-      # mismatch is surfaced as a non-fatal note (the frames still relayed), since
-      # a quirky/misbehaving origin shouldn't abort an otherwise-useful capture.
-      private def self.verify_accept(resp : Proxy::Codec::RawResponse, key : String) : String?
+      # The header field VALUE as the operator wrote it, minus the OWS after the colon.
+      # Decoded — this feeds the SHA-1 accept computation, which is defined over the key's
+      # characters — but never re-sent: `build_handshake` copies the whole line's bytes.
+      private def self.header_value(line : Bytes) : String
+        ci = line.index(0x3A_u8) # ':'
+        return "" unless ci
+        String.new(line[ci + 1, line.size - ci - 1]).strip
+      end
+
+      # The server's Sec-WebSocket-Accept must be base64(sha1(key + GUID)) (RFC 6455 §4.2.2).
+      # A mismatch is surfaced as a non-fatal note (the frames still relayed), since a
+      # quirky/misbehaving origin shouldn't abort an otherwise-useful capture.
+      #
+      # Every branch here says something. The old body opened `return nil unless got` — a
+      # server that upgraded with NO accept header at all produced the same silence as a
+      # server that answered correctly, which is precisely backwards: the missing header is
+      # the finding. And with `keep_key` an operator can now send zero keys or two, at which
+      # point there is no single key to derive an expected accept from — so that case reports
+      # that it cannot check, rather than quietly not checking.
+      private def self.verify_accept(resp : Proxy::Codec::RawResponse, keys : Array(String)) : String?
         got = resp.headers.get?("Sec-WebSocket-Accept")
-        return nil unless got
-        want = Base64.strict_encode(Digest::SHA1.digest(key + GUID))
+        if keys.size != 1
+          sent = keys.empty? ? "no Sec-WebSocket-Key" : "#{keys.size} Sec-WebSocket-Key headers"
+          return "handshake accept NOT verified: the request carried #{sent}, so there is no " \
+                 "single key to derive one from (the server answered #{got ? got.inspect : "none"})"
+        end
+        want = Base64.strict_encode(Digest::SHA1.digest(keys[0] + GUID))
+        unless got
+          return "handshake accept MISSING: the server sent 101 with no Sec-WebSocket-Accept " \
+                 "header (RFC 6455 §4.2.2 requires #{want.inspect})"
+        end
         got == want ? nil : "handshake accept mismatch (got #{got.inspect}, want #{want.inspect})"
       end
 
