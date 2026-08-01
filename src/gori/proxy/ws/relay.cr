@@ -36,7 +36,7 @@ module Gori::Proxy::WS
   # hold's edit is a STAGE inside that pipeline, not a second one beside it — two pipelines
   # would mean the operator editing bytes the rules had not seen, or rules re-running over an
   # operator's edit. Even on that path, a message neither stage changed goes out as the peer's
-  # own frame bytes, mask key and all.
+  # own frames — every fragment, in order, with its own FIN/RSV bits and mask key.
   module Relay
     # Cap on a reassembled (possibly fragmented) message we buffer for capture.
     # The raw forward is always byte-exact (P7); only the captured projection is
@@ -55,6 +55,14 @@ module Gori::Proxy::WS
     # see SocketTuning.relax in ClientConn), so it's kept well under the proxy's 30 s
     # baseline IO timeout (SocketTuning::CLIENT_IO_TIMEOUT / Upstream::IO_TIMEOUT): a real
     # peer replies near-instantly, and a dead one shouldn't pin the tunnel for 30 s.
+    #
+    # It is ALSO, once a hold is armed, the operator's decision window: from the moment
+    # either peer sends CLOSE, an undecided held message has this long. It is not
+    # configurable, and deliberately so — a longer window buys nothing, because the message
+    # is not destroyed at the deadline any more. `settle` forwards it unedited while the
+    # sockets are still open (the disposition every other involuntary release here takes),
+    # `warn_close_deadline` says the window expired, and the ws_messages row is written. A
+    # setting would only let an operator hold a dead-peer tunnel open longer.
     CLOSE_TIMEOUT = 5.seconds
 
     # `rewriter` is the Match & Replace seam (#500 step 1) and `interceptor` the hold seam
@@ -101,8 +109,15 @@ module Gori::Proxy::WS
           second_pending = false # other side finished within the window (reply relayed, or its own end)
         when timeout(CLOSE_TIMEOUT)
           # peer never replied — give up waiting; the pump below is reaped after closing.
+          warn_close_deadline(out_gate, in_gate)
         end
       end
+      # Resolve both hold queues BEFORE the sockets go. `MessageGate#close` runs from the
+      # pump's `ensure`, which is only reached because the two lines below unblocked its
+      # read — so a message released there is written to a socket that is already gone. This
+      # is the one moment at which a held message can still reach its peer.
+      out_gate.try(&.settle("the socket is closing"))
+      in_gate.try(&.settle("the socket is closing"))
       client.close rescue nil
       upstream.close rescue nil
       # Every path above consumes exactly one of the two `done` sends before this point
@@ -110,6 +125,20 @@ module Gori::Proxy::WS
       # sockets just unblocked its pending read) — `run` must never return with a pump
       # fiber still alive.
       done.receive if second_pending
+    end
+
+    # CLOSE_TIMEOUT just expired with a message still held. Nothing else tells the operator
+    # that their decision window closed — the queue row simply vanishes from the TUI — and
+    # "why did my held message go out unedited" is unanswerable without this line.
+    private def self.warn_close_deadline(out_gate : MessageGate?, in_gate : MessageGate?) : Nil
+      held = [out_gate, in_gate].compact.select(&.pending?)
+      return if held.empty?
+      ::Log.warn do
+        "ws: a peer sent CLOSE and the other side did not answer within " \
+        "#{CLOSE_TIMEOUT.total_seconds.to_i}s — " \
+        "the decision window for #{held.size == 1 ? "a" : "both"} direction's held message(s) " \
+        "is over; they are being forwarded unedited before the tunnel is torn down"
+      end
     end
 
     # This direction's Match & Replace lens, or nil when no `part: ws` rule can reach this
@@ -252,10 +281,18 @@ module Gori::Proxy::WS
     private class AssemblingPump
       @buffer = IO::Memory.new
       @opcode = OP_TEXT
-      @passthrough = false       # this message fell back to frame-by-frame byte-exact forwarding
-      @rewritable = false        # ... and this one is eligible for Match & Replace (TEXT + a live rule)
-      @fresh = true              # no data frame of this message has been buffered yet
-      @single_raw : Bytes? = nil # the message's own wire bytes, when it arrived as ONE frame
+      @passthrough = false # this message fell back to frame-by-frame byte-exact forwarding
+      @rewritable = false  # ... and this one is eligible for Match & Replace (TEXT + a live rule)
+      # This message's own wire frames, concatenated in arrival order — headers, FIN/RSV bits
+      # and mask keys included. Re-emitted verbatim whenever nothing changed the payload, which
+      # is what keeps the invariant above true for a FRAGMENTED message too. It used to hold
+      # only a single frame's `raw` (`@fresh && frame.fin?`), so every multi-frame message went
+      # out re-framed as ONE frame under a mask key gori invented — including messages no rule
+      # matched, on a socket armed for a rule scoped to some other host. Fragmentation IS the
+      # payload for per-frame length checks and WAF/IDS bypass tests, so removing it removed
+      # the property under test.
+      @raw = IO::Memory.new
+      @raw_kept = true # ... and whether those bytes are still complete (see MAX_MESSAGE)
       @scratch : Bytes
 
       def initialize(@src : IO, @dst : IO, @direction : String, @flow_id : Int64,
@@ -294,12 +331,11 @@ module Gori::Proxy::WS
         # so dropping them silently is a difference between the two pumps that should not
         # exist. Best-effort: this path is usually taken BECAUSE a peer went away.
         #
-        # GATED sockets are deliberately excluded, and NOT because of ordering. `bypass` runs
-        # `fail_open_locked` before it yields, so routing this through it would force every
-        # still-undecided held message out to the origin on any abnormal end — flipping
-        # `MessageGate#close`'s deliberate discard into a fail-open as a side effect, for
-        # messages the operator never looked at. With a gate armed, what happens to withheld
-        # bytes at teardown is `close`'s decision and it has already made it.
+        # GATED sockets are deliberately excluded. `Relay.run` closes both sockets to unblock
+        # this pump's read, so by the time this `ensure` runs on a gated socket the write has
+        # nowhere to go — and `flush_withheld` also writes a `ws_messages` row, which would
+        # then claim a delivery that did not happen. `run` has already given the gate its one
+        # real chance (`MessageGate#settle`, while the sockets were still open).
         (flush_withheld rescue nil) if @gate.nil?
       end
 
@@ -370,8 +406,7 @@ module Gori::Proxy::WS
         @opcode = opcode
         @rewritable = opcode == OP_TEXT && !@rewriter.nil?
         @passthrough = !@rewritable && @gate.nil?
-        @fresh = true
-        @single_raw = nil
+        reset_raw
       end
 
       # A frame too large to buffer: this message can no longer be rewritten OR held. Put
@@ -392,7 +427,7 @@ module Gori::Proxy::WS
         reset_buffer if prefix
         @passthrough = true
         @rewritable = false
-        @single_raw = nil
+        reset_raw
         forwarded
       end
 
@@ -416,10 +451,24 @@ module Gori::Proxy::WS
           @buffer = Relay.capture_frame(frame, @buffer, @direction, @flow_id, @sink, @opcode)
           return
         end
-        @single_raw = @fresh && frame.fin? ? frame.raw : nil
-        @fresh = false
+        keep_raw(frame)
         @buffer.write(frame.payload)
         emit_message if frame.fin?
+      end
+
+      # Accumulate this frame's own wire bytes. Bounded by MAX_MESSAGE like the payload
+      # buffer, because framing overhead is per-frame and a peer sending millions of
+      # one-byte fragments would otherwise cost more here than the payload cap allows.
+      # Past the cap the message simply loses its byte-exact form and is re-framed, the
+      # same disposition every other over-the-cap path in this class takes.
+      private def keep_raw(frame : WS::Frame) : Nil
+        return unless @raw_kept
+        if @raw.size + frame.raw.size > MAX_MESSAGE
+          @raw_kept = false
+          @raw = IO::Memory.new
+          return
+        end
+        @raw.write(frame.raw)
       end
 
       # The message is complete. ONE pipeline: rewrite, then hold, then the wire.
@@ -432,32 +481,31 @@ module Gori::Proxy::WS
       #
       # Past the gate, a rewritten OR edited message MUST go out as ONE frame — once its
       # length changes the sender's fragmentation cannot be reproduced — but a message nothing
-      # changed is forwarded as the peer's own frame, mask key and all, whenever it arrived as
-      # a single frame.
+      # changed is forwarded as the peer's OWN frames: every fragment, in order, with its own
+      # FIN/RSV bits and its own mask key.
       private def emit_message : Nil
         payload = @buffer.to_slice
         rewritten = rewrite(payload)
-        raw = (r = @single_raw) && rewritten == payload ? r : nil
+        # The gate outlives this call and reuses its own buffers, so it gets a copy; the
+        # direct write below is done with the bytes before `reset_buffer` runs and does not.
+        reusable = @raw_kept && @raw.size > 0 && rewritten == payload
         if gate = @gate
           # Never blocks: the gate either writes through or parks the message and waits on a
           # fiber of its own, so the next frame — including a PING — is read immediately.
-          gate.submit(@opcode, rewritten, raw)
+          gate.submit(@opcode, rewritten, reusable ? @raw.to_slice.dup : nil)
         else
-          write_direct(raw || WS.encode(@opcode, rewritten, mask: @mask, fin: true))
+          write_direct(reusable ? @raw.to_slice : WS.encode(@opcode, rewritten, mask: @mask, fin: true))
           # Record what gori WROTE rather than what arrived, the way #513 keeps P7 on h2: the
           # capture has to be the bytes the peer actually sees.
           @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, rewritten.dup)
         end
-        reset_buffer
         # This message is over, so the NEXT data frame starts one — even a stray `OP_CONT`,
-        # which does not go through `start_message`. Without the reset that frame found
-        # `@fresh == false`, dropped its own `raw`, and was re-emitted under the PREVIOUS
-        # message's opcode with a fresh mask key: gori silently REPAIRING a §5.4 violation
-        # that the byte-exact pump passes through for the peer to judge. That breaks this
-        # class's stated invariant — gori's own framing is used only for a message a rule or
-        # the operator actually changed.
-        @fresh = true
-        @single_raw = nil
+        # which does not go through `start_message`. Without `reset_buffer`'s reset of the
+        # accumulated wire bytes, that frame would ride out behind the PREVIOUS message's
+        # frames: gori silently REPAIRING a §5.4 violation that the byte-exact pump passes
+        # through for the peer to judge. That breaks this class's stated invariant — gori's
+        # own framing is used only for a message a rule or the operator actually changed.
+        reset_buffer
       end
 
       # Match & Replace, or the payload untouched when this message is not eligible (binary,
@@ -468,13 +516,19 @@ module Gori::Proxy::WS
         @direction == "out" ? rw.rewrite_ws_out(payload, @ctx.host) : rw.rewrite_ws_in(payload, @ctx.host)
       end
 
-      # Emit everything buffered so far as a NON-final frame, so the rest of the message can
-      # stream byte-exact behind it. Reached at most once per message (every caller either
-      # switches to passthrough or ends the message immediately after), so this is always
-      # the message's leading frame and carries the message opcode rather than OP_CONT.
+      # Emit everything buffered so far, so the rest of the message can stream byte-exact
+      # behind it. The buffer holds the payload as it ARRIVED (the rewrite only runs in
+      # `emit_message`), so the sender's own frames say the same thing byte for byte and are
+      # preferred — same invariant as `emit_message`. Only when they are gone (past the raw
+      # cap) is the prefix re-framed, as a NON-final frame carrying the message opcode rather
+      # than OP_CONT: this is reached at most once per message, so it is always the leading one.
       private def flush_buffered : Nil
         return if @buffer.size == 0
-        write_direct(WS.encode(@opcode, @buffer.to_slice, mask: @mask, fin: false))
+        if @raw_kept && @raw.size > 0
+          write_direct(@raw.to_slice)
+        else
+          write_direct(WS.encode(@opcode, @buffer.to_slice, mask: @mask, fin: false))
+        end
       end
 
       # Put a half-assembled message on the wire and into capture, then forget it. Only the
@@ -518,6 +572,12 @@ module Gori::Proxy::WS
 
       private def reset_buffer : Nil
         @buffer = @buffer.size > RESET_THRESHOLD ? IO::Memory.new : @buffer.tap(&.clear)
+        reset_raw
+      end
+
+      private def reset_raw : Nil
+        @raw = @raw.size > RESET_THRESHOLD ? IO::Memory.new : @raw.tap(&.clear)
+        @raw_kept = true
       end
     end
 

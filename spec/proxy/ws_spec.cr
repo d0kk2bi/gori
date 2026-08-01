@@ -476,6 +476,32 @@ describe Gori::Proxy::WS do
       sink.messages.should contain({"out", 1, "hi"})
     end
 
+    it "forwards a FRAGMENTED message no rule matched as the peer's own frames, byte-exact" do
+      # The single-frame case above was already byte-exact; a multi-frame one was not.
+      # With any `part: ws` rule live, both fragments were buffered and re-emitted as ONE
+      # frame under a mask key gori invented — for a message the rule never matched.
+      # Fragmentation IS the payload for per-frame length checks and WAF/IDS bypass tests.
+      first = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "nomatch-".to_slice, fin: false)
+      second = masked_op_frame(Gori::Proxy::WS::OP_CONT, "tail".to_slice)
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(first); cs_w.write(second); cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      ts_w.close                                          # the relay is done writing; read the whole forwarded stream
+      ts_r.gets_to_end.to_slice.should eq(first + second) # two frames, FIN bits and mask keys intact
+      sink.messages.should contain({"out", 1, "nomatch-tail"})
+    end
+
     it "never rewrites a BINARY message — a text find/replace over binary is corruption" do
       bin = masked_op_frame(Gori::Proxy::WS::OP_BIN, "hi there".to_slice)
       cs_r, cs_w = IO.pipe
