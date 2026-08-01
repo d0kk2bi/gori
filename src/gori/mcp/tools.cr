@@ -1139,7 +1139,7 @@ module Gori
               s.field "position", intprop("tab position order index (optional, defaults to appending at end)")
               s.field "sni", strprop("optional TLS Server Name Indication override")
               s.field "name", strprop("optional custom name for the repeater tab")
-              s.field "ws_out_messages", arr_or_str_prop("optional array of strings (or a newline-separated string) representing outbound WebSocket messages")
+              s.field "ws_out_messages", ws_out_messages_prop
             end
 
             tool j, "update_repeater", "Update an existing repeater tab's properties by database id." do |s|
@@ -1151,7 +1151,7 @@ module Gori
               s.field "sni", strprop("TLS SNI override")
               s.field "name", strprop("custom name for the repeater tab")
               s.field "tags", strprop("free-text tags for grouping tabs (the TUI subtab label); empty string clears them")
-              s.field "ws_out_messages", arr_or_str_prop("optional array of strings (or a newline-separated string) representing outbound WebSocket messages")
+              s.field "ws_out_messages", ws_out_messages_prop
             end
 
             tool j, "delete_repeater", "Delete a repeater tab by database id." do |s|
@@ -2170,6 +2170,18 @@ module Gori
       # Accepts a JSON array directly or a JSON-encoded string, or a string.
       private def arr_or_str_prop(desc : String) : JSON::Any
         JSON.parse(%({"description":#{desc.to_json},"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]}))
+      end
+
+      # `ws_out_messages`: the string forms are TEXT frames, and the object form is how a
+      # BINARY frame (protobuf/msgpack/CBOR/MQTT-over-WS) is expressed — the only shape this
+      # argument could carry before was opcode 1.
+      private def ws_out_messages_prop : JSON::Any
+        desc = "outbound WebSocket messages. A string (or an array of strings, or a " \
+               "newline-separated string) is a TEXT frame; an object " \
+               "{\"payload_base64\": \"…\"} is a BINARY frame, with an optional " \
+               "\"opcode\" to override the frame type"
+        JSON.parse(%({"description":#{desc.to_json},"oneOf":) +
+                   %([{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},{"type":"string"}]}))
       end
 
       # Accepts a JSON object directly or a JSON-encoded string (LLM clients vary).

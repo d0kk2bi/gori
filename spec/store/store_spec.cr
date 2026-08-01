@@ -283,7 +283,8 @@ describe Gori::Store do
     store = Gori::Store.new(db, nil, retention_flows: 5, prune_interval: 10)
     begin
       rid = store.insert_repeater("wss://acme.test/ws", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, false, nil, 0)
-      store.update_repeater_ws_messages(rid, ["client frame 1", "client frame 2"])
+      store.update_repeater_ws_messages(rid,
+        ["client frame 1", "client frame 2"].map { |t| Gori::Store::WsOutMessage.text(t) })
       # Churn flows well past retention so prune fires (cutoff = max_id - 5 > 0). The bug:
       # DELETE ... WHERE flow_id <= cutoff also matched the repeater rows (flow_id = 0), wiping them.
       12.times { |i| store.insert_flow(sample_request(target: "/#{i}")) }
@@ -318,7 +319,7 @@ describe Gori::Store do
   it "update_repeater_ws_messages stores an empty frame text without aborting the batch" do
     with_store do |store|
       rid = store.insert_repeater("wss://acme.test/ws", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, false, nil, 0)
-      store.update_repeater_ws_messages(rid, ["", "frame"])
+      store.update_repeater_ws_messages(rid, ["", "frame"].map { |t| Gori::Store::WsOutMessage.text(t) })
       store.flush
       store.ws_messages_for_repeater(rid).size.should eq(2)
       store.write_failures.should eq(0)

@@ -28,7 +28,7 @@ module Gori
         http2 = http2_val || false
         auto_cl_val = bool(h, "auto_content_length")
         auto_cl = (auto_cl_val.nil? && !present?(h, "auto_content_length")) ? true : !!auto_cl_val
-        ws_messages_override = nil.as(Array(String)?)
+        ws_messages_override = nil.as(Array(Store::WsOutMessage)?)
 
         if flow_id
           flow = store.get_flow(flow_id)
@@ -57,7 +57,12 @@ module Gori
           # takes SNI from the operator's flag alone, and this tool is its MCP twin.
 
           if flow.row.status == 101 && !present?(h, "ws_out_messages")
-            ws_messages_override = store.ws_messages(flow_id).select { |m| m.direction == "out" && m.text? }.map { |m| String.new(m.payload).scrub }
+            # Opcode and raw bytes, both kept. The `&& m.text?` filter dropped every captured
+            # BINARY out-frame with no warning at all (the CLI at least printed one), and the
+            # `.scrub` rewrote an invalid-UTF-8 TEXT payload to U+FFFD before it was stored —
+            # so a §8.1/§5.6 test case could not be seeded into a repeater from MCP.
+            ws_messages_override = store.ws_messages(flow_id).select { |m| m.direction == "out" }
+              .map { |m| Store::WsOutMessage.new(m.opcode, m.payload) }
           end
         end
 
@@ -106,17 +111,7 @@ module Gori
 
         # WebSocket messages handling
         if is_ws
-          messages = [] of String
-          if present?(h, "ws_out_messages")
-            if arr = h["ws_out_messages"]?.try(&.as_a?)
-              messages = arr.compact_map(&.as_s?)
-            elsif str_val = str(h, "ws_out_messages")
-              messages = str_val.split('\n').compact_map { |l| l.strip.empty? ? nil : l }
-            end
-          elsif ws_messages_override
-            messages = ws_messages_override
-          end
-
+          messages = present?(h, "ws_out_messages") ? ws_out_messages_arg(h) : (ws_messages_override || [] of Store::WsOutMessage)
           unless messages.empty?
             store.update_repeater_ws_messages(id, messages)
           end
@@ -139,6 +134,34 @@ module Gori
             j.field "position", position
           end
         })
+      end
+
+      # The `ws_out_messages` argument, in any of the three forms the schema advertises: an
+      # array of strings, a newline-separated string, or an array of objects.
+      #
+      # The OBJECT form is what makes a binary frame expressible from MCP at all. Every
+      # string form is a TEXT frame (opcode 1) — that was the only shape this tool could ever
+      # produce, so `{"payload_base64": …}` (opcode 2 unless `opcode` says otherwise) is the
+      # one addition, and it is where a later fin/rsv/mask field belongs too.
+      private def ws_out_messages_arg(h) : Array(Store::WsOutMessage)
+        if arr = h["ws_out_messages"]?.try(&.as_a?)
+          return arr.compact_map { |item| ws_out_message_item(item) }
+        end
+        return [] of Store::WsOutMessage unless str_val = str(h, "ws_out_messages")
+        str_val.split('\n').compact_map { |l| l.strip.empty? ? nil : Store::WsOutMessage.text(l) }
+      end
+
+      private def ws_out_message_item(item : JSON::Any) : Store::WsOutMessage?
+        if text = item.as_s?
+          return Store::WsOutMessage.text(text)
+        end
+        return nil unless obj = item.as_h?
+        if b64 = obj["payload_base64"]?.try(&.as_s?)
+          decoded = Base64.decode(b64) rescue return nil
+          return Store::WsOutMessage.new(obj["opcode"]?.try(&.as_i?) || 2, decoded)
+        end
+        text = obj["text"]?.try(&.as_s?) || return nil
+        Store::WsOutMessage.new(obj["opcode"]?.try(&.as_i?) || 1, text.to_slice)
       end
 
       private def update_repeater(h) : Result
@@ -197,16 +220,7 @@ module Gori
         end
 
         # WebSocket messages handling
-        if present?(h, "ws_out_messages")
-          messages = [] of String
-          if arr = h["ws_out_messages"]?.try(&.as_a?)
-            messages = arr.compact_map(&.as_s?)
-          elsif str_val = str(h, "ws_out_messages")
-            messages = str_val.split('\n').compact_map { |l| l.strip.empty? ? nil : l }
-          end
-
-          store.update_repeater_ws_messages(id, messages)
-        end
+        store.update_repeater_ws_messages(id, ws_out_messages_arg(h)) if present?(h, "ws_out_messages")
 
         # Derive the summary from the MASKED request, like create_repeater: the raw request may
         # carry a secret in the request-target (e.g. ?token=…) and this field goes to the LLM.

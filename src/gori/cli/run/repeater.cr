@@ -135,7 +135,7 @@ module Gori
         begin
           tgt_val = target
           tgt_str : String = tgt_val ? tgt_val : ""
-          ws_messages = [] of String
+          ws_messages = [] of Store::WsOutMessage
           is_ws = false
 
           if fid = flow_id
@@ -157,15 +157,13 @@ module Gori
 
             if detail.row.status == 101
               is_ws = true
-              out_frames = store.ws_messages(fid).select { |m| m.direction == "out" }
-              ws_messages = out_frames.select(&.text?).map { |m| String.new(m.payload).scrub }
-              # A repeater SESSION persists outbound messages as editable text lines
-              # (update_repeater_ws_messages stores Array(String) as opcode 1), so a binary
-              # outbound frame can't round-trip through the session store and would vanish from
-              # every later `repeater send` replay — warn instead of dropping it silently.
-              if (dropped = out_frames.size - ws_messages.size) > 0
-                STDERR.puts "gori run repeater create: #{dropped} binary outbound WebSocket frame#{dropped == 1 ? "" : "s"} dropped — the repeater session store keeps text messages only, so #{dropped == 1 ? "it is" : "they are"} not replayable"
-              end
+              # Opcode AND bytes, straight across. This used to be
+              # `select(&.text?).map { String.new(m.payload).scrub }`: a binary outbound frame
+              # was dropped with a warning (protobuf/msgpack/CBOR/MQTT-over-WS, i.e. most
+              # non-toy WS apps), and a TEXT frame carrying invalid UTF-8 — the §8.1/§5.6
+              # validation payload — was silently rewritten to U+FFFD before it was even stored.
+              ws_messages = store.ws_messages(fid).select { |m| m.direction == "out" }
+                .map { |m| Store::WsOutMessage.new(m.opcode, m.payload) }
             end
           end
 
@@ -350,7 +348,8 @@ module Gori
         abort_if_out_of_scope!(outbound, plan, "gori run repeater send")
 
         if plan.websocket?
-          cmd_repeater_send_ws(id, plan, project_name, db_path, idle_ms, ws_messages, outbound, format)
+          cmd_repeater_send_ws(id, plan, project_name, db_path, idle_ms, ws_messages, outbound, format,
+            verbatim)
           return
         end
 
@@ -376,12 +375,13 @@ module Gori
       private def self.cmd_repeater_send_ws(id : Int64, plan : Repeater::Plan, project_name : String?,
                                             db_path : String?, idle_ms : Int64?,
                                             message_override : Array(String),
-                                            outbound : Gori::Outbound, format : Symbol) : Nil
+                                            outbound : Gori::Outbound, format : Symbol,
+                                            verbatim : Bool) : Nil
         abort_if_blocked!(plan, "gori run repeater send")
 
         store = open_store(resolve_read_project(project_name, db_path))
         out_messages = begin
-          ws_out_messages(store, id, message_override)
+          ws_out_messages(store, id, message_override, verbatim)
         ensure
           store.close
         end
@@ -412,15 +412,30 @@ module Gori
       # Each frame is expanded on its own, AFTER `Repeater::Plan` built the handshake, so
       # the builder's unresolved-token check (#519) never sees a message payload — this is
       # the second half of that gate and it lives here (#524).
-      private def self.ws_out_messages(store : Store, id : Int64, override : Array(String)) : Array(Repeater::WsEngine::OutMsg)
+      #
+      # `--verbatim` reaches this at all now: it was threaded into `session_plan_options`
+      # (the handshake head) but was not a parameter of `cmd_repeater_send_ws`, so a WS
+      # message was expanded on the wire despite the flag's own help text saying "no $VAR
+      # expansion". Under verbatim a literal `$TOKEN` IS the payload — the same reasoning
+      # `PlanOptions#refuse_unresolved_env?` carries on the h1 side — so the refusal is
+      # skipped too, or the one flag that can send it would be the one that refuses it.
+      #
+      # No `.scrub` anywhere on this path. `Env.expand` scans BYTES and copies every span
+      # that is not a matched token through unchanged (its own header says so), so a TEXT
+      # frame carrying invalid UTF-8 survives to the wire; scrubbing it turned 9 bytes into
+      # 13 and sent those instead, with no warning.
+      private def self.ws_out_messages(store : Store, id : Int64, override : Array(String),
+                                       verbatim : Bool = false) : Array(Repeater::WsEngine::OutMsg)
         unless override.empty?
-          refuse_unresolved_ws(override, id)
-          return override.map { |t| Repeater::WsEngine::OutMsg.new(1, Env.expand(t).to_slice) }
+          refuse_unresolved_ws(override, id) unless verbatim
+          return override.map do |t|
+            Repeater::WsEngine::OutMsg.new(1, verbatim ? t.to_slice : Env.expand(t).to_slice)
+          end
         end
         stored = store.ws_messages_for_repeater(id).select { |m| m.direction == "out" }
-        refuse_unresolved_ws(stored.select(&.text?).map { |m| String.new(m.payload).scrub }, id)
+        refuse_unresolved_ws(stored.select(&.text?).map { |m| String.new(m.payload) }, id) unless verbatim
         stored.map do |m|
-          payload = m.text? ? Env.expand(String.new(m.payload).scrub).to_slice : m.payload
+          payload = m.text? && !verbatim ? Env.expand(String.new(m.payload)).to_slice : m.payload
           Repeater::WsEngine::OutMsg.new(m.opcode, payload)
         end
       end
@@ -461,9 +476,15 @@ module Gori
                       j.field "opcode", m.opcode
                       if m.opcode == 1
                         j.field "text", scrub(m.payload)
+                        # JSON has no way to carry a byte that is not valid UTF-8, so `text`
+                        # above is U+FFFD-substituted for exactly the payload an §8.1/§5.6
+                        # test is about. Emit the real bytes beside it rather than leaving a
+                        # script no way to read them back.
+                        j.field "payload_base64", Base64.strict_encode(m.payload) unless String.new(m.payload).valid_encoding?
                       else
                         j.field "binary", true
                         j.field "size", m.payload.size
+                        j.field "payload_base64", Base64.strict_encode(m.payload)
                       end
                     end
                   end

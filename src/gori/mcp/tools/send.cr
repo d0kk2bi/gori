@@ -345,12 +345,17 @@ module Gori
                          texts.map { |t| Repeater::WsEngine::OutMsg.new(1, Env.expand(t).to_slice) }
                        else
                          stored = store.ws_messages_for_repeater(repeater_id).select { |m| m.direction == "out" }
-                         if e = ws_unresolved_env_error(stored.select(&.text?).map { |m| String.new(m.payload).scrub },
+                         if e = ws_unresolved_env_error(stored.select(&.text?).map { |m| String.new(m.payload) },
                               "repeater_id")
                            return e
                          end
+                         # No `.scrub`: `Env.expand` scans BYTES and copies every span that is
+                         # not a matched token through unchanged, so an invalid-UTF-8 TEXT
+                         # payload — the §8.1/§5.6 validation test case — reaches the wire as
+                         # the operator captured it. Scrubbing rewrote it to U+FFFD, changing
+                         # 9 bytes into 13, and sent that with no warning.
                          stored.map do |m|
-                           payload = m.text? ? Env.expand(String.new(m.payload).scrub).to_slice : m.payload
+                           payload = m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload
                            Repeater::WsEngine::OutMsg.new(m.opcode, payload)
                          end
                        end
@@ -417,6 +422,13 @@ module Gori
                     j.field "type", Serialize.ws_frame_type(message.opcode)
                     if message.opcode == 1
                       j.field "payload", Env.mask_secrets(String.new(message.payload).scrub)
+                      # JSON-RPC has no way to carry a byte that is not valid UTF-8, so
+                      # `payload` above is U+FFFD-substituted for exactly the payload an
+                      # §8.1/§5.6 test is about. The real bytes go beside it instead of
+                      # being unreadable on every surface (they are in the BLOB column).
+                      unless String.new(message.payload).valid_encoding?
+                        j.field "payload_base64", Base64.strict_encode(message.payload)
+                      end
                     else
                       j.field "binary", true
                       j.field "payload_base64", Base64.strict_encode(message.payload)
