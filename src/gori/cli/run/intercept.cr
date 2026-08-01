@@ -69,6 +69,7 @@ module Gori
           gori run intercept get 3 --format json
           gori run intercept forward 3
           gori run intercept edit 3 --raw-file edited.txt
+          gori run intercept edit 3 --raw-file desync.txt --no-update-content-length
           gori run intercept direction request
 
         See 'gori run intercept <subcommand> --help' for more.
@@ -342,6 +343,7 @@ module Gori
         format = :text
         raw : String? = nil
         raw_file : String? = nil
+        update_cl = true
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -349,11 +351,13 @@ module Gori
                      "Forward a held item with EDITED bytes: the full replacement wire message\n" \
                      "(whichever leg — request or response — is held). The BODY is forwarded\n" \
                      "VERBATIM (no $KEY expansion, no line-ending rewrite); header lines are\n" \
-                     "CRLF-terminated and Content-Length is resynced to the new body."
+                     "CRLF-terminated and Content-Length is resynced to the new body unless\n" \
+                     "--no-update-content-length holds the value you declared."
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--raw=RAW", "Verbatim replacement wire message") { |v| raw = v }
           p.on("--raw-file=PATH", "Read the replacement wire message from FILE") { |v| raw_file = v }
+          p.on("--no-update-content-length", "Forward the Content-Length you declared instead of resyncing it to the body (the CL-desync / CL+TE smuggling primitive; mirrors MCP intercept_forward_edit{update_content_length:false})") { update_cl = false }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |rest, _| positional = rest }
@@ -381,13 +385,29 @@ module Gori
         # the BODY is a byte (binary data, or a bare LF the operator deliberately wrote), and
         # rewriting it contradicted this subcommand's own "forwarded VERBATIM" contract —
         # `--raw-file` is its only byte-exact channel, and an `alpha\rbeta\ngamma` body came
-        # out a byte longer with the LF promoted.
-        #
-        # Byte-level, not `.gsub(/\r?\n/, "\r\n")`: content may be an arbitrary binary body
-        # read from --raw-file (invalid UTF-8), which a Regex subject cannot accept.
-        bytes = Fuzz::ContentLength.sync(normalize_head_crlf(content.to_slice), add_when_missing: true)
+        # out a byte longer with the LF promoted. (That split, and the Content-Length choice
+        # beside it, live in `intercept_edit_bytes` so a spec can pin the exact bytes.)
+        bytes = intercept_edit_bytes(content, update_cl)
         status, detail = enqueue_intercept(project_name, db_path, "forward_edit", item_id: item_id, bytes: bytes)
         emit_intercept_ack(status, detail, format)
+      end
+
+      # The exact bytes `edit` enqueues, from the replacement message and the CL choice.
+      # Public and pure so a spec can pin them without a live capturing instance.
+      #
+      # Byte-level, not `.gsub(/\r?\n/, "\r\n")`: content may be an arbitrary binary body read
+      # from --raw-file (invalid UTF-8), which a Regex subject cannot accept.
+      #
+      # The Content-Length resync is a DECLARED choice, default on, mirroring MCP's
+      # `intercept_forward_edit{update_content_length}`. It used to be unconditional here,
+      # which made a CL desync (CL shorter than the body, CL longer than the body, CL+TE) —
+      # *the* canonical reason to hold a request in the first place, and the RFC 9113 §8.1.1
+      # probe — unexpressible from the CLI, and made `--raw-file`'s advertised byte-exact
+      # channel not byte-exact. The gate on the other end already honours a declared value.
+      def self.intercept_edit_bytes(content : String, update_content_length : Bool) : Bytes
+        head_normalized = normalize_head_crlf(content.to_slice)
+        return head_normalized unless update_content_length
+        Fuzz::ContentLength.sync(head_normalized, add_when_missing: true)
       end
 
       # `Env.normalize_crlf` over the HEAD only — through and including the blank-line

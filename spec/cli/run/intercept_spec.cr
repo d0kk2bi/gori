@@ -34,6 +34,37 @@ describe "Gori::CLI::Run.normalize_head_crlf" do
   end
 end
 
+# MCP has carried `intercept_forward_edit{update_content_length}` since the desync switch was
+# made a declared argument; the CLI resynced unconditionally, so the whole CL-desync probe
+# class (CL shorter than the body, CL longer than the body, CL alongside Transfer-Encoding —
+# the RFC 9113 §8.1.1 shape) was unreachable from `gori run intercept edit`, even though the
+# gate on the other end already honours a value the caller declared. `--raw-file` advertised
+# itself as the byte-exact channel while being the one path that could not hold a length.
+describe "Gori::CLI::Run.intercept_edit_bytes" do
+  it "resyncs Content-Length to the edited body by default" do
+    raw = "POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nlonger-body"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, true))
+      .should eq("POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nlonger-body")
+  end
+
+  it "forwards a DELIBERATELY short Content-Length untouched with the resync off" do
+    raw = "POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nlonger-body"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, false)).should eq(raw)
+  end
+
+  it "keeps Content-Length ALONGSIDE Transfer-Encoding — the CL.TE smuggling pair" do
+    raw = "POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n" \
+          "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, false)).should eq(raw)
+  end
+
+  it "still CRLF-terminates the head with the resync off, and adds no Content-Length" do
+    raw = "POST /h HTTP/1.1\nHost: h\n\nalpha\ngamma"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, false))
+      .should eq("POST /h HTTP/1.1\r\nHost: h\r\n\r\nalpha\ngamma")
+  end
+end
+
 # `HeldRow#target` carries TWO different things depending on `kind`: a request's target, or a
 # RESPONSE's status reason. The row builder never branched on it, so a held response rendered
 # as `http://127.0.0.1200 OK` — a string that looks like a URL, is not one, drops the port,
