@@ -87,9 +87,10 @@ module Gori::Proxy
       # allocation per body. Lazily allocated on the first body copy.
       @copy_buf = nil.as(Bytes?)
       # Why the most recent upstream dial failed, set by `open_upstream` and read only when a
-      # dial returned nil — lets a failed HTTPS flow distinguish unreachable from a TLS/verify
-      # rejection (the #323 case, whose fix is --insecure-upstream). See `upstream_error_message`.
-      @last_tls_dial_error = nil.as(Upstream::TlsDialError?)
+      # dial returned nil — lets a failed flow distinguish unreachable from a TLS/verify
+      # rejection (the #323 case, whose fix is --insecure-upstream) and from an upstream proxy
+      # that refused the tunnel outright. See `upstream_error_message`.
+      @last_dial_error = nil.as(Upstream::DialError?)
     end
 
     # The address every upstream dial on THIS connection is pinned to, or nil when nothing
@@ -1317,7 +1318,7 @@ module Gori::Proxy
     # for the rare LAN that has a real box called "gori"; that mirrors why addresses_self?
     # skips override resolution — a mapping the user wrote down is a statement of intent.
     private def reserved_self_host?(host : String) : Bool
-      SelfPage.magic_host?(host) && @host_overrides.try(&.connect_ip(host)).nil?
+      SelfPage.magic_host?(host) && @host_overrides.try(&.connect_address(host)).nil?
     end
 
     # The plaintext half of the reserved-host route. Returns true when the request was
@@ -1369,31 +1370,39 @@ module Gori::Proxy
       if @tls_upstream
         sock, err = Upstream.dial_tls_result(host, port, verify: @verify_upstream,
           overrides: @host_overrides, pin: dial_pin)
-        @last_tls_dial_error = err
+        @last_dial_error = err
         sock
       else
-        @last_tls_dial_error = nil # plaintext forward-proxy dial: no TLS leg to classify
-        Upstream.dial(host, port, overrides: @host_overrides, pin: dial_pin)
+        # A plaintext forward-proxy dial has no TLS leg to classify, but it DOES go through the
+        # upstream proxy (gori CONNECT-tunnels even http:// targets), so it can be refused by
+        # one — which is why this branch now asks for the reason too instead of clearing it.
+        sock, err = Upstream.dial_result(host, port, overrides: @host_overrides, pin: dial_pin)
+        @last_dial_error = err
+        sock
       end
     end
 
     # The error text for a failed upstream acquire/send. A nil `upstream` is a DIAL failure,
-    # split into unreachable (connect) vs. a TLS/verify rejection — the #323 case, whose fix is
-    # --insecure-upstream, so the recorded flow points there instead of at reachability. A
-    # non-nil `upstream` means the socket was live but the mid-request write failed.
+    # split into unreachable (connect), a TLS/verify rejection — the #323 case, whose fix is
+    # --insecure-upstream, so the recorded flow points there instead of at reachability — and
+    # a refusal by the configured upstream proxy, where the origin was never contacted at all.
+    # A non-nil `upstream` means the socket was live but the mid-request write failed.
     private def upstream_error_message(host : String, port : Int32, upstream : IO?) : String
       return "upstream write failed: #{host}:#{port}" unless upstream.nil?
-      case @last_tls_dial_error
-      when Upstream::TlsDialError::Tls
-        if @verify_upstream
-          "upstream TLS verification failed: #{host}:#{port} — origin certificate not trusted; " \
-          "retry with --insecure-upstream or set SSL_CERT_FILE"
-        else
-          "upstream TLS handshake failed: #{host}:#{port}"
-        end
-      else
-        "upstream connect failed: #{host}:#{port}"
+      err = @last_dial_error
+      if err && err.tls?
+        return "upstream TLS verification failed: #{host}:#{port} — origin certificate not trusted; " \
+               "retry with --insecure-upstream or set SSL_CERT_FILE" if @verify_upstream
+        return "upstream TLS handshake failed: #{host}:#{port}"
       end
+      # A detail REPLACES the host-shaped sentence rather than decorating it. Every detail the
+      # dialer sets is about a proxy — either one that refused the tunnel or one gori could not
+      # reach — and in both cases the origin was never contacted, so naming it here is exactly
+      # what used to send operators to debug DNS on a machine that was fine.
+      if detail = err.try(&.detail)
+        return "upstream connect failed: #{detail}"
+      end
+      "upstream connect failed: #{host}:#{port}"
     end
 
     private def resolve_forward(req : Codec::RawRequest) : {String, Int32, String, Bytes}

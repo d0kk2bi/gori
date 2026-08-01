@@ -222,7 +222,7 @@ A rule is matched against the **original** hostname, before any [host override](
 
 ### outbound_tls
 
-Per-destination TLS policy for the connections gori **makes**: a client certificate to present, and the protocol/cipher floor to negotiate with. Ordered, first match wins, same host-pattern dialect. Edit with `gori settings --edit`.
+Per-destination TLS policy for the connections gori **makes**: a client certificate to present, and the protocol range / cipher list to negotiate with. Ordered, first match wins, same host-pattern dialect. Edit with `gori settings --edit`.
 
 This is a separate table from [`upstream_rules`](#upstream_rules) on purpose. Both are keyed by destination host, but they answer different questions, and folding them together would make the common shape inexpressible — "everything through the corporate proxy, plus a client certificate for one host" would need the proxy address duplicated onto that host's row, because one first-match table can only apply a single row per host.
 
@@ -250,10 +250,19 @@ This is a separate table from [`upstream_rules`](#upstream_rules) on purpose. Bo
 | `client_cert` | string | Path to a PEM certificate chain to present (mutual TLS) |
 | `client_key` | string | Path to the matching PEM private key. Both halves are required, or neither |
 | `min_version` | string | Lowest protocol to negotiate: `tls1.0`, `tls1.1`, `tls1.2`, `tls1.3`. Empty leaves the default |
+| `max_version` | string | Highest protocol to negotiate, same values. Empty leaves the default |
 | `ciphers` | string | OpenSSL cipher list for TLS 1.2 and below. Empty leaves the default |
 | `permissive` | bool | Talk to broken/legacy servers: drops the OpenSSL security level to 0 and allows renegotiation |
 
 **Why `min_version` exists.** gori cannot reach a TLS 1.0/1.1-only appliance out of the box, and `verify_upstream: false` does not help — that turns off certificate *verification*, not protocol negotiation. Crystal's TLS client context disables TLS 1.0 and 1.1 in its constructor, so lowering the floor here is the only way. A legacy appliance usually needs `permissive: true` as well, because distributions build OpenSSL at a security level that rejects the old cipher suites outright.
+
+**Why `max_version` exists.** A floor alone cannot choose a version. Against any origin that also speaks TLS 1.3 — which is every modern one — the handshake lands on 1.3 however low the floor is, so `min_version: "tls1.0"` never answered *"does this target still accept TLS 1.0?"*, and `ciphers` never applied either, because OpenSSL's cipher list governs TLS 1.2 and below only. Setting both bounds is what makes "negotiate TLS 1.2 with `AES128-SHA`" expressible:
+
+```json
+{ "host": "legacy.internal", "min_version": "tls1.2", "max_version": "tls1.2", "ciphers": "AES128-SHA", "permissive": true }
+```
+
+Pinning both to the same value offers exactly that one version, so a handshake failure is a real answer: the target does not accept it. A `min_version` above `max_version` is rejected at save time — that pair offers no version at all, and OpenSSL's error would name the origin rather than the settings file.
 
 **Certificates are file paths, not inline material.** A private key does not belong in `settings.json`, which is shareable and exportable ([#439](https://github.com/hahwul/gori/issues/439)). A passphrase-protected key is rejected at save time: OpenSSL would prompt for the passphrase on the terminal the TUI owns, so gori would simply appear to hang. Decrypt it first with `openssl pkey -in key.pem -out plain.pem`.
 
@@ -362,10 +371,16 @@ Global dial map (project-level overrides win on collision). Same idea as `/etc/h
 ```json
 {
   "hostname_overrides": [
-    { "host": "api.prod.internal", "ip": "10.0.0.42" }
+    { "host": "api.prod.internal", "ip": "10.0.0.42" },
+    { "host": "api.prod.example", "ip": "127.0.0.1:8443" },
+    { "host": "v6.internal", "ip": "[::1]:8443" }
   ]
 }
 ```
+
+The value is an IP literal, optionally with a **port**: `IP`, `IP:PORT`, or `[v6]:PORT`. A bare IP keeps the port from the request URL, which is what an entry written before ports were supported has always meant. Adding a port is the one thing this goes beyond `/etc/hosts` on, and deliberately — `/etc/hosts` is read by a resolver that has no port to change, whereas gori is the thing making the connection. Pointing `https://api.prod.example/` at a local build on `127.0.0.1:8443` is otherwise inexpressible when the traffic comes from a real browser or a mobile app, because gori is not the one writing the URL.
+
+SNI, the certificate hostname and the `Host` header still keep the **original** name; only the TCP connect target moves.
 
 Edit from Preferences → **Network & Tabs** → **Network** → **Hostname overrides**, or the Project tab for per-project entries. See [Proxy & History](/guide/proxy/#host-overrides).
 

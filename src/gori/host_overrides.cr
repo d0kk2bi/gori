@@ -1,25 +1,38 @@
 require "socket"
+require "./dial_address"
 require "./store"
 
 module Gori
-  # A per-project /etc/hosts: maps a hostname to the IP the proxy should DIAL for it.
+  # A per-project /etc/hosts: maps a hostname to the address the proxy should DIAL for it.
   # The override changes ONLY the TCP connect target — SNI, the certificate hostname,
   # the Host header, and the upstream-reuse pool key all keep the original hostname
   # (see Proxy::Upstream.dial). Owned by the TUI (the Project tab's HOST OVERRIDES
   # pane), persisted per project, and ALSO layered under a global set
   # (Settings.hostname_overrides) — the project layer wins on a host collision.
   #
-  # Entries are read on the PROXY hot path (connect_ip) while the TUI fiber mutates
+  # The value is `IP` or `IP:PORT` (see `Gori::DialAddress`): a bare IP keeps the request's
+  # own port, which is what every entry written before ports existed says.
+  #
+  # Entries are read on the PROXY hot path (connect_address) while the TUI fiber mutates
   # them (add/update/remove), so every cross-fiber access is Mutex-guarded — exactly
   # like Scope.
   class HostOverrides
     # One override. Immutable: rebuilt on every load/mutate (never edited in place).
+    #
+    # `ip` is the column name and the historical spelling; it holds a dial ADDRESS, which may
+    # carry a port. Kept as `ip` rather than renamed because the persisted column is `ip` and
+    # this round must not touch the schema — `address` is the accessor that says what it is.
     class Entry
       getter id : Int64
       getter host : String # lowercased
       getter ip : String
 
       def initialize(@id : Int64, @host : String, @ip : String)
+      end
+
+      # The stored value as gori dials it.
+      def address : String
+        @ip
       end
     end
 
@@ -42,10 +55,11 @@ module Gori
       @entries.size
     end
 
-    # PROXY HOT PATH: the IP to dial for `host` (case-insensitive exact match), or nil
+    # PROXY HOT PATH: the address to dial for `host` (case-insensitive exact match), or nil
     # when no project override exists (the caller then falls back to the global set,
-    # then to normal DNS). Mutex-guarded — the proxy reads while the TUI mutates.
-    def connect_ip(host : String) : String?
+    # then to normal DNS). May carry a port — see `Gori::DialAddress`. Mutex-guarded: the
+    # proxy reads while the TUI mutates.
+    def connect_address(host : String) : String?
       return nil if @entries.empty? # fast path (the universal case): no overrides → skip the downcase + lock
       h = host.downcase
       @mutex.synchronize { @entries.find { |e| e.host == h }.try(&.ip) }
@@ -93,24 +107,23 @@ module Gori
     # override) without being so strict it blocks ordinary names.
     HOST_RE = /\A[a-zA-Z0-9._-]+\z/
 
-    # A valid override is a hostname-shaped host plus an IP that parses as a real IPv4/IPv6
-    # literal — rejecting a hostname-as-"IP" prevents a re-resolution loop (TCPSocket
-    # would resolve it) and matches /etc/hosts, which only maps names to addresses.
+    # A valid override is a hostname-shaped host plus an address that parses as a real
+    # IPv4/IPv6 literal, optionally with a port — rejecting a hostname-as-"IP" prevents a
+    # re-resolution loop (TCPSocket would resolve it) and matches /etc/hosts, which only maps
+    # names to addresses. The port is the one thing this goes BEYOND /etc/hosts on, and
+    # deliberately: /etc/hosts is consulted by a resolver that has no port to change, whereas
+    # gori is the thing making the connection.
     def self.valid?(host : String, ip : String) : Bool
       host = host.strip
-      ip = ip.strip
-      return false if host.empty? || ip.empty?
+      return false if host.empty?
       return false unless host.matches?(HOST_RE)
-      Socket::IPAddress.new(ip, 0)
-      true
-    rescue
-      false
+      DialAddress.valid?(ip)
     end
 
-    # Parse a single-line "IP host" entry (/etc/hosts order — IP first) into {host
-    # (lowercased), ip}, or nil when it isn't a valid IP + hostname pair. ONE place so the
-    # Project pane (ov_commit) and the global settings editor (HostsOverlay#commit) parse
-    # and validate identically.
+    # Parse a single-line "ADDRESS host" entry (/etc/hosts order — address first) into {host
+    # (lowercased), address}, or nil when it isn't a valid address + hostname pair. ONE place
+    # so the Project pane (ov_commit) and the global settings editor (HostsOverlay#commit)
+    # parse and validate identically.
     def self.parse_line(text : String) : {String, String}?
       parts = text.strip.split(/\s+/, 2)
       return nil if parts.size < 2

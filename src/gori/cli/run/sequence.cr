@@ -26,6 +26,7 @@ module Gori
         max_requests : Int64? = nil
         format = :text
         allow_unscoped = false
+        bind_from : Int64? = nil
         positional = [] of String
 
         set_loc = ->(k : Sequencer::ExtractKind, v : String) {
@@ -57,6 +58,7 @@ module Gori
           p.on("--timeout=SEC", "Per-request connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("--retries=N", "Retries on a network error") { |v| retries = parse_nonneg(v, "--retries") }
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
+          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run sequence") }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -115,6 +117,10 @@ module Gori
         end
         guard_outbound(outbound, origin.scheme, origin.host, plan.request_target, "gori run sequence")
         begin
+          # See CLI::Run.seed_bindings — a headless process holds no binding from a previous
+          # invocation, so it either replays one here or refuses before the run.
+          seed_bindings(bind_from.not_nil!, project_name, db_path, outbound, insecure, "gori run sequence") if bind_from
+          preflight_bindings(String.new(bytes), bind_from, "gori run sequence")
           run_sequence_stream(plan.engine, origin.scheme, origin.host, origin.port, token_loc, plan.goal, format)
         ensure
           outbound.close

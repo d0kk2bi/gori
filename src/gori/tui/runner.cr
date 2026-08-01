@@ -2193,7 +2193,7 @@ module Gori::Tui
 
     # Persist the hostname-overrides working copy. Returns Settings.save's success so the
     # editor can branch its toast (saved vs applied-but-not-persisted), like save_env.
-    # Called on EVERY mutation — the live proxy reads Settings.host_override_ip on the next
+    # Called on EVERY mutation — the live proxy reads Settings.host_override_address on the next
     # flow — which is why that editor has no ↵-to-commit and esc just closes.
     private def save_hosts(ov : HostsOverlay) : Bool
       Settings.hostname_overrides = ov.to_overrides.dup

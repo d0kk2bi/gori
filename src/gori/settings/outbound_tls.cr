@@ -12,7 +12,8 @@ require "../host_pattern"
 # a client certificate for one host" would need the proxy address duplicated onto that host's
 # row, because a single first-match table can only apply one row per host.
 module Gori::Settings
-  # Protocol floors, lowest first. "" = leave OpenSSL/Crystal's default alone.
+  # Protocol bounds, lowest first. "" = leave OpenSSL/Crystal's default alone. Used for
+  # BOTH `min_version` (the floor) and `max_version` (the ceiling).
   #
   # This matters more than it looks: Crystal's OpenSSL::SSL::Context::Client.new adds
   # NO_TLS_V1 | NO_TLS_V1_1 in its constructor, so gori CANNOT reach a TLS 1.0/1.1-only
@@ -28,11 +29,19 @@ module Gori::Settings
   # settings.json (which is shareable/exportable — #439), and gori already speaks PEM for its
   # own CA. A PASSPHRASE-PROTECTED key is not supported: OpenSSL would prompt on a terminal
   # gori has taken over, so outbound_tls_error rejects one at save time instead.
+  # `min_version` is a FLOOR and `max_version` a CEILING; either alone is legal. The ceiling
+  # is not symmetry for its own sake — without it `min_version` could not express a
+  # negotiation at all, only a lower bound that every modern origin answers with TLS 1.3,
+  # and `ciphers` (which OpenSSL's SSL_CTX_set_cipher_list applies to TLS 1.2 AND BELOW
+  # ONLY) was therefore unreachable: the two knobs together could not say "negotiate TLS 1.2
+  # with AES128-SHA", which is the test they exist for. Nor could an operator ask "does this
+  # target still accept TLS 1.0?", because gori could not be made to OFFER only that.
   record OutboundTlsRule,
     host : String,
     client_cert : String = "",
     client_key : String = "",
     min_version : String = "",
+    max_version : String = "",
     ciphers : String = "",
     permissive : Bool = false do
     # Whether this rule asks for mutual TLS. Both halves are required — OpenSSL needs the
@@ -44,7 +53,7 @@ module Gori::Settings
 
     # True when the rule changes nothing, so the shared default context can be reused.
     def default? : Bool
-      !client_auth? && min_version.empty? && ciphers.empty? && !permissive
+      !client_auth? && min_version.empty? && max_version.empty? && ciphers.empty? && !permissive
     end
 
     # A stable identity for this policy, used as part of the TLS context cache key. Contexts
@@ -55,7 +64,7 @@ module Gori::Settings
     # inside a `record` block body the interpolation form does not compile here.
     def cache_key : String
       return "" if default?
-      [client_cert, client_key, min_version, ciphers, permissive.to_s].join('\0')
+      [client_cert, client_key, min_version, max_version, ciphers, permissive.to_s].join('\0')
     end
   end
 
@@ -94,18 +103,25 @@ module Gori::Settings
       next unless o = e.as_h?
       host = o["host"]?.try(&.as_s?).try(&.strip)
       next if host.nil? || host.empty?
-      version = o["min_version"]?.try(&.as_s?).try(&.strip.downcase) || ""
-      version = "" unless TLS_VERSIONS.includes?(version)
       out << OutboundTlsRule.new(
         host,
         o["client_cert"]?.try(&.as_s?).try(&.strip) || "",
         o["client_key"]?.try(&.as_s?).try(&.strip) || "",
-        version,
+        parse_version(o["min_version"]?),
+        parse_version(o["max_version"]?),
         o["ciphers"]?.try(&.as_s?).try(&.strip) || "",
         o["permissive"]?.try(&.as_bool?) || false,
       )
     end
     out
+  end
+
+  # One protocol-bound node, normalised. An out-of-range value degrades to "" (leave OpenSSL's
+  # default alone) rather than failing the whole load — the same tolerance every other section
+  # applies to a hand-edited file, and the save-time validator is where a typo is reported.
+  private def self.parse_version(node : JSON::Any?) : String
+    v = node.try(&.as_s?).try(&.strip.downcase) || ""
+    TLS_VERSIONS.includes?(v) ? v : ""
   end
 
   # Omit when empty so an untouched install never writes "outbound_tls": [].
@@ -119,6 +135,7 @@ module Gori::Settings
             j.field "client_cert", r.client_cert unless r.client_cert.empty?
             j.field "client_key", r.client_key unless r.client_key.empty?
             j.field "min_version", r.min_version unless r.min_version.empty?
+            j.field "max_version", r.max_version unless r.max_version.empty?
             j.field "ciphers", r.ciphers unless r.ciphers.empty?
             j.field "permissive", r.permissive if r.permissive
           end
@@ -132,8 +149,8 @@ module Gori::Settings
   # that reads like the ORIGIN's fault.
   def self.outbound_tls_error(rule : OutboundTlsRule) : String?
     return "settings: outbound TLS rule needs a host pattern" if rule.host.strip.empty?
-    unless rule.min_version.empty? || TLS_VERSIONS.includes?(rule.min_version)
-      return "settings: outbound TLS min_version must be one of #{TLS_VERSIONS.join(", ")}"
+    if err = protocol_range_error(rule)
+      return err
     end
     cert = rule.client_cert
     key = rule.client_key
@@ -149,6 +166,30 @@ module Gori::Settings
     # message can say what to do, rather than at the first dial.
     return "settings: client_key is passphrase-protected; decrypt it first (openssl pkey -in #{key} -out key.pem)" if encrypted_key?(key)
     nil
+  end
+
+  # The floor/ceiling half of outbound_tls_error, split out so neither method carries the
+  # whole rule's validation.
+  #
+  # The third check is the one that is not just a spelling test: an inverted pair (min tls1.3
+  # / max tls1.2) offers NO protocol version at all, so OpenSSL would fail every handshake for
+  # the host with an error that names the ORIGIN rather than the two settings fields that
+  # disagree.
+  private def self.protocol_range_error(rule : OutboundTlsRule) : String?
+    lo = rule.min_version
+    hi = rule.max_version
+    return "settings: outbound TLS min_version must be one of #{TLS_VERSIONS.join(", ")}" unless version_ok?(lo)
+    return "settings: outbound TLS max_version must be one of #{TLS_VERSIONS.join(", ")}" unless version_ok?(hi)
+    lo_rank = TLS_VERSIONS.index(lo)
+    hi_rank = TLS_VERSIONS.index(hi)
+    return nil unless lo_rank && hi_rank && lo_rank > hi_rank
+    "settings: outbound TLS min_version (#{lo}) is above max_version (#{hi})"
+  end
+
+  # "" (leave the default alone) or a known version. Empty deliberately passes: both bounds
+  # are independently optional.
+  private def self.version_ok?(version : String) : Bool
+    version.empty? || TLS_VERSIONS.includes?(version)
   end
 
   private def self.file_readable?(path : String) : Bool

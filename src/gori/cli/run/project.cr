@@ -865,7 +865,7 @@ module Gori
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run project host-override [options]\n\n" \
-                     "List project host overrides (/etc/hosts-style: dial IP for hostname).\n" \
+                     "List project host overrides (/etc/hosts-style: dial IP[:PORT] for hostname).\n" \
                      "Project overrides win over global Settings: Hostnames on collision.\n" \
                      "Or run with a subcommand:\n" \
                      "  gori run project host-override add --host=api.example.com --ip=10.0.0.1\n" \
@@ -919,11 +919,11 @@ module Gori
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run project host-override add --host=HOST --ip=IP [options]\n" \
                      "       gori run project host-override add IP HOST [options]\n\n" \
-                     "Add a project host override (dial IP for HOST; SNI/Host header unchanged)."
+                     "Add a project host override (dial IP — or IP:PORT — for HOST; SNI/Host header unchanged)."
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--host=HOST", "Hostname to override (case-insensitive)") { |v| host = v }
-          p.on("--ip=IP", "IPv4/IPv6 literal to dial") { |v| ip = v }
+          p.on("--ip=IP", "IPv4/IPv6 literal to dial, optionally IP:PORT") { |v| ip = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |rest, _| positional = rest }
           p.invalid_option { |f| abort "gori run project host-override add: unknown option: #{f}\n#{p}" }
@@ -946,7 +946,7 @@ module Gori
             parsed
           end
         h, i = pair
-        abort "gori run project host-override add: invalid host/ip (host hostname-shaped, ip an IPv4/IPv6 literal)" unless HostOverrides.valid?(h, i)
+        abort "gori run project host-override add: invalid host/ip (host hostname-shaped; ip an IPv4/IPv6 literal, optionally IP:PORT or [v6]:PORT)" unless HostOverrides.valid?(h, i)
 
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)
@@ -979,7 +979,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--host=HOST", "New hostname (case-insensitive)") { |v| host = v }
-          p.on("--ip=IP", "New IPv4/IPv6 literal to dial") { |v| ip = v }
+          p.on("--ip=IP", "New IPv4/IPv6 literal to dial, optionally IP:PORT") { |v| ip = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |rest, _| positional = rest }
           p.invalid_option { |f| abort "gori run project host-override update: unknown option: #{f}\n#{p}" }
@@ -993,7 +993,7 @@ module Gori
         h = host
         i = ip
         abort "gori run project host-override update: --host and --ip are both required" unless h && i
-        abort "gori run project host-override update: invalid host/ip (host hostname-shaped, ip an IPv4/IPv6 literal)" unless HostOverrides.valid?(h, i)
+        abort "gori run project host-override update: invalid host/ip (host hostname-shaped; ip an IPv4/IPv6 literal, optionally IP:PORT or [v6]:PORT)" unless HostOverrides.valid?(h, i)
 
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)

@@ -33,25 +33,48 @@ module Gori::Proxy
                   io_timeout : Time::Span = Settings.io_timeout,
                   *, overrides : Gori::HostOverrides? = nil,
                   pin : String? = nil) : TCPSocket?
-      target = connect_target(host, overrides, pin)
+      dial_result(host, port, connect_timeout, io_timeout, overrides: overrides, pin: pin)[0]
+    end
+
+    # Like `dial`, but also says WHY there is no socket. Every dial failure used to collapse
+    # into one nil, so a corporate proxy answering `407 Proxy Authentication Required` was
+    # indistinguishable from a dead origin — and the callers, having nothing else to go on,
+    # printed "host unreachable (DNS/refused/timeout)" and sent the operator to debug DNS and
+    # firewall rules on a host that was perfectly fine. A bare `TCPSocket?` cannot carry that;
+    # this is the shape that can.
+    def self.dial_result(host : String, port : Int32,
+                         connect_timeout : Time::Span = Settings.connect_timeout,
+                         io_timeout : Time::Span = Settings.io_timeout,
+                         *, overrides : Gori::HostOverrides? = nil,
+                         pin : String? = nil) : {TCPSocket?, DialError?}
+      target, target_port = connect_target(host, port, overrides, pin)
       # ONE decision point for "how do we reach this host": Settings.upstream_route folds the
       # project pin, the rule table and the legacy scalar together. Resolved on the ORIGINAL
       # host, not `target` — a rule is written against the name the operator sees, and a
-      # hostname override only changes which IP we dial (see connect_target).
+      # hostname override only changes where we dial (see connect_target).
       route = Settings.upstream_route(host)
       if route.direct?
-        direct_dial(target, port, connect_timeout, io_timeout)
+        sock = direct_dial(target, target_port, connect_timeout, io_timeout)
+        sock ? {sock, nil} : {nil, DialError::ORIGIN_UNREACHABLE}
       elsif route.socks5?
-        dial_via_socks5(route, target, port, connect_timeout, io_timeout)
+        dial_via_socks5(route, target, target_port, connect_timeout, io_timeout)
       else
-        dial_via_proxy(route, target, port, connect_timeout, io_timeout)
+        dial_via_proxy(route, target, target_port, connect_timeout, io_timeout)
       end
     end
 
-    # The IP to actually dial for `host`: a project override (wins) → a global override
-    # (Settings, read live) → `pin` → `host` unchanged. ONLY the TCP connect target changes —
-    # SNI, the certificate hostname, the Host header, and the upstream-reuse pool key
-    # all keep the ORIGINAL host (a /etc/hosts-style resolution override, nothing more).
+    # The address to actually dial for `host`: a project override (wins) → a global override
+    # (Settings, read live) → `pin` → `host` unchanged, paired with the port to use. ONLY the
+    # TCP connect target changes — SNI, the certificate hostname, the Host header, and the
+    # upstream-reuse pool key all keep the ORIGINAL host (a /etc/hosts-style resolution
+    # override, nothing more).
+    #
+    # An override MAY now move the port too (`Gori::DialAddress`). It is returned rather than
+    # applied at each call site because the port is part of the same answer: the old shape
+    # returned a bare host and left every caller to assume the request's port, which is
+    # precisely the assumption that made "point this hostname at my local build on :8443"
+    # inexpressible. A value with no port keeps the request's own, so every entry written
+    # before ports existed means exactly what it always meant.
     #
     # `pin` is the address a TRANSPARENT listener read out of the kernel for this connection
     # (`Proxy::OrigDst`, #528/#529) — where the client was ACTUALLY going, as opposed to the
@@ -66,9 +89,16 @@ module Gori::Proxy
     # than the narrow residual it would remove: a lying `Host` that names an overridden host
     # can still reach that override's address, but only an address the operator already put in
     # their own table by name.
-    private def self.connect_target(host : String, overrides : Gori::HostOverrides?,
-                                    pin : String? = nil) : String
-      overrides.try(&.connect_ip(host)) || Settings.host_override_ip(host) || pin || host
+    private def self.connect_target(host : String, port : Int32, overrides : Gori::HostOverrides?,
+                                    pin : String? = nil) : {String, Int32}
+      if value = overrides.try(&.connect_address(host)) || Settings.host_override_address(host)
+        # An unparseable value can only come from a hand-edited settings.json / DB row: both
+        # writers validate. Fall through to the name rather than dialing garbage.
+        if parsed = Gori::DialAddress.parse(value)
+          return {parsed.ip, parsed.port || port}
+        end
+      end
+      {pin || host, port}
     end
 
     # True when dialing `host:port` (after override resolution) would connect back
@@ -87,8 +117,13 @@ module Gori::Proxy
     # that IP:port, so matching it never refuses legitimate traffic.
     def self.loops_to_self?(host : String, port : Int32, overrides : Gori::HostOverrides?,
                             self_addr : {String, Int32}, local_host : String? = nil) : Bool
-      return false unless port == self_addr[1]
-      target = normalize_host(connect_target(host, overrides))
+      # The port gate is asked AFTER the override is resolved, not before. An override may now
+      # move the port, so the question "would this dial land on our own listener?" is about the
+      # port we will ACTUALLY dial — testing the request's port first would let an override
+      # pointing at gori's own bind walk straight into the self-proxy loop this exists to stop.
+      resolved, target_port = connect_target(host, port, overrides)
+      return false unless target_port == self_addr[1]
+      target = normalize_host(resolved)
       bind = normalize_host(self_addr[0])
       return true if target == bind
       return true if local_host && target == normalize_host(local_host)
@@ -226,9 +261,17 @@ module Gori::Proxy
     private def self.dial_via_proxy(route : Settings::UpstreamRoute,
                                     host : String, port : Int32,
                                     connect_timeout : Time::Span = Settings.connect_timeout,
-                                    io_timeout : Time::Span = Settings.io_timeout) : TCPSocket?
+                                    io_timeout : Time::Span = Settings.io_timeout) : {TCPSocket?, DialError?}
+      # A named-but-unset password variable is a CONFIGURATION error and is refused before the
+      # socket. The old code read the variable at dial time, got nil, and sent `user:` — an
+      # empty password the proxy answers 407 to, which then arrived at the operator as "host
+      # unreachable". The name of the variable they forgot to export is the whole answer, and
+      # nothing downstream can recover it.
+      if err = route.credential_error
+        return {nil, DialError.new(DialErrorKind::Proxy, "#{proxy_label(route)}: #{err}")}
+      end
       sock = direct_dial(route.host, route.port, connect_timeout, io_timeout)
-      return nil unless sock
+      return {nil, DialError.new(DialErrorKind::Connect, "#{proxy_label(route)} unreachable (DNS/refused/timeout) — the origin was never contacted")} unless sock
       # An IPv6 literal host must be bracketed in the CONNECT request-target / Host header
       # ("CONNECT [::1]:443"), else the upstream proxy sees a malformed authority.
       authority = host.includes?(':') && !host.starts_with?('[') ? "[#{host}]:#{port}" : "#{host}:#{port}"
@@ -236,12 +279,20 @@ module Gori::Proxy
       sock << "Proxy-Authorization: Basic #{basic_credentials(route)}\r\n" if authenticating?(route)
       sock << "\r\n"
       sock.flush
-      return sock if connect_established?(sock)
-      sock.close rescue nil
-      nil
+      if err = connect_refusal(sock, route, authority)
+        sock.close rescue nil
+        return {nil, err}
+      end
+      {sock, nil}
     rescue
       sock.try(&.close) rescue nil
-      nil
+      {nil, DialError.new(DialErrorKind::Proxy, "#{proxy_label(route)}: the CONNECT exchange failed")}
+    end
+
+    # How an error names the upstream proxy. One spelling so a 407 and an unreachable proxy
+    # point at the same line of settings.json.
+    private def self.proxy_label(route : Settings::UpstreamRoute) : String
+      "upstream #{route.socks5? ? "SOCKS5" : "HTTP"} proxy #{route.host}:#{route.port}"
     end
 
     # Whether this route has credentials to present. A username alone is legitimate (some
@@ -283,15 +334,20 @@ module Gori::Proxy
     private def self.dial_via_socks5(route : Settings::UpstreamRoute,
                                      host : String, port : Int32,
                                      connect_timeout : Time::Span = Settings.connect_timeout,
-                                     io_timeout : Time::Span = Settings.io_timeout) : TCPSocket?
+                                     io_timeout : Time::Span = Settings.io_timeout) : {TCPSocket?, DialError?}
+      # Same reasoning as the CONNECT path: a named-but-unset password variable is refused
+      # before the socket, naming the variable.
+      if err = route.credential_error
+        return {nil, DialError.new(DialErrorKind::Proxy, "#{proxy_label(route)}: #{err}")}
+      end
       sock = direct_dial(route.host, route.port, connect_timeout, io_timeout)
-      return nil unless sock
-      return sock if socks5_handshake(sock, route, host, port)
+      return {nil, DialError.new(DialErrorKind::Connect, "#{proxy_label(route)} unreachable (DNS/refused/timeout) — the origin was never contacted")} unless sock
+      return {sock, nil} if socks5_handshake(sock, route, host, port)
       sock.close rescue nil
-      nil
+      {nil, DialError.new(DialErrorKind::Proxy, "#{proxy_label(route)} refused the tunnel to #{host}:#{port}")}
     rescue
       sock.try(&.close) rescue nil
-      nil
+      {nil, DialError.new(DialErrorKind::Proxy, "#{proxy_label(route)}: the SOCKS5 handshake failed")}
     end
 
     # Method negotiation → optional auth → CONNECT. False on any refusal, so the caller closes.
@@ -413,22 +469,61 @@ module Gori::Proxy
     MAX_CONNECT_HEADERS = 64 * 1024
 
     # Read the proxy's CONNECT reply: a 2xx status line, then drain headers to the
-    # blank line so the socket sits at the tunnel start. true on success. A reply that
-    # blows past the line/section caps (an endless line with no CRLF, or endless
+    # blank line so the socket sits at the tunnel start. nil when the tunnel is open. A reply
+    # that blows past the line/section caps (an endless line with no CRLF, or endless
     # headers — a memory-DoS shape) fails the CONNECT rather than pinning memory or
     # proceeding onto a desynced tunnel.
-    private def self.connect_established?(sock : TCPSocket) : Bool
+    #
+    # The status used to be parsed into a Bool and thrown away, which encoded the belief that
+    # "the tunnel is not open" is all a caller needs. It is not: 407, 403 and 502 have three
+    # different fixes and NONE of them is on the origin host, which is the only thing the
+    # collapsed message ever named.
+    private def self.connect_refusal(sock : TCPSocket, route : Settings::UpstreamRoute,
+                                     authority : String) : DialError?
       status = sock.gets('\n', MAX_CONNECT_LINE)
-      return false unless status
+      unless status
+        return DialError.new(DialErrorKind::Proxy,
+          "#{proxy_label(route)} closed the connection without answering CONNECT #{authority}")
+      end
       parts = status.chomp.split(' ', 3)
-      ok = parts.size >= 2 && ((parts[1].to_i? || 0) // 100) == 2
+      code = parts.size >= 2 ? (parts[1].to_i? || 0) : 0
       read = 0
       while line = sock.gets('\n', MAX_CONNECT_LINE)
         read += line.bytesize
-        return false if read > MAX_CONNECT_HEADERS
+        if read > MAX_CONNECT_HEADERS
+          return DialError.new(DialErrorKind::Proxy,
+            "#{proxy_label(route)} sent an oversized CONNECT reply header section (> #{MAX_CONNECT_HEADERS} bytes)")
+        end
         break if line.chomp.empty?
       end
-      ok
+      return nil if (code // 100) == 2
+      DialError.new(DialErrorKind::Proxy,
+        "#{proxy_label(route)} refused CONNECT #{authority}: #{status_text(status)}#{connect_hint(code, route)}")
+    end
+
+    # The proxy's status line, made safe to put in an error string / log line: it is remote
+    # input, so a hostile proxy could otherwise write control characters (or an endless line)
+    # into gori's own output.
+    private def self.status_text(status : String) : String
+      line = status.chomp.scrub.gsub(/[[:cntrl:]]/, ' ').strip
+      line.size > 120 ? "#{line[0, 120]}…" : line
+    end
+
+    # What to DO about this refusal. The status alone still leaves an operator guessing which
+    # of settings.json / the proxy's ACL / the target is at fault.
+    private def self.connect_hint(code : Int32, route : Settings::UpstreamRoute) : String
+      case code
+      when 407
+        if authenticating?(route)
+          " — the credentials on the matching upstream rule were rejected"
+        else
+          " — the proxy requires authentication; set `username` + `password_env` on the matching upstream rule"
+        end
+      when 403 then " — the proxy's ACL does not permit CONNECT to that host/port"
+      when 502, 503, 504
+        " — the proxy could not reach the origin"
+      else ""
+      end
     end
 
     # Dials and wraps an origin in TLS (post-CONNECT MITM upstream). `host` is
@@ -597,6 +692,7 @@ module Gori::Proxy
         ctx.private_key = tls.client_key
       end
       apply_tls_floor(ctx, tls.min_version)
+      apply_tls_ceiling(ctx, tls.max_version)
       # Lower the security level BEFORE the cipher list: on a distribution built at
       # SECLEVEL=2 the legacy suites a caller names here are rejected outright, so setting
       # ciphers first would raise on exactly the legacy origin this exists to reach.
@@ -623,14 +719,65 @@ module Gori::Proxy
       end
     end
 
-    # Why a TLS upstream dial failed. The proxy capture path records this so a failed HTTPS
-    # flow says WHAT broke instead of a blanket "connect/write failed": a Connect failure is a
-    # reachability problem, whereas a Tls failure under verify-on is almost always an untrusted
-    # / self-signed / expired origin cert (the #323 shape) whose fix is --insecure-upstream
-    # (or SSL_CERT_FILE) — guidance a "connect failed" message actively hides.
-    enum TlsDialError
-      Connect # TCP connect (or the upstream proxy's CONNECT tunnel) to the origin failed
+    # Move the protocol CEILING, by refusing every version above it. The old code encoded the
+    # belief that a floor is enough to choose a version — it is not: against any origin that
+    # also speaks 1.3 (which is every modern one) the handshake lands on 1.3 no matter how low
+    # the floor is, so `min_version: "tls1.0"` never answered "does this target still accept
+    # TLS 1.0?" and `ciphers` never applied, because SSL_CTX_set_cipher_list governs TLS 1.2
+    # and below only. A ceiling is what makes both questions askable.
+    #
+    # Expressed with the SAME NO_TLS_V1* options as the floor rather than
+    # SSL_CTX_set_max_proto_version, so the two halves compose by simple OR: OpenSSL derives
+    # the offered range from the union of the disabled versions, so a floor of 1.0 plus a
+    # ceiling of 1.0 leaves exactly TLS 1.0 on the table. Mixing the option mask with the
+    # min/max_proto_version API would give two mechanisms that must agree, and the API form
+    # would silently win over the mask.
+    private def self.apply_tls_ceiling(ctx : OpenSSL::SSL::Context::Client, max_version : String) : Nil
+      case max_version
+      when "tls1.0"
+        ctx.add_options(OpenSSL::SSL::Options.flags(NO_TLS_V1_1, NO_TLS_V1_2, NO_TLS_V1_3))
+      when "tls1.1"
+        ctx.add_options(OpenSSL::SSL::Options.flags(NO_TLS_V1_2, NO_TLS_V1_3))
+      when "tls1.2"
+        ctx.add_options(OpenSSL::SSL::Options::NO_TLS_V1_3)
+      when "tls1.3"
+        # Nothing to disable: 1.3 is the highest version this OpenSSL offers. Named so the
+        # case is a deliberate no-op rather than looking like an omission.
+      end
+    end
+
+    # Why an upstream dial failed. Every send path records this so a failed flow says WHAT
+    # broke instead of a blanket "connect failed": a Connect failure is a reachability problem,
+    # a Tls failure under verify-on is almost always an untrusted / self-signed / expired
+    # origin cert (the #323 shape) whose fix is --insecure-upstream (or SSL_CERT_FILE), and a
+    # Proxy failure is neither — the origin was never contacted at all, and the fix is a
+    # credential or a proxy ACL. A "connect failed" message actively hides all three.
+    enum DialErrorKind
+      Connect # TCP connect (to the origin, or to the upstream proxy itself) failed
+      Proxy   # the upstream proxy answered and REFUSED the tunnel (407/403/502, SOCKS5 REP≠0)
       Tls     # origin reached, but the TLS handshake / certificate verification failed
+    end
+
+    # The kind plus the sentence a surface should show. `detail` is nil only for the plain
+    # Connect/Tls cases every caller already words for itself; when it is set it names the
+    # thing that refused and what it said, which is the whole point of #F3 — a nil socket
+    # cannot say "the proxy you configured wants credentials".
+    struct DialError
+      getter kind : DialErrorKind
+      getter detail : String?
+
+      def initialize(@kind : DialErrorKind, @detail : String? = nil)
+      end
+
+      # A direct dial that did not connect. Deliberately carries NO detail: the caller already
+      # names the origin in its own idiom ("connect failed: host:port — host unreachable…"),
+      # and a second copy of the same fact would read as two failures. Detail is reserved for
+      # the cases a caller CANNOT word for itself, which is every one involving a proxy.
+      ORIGIN_UNREACHABLE = new(DialErrorKind::Connect)
+
+      def tls? : Bool
+        @kind.tls?
+      end
     end
 
     # `sni` overrides the name presented in the TLS ClientHello (and, under verify,
@@ -646,16 +793,16 @@ module Gori::Proxy
         overrides: overrides, pin: pin)[0]
     end
 
-    # Like `dial_tls` but also reports WHY the dial failed (see TlsDialError) as the second
+    # Like `dial_tls` but also reports WHY the dial failed (see DialError) as the second
     # tuple element — nil on success. The proxy capture path uses this to record an accurate,
     # actionable upstream error; other callers use `dial_tls` and only need the socket.
     def self.dial_tls_result(host : String, port : Int32, verify : Bool, alpn : String? = nil, sni : String? = nil,
                              connect_timeout : Time::Span = Settings.connect_timeout,
                              io_timeout : Time::Span = Settings.io_timeout,
                              *, overrides : Gori::HostOverrides? = nil,
-                             pin : String? = nil) : {OpenSSL::SSL::Socket::Client?, TlsDialError?}
-      tcp = dial(host, port, connect_timeout, io_timeout, overrides: overrides, pin: pin)
-      return {nil, TlsDialError::Connect} unless tcp
+                             pin : String? = nil) : {OpenSSL::SSL::Socket::Client?, DialError?}
+      tcp, dial_err = dial_result(host, port, connect_timeout, io_timeout, overrides: overrides, pin: pin)
+      return {nil, dial_err || DialError::ORIGIN_UNREACHABLE} unless tcp
       # `hostname:` below is unaffected by `pin` on purpose: SNI and the verified name stay the
       # NAME. A pinned dial reaches the address the client actually connected to and then asks
       # that origin for the name the client asked for — which is what makes the leaf, the
@@ -677,7 +824,7 @@ module Gori::Proxy
       # per failed origin → fd exhaustion). `tcp` is non-nil here: `dial` never raises
       # (it returns nil), so the only raising step runs after the nil-guard above.
       tcp.try(&.close) rescue nil
-      {nil, TlsDialError::Tls}
+      {nil, DialError.new(DialErrorKind::Tls)}
     end
 
     # A bare (unbracketed) IPv6 literal. The charset guard scrubs and rejects anything

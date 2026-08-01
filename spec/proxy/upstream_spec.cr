@@ -402,7 +402,7 @@ describe Gori::Proxy::Upstream do
       srv.close # free the port so the connect is refused, not accepted
       sock, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: false)
       sock.should be_nil
-      err.should eq(Gori::Proxy::Upstream::TlsDialError::Connect)
+      err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Connect)
     end
 
     it "classifies an untrusted-cert origin as a Tls failure under verify, and succeeds with verify off" do
@@ -430,7 +430,7 @@ describe Gori::Proxy::Upstream do
         # Dial 127.0.0.1 explicitly (no localhost→::1 resolution race), verify the "localhost" cert via SNI.
         sock, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: true, sni: "localhost")
         sock.should be_nil
-        err.should eq(Gori::Proxy::Upstream::TlsDialError::Tls)
+        err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Tls)
 
         # verify OFF: the same origin dials fine — a live socket, no error.
         sock2, err2 = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: false, sni: "localhost")

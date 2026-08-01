@@ -516,8 +516,14 @@ module Gori
     # is the whole lesson of #491: a refusal that does not name its gate is barely better
     # than silence. Each surface prefixes its own prescription (#525's shape).
     def self.unbound_error(names : Array(String)) : String
-      "unbound session binding #{token_list(names)} — nothing has extracted it yet"
+      "#{UNBOUND_PREFIX} #{token_list(names)} — nothing has extracted it yet"
     end
+
+    # The opening words of `unbound_error`, so a surface can recognise its OWN sentence coming
+    # back to it as an engine's `blocked_reason` string and add the prescription it owns
+    # (`gori run` cannot bind at all without a replay step — see CLI::Run.seed_bindings).
+    # A named constant rather than a substring literal at the far end: the two must not drift.
+    UNBOUND_PREFIX = "unbound session binding"
 
     private def self.scan_unresolved(bytes : Bytes, vars : Hash(String, String),
                                      prefix : String, deferred : Array(String)?) : Array(String)

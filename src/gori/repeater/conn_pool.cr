@@ -142,11 +142,11 @@ module Gori::Repeater
       # Timed from BEFORE the dial, like `Repeater::Engine.send` — a fresh connection's
       # handshake is part of what that request cost. A reused one honestly reports less.
       started = Time.instant
-      io = Repeater::Engine.dial(@scheme, @host, @port, @verify,
+      io, dial_error = Repeater::Engine.dial_result(@scheme, @host, @port, @verify,
         @sni, @timeout, @overrides)
       unless io
         return Repeater::Engine.error(
-          Repeater::Engine.connect_error(@scheme, @host, @port, @verify), started)
+          Repeater::Engine.connect_error(@scheme, @host, @port, @verify, dial_error), started)
       end
       @dialed += 1
       result = Repeater::Engine.exchange(io, bytes, @host, @port, started)

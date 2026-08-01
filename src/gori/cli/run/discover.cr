@@ -23,6 +23,7 @@ module Gori
         keep_alive = true
         insecure = false
         allow_unscoped = false
+        bind_from : Int64? = nil
         force = false
         no_store = false
         format = :text
@@ -48,6 +49,7 @@ module Gori
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
           p.on("--no-keep-alive", "Dial a fresh connection for every probe (default: reuse)") { keep_alive = false }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
+          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run discover") }
           p.on("--allow-unscoped", "Run even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--force", "Bypass the unbounded-run safety gate") { force = true }
           p.on("--no-store", "Do not write findings into the project (Sitemap)") { no_store = true }
@@ -89,6 +91,10 @@ module Gori
             abort "gori run discover: #{discover_plan_error(ex)}"
           end
           guard_discover_scope(plan, outbound)
+          # See CLI::Run.seed_bindings. Discover's own `$NAME` surface is `--header`, which is
+          # exactly where a session token goes, so the same two steps apply.
+          seed_bindings(bind_from.not_nil!, project_name, db_path, outbound, insecure, "gori run discover") if bind_from
+          preflight_bindings(headers.join('\n'), bind_from, "gori run discover")
           discover_preflight(plan, force)
           run_discover_stream(plan.engine, store, format, no_store, -> { plan.sender.pool_stats })
         ensure

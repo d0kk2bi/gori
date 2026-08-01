@@ -38,6 +38,28 @@ private def with_capturing_http_proxy(&)
   end
 end
 
+# A one-shot HTTP proxy that REFUSES the tunnel with `status`, the way a corporate proxy
+# answers an unauthenticated (407) or ACL-blocked (403) CONNECT. Drains the request head first
+# so gori's write completes, then answers and closes.
+private def with_refusing_http_proxy(status : Int32, reason : String, &)
+  server = TCPServer.new("127.0.0.1", 0)
+  spawn do
+    conn = server.accept
+    while (line = conn.gets("\r\n", chomp: true)) && !line.empty?
+    end
+    conn << "HTTP/1.1 #{status} #{reason}\r\nProxy-Agent: spec\r\nContent-Length: 0\r\n\r\n"
+    conn.flush
+    sleep 50.milliseconds
+    conn.close rescue nil
+  rescue
+  end
+  begin
+    yield server.local_address.port
+  ensure
+    server.close rescue nil
+  end
+end
+
 # A one-shot SOCKS5 proxy. Performs method negotiation (offering `auth_method`), the optional
 # RFC 1929 exchange, then reads the CONNECT request and reports what it was asked for instead of
 # actually connecting — the point is to pin the bytes gori emits, not to relay.
@@ -384,6 +406,117 @@ describe "upstream rules" do
     it "rejects a $-prefixed password_env, which would be a value not a variable name" do
       Gori::Settings.upstream_rule_error(rule("a.test", "http", "p.test:1", "u", "$SECRET")).to_s
         .should contain("environment variable NAME")
+    end
+  end
+
+  # Every dial failure used to collapse into one nil socket, so an upstream proxy refusing the
+  # tunnel arrived at the operator as "host unreachable (DNS/refused/timeout)" — naming the
+  # ORIGIN, a machine gori had never tried to contact. These assert the reason survives the
+  # dialer and reaches the send path.
+  describe "a refused CONNECT" do
+    it "names the proxy and the status it returned, not the origin" do
+      with_refusing_http_proxy(407, "Proxy Authentication Required") do |pport|
+        Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}")]
+        sock, err = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        sock.should be_nil
+        err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Proxy)
+        detail = err.try(&.detail).to_s
+        detail.should contain("upstream HTTP proxy 127.0.0.1:#{pport}")
+        detail.should contain("407 Proxy Authentication Required")
+        detail.should contain("requires authentication")
+        detail.should_not contain("unreachable")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "distinguishes 403 (an ACL) from 407 (a credential)" do
+      with_refusing_http_proxy(403, "Forbidden") do |pport|
+        Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}")]
+        _, err = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        err.try(&.detail).to_s.should contain("ACL does not permit CONNECT")
+      end
+    ensure
+      reset_upstream
+    end
+
+    # The whole point of carrying the reason: it has to reach the sentence an operator reads.
+    # `Repeater::Engine` is the dial seam for repeater, fuzz, mine, sequence, discover and MCP
+    # alike, so pinning it here pins all of them.
+    it "reaches the send path's error string instead of 'host unreachable'" do
+      with_refusing_http_proxy(407, "Proxy Authentication Required") do |pport|
+        Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}")]
+        result = Gori::Repeater::Engine.send("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_slice,
+          scheme: "http", host: "example.test", port: 80, verify_upstream: false)
+        msg = result.error.to_s
+        msg.should contain("407")
+        msg.should contain("upstream HTTP proxy 127.0.0.1:#{pport}")
+        msg.should_not contain("DNS/refused/timeout")
+      end
+    ensure
+      reset_upstream
+    end
+
+    # A proxy address that answers nothing at all is still a proxy problem, and must not be
+    # reported against the origin either.
+    it "says the PROXY is unreachable when the proxy itself cannot be dialled" do
+      srv = TCPServer.new("127.0.0.1", 0)
+      pport = srv.local_address.port
+      srv.close
+      Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}")]
+      sock, err = Gori::Proxy::Upstream.dial_result("example.test", 443)
+      sock.should be_nil
+      err.try(&.detail).to_s.should contain("upstream HTTP proxy 127.0.0.1:#{pport} unreachable")
+      err.try(&.detail).to_s.should contain("the origin was never contacted")
+    ensure
+      reset_upstream
+    end
+  end
+
+  # A rule that NAMES a password variable is a statement that a password is required. gori
+  # used to read the unset variable, get nil, and send `Basic base64("bob:")` — an empty
+  # password the proxy answers 407 to, which the dialer then collapsed. The name of the
+  # variable is the whole answer and nothing downstream can recover it.
+  describe "an unset password_env" do
+    it "refuses before the socket and names the variable" do
+      ENV.delete("GORI_SPEC_UNSET_PW")
+      with_refusing_http_proxy(407, "Proxy Authentication Required") do |pport|
+        Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}", "bob", "GORI_SPEC_UNSET_PW")]
+        sock, err = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        sock.should be_nil
+        detail = err.try(&.detail).to_s
+        detail.should contain("$GORI_SPEC_UNSET_PW is unset")
+        detail.should contain("export it")
+      end
+    ensure
+      ENV.delete("GORI_SPEC_UNSET_PW")
+      reset_upstream
+    end
+
+    # The control: with the variable exported, the same rule dials and authenticates. Without
+    # it the example above could pass on any refusal at all.
+    it "dials normally once the variable is exported" do
+      ENV["GORI_SPEC_UNSET_PW"] = "s3cr3t"
+      with_capturing_http_proxy do |pport, head|
+        Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}", "bob", "GORI_SPEC_UNSET_PW")]
+        sock, err = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        sock.should_not be_nil
+        err.should be_nil
+        head.receive.should contain("Proxy-Authorization: Basic #{Base64.strict_encode("bob:s3cr3t")}")
+        sock.try(&.close) rescue nil
+      end
+    ensure
+      ENV.delete("GORI_SPEC_UNSET_PW")
+      reset_upstream
+    end
+
+    # A username with NO password_env is untouched: some proxies key on the username alone,
+    # and that was never the broken case.
+    it "leaves a username-only rule alone" do
+      Gori::Settings.upstream_rules = [rule("a.test", "http", "p.test:3128", "bob")]
+      Gori::Settings.upstream_route("a.test").credential_error.should be_nil
+    ensure
+      reset_upstream
     end
   end
 end

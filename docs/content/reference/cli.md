@@ -218,6 +218,7 @@ Sources: `--flow=ID`, `--request=FILE`, or stdin. Positions: `§…§` markers, 
 | Processors | `--prefix`, `--suffix`, `--encode` (`url`\|`urlall`\|`base64`\|`hex`), `--case` (`upper`\|`lower`), `--hash` (`md5`\|`sha1`\|`sha256`), `--regex-replace=/pat/rep/` |
 | Rate | `--concurrency` (20), `--rate=RPS`, `--throttle=MS`, `--timeout=SEC`, `--retries=N`, `--follow-redirects`, `--no-keep-alive` |
 | Matchers | `--mc`/`--fc` status, `--ms`/`--fs` size, `--mw`/`--fw` words, `--ml`/`--fl` lines, `--mr`/`--fr` body regex, `--extract=REGEX`, `--ac` auto-calibrate |
+| Session bindings | `--bind-from=FLOW-ID` — replay that captured flow first so its response fills the project's `$NAME` bindings for the rest of the run |
 | Output | `--format` (`text`\|`json`\|`jsonl`), `--force`, `--fail-if-no-matches` |
 
 ### run mine
@@ -232,6 +233,7 @@ gori run mine <flow-id> --locations query,headers --wordlist params.txt
 | `--locations=LIST` | `query`, `form`, `multipart`, `json`, `headers`, `cookies` (multipart off by default, pass it explicitly) |
 | `--wordlist`, `--bucket=N` | Candidate names and bucket size |
 | `--concurrency` (10), `--rate`, `--throttle`, `--timeout`, `--retries` (1), `--max-requests=N` | Rate control |
+| `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
 | `--format` | `text`, `json`, or `jsonl` |
 
 ### run sequence
@@ -251,6 +253,7 @@ gori run sequence --tokens tokens.txt          # '-' reads stdin
 | `--count=N` | Target token count (default 500) |
 | `--target`, `--http2`, `--sni`, `-k` | Transport (target required for `--request`/stdin) |
 | `--concurrency` (1), `--rate`, `--throttle`, `--timeout`, `--retries`, `--max-requests=N` | Rate control (concurrency stays 1 for stateful tokens) |
+| `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
 | `--format` | `text`, `json`, or `jsonl` |
 
 ### run probe
@@ -284,12 +287,28 @@ gori run discover --target https://target.example --max-depth 3 --extensions php
 | `--concurrency` (20), `--rate`, `--throttle`, `--timeout`, `--retries`, `--max-requests=N` | Rate control |
 | `--no-keep-alive` | Dial a fresh connection per probe instead of reusing one per origin |
 | `-k`, `--insecure-upstream` | Skip upstream TLS verification |
+| `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
 | `--allow-unscoped` | Run even if the target is outside the project scope. Waives the up-front (Layer 1) check only — Sandbox mode and explicit exclude rules still refuse each send, and the refusal now names which of the two fired. |
 | `--force` | Bypass the unbounded-run safety gate |
 | `--no-store` | Do not write findings into the project |
 | `--format` | `text`, `json`, or `jsonl` |
 
 Connections are reused per origin by default, so a brute-force pass pays one TCP (and on https one TLS) handshake per worker rather than one per probe. The `connections · N dialed · M reused` line at the end of a run is where you see whether the target honoured it. Turn it off with `--no-keep-alive` when the target behaves per-connection.
+
+### Session bindings from the command line
+
+A session binding (`$SESSION` filled from a login response — see the [Rewriter guide](/guide/workbench/#rewriter)) lives in the **memory** of the gori process that observed it. It is never written to `settings.json` or to the project database: a restored token is stale by construction, and re-extracting one costs a single request.
+
+`gori run` is one process per invocation, and a sweep is deliberately **not** an extraction source (a response echoing an attack payload back could otherwise rebind your session to it). So a headless `fuzz` / `mine` / `sequence` / `discover` whose template names a declared binding has nothing to resolve it with, and is refused before it sends.
+
+`--bind-from FLOW-ID` is the missing step: it replays one captured flow — the login — through the deliberate-send path, whose response fills the binding table, and then runs the sweep in the same process.
+
+```bash
+gori run fuzz 42 --payloads-file ids.txt --bind-from 17
+# bind-from: flow #17 replayed → bound $SESS
+```
+
+Driving two `gori mcp` tool calls over one stdio session works the same way and always has.
 
 ### run import
 
@@ -572,13 +591,14 @@ gori run project env delete TOKEN
 
 #### project host-override
 
-Manage **project** host overrides: `/etc/hosts`-style maps that change only the TCP dial target (SNI, certificate hostname, and `Host` header stay the original name). Project entries win over the global hostname overrides on collision. Alias: `host-overrides`.
+Manage **project** host overrides: `/etc/hosts`-style maps that change only the TCP dial target (SNI, certificate hostname, and `Host` header stay the original name). The value may carry a **port** — `IP`, `IP:PORT` or `[v6]:PORT` — so a hostname can be redirected at a listener on a different port; a bare IP keeps the request's own port. Project entries win over the global hostname overrides on collision. Alias: `host-overrides`.
 
 ```bash
 gori run project host-override                              # list
 gori run project host-override --format json
 gori run project host-override add --host=api.example.com --ip=10.0.0.1
 gori run project host-override add 10.0.0.1 api.example.com   # /etc/hosts order
+gori run project host-override add --host=api.example.com --ip=127.0.0.1:8443   # move the port too
 gori run project host-override update 1 --host=api.example.com --ip=10.0.0.9
 gori run project host-override delete 1
 ```
