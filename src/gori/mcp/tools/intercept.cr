@@ -149,7 +149,7 @@ module Gori
       end
 
       private def intercept_toggle(h) : Result
-        want = bool(h, "enable")
+        want = optional_bool_arg(h, "enable")
         return err("missing required 'enable' (true or false)", "INVALID_ARGUMENT", field: "enable") if want.nil?
         enqueue_intercept("toggle", arg: want ? "true" : "false")
       end

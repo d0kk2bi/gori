@@ -20,7 +20,7 @@ module Gori
         return Result.new("missing required 'input'", is_error: true) if raw.nil?
 
         input =
-          if bool(h, "input_base64")
+          if bool_arg(h, "input_base64", false)
             begin
               Base64.decode(raw)
             rescue

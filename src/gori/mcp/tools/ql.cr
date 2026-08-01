@@ -15,7 +15,7 @@ module Gori
         return ql_error(query) if QL.reject_empty?(query, filter)
         bad = QL.invalid_regex_terms(query)
         return ql_invalid_regex_error(query, bad) unless bad.empty?
-        if bool(h, "strict") || false
+        if bool_arg(h, "strict", false)
           analysis = QL.analyze(query)
           return ql_strict_error(analysis) unless analysis.clean?
         end

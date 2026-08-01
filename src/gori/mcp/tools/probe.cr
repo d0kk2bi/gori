@@ -26,11 +26,11 @@ module Gori
         category = probe_scan_category(h)
         return category if category.is_a?(Result)
 
-        active = bool(h, "active") || false
+        active = bool_arg(h, "active", false)
         allow_unscoped = bool_arg(h, "allow_unscoped", false)
         # --aggressive implies unsafe (it also raises caps + widens bypass sets).
-        aggressive = bool(h, "aggressive") || false
-        unsafe = (bool(h, "unsafe") || false) || aggressive
+        aggressive = bool_arg(h, "aggressive", false)
+        unsafe = bool_arg(h, "unsafe", false) || aggressive
         gate = probe_active_gate(active, allow_unscoped)
         return gate if gate.is_a?(Result)
         scope, scope_configured = gate
@@ -49,7 +49,7 @@ module Gori
         # `insecure` is the ACTIVE path's `gori run probe -k`: a lab / staging origin with a
         # self-signed certificate is the ordinary case for a scan, and without this the active
         # checks simply failed there with a TLS error that named nothing actionable.
-        verify_upstream = @verify_upstream && !bool_arg(h, "insecure", false)
+        verify_upstream = !bool_arg(h, "insecure", false) && @verify_upstream
         dets, repeater_n = Probe::Scan.scan_all(store, ids, active: active, verify_upstream: verify_upstream,
           scope: scope, allow_unscoped: allow_unscoped, opts: opts, active_budget: budget,
           on_error: ->(_where : String, _ex : Exception) { scan_errors += 1; nil })
@@ -75,7 +75,7 @@ module Gori
         category = probe_scan_category(h)
         return category if category.is_a?(Result)
 
-        include_closed = bool(h, "include_closed") || false
+        include_closed = bool_arg(h, "include_closed", false)
         all = store.probe_issues(category.as(String?), str(h, "host").try(&.strip).presence,
           severity_from(str(h, "severity")))
         all = all.select(&.status.open?) unless include_closed
@@ -162,7 +162,7 @@ module Gori
       private def probe_delete(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) if id.nil? && present?(h, "id")
-        all = bool(h, "all") || false
+        all = bool_arg(h, "all", false)
         # Reject the ambiguous combination rather than silently letting `all` win — an agent
         # that sets `all` defensively alongside a specific `id` would lose the whole table.
         # (The CLI refuses the same input.)
@@ -172,7 +172,7 @@ module Gori
         end
         if all
           n = store.count_probe_issues
-          unless bool(h, "confirm")
+          unless bool_arg(h, "confirm", false)
             return err("refusing to delete #{n} finding#{n == 1 ? "" : "s"} without confirm:true — this also clears every hard-delete suppression, so a rescan re-discovers them",
               "CONFIRM_REQUIRED", field: "confirm", details: JSON.parse({"findings" => n}.to_json))
           end
@@ -213,7 +213,7 @@ module Gori
       private def set_probe_rule_enabled(h) : Result
         id = str(h, "id").try(&.strip).presence
         return err("missing required 'id' (see list_probe_rules)", "INVALID_ARGUMENT", field: "id") unless id
-        enabled = bool(h, "enabled")
+        enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled'", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
 
         entry = Probe::RuleCatalog.load(store).find { |e| e.id == id }

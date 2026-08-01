@@ -102,7 +102,7 @@ module Gori
           return mismatch
         end
         job.stop
-        wait = bool(h, "wait") || false
+        wait = bool_arg(h, "wait", false)
         waited_out = false
         if wait
           budget = int(h, "wait_timeout_ms").try(&.clamp(1_i64, 60_000_i64)) || 10_000_i64

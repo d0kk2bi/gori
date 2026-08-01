@@ -31,15 +31,35 @@ module Gori
 
         text = String.new(rec.request)
         ob = outbound(bool_arg(h, "allow_unscoped", false))
-        target = minimize_target(id, rec, text, ob)
+        # `send_repeater --verbatim` exists because a session can hold EVIDENCE (seeded from a
+        # capture). Minimize is a search over that same request, so it needs the same knob:
+        # without it the one flag that makes such a session sendable made it un-minimizable —
+        # a captured `$top` was refused outright, and a captured `$where` was minimized against
+        # substituted bytes with a reframed Content-Length, i.e. against a request that a later
+        # `--verbatim` send would never put on the wire.
+        verbatim = bool_arg(h, "verbatim", false)
+        # Read BEFORE the search, not after: `apply` used to be parsed once the sends were
+        # already spent, so an unintelligible value would refuse a run that had put up to 250
+        # real requests on the wire.
+        apply = bool_arg(h, "apply", false)
+        target = minimize_target(id, rec, text, ob, verbatim)
         return target if target.is_a?(Result)
         scheme, host, port = target
 
-        auto_cl = rec.auto_content_length?
-        # Mirrors the TUI/CLI resolve: env-expand, then Content-Length resync only when the
-        # session has Auto-CL on (the same gate that lets body params be removed at all).
+        # The SEARCH's Auto-CL, not the session's — `send_repeater --verbatim` reads
+        # `auto_content_length: !verbatim && rec.auto_content_length?`, and this has to agree
+        # with it or the minimized request is not the request a verbatim send would produce.
+        # Under verbatim a body param stops being a removal candidate, which is the honest
+        # consequence: removing one requires reframing Content-Length, and verbatim is the
+        # operator saying do not reframe. The session's own stored setting is untouched (the
+        # apply-back below still writes `rec.auto_content_length?`).
+        auto_cl = !verbatim && rec.auto_content_length?
+        # Mirrors the TUI/CLI resolve: env-expand, then Content-Length resync only when
+        # Auto-CL is on (the same gate that lets body params be removed at all). `verbatim`
+        # drops the whole draft pass — no `$VAR` substitution and no bare-LF→CRLF promotion —
+        # exactly as `--verbatim`/`expand_request: false` does on the send path.
         resolve = ->(t : String) do
-          raw = Env.expand_wire(t)
+          raw = verbatim ? t.to_slice : Env.expand_wire(t)
           auto_cl ? Repeater::FlowRequest.resync_content_length(raw) : raw
         end
         # Minimize dials Fuzz::Sender directly (many capped probe sends) rather than through
@@ -55,10 +75,10 @@ module Gori
         report = Repeater::Minimize.run(text, auto_cl: auto_cl, resolve: resolve, backend: backend) { }
 
         applied = false
-        if (bool(h, "apply") || false) && !report.aborted && !report.removed.empty?
+        if apply && !report.aborted && !report.removed.empty?
           applied = store.update_repeater(id: id, target: rec.target,
             request: report.minimized_text.to_slice, http2: rec.http2?,
-            auto_cl: auto_cl, sni: rec.sni)
+            auto_cl: rec.auto_content_length?, sni: rec.sni)
         end
 
         Result.new(JSON.build do |j|
@@ -84,7 +104,7 @@ module Gori
       # The validated {scheme, host, port} to minimize against, or a refusal Result. Split out
       # of minimize_repeater to keep it under the cyclomatic-complexity bar.
       private def minimize_target(id : Int64, rec : Store::RepeaterRecord, text : String,
-                                  ob : Outbound) : {String, String, Int32} | Result
+                                  ob : Outbound, verbatim : Bool = false) : {String, String, Int32} | Result
         if Repeater::WsEngine.upgrade_request?(text)
           return err("repeater #{id} is a WebSocket upgrade — minimize works on plain HTTP requests",
             "INVALID_ARGUMENT", field: "repeater_id")
@@ -107,7 +127,12 @@ module Gori
         # body is a byte, and a whole-request check refuses nearly every binary-body session —
         # but whole-string on the target and SNI, which are short operator-typed fields with no
         # body to exclude. The CLI and TUI minimize paths carry the same three checks.
-        names = Env.unresolved_wire(text) | Env.unresolved(rec.target) |
+        #
+        # `verbatim` drops the REQUEST half of that check, on the provenance axis: those bytes
+        # are evidence the operator did not author (a captured `$filter`/`$top`/`$where`), and
+        # nothing will expand them, so there is no unresolved token to refuse. The target and
+        # SNI checks stay — those ARE operator-typed and they ARE still expanded below.
+        names = (verbatim ? [] of String : Env.unresolved_wire(text)) | Env.unresolved(rec.target) |
                 (rec.sni.try { |s| Env.unresolved(s) } || [] of String)
         unless names.empty?
           return err(env_unresolved_error(Env.token_list(names)), "INVALID_ARGUMENT", field: "repeater_id")

@@ -118,12 +118,8 @@ module Gori
         ui = parse_ui_state
         repeater_id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) if repeater_id.nil? && present?(h, "id")
-        include_content = bool(h, "include_content")
-        if include_content.nil? && present?(h, "include_content")
-          return Result.new("invalid 'include_content' (expected true or false)", is_error: true)
-        end
-        include_content = include_content || false
-        include_sensitive = bool(h, "include_sensitive") || false
+        include_content = bool_arg(h, "include_content", false)
+        include_sensitive = bool_arg(h, "include_sensitive", false)
         req_lim = int(h, "limit")
         req_off = int(h, "offset")
         limit = clamp(req_lim, 50, 500)

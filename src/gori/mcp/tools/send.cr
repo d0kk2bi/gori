@@ -31,8 +31,9 @@ module Gori
         # builder must never pick it, or MCP's strict "no scope ⇒ refuse" default would
         # silently become whichever policy got hard-coded there (DESIGN.md §7).
         ob = outbound(bool_arg(h, "allow_unscoped", false))
-        plan = build_send_plan(h, ob)
-        return plan if plan.is_a?(Result)
+        built_plan = build_send_plan(h, ob)
+        return built_plan if built_plan.is_a?(Result)
+        plan, request_line_rewritten = built_plan
         # OPT-IN Match&Replace parity (before the scope gate + History write so the
         # recorded/effective request == the wire); byte-exact by default.
         plan, applied_rules = maybe_apply_request_rules(h, plan)
@@ -63,7 +64,8 @@ module Gori
 
         body_cap, body_omit = body_return_opts(h)
         Result.new(send_result_json(result, recorded_flow_id, repeater_id,
-          include_sensitive_headers, sc, built, wire, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules, plan.h2_fields),
+          include_sensitive_headers, sc, built, wire, http2, flow_precedence_ignored(h), body_cap, body_omit, applied_rules, plan.h2_fields,
+          request_line_rewritten),
           is_error: !result.ok?)
       rescue ex : Gori::Error
         # Bad input (missing/invalid url, illegal header, …) — return a clean
@@ -444,12 +446,17 @@ module Gori
                                    http2 : Bool,
                                    ignored : Array(String), body_cap : Int32, body_omit : Bool,
                                    applied_rules : Bool = false,
-                                   h2_fields : Array({String, String})? = nil) : String
+                                   h2_fields : Array({String, String})? = nil,
+                                   request_line_rewritten : Bool = false) : String
         JSON.build do |j|
           j.object do
             emit_scope(j, sc)
             emit_effective_request(j, built, wire, http2, h2_fields)
             emit_sent_h2_fields(j, h2_fields)
+            # Only when it FIRED: gori changed the operator's stored bytes, so the surface
+            # that reports the send has to say so (`effective_request.target` then shows the
+            # origin-form line that actually went out). Absent means nothing was rewritten.
+            j.field "request_line_rewritten", true if request_line_rewritten
             j.field "match_replace_applied", true if applied_rules
             unless ignored.empty?
               j.field("ignored_fields") { j.array { ignored.each { |f| j.string f } } }
@@ -574,7 +581,11 @@ module Gori
 
         # Scope gate before the outbound handshake (same policy as send_request).
         ob = outbound(bool_arg(h, "allow_unscoped", false))
-        verify = @verify_upstream && !bool_arg(h, "insecure", false)
+        verify = !bool_arg(h, "insecure", false) && @verify_upstream
+        # The session's stored setting, overridable per call — a handshake test wants to run
+        # it both ways against the same session without editing the session. Read up here with
+        # the other flags so an unintelligible value refuses before the issue link is written.
+        keep_key = bool_arg(h, "keep_sec_websocket_key", repeater.ws_keep_key?)
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([repeater.request],
             default_target: repeater.target, sni: repeater.sni, verify: verify,
@@ -597,9 +608,6 @@ module Gori
           store.add_link(Store::LinkOwnerKind::Issue, issue_id,
             Store::LinkRefKind::Repeater, repeater_id)
         end
-        # The session's stored setting, overridable per call — a handshake test wants to run
-        # it both ways against the same session without editing the session.
-        keep_key = present?(h, "keep_sec_websocket_key") ? (bool(h, "keep_sec_websocket_key") || false) : repeater.ws_keep_key?
         result = plan.send_ws(out_messages, idle, keep_key)
 
         store.update_repeater_response(repeater_id, result.handshake_head, Bytes.empty,
@@ -691,9 +699,9 @@ module Gori
       # `Repeater::Plan` owns the assembly (env expansion, the Content-Length policy, target
       # parsing, SNI, host overrides, the gated dialer); everything left here is MCP's own
       # argument parsing.
-      private def build_send_plan(h, ob : Outbound) : Repeater::Plan | Result
-        opts = present?(h, "h2_fields") ? field_native_plan_options(h) : send_plan_options(h)
-        Repeater::Plan.build(opts, ob)
+      private def build_send_plan(h, ob : Outbound) : {Repeater::Plan, Bool} | Result
+        opts, rewrote = present?(h, "h2_fields") ? {field_native_plan_options(h), false} : send_plan_options(h)
+        {Repeater::Plan.build(opts, ob), rewrote}
       rescue ex : Repeater::PlanError
         send_plan_error(ex, "url")
       end
@@ -768,16 +776,22 @@ module Gori
         Repeater::PlanOptions.new(
           h2_fields: fields, h2_body: h2_body_arg(h),
           origin: Repeater::Origin.new(scheme, host, port),
-          http2: true, verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          http2: true, verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           timeout: send_timeout(h), overrides: HostOverrides.load(store))
       end
 
-      private def send_plan_options(h) : Repeater::PlanOptions
+      # The option set plus "did gori rewrite the stored request line?" — the second half is
+      # not derivable from `PlanOptions`, and `send_request` has to report it (see the
+      # `flow_id` branch below).
+      private def send_plan_options(h) : {Repeater::PlanOptions, Bool}
         if present?(h, "flow_id") && present?(h, "repeater_id")
           raise Gori::Error.new("pass only one of flow_id or repeater_id")
         end
-        verify = @verify_upstream && !bool_arg(h, "insecure", false)
+        verify = !bool_arg(h, "insecure", false) && @verify_upstream
         timeout = send_timeout(h)
+        # Read up front, not inside the `flow_id` branch that uses it: an argument validated in
+        # one branch and ignored in another is the same silent-substitution trap one level up.
+        keep_request_line = bool_arg(h, "keep_request_line", false)
         # Honor the project's host overrides on the direct-dial path (parity with the live
         # proxy). nil/empty is behaviorally identical to no override.
         overrides = HostOverrides.load(store)
@@ -792,17 +806,25 @@ module Gori
           end
           # Respect the repeater's auto-Content-Length setting (the TUI Repeater does):
           # only recompute CL when it's on, so a deliberately hand-set CL is preserved.
-          return Repeater::PlanOptions.new([rec.request], default_target: rec.target,
+          return {Repeater::PlanOptions.new([rec.request], default_target: rec.target,
             http2: bool_arg(h, "http2", rec.http2?), sni: rec.sni,
             auto_content_length: rec.auto_content_length?, verify: verify,
-            timeout: timeout, overrides: overrides)
+            timeout: timeout, overrides: overrides), false}
         end
         if present?(h, "flow_id")
           id = int(h, "flow_id")
           raise Gori::Error.new(id_error(h, "flow_id")) unless id
           detail = store.get_flow(id)
           raise Gori::Error.new("no flow with id #{id}") unless detail
-          flow = Repeater::FlowRequest.build(detail)
+          # A stored ABSOLUTE-form request line is a proxy artifact on a proxy capture and the
+          # PAYLOAD on a flow gori recorded from a direct send — routing / cache-poisoning /
+          # SSRF probes are written that way, and MCP's own `send_request{raw, verbatim}` can
+          # produce one. So the rewrite stays the default (every plaintext-HTTP capture needs
+          # it), but it is now REPORTED (`request_line_rewritten`) and `keep_request_line`
+          # turns it off — the same pair `gori run repeater --keep-request-line` has. Without
+          # it an agent had no route to the probe at all: the rewrite was silent and there was
+          # no argument to prevent it.
+          flow = Repeater::FlowRequest.build(detail, rewrite_absolute_form: !keep_request_line)
           # Default to how the flow was captured, but honor an EXPLICIT http2 either way —
           # `bool_arg` returns `flow.http2` only when the arg is absent, so `http2:false`
           # can now downgrade an h2 capture to h1 (it used to be silently ignored because
@@ -831,11 +853,11 @@ module Gori
           # With expansion off there is no expansion to resync a Content-Length after, so
           # `resync_cl_after_expansion` goes with it: the stored framing ships exactly as
           # captured, which is what a CL/TE desync capture is for.
-          Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
+          {Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
             expand_request: false, refuse_unresolved_env: false,
             auto_content_length: false,
             http2: bool_arg(h, "http2", flow.http2), sni: flow.sni, verify: verify,
-            timeout: timeout, overrides: overrides)
+            timeout: timeout, overrides: overrides), flow.rewrote_request_line}
         else
           # `RequestBuilder` already expanded, framed and range-checked this one, with
           # sharper messages than a re-parse could give — so the origin is handed over
@@ -847,7 +869,7 @@ module Gori
           # Reading `verbatim` again through `bool_arg` here let the builder and this gate
           # disagree about the same call.
           verbatim = RequestBuilder.verbatim?(h)
-          Repeater::PlanOptions.new([built.bytes], expand_request: false,
+          {Repeater::PlanOptions.new([built.bytes], expand_request: false,
             auto_content_length: false,
             # `verbatim:true` means the operator's bytes ARE the message (RequestBuilder
             # already skipped expansion for it), so a leftover `$user.name` / `$IFS` is the
@@ -860,7 +882,7 @@ module Gori
             preserve_field_case: verbatim,
             origin: Repeater::Origin.new(built.scheme, built.host, built.port),
             http2: bool_arg(h, "http2", false), verify: verify,
-            timeout: timeout, overrides: overrides)
+            timeout: timeout, overrides: overrides), false}
         end
       end
 

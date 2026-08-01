@@ -234,17 +234,17 @@ module Gori
       # tool args. Raises FuzzArgError (clean message) on any malformed input.
       private def build_fuzz_job(h, ob : Outbound) : {Fuzz::Engine, Fuzz::Origin, Int64?, Bool}
         text, default_target, src_h2 = fuzz_template_source(h)
-        use_h2 = (bool(h, "http2") || false) || src_h2
+        use_h2 = bool_arg(h, "http2", false) || src_h2
         mode = fuzz_mode(h)
         options = Fuzz::PlanOptions.new(text,
           default_target: default_target, target: str(h, "url"),
-          auto_mark: bool(h, "auto") || false, marks: fuzz_marks(h), http2: use_h2,
+          auto_mark: bool_arg(h, "auto", false), marks: fuzz_marks(h), http2: use_h2,
           sources: fuzz_sources(h), processors: fuzz_processors(h),
           config: fuzz_config(h, mode), matcher: fuzz_matcher(h),
           # Defense-in-depth alongside the job-start Layer-1 check: that check only covers
           # the origin once, not a path a template mutates per-request. The Outbound re-reads
           # the scope periodically, so a mid-run EXCLUDE / Sandbox toggle stops the sweep.
-          verify: @verify_upstream && !bool_arg(h, "insecure", false),
+          verify: !bool_arg(h, "insecure", false) && @verify_upstream,
           # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
           # `Fuzz::PlanOptions` and the CLI have always carried it; MCP's only route to it was
           # create_repeater{sni} → send_request{repeater_id}, i.e. not a sweep at all.
