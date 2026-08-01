@@ -68,3 +68,41 @@ describe "Gori::Env.head_body_boundary" do
     Gori::Env.head_body_boundary(bytes).should eq(bytes.size)
   end
 end
+
+# A hand-authored head's start line, for the RECORD path only.
+#
+# The shared `parse_request_head` stays strict-CRLF on purpose, and that is not a detail:
+# `Body.framing_ambiguous?` detects a response desync by comparing the strict parse against
+# what a lenient recipient would read, and Fuzz's redirect guard refuses a `Location` whose
+# bare LF splices a second request. Teaching the shared parser about bare LF turned three of
+# those specs red — which is the reason this second, narrower function exists at all.
+describe "Gori::Proxy::Codec::Http1.authored_start_line" do
+  it "reads the version correctly from a BARE-LF head" do
+    # The strict scan found the CRLF inside the BODY instead, so History filed
+    # `http_version: "HTTP/1.1\nHost:"` for a request whose bytes it held byte-exact.
+    head = "GET /x2 HTTP/1.1\nHost: h\nX-Probe: v\n\n".to_slice
+    Gori::Proxy::Codec::Http1.authored_start_line(head).should eq({"GET", "/x2", "HTTP/1.1"})
+  end
+
+  it "reads a CRLF head identically" do
+    head = "POST /y HTTP/1.0\r\nHost: h\r\n\r\n".to_slice
+    Gori::Proxy::Codec::Http1.authored_start_line(head).should eq({"POST", "/y", "HTTP/1.0"})
+  end
+
+  it "takes the FIRST terminator, so a CRLF later in the message cannot move the line" do
+    head = "GET /z HTTP/9.9\nA: 1\r\nB: 2\n\n".to_slice
+    Gori::Proxy::Codec::Http1.authored_start_line(head).should eq({"GET", "/z", "HTTP/9.9"})
+  end
+
+  it "returns empty strings for the tokens a malformed line omits, without raising" do
+    Gori::Proxy::Codec::Http1.authored_start_line("GET /only-two\n\n".to_slice)
+      .should eq({"GET", "/only-two", ""})
+    Gori::Proxy::Codec::Http1.authored_start_line("".to_slice).should eq({"", "", ""})
+  end
+
+  it "leaves the shared parser strict — the security machinery that depends on it" do
+    # If this ever starts returning "HTTP/1.1", the desync detectors have lost their lever.
+    Gori::Proxy::Codec::Http1.parse_request_head("GET /x HTTP/1.1\nHost: h\n\n".to_slice)
+      .version.should_not eq("HTTP/1.1")
+  end
+end

@@ -193,15 +193,18 @@ module Gori
 
       private def record_outbound_request(built : RequestBuilder::Built, http2 : Bool) : Int64
         head, body = split_wire_request(built.bytes)
-        parsed = Proxy::Codec::Http1.parse_request_head(head)
+        # `authored_start_line`, not `parse_request_head`: these bytes are the caller's, and
+        # under `verbatim` a bare-LF terminator is the payload. See its comment for why the
+        # shared parser must stay strict.
+        method, target, version = Proxy::Codec::Http1.authored_start_line(head)
         captured = Store::CapturedRequest.new(
           created_at: Time.utc.to_unix_ms * 1000_i64,
           scheme: built.scheme,
           host: built.host,
           port: built.port,
-          method: parsed.method,
-          target: parsed.target,
-          http_version: http2 ? "HTTP/2" : parsed.version,
+          method: method,
+          target: target,
+          http_version: http2 ? "HTTP/2" : version,
           head: head,
           body: body,
           body_size: body.try(&.size.to_i64),

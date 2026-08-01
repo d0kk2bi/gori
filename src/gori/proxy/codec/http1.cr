@@ -119,6 +119,35 @@ module Gori::Proxy::Codec::Http1
     )
   end
 
+  # {method, target, version} of a HAND-AUTHORED head, tolerating a BARE-LF terminator.
+  #
+  # Deliberately NOT folded into `parse_request_head`: that parser's strict-CRLF scan is
+  # load-bearing security machinery, not an oversight. `Body.framing_ambiguous?` detects a
+  # response desync precisely by comparing this strict parse against what a LENIENT recipient
+  # would read, and Fuzz's redirect guard refuses a `Location` whose bare LF splices a second
+  # request. Both collapse the moment the shared parser learns to accept a bare LF — making
+  # it lenient turned three of those specs red, which is how this split earned its keep.
+  #
+  # The record/replay side has the opposite need. A bare LF there is the OPERATOR'S payload
+  # (`verbatim`), and the strict scan then finds either a CRLF inside the body or none at
+  # all, so History filed `http_version` as `"HTTP/1.1\nHost:"` for a request whose bytes it
+  # was holding byte-exact. This is an evidence projection only — nothing framed off it.
+  def self.authored_start_line(raw : Bytes) : {String, String, String}
+    i = 0
+    n = raw.size
+    eol = n
+    while i < n
+      b = raw.unsafe_fetch(i)
+      if b == 0x0a_u8 || (b == 0x0d_u8 && i + 1 < n && raw.unsafe_fetch(i + 1) == 0x0a_u8)
+        eol = i
+        break
+      end
+      i += 1
+    end
+    parts = String.new(raw[0, eol]).split(' ')
+    {parts[0]? || "", parts[1]? || "", parts[2]? || ""}
+  end
+
   # True when `req`'s start-line is EXACTLY the HTTP/2 client preface (H2_PREFACE_LINE) — the
   # well-known, unambiguous signal that this connection is an h2/gRPC client, not HTTP/1.1, so a
   # caller (ClientConn) can reject it outright instead of treating it as a real request.

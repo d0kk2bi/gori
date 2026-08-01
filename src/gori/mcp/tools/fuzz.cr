@@ -102,12 +102,12 @@ module Gori
       # fuzz Result. Stored raw; get_flow redacts sensitive headers on read.
       private def record_fuzz_flow(request : Bytes, origin : Fuzz::Origin, http2 : Bool, r : Fuzz::Result) : Int64?
         head, body = split_wire_request(request)
-        parsed = Proxy::Codec::Http1.parse_request_head(head)
+        method, target, version = Proxy::Codec::Http1.authored_start_line(head)
         fid = store.insert_flow(Store::CapturedRequest.new(
           created_at: Time.utc.to_unix_ms * 1000_i64,
           scheme: origin.scheme, host: origin.host, port: origin.port,
-          method: parsed.method, target: parsed.target,
-          http_version: http2 ? "HTTP/2" : parsed.version,
+          method: method, target: target,
+          http_version: http2 ? "HTTP/2" : version,
           head: head, body: body, body_size: body.try(&.size.to_i64)))
         return nil if fid <= 0
         rhead = r.head
