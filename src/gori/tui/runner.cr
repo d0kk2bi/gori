@@ -2989,7 +2989,13 @@ module Gori::Tui
         # Focus on the far-right ⋯ "more" affordance: ↵/↓ expands the hidden-tabs list.
         return "↵/↓ show hidden tabs · ← back · ^P cmds · q projects" if @focus == :menu && @menu_more
         # Focus on the tab bar: ←/→ pick the tab, Tab/↵ drop into the body.
-        return "←/→ switch tab · ↹/↵ enter · 1-9 jump · ^P cmds · q projects · ^D quit" if @focus == :menu
+        #
+        # `c` and `i` earn their place here even though they are Global verbs reachable from
+        # every focus. At TABS focus there is no pane to swallow a bare letter, so a stray
+        # keypress lands on one of them — and both change what the PROXY does, from a tab that
+        # shows neither: `i` starts holding every request, `c` stops recording entirely. They
+        # were the only unadvertised keys at this focus with an effect outside the current tab.
+        return "←/→ switch tab · ↹/↵ enter · 1-9 jump · c capture · i intercept · ^P cmds · q projects · ^D quit" if @focus == :menu
         if @focus == :subtabs
           # A fixed strip (Help) has no create/close and a read-only body — don't
           # advertise ^N/^W/edit as live keys there.
