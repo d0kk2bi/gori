@@ -11,7 +11,8 @@ module Gori::Tui
   # strings (compiled by the view's commit_buffers at build/persist time, unchanged).
   record AdvancedSnapshot,
     conc : String, rate : String, timeout : String, retries : String,
-    follow : Bool, calibrate : Bool, keep_alive : Bool,
+    max_requests : String,
+    follow : Bool, calibrate : Bool, keep_alive : Bool, update_cl : Bool,
     m_status : String, m_size : String, m_words : String, m_regex : String,
     f_status : String, f_size : String, f_words : String, f_regex : String
 
@@ -29,9 +30,19 @@ module Gori::Tui
       {:rate, "Rate (rps)", :text},
       {:timeout, "Timeout (s)", :text},
       {:retries, "Retries", :text},
+      # The TRUE wire count is what this caps (retries + redirect hops each charge it) —
+      # `Fuzz::CappedBackend`, the same counter `--max-requests` and MCP's `max_requests`
+      # are enforced against. Blank = no cap, which is what every TUI run used to be.
+      {:max_requests, "Max requests", :text},
       {:follow, "Follow redirects", :toggle},
       {:calibrate, "Auto-calibrate", :toggle},
       {:keep_alive, "Keep-alive", :toggle},
+      # The Repeater's ^L / `--verbatim` and Intercept's `update_content_length:false` by
+      # the same name and for the same reason: a CL / CL-TE desync template IS the payload,
+      # and recomputing its Content-Length sweeps a different request than the one written.
+      # ON is the old (and right) default for an ordinary sweep whose payload changed the
+      # body length; OFF sends the header exactly as the template declares it.
+      {:update_cl, "Auto Content-Length", :toggle},
       {:m_status, "Match status", :text},
       {:m_size, "Match size", :text},
       {:m_words, "Match words", :text},
@@ -41,7 +52,7 @@ module Gori::Tui
       {:f_words, "Filter words", :text},
       {:f_regex, "Filter regex", :text},
     ]
-    LABEL_W = 18 # value column offset (widest label "Follow redirects" + padding)
+    LABEL_W = 21 # value column offset (widest label "Auto Content-Length" + padding)
 
     def initialize(snap : AdvancedSnapshot)
       @sel = 0
@@ -49,19 +60,21 @@ module Gori::Tui
       @follow = snap.follow
       @calibrate = snap.calibrate
       @keep_alive = snap.keep_alive
+      @update_cl = snap.update_cl
       @fields = {
-        :conc     => TextField.new(snap.conc),
-        :rate     => TextField.new(snap.rate),
-        :timeout  => TextField.new(snap.timeout),
-        :retries  => TextField.new(snap.retries),
-        :m_status => TextField.new(snap.m_status),
-        :m_size   => TextField.new(snap.m_size),
-        :m_words  => TextField.new(snap.m_words),
-        :m_regex  => TextField.new(snap.m_regex),
-        :f_status => TextField.new(snap.f_status),
-        :f_size   => TextField.new(snap.f_size),
-        :f_words  => TextField.new(snap.f_words),
-        :f_regex  => TextField.new(snap.f_regex),
+        :conc         => TextField.new(snap.conc),
+        :rate         => TextField.new(snap.rate),
+        :timeout      => TextField.new(snap.timeout),
+        :retries      => TextField.new(snap.retries),
+        :max_requests => TextField.new(snap.max_requests),
+        :m_status     => TextField.new(snap.m_status),
+        :m_size       => TextField.new(snap.m_size),
+        :m_words      => TextField.new(snap.m_words),
+        :m_regex      => TextField.new(snap.m_regex),
+        :f_status     => TextField.new(snap.f_status),
+        :f_size       => TextField.new(snap.f_size),
+        :f_words      => TextField.new(snap.f_words),
+        :f_regex      => TextField.new(snap.f_regex),
       }
     end
 
@@ -126,6 +139,7 @@ module Gori::Tui
       when :follow     then @follow = !@follow
       when :calibrate  then @calibrate = !@calibrate
       when :keep_alive then @keep_alive = !@keep_alive
+      when :update_cl  then @update_cl = !@update_cl
       end
     end
 
@@ -143,7 +157,9 @@ module Gori::Tui
       AdvancedSnapshot.new(
         conc: @fields[:conc].value, rate: @fields[:rate].value,
         timeout: @fields[:timeout].value, retries: @fields[:retries].value,
+        max_requests: @fields[:max_requests].value,
         follow: @follow, calibrate: @calibrate, keep_alive: @keep_alive,
+        update_cl: @update_cl,
         m_status: @fields[:m_status].value, m_size: @fields[:m_size].value,
         m_words: @fields[:m_words].value, m_regex: @fields[:m_regex].value,
         f_status: @fields[:f_status].value, f_size: @fields[:f_size].value,
@@ -152,7 +168,7 @@ module Gori::Tui
 
     # --- rendering ----------------------------------------------------------
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 56}.min
+      w = {area.w - 6, 60}.min
       h = {area.h - 4, ROWS.size + 4}.min
       return nil if w < 30 || h < 8
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
@@ -189,6 +205,7 @@ module Gori::Tui
         on = case key
              when :follow     then @follow
              when :keep_alive then @keep_alive
+             when :update_cl  then @update_cl
              else                  @calibrate
              end
         screen.text(vx, y, on ? "‹ on ›" : "‹ off ›", foc ? Theme.text_bright : Theme.text, bg)

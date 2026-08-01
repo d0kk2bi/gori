@@ -39,13 +39,22 @@ module Gori::Tui
     CONC_CHOICES   = [1, 2, 5, 10]
     NOTIFY_CHOICES = Sequencer::NotifyMode.values
 
+    # Hard ceiling on REQUESTS the run may put on the target (retries and redirect hops
+    # each charge it — `Fuzz::CappedBackend`, the same counter `--max-requests` and MCP's
+    # `max_requests` are enforced against). nil = uncapped, which is what every TUI run
+    # used to be: there was no way to cap one from the primary surface at all, while
+    # `gori run` and MCP both had the knob. A cycler, not a text field, because this
+    # overlay deliberately has none (no IME plumbing).
+    MAX_REQ_CHOICES = [nil, 100, 250, 500, 1000, 2500, 5000, 10000] of Int32?
+
     KIND_ROW     = 0
     SELECTOR_ROW = 1
     GOAL_ROW     = 2
-    CONC_ROW     = 3
-    NOTIFY_ROW   = 4
-    START_ROW    = 5
-    ROW_COUNT    = 6
+    MAXREQ_ROW   = 3
+    CONC_ROW     = 4
+    NOTIFY_ROW   = 5
+    START_ROW    = 6
+    ROW_COUNT    = 7
 
     getter seed : SequenceSeed
 
@@ -55,6 +64,7 @@ module Gori::Tui
       init = loc ? (loc.kind.position? ? "#{loc.pos_start}:#{loc.pos_end}" : loc.selector) : ""
       @selector = TextField.new(init)
       @goal_idx = GOAL_CHOICES.index(500) || 2
+      @maxreq_idx = 0
       @conc_idx = 0
       @notify_idx = NOTIFY_CHOICES.index(Sequencer::NotifyMode::WhenDone) || 0
       @selected = SELECTOR_ROW
@@ -150,6 +160,7 @@ module Gori::Tui
         @kind_idx = (@kind_idx + d) % KINDS.size
         prefill_for_kind
       when GOAL_ROW   then @goal_idx = (@goal_idx + d) % GOAL_CHOICES.size
+      when MAXREQ_ROW then @maxreq_idx = (@maxreq_idx + d) % MAX_REQ_CHOICES.size
       when CONC_ROW   then @conc_idx = (@conc_idx + d) % CONC_CHOICES.size
       when NOTIFY_ROW then @notify_idx = (@notify_idx + d) % NOTIFY_CHOICES.size
       end
@@ -157,7 +168,8 @@ module Gori::Tui
 
     # Space/Enter on a cycler advances it; on the kind row it also re-prefills.
     def toggle_or_advance : Nil
-      adjust(1) if @selected == KIND_ROW || @selected == GOAL_ROW || @selected == CONC_ROW || @selected == NOTIFY_ROW
+      adjust(1) if @selected == KIND_ROW || @selected == GOAL_ROW || @selected == MAXREQ_ROW ||
+                   @selected == CONC_ROW || @selected == NOTIFY_ROW
     end
 
     # When the kind flips to Cookie/Header and the field is blank, offer the first
@@ -186,6 +198,7 @@ module Gori::Tui
                       Sequencer::TokenLoc.new(kind, sel)
                     end
       c.goal = GOAL_CHOICES[@goal_idx]
+      c.max_requests = MAX_REQ_CHOICES[@maxreq_idx].try(&.to_i64)
       c.concurrency = CONC_CHOICES[@conc_idx]
       c.notify = NOTIFY_CHOICES[@notify_idx]
       c
@@ -239,19 +252,27 @@ module Gori::Tui
       when SELECTOR_ROW
         screen.text(x, py, selector_label, Theme.muted, bg)
         @selector.render(screen, vx, py, vw, sel, sel ? Theme.text_bright : Theme.text, bg)
-      when GOAL_ROW
-        screen.text(x, py, "samples:", Theme.muted, bg)
-        screen.text(vx, py, "#{GOAL_CHOICES[@goal_idx]}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
-      when CONC_ROW
-        screen.text(x, py, "concurrency:", Theme.muted, bg)
-        screen.text(vx, py, "#{CONC_CHOICES[@conc_idx]}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
-      when NOTIFY_ROW
-        screen.text(x, py, "notify:", Theme.muted, bg)
-        screen.text(vx, py, "#{NOTIFY_CHOICES[@notify_idx].label}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
-      else
+      when START_ROW
         label = valid? ? "[ Start collecting ]" : "[ set a token location ]"
         screen.text(x, py, label, valid? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
+      else
+        draw_cycler(screen, x, vx, py, bg, sel, i)
       end
+    end
+
+    # The four ←/›-cycled rows, split out of draw_row so adding a knob does not keep
+    # growing one branch chain.
+    private def draw_cycler(screen : Screen, x : Int32, vx : Int32, py : Int32,
+                            bg : Color, sel : Bool, i : Int32) : Nil
+      label, value =
+        case i
+        when GOAL_ROW   then {"samples:", GOAL_CHOICES[@goal_idx].to_s}
+        when MAXREQ_ROW then {"max requests:", MAX_REQ_CHOICES[@maxreq_idx].try(&.to_s) || "uncapped"}
+        when CONC_ROW   then {"concurrency:", CONC_CHOICES[@conc_idx].to_s}
+        else                 {"notify:", NOTIFY_CHOICES[@notify_idx].label}
+        end
+      screen.text(x, py, label, Theme.muted, bg)
+      screen.text(vx, py, "#{value}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?

@@ -10,8 +10,8 @@ end
 
 private def blank_snapshot : Gori::Tui::AdvancedSnapshot
   Gori::Tui::AdvancedSnapshot.new(
-    conc: "20", rate: "", timeout: "", retries: "0",
-    follow: false, calibrate: false, keep_alive: true,
+    conc: "20", rate: "", timeout: "", retries: "0", max_requests: "",
+    follow: false, calibrate: false, keep_alive: true, update_cl: true,
     m_status: "", m_size: "", m_words: "", m_regex: "",
     f_status: "", f_size: "", f_words: "", f_regex: "")
 end
@@ -26,7 +26,7 @@ describe Gori::Tui::FuzzAdvancedOverlay do
 
   it "toggles a boolean row with space (←/→ on text rows never toggles it)" do
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
-    4.times { ov.handle_key(akey(Termisu::Input::Key::Down)) } # → Follow redirects (row 4)
+    5.times { ov.handle_key(akey(Termisu::Input::Key::Down)) } # → Follow redirects (row 5, past Max requests)
     ov.handle_key(akey(Termisu::Input::Key::Space))
     ov.snapshot.follow.should be_true
   end
@@ -93,7 +93,7 @@ describe Gori::Tui::FuzzAdvancedOverlay do
   it "a click inside focuses the row under the pointer and stays open" do
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     h = OverlayHarness.new(ov)
-    h.click_in_box(2, 5).should eq(:open) # rows start at box.y + 1 → row index 4 (Follow redirects)
+    h.click_in_box(2, 6).should eq(:open) # rows start at box.y + 1 → row index 5 (Follow redirects)
     h.commits.should eq(0)
     h.press(Termisu::Input::Key::Space)
     ov.snapshot.follow.should be_true
@@ -102,7 +102,7 @@ describe Gori::Tui::FuzzAdvancedOverlay do
   it "the wheel moves the selected row (base handle_wheel delegates to move)" do
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     h = OverlayHarness.new(ov)
-    h.wheel(5) # → Calibrate (row 5)
+    h.wheel(6) # → Calibrate (row 6)
     h.press(Termisu::Input::Key::Space)
     ov.snapshot.calibrate.should be_true
     ov.snapshot.follow.should be_false
@@ -133,11 +133,12 @@ describe Gori::Tui::FuzzAdvancedOverlay do
   it "toggles keep-alive, which starts on" do
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     ov.snapshot.keep_alive.should be_true
-    6.times { ov.handle_key(akey(Termisu::Input::Key::Down)) } # → Keep-alive (row 6)
+    7.times { ov.handle_key(akey(Termisu::Input::Key::Down)) } # → Keep-alive (row 7)
     ov.handle_key(akey(Termisu::Input::Key::Space))
     ov.snapshot.keep_alive.should be_false
-    ov.snapshot.calibrate.should be_false # the neighbouring toggle is untouched
+    ov.snapshot.calibrate.should be_false # the neighbouring toggles are untouched
     ov.snapshot.follow.should be_false
+    ov.snapshot.update_cl.should be_true
   end
 
   it "offsets a click by the scroll position once the list has scrolled" do

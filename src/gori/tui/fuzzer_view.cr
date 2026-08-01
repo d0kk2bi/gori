@@ -58,6 +58,11 @@ module Gori::Tui
     getter? loaded : Bool
     getter? dirty : Bool
     getter? running : Bool
+    # PROVENANCE: this template's bytes came out of a CAPTURED FLOW (⇧I from History /
+    # Sitemap / Issues evidence), not a request the operator drafted here. Feeds
+    # `Fuzz::PlanOptions#evidence?` — see `evidence_template` for what it turns off and
+    # why an operator edit does NOT clear it.
+    getter? evidence : Bool
     property name : String?
     property job_id : Int32 # bottom-bar/notification job handle (0 = no active job)
     getter config : Fuzz::Config
@@ -71,6 +76,7 @@ module Gori::Tui
       @tcx = 0
       @sni = ""
       @http2 = false
+      @evidence = false
       @editor = TextArea.new
       @editor.gutter = true
       @editor.follow_x = true     # long lines (headers, URLs, §-marked params) scroll horizontally to keep the cursor visible
@@ -89,6 +95,7 @@ module Gori::Tui
       @s_rate = ""   # buffers, committed to @config at build/persist time (so a field can be cleared)
       @s_timeout = ""
       @s_retries = "0"
+      @s_max_req = ""
       @s_m_regex = "" # regex fields buffered as source strings, compiled on commit
       @s_f_regex = ""
       # Memoized "Run · N requests" count, recomputed only when the config signature
@@ -108,6 +115,11 @@ module Gori::Tui
       # not whatever the CONFIG pane says now.
       @run_policy = nil.as({Bool, Bool, Symbol}?)
       @pending_policy = nil.as({Bool, Bool, Symbol}?)
+      # `Fuzz::Plan#rewrites_content_length?` as of the last plan build, plus the
+      # `@editor.edits` revision it was computed at — an edit to the template invalidates
+      # the answer, and a stale "your CL is being rewritten" is worse than none.
+      @cl_rewrite = false
+      @cl_rewrite_rev = -1
       @sel = 0
       @scroll = 0
       @sort = :index
@@ -198,12 +210,15 @@ module Gori::Tui
     end
 
     # --- loading -------------------------------------------------------------
+    # ⇧I: a CAPTURED flow becomes this session's template. `evidence` is set here and
+    # nowhere else, because this is the only loader whose bytes came off the wire.
     def load(detail : Store::FlowDetail) : Nil
       built = Repeater::FlowRequest.build(detail)
       @http2 = built.http2
       @target = built.target
       @tcx = @target.size
       @editor.set_text(String.new(built.bytes).scrub)
+      @evidence = true
       @focus = :template
       @loaded = true
       @dirty = false
@@ -215,6 +230,9 @@ module Gori::Tui
       @http2 = http2
       @sni = sni
       @editor.set_text(request_text)
+      # A Repeater/reconstruction seed and ^N are DRAFTS: the operator authored (or gori
+      # rebuilt) those bytes, so a `$KEY` in them is a variable reference they meant.
+      @evidence = false
       @focus = :template
       @loaded = true
       @dirty = false
@@ -235,6 +253,11 @@ module Gori::Tui
       @http2 = rec.http2?
       @sni = rec.sni || ""
       @editor.set_text(rec.template)
+      # Provenance has to survive a restart, or a reopened capture silently becomes a
+      # draft again. `flow_id` is what `insert_fuzz_session` already stored for the ⇧I
+      # path and nothing else sets it — the same one-line test the CLI's `fuzz_source`
+      # makes on `--flow`.
+      @evidence = !rec.flow_id.nil?
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -257,6 +280,7 @@ module Gori::Tui
       # form now, so a normalized compare would be blind to a pure line-ending edit — which
       # is a real edit on a message — while an exact one is never falsely unequal.
       @editor.set_text(rec.template) if @editor.wire_text != rec.template
+      @evidence = !rec.flow_id.nil? # see restore
       @name = rec.name
       apply_config_json(rec.config)
       @last_synced_config = rec.config
@@ -280,6 +304,11 @@ module Gori::Tui
     # Does not copy run results, job state, or source flow linkage.
     def duplicate_from(src : FuzzerView) : Nil
       load_request(src.target, src.template_text, src.http2?, src.sni_override || "")
+      # `load_request` cleared it; a content clone carries the SAME bytes, so it carries
+      # the same provenance. (The clone has no `flow_id` row of its own, so `restore`
+      # will read it back as a draft after a restart — that is the store's linkage, not
+      # a claim about these bytes, and erring toward "draft" for a copy is the safe way.)
+      @evidence = src.evidence?
       apply_config_json(src.config_json)
       @name = SubtabClone.copy_name(src.name)
       @dirty = true
@@ -860,8 +889,9 @@ module Gori::Tui
     def advanced_snapshot : AdvancedSnapshot
       AdvancedSnapshot.new(
         conc: @s_conc, rate: @s_rate, timeout: @s_timeout, retries: @s_retries,
+        max_requests: @s_max_req,
         follow: @config.follow_redirects?, calibrate: @config.auto_calibrate?,
-        keep_alive: @config.keep_alive?,
+        keep_alive: @config.keep_alive?, update_cl: @config.update_content_length?,
         m_status: @matcher.match_status || "", m_size: @matcher.match_size || "",
         m_words: @matcher.match_words || "", m_regex: @s_m_regex,
         f_status: @matcher.filter_status || "", f_size: @matcher.filter_size || "",
@@ -875,10 +905,12 @@ module Gori::Tui
       @s_rate = s.rate
       @s_timeout = s.timeout
       @s_retries = s.retries
+      @s_max_req = s.max_requests
       @config.follow_redirects = s.follow
       @config.auto_calibrate = s.calibrate
       @matcher.auto_calibrate = s.calibrate
       @config.keep_alive = s.keep_alive
+      @config.update_content_length = s.update_cl
       @matcher.match_status = blank_nil(s.m_status)
       @matcher.match_size = blank_nil(s.m_size)
       @matcher.match_words = blank_nil(s.m_words)
@@ -966,6 +998,9 @@ module Gori::Tui
       @config.rps = @s_rate.to_f?.try { |r| r > 0 ? r : nil }
       @config.timeout = @s_timeout.to_i?.try { |t| t > 0 ? t.seconds : nil }
       @config.retries = (@s_retries.to_i? || 0).clamp(0, 1000)
+      # Blank / unparsable / <= 0 all mean "no cap" — the same reading `--max-requests`
+      # and MCP give an absent key, so clearing the field really does remove the ceiling.
+      @config.max_requests = @s_max_req.to_i64?.try { |n| n > 0 ? n : nil }
       @matcher.match_regex = @s_m_regex.empty? ? nil : (Regex.new(@s_m_regex) rescue nil)
       @matcher.filter_regex = @s_f_regex.empty? ? nil : (Regex.new(@s_f_regex) rescue nil)
     end
@@ -975,6 +1010,7 @@ module Gori::Tui
       @s_rate = @config.rps.try(&.to_s) || ""
       @s_timeout = @config.timeout.try(&.total_seconds.to_i.to_s) || ""
       @s_retries = @config.retries.to_s
+      @s_max_req = @config.max_requests.try(&.to_s) || ""
       @s_m_regex = @matcher.match_regex.try(&.source) || ""
       @s_f_regex = @matcher.filter_regex.try(&.source) || ""
     end
@@ -1013,7 +1049,8 @@ module Gori::Tui
       # `Plan.build`'s `Env.expand_wire` still promotes the HEAD to CRLF, and it is idempotent
       # on a head that already carries CRLF (`Env.normalize_crlf` only inserts a CR before an
       # LF that has none), so a wire-form template changes nothing downstream.
-      options = Fuzz::PlanOptions.new(@editor.wire_text, target: @target, http2: @http2,
+      options = Fuzz::PlanOptions.new(evidence_template, evidence: @evidence,
+        target: @target, http2: @http2,
         sources: @sets.map { |s| build_source(s) }, config: @config, matcher: @matcher,
         verify: verify, sni: sni_override, overrides: overrides)
       plan = Fuzz::Plan.build(options, Gori::Outbound.interactive(scope))
@@ -1023,11 +1060,62 @@ module Gori::Tui
       # name the retention THIS run used — not what the CONFIG pane says after a post-run edit.
       @pending_policy = {@config.update_content_length?, @config.add_content_length_when_missing?,
                          @matcher.keep_bodies}
+      # The template declares a Content-Length that disagrees with its own body BEFORE any
+      # payload is substituted — so the auto-resync is about to rewrite framing the operator
+      # authored deliberately, on every variation, and the sweep would report a clean
+      # CL-desync run that never put a CL desync on the wire. `gori run fuzz` says this once
+      # up front and names `--verbatim`; this is the same fact pointed at the toggle.
+      @cl_rewrite = plan.rewrites_content_length?
+      @cl_rewrite_rev = @editor.edits
       {plan.engine, nil}
     rescue ex : Fuzz::PlanError
       {nil, fuzz_plan_error(ex)}
     rescue ex
       {nil, "config error: #{ex.message}"}
+    end
+
+    # The template bytes handed to `Plan.build`, with ONE editor-owed fixup applied for an
+    # EVIDENCE session.
+    #
+    # `Fuzz::PlanOptions#evidence?` turns off two draft-time passes at once, and only one of
+    # them is right for a tab that has an editor in it:
+    #
+    #   * the unresolved-`$KEY` refusal and `$KEY` SUBSTITUTION — off, and that is the whole
+    #     point. A capture's `$filter`/`$top`/`$where`/`$IFS`/`$user.name` are bytes the
+    #     origin sent, not variables anybody typed. With them on, a captured OData request
+    #     was refused outright, and the refusal's own remedy ("set the variable") rewrote the
+    #     PARAMETER NAMES on the wire (`?PWNED=aa&99=10`) while the TEMPLATE pane still read
+    #     `$filter=§…§` and the screen said `6 hits / 6 sent`.
+    #   * the head's LF→CRLF promotion — which `expand_wire` did, and which this editor still
+    #     OWES the wire. `TextArea#insert_newline` gives a line the user typed `DEFAULT_EOL`
+    #     ("\n") and documents `expand_wire` as what promotes it back; without that, adding
+    #     one header to a seeded capture would put a bare LF in the head — itself a
+    #     front-end/back-end desync primitive, i.e. a different test than the one on screen.
+    #     So the view runs the head-only normalization itself. It is idempotent on a head
+    #     that already carries CRLF (`Env.normalize_crlf` only inserts a CR before an LF that
+    #     has none), the body is copied through byte-for-byte, and no `$` is touched.
+    #
+    # Provenance is about where the bytes CAME FROM, so an operator edit does not clear it:
+    # ^A/^K only insert §/¦ within a line (`restore_wire_eols` keeps every terminator), and
+    # dropping evidence on the first keystroke would put the substitution back on the most
+    # common workflow there is — seed a capture, tweak a header, mark, run.
+    #
+    # The one thing given up: an IMPORTED flow whose head is bare-LF terminated is promoted
+    # here rather than replayed. gori's proxy refuses to capture such a head at all (P7), so
+    # it is not reachable through the proxy; `gori run repeater --verbatim` is the byte-exact
+    # route for one.
+    private def evidence_template : String
+      text = @editor.wire_text
+      return text unless @evidence
+      bytes = text.to_slice
+      boundary = Env.head_body_boundary(bytes)
+      head = Env.normalize_crlf(bytes[0...boundary])
+      return String.new(head) if boundary >= bytes.size
+      body = bytes[boundary..]
+      buf = IO::Memory.new(head.size + body.size)
+      buf.write(head)
+      buf.write(body)
+      String.new(buf.to_slice)
     end
 
     # The Fuzzer tab's wording for a plan this view's state can't produce. The builder
@@ -1044,6 +1132,20 @@ module Gori::Tui
         "unresolved env #{ex.detail} — add it in the Project tab's ENV pane"
       end
     end
+
+    # True when the LAST plan built off this exact template buffer was going to recompute a
+    # Content-Length the operator wrote by hand. Scoped to `@editor.edits` so a template
+    # edit retracts the claim rather than leaving a stale one on screen.
+    def rewrites_content_length? : Bool
+      @cl_rewrite && @editor.edits == @cl_rewrite_rev
+    end
+
+    # `gori run fuzz`'s sentence for the same fact, with this surface's remedy in place of
+    # `--verbatim`. A constant so the controller's run-start line and any future consumer
+    # cannot drift from each other about what the run is doing.
+    CL_REWRITE_NOTE = "the template's Content-Length disagrees with its own body and is " \
+                      "being recomputed on every request — turn off ^O ▸ Advanced ▸ " \
+                      "Auto Content-Length to send it as written"
 
     # Whether the run targets HTTP/2 — for Probe's synthetic RepeaterRecord (see
     # FuzzerController#probe_scan_fuzz_result), which needs to know the protocol
@@ -1460,9 +1562,11 @@ module Gori::Tui
           j.field "throttle_ms", @config.throttle_ms
           j.field "timeout_s", @config.timeout.try(&.total_seconds.to_i)
           j.field "retries", @config.retries
+          j.field "max_requests", @config.max_requests
           j.field "follow", @config.follow_redirects?
           j.field "calibrate", @config.auto_calibrate?
           j.field "keep_alive", @config.keep_alive?
+          j.field "update_cl", @config.update_content_length?
           j.field("sets") { j.array { @sets.each { |s| j.object { j.field "kind", s.kind.to_s; j.field "value", s.value } } } }
           j.field "match_status", @matcher.match_status
           j.field "filter_status", @matcher.filter_status
@@ -1488,11 +1592,15 @@ module Gori::Tui
       @config.throttle_ms = obj["throttle_ms"]?.try(&.as_i?)
       obj["timeout_s"]?.try(&.as_i?).try { |s| @config.timeout = s.seconds }
       obj["retries"]?.try(&.as_i?).try { |n| @config.retries = n }
+      @config.max_requests = obj["max_requests"]?.try(&.as_i64?)
       @config.follow_redirects = obj["follow"]?.try(&.as_bool?) || false
       @config.auto_calibrate = obj["calibrate"]?.try(&.as_bool?) || false
       # A session persisted before this key existed reads as nil ⇒ keep the ctor default
       # (on). `|| false` here would silently turn keep-alive off for every saved tab.
       @config.keep_alive = obj["keep_alive"]?.try(&.as_bool?) != false
+      # Same nil-means-default reading as keep_alive above: a session saved before this
+      # key existed must keep the ctor default (on), not silently start sending desyncs.
+      @config.update_content_length = obj["update_cl"]?.try(&.as_bool?) != false
       apply_sets_json(obj["sets"]?)
       @matcher.match_status = obj["match_status"]?.try(&.as_s?)
       @matcher.filter_status = obj["filter_status"]?.try(&.as_s?)
@@ -1843,8 +1951,16 @@ module Gori::Tui
         else
           "↳ run size unknown"
         end
+      # The two things a run's SIZE now depends on besides the payload sets: the wire cap
+      # (retries + redirect hops charge it, so it is not the same number as the estimate
+      # above) and whether the framing the operator authored is about to be rewritten.
+      cl = rewrites_content_length?
+      if cap = @config.max_requests
+        text += "#{text.empty? ? "↳" : " ·"} cap #{Fmt.count(cap)}"
+      end
+      text += "#{text.empty? ? "↳" : " ·"} CL recomputed" if cl
       return if text.empty?
-      screen.text(inner.x, y, text, Theme.muted, Theme.bg, width: {inner.w, 1}.max)
+      screen.text(inner.x, y, text, cl ? Theme.yellow : Theme.muted, Theme.bg, width: {inner.w, 1}.max)
     end
 
     # One Sets row. In per-position modes (pp) it carries a marker-coloured swatch + →N
@@ -1882,17 +1998,37 @@ module Gori::Tui
       end
     end
 
+    # The RESULTS border's live count. ONE definition because `results_chrome_hit` has to
+    # measure exactly the string `render_results` drew, or the badge hit-boxes shift.
+    #
+    # `requests` — the TRUE number of requests this run put on the target — is shown only
+    # when it exceeds the payload count, which is precisely when retries or redirect hops
+    # made them diverge. It used to be absent entirely: the header read the number of
+    # RESULT ROWS, so a 3-payload sweep with `Follow redirects` on against a redirect chain
+    # said `3 sent` for 18 requests at the origin, and `Retries 2` against a dead host said
+    # `2 sent` for 3. For a tester inside an agreed request budget, or against anything that
+    # rate-limits or alerts on volume, that is the number that matters, and the engine has
+    # always published it (`Fuzz::Progress#requests`).
+    # Public so a spec can assert on the exact string the border draws — the whole defect
+    # was a header reporting a different number from the one on the wire.
+    def results_count_label : String
+      p = @progress
+      req = p ? p.requests : 0_i64
+      if @running
+        extra = req > (p ? p.sent : 0_i64) ? " · #{req} req" : ""
+        "running #{p ? p.sent : 0}/#{@run_total || "?"}#{extra} · #{matched_count} hit"
+      else
+        extra = req > result_count ? " · #{req} requests" : ""
+        "#{result_count} sent#{extra} · #{matched_count} hit"
+      end
+    end
+
     private def render_results(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "RESULTS", bg: Theme.bg, border: Frame.pane_border(focused))
       # Left: the live count. Right: keyed toggle badges (sort value · matched · dist) so
       # each results toggle's shortcut rides the border, not just the bottom hint bar.
-      count = if @running
-                p = @progress
-                "running #{p ? p.sent : 0}/#{@run_total || "?"} · #{matched_count} hit"
-              else
-                "#{result_count} sent · #{matched_count} hit"
-              end
+      count = results_count_label
       screen.text(rect.x + 11, rect.y, count, Theme.muted, Theme.bg) # +11 clears the " RESULTS " title
       min_x = rect.x + 11 + count.size + 1                           # badges never overwrite the count
       rx = Frame.toggle_badge(screen, rect.right - 1, rect.y, min_x, "v", "DIST", @show_dist)
@@ -2419,13 +2555,7 @@ module Gori::Tui
     def results_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
       return nil unless pane = results_rect(rect)
       return nil if pane.w < 2 || my != pane.y
-      count = if @running
-                p = @progress
-                "running #{p ? p.sent : 0}/#{@run_total || "?"} · #{matched_count} hit"
-              else
-                "#{result_count} sent · #{matched_count} hit"
-              end
-      min_x = pane.x + 11 + count.size + 1
+      min_x = pane.x + 11 + results_count_label.size + 1
       Frame.right_badge_hit(mx, my, pane.y, pane.right - 1, min_x, [
         {:dist, "v", "DIST"},
         {:match, "m", "MATCH"},

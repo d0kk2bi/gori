@@ -357,9 +357,9 @@ describe "Overlay seam — SequenceConfigOverlay (hard case: 2 open-sites, no fl
     reconf_h = OverlayHarness.new(SequenceConfigOverlay.new(seed))
     reconf_h.on_commit { log << "reconfigure_current"; true }
 
-    # Drive each to Start (row 5) and commit through the generic shell dispatch.
+    # Drive each to Start (row 6) and commit through the generic shell dispatch.
     [new_h, reconf_h].each do |h|
-      4.times { h.press(Termisu::Input::Key::Down) } # selector → … → Start
+      5.times { h.press(Termisu::Input::Key::Down) } # selector → … → Start
       h.overlay.as(SequenceConfigOverlay).on_start_row?.should be_true
       h.press(Termisu::Input::Key::Enter).should eq(:closed)
     end
@@ -372,14 +372,14 @@ describe "Overlay seam — SequenceConfigOverlay (hard case: 2 open-sites, no fl
     ov.valid?.should be_false
     h = OverlayHarness.new(ov)
     h.on_commit { ov.valid? } # real open-site gate: reject + keep open, mirroring Runner#commit_sequence
-    ov.set_selected(5)        # Start row
+    ov.set_selected(6)        # Start row
     h.press(Termisu::Input::Key::Enter).should eq(:open)
   end
 
   it "click on Start commits; a click outside dismisses" do
     h = OverlayHarness.new(SequenceConfigOverlay.new(seed))
-    # Start is row index 5; its screen row is box.y + 3 + 5.
-    h.click_in_box(3, 8).should eq(:closed)
+    # Start is row index 6; its screen row is box.y + 3 + 6.
+    h.click_in_box(3, 9).should eq(:closed)
     h.commits.should eq(1)
 
     away = OverlayHarness.new(SequenceConfigOverlay.new(seed))
@@ -422,8 +422,8 @@ describe "Overlay seam — MineConfigOverlay (laggard: keys were shell-owned; cl
   it "commits from the Start row through the generic dispatch" do
     ov = MineConfigOverlay.new(mseed)
     h = OverlayHarness.new(ov)
-    # rows: [Query, Json, concurrency, notify, Start] → 4 downs to Start.
-    4.times { h.press(Termisu::Input::Key::Down) }
+    # rows: [Query, Json, max requests, concurrency, notify, Start] → 5 downs to Start.
+    5.times { h.press(Termisu::Input::Key::Down) }
     ov.on_start_row?.should be_true
     h.press(Termisu::Input::Key::Enter).should eq(:closed)
     h.commits.should eq(1)
@@ -432,7 +432,7 @@ describe "Overlay seam — MineConfigOverlay (laggard: keys were shell-owned; cl
   it "keeps the form open when the commit closure rejects (no location selected)" do
     ov = MineConfigOverlay.new(mseed)
     h = OverlayHarness.new(ov, commit: false) # e.g. any_checked? was false
-    ov.set_selected(4)                        # Start row
+    ov.set_selected(5)                        # Start row
     h.press(Termisu::Input::Key::Enter).should eq(:open)
   end
 
@@ -447,8 +447,8 @@ describe "Overlay seam — MineConfigOverlay (laggard: keys were shell-owned; cl
 
   it "click on Start commits; a click outside dismisses" do
     h = OverlayHarness.new(MineConfigOverlay.new(mseed))
-    # Start is row index 4; its screen row is box.y + 3 + 4.
-    h.click_in_box(3, 7).should eq(:closed)
+    # Start is row index 5; its screen row is box.y + 3 + 5.
+    h.click_in_box(3, 8).should eq(:closed)
     h.commits.should eq(1)
 
     away = OverlayHarness.new(MineConfigOverlay.new(mseed))

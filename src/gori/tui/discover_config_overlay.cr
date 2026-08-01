@@ -24,17 +24,26 @@ module Gori::Tui
     CONTAINMENTS = [Discover::Containment::ScopeAware, Discover::Containment::SameOrigin, Discover::Containment::HostAndSubdomains]
     COMMON_EXT   = %w(php asp aspx jsp html json txt bak zip)
 
+    # Hard ceiling on REQUESTS the run may put on the target (retries and redirect hops
+    # each charge it — `Fuzz::CappedBackend`, the same counter `--max-requests` and MCP's
+    # `max_requests` are enforced against). nil = uncapped, which is what every TUI run
+    # used to be: there was no way to cap one from the primary surface at all, while
+    # `gori run` and MCP both had the knob. A cycler, not a text field, because this
+    # overlay deliberately has none (no IME plumbing).
+    MAX_REQ_CHOICES = [nil, 100, 250, 500, 1000, 2500, 5000, 10000] of Int32?
+
     ROW_TARGET  =  0
     ROW_SPIDER  =  1
     ROW_BRUTE   =  2
     ROW_DEPTH   =  3
     ROW_CONTAIN =  4
-    ROW_CONC    =  5
-    ROW_EXT     =  6
-    ROW_KEEP    =  7
-    ROW_HEADERS =  8
-    ROW_START   =  9
-    ROWS        = 10
+    ROW_MAXREQ  =  5
+    ROW_CONC    =  6
+    ROW_EXT     =  7
+    ROW_KEEP    =  8
+    ROW_HEADERS =  9
+    ROW_START   = 10
+    ROWS        = 11
 
     getter seed : DiscoverSeed
     # Custom request headers ({name, value}) prefilled from a History flow and/or
@@ -53,6 +62,7 @@ module Gori::Tui
       @depth_idx = DEPTHS.index(4) || 3
       @contain_idx = 0
       @conc_idx = CONCS.index(20) || 1
+      @maxreq_idx = 0
       @ext = false
       @keep_alive = true
       @selected = 0
@@ -162,17 +172,18 @@ module Gori::Tui
       when ROW_TARGET  then @target_idx = (@target_idx + d) % @seed.choices.size
       when ROW_DEPTH   then @depth_idx = (@depth_idx + d) % DEPTHS.size
       when ROW_CONTAIN then @contain_idx = (@contain_idx + d) % CONTAINMENTS.size
+      when ROW_MAXREQ  then @maxreq_idx = (@maxreq_idx + d) % MAX_REQ_CHOICES.size
       when ROW_CONC    then @conc_idx = (@conc_idx + d) % CONCS.size
       end
     end
 
     def toggle : Nil
       case @selected
-      when ROW_SPIDER                                   then @spider = !@spider
-      when ROW_BRUTE                                    then @bruteforce = !@bruteforce
-      when ROW_EXT                                      then @ext = !@ext
-      when ROW_KEEP                                     then @keep_alive = !@keep_alive
-      when ROW_TARGET, ROW_DEPTH, ROW_CONTAIN, ROW_CONC then adjust(1)
+      when ROW_SPIDER                                               then @spider = !@spider
+      when ROW_BRUTE                                                then @bruteforce = !@bruteforce
+      when ROW_EXT                                                  then @ext = !@ext
+      when ROW_KEEP                                                 then @keep_alive = !@keep_alive
+      when ROW_TARGET, ROW_DEPTH, ROW_CONTAIN, ROW_CONC, ROW_MAXREQ then adjust(1)
       end
     end
 
@@ -184,6 +195,7 @@ module Gori::Tui
       Discover::Config.new(
         spider: @spider, bruteforce: @bruteforce,
         max_depth: DEPTHS[@depth_idx], concurrency: CONCS[@conc_idx],
+        max_requests: MAX_REQ_CHOICES[@maxreq_idx].try(&.to_i64),
         containment: CONTAINMENTS[@contain_idx],
         extensions: @ext ? COMMON_EXT.dup : [] of String,
         keep_alive: @keep_alive,
@@ -228,6 +240,7 @@ module Gori::Tui
       when ROW_DEPTH   then cyc(screen, x, py, bg, sel, "max depth:", DEPTHS[@depth_idx].to_s)
       when ROW_CONTAIN then cyc(screen, x, py, bg, sel, "scope:", CONTAINMENTS[@contain_idx].label)
       when ROW_CONC    then cyc(screen, x, py, bg, sel, "concurrency:", CONCS[@conc_idx].to_s)
+      when ROW_MAXREQ  then cyc(screen, x, py, bg, sel, "max requests:", MAX_REQ_CHOICES[@maxreq_idx].try(&.to_s) || "uncapped")
       when ROW_HEADERS then headers_row(screen, x, py, bg, sel)
       else                  start_row(screen, x, py, bg)
       end
