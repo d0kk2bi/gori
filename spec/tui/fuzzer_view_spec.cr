@@ -16,6 +16,38 @@ private def loaded_fuzzer : FuzzerView
   view
 end
 
+# A row the run's keep_bodies dropped: no head, no body, no request — the TUI default
+# (:matched) leaves EVERY non-matching row in this shape.
+private def unretained_result(idx : Int32, payloads : Array(String)) : Gori::Fuzz::Result
+  Gori::Fuzz::Result.new(idx.to_i64, payloads, nil, 404, 12_i64, 2, 1, 1000_i64,
+    nil, false, false, nil)
+end
+
+private def with_fuzz_store(&)
+  path = File.tempname("gori-fuzzview", ".db")
+  store = Gori::Store.open(path)
+  begin
+    yield store
+  ensure
+    store.close
+    File.delete?(path)
+    File.delete?("#{path}-wal")
+    File.delete?("#{path}-shm")
+  end
+end
+
+# Byte offset just past the head/body separator, or 0. Byte-level on purpose: the seed
+# text under test is deliberately not valid UTF-8.
+private def body_start(s : String) : Int32
+  b = s.to_slice
+  i = 0
+  while i + 3 < b.size
+    return i + 4 if b[i] == 0x0d && b[i + 1] == 0x0a && b[i + 2] == 0x0d && b[i + 3] == 0x0a
+    i += 1
+  end
+  0
+end
+
 describe Gori::Tui::FuzzerView do
   describe "a failed send's reason" do
     # Fuzz::Engine returns a scope/sandbox refusal as a Result whose `error` carries the
@@ -470,8 +502,206 @@ describe Gori::Tui::FuzzerView do
       view.append_result(fuzz_result(0, 404, 12)) # keep_bodies dropped head/body/request
       r = view.selected_result.not_nil!
       # The marked position takes the row's payload, so the row still reads as its own
-      # request. The editor holds LF text; the Repeater seed re-expands to CRLF on send.
-      String.new(view.result_request_bytes(r)).should eq("GET /?x=p0 HTTP/1.1\nHost: h\n\n")
+      # request. WIRE form, not the LF projection: the template is a message, and the
+      # fallback must reproduce what the socket would have carried (R5-F1).
+      String.new(view.result_request_bytes(r)).should eq("GET /?x=p0 HTTP/1.1\r\nHost: h\r\n\r\n")
+    end
+  end
+
+  # ── R5-F1 / R5-F2 ──────────────────────────────────────────────────────────────────
+  #
+  # A captured body carrying a CRLF is the whole point of these: 0x0D 0x0A inside a BODY is
+  # data (a CL/TE desync probe, a multipart delimiter, part content, a CRLF-injection test),
+  # never a line ending the fuzzer may re-encode. The TUI Fuzzer read `TextArea#text` — the
+  # LF projection — on the send path, the persistence path AND every § marking helper, so the
+  # capture went out one byte shorter per line with `ContentLength.sync` quietly resyncing the
+  # header DOWN to match. Nothing errored. `gori run fuzz` given the same bytes is byte-exact,
+  # and so is the Repeater replaying the same flow in the same session.
+  describe "byte-exact captured template (R5-F1)" do
+    # POST with a deliberate CRLF inside the JSON body. Body is exactly 12 bytes.
+    captured = "POST /h1t HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n" \
+               "Content-Length: 12\r\n\r\n{\"k\":\"v\r\nx\"}"
+    # The same request an operator TYPED — every terminator LF, body has no CR at all.
+    # This is the complement: the fix must not go the other way and inject CRLF into a body.
+    typed = "POST /h1t HTTP/1.1\nHost: h\nContent-Type: application/json\n" \
+            "Content-Length: 11\n\n{\"k\":\"v\nx\"}"
+
+    # Put the caret on the body's `v` (line 5, col 6) — the finding's own repro chord.
+    caret_on_body_v = ->(view : FuzzerView) do
+      view.focus_pane(:template)
+      view.template_move(5, 6)
+    end
+
+    it "keeps the body's CRLF through ^K mark word — the chord the repro uses" do
+      view = FuzzerView.new
+      view.load_request("http://h", captured, false, "")
+      caret_on_body_v.call(view)
+      view.mark_word.should eq("marked position")
+      # The § landed around the body's `v`, and the CRLF that followed it is still a CRLF.
+      view.template_text.should eq("POST /h1t HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n" \
+                                   "Content-Length: 12\r\n\r\n{\"k\":\"§v§\r\nx\"}")
+    end
+
+    it "keeps a hand-typed body's bare LF through ^K — the complement" do
+      view = FuzzerView.new
+      view.load_request("http://h", typed, false, "")
+      caret_on_body_v.call(view)
+      view.mark_word.should eq("marked position")
+      view.template_text.should eq("POST /h1t HTTP/1.1\nHost: h\nContent-Type: application/json\n" \
+                                   "Content-Length: 11\n\n{\"k\":\"§v§\nx\"}")
+    end
+
+    it "keeps the body's CRLF through ^A auto-mark and Clear markers" do
+      view = FuzzerView.new
+      view.load_request("http://h", captured, false, "")
+      view.auto_mark.should contain("auto-marked")
+      # auto-mark wraps the whole JSON string value, so the CRLF sits INSIDE the marker —
+      # a position whose default spans a line break, which is exactly the shape that the
+      # LF projection destroyed (`§v\nx§`, one byte short).
+      view.template_text.should contain("{\"k\":\"§v\r\nx§\"}")
+
+      view.clear_marks
+      view.template_text.should eq(captured) # …and a full round-trip is the identity
+    end
+
+    it "persists the template in wire form and round-trips it across a restart" do
+      view = FuzzerView.new
+      view.load_request("http://h", captured, false, "")
+      caret_on_body_v.call(view)
+      view.mark_word
+      stored = view.template_text # exactly what insert/update_fuzz_session writes
+
+      reopened = FuzzerView.new
+      reopened.restore(Gori::Store::FuzzSessionRecord.new(1_i64, "http://h", stored, false, nil,
+        "", nil, 0, nil))
+      reopened.template_text.should eq(stored)
+      # …and the reconcile poll must see them as equal, or it slams the caret every tick.
+      reopened.session_side_matches?(Gori::Store::FuzzSessionRecord.new(1_i64, "http://h", stored,
+        false, nil, "", nil, 0, nil)).should be_true
+    end
+
+    it "puts the captured body on the wire byte-exact, CL and all, end to end" do
+      with_fuzz_store do |store|
+        scope = Gori::Scope.load(store)
+        view = FuzzerView.new
+        view.load_request("http://127.0.0.1:1/h1t", captured, false, "")
+        caret_on_body_v.call(view)
+        view.mark_word
+        view.apply_set(nil, Gori::Tui::SetSpec.new(:list, "a,bbbbbbbbbb"))
+
+        engine, err = view.build_engine(false, scope, nil)
+        err.should be_nil
+        engine.should_not be_nil
+        view.begin_run(2_i64)
+
+        # Row 0, payload "a": same length as the default, so the CL is unchanged at 12 —
+        # and the body's CRLF is still two bytes. The old code sent 11 with a bare LF.
+        view.append_result(unretained_result(0, ["a"]))
+        String.new(view.result_request(view.selected_result.not_nil!).bytes)
+          .should eq("POST /h1t HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n" \
+                     "Content-Length: 12\r\n\r\n{\"k\":\"a\r\nx\"}")
+
+        # Row 1, payload "bbbbbbbbbb": the CL MOVES (12 → 21). 21, not the 20 a flattened
+        # body produces — the complement that proves the CRLF is counted as two bytes.
+        view.append_result(unretained_result(1, ["bbbbbbbbbb"]))
+        view.select_result_row(1)
+        String.new(view.result_request(view.selected_result.not_nil!).bytes)
+          .should eq("POST /h1t HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n" \
+                     "Content-Length: 21\r\n\r\n{\"k\":\"bbbbbbbbbb\r\nx\"}")
+      end
+    end
+  end
+
+  # R5-F2: `Result#request` is nil for every row the run's keep_bodies dropped — and the TUI
+  # default is :matched, so that is EVERY non-matching row. The fallback re-rendered the raw
+  # template: no Content-Length sync, no per-position chain transform, and no mark saying it
+  # was a reconstruction — while the response pane beside it DOES name its own retention,
+  # which implies by contrast that the request pane is evidence.
+  describe "reconstruction provenance (R5-F2)" do
+    marked = "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nv=§x§"
+
+    it "syncs Content-Length on the reconstruction instead of showing an impossible pair" do
+      view = FuzzerView.new
+      view.load_request("http://h", marked, false, "")
+      view.append_result(unretained_result(0, ["ccccccccccccccccccccc"])) # 21 bytes
+      req = view.result_request(view.selected_result.not_nil!)
+      req.reconstructed.should be_true
+      # body is "v=" + 21 = 23. The old fallback left the template's "Content-Length: 3"
+      # beside a 23-byte body — a pair no socket ever carried.
+      String.new(req.bytes).should eq("POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 23\r\n\r\nv=ccccccccccccccccccccc")
+    end
+
+    it "applies the position's ¦chain, as the generator did" do
+      view = FuzzerView.new
+      view.load_request("http://h", "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nv=§x¦b64§", false, "")
+      view.append_result(unretained_result(0, ["bbbbbbbbbb"]))
+      body = String.new(view.result_request(view.selected_result.not_nil!).bytes).split("\r\n\r\n", 2)[1]
+      body.should eq("v=YmJiYmJiYmJiYg==") # base64("bbbbbbbbbb") — the ¦b64 chain ran
+    end
+
+    it "labels the reconstruction in the detail pane, and does NOT label retained bytes" do
+      view = FuzzerView.new
+      view.load_request("http://h", marked, false, "")
+      view.focus_pane(:results)
+      view.append_result(unretained_result(0, ["yyy"]))
+      view.open_detail
+      view.detail_step_pane(-1) # :response → :request
+      lines = view.detail_plain_lines
+      lines.first.should contain("reconstructed from the template")
+      lines.first.should contain("keep_bodies: matched")
+      # It reads as a sibling of the response pane's own retention note, not as a new dialect.
+      view.detail_step_pane(1)
+      view.detail_plain_lines.first.should contain("response not retained")
+
+      # Complement: a row whose request WAS retained carries no note, and no rewriting.
+      sent = "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 99\r\n\r\nv=yyy"
+      view2 = FuzzerView.new
+      view2.load_request("http://h", marked, false, "")
+      view2.focus_pane(:results)
+      view2.append_result(Gori::Fuzz::Result.new(0_i64, ["yyy"], nil, 200, 5_i64, 1, 1, 10_i64,
+        nil, true, false, nil, "HTTP/1.1 200 OK\r\n\r\n".to_slice, Bytes.empty, sent.to_slice))
+      view2.open_detail
+      view2.detail_step_pane(-1)
+      view2.detail_plain_lines.first.should eq("POST /p HTTP/1.1")
+      view2.result_request_note(view2.selected_result.not_nil!).should be_nil
+      # …and the operator's deliberate CL/body desync is handed back untouched.
+      String.new(view2.result_request(view2.selected_result.not_nil!).bytes).should eq(sent)
+    end
+
+    it "carries the caveat into the Repeater seed, and keeps the bytes exact" do
+      view = FuzzerView.new
+      view.load_request("http://h:80", marked, false, "")
+      view.focus_pane(:results)
+      view.append_result(unretained_result(0, ["yyy"]))
+      seed = FuzzerController.repeater_seed_for(view, view.selected_result.not_nil!)
+      seed.note.should_not be_nil
+      seed.note.not_nil!.should contain("reconstructed from the template")
+      seed.label.should contain("reconstructed")
+      # The head keeps its CRLFs — the seed used to collapse them to LF on the premise
+      # "Repeater editors store LF text", which the @eols work made false.
+      seed.request_text.should contain("POST /p HTTP/1.1\r\nHost: h\r\n")
+
+      # Complement: a retained row seeds with no note and an untouched label.
+      view.append_result(Gori::Fuzz::Result.new(1_i64, ["zzz"], nil, 200, 5_i64, 1, 1, 10_i64,
+        nil, true, false, nil, "HTTP/1.1 200 OK\r\n\r\n".to_slice, Bytes.empty,
+        "POST /p HTTP/1.1\r\n\r\nv=zzz".to_slice))
+      view.select_result_row(1)
+      seed2 = FuzzerController.repeater_seed_for(view, view.selected_result.not_nil!)
+      seed2.note.should be_nil
+      seed2.label.should eq("#1 zzz")
+    end
+
+    it "hands a non-UTF-8 payload byte to the Repeater verbatim instead of U+FFFD" do
+      view = FuzzerView.new
+      view.load_request("http://h:80", marked, false, "")
+      view.focus_pane(:results)
+      raw = String.new(Bytes[0xff_u8, 0xfe_u8]) # not valid UTF-8 — a hex/binary payload set
+      view.append_result(unretained_result(0, [raw]))
+      seed = FuzzerController.repeater_seed_for(view, view.selected_result.not_nil!)
+      body = seed.request_text.to_slice[body_start(seed.request_text)..]
+      body.should eq(Bytes[0x76_u8, 0x3d_u8, 0xff_u8, 0xfe_u8]) # "v=" + the two raw bytes
+      # `.scrub` would have replaced each with U+FFFD (3 bytes each) and lied about the length.
+      seed.request_text.should contain("Content-Length: 4")
     end
   end
 
@@ -692,7 +922,9 @@ describe "FuzzerView#template_click_to_cursor / #target_click_to_cursor" do
     # The template card sits below the 3-row target band; row 1 is the "Host: h" line.
     view.template_click_to_cursor(rect, 90, 5) # mx past end → clamps to end of that line
     view.template_insert('X')
-    view.template_text.split('\n')[1].should eq("Host: hX")
+    # `template_text` is wire form (R5-F1) — the captured CRLFs are still there, so split
+    # on the terminator the request actually carries.
+    view.template_text.split("\r\n")[1].should eq("Host: hX")
   end
 
   it "places the target caret at the clicked column" do

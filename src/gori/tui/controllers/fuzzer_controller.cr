@@ -937,7 +937,8 @@ module Gori::Tui
       request_text : String,
       http2 : Bool,
       sni : String?,
-      label : String # sub-tab chip + toast ("#index payload")
+      label : String,  # sub-tab chip + toast ("#index payload")
+      note : String? = nil # provenance when request_text is NOT the retained wire bytes
 
     # True when the focused session has a result row under the cursor (gates space →
     # Send to Repeater): no run yet, or a filter that hides every row, means no request
@@ -950,12 +951,31 @@ module Gori::Tui
     def selected_repeater_seed : RepeaterSeed?
       return nil unless v = current_view
       return nil unless r = v.selected_result
-      # Repeater editors store LF text; send expands back to CRLF (RepeaterView#expanded_text_to_bytes).
-      # Same LF shape as History→Repeater (origin_form_text) and the Miner path.
-      text = String.new(v.result_request_bytes(r)).scrub.gsub("\r\n", "\n")
+      FuzzerController.repeater_seed_for(v, r)
+    end
+
+    # The seed for one {session, result} pair. A class method because it reads no shell
+    # state: `selected_repeater_seed` above only picks the pair, so a spec can drive the
+    # REAL byte handling below without standing up a Host.
+    def self.repeater_seed_for(v : FuzzerView, r : Fuzz::Result) : RepeaterSeed
+      req = v.result_request(r)
+      # `String.new`, NOT `.scrub`, and NO CRLF→LF collapse. Both used to be justified by
+      # "Repeater editors store LF text", which the @eols work made false — `TextArea#set_text`
+      # now round-trips each line's own terminator and the send path reads `wire_text`, so
+      # collapsing here is exactly the loss F1 fixed one tab over. `.scrub` was worse than
+      # cosmetic: a payload byte that is not valid UTF-8 (a hex/binary set, a decoder chain
+      # emitting raw bytes) became U+FFFD in bytes this record calls the request that was sent.
+      # `String.new(Bytes)` copies them through verbatim.
+      text = String.new(req.bytes)
       payload = r.payloads.join(", ")
       payload = "#{payload[0, 23]}…" if payload.size > 24
-      RepeaterSeed.new(v.target_origin, text, v.http2?, v.sni_override, "##{r.index} #{payload}".rstrip)
+      label = "##{r.index} #{payload}".rstrip
+      note = v.result_request_note(r)
+      # The chip/toast label carries the caveat too, not just `note`: the label is the only
+      # field that reaches the operator through every consumer of this seed, and a tab holding
+      # a reconstruction should keep saying so after the toast has gone.
+      label = "#{label} · reconstructed" if note
+      RepeaterSeed.new(v.target_origin, text, v.http2?, v.sni_override, label, note)
     end
 
     # ⇧I from History (or Issues evidence): open a captured flow as a fuzz session.
