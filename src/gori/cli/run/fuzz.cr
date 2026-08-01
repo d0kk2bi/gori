@@ -131,7 +131,7 @@ module Gori
         begin
           # Session bindings: seed the in-memory table, or refuse before the sweep rather
           # than after every row of it. See CLI::Run.seed_bindings.
-          seed_bindings(bind_from.not_nil!, project_name, db_path, outbound, insecure, "gori run fuzz") if bind_from
+          (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run fuzz")
           preflight_bindings(text, bind_from, "gori run fuzz")
           plan.engine.calibrate_baseline if auto_cal
           run_fuzz_stream(plan.engine, mode, origin.scheme, origin.host, origin.port, format, force, fail_if_no_matches, plan.pool)

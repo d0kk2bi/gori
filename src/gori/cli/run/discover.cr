@@ -93,7 +93,7 @@ module Gori
           guard_discover_scope(plan, outbound)
           # See CLI::Run.seed_bindings. Discover's own `$NAME` surface is `--header`, which is
           # exactly where a session token goes, so the same two steps apply.
-          seed_bindings(bind_from.not_nil!, project_name, db_path, outbound, insecure, "gori run discover") if bind_from
+          (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run discover")
           preflight_bindings(headers.join('\n'), bind_from, "gori run discover")
           discover_preflight(plan, force)
           run_discover_stream(plan.engine, store, format, no_store, -> { plan.sender.pool_stats })

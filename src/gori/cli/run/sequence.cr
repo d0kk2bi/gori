@@ -119,7 +119,7 @@ module Gori
         begin
           # See CLI::Run.seed_bindings — a headless process holds no binding from a previous
           # invocation, so it either replays one here or refuses before the run.
-          seed_bindings(bind_from.not_nil!, project_name, db_path, outbound, insecure, "gori run sequence") if bind_from
+          (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run sequence")
           preflight_bindings(String.new(bytes), bind_from, "gori run sequence")
           run_sequence_stream(plan.engine, origin.scheme, origin.host, origin.port, token_loc, plan.goal, format)
         ensure
