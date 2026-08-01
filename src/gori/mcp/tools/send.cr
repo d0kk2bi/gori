@@ -639,7 +639,7 @@ module Gori
                     # §5.1/§5.2/§5.4 test has to be able to read back that the unmasked frame,
                     # the RSV1 bit or the lying length header really went out — a transcript
                     # that only echoes the payload is asking to be taken on trust.
-                    j.field "frame", Store::WsOutMessage.new(message.opcode, message.payload, message.shape).shape_label
+                    j.field "frame", Store::WsOutMessage.new(message.opcode, message.payload, message.shape).shape_label(message.direction == "out")
                     if code = ws_close_code(message)
                       j.field "close_code", code
                       reason = message.payload[2, message.payload.size - 2]

@@ -3156,9 +3156,10 @@ module Gori::Tui
     # in front of the reason, so the one row an operator reads when a WebSocket test fails
     # was the one row that came out as mojibake.
     private def ws_transcript_body(m : Repeater::WsEngine::Message) : String
+      to_server = m.direction == "out"
       msg = Store::WsOutMessage.new(m.opcode, m.payload, m.shape)
-      label = msg.shape_label
-      prefix = (m.opcode == 1 && m.shape.default?) ? "" : "[#{label}] "
+      label = msg.shape_label(to_server)
+      prefix = (m.opcode == 1 && m.shape.default?(to_server)) ? "" : "[#{label}] "
       if code = Store::WsMessage.new(0_i64, 0_i64, nil, 0_i64, m.direction, m.opcode, m.payload).close_code
         reason = m.payload.size > 2 ? String.new(m.payload[2, m.payload.size - 2]).scrub : ""
         return reason.empty? ? "#{prefix}code #{code}" : "#{prefix}code #{code} #{reason}"
@@ -3181,7 +3182,7 @@ module Gori::Tui
           # Report the bytes actually put on the wire — a reframed (edited) unary payload
           # differs from the captured @grpc_body.
           rows << {"→ sent #{reqn} request message#{reqn == 1 ? "" : "s"} (#{grpc_send_body.size}b)", Theme.muted}
-          rows << {"⚠ #{RepeaterView.grpc_framing_error(@grpc_req_residual)}", Theme.yellow} if @grpc_req_residual > 0
+          rows << {"⚠ #{Proxy::H2::Grpc.framing_error(@grpc_req_residual)}", Theme.yellow} if @grpc_req_residual > 0
           st = result.response.try(&.status) || 0
           rows << {"HTTP #{st}", st >= 400 ? Theme.red : Theme.text}
           grpc_response_rows(result).each { |r| rows << r }
@@ -3256,20 +3257,8 @@ module Gori::Tui
           end
         end
       end
-      rows << {"⚠ #{RepeaterView.grpc_framing_error(residual)}", Theme.yellow} if residual > 0
+      rows << {"⚠ #{Proxy::H2::Grpc.framing_error(residual)}", Theme.yellow} if residual > 0
       rows
-    end
-
-    # The one wording every gRPC surface uses for a framing failure — byte-identical to
-    # `gori run show --format json`'s `framing_error` and to the History pane's row, so an
-    # operator comparing two surfaces on the same flow is reading the same sentence.
-    #
-    # NOTE (merge): this duplicates `Proxy::H2::Grpc.framing_error`, which lands on the
-    # `fix/b-h2-grpc` branch. Collapse this into a call to that helper once both are merged —
-    # the string is deliberately identical so the swap is a no-op.
-    def self.grpc_framing_error(residual : Int32) : String
-      "the last #{residual} byte#{residual == 1 ? "" : "s"} are not a complete gRPC frame — " \
-      "a length prefix claiming more than arrived, or a body cut short"
     end
 
     # grpc-status/grpc-message arrive as response trailers (absorbed into the synth

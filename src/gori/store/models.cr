@@ -235,11 +235,21 @@ module Gori
       # The frame this message asks for, in the notation the CLI's `--message-frame` and the
       # TUI's seed notice use. Only the departures from the default are named, so an ordinary
       # TEXT frame reads as just its opcode.
-      def shape_label : String
+      #
+      # `to_server` names which side sent it. §5.1 fixes masking per direction — a
+      # client→server frame MUST be masked, a server→client frame MUST NOT be — so only the
+      # violation is worth a word. Labelling every inbound server frame "unmasked", as this
+      # did, fires the §5.1 marker on the ordinary case and buries the anomaly it exists for.
+      # `CLI::Output.ws_shape_note` already draws the distinction on the capture side.
+      def shape_label(to_server : Bool = true) : String
         parts = [OPCODE_NAMES[@opcode]? || "op#{@opcode}"]
         parts << "fin=0" unless shape.fin
         parts << "rsv=#{shape.rsv}" if shape.rsv != 0
-        parts << "unmasked" if shape.masked == false
+        if to_server
+          parts << "unmasked" if shape.masked == false
+        else
+          parts << "masked" if shape.masked == true
+        end
         shape.mask_key.try { |k| parts << "mask=#{k.hexstring}" }
         shape.declared_len.try { |l| parts << "len=#{l}" }
         parts.join(' ')

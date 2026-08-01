@@ -631,9 +631,10 @@ module Gori
       # always did; anything else names its shape first, because the whole point of being able
       # to send a PING or an unmasked frame is being able to read back that you did.
       private def self.ws_transcript_line(m : Repeater::WsEngine::Message) : String
-        arrow = m.direction == "out" ? "→" : "←"
-        return "#{arrow} #{scrub(m.payload)}" if m.opcode == 1 && m.shape.default?
-        label = Store::WsOutMessage.new(m.opcode, m.payload, m.shape).shape_label
+        to_server = m.direction == "out"
+        arrow = to_server ? "→" : "←"
+        return "#{arrow} #{scrub(m.payload)}" if m.opcode == 1 && m.shape.default?(to_server)
+        label = Store::WsOutMessage.new(m.opcode, m.payload, m.shape).shape_label(to_server)
         body =
           case m.opcode
           when 1 then scrub(m.payload)
@@ -677,7 +678,7 @@ module Gori
                     j.object do
                       j.field "direction", m.direction
                       j.field "opcode", m.opcode
-                      j.field "frame", Store::WsOutMessage.new(m.opcode, m.payload, m.shape).shape_label
+                      j.field "frame", Store::WsOutMessage.new(m.opcode, m.payload, m.shape).shape_label(m.direction == "out")
                       if m.opcode == 1
                         j.field "text", scrub(m.payload)
                         # JSON has no way to carry a byte that is not valid UTF-8, so `text`

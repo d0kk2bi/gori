@@ -107,6 +107,12 @@ module Gori::Tui
         @intercept.edit_newline
       elsif ev.ctrl_z?
         @intercept.edit_undo
+      elsif ev.ctrl? && key.lower_l?
+        # ^L — stop resyncing Content-Length to the edited body. A CL that disagrees with the
+        # body is the reason to hold a request in the first place, so the resync has to be
+        # something the operator can turn off; the badge on the REQUEST (held) border shows
+        # which way it is set.
+        @intercept.toggle_content_length_sync
       elsif key.backspace?
         @intercept.edit_backspace
       elsif key.up?

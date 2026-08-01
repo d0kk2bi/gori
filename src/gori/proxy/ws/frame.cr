@@ -55,6 +55,17 @@ module Gori::Proxy::WS
     def default? : Bool
       fin && rsv == 0 && masked.nil? && mask_key.nil? && declared_len.nil?
     end
+
+    # As `default?`, but for a frame READ off the wire, where §5.1 fixes what "ordinary"
+    # means per direction: a server→client frame is REQUIRED to be unmasked, so `masked:
+    # false` is the norm there and not a departure at all. Without this every inbound row
+    # in a repeater transcript is "not default", so it renders as `[TEXT unmasked] …` and
+    # the plain `← ABCD` line is unreachable — a marker that fires on every frame is one
+    # an operator learns to read past, which is the opposite of what §5.1 needs it for.
+    def default?(to_server : Bool) : Bool
+      return default? if to_server
+      fin && rsv == 0 && masked != true && mask_key.nil? && declared_len.nil?
+    end
   end
 
   # One message's own wire frames, in the two forms a hold can need them.
