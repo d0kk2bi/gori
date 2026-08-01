@@ -508,6 +508,30 @@ describe "Interceptor scope gates over an ABSOLUTE-FORM target" do
         back.label.should eq("acme.test/ws server->client 2B")
       end
     end
+
+    # R4. The composition is ONE definition now: `InterceptView#row_label` and
+    # `InterceptController#intercept_label` had their own per-kind branches and call this
+    # instead, passing the EDITED method/target so a queue row and a forward toast name the
+    # message about to be sent rather than the hold-time metadata. Same rule either way —
+    # which is the point, since three separate branches is how `POST 127.0.0.1200 OK` shipped.
+    it "composes an OVERRIDDEN method/target by exactly the same rule" do
+      with_store do |store|
+        ic = Gori::Interceptor.new(Gori::Scope.load(store))
+        ic.toggle
+        req = ic.enqueue_request("x".to_slice, method: "GET", target: "/held",
+          host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+        # A GET the operator edited into a PUT against another path, absolute-form and all.
+        req.label("PUT", "http://127.0.0.1:19201/edited").should eq("PUT 127.0.0.1/edited")
+        # An unedited call is the no-argument one.
+        req.label(req.method, req.target).should eq(req.label)
+
+        resp = ic.enqueue_response("x".to_slice, flow_id: 1_i64, method: "POST", target: "200 OK",
+          host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+        # A 200→201 status edit, which is what the editor's first line gives back.
+        resp.label("POST", "201 CREATED").should eq("POST 127.0.0.1 -> 201 CREATED")
+        resp.label("POST", "201 CREATED").should_not contain("127.0.0.1201")
+      end
+    end
   end
 
   # The head/body boundary an intercept edit is split on. Shared with `H2::StreamGate`, which

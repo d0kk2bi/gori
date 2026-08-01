@@ -66,3 +66,50 @@ describe "Gori::CLI::Run.intercept_row_where" do
       .should eq("http://127.0.0.1:19501/held")
   end
 end
+
+# R4. The refusal is decided when the message is HELD, and it reached no read surface: the
+# operator (or the agent) composed an edit against a message described as ordinarily editable
+# and learned otherwise from the ack. Both projections say so up front now.
+private def refusing_row(refusal : String? = nil, head_only : Bool = false) : Gori::Store::HeldRow
+  Gori::Store::HeldRow.new(
+    session_token: "t", item_id: 1_i64, kind: "request", method: "GET", host: "h",
+    port: 443, scheme: "https", target: "/a",
+    raw: "GET /a HTTP/2\r\nHost: h\r\n\r\n".to_slice, held_at_ms: 0_i64,
+    edit_refusal: refusal, head_only: head_only)
+end
+
+describe "held-item edit refusal on the read surfaces" do
+  it "emits the reason and the head-only hold in the MCP list and detail projections" do
+    row = refusing_row("the value of \"x-evil\" carries a CR or LF", head_only: true)
+    listed = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) })
+    listed["edit_refusal"].as_s.should contain("x-evil")
+    listed["head_only"].as_bool.should be_true
+    detail = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_detail(j, row, false, 0_i64) })
+    detail["edit_refusal"].as_s.should contain("x-evil")
+  end
+
+  # EVERY h2 hold is head-only (`H2::StreamGate` passes `head_only: true` on both legs), so
+  # folding that into `edit_refusal` would mark every held HTTP/2 message uneditable — head
+  # edits DO apply, only a body has nowhere to go. Two statements, two fields.
+  it "does not report a head-only hold as a refusal" do
+    row = refusing_row(nil, head_only: true)
+    row.edit_refusal.should be_nil
+    row.head_only_note.not_nil!.should contain("HEAD only")
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) }).as_h
+    obj["head_only"].as_bool.should be_true
+    obj["head_only_note"].as_s.should contain("ADDS A BODY")
+    obj.has_key?("edit_refusal").should be_false
+  end
+
+  # The complement: an h1 hold covers head+body and forwards byte-exact, so no field is
+  # emitted and a client keying off field presence sees exactly the shape it saw before.
+  it "says nothing at all about an ordinary h1 hold" do
+    row = refusing_row
+    row.edit_refusal.should be_nil
+    row.head_only_note.should be_nil
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) }).as_h
+    obj.has_key?("edit_refusal").should be_false
+    obj.has_key?("head_only").should be_false
+    obj.has_key?("head_only_note").should be_false
+  end
+end

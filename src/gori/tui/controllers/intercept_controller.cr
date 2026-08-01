@@ -342,6 +342,7 @@ module Gori::Tui
       ids = @intercept.target_ids
       return if ids.empty?
       return if refuse_unresolved_env?
+      return if refuse_unappliable_edit?
       ic = @host.session.interceptor
       edit = @intercept.pending_edit
       label = batch_label(ids) # built BEFORE the decisions go out — the items are gone after
@@ -398,9 +399,30 @@ module Gori::Tui
       true
     end
 
+    # Refuse a forward whose pending edit gori would never apply, and say why.
+    #
+    # The CLI/MCP drain has asked `Item#refuse_edit` since R3-F1; this path had not, so the
+    # human got the older behaviour it was written to end — `forwarded GET …` in the status
+    # bar while the settle side (`H2::StreamGate#edited` → `encode_edited || block`) threw the
+    # edit away and the ORIGINAL message went on the wire. Verified against a live h2 origin:
+    # the status bar said forwarded and the origin logged the untouched request.
+    #
+    # The message stays HELD, exactly as it does for the agent path: nothing was decided, so
+    # the operator can forward it as it is, drop it, or write a different edit. And the WHOLE
+    # batch is refused for the same reason `refuse_unresolved_env?` refuses it — reporting
+    # "forwarded 4 held messages" for a set that went out as 3 is the lie being removed.
+    private def refuse_unappliable_edit? : Bool
+      refusal = @intercept.refused_edit
+      return false unless refusal
+      item, reason = refusal
+      @host.status("edit NOT applied to #{item.label} — #{reason}")
+      true
+    end
+
     def intercept_forward_all : Nil
       n = @host.session.interceptor.pending_count
       return if refuse_unresolved_env?
+      return if refuse_unappliable_edit?
       # Carry the currently-loaded item's in-progress edit into the bulk forward, so
       # "forward all" doesn't send its stale original bytes (single-forward already does).
       overrides = @intercept.pending_edit.try { |e| {e[0] => e[1]} }
@@ -487,10 +509,9 @@ module Gori::Tui
     private def intercept_label(it : Interceptor::Item) : String
       method, target = @intercept.effective_method_target(it)
       case it.kind
-      in .request?  then "#{method} #{Url.origin_path(target)}"
-      in .response? then target
-      in .ws_out?   then "WS message → #{it.host}"
-      in .ws_in?    then "WS message ← #{it.host}"
+      in .request?, .response? then it.label(method, target)
+      in .ws_out?              then "WS message → #{it.host}"
+      in .ws_in?               then "WS message ← #{it.host}"
       end
     end
   end

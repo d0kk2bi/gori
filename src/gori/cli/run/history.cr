@@ -290,6 +290,16 @@ module Gori
 
       private def self.show_text(detail : Store::FlowDetail, req : Bool, resp : Bool,
                                  ws_msgs : Array(Store::WsMessage)) : Nil
+        # FIRST, above the bytes it is about: what gori DID to this exchange that the bytes
+        # cannot show — a Match&Replace rule it could not run, a request the origin invented.
+        # The WebSocket half of this has been readable here since #518 (`[gori] …` rows in the
+        # message list); an HTTP flow now carries the same statement on the row itself.
+        advisories = detail.row.advisories
+        unless advisories.empty?
+          puts "=== GORI ADVISORY ==="
+          advisories.each { |a| puts "! #{CLI::Output.term_safe_multiline(a)}" }
+          puts ""
+        end
         if req
           puts "=== REQUEST (#{detail.http_version}) ==="
           print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body), detail.request_body)

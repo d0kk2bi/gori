@@ -1,5 +1,6 @@
 require "json"
 require "../store"
+require "../url"
 require "../fuzz"
 require "../miner"
 require "../sequencer"
@@ -42,6 +43,15 @@ module Gori
           # the two key sets against each other): a consumer of either feed has no other way
           # to tell a gori-authored stub response from one the origin actually sent (#511).
           j.field "short_circuited", row.short_circuited?
+          # What gori has to say about this flow that its bytes cannot (`FlowRow#advisory`):
+          # a rule that structurally could not run on it, a request the ORIGIN invented in a
+          # PUSH_PROMISE. Emitted only when there is one, so a script keying off field
+          # presence is not broken by a field it never asked for — the same discipline
+          # `emit_ws_shape_json` uses.
+          advisories = row.advisories
+          unless advisories.empty?
+            j.field("advisory") { j.array { advisories.each { |l| j.string(term_safe(l)) } } }
+          end
         end
       end
 
@@ -117,9 +127,12 @@ module Gori
       # Columns are padded for scannability; status/state make capture progress legible.
       def self.flow_row_text(row : Store::FlowRow) : String
         status = row.status.try(&.to_s) || "—"
-        # HTTP proxied requests store an absolute-form target ("http://host/path")
-        # that already carries the host; only origin-form targets need host prefixed.
-        loc = term_safe(row.target.starts_with?("http") ? row.target : "#{row.host}#{row.target}")
+        # HTTP proxied requests store an absolute-form target ("http://host/path") that
+        # already carries the host; only origin-form targets need the host prefixed.
+        # `Gori::Url.location`, not the `target.starts_with?("http")` spelled out here before:
+        # that is not the absolute-form test (RFC 3986 §3.1 — schemes are case-insensitive),
+        # so a captured `GET HTTP://host/x` printed as `127.0.0.1HTTP://127.0.0.1:19594/upper`.
+        loc = term_safe(Gori::Url.location(row.host, row.target))
         dur = row.duration_us.try { |us| " #{human_us(us)}" } || ""
         String.build do |io|
           io << '#' << row.id.to_s.ljust(6)
@@ -132,6 +145,10 @@ module Gori
           # Never silently: a text-mode reader scanning this list would otherwise take a
           # stub for traffic the server produced.
           io << "  [stub]" if row.short_circuited?
+          # Same reasoning as [stub] one line up: a text-mode reader scanning a list must be
+          # able to SEE that gori has something to say about a row. The chip is a pointer —
+          # `gori run show <id>` prints the sentences.
+          io << "  [!]" unless row.advisories.empty?
           io << "  [" << row.state << ']' unless row.state.complete?
         end
       end

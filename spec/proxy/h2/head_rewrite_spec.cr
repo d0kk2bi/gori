@@ -555,6 +555,70 @@ describe Gori::Proxy::H2::HeadRewrite do
       end
     end
 
+    # R4. The stream id was right after R3-F3 and the statement still reached nobody: one WARN
+    # per direction per connection on `gori run capture`'s STDERR, correlated with no flow. The
+    # skip is a PER-MESSAGE fact ("did my rule run on THIS request?"), so it goes on the flow
+    # row — `Store::FlowRow#advisory`, the HTTP twin of the `[gori] …` rows a WebSocket flow
+    # has carried since #518.
+    it "records the skip on the FLOW, not only in the log" do
+      pipe, assembler, sink = pipeline(SubRewriter.new("/two", "/twoLONGER"), direction: "out")
+      evil = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"},
+              {":path", "/two"}, {"x-reflected", "a\r\nx-injected: 1"}]
+      pipe.accept(headers(3_u32, HPACK::Encoder.new.encode(evil))) { |f, pre| assembler.feed("out", f, pre) }
+
+      advisory = sink.requests.first.advisory.not_nil!
+      advisory.should contain("Match&Replace was NOT applied to this request head")
+      advisory.should contain("x-reflected") # the FIELD, which is what names the probe that induced it
+      advisory.should contain("no HTTP/1.1 text form")
+    end
+
+    # The complement of the fix condition: two messages on ONE connection, only the second
+    # unfaithful. The log line is once per connection; the advisory must be per MESSAGE, so the
+    # faithful flow must carry none and the unfaithful one must carry its own.
+    it "leaves a faithful head's flow with no advisory on the same connection" do
+      pipe, assembler, sink = pipeline(SubRewriter.new("/two", "/twoLONGER"), direction: "out")
+      ok = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"}, {":path", "/two"}]
+      evil = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"},
+              {":path", "/two"}, {"x-reflected", "a\r\nx-injected: 1"}]
+      enc = HPACK::Encoder.new
+      pipe.accept(headers(1_u32, enc.encode(ok))) { |f, pre| assembler.feed("out", f, pre) }
+      pipe.accept(headers(3_u32, enc.encode(evil))) { |f, pre| assembler.feed("out", f, pre) }
+
+      sink.requests.size.should eq(2)
+      sink.requests[0].advisory.should be_nil
+      sink.requests[1].advisory.not_nil!.should contain("x-reflected")
+    end
+
+    # The other complement: no rule live means nothing failed to fire, so there is nothing to
+    # report. An advisory on every CRLF-carrying head would be noise about a rule table that
+    # is empty.
+    it "says nothing when no head rule is live" do
+      pipe, assembler, sink = pipeline(SubRewriter.new("/two", "/twoLONGER", on: false), direction: "out")
+      evil = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"},
+              {":path", "/two"}, {"x-reflected", "a\r\nx-injected: 1"}]
+      pipe.accept(headers(3_u32, HPACK::Encoder.new.encode(evil))) { |f, pre| assembler.feed("out", f, pre) }
+      sink.requests.first.advisory.should be_nil
+    end
+
+    # The RESPONSE direction reaches the same seam through `emit_response`, and it must not
+    # erase what the request side already stored — `update_one` writes the column outright.
+    it "carries a response-direction advisory without dropping the request-direction one" do
+      sink = RecSink.new
+      assembler = Gori::Proxy::H2::Assembler.new(sink, "a.test", 443, 1_i64)
+      out_pipe = Gori::Proxy::H2::HeadRewrite.new("out", SubRewriter.new("/two", "/twoLONGER"), assembler, "a.test")
+      in_pipe = Gori::Proxy::H2::HeadRewrite.new("in", SubRewriter.new("x-tag: a", "x-tag: b"), assembler, "a.test")
+      evil_req = [{":method", "GET"}, {":scheme", "https"}, {":authority", "a.test"},
+                  {":path", "/two"}, {"x-reflected", "a\r\nx-injected: 1"}]
+      evil_resp = [{":status", "200"}, {"x-echo", "safe\r\nset-cookie: injected=1"}]
+      out_pipe.accept(headers(1_u32, HPACK::Encoder.new.encode(evil_req))) { |f, pre| assembler.feed("out", f, pre) }
+      in_pipe.accept(headers(1_u32, HPACK::Encoder.new.encode(evil_resp))) { |f, pre| assembler.feed("in", f, pre) }
+
+      resp = sink.responses.first.advisory.not_nil!
+      resp.should contain("request head") # the request-direction line survived
+      resp.should contain("response head")
+      resp.lines.size.should eq(2)
+    end
+
     # The complement: the SAME connection, the same rule, a head the text CAN carry — the rule
     # fires and nothing is warned about.
     it "fires the rule normally on a head that has an h1 text form" do

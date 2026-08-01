@@ -73,13 +73,27 @@ describe Gori::Links do
       end
     end
 
-    it "treats a schemeless 'http'-prefixed target as verbatim (best-effort location)" do
-      # flow_location checks starts_with?("http") loosely; a schemeless host that
-      # begins with "http" is passed through as-is. Documented as best-effort.
+    # R4. `flow_location` used `starts_with?("http")`, which is not the absolute-form test:
+    # it MISSED `HTTP://host/x` (RFC 3986 §3.1 — schemes are case-insensitive) and CAUGHT a
+    # schemeless `httpbin.org/x`. `Gori::Url.location` is the strict test now, so this target
+    # — which carries no authority of its own — takes the host prefix every other non-absolute
+    # target takes, and `label` finally agrees with `url` (which has used `absolute_form?` all
+    # along and read `http://a.testhttpbin.org/x` while the label read `httpbin.org/x`).
+    it "prefixes the host on a schemeless 'http'-prefixed target, agreeing with #url" do
       with_store do |store|
         fid = insert_flow_row(store, host: "a.test", target: "httpbin.org/x")
         r = Gori::Links.resolve(store, link_for(Gori::Store::LinkRefKind::Flow, fid))
-        r.label.should eq("GET httpbin.org/x")
+        r.label.should eq("GET a.testhttpbin.org/x")
+        r.url.should eq("http://a.testhttpbin.org/x")
+      end
+    end
+
+    it "uses an UPPERCASE-scheme absolute-form target verbatim, without doubling the host" do
+      with_store do |store|
+        fid = insert_flow_row(store, host: "a.test", target: "HTTP://a.test:8080/abs")
+        r = Gori::Links.resolve(store, link_for(Gori::Store::LinkRefKind::Flow, fid))
+        r.label.should eq("GET HTTP://a.test:8080/abs")
+        r.label.should_not contain("a.testHTTP://")
       end
     end
 

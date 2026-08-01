@@ -1,5 +1,6 @@
 require "./scope"
 require "./intercept_filter"
+require "./url"
 
 module Gori
   # The Intercept lens (P4 — the human decides): when enabled, an in-flight HTTP
@@ -128,26 +129,24 @@ module Gori
       # so the one expression `"#{method} #{host}#{target}"` produced
       # `POST 127.0.0.1http://127.0.0.1:19201/held` for a proxied h1 request and
       # `POST 127.0.0.1200 OK` for a held response — which reads as HTTP status 1200. Composing
-      # per kind is what `Tui::InterceptView#row_label`, `CLI::Output` and `Links` already do
-      # separately; this is the copy the settle paths use so they cannot drift again.
-      def label : String
+      # per kind is what `Tui::InterceptView#row_label` and `InterceptController` render, so
+      # they call THIS with the values they display and the composition lives once.
+      #
+      # `m`/`t` default to the Item's own immutable metadata. The TUI passes the EDITED
+      # method/target instead (`InterceptView#effective_method_target`), so a queue row and a
+      # forward toast name the message the operator is actually about to send — the one
+      # reason a surface ever needs different values here.
+      #
+      # `Gori::Url.origin_path` is the shared spelling of the absolute-form rule; it used to
+      # be copied into this file because `Interceptor` is core and the only other copy was
+      # `Tui::Url`'s.
+      def label(m : String = method, t : String = target) : String
         case kind
-        in .request?  then "#{method} #{host}#{origin_form(target)}"
-        in .response? then "#{method} #{host} -> #{target}"
-        in .ws_out?   then "#{host}#{origin_form(target)} client->server #{raw.size}B"
-        in .ws_in?    then "#{host}#{origin_form(target)} server->client #{raw.size}B"
+        in .request?  then "#{m} #{host}#{Gori::Url.origin_path(t)}"
+        in .response? then "#{m} #{host} -> #{t}"
+        in .ws_out?   then "#{host}#{Gori::Url.origin_path(t)} client->server #{raw.size}B"
+        in .ws_in?    then "#{host}#{Gori::Url.origin_path(t)} server->client #{raw.size}B"
         end
-      end
-
-      # A plaintext forward-proxy request is captured absolute-form (the wire truth, P7), and
-      # gluing the host onto one doubles the authority. Same rule as `Tui::Url.origin_path`,
-      # kept here because `Interceptor` is core and that helper is TUI-scoped.
-      private def origin_form(t : String) : String
-        return t unless t.starts_with?("http://") || t.starts_with?("https://")
-        scheme_end = t.index("://")
-        return t unless scheme_end
-        slash = t.index('/', scheme_end + 3)
-        slash ? t[slash..] : "/"
       end
     end
 

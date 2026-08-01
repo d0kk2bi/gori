@@ -119,6 +119,78 @@ describe Gori::Store do
     end
   end
 
+  # R4. `Interceptor::Item` has known why an edit cannot be applied since R3-F1, and the
+  # bridge dropped it — so `gori run intercept get`/`list` and MCP `intercept_get` described a
+  # CRLF-carrying HTTP/2 message as ordinarily editable, and the operator (or the agent)
+  # learned otherwise only from the ack of an edit that was never applied.
+  it "carries the edit refusal and the head-only hold across the intercept bridge" do
+    with_store do |store|
+      tok = "sess-refuse"
+      raw = "GET /a HTTP/2\r\nHost: x.test\r\n\r\n".to_slice
+      reason = "gori will not apply an edit: the value of \"x-evil\" carries a CR or LF"
+      store.publish_intercept_held(tok, [
+        Gori::Store::HeldRow.new(tok, 1_i64, "request", "GET", "x.test", 443, "https", "/a",
+          raw, 1_000_i64, nil, false, 0_i64, reason, true),
+        # head_only alone, with no refusal — an editable h2 hold, which still cannot take a BODY.
+        Gori::Store::HeldRow.new(tok, 2_i64, "request", "GET", "x.test", 443, "https", "/b",
+          raw, 1_000_i64, nil, false, 0_i64, nil, true),
+        # h1: head+body held and forwarded byte-exact, so neither flag is set.
+        Gori::Store::HeldRow.new(tok, 3_i64, "request", "GET", "x.test", 80, "http", "/c",
+          raw, 1_000_i64, nil, false),
+      ])
+      held = store.intercept_held(tok)
+      held.map(&.edit_refusal).should eq([reason, nil, nil])
+      held.map(&.head_only?).should eq([true, true, false])
+      held[0].edit_refusal.should eq(reason)
+      # head_only is a CAVEAT, not a refusal: it holds for every h2 message and a head edit
+      # still applies, so it must never read as "this message cannot be edited".
+      held[1].edit_refusal.should be_nil
+      held[1].head_only_note.not_nil!.should contain("HEAD only")
+      held[2].head_only_note.should be_nil
+    end
+  end
+
+  # R4. The two producers that had nowhere to put a flow-level statement (a Match&Replace rule
+  # that could not run, a server-pushed request) write here. `error` is the neighbouring shape;
+  # this one does not mean the flow failed.
+  it "persists a flow advisory and lets the response side add to it without erasing it" do
+    with_store do |store|
+      req = Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "a.test", port: 443, method: "GET",
+        target: "/x", http_version: "HTTP/2", head: "GET /x HTTP/2\r\n\r\n".to_slice,
+        advisory: "request-side line")
+      id = store.insert_flow(req)
+      store.flow_row(id).not_nil!.advisory.should eq("request-side line")
+
+      # The h2 assembler re-sends the FULL accumulated set on the response, because this write
+      # replaces the column. Both lines must survive, and `advisories` must split them.
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/2 200\r\n\r\n".to_slice,
+        advisory: "request-side line\nresponse-side line"))
+      row = store.flow_row(id).not_nil!
+      row.advisories.should eq(["request-side line", "response-side line"])
+      store.get_flow(id).not_nil!.row.advisories.size.should eq(2)
+
+      # A response that carries NO advisory must leave the stored one alone (COALESCE) —
+      # every ordinary flow takes this path, and a bare `advisory = ?` would blank the column.
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/2 200\r\n\r\n".to_slice))
+      store.flow_row(id).not_nil!.advisories.size.should eq(2)
+    end
+  end
+
+  # The complement: an ordinary flow stores NULL, and every advisory reader answers empty.
+  it "leaves an ordinary flow's advisory null" do
+    with_store do |store|
+      id = store.insert_flow(sample_request)
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+      row = store.flow_row(id).not_nil!
+      row.advisory.should be_nil
+      row.advisories.should be_empty
+    end
+  end
+
   it "never reuses an intercept_commands id after a delete (AUTOINCREMENT watermark safety)" do
     with_store do |store|
       a = store.enqueue_intercept_command("t", "forward", item_id: 1_i64)
