@@ -137,19 +137,31 @@ module Gori::Proxy::Codec
     # Public so the Match&Replace body path can rewrite the entity, not the wire form.
     def self.dechunk(body : Bytes) : Bytes
       out = IO::Memory.new
+      scan_chunks(body) { |chunk| out.write(chunk) }
+      out.to_slice
+    end
+
+    # Walk a chunked wire body, yielding each chunk's data span, and return the offset just
+    # PAST the terminating 0-chunk's size line — where RFC 7230 §4.1.2's trailer section
+    # begins — or nil when the body never got there (truncated, EOF, malformed size line).
+    #
+    # One scanner for `dechunk` and `trailers` so the two can never disagree about where the
+    # chunk data ends and the trailer section starts.
+    private def self.scan_chunks(body : Bytes, & : Bytes ->) : Int32?
       pos = 0
       while pos < body.size
         eol = index_of(body, 0x0a_u8, pos)
-        break unless eol
+        return nil unless eol
         line = String.new(body[pos, eol - pos]).strip
         pos = eol + 1
         semi = line.index(';')
         hex = (semi ? line[0...semi] : line).strip
         size = hex.each_char.all?(&.to_i?(16)) ? hex.to_i?(base: 16) : nil # pure hex only (reject +/garbage)
-        break if size.nil? || size <= 0                                    # 0 = terminating chunk; nil/negative = malformed
+        return nil if size.nil? || size < 0                                # malformed size line
+        return pos if size == 0                                            # terminating chunk — the trailer section starts here
         avail = {size, body.size - pos}.min
-        out.write(body[pos, avail])
-        break if avail < size # truncated mid-chunk
+        yield body[pos, avail]
+        return nil if avail < size # truncated mid-chunk
         pos += size
         # Skip the chunk-data terminator byte-accurately: an OPTIONAL CR then the LF.
         # A blind 2-byte skip eats the first byte of the next chunk-size line when the
@@ -158,7 +170,59 @@ module Gori::Proxy::Codec
         pos += 1 if pos < body.size && body[pos] == 0x0d_u8 # CR (optional)
         pos += 1 if pos < body.size && body[pos] == 0x0a_u8 # LF
       end
-      out.to_slice
+      nil
+    end
+
+    # Ceiling on trailer fields lifted into the projection. The wire reader already bounds
+    # the trailer section (Body::MAX_TRAILER_BYTES), but a stored/imported body reaches this
+    # without passing through it, so the display projection carries its own bound.
+    MAX_TRAILERS = 64
+
+    NO_TRAILERS = [] of {String, String}
+
+    # The trailer fields of a chunked wire body: the header lines that follow the
+    # terminating 0-chunk (RFC 7230 §4.1.2).
+    #
+    # The old code encoded the belief that a chunked body's only content is its chunk DATA:
+    # `dechunk` stops at the 0-chunk and the rendered head stops at the blank line BEFORE the
+    # body, so a trailer was captured by neither half and vanished from every decoded
+    # projection while `Trailer:` was still echoed in the head — which reads as "the origin
+    # sent none". For trailer-based header injection, trailer smuggling, and gRPC-over-h1
+    # (where `grpc-status` arrives here and IS the call's real status) the trailer is the
+    # whole result.
+    #
+    # They are surfaced AS trailers, never folded into the header list: whether a target
+    # treats a trailer as a header is itself the test, so the projection must not decide it.
+    # Tolerant like `dechunk` — an unterminated trailer section yields what was recovered.
+    def self.trailers(body : Bytes) : Array({String, String})
+      pos = scan_chunks(body) { } || return NO_TRAILERS
+      out = [] of {String, String}
+      while pos < body.size && out.size < MAX_TRAILERS
+        stop = index_of(body, 0x0a_u8, pos) || body.size
+        len = stop - pos
+        len -= 1 if len > 0 && body[pos + len - 1] == 0x0d_u8 # the optional CR before the LF
+        line = body[pos, len]
+        pos = stop + 1
+        break if line.empty? # the blank line ends the trailer section
+        # Split on the colon in BYTE space: a trailer VALUE is remote bytes and may not be
+        # valid UTF-8, and a char-indexed split of such a String does not land where the
+        # colon actually is.
+        colon = index_of(line, 0x3a_u8, 0)
+        next unless colon # not a field line — skip it rather than guessing at its shape
+        out << {String.new(line[0, colon]).strip, String.new(line[(colon + 1)..]).strip}
+      end
+      out
+    end
+
+    # Trailers for a whole message, gated on the head actually declaring `chunked` framing —
+    # the same test `decode` uses before it de-chunks, so a body that merely happens to look
+    # chunk-shaped is never mined for fields. Empty for every other message.
+    def self.trailers(head : Bytes?, body : Bytes?) : Array({String, String})
+      return NO_TRAILERS if head.nil? || body.nil? || body.empty?
+      return NO_TRAILERS unless head_has_encoding?(head)
+      te_values, _ = encoding_headers(head)
+      return NO_TRAILERS unless transfer_encoding_chunked?(te_values)
+      trailers(body)
     end
 
     private def self.index_of(body : Bytes, byte : UInt8, from : Int32) : Int32?

@@ -1,3 +1,4 @@
+require "base64"
 require "json"
 require "uri"
 require "../env"
@@ -19,7 +20,11 @@ module Gori
         uri, scheme, host, port = parse_origin(args)
 
         bytes =
-          if (raw = args["raw"]?.try(&.as_s?)) && !raw.empty?
+          if b64 = base64_arg(args, "raw_base64")
+            # A base64 input IS the wire: the caller encoded the exact octets it wants sent,
+            # so there is nothing to normalise and nothing to expand. See `verbatim?`.
+            b64
+          elsif (raw = args["raw"]?.try(&.as_s?)) && !raw.empty?
             # `verbatim` means the operator's bytes ARE the message: no `$VAR` expansion and no
             # bare-LF promotion. `normalize_raw` exists so a hand-typed request still frames,
             # but a bare-LF header terminator is a standard front-end/back-end desync
@@ -95,9 +100,15 @@ module Gori
       # `as_bool?` alone read a STRINGIFIED `"true"` — which LLM clients emit constantly,
       # the schema's "boolean" being advisory — as nil, so `verbatim` silently turned OFF and
       # the bare LF the caller asked to preserve was promoted to CRLF. Matches `Tools#bool`'s
-      # leniency, and must: `send.cr` reads the same key through `bool_arg`, so a stricter
-      # reading here would have the two disagree about whether one call is verbatim.
+      # leniency, and must: `send.cr` reads the same key through this ONE predicate, so the
+      # two cannot disagree about whether a call is verbatim.
+      #
+      # `raw_base64` implies it. Base64 is how a caller says "these exact octets" — JSON has
+      # no other way to write one — so demanding `verbatim:true` alongside it would mean a
+      # caller who forgot the flag got its bytes silently LF-promoted and env-expanded, which
+      # is precisely what encoding them was meant to prevent.
       def self.verbatim?(args : Hash(String, JSON::Any)) : Bool
+        return true if args["raw_base64"]?.try(&.as_s?).try { |s| !s.empty? }
         v = args["verbatim"]?
         return false unless v
         b = v.as_bool?
@@ -105,11 +116,35 @@ module Gori
         v.as_s?.try(&.downcase) == "true"
       end
 
+      # Decode a `*_base64` argument into the exact bytes it names, or nil when absent/empty.
+      #
+      # This is the ONLY way to put a raw 0x00 or 0x80–0xFF octet on the wire from JSON-RPC:
+      # `raw`/`body` are JSON strings handed to the socket as `String#to_slice`, i.e. their
+      # UTF-8 ENCODING, so `é` left as `\xc3\xa9` and a latin-1 payload, an overlong/invalid
+      # UTF-8 traversal bypass, and every binary body (protobuf, gzip, a multipart upload)
+      # were inexpressible — with `isError:false` and an echo of the intended text, so the
+      # caller never learned. Invalid base64 is an ERROR rather than a silent fallback: a
+      # caller reaching for this argument is asking for exact bytes, and quietly sending
+      # different ones is the failure it came here to avoid.
+      private def self.base64_arg(args : Hash(String, JSON::Any), name : String) : Bytes?
+        s = args[name]?.try(&.as_s?)
+        return nil if s.nil? || s.empty?
+        begin
+          Base64.decode(s)
+        rescue
+          raise Gori::Error.new("'#{name}' is not valid base64")
+        end
+      end
+
       private def self.build_from_parts(uri : URI, scheme : String, host : String, port : Int32,
                                         args : Hash(String, JSON::Any)) : Bytes
         method = (args["method"]?.try(&.as_s?) || "GET").upcase
         validate_method(method)
-        body = args["body"]?.try(&.as_s?).try { |b| Env.expand(b) }
+        # `body_base64` wins over `body`: it is the byte-exact form, and a caller that sent
+        # both meant the precise one. It is NOT env-expanded — the caller already decided
+        # every octet, and expanding would change the length it encoded.
+        body = base64_arg(args, "body_base64") ||
+               args["body"]?.try(&.as_s?).try { |b| Env.expand(b).to_slice }
 
         path = uri.path
         path = "/" if path.empty?
@@ -133,14 +168,14 @@ module Gori
         end
         if body && !headers.any? { |(k, _)| k.compare("content-length", case_insensitive: true) == 0 ||
            k.compare("transfer-encoding", case_insensitive: true) == 0 }
-          headers << {"Content-Length", body.bytesize.to_s}
+          headers << {"Content-Length", body.size.to_s}
         end
 
         io = IO::Memory.new
         io << method << ' ' << target << " HTTP/1.1\r\n"
         headers.each { |(k, v)| io << k << ": " << v << "\r\n" }
         io << "\r\n"
-        io << body if body
+        io.write(body) if body
         io.to_slice
       end
 

@@ -63,6 +63,11 @@ module Gori::Proxy::H2
       # is a protocol violation a hostile peer uses to fabricate or erase a flow, so it is
       # dropped (#409).
       property awaiting_continuation = false
+      # Names of the fields that arrived in a TRAILING HEADERS block. `finish_header_block`
+      # merges trailers into `headers` (that merge is what makes grpc-status reachable), and
+      # after it nothing distinguished a trailer from a real response header. Recorded here
+      # so the stored head can say which is which — see HeadCodec::TRAILER_MARKER.
+      getter trailer_names = [] of String
     end
 
     private class Stream
@@ -263,6 +268,10 @@ module Gori::Proxy::H2
         # frame log authoritative; the ensure below still clears header_buf.
         raise Gori::Error.new("h2 cumulative header list too large") if side.header_bytes + added > HPACK::Decoder::MAX_HEADER_LIST
         side.header_bytes += added
+        # Remember WHICH names these are before they lose their identity in the merge —
+        # after the concat a `grpc-status` that arrived in a trailer reads exactly like one
+        # sent in the response head, and for gRPC the trailer is the call's real status.
+        decoded.each { |(n, _)| side.trailer_names << n unless side.trailer_names.includes?(n) }
         existing.concat(decoded)
       else
         # First block, OR a status-bearing response block. An interim 1xx (100/103)
@@ -272,6 +281,9 @@ module Gori::Proxy::H2
         # header list against a flood of repeated interim HEADERS blocks.
         side.headers = decoded
         side.header_bytes = added
+        # A final status block REPLACES an interim one, so anything recorded as a trailer
+        # against the interim head belongs to a head that no longer exists.
+        side.trailer_names.clear
       end
     ensure
       # Always reset, even if decode raised (feed rescues HPACK/framing errors and
@@ -395,7 +407,7 @@ module Gori::Proxy::H2
       body = cap.total == 0 ? nil : cap.to_slice
       content_type = header_value(headers, "content-type")
       content_encoding = header_value(headers, "content-encoding")
-      head = synth_response_head(headers)
+      head = synth_response_head(headers, stream.resp.trailer_names)
       now = Time.instant
       duration_us = (now - stream.started_at).total_microseconds.to_i64
       ttfb_us = stream.resp_first_at.try { |t| (t - stream.started_at).total_microseconds.to_i64 }
@@ -462,8 +474,12 @@ module Gori::Proxy::H2
       HeadCodec.synth_request(headers, authority)
     end
 
-    private def synth_response_head(headers : Array({String, String})) : Bytes
-      HeadCodec.synth_response(headers)
+    # `trailers` is the CAPTURE projection's extra: only the stored head names which fields
+    # came from a trailing HEADERS block. The rewrite path builds its own head from the live
+    # fields, so the marker never reaches a wire.
+    private def synth_response_head(headers : Array({String, String}),
+                                    trailers : Array(String)? = nil) : Bytes
+      HeadCodec.synth_response(headers, trailers)
     end
   end
 end

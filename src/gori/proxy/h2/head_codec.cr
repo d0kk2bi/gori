@@ -50,15 +50,34 @@ module Gori::Proxy::H2
       end.to_slice
     end
 
+    # The marker line that names which fields of a synthesized h2 response head arrived in a
+    # TRAILING HEADERS block rather than the response head (`Assembler` merges the two — that
+    # merge is what makes `grpc-status` reachable at all, see `finish_header_block`).
+    #
+    # After the merge a trailer was INDISTINGUISHABLE from a real response header, and for
+    # gRPC the trailer IS the call's real status — while whether a target/CDN/WAF treats a
+    # trailer as a header is itself a test the operator came to run. Additive on purpose:
+    # renaming or moving the fields would break every consumer that reads `grpc-status` off
+    # the parsed head (the Repeater's gRPC status row does exactly that), so the fields stay
+    # exactly where they were and this line says which ones they are.
+    TRAILER_MARKER = "X-Gori-Trailers"
+
     # Synthesized h1-equivalent response head. h2 has no reason phrase (RFC 9113 §8.3.2),
     # so the status line stops at the code. The code is normalized through `to_i` for the
     # same reason `Assembler` always did: the stored head must not vary with a peer's
     # zero-padded `:status`.
-    def synth_response(fields : Array({String, String})) : Bytes
+    #
+    # `trailers` names the fields that came from a trailing HEADERS block; it is passed ONLY
+    # by the capture projection (`Assembler`). The rewrite path re-synthesizes from the live
+    # fields and passes nothing, so this fabricated line can never reach an h2 wire.
+    def synth_response(fields : Array({String, String}), trailers : Array(String)? = nil) : Bytes
       status = (pseudo(fields, ":status") || "0").to_i? || 0
       String.build do |io|
         io << "HTTP/2 " << status << "\r\n"
         regular(fields) { |n, v| io << line_safe(n) << ": " << line_safe(v) << "\r\n" }
+        if trailers && !trailers.empty?
+          io << TRAILER_MARKER << ": " << line_safe(trailers.join(", ")) << "\r\n"
+        end
         io << "\r\n"
       end.to_slice
     end

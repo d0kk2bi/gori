@@ -150,6 +150,28 @@ describe Gori::Proxy::H2::HeadCodec do
       head.should eq("HTTP/2 200\r\ncontent-type: text/html\r\n\r\n")
     end
 
+    # `Assembler` merges a trailing HEADERS block into the response's field list — that merge
+    # is what makes gRPC's `grpc-status` reachable, and it is also what made a trailer
+    # indistinguishable from a header the origin sent in the head.
+    it "names the trailer fields only when the caller says which ones they were" do
+      fields = tuples([f(":status", "200"), f("content-type", "application/grpc"), f("grpc-status", "7")])
+      String.new(HeadCodec.synth_response(fields)).should_not contain(HeadCodec::TRAILER_MARKER)
+      marked = String.new(HeadCodec.synth_response(fields, ["grpc-status"]))
+      marked.should contain("grpc-status: 7")                   # still where every consumer reads it
+      marked.should contain("X-Gori-Trailers: grpc-status\r\n") # …and now labelled
+      marked.should end_with("X-Gori-Trailers: grpc-status\r\n\r\n")
+    end
+
+    # The marker is a CAPTURE-projection field. The rewrite path re-synthesizes from the LIVE
+    # decoded fields and passes no trailer list, so this fabricated line can never be encoded
+    # back onto an h2 wire — this pins that the round trip HeadRewrite drives stays clean.
+    it "never round-trips the marker back into h2 fields" do
+      fields = [f(":status", "200"), f("grpc-status", "7")]
+      back = HeadCodec.parse_response(HeadCodec.synth_response(tuples(fields)), fields).not_nil!
+      back.map(&.name).should_not contain(HeadCodec::TRAILER_MARKER.downcase)
+      back.map(&.to_tuple).should eq(tuples(fields))
+    end
+
     # #517 on the CAPTURE side. `h1_faithful?` guards `parse_*`/`rewrite`/`encode_edited`, but
     # `Assembler` calls these two DIRECTLY to build the stored head, so a peer field whose value
     # carried a CRLF was projected as two well-formed headers into `gori run show`, MCP get_flow,

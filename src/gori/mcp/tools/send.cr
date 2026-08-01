@@ -78,7 +78,7 @@ module Gori
       # of them — so the caller can SEE what was dropped.
       private def flow_precedence_ignored(h) : Array(String)
         return [] of String unless present?(h, "flow_id") || present?(h, "repeater_id")
-        {"url", "method", "headers", "body", "raw"}.select { |f| present?(h, f) }.to_a
+        {"url", "method", "headers", "body", "body_base64", "raw", "raw_base64"}.select { |f| present?(h, f) }.to_a
       end
 
       # The bytes that actually reach the origin, as head text.
@@ -182,20 +182,45 @@ module Gori
         int(h, "timeout_ms").try(&.clamp(1_i64, 600_000_i64).milliseconds)
       end
 
+      # Substrings that identify a DETERMINISTIC protocol refusal in gori's own error text —
+      # a message gori (or the origin) will produce identically on every retry.
+      #
+      # The list used to stop at malformed/framing/interim/chunk, which left the sharpest
+      # finding a tester can get filed as an "other" transient error: two conflicting
+      # `Content-Length` headers — a response-splitting/desync condition — came back as
+      # `error_kind:"other", error_code:"NETWORK_ERROR", retryable:true`, so an agent LOOPS on
+      # it instead of reporting it. Every phrase here is raised by gori's own framing guards
+      # (`Codec::Body`, `Codec::Http1`, the h2 assembler/engine), never by a socket.
+      PROTOCOL_ERROR_PHRASES = {
+        "malformed", "framing", "interim", "chunk",
+        "conflicting content-length", "ambiguous framing", "obfuscated",
+        "transfer-encoding", "content-length", "invalid header", "invalid status",
+        "http/2", "h2 ", "hpack", "response head", "status line",
+      }
+
       # Coarse category for a send's network error, from the engine's error text
       # (gori's own controlled strings). "connect" (the dialer collapses DNS /
       # refused / connect-timeout / TLS-verify into one failure — finer split would
-      # need dialer changes), "timeout" (idle read/write), "protocol" (framing /
-      # malformed response), "no_response", else "other". Advisory.
+      # need dialer changes), "timeout" (idle read/write), "protocol" (a deterministic
+      # framing/protocol refusal — see PROTOCOL_ERROR_PHRASES), "no_response", else "other".
       private def network_error_kind(message : String?) : String?
         return nil unless message
         m = message.downcase
         return "connect" if m.starts_with?("connect failed")
         return "timeout" if m.includes?("timed out") || m.includes?("timeout")
-        return "protocol" if m.includes?("malformed") || m.includes?("framing") ||
-                             m.includes?("interim") || m.includes?("chunk")
+        return "protocol" if PROTOCOL_ERROR_PHRASES.any? { |p| m.includes?(p) }
         return "no_response" if m.includes?("no response") || m.includes?("closed")
         "other"
+      end
+
+      # The structured-error pair for a failed send. A "protocol" kind is gori refusing a
+      # message it can prove is malformed, so it is NOT retryable and is not a network fault:
+      # retrying reproduces it exactly, and the refusal itself is the finding. Everything else
+      # keeps the transient NETWORK_ERROR contract callers already apply policy against.
+      private def emit_send_error_code(j : JSON::Builder, kind : String?) : Nil
+        protocol = kind == "protocol"
+        j.field "error_code", protocol ? "PROTOCOL_ERROR" : "NETWORK_ERROR"
+        j.field "retryable", !protocol
       end
 
       private def persist_send_repeater(h, save : Bool, built : RequestBuilder::Built,
@@ -339,13 +364,13 @@ module Gori
             j.field "recorded_flow_id", recorded_flow_id
             j.field "saved_repeater_id", repeater_id if repeater_id && repeater_id > 0
             unless result.ok?
+              kind = network_error_kind(result.error)
               j.field "error", result.error
-              j.field "error_kind", network_error_kind(result.error)
+              j.field "error_kind", kind
               # Structured-error contract inside the payload (the payload IS the
-              # structuredContent): a network failure is coded + retryable so a
-              # caller can apply policy without string-matching the message.
-              j.field "error_code", "NETWORK_ERROR"
-              j.field "retryable", true
+              # structuredContent) so a caller can apply policy without string-matching the
+              # message — including "do not retry this, report it" (see emit_send_error_code).
+              emit_send_error_code(j, kind)
             end
             if response = result.response
               j.field "status", response.status
@@ -361,7 +386,15 @@ module Gori
                     redacted ||= sensitive
                     j.object do
                       j.field "name", Serialize.text(header.name)
-                      j.field "value", sensitive ? "[REDACTED]" : Serialize.text(header.value)
+                      if sensitive
+                        j.field "value", "[REDACTED]"
+                      else
+                        # The BODY already had a base64 fallback for bytes JSON cannot carry;
+                        # a header value did not, so an 8-bit byte here came back as `�` and
+                        # was unrecoverable through MCP entirely — two different invalid bytes
+                        # rendered identically. Header values are remote bytes too.
+                        Serialize.emit_lossy_text(j, "value", header.value)
+                      end
                     end
                   end
                 end
@@ -473,10 +506,10 @@ module Gori
             j.field "close_code", result.close_code if result.close_code
             j.field "note", Env.mask_secrets(result.note.not_nil!) if result.note
             if err = result.error
+              kind = network_error_kind(err)
               j.field "error", Env.mask_secrets(err)
-              j.field "error_kind", network_error_kind(err)
-              j.field "error_code", "NETWORK_ERROR"
-              j.field "retryable", true
+              j.field "error_kind", kind
+              emit_send_error_code(j, kind)
             end
             unless result.handshake_head.empty?
               response = begin
@@ -672,17 +705,22 @@ module Gori
           # pre-resolved and the bytes are taken verbatim (a second `Env.expand_wire` would
           # double-expand a `$KEY` whose value itself looks like a token).
           built = RequestBuilder.build(h)
+          # ONE reading of "these bytes are literal", `RequestBuilder`'s — which also treats
+          # `raw_base64` as verbatim, since encoding octets IS saying they are the message.
+          # Reading `verbatim` again through `bool_arg` here let the builder and this gate
+          # disagree about the same call.
+          verbatim = RequestBuilder.verbatim?(h)
           Repeater::PlanOptions.new([built.bytes], expand_request: false,
             auto_content_length: false,
             # `verbatim:true` means the operator's bytes ARE the message (RequestBuilder
             # already skipped expansion for it), so a leftover `$user.name` / `$IFS` is the
             # SSTI/shell payload and must not be refused here. Non-verbatim callers keep the
             # refusal: RequestBuilder expanded, so a surviving `$KEY` really is unresolved.
-            refuse_unresolved_env: !bool_arg(h, "verbatim", false),
+            refuse_unresolved_env: !verbatim,
             # The h2 half of the same promise: `verbatim` means the bytes ARE the message, so
             # an uppercase field name is the RFC 9113 §8.2.1 conformance probe and not a
             # copy-paste artifact to repair. See `PlanOptions#preserve_field_case?`.
-            preserve_field_case: bool_arg(h, "verbatim", false),
+            preserve_field_case: verbatim,
             origin: Repeater::Origin.new(built.scheme, built.host, built.port),
             http2: bool_arg(h, "http2", false), verify: verify,
             timeout: timeout, overrides: overrides)

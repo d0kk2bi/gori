@@ -12,7 +12,11 @@ module Gori
         return Result.new(id_error(h, "flow_id"), is_error: true) if flow_id.nil? && present?(h, "flow_id")
 
         target = str(h, "target")
-        request = str(h, "request")
+        # `request_base64` wins over `request`: it is the byte-exact form, the only way to
+        # seed a repeater whose stored bytes carry a latin-1 header value, an invalid-UTF-8
+        # traversal payload, or a binary body. A JSON string reaches the store as its UTF-8
+        # encoding, so those bytes could previously only arrive via a Burp XML file on disk.
+        request = base64_str(h, "request_base64") || str(h, "request")
 
         if issue_id
           issue = store.get_issue(issue_id)
@@ -134,6 +138,10 @@ module Gori
             j.field "position", position
           end
         })
+      rescue ex : Gori::Error
+        # A bad `request_base64` is caller input, not a server fault — return the message
+        # instead of letting call()'s generic "tool error:" wrapper swallow it.
+        Result.new(ex.message || "invalid repeater arguments", is_error: true)
       end
 
       # The `ws_out_messages` argument, in any of the three forms the schema advertises: an
@@ -172,7 +180,7 @@ module Gori
         return not_found("no repeater with id #{id}") unless existing
 
         target = str(h, "target") || existing.target
-        request = str(h, "request") || String.new(existing.request)
+        request = base64_str(h, "request_base64") || str(h, "request") || String.new(existing.request)
         # An explicitly-passed empty string is truthy in Crystal, so guard it here to
         # mirror create_repeater's invariant — a blank target/request can't be sent.
         return Result.new("target must not be empty", is_error: true) if target.empty?
@@ -239,6 +247,8 @@ module Gori
             j.field "position", existing.position
           end
         })
+      rescue ex : Gori::Error
+        Result.new(ex.message || "invalid repeater arguments", is_error: true)
       end
 
       private def delete_repeater(h) : Result

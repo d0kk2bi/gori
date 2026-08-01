@@ -1,3 +1,4 @@
+require "../ascii_bytes"
 require "../token_extract"
 
 module Gori
@@ -102,9 +103,20 @@ module Gori
       # (RFC 3986 §3.1: URI schemes are case-insensitive), so `HTTP://host/x` is caught too —
       # a naive case-sensitive check would let it double into `http://hostHTTP://host/x`.
       # Shared by #url below and Scope.request_url (scope.cr) so this check only lives once.
+      #
+      # Byte-level, NOT a Regex: `target` is the request line an operator or a peer put on
+      # the wire, so it is not guaranteed to be valid UTF-8 — and PCRE2 RAISES
+      # (`ArgumentError: UTF-8 error`) rather than simply not matching. On the fuzz path that
+      # raise reached `Outbound.scope_url` inside a worker fiber and killed the whole sweep,
+      # unhandled, the first time a payload carried a high byte. A URI scheme is ASCII by
+      # definition, so nothing about the check needed a Regex.
       def self.absolute_form?(target : String) : Bool
-        target.starts_with?(/https?:\/\//i)
+        b = target.to_slice
+        AsciiBytes.starts_with_ci?(b, HTTP_PREFIX) || AsciiBytes.starts_with_ci?(b, HTTPS_PREFIX)
       end
+
+      HTTP_PREFIX  = "http://".to_slice
+      HTTPS_PREFIX = "https://".to_slice
 
       # The full absolute URL of the request. Plaintext forward-proxy requests are captured
       # ABSOLUTE-form (`http://host:port/path` — the wire truth, P7), so `target` already
