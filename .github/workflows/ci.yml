@@ -82,7 +82,7 @@ jobs:
       - name: Install dependencies
         run: shards install
       - name: Run tests
-        run: crystal spec
+        run: stdbuf -oL -eL crystal spec --verbose
 # No `build-docker` job here. It used to build docker/Dockerfile for amd64 and
 # arm64 on every PR, and those two builds — each compiling a static Crystal
 # binary from source, the arm64 one on a native runner because QEMU is far too
