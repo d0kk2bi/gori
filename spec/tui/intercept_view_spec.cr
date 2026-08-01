@@ -174,10 +174,57 @@ describe Gori::Tui::InterceptView do
       # bare LF (the TextArea round-trip would otherwise rewrite it to CRLF).
       String.new(view.forward_bytes(it)).should eq(raw)
 
-      # An actual edit DOES send the edited bytes (line-ending normalization there is
-      # an accepted text-editor limitation).
+      # An actual edit DOES send the edited bytes — and only those: the bare LF in the body
+      # is still a bare LF (see the head-edit spec below).
       view.edit_insert('X')
       String.new(view.forward_bytes(it)).should_not eq(raw)
+      String.new(view.forward_bytes(it)).should end_with("\r\n\r\nline1\nline2")
+    end
+  end
+
+  # F3: editing a HEADER of a held message rewrote its BODY — every CR deleted, Content-Length
+  # silently resynced down to the shortened body — because the editor could only hold LF. That
+  # is the "I only changed one header" case, the most common intercept edit there is, and it
+  # shipped different bytes to a live target in BOTH directions while the operator believed
+  # nothing but the header had moved.
+  it "leaves the body byte-identical when only a header is edited (request direction)" do
+    tmp_interceptor do |ic|
+      body = "line1\r\nline2\r\n\r\ntail-after-blank\r\n" # 34 bytes, CR-carrying
+      raw = "POST /icept HTTP/1.1\r\nHost: h\r\nAccept: */*\r\nContent-Length: 34\r\n\r\n#{body}"
+      hold_req(ic, "h", "/icept", raw)
+      view = InterceptView.new
+      view.reload(ic)
+      it = view.selected_item.not_nil!
+      view.toggle_edit
+      view.edit_move(2, 0)  # to the Accept: line
+      view.edit_end         # end of it
+      view.edit_insert('X') # one character, in the HEAD
+
+      out = String.new(view.forward_bytes(it))
+      out.should eq("POST /icept HTTP/1.1\r\nHost: h\r\nAccept: */*X\r\nContent-Length: 34\r\n\r\n#{body}")
+    end
+  end
+
+  it "leaves the body byte-identical when only a header is edited (response direction)" do
+    tmp_interceptor do |ic|
+      body = "R1\r\nR2\r\nEND" # 11 bytes, CR-carrying
+      raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\n#{body}"
+      spawn do
+        ic.hold_response(raw.to_slice, flow_id: nil, method: "GET", target: "200 OK",
+          host: "h", port: 80, scheme: "http")
+      end
+      Fiber.yield
+      view = InterceptView.new
+      view.reload(ic)
+      it = view.selected_item.not_nil!
+      view.toggle_edit
+      view.edit_move(1, 0) # to the Content-Type line
+      view.edit_end
+      "; charset=utf-8".each_char { |c| view.edit_insert(c) }
+
+      out = String.new(view.forward_bytes(it))
+      out.should eq("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n" \
+                    "Content-Length: 11\r\n\r\n#{body}")
     end
   end
 

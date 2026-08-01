@@ -1453,9 +1453,9 @@ module Gori::Tui
       return unless (id = tab.db_id) && tab.view.dirty?
       v = tab.view
       if v.ws_mode?
-        # Persist the RAW handshake text (request_text = the editor's `$KEY` tokens, LF),
-        # NOT ws_upgrade_bytes (env-expanded + CRLF): baking the expanded form in would
-        # write secrets to the DB and defeat the reconcile guard (which compares LF text).
+        # Persist the RAW handshake text (request_text = the editor's `$KEY` tokens, in the
+        # line endings the editor holds), NOT ws_upgrade_bytes (env-expanded): baking the
+        # expanded form in would write secrets to the DB and defeat the reconcile guard.
         @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
           v.sni_override)
         # Raw message lines too — the store masks secrets; env tokens re-expand on send.

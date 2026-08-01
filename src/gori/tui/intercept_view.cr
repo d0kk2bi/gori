@@ -382,8 +382,10 @@ module Gori::Tui
     # Content-Length recomputed to match the edited body (Burp's "update
     # Content-Length", default on; add_when_missing: true so adding a body to a GET
     # that had none still gets framed). The proxy itself stays byte-exact — the
-    # update-CL decision lives here, in the human's editor, not the wire path. (An edit
-    # still normalizes line endings — a text-editor limitation shared with Repeater.)
+    # update-CL decision lives here, in the human's editor, not the wire path. An edit now
+    # keeps every line's ORIGINAL terminator (TextArea#wire_text), so editing the head leaves
+    # the body byte-identical; only the head is normalized to CRLF, which is where CRLF is
+    # required. The one thing an edit still changes on its own is Content-Length, deliberately.
     def forward_bytes(it : Interceptor::Item) : Bytes
       edit = pending_edit
       (edit && edit[0] == it.id) ? edit[1] : it.raw
@@ -410,12 +412,17 @@ module Gori::Tui
     def pending_edit : {Int64, Bytes}?
       id = @loaded_id
       return nil unless id && @editor_dirty
-      # `text` (LF-joined), NOT `to_bytes` — that one joins with CRLF because it exists for
-      # WIRE text, and a WS payload is not wire text.
-      return {id, @editor.text.to_slice} if @loaded_ws
+      # `wire_text`, NOT `text` — a WS payload is opaque bytes with no line structure at all,
+      # so it has to come back exactly as it was loaded. (`to_bytes` would be worse still: it
+      # joins with CRLF because it exists for wire HEADS.)
+      return {id, @editor.wire_bytes} if @loaded_ws
+      # `wire_text` again, for the same reason the Repeater's send path reads it: `text` is the
+      # LF projection, so an edit to a HEADER used to rewrite the BODY — every CR deleted and
+      # Content-Length silently resynced down to match. That is the "I only changed one header"
+      # case, which is most intercept edits, and it shipped different bytes to a live target.
       # `Env.expand_wire` (gsub `/\r?\n/`) not `split('\n').join("\r\n")`: a `$KEY` value
       # carrying a CRLF would otherwise double into `\r\r\n` and corrupt the forwarded bytes.
-      raw = Env.expand_wire(@editor.text)
+      raw = Env.expand_wire(@editor.wire_text)
       {id, Fuzz::ContentLength.sync(raw, add_when_missing: true)}
     end
 

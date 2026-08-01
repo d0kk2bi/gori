@@ -206,7 +206,16 @@ module Gori::Tui
       # In gRPC mode the hex buffer edits the deframed message PAYLOAD (the head stays in
       # @editor, sent as text); grpc_request_bytes re-length-prefixes it on send. Otherwise
       # it snapshots the whole wire request.
-      @req_hex_edit = HexEdit.new(@grpc_mode ? @grpc_payload : @editor.to_bytes)
+      #
+      # `wire_bytes`, NOT `to_bytes`. `to_bytes` re-joins the LF projection with CRLF, so the
+      # "raw bytes" pane was a FABRICATION: it invented an 0x0D in front of every bare LF in
+      # the body and showed the operator bytes that had never existed anywhere. Worse, hex
+      # mode deliberately disables auto-Content-Length, so those invented bytes shipped under
+      # the head's older, shorter CL and the remainder was left on the socket for the origin
+      # to read as the front of the next request — gori desyncing its own connection while
+      # reporting `✓ sent`. Hex mode is the documented byte-exact escape hatch; it has to
+      # start from the bytes.
+      @req_hex_edit = HexEdit.new(@grpc_mode ? @grpc_payload : @editor.wire_bytes)
       @scroll_req = 0 # entering the same bytes isn't an edit — no @dirty
     end
 
@@ -215,7 +224,10 @@ module Gori::Tui
         if @grpc_mode
           @grpc_payload = h.to_bytes # keep the edited payload byte-exact (reframed on send)
         else
-          @editor.set_text(String.new(h.to_bytes)) # LOSSY: U+FFFD for non-UTF8 + \r rstrip (accepted)
+          # Round-trips byte-exactly now: set_text keeps each line's terminator in @eols, and
+          # `String.new(Bytes)` does not scrub, so the hex buffer's bytes come back out of
+          # `wire_bytes` unchanged — hex ⇄ text is no longer a one-way door.
+          @editor.set_text(String.new(h.to_bytes))
         end
         @dirty = true # the edit is a content change
       end
@@ -334,8 +346,11 @@ module Gori::Tui
     end
 
     # --- persistence accessors (the Runner saves these + reconciles by them) ---
+    # What gets PERSISTED (and what reconcile compares against). Wire form, so a saved tab
+    # restores to the bytes it was sending: persisting the LF projection would have re-lost
+    # every body CR on the next restore, undoing the fix one session later.
     def request_text : String
-      (h = @req_hex_edit) ? String.new(h.to_bytes) : @editor.text # lossy snapshot in hex mode
+      (h = @req_hex_edit) ? String.new(h.to_bytes) : @editor.wire_text
     end
 
     # The buffer the external editor (^E) round-trips: the ACTIVE request sub-pane — the
@@ -520,7 +535,7 @@ module Gori::Tui
     end
 
     def ws_upgrade_bytes : Bytes
-      @ws_mode ? expanded_text_to_bytes(@editor.text) : (@ws_upgrade || Bytes.empty)
+      @ws_mode ? expanded_editor_bytes : (@ws_upgrade || Bytes.empty)
     end
 
     # Cross-process snapshot for `gori mcp get_repeater_context` (written into ui_state
@@ -858,7 +873,7 @@ module Gori::Tui
     # the envelope, then send the envelope (the authoritative request) with CL synced.
     private def decoded_request_bytes : Bytes
       commit_decoded
-      finalize_wire(expanded_text_to_bytes(@editor.text))
+      finalize_wire(expanded_editor_bytes)
     end
 
     # The request HEAD as origin-form text (request line rewritten, headers), WITHOUT
@@ -883,7 +898,7 @@ module Gori::Tui
     # matches the payload the origin receives; otherwise the pristine @grpc_body is resent
     # verbatim. Auto-Content-Length never applies (h2 frames by DATA/END_STREAM).
     private def grpc_request_bytes : Bytes
-      raw = expanded_text_to_bytes(@editor.text)
+      raw = expanded_editor_bytes
       n = raw.size
       while n > 0 && (raw[n - 1] == 0x0A_u8 || raw[n - 1] == 0x0D_u8) # trim trailing CR/LF
         n -= 1
@@ -929,25 +944,35 @@ module Gori::Tui
     # response transcript. A head-only (bodyless) chunk gets its CRLFCRLF terminator
     # appended — the blank line the user typed before `%%%` is consumed by the split, so we
     # must NOT rely on it surviving (the timeout-hunting bug the group-send E2E caught).
+    # Carries each line's own terminator through the split, so a chunk's BODY keeps the CRs it
+    # was captured with — the same reason `expanded_editor_bytes` reads `wire_text`. The last
+    # surviving line's terminator is dropped: that newline is the one before the `%%%` (or the
+    # end of the buffer), which belongs to the separator, not to the body.
     def pipeline_requests : Array({String, Bytes})
       reqs = [] of {String, Bytes}
-      chunk = [] of String
+      chunk = [] of {String, String}
       flush = -> do
         lines = chunk.dup
-        while !lines.empty? && lines.first.strip.empty? # drop blank lines around the separator
+        while !lines.empty? && lines.first[0].strip.empty? # drop blank lines around the separator
           lines.shift
         end
-        while !lines.empty? && lines.last.strip.empty?
+        while !lines.empty? && lines.last[0].strip.empty?
           lines.pop
         end
         unless lines.empty?
-          label = lines.first.strip
-          reqs << {label, finalize_wire(expanded_text_to_bytes(lines.join('\n')))}
+          label = lines.first[0].strip
+          text = String.build do |io|
+            lines.each_with_index do |(l, eol), i|
+              io << l
+              io << eol unless i == lines.size - 1
+            end
+          end
+          reqs << {label, finalize_wire(expanded_text_to_bytes(text))}
         end
         chunk.clear
       end
-      @editor.text.split('\n').each do |line|
-        line.strip == PIPELINE_SEP ? flush.call : chunk << line
+      @editor.wire_lines.each do |pair|
+        pair[0].strip == PIPELINE_SEP ? flush.call : chunk << pair
       end
       flush.call
       reqs
@@ -1051,15 +1076,17 @@ module Gori::Tui
     # True when the live view's request-side fields match a store row (reconcile skip).
     # Normalizes empty SNI: view.sni_override is nil when blank, but older/peer rows
     # may store "" — those must compare equal or every poll re-applies needlessly.
-    # Normalizes CRLF→LF on the request: the TextArea holds LF (set_text strips \r) but
-    # the store may hold wire CRLF (MCP create_repeater / import / a peer). Without this
-    # the compare is LF-vs-CRLF false EVERY poll, so reconcile re-applies apply_peer_request
-    # → set_text on every capture tick — which slams the request caret back to the top of
-    # the pane in READ mode (INS locks the tab out of reconcile, so it looked NOR-only).
-    # Mirrors FuzzerView#session_side_matches?.
+    # The request compare is now EXACT (`request_text` is wire form, `set_text`'s exact
+    # inverse), so a store row holding wire CRLF — MCP create_repeater / import / a peer —
+    # matches without normalizing anything away. That normalization existed because the
+    # TextArea could only hold LF, which made the compare LF-vs-CRLF false on EVERY poll and
+    # slammed the request caret back to the top of the pane on every capture tick. It also
+    # made the compare blind to a pure line-ending difference, which is a real edit now.
+    # (FuzzerView#session_side_matches? still normalizes — its template is a document, not
+    # a captured message, and it is persisted from `#text`.)
     def request_side_matches?(target : String, request : String, http2 : Bool, auto_cl : Bool,
                               sni : String?) : Bool
-      @target == target && request_text == TextArea.normalize_lf(request) &&
+      @target == target && request_text == request &&
         @http2 == http2 && @auto_content_length == auto_cl &&
         (sni_override || "") == (sni || "")
     end
@@ -1081,16 +1108,18 @@ module Gori::Tui
         @ws_upgrade = request.to_slice
         # Only rewrite the editor when the text ACTUALLY changed: set_text resets the caret
         # + scroll and clears the undo stack, so a soft reconcile poll (apply_peer_request)
-        # that only touched a non-text field must not disturb the pane. Compare on a
-        # CRLF-normalized basis (the editor is LF; the store may be CRLF). Mirrors
-        # FuzzerView#apply_peer_session / NotesView#soft_merge_from.
-        @editor.set_text(request) if @editor.text != TextArea.normalize_lf(request)
+        # that only touched a non-text field must not disturb the pane. `wire_text` is
+        # set_text's exact inverse, so this is the precise "would set_text be a no-op?" test —
+        # no normalization, and a line-ending-only difference is honoured as the edit it is.
+        @editor.set_text(request) if @editor.wire_text != request
+        # The outbound-message pane stays a DOCUMENT compare: it is persisted as LF-split
+        # lines (ws_out_texts_raw), so there is no wire form to be exact about.
         joined = (ws_messages || [] of String).join('\n')
         @decoded.set_text(joined) if @decoded.text != TextArea.normalize_lf(joined)
         @req_pane = :decoded
       else
         @ws_mode = false
-        @editor.set_text(request) if @editor.text != TextArea.normalize_lf(request)
+        @editor.set_text(request) if @editor.wire_text != request
       end
 
       @auto_content_length = auto_cl
@@ -1236,8 +1265,12 @@ module Gori::Tui
       finalize_wire(expanded_editor_bytes)
     end
 
+    # `wire_text`, NOT `text`: `text` is the LF projection, and joining the buffer with LF
+    # throws away every CR the capture carried in its BODY — where 0x0D is data, not a line
+    # ending. expand_wire below normalizes the HEAD to CRLF either way, so the only thing this
+    # changes is that body bytes now survive the round trip through the editor.
     private def expanded_editor_bytes : Bytes
-      expanded_text_to_bytes(@editor.text)
+      expanded_text_to_bytes(@editor.wire_text)
     end
 
     # Head terminator + auto-Content-Length: the last two steps every plain-text send
@@ -3237,14 +3270,24 @@ module Gori::Tui
 
     # Rewrites an absolute-form request-line ("GET http://h/p ...") to origin-form
     # ("GET /p ..."); origin-form requests are left unchanged.
+    # The captured request as editor text, with ONLY the request line rewritten (absolute-form
+    # → origin-form). Everything after the first line is passed through byte for byte.
+    #
+    # It used to split/rstrip/re-join the whole message, which flattened every terminator in
+    # the request — head AND body — before `set_text` ever saw it. That happened at LOAD, so
+    # no amount of care in the send path could have recovered the bytes.
     private def origin_form_text(detail : Store::FlowDetail) : String
-      lines = String.new(combine(detail.request_head, detail.request_body)).split('\n').map(&.rstrip('\r'))
-      return "" if lines.empty?
-      parts = lines[0].split(' ')
+      raw = String.new(combine(detail.request_head, detail.request_body))
+      nl = raw.index('\n')
+      first = nl ? raw[0, nl] : raw
+      rest = nl ? raw[nl..] : ""
+      line = first.rstrip('\r')
+      eol = first[line.size..] # the CRs the request line carried — put back verbatim
+      parts = line.split(' ')
       if parts.size == 3 && (parts[1].starts_with?("http://") || parts[1].starts_with?("https://"))
-        lines[0] = "#{parts[0]} #{to_origin(parts[1])} #{parts[2]}"
+        line = "#{parts[0]} #{to_origin(parts[1])} #{parts[2]}"
       end
-      lines.join('\n')
+      "#{line}#{eol}#{rest}"
     end
 
     private def to_origin(url : String) : String
