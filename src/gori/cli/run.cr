@@ -371,6 +371,93 @@ module Gori
         abort "#{cmd}: #{host} is out of the project scope — #{Gori::Outbound.remedy(verdict, "--allow-unscoped")}"
       end
 
+      # ── session bindings, headless ───────────────────────────────────────────────────
+      #
+      # A session binding lives in the MEMORY of the gori that observed it and is never
+      # persisted (`Bindings`: a restored token is stale by construction, and re-extracting
+      # costs one request). Only `Repeater::Sender` and the proxy write the table — a sweep
+      # deliberately does not, because a response echoing an attack payload back could
+      # otherwise rebind the operator's session to it.
+      #
+      # In the TUI and over MCP that is fine: one process holds a send and the sweep that
+      # follows. `gori run` is ONE-SHOT per process and had no command that sends first, so a
+      # `$SESSION` in a headless fuzz/mine/sequence template could never acquire a value and
+      # every request was refused — 100% of them, against every authenticated target. The
+      # refusal said "nothing has extracted it yet", which reads as "wait, or retry".
+      #
+      # `--bind-from FLOW-ID` is the missing step, and it is deliberately a REPLAY rather than
+      # persistence: it puts the deliberate send and the sweep inside one process, which is
+      # exactly the shape that already works everywhere else. Persisting the value instead
+      # would ship a token minutes-to-days stale into the run and produce the page of 401s the
+      # feature exists to remove.
+
+      # Replay flow `flow_id` through `Repeater::Sender` — the one extraction source — so its
+      # response can fill the binding table before the sweep starts. Aborts on anything that
+      # leaves the table unfilled: a seed that silently did nothing would hand the operator
+      # back the same 100%-refused run, one flag later.
+      private def self.seed_bindings(flow_id : Int64, project_name : String?, db_path : String?,
+                                     outbound : Gori::Outbound, insecure : Bool, cmd : String) : Nil
+        # open_store also installs the project's extract rules as `Env.layer` (see its
+        # comment) — the seed depends on that having happened, which is why it reads the flow
+        # through the same helper rather than opening the DB by hand.
+        store = open_store(resolve_read_project(project_name, db_path))
+        detail, overrides = begin
+          {store.get_flow(flow_id), Gori::HostOverrides.load(store)}
+        ensure
+          store.close
+        end
+        abort "#{cmd}: --bind-from: no flow ##{flow_id}" unless detail
+        built = Repeater::FlowRequest.build(detail)
+        scheme, host, port = Repeater::FlowRequest.parse_target(built.target)
+        bindings = Env.layer.as?(Gori::Bindings)
+        if bindings.nil? || bindings.declared.empty?
+          abort "#{cmd}: --bind-from: this project declares no extract rules, so a replay has " \
+                "nothing to bind — add one with `gori run rewriter extract add`"
+        end
+        sender = Repeater::Sender.new(outbound, scheme: scheme, host: host, port: port,
+          verify: !insecure, http2: built.http2, sni: built.sni, overrides: overrides)
+        result = sender.send(built.bytes)
+        if err = result.error
+          abort "#{cmd}: --bind-from: replaying flow ##{flow_id} failed: #{err}"
+        end
+        bound = bindings.values.keys
+        if bound.empty?
+          abort "#{cmd}: --bind-from: flow ##{flow_id} replayed (HTTP #{result.response.try(&.status) || "?"}) " \
+                "but no extract rule matched its response, so nothing was bound — check the rule's " \
+                "host glob, condition and selector with `gori run rewriter extract`"
+        end
+        STDERR.puts "bind-from: flow ##{flow_id} replayed → bound #{Env.token_list(bound)}"
+      end
+
+      # What a headless operator has to know when a send is refused for an unbound binding:
+      # that no amount of retrying will help, and which flag does. `Env.unbound_error` is the
+      # shared FACT ("unbound session binding $SESS"); this is `gori run`'s own prescription,
+      # the #525 shape.
+      private def self.bindings_headless_hint(cmd : String) : String
+        "#{cmd} runs as ONE process and holds no bindings from a previous invocation — " \
+        "a binding is never persisted. Replay the flow that mints the token first with " \
+        "--bind-from FLOW-ID, or drive the two steps over one `gori mcp` session."
+      end
+
+      # An engine's `blocked_reason` with `gori run`'s own prescription attached when — and
+      # only when — the refusal is the unbound-binding one. A binding can also come UNSTUCK
+      # mid-run (a token rotated, an operator cleared it), which the pre-flight cannot see, so
+      # the hint has to exist on this end of the run too.
+      private def self.blocked_reason_line(reason : String?, cmd : String) : String?
+        return nil unless reason
+        reason.starts_with?(Env::UNBOUND_PREFIX) ? "#{reason}. #{bindings_headless_hint(cmd)}" : reason
+      end
+
+      # Refuse BEFORE the sweep when the template names a declared-but-unbound binding and no
+      # --bind-from was given. Without this the run still starts and every single row comes
+      # back refused, which reads like a target problem rather than a missing step.
+      private def self.preflight_bindings(text : String, bind_from : Int64?, cmd : String) : Nil
+        return if bind_from
+        unbound = Env.unbound(text)
+        return if unbound.empty?
+        abort "#{cmd}: #{Env.unbound_error(unbound)}. #{bindings_headless_hint(cmd)}"
+      end
+
       # One sentence for every `gori run` tool whose builder refused an env token that
       # resolves to nothing (#519). Shared rather than written per command because, unlike
       # the other plan reasons, this one names no flag of the command's own — the token is

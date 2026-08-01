@@ -463,7 +463,7 @@ describe "gori run fuzz/mine/sequence — project host overrides (R2-1)" do
       store.close; closed = true # Store#close is NOT idempotent (a 2nd @done.receive blocks forever)
       ov = Gori::CLI::Run.cli_host_overrides_for_spec(nil, path, nil)
       ov.should_not be_nil
-      ov.not_nil!.connect_ip("api.invalid").should eq("127.0.0.1")
+      ov.not_nil!.connect_address("api.invalid").should eq("127.0.0.1")
       # --request/stdin with no project in play → nil (global Settings overrides still apply)
       Gori::CLI::Run.cli_host_overrides_for_spec(nil, nil, nil).should be_nil
     ensure
@@ -662,5 +662,51 @@ describe "Gori::CLI::Run.open_store per-project network overrides" do
       File.delete?("#{path}-wal")
       File.delete?("#{path}-shm")
     end
+  end
+end
+
+# ── headless session bindings (F5) ────────────────────────────────────────────────────
+#
+# A binding lives in the memory of the gori that observed it and is never persisted, and only
+# `Repeater::Sender` / the proxy write the table. `gori run` is one-shot per process, so a
+# `$SESSION` in a headless template could never acquire a value: every request was refused,
+# 100% of them, and the refusal ("nothing has extracted it yet") read as "wait and retry".
+# These pin the two halves of the answer — the pre-flight abort, and the prescription that
+# names the way out.
+module Gori::CLI::Run
+  def self.bindings_hint_for_spec(cmd : String) : String
+    bindings_headless_hint(cmd)
+  end
+
+  def self.blocked_reason_for_spec(reason : String?, cmd : String) : String?
+    blocked_reason_line(reason, cmd)
+  end
+end
+
+describe "Gori::CLI::Run — the headless binding refusal" do
+  it "names the one-process limitation and the flag that resolves it" do
+    hint = Gori::CLI::Run.bindings_hint_for_spec("gori run fuzz")
+    hint.should contain("ONE process")
+    hint.should contain("--bind-from")
+    hint.should contain("gori mcp") # the other way out, which already worked
+  end
+
+  # Only the unbound-binding refusal gets the prescription. A Sandbox / exclude block has its
+  # own remedy (Outbound.remedy) and must not collect a second, wrong one.
+  it "attaches the prescription to an unbound-binding reason and nothing else" do
+    unbound = Gori::Env.unbound_error(["SESS"])
+    line = Gori::CLI::Run.blocked_reason_for_spec(unbound, "gori run mine").to_s
+    line.should contain("$SESS")
+    line.should contain("--bind-from")
+
+    sandbox = "blocked by sandbox mode"
+    Gori::CLI::Run.blocked_reason_for_spec(sandbox, "gori run mine").should eq(sandbox)
+    Gori::CLI::Run.blocked_reason_for_spec(nil, "gori run mine").should be_nil
+  end
+
+  # The recogniser is a shared constant, not a substring literal repeated at the far end —
+  # the two spellings must not be able to drift apart.
+  it "recognises its own sentence through Env::UNBOUND_PREFIX" do
+    Gori::Env.unbound_error(["A"]).starts_with?(Gori::Env::UNBOUND_PREFIX).should be_true
   end
 end

@@ -754,7 +754,7 @@ module Gori
         # cheaply probe whether a repeater SESSION shares this id (get_repeater reads
         # no response BLOBs) — only when the flow exists — to warn about the ambiguity.
         store = open_store(resolve_read_project(project_name, db_path))
-        # HostOverrides.load snapshots rows into memory (connect_ip never re-touches the
+        # HostOverrides.load snapshots rows into memory (connect_address never re-touches the
         # store), so it's safe to load here and use after the store closes.
         detail, session_collision, host_overrides = begin
           d = store.get_flow(id)

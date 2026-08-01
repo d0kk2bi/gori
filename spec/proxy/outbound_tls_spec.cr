@@ -10,9 +10,10 @@ private def reset_outbound_tls : Nil
 end
 
 private def tls_rule(host : String, cert : String = "", key : String = "",
-                     min_version : String = "", ciphers : String = "",
+                     min_version : String = "", max_version : String = "",
+                     ciphers : String = "",
                      permissive : Bool = false) : Gori::Settings::OutboundTlsRule
-  Gori::Settings::OutboundTlsRule.new(host, cert, key, min_version, ciphers, permissive)
+  Gori::Settings::OutboundTlsRule.new(host, cert, key, min_version, max_version, ciphers, permissive)
 end
 
 # Write a self-signed cert + key pair to disk and yield their paths — what a client certificate
@@ -64,6 +65,34 @@ private def start_mtls_origin(seen : Channel(String), client_ca : String? = nil)
   port
 end
 
+# A server that will speak ANY version from TLS 1.0 to 1.3 and reports what was actually
+# negotiated. That range is the whole point: a ceiling is only observable against an origin
+# that would otherwise have gone higher. `cipher: true` reports the negotiated cipher suite
+# instead of the version — the second half of the same claim.
+private def start_version_origin(seen : Channel(String), cipher : Bool = false) : Int32
+  cert, key = CertBuilder.build_root("origin.test")
+  ctx = ContextFactory.server_context(cert, key, advertise_h2: false)
+  ctx.security_level = 0
+  ctx.ciphers = "ALL:@SECLEVEL=0"
+  ctx.remove_options(OpenSSL::SSL::Options.flags(NO_TLS_V1, NO_TLS_V1_1, NO_TLS_V1_2, NO_TLS_V1_3))
+  server = TCPServer.new("127.0.0.1", 0)
+  port = server.local_address.port
+  spawn do
+    while raw = server.accept?
+      begin
+        ssl = OpenSSL::SSL::Socket::Server.new(raw, ctx, sync_close: true)
+        seen.send(cipher ? ssl.cipher : ssl.tls_version)
+        ssl << "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi"
+        ssl.flush
+        ssl.close
+      rescue
+        seen.send("(handshake failed)") rescue nil
+      end
+    end
+  end
+  port
+end
+
 describe "outbound TLS policy" do
   describe ".outbound_tls_for" do
     it "returns the first matching rule, else the all-defaults policy" do
@@ -100,6 +129,7 @@ describe "outbound TLS policy" do
         tls_rule("a", cert: "/other.pem", key: "/k.pem"),
         tls_rule("a", min_version: "tls1.0"),
         tls_rule("a", min_version: "tls1.3"),
+        tls_rule("a", max_version: "tls1.2"),
         tls_rule("a", ciphers: "DEFAULT@SECLEVEL=0"),
         tls_rule("a", permissive: true),
       ].map(&.cache_key)
@@ -216,6 +246,53 @@ describe "outbound TLS policy" do
     end
   end
 
+  # A floor alone cannot CHOOSE a version: against an origin that also speaks 1.3 the
+  # handshake always landed on 1.3, which is what made `ciphers` dead too (OpenSSL's cipher
+  # list governs TLS 1.2 and below only). These assert the version the ORIGIN negotiated, not
+  # the option flags, because the flags were never the claim in doubt.
+  describe "protocol ceiling" do
+    it "pins the negotiated version below an origin's best offer" do
+      seen = Channel(String).new(4)
+      port = start_version_origin(seen)
+      begin
+        # Control: no ceiling → the origin's best, TLS 1.3.
+        reset_outbound_tls
+        a = Gori::Proxy::Upstream.dial_tls("localhost", port, verify: false)
+        a.should_not be_nil
+        seen.receive.should eq("TLSv1.3")
+        a.try(&.close) rescue nil
+
+        # Ceiling at 1.2 against the SAME origin.
+        Gori::Settings.outbound_tls = [tls_rule("localhost", max_version: "tls1.2", permissive: true)]
+        b = Gori::Proxy::Upstream.dial_tls("localhost", port, verify: false)
+        b.should_not be_nil
+        seen.receive.should eq("TLSv1.2")
+        b.try(&.close) rescue nil
+      ensure
+        reset_outbound_tls
+      end
+    end
+
+    # The consequence the ceiling exists for: with the negotiation held at 1.2, the cipher
+    # list finally applies. Without a ceiling this rule is silently ignored.
+    it "makes the cipher list reachable once the negotiation is held at 1.2" do
+      seen = Channel(String).new(4)
+      port = start_version_origin(seen, cipher: true)
+      begin
+        Gori::Settings.outbound_tls = [
+          tls_rule("localhost", min_version: "tls1.2", max_version: "tls1.2",
+            ciphers: "ECDHE-ECDSA-AES128-SHA", permissive: true),
+        ]
+        sock = Gori::Proxy::Upstream.dial_tls("localhost", port, verify: false)
+        sock.should_not be_nil
+        seen.receive.should eq("ECDHE-ECDSA-AES128-SHA")
+        sock.try(&.close) rescue nil
+      ensure
+        reset_outbound_tls
+      end
+    end
+  end
+
   describe ".outbound_tls_error" do
     it "accepts a rule with neither half of a certificate pair" do
       Gori::Settings.outbound_tls_error(tls_rule("a.test", min_version: "tls1.2")).should be_nil
@@ -243,6 +320,17 @@ describe "outbound TLS policy" do
       Gori::Settings.outbound_tls_error(tls_rule(" ")).to_s.should contain("host pattern")
       Gori::Settings.outbound_tls_error(tls_rule("a.test", min_version: "ssl3")).to_s
         .should contain("min_version must be one of")
+      Gori::Settings.outbound_tls_error(tls_rule("a.test", max_version: "ssl3")).to_s
+        .should contain("max_version must be one of")
+    end
+
+    # An inverted pair offers no protocol version at all; OpenSSL's error would name the
+    # ORIGIN, so the disagreement has to be caught where the two fields are visible.
+    it "rejects a floor above the ceiling, and accepts a pin where they are equal" do
+      Gori::Settings.outbound_tls_error(tls_rule("a.test", min_version: "tls1.3", max_version: "tls1.2")).to_s
+        .should contain("is above max_version")
+      Gori::Settings.outbound_tls_error(tls_rule("a.test", min_version: "tls1.2", max_version: "tls1.2"))
+        .should be_nil
     end
 
     # An encrypted key makes OpenSSL prompt for a passphrase on the terminal the TUI owns —

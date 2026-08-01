@@ -32,6 +32,41 @@ describe Gori::ExternalEditor do
     r.text.should eq("edited") # not "edited\n" (which would add a spurious empty line)
   end
 
+  # The unconditional strip silently deleted two bytes off a request body that genuinely ends
+  # in CRLF — observed as `Content-Length: 34` shipped over 32 bytes, which is the desync a
+  # smuggling test is trying to cause deliberately, arriving by accident. Byte-exactness on
+  # operator input is a P0 invariant, so the strip is conditional on a WIRE kind.
+  it "keeps a request body's own trailing CRLF" do
+    body = "POST /x HTTP/1.1\r\nContent-Length: 4\r\n\r\nab\r\n"
+    r = Gori::ExternalEditor.edit(body, :request, &fake_editor(body))
+    r.outcome.should eq(Gori::ExternalEditor::Outcome::Unchanged)
+
+    edited = "POST /x HTTP/1.1\r\nContent-Length: 4\r\n\r\ncd\r\n"
+    r2 = Gori::ExternalEditor.edit(body, :request, &fake_editor(edited))
+    r2.text.should eq(edited) # all 4 body bytes survive, CRLF included
+  end
+
+  it "keeps an intercepted message's own trailing newline too" do
+    text = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi\n"
+    r = Gori::ExternalEditor.edit(text, :intercept, &fake_editor(text))
+    r.outcome.should eq(Gori::ExternalEditor::Outcome::Unchanged)
+  end
+
+  # The mirror-image defect the conditional guards against: with no trailing newline of its
+  # own, the editor's ensure-newline-at-EOF must still be undone or the request GAINS a byte.
+  it "still removes the editor's added newline when the request had none" do
+    r = Gori::ExternalEditor.edit("GET / HTTP/1.1\r\n\r\n---", :request,
+      &fake_editor("GET / HTTP/1.1\r\n\r\n===\n"))
+    r.text.should eq("GET / HTTP/1.1\r\n\r\n===")
+  end
+
+  # Prose is the other half of the split: a note's trailing newline is the editor's
+  # convention, and keeping it would show a spurious empty last line in the TextArea.
+  it "keeps stripping unconditionally for notes and the project description" do
+    Gori::ExternalEditor.edit("a\n", :notes, &fake_editor("b\n")).text.should eq("b")
+    Gori::ExternalEditor.edit("a\n", :desc, &fake_editor("b\n")).text.should eq("b")
+  end
+
   it "treats identical content as Unchanged (no spurious dirty)" do
     r = Gori::ExternalEditor.edit("same", :desc, &fake_editor("same"))
     r.outcome.should eq(Gori::ExternalEditor::Outcome::Unchanged)

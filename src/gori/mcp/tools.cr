@@ -943,13 +943,13 @@ module Gori
               "Add a host override (dial a specific IP for a hostname; SNI/Host header unchanged) — " \
               "used by send_request/send_websocket/repeater and the live proxy." do |s|
               s.field "host", strprop("hostname to override (case-insensitive)"), required: true
-              s.field "ip", strprop("IPv4/IPv6 literal to dial"), required: true
+              s.field "ip", strprop("IPv4/IPv6 literal to dial, optionally IP:PORT (or [v6]:PORT) to move the port too"), required: true
             end
 
             tool j, "update_host_override", "Update an existing host override by id." do |s|
               s.field "id", intprop("host override id (see list_host_overrides)"), required: true
               s.field "host", strprop("new hostname"), required: true
-              s.field "ip", strprop("new IPv4/IPv6 literal"), required: true
+              s.field "ip", strprop("new IPv4/IPv6 literal, optionally IP:PORT (or [v6]:PORT)"), required: true
             end
 
             tool j, "delete_host_override", "Delete a host override by id." do |s|
