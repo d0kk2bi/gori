@@ -1113,7 +1113,11 @@ module Gori
               "always includes `effective_request` (the scheme/host/port/method/target/" \
               "http_version actually sent). " \
               "Host + Content-Length are auto-added when omitted on the url path. " \
-              "Match & Replace rules are NOT applied unless apply_rules:true." do |s|
+              "Match & Replace rules are NOT applied unless apply_rules:true. " \
+              "On a failed send, branch on `retryable`: PROTOCOL_ERROR (gori proved the message " \
+              "malformed) and REQUEST_TRUNCATED (the origin answered — status/head/body are all " \
+              "here — before the request body finished, which RFC 9113 §8.1 permits) are both " \
+              "final; re-sending a truncated body puts the whole body back on the wire." do |s|
               s.field "flow_id", intprop("resend a captured flow by id (no url needed; like the TUI Repeater)")
               s.field "keep_request_line", boolprop("flow_id only: send the STORED request line as captured instead of rewriting an absolute-form line (GET http://h/p) to origin-form (GET /p). Default false, because a proxy capture's absolute form is a proxy artifact — but on a flow recorded from a direct send it is the routing / cache-poisoning / SSRF payload. `request_line_rewritten:true` comes back whenever the rewrite fired")
               s.field "repeater_id", intprop("execute a saved HTTP repeater by id (no url needed; respects its target/http2/sni/auto-Content-Length)")

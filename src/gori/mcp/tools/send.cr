@@ -245,6 +245,22 @@ module Gori
       # verdict means gori can PROVE the message malformed; silence is not that.
       NO_RESPONSE_PHRASES = {"no h2 response", "no response"}
 
+      # RFC 9113 §8.1 lets an origin answer while the request body is still going out — a 413
+      # after N bytes is exactly what an upload / body-size probe is looking for. The send has
+      # a REAL response (status, head, body); what it does not have is the whole request. That
+      # is neither a network fault nor gori proving the message malformed:
+      #   * retrying re-sends the entire body to a server that already rejected it, which for a
+      #     body-size probe is the wrong move and, at scale, is the probe becoming the attack;
+      #   * `PROTOCOL_ERROR` would blame someone for behaviour the RFC explicitly permits.
+      # So it gets its own kind and its own non-retryable code.
+      #
+      # Keyed on "truncated at" and NOT on "NOT fully sent", deliberately: the flow-control
+      # stall sentence (`H2Engine.flow_stalled`) ALREADY ends with "The request was NOT fully
+      # sent." and is a genuine stall that must stay `protocol`. The two conditions differ in
+      # whether a response arrived, and only the truncation sentence counts bytes with
+      # "truncated at".
+      TRUNCATED_REQUEST_PHRASE = "truncated at"
+
       # Coarse category for a send's network error, from the engine's error text
       # (gori's own controlled strings). "connect" (the dialer collapses DNS /
       # refused / connect-timeout / TLS-verify into one failure — finer split would
@@ -268,18 +284,39 @@ module Gori
         return "other" if RETRYABLE_H2_PHRASES.any? { |p| m.includes?(p) }
         return "no_response" if NO_RESPONSE_PHRASES.any? { |p| m.includes?(p) }
         return "protocol" if PROTOCOL_ERROR_PHRASES.any? { |p| m.includes?(p) }
+        # AFTER the three lists above, on purpose. A GOAWAY/RST_STREAM reason APPENDS the
+        # truncation clause rather than replacing it, so those sentences must keep the verdict
+        # their error code already earns them (REFUSED_STREAM stays retryable, CANCEL stays
+        # protocol) — every one of them says "h2 " and is matched strictly earlier.
+        return "truncated_request" if m.includes?(TRUNCATED_REQUEST_PHRASE)
         return "no_response" if m.includes?("closed")
         "other"
       end
 
-      # The structured-error pair for a failed send. A "protocol" kind is gori refusing a
-      # message it can prove is malformed, so it is NOT retryable and is not a network fault:
-      # retrying reproduces it exactly, and the refusal itself is the finding. Everything else
-      # keeps the transient NETWORK_ERROR contract callers already apply policy against.
+      # The structured-error pair for a failed send.
+      #
+      # "protocol" is gori refusing a message it can prove is malformed: NOT retryable and not
+      # a network fault — retrying reproduces it exactly, and the refusal itself is the
+      # finding. "truncated_request" is the origin answering early (RFC 9113 §8.1): also not
+      # retryable, but for the opposite reason — the answer is real and complete, it is the
+      # REQUEST that is partial, and re-sending would put the whole body back on the wire.
+      # Everything else keeps the transient NETWORK_ERROR contract callers already apply
+      # policy against. `retryable` is the field to branch on; the code names the cause.
       private def emit_send_error_code(j : JSON::Builder, kind : String?) : Nil
-        protocol = kind == "protocol"
-        j.field "error_code", protocol ? "PROTOCOL_ERROR" : "NETWORK_ERROR"
-        j.field "retryable", !protocol
+        code = Tools.send_error_code(kind)
+        j.field "error_code", code
+        j.field "retryable", code == "NETWORK_ERROR"
+      end
+
+      # Split out and `self.` for the same reason `network_error_kind` is: the retry policy an
+      # agent applies hangs off this mapping, and pinning it in a spec is what stops a new kind
+      # from silently landing in the retryable bucket by falling through the `else`.
+      def self.send_error_code(kind : String?) : String
+        case kind
+        when "protocol"          then "PROTOCOL_ERROR"
+        when "truncated_request" then "REQUEST_TRUNCATED"
+        else                          "NETWORK_ERROR"
+        end
       end
 
       private def persist_send_repeater(h, save : Bool, built : RequestBuilder::Built,
