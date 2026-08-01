@@ -170,6 +170,7 @@ module Gori::Proxy::H2
       @deferred_cross = [] of UInt32
       @closed = false
       @warned_body = false
+      @warned_length = false
       @warned_scope = false
       @warned_overflow = false
       # Connection-level flow-control credit owed back to the SENDER for DATA this gate
@@ -235,6 +236,7 @@ module Gori::Proxy::H2
       # refused stream is never held: there is no decision to offer a human about a request
       # that is not going anywhere.
       return true if sandbox_refuses_locked(block)
+      return true if push_refuses_locked(block)
       item = start_hold(block)
       queued = @ordered && !block.head.nil? && !@opens.empty?
       return false unless item || queued
@@ -464,6 +466,64 @@ module Gori::Proxy::H2
       true
     end
 
+    # The same containment gate for a request the ORIGIN invented (RFC 9113 §8.4 server push).
+    #
+    # `sandbox_refuses_locked` cannot reach it: PUSH_PROMISE arrives on the RESPONSE leg, where
+    # `@ordered` is false, and `HeadRewrite#head_text` returns nil for it (rules are correctly
+    # never run over a promised head), so `block.head` is nil too. A promised request therefore
+    # walked past a gate that refuses the identical authority on a real request, and
+    # `Assembler#handle_push_promise` projected it into History as an ordinary row — a flow the
+    # origin authored, indistinguishable from one the client made, inside the evidence the
+    # operator came to read. "Hard containment" is what the sandbox advertises.
+    #
+    # Refusing a promise means three things, and they are the client's own §8.4 disposition:
+    #   * the PUSH_PROMISE never reaches the client (suppressed, hence `@heads.latch` — the
+    #     third route into the §6.2.1 HPACK asymmetry, exactly as `refuse_locked` describes);
+    #   * RST_STREAM(CANCEL) goes to the ORIGIN on the PROMISED id, which is how a client
+    #     declines a push, so the origin stops before it sends the pushed response;
+    #   * the promised id joins `@refused` on THIS leg, so a pushed response already in flight
+    #     is swallowed rather than written to a client that never learned the stream exists.
+    #
+    # Both URLs are tested for the reason `sandbox_refuses_locked` gives: the promised
+    # `:authority` may be any origin the certificate covers (§9.1.1), which is the whole point
+    # of the finding — an origin that names `evil.test` in a promise.
+    private def push_refuses_locked(block : HeadRewrite::Block) : Bool
+      return false if @ordered # promises are server-initiated; the request leg never sees one
+      return false unless block.first.frame_type == Frame::Type::PushPromise
+      return false unless @interceptor.sandbox_enabled?
+      promised = promised_stream_id(block)
+      return false if promised == 0 || promised.odd? # §5.1.1 — the assembler rejects these too
+      fields = block.fields
+      authority = HeadCodec.pseudo_of(fields, ":authority") || @host
+      host, _ = Upstream.split_host_port(authority, @port)
+      scheme = HeadCodec.pseudo_of(fields, ":scheme") || "https"
+      target = HeadCodec.pseudo_of(fields, ":path") || "/"
+      blocked = @interceptor.sandbox_blocks?(scheme, host, target) ||
+                (host != @host && @interceptor.sandbox_blocks?(scheme, @host, target))
+      return false unless blocked
+      ::Log.warn do
+        "h2 in: refused a server PUSH_PROMISE for #{scheme}://#{host}#{target} (promised " \
+        "stream #{promised}, promised on stream #{block.stream_id}) — the sandbox does not " \
+        "allow that URL, and a promise is the origin's request, not the client's"
+      end
+      @heads.latch
+      project(block)
+      @assembler.drop_stream(promised, SANDBOX_REASON)
+      remember_refused(promised)
+      @deferred_cross << promised
+      true
+    end
+
+    # The promised stream id out of a PUSH_PROMISE's carried-over prefix (R + 31 bits), which
+    # `HeadRewrite#split_block` preserved verbatim for exactly this frame type. 0 when the
+    # prefix is not there — a malformed promise the caller then leaves alone.
+    private def promised_stream_id(block : HeadRewrite::Block) : UInt32
+      prefix = block.prefix
+      return 0_u32 if prefix.size < 4
+      ((prefix[0].to_u32 & 0x7f) << 24) | (prefix[1].to_u32 << 16) |
+        (prefix[2].to_u32 << 8) | prefix[3].to_u32
+    end
+
     # Refuse one stream. The head never goes on the wire, so it is fed to the assembler for the
     # PROJECTION ONLY — `write` is what logs a frame, and P7 logs what gori actually wrote — and
     # the flow is finalized with h1's own sandbox reason, so a blocked attempt stays visible in
@@ -543,7 +603,8 @@ module Gori::Proxy::H2
       return nil unless @interceptor.intercepts_request?(
                           method: method, host: host, target: target, scheme: scheme)
       @interceptor.enqueue_request(head, method: method, target: target,
-        host: host, port: port, scheme: scheme)
+        host: host, port: port, scheme: scheme,
+        edit_refusal: edit_refusal(block), head_only: true)
     end
 
     private def hold_response(block : HeadRewrite::Block, head : Bytes) : Gori::Interceptor::Item?
@@ -567,7 +628,22 @@ module Gori::Proxy::H2
                           scheme: ref.scheme, status: status)
       # h1's response Item carries "<status> <reason>"; h2 has no reason phrase (§8.3.2).
       @interceptor.enqueue_response(head, flow_id: @assembler.flow_id_of(block.stream_id),
-        method: ref.method, target: status.to_s, host: host, port: port, scheme: ref.scheme)
+        method: ref.method, target: status.to_s, host: host, port: port, scheme: ref.scheme,
+        edit_refusal: edit_refusal(block), head_only: true)
+    end
+
+    # Why an edit to this held head cannot be applied, or nil. Asked HERE — at hold time, on
+    # the pump fiber — because `h1_faithful?` is a pure function of the block's decoded fields,
+    # so the answer is already knowable and the surface can refuse before the operator writes
+    # the edit. It used to be discovered on the wait fiber, inside `HeadRewrite#encode_edited`,
+    # whose `|| block` fallback in `edited` silently threw the edit away long after the CLI /
+    # MCP / TUI had reported it applied.
+    private def edit_refusal(block : HeadRewrite::Block) : String?
+      reason = HeadCodec.h1_unfaithful_reason(block.fields, block.request)
+      return nil unless reason
+      "gori will not apply an edit to this HTTP/2 message: #{reason}. The h1 text form shown " \
+      "here is lossy for it, so an edit would be applied to a different message than the one " \
+      "the peer sent (#517) — the fields go out exactly as they arrived"
     end
 
     private def wait_for(item : Gori::Interceptor::Item, block : HeadRewrite::Block) : Nil
@@ -595,46 +671,76 @@ module Gori::Proxy::H2
       if decision.action.drop?
         slot.dropped = true
       else
-        slot.decided = decision.bytes == block.head ? block : edited(block, decision.bytes)
+        slot.decided = decision.bytes == block.head ? block : edited(block, decision)
       end
       slot.ready = true
       drain_locked
     end
 
     # The operator's bytes, back through the same pipeline a rule takes.
-    private def edited(block : HeadRewrite::Block, bytes : Bytes) : HeadRewrite::Block
-      head, body = split_edit(bytes)
+    private def edited(block : HeadRewrite::Block,
+                       decision : Gori::Interceptor::Decision) : HeadRewrite::Block
+      head, body = Gori::Interceptor.split_edit(decision.bytes)
       # h2 holds the HEAD only (#492 step 3, D2) — DATA streams past untouched, so a body typed
-      # into the editor has nowhere to go. Ignoring it silently is the failure class this epic
-      # exists to remove, so say it once. (`content-length` needs no equivalent warning: the
-      # editor's own automatic `Content-Length:` on a dirty edit is reverted by
-      # `HeadCodec.restore_content_length`, which is required anyway because DATA is untouched.)
+      # into the editor has nowhere to go. `Item#head_only?` lets the surface refuse the edit
+      # outright now, so reaching here means a caller that did not check; say it once anyway.
       if body && !@warned_body
         @warned_body = true
         ::Log.warn { "h2 #{@direction}: an intercept edit added a body (stream #{block.stream_id}) — h2 holds the head only, the body was ignored" }
       end
-      @heads.encode_edited(block, head) || block
+      restore = length_synced?(head, decision.bytes.size - head.size)
+      warn_length_restored(block.stream_id) if restore && declares_length?(head)
+      @heads.encode_edited(block, head, restore) || block
     end
 
-    # {head incl. its terminating blank line, whether anything followed it}.
+    # Whether the edit's `content-length` was computed FOR the operator rather than declared BY
+    # them — the one thing that decides whether `HeadCodec.restore_content_length` runs over
+    # their bytes (R3-F2).
     #
-    # The EARLIEST blank line, in either spelling — `Rules#split_message`'s rule and for the
-    # same reason. `||` preferred the CRLF form wherever it appeared, so an operator whose
-    # edited head is LF-joined (the intercept editor's `TextArea#text` is) and whose BODY
-    # carries a CRLFCRLF got the boundary taken inside the body: the "head" handed to the
-    # codec would then include body bytes.
-    private def split_edit(bytes : Bytes) : {Bytes, Bool}
-      text = String.new(bytes)
-      crlf = text.index("\r\n\r\n")
-      lf = text.index("\n\n")
-      idx =
-        if crlf && (lf.nil? || crlf < lf)
-          crlf + 4
-        elsif lf
-          lf + 2
-        end
-      return {bytes, false} unless idx
-      {bytes[0, idx], idx < bytes.size}
+    # Derived from the bytes, not asserted by the caller, because the caller does not reliably
+    # know: `gori run intercept edit` runs `ContentLength.sync` over `--raw-file` unconditionally,
+    # the MCP tool runs it unless `update_content_length:false`, and the TUI editor runs it
+    # unless `^L` is off. What every one of those affordances PRODUCES is a `content-length`
+    # that agrees with the body the edit carries, and an h2 hold carries no body — so a value
+    # that DISAGREES cannot have come from any of them. That is the operator declaring one,
+    # which on h2 is the RFC 9113 §8.1.1 probe (does this origin/CDN/WAF/gRPC gateway enforce
+    # content-length against DATA?) and on h1 is already forwarded byte-exact.
+    #
+    # Its stated limit: a deliberate `content-length: 0` on a head-only hold is
+    # INDISTINGUISHABLE from a sync of the same empty body, so it still gets the peer's value
+    # back. That case is unreachable by construction, not by choice.
+    private def length_synced?(head : Bytes, body_size : Int32) : Bool
+      declared = declared_lengths(head)
+      declared.empty? || declared.all? { |v| v == body_size.to_s }
+    end
+
+    private def declares_length?(head : Bytes) : Bool
+      !declared_lengths(head).empty?
+    end
+
+    private def declared_lengths(head : Bytes) : Array(String)
+      values = [] of String
+      String.new(head).each_line do |line|
+        stripped = line.rstrip('\r')
+        break if stripped.empty?
+        next unless pair = HeadCodec.header_field(stripped)
+        values << pair[1] if pair[0].compare("content-length", case_insensitive: true) == 0
+      end
+      values
+    end
+
+    # The restore is a rewrite of the operator's own bytes, so it does not get to be silent —
+    # the reasoning `warned_body` already had, applied to the other thing this path changes.
+    private def warn_length_restored(stream_id : UInt32) : Nil
+      return if @warned_length
+      @warned_length = true
+      ::Log.warn do
+        "h2 #{@direction}: an intercept edit's content-length agreed with the body the edit " \
+        "carried, which is what an \"update Content-Length\" affordance produces — the peer's " \
+        "original value was put back (stream #{stream_id}), because h2 holds the head only and " \
+        "the DATA frames are unchanged. To send a content-length that disagrees with the DATA " \
+        "(the RFC 9113 §8.1.1 probe), declare it with the editor's Content-Length sync OFF"
+      end
     end
 
     # --- release -------------------------------------------------------------

@@ -387,5 +387,86 @@ describe Gori::Proxy::H2::HeadCodec do
       rewritten = [f(":method", "GET"), f("content-length", "5")]
       tuples(HeadCodec.restore_content_length(rewritten, original)).should eq([{":method", "GET"}])
     end
+
+    # R3-F2. The restore used to `reject` then `concat`, so the field moved to the END of the
+    # list — a header REORDER gori made on the wire, silently, in the one ordering a
+    # header-order probe is about.
+    it "restores the value in place rather than moving the field to the end" do
+      original = [f(":method", "POST"), f("content-length", "12"), f("x-probe", "a")]
+      rewritten = [f(":method", "POST"), f("content-length", "3"), f("x-probe", "cl-mismatch")]
+      tuples(HeadCodec.restore_content_length(rewritten, original))
+        .should eq([{":method", "POST"}, {"content-length", "12"}, {"x-probe", "cl-mismatch"}])
+    end
+
+    # The complement of the in-place case: the peer sent a content-length the rewritten head
+    # dropped, so there is no position left to restore it to and it goes back at the end.
+    it "appends a content-length the rewrite removed, since it has no position to keep" do
+      original = [f(":method", "POST"), f("content-length", "12")]
+      rewritten = [f(":method", "POST"), f("x-added", "1")]
+      tuples(HeadCodec.restore_content_length(rewritten, original))
+        .should eq([{":method", "POST"}, {"x-added", "1"}, {"content-length", "12"}])
+    end
+  end
+
+  # R3-F1. The refusal was correct and invisible: "no HTTP/1.1 text form" is a CLASS, and the
+  # operator who induced it (probe a CRLF sink, watch the origin reflect `%0d%0a` back) needs
+  # the FIELD to connect the two.
+  describe "h1_unfaithful_reason" do
+    it "is nil for a head the h1 text can carry" do
+      HeadCodec.h1_unfaithful_reason(req_fields, true).should be_nil
+      HeadCodec.h1_unfaithful_reason([f(":status", "200"), f("x-tag", "a")], false).should be_nil
+    end
+
+    it "names the field and the CR/LF for a value the h1 text would split in two" do
+      fields = req_fields + [f("x-evil", "a\r\nx-injected: yes"), f("x-tail", "z")]
+      reason = HeadCodec.h1_unfaithful_reason(fields, true).not_nil!
+      reason.should contain("x-evil")
+      reason.should contain("CR or LF")
+      # The innocent neighbour is not blamed.
+      reason.should_not contain("x-tail")
+    end
+
+    it "names an uppercase field name, a duplicate pseudo and a padded :status" do
+      HeadCodec.h1_unfaithful_reason(req_fields + [f("X-Upper", "1")], true)
+        .not_nil!.should contain("X-Upper")
+      HeadCodec.h1_unfaithful_reason(req_fields + [f(":path", "/again")], true)
+        .not_nil!.should contain("more than once")
+      HeadCodec.h1_unfaithful_reason([f(":status", "0200")], false)
+        .not_nil!.should contain(":status")
+    end
+
+    it "names the response direction's CRLF too — the origin's value, the dangerous one" do
+      fields = [f(":status", "200"), f("x-evil", "a\r\nx-injected: yes")]
+      HeadCodec.h1_unfaithful_reason(fields, false).not_nil!.should contain("x-evil")
+      # Complement: strip the injected bytes back out and the same shape is carried fine.
+      HeadCodec.h1_unfaithful_reason([f(":status", "200"), f("x-evil", "a")], false).should be_nil
+    end
+
+    it "agrees with h1_faithful? on every corpus entry" do
+      CORPUS.each do |entry|
+        HeadCodec.h1_unfaithful_reason(entry.fields, entry.request).nil?.should eq(entry.faithful)
+      end
+    end
+  end
+
+  # R3-F5 / R3-F4. Both markers are capture-projection only; the rewrite path passes neither,
+  # so neither can reach an h2 wire.
+  describe "synth_request markers" do
+    it "names request trailers, exactly as synth_response already named response ones" do
+      fields = [{":method", "POST"}, {":path", "/trail"}, {"x-req-trailer", "yes"}]
+      head = String.new(HeadCodec.synth_request(fields, "h:1", ["x-req-trailer"]))
+      head.should contain("X-Gori-Trailers: x-req-trailer\r\n")
+      # Complement: no trailers, no line — an ordinary request head is byte-identical to before.
+      String.new(HeadCodec.synth_request(fields, "h:1")).should_not contain("X-Gori-Trailers")
+      String.new(HeadCodec.synth_request(fields, "h:1", [] of String)).should_not contain("X-Gori-Trailers")
+    end
+
+    it "marks a request the ORIGIN invented via PUSH_PROMISE" do
+      fields = [{":method", "GET"}, {":path", "/pushed"}]
+      String.new(HeadCodec.synth_request(fields, "evil.test", nil, 3_u32))
+        .should contain("X-Gori-Pushed: server push promised on stream 3\r\n")
+      # Complement: a request the client actually sent carries no marker.
+      String.new(HeadCodec.synth_request(fields, "evil.test")).should_not contain("X-Gori-Pushed")
+    end
   end
 end

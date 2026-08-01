@@ -160,12 +160,24 @@ module Gori::Proxy::H2
     # intercept is a stage inside this pipeline, not a second pipeline beside it. nil when the
     # edited bytes are no longer a head: the caller then forwards the block as it stood, which
     # is what an unparseable RULE result already does.
-    def encode_edited(block : Block, head : Bytes) : Block?
+    #
+    # `restore_length` is PROVENANCE, not policy (#513 / R3-F2). Reverting the operator's
+    # `content-length` is right when the surface computed it FOR them — the TUI intercept
+    # editor's `^L` recomputes it from the editor's body, and an h2 hold is the head only, so
+    # on a dirty edit that lands as `content-length: 0` beside DATA gori still relays. It is
+    # wrong when the operator DECLARED it: a content-length that disagrees with the DATA is
+    # RFC 9113 §8.1.1-malformed, and whether a given origin/CDN/WAF/gRPC gateway enforces that
+    # is exactly the probe they opened the editor to run. h1 forwards the identical edit
+    # byte-exact and says so (`client_conn.cr`); h2 reverted it and reported success.
+    def encode_edited(block : Block, head : Bytes, restore_length : Bool = true) : Block?
       # The head shown to the operator is a lossy rendering of what the peer sent, so re-parsing
       # their edit would apply it to a DIFFERENT message (#517). Refuse the edit rather than
       # send that; the caller keeps the block as it stood.
-      unless HeadCodec.h1_faithful?(block.fields, block.request)
-        warn_unfaithful(block.stream_id, block.request)
+      #
+      # `StreamGate` now asks `HeadCodec.h1_unfaithful_reason` at HOLD time and refuses the edit
+      # at the surface that asked for it, so this is the backstop rather than the only stop.
+      if reason = HeadCodec.h1_unfaithful_reason(block.fields, block.request)
+        warn_unfaithful(block.stream_id, block.request, reason)
         return nil
       end
       parsed = block.request ? HeadCodec.parse_request(head, block.fields) : HeadCodec.parse_response(head, block.fields)
@@ -173,7 +185,7 @@ module Gori::Proxy::H2
         warn_unparseable(block.stream_id, "an intercept edit")
         return nil
       end
-      fields = HeadCodec.restore_content_length(parsed, block.fields)
+      fields = restore_length ? HeadCodec.restore_content_length(parsed, block.fields) : parsed
       @engaged = true
       Block.new(reframe(block.first, block.prefix, @encoder.encode(fields)),
         Assembler::HeadBlock.new(pairs(fields)), fields, head, block.first, block.prefix, block.request)
@@ -322,13 +334,19 @@ module Gori::Proxy::H2
       return unreadable(first, snapshot) if fields.nil?
 
       request = @direction == "out"
+      # `first.stream_id`, NOT `@block_stream`: `reset` above zeroed it (deliberately — it
+      # closes the buffered-block leak class), so every warning below `finish` named "stream 0",
+      # a stream that cannot exist. `encode_edited` was never affected because it reads
+      # `block.stream_id`, which is why the intercept-path warnings said the right thing while
+      # the rule-path ones did not.
+      stream_id = first.stream_id
       head = head_text(fields, first, request)
       # Before the rewrite, and NOT from inside it: what this announces is a seam the relay
       # cannot reach at all, which is true whether or not a head rule is live. Running it from
       # `rewrite` put it behind `rw.active?`, so an operator whose only rule is a session-binding
       # extract descriptor — the case #536 is about — got nothing.
       notice_coalesced(fields) if request && head
-      rewritten = head ? rewrite(fields, head, request) : nil
+      rewritten = head ? rewrite(fields, head, request, stream_id) : nil
       emit_fields = rewritten || fields
       built = if rewritten.nil? && !@engaged
                 # Unchanged, and this direction has never re-encoded: byte-exact passthrough,
@@ -380,14 +398,17 @@ module Gori::Proxy::H2
 
     # Run the Match&Replace rules over this block's h1-equivalent head. nil = unchanged
     # (which is also what a block the rules do not apply to returns).
-    private def rewrite(fields : Array(HPACK::Field), head : Bytes, request : Bool) : Array(HPACK::Field)?
+    private def rewrite(fields : Array(HPACK::Field), head : Bytes, request : Bool,
+                        stream_id : UInt32) : Array(HPACK::Field)?
       rw = @rewriter
       return nil unless rw && rw.active?
       # The peer's own head has no faithful h1-text form, so the round trip that runs the
       # rules would hand the far side a DIFFERENT message — see `HeadCodec.h1_faithful?`.
       # `parse_*` refuses it anyway; checking here keeps the rules from running for nothing
       # and, more to the point, keeps the log from blaming a rule for the peer's bytes.
-      return warn_unfaithful(@block_stream, request) unless HeadCodec.h1_faithful?(fields, request)
+      if reason = HeadCodec.h1_unfaithful_reason(fields, request)
+        return warn_unfaithful(stream_id, request, reason)
+      end
       # The BARE host, because that is what a rule's host glob is written against and what
       # every other host-scoping site in this pipeline passes (`notice_coalesced` below,
       # `H2::Extract`, `StreamGate`'s three gates). `:authority` may carry a port, and
@@ -400,7 +421,7 @@ module Gori::Proxy::H2
 
       parsed = request ? HeadCodec.parse_request(rewritten_head, fields) : HeadCodec.parse_response(rewritten_head, fields)
       if parsed.nil?
-        warn_unparseable(@block_stream, "a Match&Replace rule")
+        warn_unparseable(stream_id, "a Match&Replace rule")
         return nil
       end
       restored = HeadCodec.restore_content_length(parsed, fields)
@@ -436,13 +457,17 @@ module Gori::Proxy::H2
     # (#517). Not a rule's doing and not the operator's, so it gets its own line — and its own
     # flag, or whichever of the two happened first would silence the other. Always nil, so
     # `rewrite` can return it directly: nothing is rewritten and the original fields go out.
-    private def warn_unfaithful(stream_id : UInt32, request : Bool) : Nil
+    #
+    # `reason` names the offending field. "No HTTP/1.1 text form" is a class, not a cause, and
+    # the operator who induced it — probe a CRLF sink, watch the origin reflect `%0d%0a` back —
+    # needs to read the field name to connect the two.
+    private def warn_unfaithful(stream_id : UInt32, request : Bool, reason : String) : Nil
       return if @warned_unfaithful
       @warned_unfaithful = true
       ::Log.warn do
         "h2 #{@direction}: the peer sent a #{request ? "request" : "response"} head that has no " \
-        "HTTP/1.1 text form (stream #{stream_id}) — Match&Replace and intercept edits are " \
-        "not applied to it, the fields go out exactly as they arrived"
+        "HTTP/1.1 text form (stream #{stream_id}): #{reason}. Match&Replace and intercept edits " \
+        "are not applied to it, the fields go out exactly as they arrived"
       end
     end
 
