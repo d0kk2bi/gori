@@ -452,7 +452,7 @@ module Gori
         else            return
         end
         if flow.conn > MAX_WINDOW || flow.stream > MAX_WINDOW
-          flow.violation ||= "the origin's WINDOW_UPDATEs drove a flow-control window past " \
+          flow.violation ||= "the origin's WINDOW_UPDATE frames drove a flow-control window past " \
                              "2^31-1, which RFC 9113 §6.9.1 makes a FLOW_CONTROL_ERROR " \
                              "(connection #{flow.conn}, stream #{flow.stream})"
         end
