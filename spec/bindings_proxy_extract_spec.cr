@@ -201,6 +201,137 @@ describe "Gori::Bindings — the proxy response seam (#501 slice 2)" do
       end
     end
 
+    # One origin response, five descriptors, ONE value. `decoded_text` used to `#scrub` the
+    # whole body before `regex`, `position` and `jsonpath` touched it, so an invalid UTF-8 byte
+    # became U+FFFD and every `position` offset past it slid by two — a cookie rule returned the
+    # origin's `41 42 FF 43 44` and a `position` rule asking for the same five bytes returned
+    # five different ones. `bindings.cr` states the rule that breaks: "the same `TokenLoc` on
+    # the same response has to mean one thing", and its own comment says "`Position` has no
+    # text-only reading at all".
+    describe "a body that is not valid UTF-8" do
+      # `AB\xffCD` in the cookie, the header and the body — mint.py's `/login?m=nonutf8` shape.
+      nonutf8_body = String.new(Bytes[0x7b, 0x22, 0x74, 0x22, 0x3a, 0x22, 0x41, 0x42, 0xff,
+        0x43, 0x44, 0x22, 0x7d, 0x54, 0x4f, 0x4b, 0x45, 0x4e, 0x3d, 0x41, 0x42, 0xff, 0x43,
+        0x44, 0x3b]) # {"t":"AB\xffCD"}TOKEN=AB\xffCD;
+      head = "HTTP/1.1 200 OK\r\nSet-Cookie: sid=" + String.new(Bytes[0x41, 0x42, 0xff, 0x43, 0x44]) +
+             "\r\n\r\n"
+
+      it "gives a position descriptor the origin's bytes, not a repaired reading" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("CTOK", "", Gori::ExtractKind::Cookie, "sid").should be_nil
+          # bytes 6..10 of the body are exactly `AB\xffCD` — the same five the cookie carries.
+          b.add("QTOK", "", Gori::ExtractKind::Position, "", 6, 11).should be_nil
+          observe(b, head, nonutf8_body.to_slice)
+          origin = Bytes[0x41, 0x42, 0xff, 0x43, 0x44]
+          b.values["QTOK"].to_slice.should eq origin
+          # The whole point: the two descriptors agree, byte for byte.
+          b.values["QTOK"].should eq b.values["CTOK"]
+        end
+      end
+
+      it "does not slide a range that starts past the invalid byte" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          # `TOKEN` — five bytes at 13..17, all AFTER the 0xff at offset 8. Under the scrubbed
+          # reading this came back as `EN=AB` (the U+FFFD had pushed everything two along).
+          b.add("PTOK", "", Gori::ExtractKind::Position, "", 13, 18).should be_nil
+          observe(b, head, nonutf8_body.to_slice)
+          b.values["PTOK"].should eq "TOKEN"
+        end
+      end
+
+      it "is unaffected by an invalid byte AFTER the requested range" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          # bytes 0..5 are `{"t":"`, entirely before the 0xff at 8.
+          b.add("PTOK", "", Gori::ExtractKind::Position, "", 0, 6).should be_nil
+          observe(b, head, nonutf8_body.to_slice)
+          b.values["PTOK"].should eq %({"t":")
+        end
+      end
+
+      it "returns the invalid byte itself when the range ends exactly on it" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("PTOK", "", Gori::ExtractKind::Position, "", 6, 9).should be_nil
+          observe(b, head, nonutf8_body.to_slice)
+          b.values["PTOK"].to_slice.should eq Bytes[0x41, 0x42, 0xff]
+        end
+      end
+
+      # `Regex` and `JsonPath` genuinely need a valid subject — Crystal's `Regex` raises
+      # `ArgumentError` otherwise — so the scrub STAYS there. What must not stay is it being
+      # silent: binding bytes that are not the origin's without saying so is the one option
+      # ruled out. Refusing outright was rejected: a page in a legacy encoding with a CSRF
+      # token in it is an ordinary target and refusing would break a case that works today.
+      it "binds a regex descriptor but says the body was repaired" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("RTOK", "", Gori::ExtractKind::Regex, "TOKEN=([\\s\\S]*?);").should be_nil
+          observe(b, head, nonutf8_body.to_slice)
+          b.bound?("RTOK").should be_true
+          ev = store.events_after(0, 50).find { |e| e.kind == "extract_scrubbed" }.not_nil!
+          ev.level.should eq("warn")
+          ev.message.should contain("$RTOK")
+          ev.message.should contain("not valid UTF-8")
+          ev.message.should contain("U+FFFD")
+        end
+      end
+
+      # Once per rule per rule revision, the same key `extract_no_body` uses: this is a
+      # structural fact about the target's body, so it is news when the operator edits the
+      # rule and noise on every subsequent response.
+      it "says it once per rule, not once per response" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("RTOK", "", Gori::ExtractKind::Regex, "TOKEN=([\\s\\S]*?);").should be_nil
+          5.times { observe(b, head, nonutf8_body.to_slice) }
+          store.events_after(0, 50).count { |e| e.kind == "extract_scrubbed" }.should eq 1
+        end
+      end
+
+      # The COMPLEMENT of the condition the advisory keys on, in both directions.
+      it "says nothing for a valid-UTF-8 body, and nothing for a byte-scoped descriptor" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("RTOK", "", Gori::ExtractKind::Regex, "tok=(\\w+)").should be_nil
+          observe(b, "HTTP/1.1 200 OK\r\n\r\n", "tok=swordfish".to_slice)
+          b.values["RTOK"].should eq "swordfish"
+          store.events_after(0, 50).any? { |e| e.kind == "extract_scrubbed" }.should be_false
+        end
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          # `position` reads bytes, so an invalid body costs it nothing and says nothing.
+          b.add("PTOK", "", Gori::ExtractKind::Position, "", 6, 11).should be_nil
+          b.add("CTOK", "", Gori::ExtractKind::Cookie, "sid").should be_nil
+          observe(b, head, nonutf8_body.to_slice)
+          store.events_after(0, 50).any? { |e| e.kind == "extract_scrubbed" }.should be_false
+        end
+      end
+
+      # A gzip body is the case `Position`'s own comment names — "forty bytes of DEFLATE" —
+      # so the range must land on the DECODED entity and be byte-exact there too.
+      it "slices the decoded entity of a gzipped body, byte-exact" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("PTOK", "", Gori::ExtractKind::Position, "", 6, 11).should be_nil
+          observe(b, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n", gzip(nonutf8_body))
+          b.values["PTOK"].to_slice.should eq Bytes[0x41, 0x42, 0xff, 0x43, 0x44]
+        end
+      end
+
+      it "slices the de-chunked entity of a chunked body, byte-exact" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("PTOK", "", Gori::ExtractKind::Position, "", 6, 11).should be_nil
+          observe(b, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            chunked(nonutf8_body[0, 4], nonutf8_body[4..]))
+          b.values["PTOK"].to_slice.should eq Bytes[0x41, 0x42, 0xff, 0x43, 0x44]
+        end
+      end
+    end
+
     it "keeps the previous value when the extractor finds nothing" do
       with_store do |store|
         b = Gori::Bindings.load(store)

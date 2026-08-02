@@ -15,6 +15,26 @@ module Gori
   # message) and the TUI (which edits the rule set). A Mutex guards the rule snapshot so
   # an edit can never tear a concurrent rewrite.
   class Rules < Proxy::HeadRewriter
+    # Why a `$NAME` in a replacement stopped its rule from applying, and which name did it.
+    #
+    # `substitute` has TWO refusals and they mean opposite things — "declared but no value
+    # yet" and "there IS a value and the head cannot carry it" — and they used to share one
+    # `nil`. `report_unbound` only ever understood the first: it computes
+    # `Env.unbound(rule.replacement)` and returns when that is empty, and a BOUND name is by
+    # definition not unbound. So the boundary refusal fired in total silence — no header on the
+    # wire, no event, no log line, no advisory, no status — and every head-scoped injection rule
+    # in the project simply ceased to exist the moment an origin minted a cookie with a stray
+    # CR in it. That is the origin disarming the operator's test setup invisibly, which is why
+    # the two now carry their reason and their key instead of a shared nil.
+    private enum Refusal
+      Unbound  # declared by an enabled extract rule, no value yet
+      Boundary # bound, and the value carries CR/LF/NUL — see `forges_boundary?`
+    end
+
+    # The key travels with the reason because the event has to name it: a replacement holding
+    # several `$NAME`s makes "the value carries CR" actionable only if it says whose.
+    private record Refused, reason : Refusal, key : String
+
     def initialize(@store : Store, @rules : Array(Store::MatchRule))
       @mutex = Mutex.new
       @stub_bodies = RuleStubBodyCache.new
@@ -449,8 +469,8 @@ module Gori
       # (env.cr) — puts eight meaningless characters on the wire in a credential's place.
       # The operator hears about it through the event feed rather than through a 401.
       repl = replacement_for(rule)
-      unless repl
-        report_unbound(rule) if report
+      if repl.is_a?(Refused)
+        report_refused(rule, repl) if report
         return text
       end
       case rule.op
@@ -480,7 +500,7 @@ module Gori
     # body injection (`Replace` with `part: Body`), static env vars in M&R rules — which
     # simply did not work before — and one syntax everywhere, with no schema change and no
     # new rule kind.
-    private def replacement_for(rule : Store::MatchRule) : String?
+    private def replacement_for(rule : Store::MatchRule) : String | Refused
       repl = rule.replacement
       prefix = Settings.env_prefix
       # The overwhelmingly common case, and the one that must cost nothing: no `$` in the
@@ -524,7 +544,7 @@ module Gori
     # Byte-level for the same reason `Env.expand` is: a BODY replacement can carry bytes
     # that are not valid UTF-8, and `String#chars` would turn each of them into U+FFFD.
     private def substitute(repl : String, prefix : String, vars : Hash(String, String),
-                           declared : Array(String), regex : Bool, head : Bool = false) : String?
+                           declared : Array(String), regex : Bool, head : Bool = false) : String | Refused
       bytes = repl.to_slice
       prefix_bytes = prefix.to_slice
       n = bytes.size
@@ -546,8 +566,8 @@ module Gori
         if parsed = Env.read_key_bytes?(bytes, i + plen, n)
           key, consumed = parsed
           # Declared by an extract rule but not bound yet → the rule must not apply.
-          return nil if !vars.has_key?(key) && declared.includes?(key)
-          return nil if head && forges_boundary?(vars, declared, key)
+          return Refused.new(Refusal::Unbound, key) if !vars.has_key?(key) && declared.includes?(key)
+          return Refused.new(Refusal::Boundary, key) if head && forges_boundary?(vars, declared, key)
           i += emit_key(buf, bytes, vars, key, consumed, prefix, plen, regex)
           next
         end
@@ -628,19 +648,45 @@ module Gori
 
     # One warn event per (rule, binding revision): a rule injecting an unbound `$SESSION`
     # into every proxied request would otherwise write one row per message. The value is
-    # never in the message — only the rule and the name, which is what #491 asked for.
-    private def report_unbound(rule : Store::MatchRule) : Nil
+    # never in the message — only the rule, the name and, for a boundary refusal, which byte
+    # class was found, which is what #491 asked for.
+    #
+    # Keyed on `Env.binding_rev` and not latched forever, so the report self-resets exactly
+    # when it becomes news again: that revision moves on every rebind, every clear and every
+    # extract-rule edit, which is the whole set of events that can change either answer.
+    private def report_refused(rule : Store::MatchRule, refused : Refused) : Nil
       brev = Env.binding_rev
       if brev != @unbound_reported_rev
         @unbound_reported_rev = brev
         @unbound_reported.clear
       end
       return unless @unbound_reported.add?(rule.id)
-      names = Env.unbound(rule.replacement)
-      return if names.empty?
       label = rule.name.presence || rule.pattern
-      @store.insert_event("bindings", "unbound", "warn",
-        "rewrite rule #{label.inspect} not applied: #{Env.token_list(names)} is not bound yet")
+      case refused.reason
+      in Refusal::Unbound
+        names = Env.unbound(rule.replacement)
+        return if names.empty?
+        @store.insert_event("bindings", "unbound", "warn",
+          "rewrite rule #{label.inspect} not applied: #{Env.token_list(names)} is not bound yet")
+      in Refusal::Boundary
+        vars, _ = subst_snapshot
+        classes = Bindings.boundary_bytes(vars[refused.key]? || "")
+        # Empty only if the value changed between the refusal and here, which is a rebind and
+        # therefore a new revision — say nothing rather than name a byte class that is no
+        # longer in the value.
+        return if classes.empty?
+        @store.insert_event("bindings", "boundary_refused", "warn",
+          "rewrite rule #{label.inspect} not applied: #{Env.token_list([refused.key])}'s value " \
+          "carries #{Rules.and_list(classes)} and would forge a message boundary in a header " \
+          "(the value is still bound — a body-scoped rule can carry it)")
+      end
+    end
+
+    # "CR" / "CR and LF" / "CR, LF and NUL". Small enough that reaching for a helper module
+    # would cost more than it saves, and the refusal above is its only caller.
+    def self.and_list(items : Array(String)) : String
+      return items.first? || "" if items.size <= 1
+      "#{items[0..-2].join(", ")} and #{items[-1]}"
     end
 
     # The line terminator a head uses — CRLF for real HTTP, LF as a fallback so a
