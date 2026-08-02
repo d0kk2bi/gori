@@ -626,6 +626,419 @@ describe Gori::Tui::RepeaterView do
     String.new(view.request_bytes).should eq("POST /x HTTP/1.1\r\nHost: a.test\r\n\r\nq=hi")
   end
 
+  # PROVENANCE: `§` (U+00A7) is ordinary text — a German/legal body carries it constantly —
+  # so a `§…§` pair that arrived as CAPTURED evidence is data, not the operator's marker
+  # syntax. The Repeater used to parse it as a template anyway: both § were deleted from the
+  # wire and `Content-Length` was re-synced behind the loss, while `gori run repeater <id>`
+  # and MCP `send_request{flow_id}` replayed the same flow byte-exact. See
+  # `RepeaterView#markers_live?`.
+  describe "§ in a CAPTURED body is data, not marker syntax" do
+    # The hunter's vector: `§` next to every other byte class that already survives a send —
+    # a CRLF in the body, invalid UTF-8, a captured `$TOKEN`, a tab — so a failure here can
+    # only be the marker path.
+    body = IO::Memory.new.tap { |io|
+      io << %({"note":"a\r\nb","mk":"§SEED§","env":"$TOKEN","bin":")
+      io.write(Bytes[0xFF, 0xFE, 0x01, 0x02])
+      io << %(","tab":"\tx"})
+    }.to_slice
+    head = "POST /seed?q=1&r=2 HTTP/1.1\r\nHost: h.test\r\n" \
+           "Content-Type: application/json\r\nContent-Length: #{body.size}\r\n" \
+           "Connection: close\r\n\r\n"
+    wire = head + String.new(body)
+
+    # `§SEED§` as it sits on the wire: c2 a7 53 45 45 44 c2 a7. Searched byte-wise — the
+    # surrounding body is deliberately not valid UTF-8.
+    marker_run = Bytes[0xC2, 0xA7, 0x53, 0x45, 0x45, 0x44, 0xC2, 0xA7]
+    carries_marker = ->(b : Bytes) do
+      (0..(b.size - marker_run.size)).any? { |i| b[i, marker_run.size] == marker_run }
+    end
+
+    seed = ->(store : Gori::Store) do
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "POST", target: "/seed?q=1&r=2", http_version: "HTTP/1.1",
+        head: head.to_slice, body: body))
+      store.get_flow(id).not_nil!
+    end
+
+    it "sends the captured § byte-exact and leaves Content-Length alone" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+
+        sent = view.request_bytes
+        # The whole request, byte for byte: § kept, CRLF-in-body kept, invalid UTF-8 kept,
+        # the captured `$TOKEN` kept, CL still the captured 70.
+        String.new(sent).should eq(wire)
+        sent.size.should eq(head.bytesize + body.size)
+        String.new(sent).should contain("Content-Length: #{body.size}")
+        # …and the two § really are still on the wire (c2 a7 SEED c2 a7).
+        carries_marker.call(sent).should be_true
+      end
+    end
+
+    it "reflects the CAPTURED Content-Length in the editor, so ^X hex sends a consistent request" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        # The auto-CL reflection is what ^X snapshots. It used to write the RENDERED (marker-
+        # stripped) length into the visible head, so the byte-exact escape hatch shipped a
+        # 70-byte body under `Content-Length: 66` — a CL/body desync gori invented out of a
+        # benign capture.
+        view.request_text.should contain("Content-Length: #{body.size}")
+        view.request_text.should_not contain("Content-Length: #{body.size - 4}")
+
+        view.focus_pane(:request)
+        view.toggle_request_hex.should be_true # ^X: the byte buffer is authoritative now
+        String.new(view.request_bytes).should eq(wire)
+      end
+    end
+
+    it "does not hand the capture's § to the Fuzzer as an injection position" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        # `space ▸ f` seeds a tab that reads §…§ as syntax; the capture's own § must not
+        # become a position there either. The escape `Fuzz::Template` already defines (§§)
+        # carries it as a literal, so the template still renders the captured bytes.
+        tmpl = Gori::Fuzz::Template.parse(view.fuzz_seed_text)
+        tmpl.position_count.should eq(0) # was 1 — the site's own text as a fuzz position
+        # …and the escape really does render back to the single captured § (`§§` → `§`).
+        # (Compared on the marked region: `Template#render` rebuilds through String, which
+        # scrubs the deliberately-invalid UTF-8 further down this fixture's body — a separate
+        # concern of the Fuzzer's own seed path, not of the escape.)
+        String.new(tmpl.render(tmpl.default_payloads)).should contain(%("mk":"§SEED§"))
+        view.fuzz_seed_text.should contain(%("mk":"§§SEED§§"))
+        # …and the escape is byte-level: a `String#gsub` here walks CHARS, which rewrites the
+        # invalid UTF-8 this capture also carries to U+FFFD (measured: `ff fe 01 02` became
+        # `ef bf bd ef bf bd 01 02`, inflating Content-Length with it). Round 4's T1 again.
+        seed_bytes = view.fuzz_seed_text.to_slice
+        (0..(seed_bytes.size - 4)).any? { |i| seed_bytes[i, 4] == Bytes[0xFF, 0xFE, 0x01, 0x02] }.should be_true
+        seed_bytes.size.should eq(wire.bytesize + 4) # exactly the two doubled § (2 bytes each)
+      end
+    end
+
+    it "keeps the § inert while the operator edits an unrelated header" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        view.focus_pane(:request)
+        view.goto_request_line(2) # the Host line
+        view.edit_end
+        view.edit_insert('x') # an edit is not a marker declaration — see markers_live?
+        String.new(view.request_bytes).should contain("Host: h.testx")
+        String.new(view.request_bytes).should contain("Content-Length: #{body.size}")
+        carries_marker.call(view.request_bytes).should be_true
+      end
+    end
+
+    it "^A auto-mark refuses by name rather than adopting the capture's § for nothing" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        view.focus_pane(:request)
+        # Template.auto_mark is a no-op once ANY § is present, so declaring here would cost
+        # the capture's bytes and buy no positions.
+        view.auto_mark.should contain("capture's own §")
+        view.markers_active?.should be_false
+        String.new(view.request_bytes).should eq(wire)
+      end
+    end
+
+    it "^K on a token DOES declare the buffer a template — and says the § came along" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        view.focus_pane(:request)
+        view.goto_request_line(1) # the request line — mark the METHOD token
+        msg = view.mark_word
+        msg.should contain("marked position")
+        msg.should contain("the capture's own § are markers now")
+        view.markers_active?.should be_true
+        view.request_text.should contain("§POST§")
+        # Declared: the capture's § now render like any other marker (visible, and the border
+        # chip is lit) — the operator asked for a template.
+        String.new(view.request_bytes).should contain(%("mk":"SEED"))
+      end
+    end
+
+    it "clear-marks refuses on an undeclared capture (it would delete the captured §)" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        view.focus_pane(:request)
+        view.clear_marks.should contain("captured data")
+        String.new(view.request_bytes).should eq(wire)
+      end
+    end
+
+    it "COMPLEMENT: the same bytes as a DRAFT still mark, chain and fuzz" do
+      draft = RepeaterView.new
+      draft.restore("http://h.test",
+        "POST /x HTTP/1.1\nHost: h.test\nContent-Length: 99\n\ntok=§secret¦base64-encode§",
+        false, true) # evidence: false — the operator typed this
+      draft.markers_active?.should be_true
+      sent = String.new(draft.request_bytes)
+      sent.should contain("tok=c2VjcmV0")
+      sent.should contain("Content-Length: 12")
+      Gori::Fuzz::Template.parse(draft.fuzz_seed_text).position_count.should eq(1)
+    end
+
+    it "COMPLEMENT: a capture with NO § is byte-identical to before the gate" do
+      repeater_tmp_store do |store|
+        plain = %({"note":"a\r\nb","env":"$TOKEN"})
+        h = "POST /x HTTP/1.1\r\nHost: h.test\r\nContent-Length: #{plain.bytesize}\r\n\r\n"
+        id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+          method: "POST", target: "/x", http_version: "HTTP/1.1",
+          head: h.to_slice, body: plain.to_slice))
+        view = RepeaterView.new
+        view.load(store.get_flow(id).not_nil!)
+        String.new(view.request_bytes).should eq(h + plain)
+        view.fuzz_seed_text.should eq(view.request_text)
+        view.markers_active?.should be_false
+      end
+    end
+  end
+
+  # The `%%%` twin of the block above, and the reason one flag would not have covered it:
+  # `%%%` is draft syntax too — it means "split here" only because the operator typed it.
+  # A capture whose body holds a lone `%%%` line was split anyway, which produced the same
+  # three harms: the pane showed chunk 1's Content-Length over a whole-buffer send, `^X`
+  # snapshotted that head (a CL/body desync invented out of ordinary traffic), and
+  # `space ▸ g` manufactured a second request whose REQUEST LINE was the capture's own text.
+  # See `RepeaterView#pipeline_live?`.
+  describe "%%% in a CAPTURED body is data, not a group separator" do
+    body = "line1\r\n%%%\r\nline2" # 17 bytes; the middle line is the capture's, not a split
+    head = "POST /p HTTP/1.1\r\nHost: h.test\r\nContent-Length: #{body.bytesize}\r\n\r\n"
+    wire = head + body
+
+    seed = ->(store : Gori::Store) do
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "POST", target: "/p", http_version: "HTTP/1.1",
+        head: head.to_slice, body: body.to_slice))
+      store.get_flow(id).not_nil!
+    end
+
+    it "reflects the WHOLE buffer's Content-Length, so the pane, ^X and ^R agree" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        # Was `Content-Length: 5` (the pre-`%%%` chunk) in a pane whose ^R sent 17.
+        view.request_text.should contain("Content-Length: 17")
+        view.request_text.should_not contain("Content-Length: 5")
+        String.new(view.request_bytes).should eq(wire)
+
+        view.focus_pane(:request)
+        view.toggle_request_hex.should be_true # ^X snapshots the editor buffer
+        String.new(view.request_bytes).should eq(wire)
+      end
+    end
+
+    it "does not split a capture into a request the operator never authored" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        reqs = view.pipeline_requests
+        reqs.size.should eq(1) # was 2 — the second's request LINE was the body's `line2`
+        reqs.first[0].should eq("POST /p HTTP/1.1")
+        String.new(reqs.first[1]).should eq(wire)
+      end
+    end
+
+    it "DOES split once the operator adds a separator of their own" do
+      repeater_tmp_store do |store|
+        view = RepeaterView.new
+        view.load(seed.call(store))
+        # The capture brought one `%%%`; a second one is the operator's, and from then on the
+        # buffer is a group draft — captured separator included, which the per-chunk
+        # Content-Lengths make visible.
+        view.replace_request(wire + "\r\n%%%\r\nGET /second HTTP/1.1\r\nHost: h.test\r\n\r\n")
+        reqs = view.pipeline_requests
+        reqs.size.should eq(3)
+        reqs.last[0].should eq("GET /second HTTP/1.1")
+      end
+    end
+
+    it "COMPLEMENT: an operator-typed %%% on a DRAFT still splits and still group-sends" do
+      view = RepeaterView.new
+      view.restore("http://h.test",
+        "POST /a HTTP/1.1\nHost: h.test\nContent-Length: 99\n\nx=1\n%%%\nGET /b HTTP/1.1\nHost: h.test\n\n",
+        false, true) # evidence: false — the operator typed the separator
+      reqs = view.pipeline_requests
+      reqs.size.should eq(2)
+      reqs[0][0].should eq("POST /a HTTP/1.1")
+      reqs[1][0].should eq("GET /b HTTP/1.1")
+      String.new(reqs[0][1]).should contain("Content-Length: 3") # per-CHUNK, as before
+      view.request_text.should contain("Content-Length: 3")      # …and reflected in the pane
+    end
+
+    # The third face, on a DRAFT the operator wrote correctly. `reflect_content_length_in_editor`
+    # writes a CHUNK-scoped Content-Length into a buffer that `request_bytes` and the `^X`
+    # snapshot both read WHOLE, and one number cannot be right for both framings:
+    #
+    #   pane        Content-Length: 3    ← chunk 1's body, "AAA"; what `space ▸ g` sends
+    #   ^R          Content-Length: 60   ← re-synced whole; self-consistent, but the pane never
+    #                                      said 60 and the operator authored TWO requests
+    #   ^X then ^R  Content-Length: 3 over a 60-byte body — a desync gori INVENTED
+    #
+    # So the whole-buffer framing is refused by name. Reflecting the whole-buffer number
+    # instead would only move the lie onto `g`, which `reflect_content_length_in_editor`'s own
+    # comment calls the worse way round. See `RepeaterView#group_framing_refusal`.
+    describe "a %%% buffer is a GROUP — the whole-buffer send is refused, not guessed" do
+      draft = "POST /g1 HTTP/1.1\nHost: h.test\nContent-Length: 99\n\nAAA\n" \
+              "%%%\nPOST /g2 HTTP/1.1\nHost: h.test\nContent-Length: 99\n\nBB"
+
+      it "refuses ^R by name and names both remedies" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, false, true) # auto-CL ON
+        view.request_text.should contain("Content-Length: 3")
+        ex = expect_raises(Gori::Fuzz::ChainError, /%%% separator/) { view.request_bytes }
+        ex.message.not_nil!.should contain("space ▸ g")
+        ex.message.not_nil!.should contain("^L")
+      end
+
+      it "refuses the ^X snapshot too — the sharp face, an invented CL/body desync" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, false, true)
+        view.focus_pane(:request)
+        view.toggle_request_hex.should be_true
+        # Was: 110 bytes of `Content-Length: 3` over a 60-byte body, sent verbatim.
+        expect_raises(Gori::Fuzz::ChainError, /%%% separator/) { view.request_bytes }
+      end
+
+      it "refuses a TRAILING %%% too — where `g` sees only ONE chunk" do
+        view = RepeaterView.new
+        # The row that rules out any "more than one chunk" predicate: pipeline_requests is 1,
+        # yet the pane says 3 and a whole-buffer ^R would frame 7.
+        view.restore("http://h.test",
+          "POST /g1 HTTP/1.1\nHost: h.test\nContent-Length: 99\n\nAAA\n%%%", false, true)
+        view.pipeline_requests.size.should eq(1)
+        view.request_text.should contain("Content-Length: 3")
+        expect_raises(Gori::Fuzz::ChainError, /%%% separator/) { view.request_bytes }
+      end
+
+      it "COMPLEMENT: `space ▸ g` still splits and still sends per-chunk lengths" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, false, true)
+        reqs = view.pipeline_requests # does NOT go through request_bytes — unrefused
+        reqs.size.should eq(2)
+        String.new(reqs[0][1]).should contain("Content-Length: 3")
+        String.new(reqs[1][1]).should contain("Content-Length: 2")
+      end
+
+      it "COMPLEMENT: auto-CL OFF sends whole, unrefused — gori wrote no number" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, false, false) # ^L off
+        # Pane, ^R and g all carry the operator's own 99. Nothing invented ⇒ nothing to refuse,
+        # and a literal `%%%` line in a body stays expressible.
+        view.request_text.should contain("Content-Length: 99")
+        String.new(view.request_bytes).should contain("Content-Length: 99")
+        view.request_text.should_not contain("Content-Length: 3")
+      end
+
+      it "COMPLEMENT: a draft with NO %%% is byte-identical and never refused" do
+        view = RepeaterView.new
+        view.restore("http://h.test",
+          "POST /g1 HTTP/1.1\nHost: h.test\nContent-Length: 99\n\nAAA", false, true)
+        view.request_text.should contain("Content-Length: 3")
+        String.new(view.request_bytes).should eq(
+          "POST /g1 HTTP/1.1\r\nHost: h.test\r\nContent-Length: 3\r\n\r\nAAA")
+      end
+
+      # The THIRD whole-buffer reader. `repeater_minimize` never calls `request_bytes` — it
+      # snapshots `request_text` and re-syncs Content-Length over the whole buffer in its own
+      # `resolve` — so the framing `^R` refuses ONCE, a minimize did up to SEND_CAP times in
+      # one keypress. See `RepeaterView#minimize_refusal`.
+      it "refuses MINIMIZE, whose one keypress carries that framing hundreds of times" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, false, true)
+        view.minimizable?.should be_false # was true
+        view.minimize_refusal.not_nil!.should contain("%%% separator")
+        view.minimize_refusal.not_nil!.should contain("several requests as one")
+      end
+
+      it "refuses MINIMIZE with auto-CL OFF too — unlike ^R, which stays allowed there" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, false, false)
+        # `Minimize.run` reads base_text STRUCTURALLY as one request, so on a group buffer it
+        # strips lines out of the operator's SECOND request whatever the Content-Length says.
+        # A whole-buffer `^R` with ^L off is a legitimate byte-exact send; this is not.
+        view.minimizable?.should be_false
+        String.new(view.request_bytes).should contain("Content-Length: 99") # ^R still allowed
+      end
+
+      it "COMPLEMENT: minimize still runs on an ordinary request, and names its other refusals" do
+        plain = RepeaterView.new
+        plain.restore("http://h.test", "GET /a?x=1 HTTP/1.1\nHost: h.test\n\n", false, true)
+        plain.minimizable?.should be_true
+        plain.minimize_refusal.should be_nil
+
+        marked = RepeaterView.new
+        marked.restore("http://h.test", "GET /a?x=§1§ HTTP/1.1\nHost: h.test\n\n", false, true)
+        marked.minimizable?.should be_false
+        marked.minimize_refusal.not_nil!.should contain("§…§")
+
+        hex = RepeaterView.new
+        hex.restore("http://h.test", "GET /a HTTP/1.1\nHost: h.test\n\n", false, true)
+        hex.focus_pane(:request)
+        hex.toggle_request_hex
+        hex.minimize_refusal.not_nil!.should contain("plain HTTP text")
+      end
+
+      it "COMPLEMENT: h2 minimizes and sends whole — %%% is not a separator there" do
+        view = RepeaterView.new
+        view.restore("http://h.test", draft, true, true) # http2: true
+        view.minimizable?.should be_true                 # send_pipeline is an h1 primitive
+        # 61, not the 60 of the auto-CL-ON group: with no chunking the SECOND request's own
+        # `Content-Length: 99` is left as body text rather than resynced to 2.
+        view.request_text.should contain("Content-Length: 61")              # pane reads whole-buffer
+        String.new(view.request_bytes).should contain("Content-Length: 61") # …and the wire agrees
+      end
+
+      # Four surfaces now split or refuse on this separator (TUI group send, TUI minimize,
+      # `gori run repeater minimize`, MCP minimize). Two spellings of it was the last drift
+      # left in that set, and a separator the TUI and the engine disagreed about would be
+      # precisely the "two places decide the split" failure the seam exists to prevent.
+      it "shares ONE spelling of the separator with the engine the headless surfaces use" do
+        RepeaterView::PIPELINE_SEP.should eq(Gori::Repeater::Minimize::GROUP_SEP)
+        # …and they agree on a real buffer, trimming included.
+        text = "POST /a HTTP/1.1\nHost: h.test\nContent-Length: 9\n\nx\n  %%%\t\nPOST /b HTTP/1.1\nHost: h.test\n\n"
+        Gori::Repeater::Minimize.group_document?(text).should be_true
+        view = RepeaterView.new
+        view.restore("http://h.test", text, false, true)
+        view.pipeline_requests.size.should eq(2)
+        view.minimizable?.should be_false
+      end
+
+      it "COMPLEMENT: a CAPTURED %%% is inert, so it reflects and sends WHOLE, unrefused" do
+        repeater_tmp_store do |store|
+          view = RepeaterView.new
+          view.load(seed.call(store)) # the capture from the describe above: `line1\r\n%%%\r\nline2`
+          view.request_text.should contain("Content-Length: 17")
+          String.new(view.request_bytes).should eq(wire) # no refusal — the separator is not live
+        end
+      end
+    end
+
+    it "COMPLEMENT: a capture with NO %%% is byte-identical to before the gate" do
+      repeater_tmp_store do |store|
+        plain = "line1\r\nline2"
+        h = "POST /p HTTP/1.1\r\nHost: h.test\r\nContent-Length: #{plain.bytesize}\r\n\r\n"
+        id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+          method: "POST", target: "/p", http_version: "HTTP/1.1",
+          head: h.to_slice, body: plain.to_slice))
+        view = RepeaterView.new
+        view.load(store.get_flow(id).not_nil!)
+        String.new(view.request_bytes).should eq(h + plain)
+        view.request_text.should contain("Content-Length: 12")
+        view.pipeline_requests.size.should eq(1)
+      end
+    end
+  end
+
   it "CHAIN pane: focus a marker, type a chain, commit writes it back" do
     view = RepeaterView.new
     # marker at offset 0 → set_text zeroes the cursor, so it sits inside §v§

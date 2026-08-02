@@ -80,6 +80,12 @@ module Gori
           p.on("--verbatim", "Send the template's Content-Length as written — no auto-resync after payload substitution (for CL / CL-TE desync payloads)") { update_cl = false }
           p.on("--mc=SPEC", "Match status (e.g. 200,302,500-599,2xx)") { |v| matcher.match_status = v }
           p.on("--fc=SPEC", "Filter out status") { |v| matcher.filter_status = v }
+          # The h2 `:status` of a gRPC response is 200 by definition, so --mc/--fc cannot tell
+          # a granted call from `7 PERMISSION_DENIED`; the call status is in the `grpc-status`
+          # trailer, which every row now carries. Numeric spec (7, >0, 1-16) — a `2xx` class
+          # means nothing for a gRPC code.
+          p.on("--mg=SPEC", "Match gRPC status from the grpc-status trailer (e.g. 7, >0, 1-16)") { |v| matcher.match_grpc = v }
+          p.on("--fg=SPEC", "Filter out gRPC status") { |v| matcher.filter_grpc = v }
           p.on("--ms=SPEC", "Match response size (e.g. 1500,>1000)") { |v| matcher.match_size = v }
           p.on("--fs=SPEC", "Filter out response size") { |v| matcher.filter_size = v }
           p.on("--mw=SPEC", "Match word count") { |v| matcher.match_words = v }
@@ -136,7 +142,7 @@ module Gori
           Fuzz::Plan.build(options, outbound)
         rescue ex : Fuzz::PlanError
           outbound.close
-          abort "gori run fuzz: #{fuzz_plan_error(ex)}"
+          abort "gori run fuzz: #{fuzz_plan_error(ex, text)}"
         end
         warn_fuzz_marks(plan)
         warn_fuzz_content_length(plan)
@@ -149,10 +155,10 @@ module Gori
         # Calibration SENDS, so it belongs inside the block that releases the read
         # connection — a raise in there would otherwise leak it.
         begin
-          # Session bindings: seed the in-memory table, or refuse before the sweep rather
-          # than after every row of it. See CLI::Run.seed_bindings.
+          # Session bindings: seed the in-memory table before the sweep rather than after
+          # every row of it. See CLI::Run.seed_bindings. An unseeded `$NAME` is not refused —
+          # it ships literally (see `Env.unbound`).
           (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run fuzz")
-          preflight_bindings(text, bind_from, "gori run fuzz")
           plan.engine.calibrate_baseline if auto_cal
           run_fuzz_stream(plan.engine, mode, origin.scheme, origin.host, origin.port, format, force,
             fail_if_no_matches, plan.pool, max_requests)
@@ -163,10 +169,23 @@ module Gori
 
       # `gori run fuzz`'s wording for a plan the options can't produce. The builder reports
       # the machine-readable `reason`; the sentence (and the flags it names) is ours.
-      private def self.fuzz_plan_error(ex : Fuzz::PlanError) : String
+      # `template` is the seeded text, needed only to tell the two NoPositions cases apart.
+      private def self.fuzz_plan_error(ex : Fuzz::PlanError, template : String? = nil) : String
         case ex.reason
         in Fuzz::PlanError::Reason::NoPositions
-          "no positions — add §…§ markers, --auto, or --mark TOKEN"
+          # Every `§` present is LITERAL: an escaped `§§`, which is what the `--flow` seed
+          # makes of a capture's own `§`, or an unpaired one the operator typed. `Template
+          # .auto_mark` is a documented no-op once ANY `§` is in the text, so naming `--auto`
+          # here would send the operator round the same loop — and on a `--flow --auto` run it
+          # would deny that `--auto` had been passed at all, about a request that visibly has
+          # a query string and a body full of values. `--mark` still names a position.
+          if (t = template) && Fuzz::Template.marker_bytes_in?(t.to_slice)
+            "no positions — every § in this template is literal (a --flow capture's § is " \
+            "escaped to §§ so the site's own text is not swept), and --auto adds nothing " \
+            "while any § is present; name a position with --mark TOKEN"
+          else
+            "no positions — add §…§ markers, --auto, or --mark TOKEN"
+          end
         in Fuzz::PlanError::Reason::NoTarget
           "--target is required for --request/stdin"
         in Fuzz::PlanError::Reason::BadTarget
@@ -222,7 +241,23 @@ module Gori
           # while its line names another needs its own design, not a boolean.
           warn_request_line_rewrite(built, "gori run fuzz",
             "replay it with `gori run repeater #{id} --keep-request-line` to keep it")
-          {String.new(built.bytes).scrub, built.target, built.http2, true}
+          # Two things the DRAFT branches above must not get, and this one must — see
+          # `FuzzerView#load`, which is the same seam on the TUI's ⇧I road:
+          #
+          #   * every `§` is escaped to the `§§` literal `Fuzz::Template.parse` already
+          #     defines. `§…§` is this template's injection-position syntax, but `§` is also
+          #     U+00A7 — ordinary text a German or legal body carries constantly — so a
+          #     captured `"mk":"§SEED§"` used to arrive as a live position nobody marked, and
+          #     the sweep replaced the site's own text with every payload in the set with no
+          #     `--auto` and no `--mark` passed. Escaping keeps the bytes: `render` puts the
+          #     single `§` back on the wire and the Content-Length still agrees.
+          #   * no `.scrub`. A capture is EVIDENCE and may legitimately not be valid UTF-8 (a
+          #     protobuf/gRPC frame, a gzip'd POST, a latin-1 field). Scrubbing rewrote each
+          #     such byte to the three bytes of U+FFFD before the sweep ran, and `Plan.build`
+          #     then resynced Content-Length to the corruption — measured, `ff fe 01 02` went
+          #     out as `ef bf bd ef bf bd 01 02`. `Template.parse`/`render` are byte-oriented,
+          #     so nothing downstream needed the scrub in the first place.
+          {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true}
         elsif !STDIN.tty?
           {STDIN.gets_to_end, nil, false, false}
         else
@@ -299,6 +334,19 @@ module Gori
                     "#{total - p.sent} of #{total} payloads untried"
       end
 
+      # The template was a cleanly-framed gRPC request and a payload of a different length left
+      # its 5-byte length prefix declaring the OLD one — bytes a real gRPC server rejects, sent
+      # under `N sent · 0 errors`. The bytes are NOT changed (P7: the payload is the test case,
+      # and `--verbatim` exists because a silent re-frame is the complaint elsewhere); this is
+      # the disclosure Content-Length has always had and this declaration never did.
+      private def self.warn_fuzz_grpc_framing(p : Fuzz::Progress) : Nil
+        return unless p.grpc_stale > 0
+        STDERR.puts "gori run fuzz: note: #{p.grpc_stale_reason}" if p.grpc_stale_reason
+        STDERR.puts "gori run fuzz: note: the template's gRPC length prefix is not recomputed " \
+                    "when a payload changes the message length — #{p.grpc_stale} of " \
+                    "#{p.grpc_requests} requests left it stale"
+      end
+
       private def self.fuzz_done(ev : Fuzz::DoneEvent, emitted : Int32, pool : Fuzz::ConnPool?,
                                  max_requests : Int64? = nil) : Nil
         STDERR.print "\r" if STDERR.tty? # clear the in-place meter (none was drawn when piped)
@@ -309,11 +357,13 @@ module Gori
         extra = p.requests > p.sent ? " · #{p.requests} requests on the wire" : ""
         STDERR.puts "done · #{p.sent} sent#{extra} · #{emitted} shown · #{p.errors} errors#{ev.stopped ? " (stopped)" : ""}"
         warn_fuzz_budget(p, max_requests)
-        # Sends stopped BEFORE the socket (Sandbox, an exclude rule, an unbound binding). They
-        # already appear as per-row errors, but a run that is 100% refused reads as "the
-        # target is down" unless the gate is named once, with its remedy.
+        warn_fuzz_grpc_framing(p)
+        # Sends stopped BEFORE the socket (Sandbox, an exclude rule). They already appear as
+        # per-row errors, but a run that is 100% refused reads as "the target is down" unless
+        # the gate is named once.
+
         if (blocked = ev.progress.blocked) > 0
-          note = blocked_reason_line(ev.progress.blocked_reason, "gori run fuzz")
+          note = ev.progress.blocked_reason
           STDERR.puts "blocked · #{blocked} refused before the socket#{note ? " — #{note}" : ""}"
         end
         # Handshakes actually paid for. Worth a line: it is how an operator sees whether the

@@ -193,8 +193,13 @@ module Gori::Fuzz
     end
 
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
-      # ONE `Env.expand_wire` over the template, before anything reads it — and first, a
-      # refusal when a token in the HEAD resolves to nothing (see `refuse_unresolved`).
+      # ONE `Env.expand_wire` over the template, before anything reads it.
+      #
+      # There USED to be a refusal in front of it, when a token in the HEAD resolved to
+      # nothing (#519). It is gone: a `$NAME` with no value is a literal string on the wire
+      # (see `Env::Escape`), and this check refused a GraphQL query string, a Mongo `$where`
+      # filter and a JSON Schema `$ref` in a header — all of them the operator's test case.
+      # `$$` is the escape for a name that DOES resolve.
       #
       # `expand_wire`, not `expand`: this was the ONE plan builder of the three that skipped
       # the head's LF→CRLF promotion (`miner/plan.cr` and `sequencer/plan.cr` have always
@@ -209,18 +214,11 @@ module Gori::Fuzz
       # marking, template parse and payload splice below are unchanged either way — a
       # position is a position whether the operator marked it in an editor or `--auto`
       # found it in a capture.
-      text = if options.evidence?
-               options.template
-             else
-               refuse_unresolved(Env.unresolved_wire(options.template))
-               String.new(Env.expand_wire(options.template))
-             end
+      text = options.evidence? ? options.template : String.new(Env.expand_wire(options.template))
       text = Template.auto_mark(text) if options.auto_mark?
-      marker = Template::MARKER
       mark_matches = options.marks.map do |tok|
-        occ = {tok, occurrences(text, tok)}
-        text = text.gsub(tok, "#{marker}#{tok}#{marker}")
-        occ
+        text, count = wrap_token(text, tok)
+        {tok, count}
       end
       template = Template.parse(text, options.http2?)
       raise PlanError.new(PlanError::Reason::NoPositions, "the template has no §…§ positions") if template.position_count == 0
@@ -253,12 +251,31 @@ module Gori::Fuzz
       # The shared decoder registry applies each position's inline `¦chain` at render time.
       # Wired here so a new surface cannot forget it and silently send un-transformed payloads.
       generator = Generator.new(template, gen_sets, config, registry: Decoder.shared_registry)
+      # gRPC framing, decided ONCE off the seed rendering: a template that declares
+      # `content-type: application/grpc` and whose body frames cleanly has a 5-byte length
+      # prefix that a payload of a different length will INVALIDATE. gori keeps the operator's
+      # bytes either way (P7), but Content-Length gets resynced-and-announced while this
+      # declaration got neither — so a sweep in which two of three requests were malformed at
+      # the gRPC layer reported `3 sent · 0 errors`. From here the Matcher counts them and the
+      # surfaces name it once. A seed that was ALREADY mis-framed is the operator's own parser
+      # test and switches this off, because there is nothing left to break.
+      matcher.grpc_template = GrpcVerdict.framed_template?(generator.baseline_raw)
       # One parked connection per worker fiber is the ceiling that can ever be checked out
       # at once, so the pool is sized to the (clamped) concurrency the engine will run at.
+      #
+      # `evidence:` carries the SAME provenance decision the template branch above took, one
+      # stage further — to the send seam, where session bindings resolve (`Sender#evidence?`).
+      # Skipping `expand_wire` at plan time and then expanding `$id` per send is the shape
+      # this whole axis is made of: the run's own `--mark`/`--auto` payload spans protected
+      # the operator's payloads while the CAPTURED body around them was still substituted.
+      # It reaches all three of the engine's send sites at once — the sweep, the redirect
+      # hops, and `calibrate_baseline`, whose nonces are safe but whose CARRIER is this same
+      # template rendered with them.
       sender = Sender.new(origin, outbound, http2: options.http2?, verify: options.verify?,
         sni: options.sni, timeout: config.timeout, overrides: options.overrides,
         keep_alive: config.keep_alive?,
-        idle_conns: config.concurrency.clamp(1, Engine::MAX_CONCURRENCY))
+        idle_conns: config.concurrency.clamp(1, Engine::MAX_CONCURRENCY),
+        evidence: options.evidence?)
       new(engine: Engine.new(generator, matcher, sender, config), generator: generator,
         matcher: matcher, config: config, origin: origin, template: template,
         http2: options.http2?, request_target: request_target, mark_matches: mark_matches,
@@ -273,8 +290,8 @@ module Gori::Fuzz
       raw = options.target.presence || options.default_target.presence
       raise PlanError.new(PlanError::Reason::NoTarget, "no target origin") unless raw
       # `deferred: nil` — a DIAL TUPLE cannot defer. Every other unresolved-name site skips a
-      # DECLARED binding because a send seam re-scans the same value with `Env.unbound` +
-      # `expand_bindings` later; this value is read ONCE, frozen into the plan, and never
+      # DECLARED binding because a send seam re-scans the same value with `Env.expand_bindings`
+      # later; this value is read ONCE, frozen into the plan, and never
       # looked at again — `Fuzz::Sender`/`Discover::Sender` build their ConnPool on it and the
       # Layer-1 `Outbound#check` verdict was already taken against it, so re-resolving per send
       # would move the dial target out from under a scope decision. Deferring bought nothing
@@ -289,13 +306,14 @@ module Gori::Fuzz
       Origin.new(scheme, host, port)
     end
 
-    # Refuse a run whose template or target still carries a token that resolves to
-    # nothing. `Env.expand` leaves an unregistered `$KEY` literal on purpose — right for
-    # a display path, wrong here, because the seven characters `$SESSION` then go out as
-    # a header value, the origin answers 401, and the results read as findings about the
-    # target rather than as a variable the operator never set (#519). This builder is the
-    # surface-independent chokepoint every fuzz surface expands through, so the check
-    # lives here once instead of in each of the three.
+    # Refuse a run whose TARGET carries a token that resolves to nothing.
+    #
+    # The template half of this is gone — a `$NAME` with no value is a literal string on the
+    # wire now, everywhere. A DIAL TUPLE is the exception the note at the call site argues:
+    # `$` is not a legal byte in a hostname, so there is no operator test case to protect,
+    # and a literal `$SESSION` there makes `Outbound.scope_url` ask about `https://$SESSION/a`
+    # — a URL no rule can match — so the run comes back refused as OUT-OF-SCOPE, naming a
+    # gate that was never the problem. Refusing here names the real one.
     private def self.refuse_unresolved(names : Array(String)) : Nil
       return if names.empty?
       detail = Env.token_list(names)
@@ -348,17 +366,54 @@ module Gori::Fuzz
                            "(list the converters with `gori run decoder list`)")
     end
 
-    # Non-overlapping occurrences of a literal token (mirrors what `String#gsub` will
-    # replace), so a surface can warn about a short token matching far more than intended.
-    private def self.occurrences(text : String, token : String) : Int32
-      return 0 if token.empty?
+    # Wrap every non-overlapping occurrence of a literal `--mark` / MCP `marks` token in
+    # `§…§`, returning {new text, occurrence count} — one pass, so the count a surface warns
+    # with is by construction the number of positions that were actually made.
+    #
+    # BYTE SAFETY — read before reaching for `String#gsub` here. `text` can be a CAPTURE's
+    # own bytes (`--flow`, MCP `flow_id`), which may legitimately not be valid UTF-8: a
+    # protobuf/gRPC frame, a gzip'd POST, a latin-1 form field. `String#gsub(String, String)`
+    # delegates to the CHAR overload as soon as the needle is ONE BYTE long, and Crystal's
+    # char iteration substitutes the three bytes of U+FFFD for every byte that is not valid
+    # UTF-8 — so the LENGTH of the operator's token silently decided whether the request
+    # survived. Measured through `gori run fuzz --request` against a recording origin, on a
+    # body `v=1&bin=<ff fe 01 02>&w=2`:
+    #
+    #   --mark v   →  50 3d 31 26 62 69 6e 3d ef bf bd ef bf bd 01 02 26 77 3d 32   CL 16 → 20
+    #   --mark v=  →  50 31 26 62 69 6e 3d ff fe 01 02 26 77 3d 32                  intact
+    #
+    # …and on the corrupt run gori then printed "the template's Content-Length disagrees with
+    # its own body", about a disagreement it had just manufactured. This is the headless twin
+    # of the ^K marking defect; the rule is the same one written down under
+    # `Fuzz::Template.split_raw_interior` — bytes in, bytes out, never a char walk.
+    #
+    # Returns `text` ITSELF when the token does not occur, so the common case is
+    # byte-identical and allocation-free.
+    private def self.wrap_token(text : String, token : String) : {String, Int32}
+      return {text, 0} if token.empty?
+      hay = text.to_slice
+      needle = token.to_slice
+      return {text, 0} if needle.size > hay.size
+      marker = Template::MARKER_BYTES
+      io = IO::Memory.new(hay.size + 8)
       count = 0
-      idx = 0
-      while found = text.index(token, idx)
-        count += 1
-        idx = found + token.size
+      i = 0
+      last = hay.size - needle.size
+      while i <= last
+        if hay[i, needle.size] == needle
+          io.write(marker)
+          io.write(needle)
+          io.write(marker)
+          count += 1
+          i += needle.size
+        else
+          io.write_byte(hay[i])
+          i += 1
+        end
       end
-      count
+      return {text, 0} if count.zero?
+      io.write(hay[i..]) if i < hay.size
+      {String.new(io.to_slice), count}
     end
   end
 end

@@ -1231,6 +1231,18 @@ module Gori::Tui
       @host.status(@repeaters.empty? ? "closed repeater — none open (^N new · ^R from History)" : "closed repeater (#{@repeaters.size} open)")
     end
 
+    # Finish the one running minimize on a project-level exit (leave project / quit), for
+    # the same reason close_repeater_tab does it per tab: the Runner is about to unwind, so
+    # `drain_results` never runs again to see the terminal Report and the job would stay
+    # :running forever in a Jobs registry the next open no longer shares. Minimize has no
+    # `request_stop` seam (it is a capped, bounded probe run — see repeater_minimize), so
+    # finishing the job is the whole treatment here, exactly as at :1222.
+    def stop_all : Nil
+      return unless mj = @minimize_job
+      @host.jobs.finish(mj[1], :stopped, "project closed")
+      @minimize_job = nil
+    end
+
     def repeater_send : Nil
       return unless (tab = current_repeater_tab) && (view = tab.view).loaded?
       view.commit_chain_pane                        # flush an in-progress CHAIN-pane edit so ^R can't send stale bytes (matches the SEND-chip click)
@@ -1292,8 +1304,12 @@ module Gori::Tui
     # request back into the editor when done. One minimize at a time, per project.
     def repeater_minimize : Nil
       return unless (tab = current_repeater_tab) && (view = tab.view).loaded?
-      unless view.minimizable?
-        @host.status("minimize needs a plain HTTP text request (not hex/gRPC/WS/decode or §markers)")
+      # `minimize_refusal`, not `minimizable?` + a sentence of our own: the view now owns
+      # BOTH the predicate and the wording (`minimizable?` is defined as this being nil), so
+      # the two cannot drift. The old sentence here named hex/gRPC/WS/decode and §markers,
+      # and answered none of the three problems for a `%%%` group document.
+      if reason = view.minimize_refusal
+        @host.status("minimize: #{reason}")
         return
       end
       if view.inflight? || @minimize_job
@@ -1302,21 +1318,15 @@ module Gori::Tui
       end
       view.commit_chain_pane
       # Minimize dials `Fuzz::Sender` directly rather than through `Repeater::Plan`, by
-      # design, so the builder's unresolved-token refusal (#519) never runs for it and this
-      # is the only place that check can happen (#524). Before `parse_target`, which expands:
-      # an unresolved `$HOST` survives as the literal host and would otherwise be reported as
-      # an invalid target naming no variable.
+      # design, so the builder's dial-tuple refusal never runs for it and this is the only
+      # place that check can happen (#524). Before `parse_target`, which expands: an
+      # unresolved `$HOST` survives as the literal host and would otherwise be reported as an
+      # invalid target naming no variable.
       #
-      # Head-only on the REQUEST (`unresolved_wire`) for #519's reason — a `$` in a captured
-      # body is a byte, and a whole-request check refuses nearly every binary-body session —
-      # but whole-string on the target and SNI, which are short operator-typed fields with no
-      # body to exclude. The CLI and MCP minimize paths carry the same three checks.
-      # The REQUEST half drops out for an EVIDENCE tab, for the same reason `^R` no longer
-      # expands one: a capture's `$filter`/`$where` is not a variable anybody typed, so it is
-      # neither refusable nor resolvable. The TARGET and SNI stay checked either way — those
-      # are operator-typed fields on any tab.
-      req_names = view.evidence? ? [] of String : Env.unresolved_wire(view.request_text)
-      env_names = req_names | Env.unresolved(view.target) |
+      # The REQUEST is no longer checked at all — a `$NAME` with no value is a literal string
+      # on the wire everywhere now (see `Env::Escape`). Only the TARGET and SNI are refused;
+      # the CLI and MCP minimize paths carry the same two checks.
+      env_names = Env.unresolved(view.target) |
                   (view.sni_override.try { |s| Env.unresolved(s) } || [] of String)
       unless env_names.empty?
         @host.status("minimize: unresolved env #{Env.token_list(env_names)} — add it in the Project tab's ENV pane")
@@ -1348,11 +1358,18 @@ module Gori::Tui
       # the project's host overrides (#367 — without them this path resolves the target for
       # real while ^R honours the operator's pin), and `Env.expand` over the SNI, which the
       # CLI and MCP minimize paths have always done and this one did not.
+      #
+      # And `evidence:` — the third. The `resolve` proc above already acts on it, and the
+      # comment on it already says the `$KEY` substitution is not owed to captured bytes; the
+      # SESSION-BINDING substitution lives one seam later, inside `Fuzz::Sender`, and ran
+      # regardless. This is the most exposed of the three minimize surfaces because a live TUI
+      # holds bound bindings continuously, which is the normal state and not the exceptional
+      # one. See `Fuzz::Sender#evidence?`.
       backend = Fuzz::CappedBackend.new(
         Fuzz::Sender.new(Fuzz::Origin.new(scheme, host, port), outbound, view.http2?,
           !@host.session.config.insecure_upstream?,
           view.sni_override.try { |s| Env.expand(s).presence }, timeout: 10.seconds,
-          overrides: @host.session.host_overrides),
+          overrides: @host.session.host_overrides, evidence: evidence),
         Repeater::Minimize::SEND_CAP)
       job = @host.jobs.start(:minimize, view.summary, goto: Jobs::Goto.new(:repeater, tab.db_id))
       @minimize_job = {view, job, text} # `text` is the snapshot the run minimizes; see apply_minimize_report
@@ -1383,14 +1400,6 @@ module Gori::Tui
         @host.status("ws repeater: #{reason}")
         return
       end
-      # The handshake went through the builder above, which refuses an unresolved token
-      # (#519); the MESSAGES did not — they are expanded one frame at a time, after the
-      # handshake is built, so this is the only place that check can run for them (#524).
-      # Before `inflight` and before the dial: a refused send must leave the tab resendable.
-      unless (names = view.ws_unresolved_env).empty?
-        @host.status("ws repeater: unresolved env #{Env.token_list(names)} in a message — add it in the Project tab's ENV pane")
-        return
-      end
       messages = view.ws_out_messages
       keep_key = view.ws_keep_key?
       view.inflight = true
@@ -1419,6 +1428,10 @@ module Gori::Tui
       end
       unless view.group_sendable?
         @host.status(view.http2? ? "send group is HTTP/1.1 only — ^V to switch off h2" : "send group needs plain text mode (not hex/gRPC/WS/decode)")
+        return
+      end
+      if reason = RepeaterController.group_marker_refusal(view.markers_active?)
+        @host.status(reason)
         return
       end
       view.downgrade_h2_request_lines(group: true) # every chunk rides the same h1 connection
@@ -1494,13 +1507,60 @@ module Gori::Tui
     # split exists for. And these are exactly the bytes `expand_bindings` would have
     # rewritten, so the two cannot disagree about what was withheld. An UNBOUND declared
     # name is deliberately not reported: nothing would have been substituted for it on any
-    # surface, so there is no divergence to name (`Sender#refusal` owns that case).
+    # surface — evidence or draft — so there is no divergence to name.
     def self.literal_bindings(evidence : Bool, text : String) : Array(String)
       return [] of String unless evidence
       prefix = Gori::Settings.env_prefix
       return [] of String if prefix.empty?
       Env.binding_values.keys.select { |n| text.includes?("#{prefix}#{n}") }.sort!
     end
+
+    # Why a `%%%` group send refuses while LIVE §…§ markers are present, or nil to proceed.
+    #
+    # `RepeaterView#pipeline_requests` goes straight to
+    # `finalize_wire(expanded_text_to_bytes(…))` and never reaches `marked_request_bytes` →
+    # `render_marked`, so without this the markers left as their OWN literal bytes:
+    # `§PAYLOAD-A¦base64-encode§` on the wire under `Content-Length: 28` while the editor
+    # showed the rendered `12`, reported as a clean "2/2 ok". The same divergence took the
+    # `¦chain` refusal (`RepeaterView#refuse_bad_chains`, reachable only through
+    # `render_marked(refuse: true)`) off this path entirely, so `%%%` shipped an unrunnable
+    # chain that `^R` refuses two keystrokes earlier — one of the two send buttons on the
+    # pane protected and the other not.
+    #
+    # Takes `RepeaterView#markers_active?`, NOT a raw `Fuzz::Template.marker_regions` scan:
+    # a `§` that arrived as CAPTURED evidence is data (a German/legal body carries them),
+    # it is inert until the operator declares markers, and `pipeline_requests` puts inert
+    # bytes on the wire exactly as `^R` does — so refusing on it would block a group send
+    # that was never wrong. One predicate for both send buttons.
+    #
+    # The condition's home is `RepeaterView#group_sendable?`, whose own comment already
+    # names MARK alongside hex / gRPC / WS / decode; it simply never grew the term its
+    # sibling `minimizable?` has. It sits here for now, at the ONE call site of
+    # `pipeline_requests`.
+    #
+    # `self.` and pure for the reason `.literal_bindings` above is: what the operator is
+    # told instead of a send is the whole behaviour, and a Host double is not the thing
+    # worth building to pin it.
+    def self.group_marker_refusal(markers_active : Bool) : String?
+      return nil unless markers_active
+      "send group does not render §…§ markers — remove them, or ^R to send one request with the chains applied"
+    end
+
+    # (A `whole_buffer_refusal` helper used to live here, asking the view through
+    # `request_bytes` whether a WHOLE-BUFFER read was refusable — minimize is one by
+    # definition, since its `resolve` re-syncs Content-Length over the entire buffer, and
+    # `minimizable?` had no `%%%` clause. It found a real defect: pane `Content-Length: 3`,
+    # minimize's resolve `Content-Length: 63`, applied once per PROBE send, i.e. hundreds of
+    # times against the origin under one `space ▸ M`.
+    #
+    # It is gone because routing through `request_bytes` inherited that method's auto-CL
+    # scoping, and minimize legitimately differs there: `Minimize.run` reads the buffer
+    # STRUCTURALLY as one request, so on a group document it strips lines out of the
+    # operator's SECOND request and reports them as headers removed from the first —
+    # meaningless whatever the Content-Length says, and true with auto-CL off too. The view
+    # now splits `group_document?` (structural) from `chunked_reflection?` (structural, plus
+    # gori wrote the number) and answers through `minimize_refusal`, which `repeater_minimize`
+    # calls directly.)
 
     # The scope decision Repeater's direct sends (^R, send-group, WS, minimize) dial through.
     # Unlike ordinary proxied traffic these dial Repeater::Engine/H2Engine/WsEngine straight

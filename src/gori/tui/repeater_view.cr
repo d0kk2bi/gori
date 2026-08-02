@@ -19,6 +19,7 @@ require "../repeater/h2_engine"
 require "../repeater/ws_engine"
 require "../repeater/diff"
 require "../repeater/flow_request"
+require "../repeater/minimize" # PIPELINE_SEP aliases Minimize::GROUP_SEP
 require "../repeater/subtab_filter"
 require "../fuzz"
 require "../decoder"
@@ -189,9 +190,19 @@ module Gori::Tui
       @diffable = false           # true only when loaded from a captured flow (has an original to diff)
       @auto_content_length = true # recompute Content-Length from the edited body on send
       # `§…§` markers carry inline Decoder chains applied on send (mark a value, attach
-      # base64-encode → it's encoded on the wire). Always active (like the Fuzzer): a request
-      # that contains a marker region renders it on send, a marker-free request is byte-
-      # identical to a plain send. Highlighting + the CHAIN pane surface contextually — no mode.
+      # base64-encode → it's encoded on the wire). On a DRAFT they are always active (like the
+      # Fuzzer): a request that contains a marker region renders it on send, a marker-free
+      # request is byte-identical to a plain send. Highlighting + the CHAIN pane surface
+      # contextually — no mode. On an EVIDENCE tab they are inert until declared, see
+      # `@markers_declared` / `markers_live?`.
+      @markers_declared = false
+      # The `%%%` twin of `@markers_declared`, and deliberately NOT the same flag: `§` and
+      # `%%%` are different syntaxes an operator types independently, so sharing one would
+      # both over-declare (mark a word → the capture's own `%%%` starts splitting the send)
+      # and under-declare. This one counts instead of latching because `%%%` has no marking
+      # verb to latch on — see `pipeline_live?`. Baseline = the separators the CAPTURE
+      # arrived with; 0 on a draft, where every `%%%` is the operator's by definition.
+      @evidence_pipeline_seps = 0
       @marker_regions_rev = -1
       @marker_regions_cache = [] of {Int32, Int32, Int32}
       # §…§ spans + the chain under the cursor, cached on the editor revision (marked_spans)
@@ -386,6 +397,39 @@ module Gori::Tui
       (h = @req_hex_edit) ? String.new(h.to_bytes) : @editor.wire_text
     end
 
+    # The same request handed to a tab that reads `§…§` as TEMPLATE SYNTAX — `space ▸ f`
+    # (Send to Fuzzer). Where this tab's markers are inert (a capture whose body legitimately
+    # carries `§`; see `markers_live?`), the literal `§` are escaped to `§§` — the escape
+    # `Fuzz::Template.parse` already defines — so the receiving template renders them back to
+    # one `§` on the wire instead of turning the site's own text into an injection position
+    # the operator never marked. Byte-identical to `request_text` in every other case, which
+    # is every request without a `§` in it.
+    #
+    # Done over BYTES, not `String#gsub`: this request is a capture, so its body may hold
+    # genuinely invalid UTF-8 (round 4's T1), and every String rebuild that walks chars
+    # rewrites those bytes to U+FFFD — measured, on this very fixture, turning
+    # `ff fe 01 02` into `ef bf bd ef bf bd 01 02` and inflating Content-Length with it.
+    # The escape itself is `Fuzz::Template.escape_literal_markers`, not a second copy of the
+    # loop: the OTHER road into a fuzz template — `FuzzerView#load`, ⇧I from History — escapes
+    # at its own seam with that helper, and two spellings of one rule is the drift this branch
+    # spent three round-trips removing for the `%%%` separator. Only the PROVENANCE question
+    # (`markers_live?`) is ours; the byte rule belongs to the template.
+    #
+    # Each road escapes exactly once: `space ▸ f` goes runner/fuzzer.cr → here →
+    # `FuzzerView#load_request`, which sets the text unescaped, so a captured `§` is never
+    # doubled.
+    # The `marker_bytes_in?` guard is LOAD-BEARING, not a redundant pre-check.
+    # `escape_literal_markers` returns `raw` itself when there is no `§`, but `String.new(Bytes)`
+    # always copies — so collapsing this to one line would copy the whole request buffer on
+    # every marker-free `space ▸ f`, which is the overwhelmingly common seed and exactly the
+    # allocation the helper's own comment says it avoids.
+    def fuzz_seed_text : String
+      text = request_text
+      src = text.to_slice
+      return text if markers_live? || !Fuzz::Template.marker_bytes_in?(src)
+      String.new(Fuzz::Template.escape_literal_markers(src))
+    end
+
     # The buffer the external editor (^E) round-trips: the ACTIVE request sub-pane — the
     # envelope, or the decoded payload when it's the split's active pane (so you can edit
     # a big SAML XML / GraphQL query in $EDITOR). Non-decode tabs = the envelope, as before.
@@ -472,7 +516,8 @@ module Gori::Tui
 
     def load(detail : Store::FlowDetail) : Nil
       @flow = detail
-      @evidence = true # a CAPTURED request — see `evidence?`
+      @evidence = true          # a CAPTURED request — see `evidence?`
+      @markers_declared = false # a fresh capture: any § in it is the origin's (see markers_live?)
       @http2 = detail.http_version == "HTTP/2"
       @target = build_target(detail.row.scheme, detail.row.host, detail.row.port)
       @tcx = @target.size
@@ -480,6 +525,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(origin_form_text(detail))
+      seed_pipeline_baseline
       @original_lines = message_lines(detail.response_head, display_body(detail.response_head, detail.response_body))
 
       @result = nil
@@ -507,6 +553,7 @@ module Gori::Tui
     def load_ws(detail : Store::FlowDetail, out_messages : Array(Store::WsOutMessage)) : Nil
       @flow = detail
       @evidence = true # the handshake AND the seeded frames are the capture's
+      @markers_declared = false
       @ws_mode = true
       @ws_keep_key = false # a fresh capture: the regenerated key is the default (see the ivar)
       @http2 = false       # WebSocket is HTTP/1.1
@@ -519,6 +566,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(String.new(detail.request_head))
+      seed_pipeline_baseline
       seed_ws_out(out_messages)
       @original_lines = [] of String
       @result = nil
@@ -548,9 +596,10 @@ module Gori::Tui
     # A tab seeded from a CAPTURED 101 flow is EVIDENCE and is not expanded at all — the
     # same rule `gori run repeater send` and MCP `send_websocket` now apply to a flow-seeded
     # session's stored rows. A captured `{"$where":"this.a==1"}` is a MongoDB injection test,
-    # not a reference to a project variable; with the draft policy on it was unsendable
-    # (`ws_unresolved_env` named `$where`) and setting the variable to get past that sent
-    # `{"WHEREVAL":"this.a==1"}`.
+    # not a reference to a project variable; with the draft policy on it was unsendable (the
+    # send named `$where`) and setting the variable to get past that sent
+    # `{"WHEREVAL":"this.a==1"}`. Neither half can happen now — an unresolved name is never
+    # refused, and evidence is never expanded.
     def ws_out_messages : Array(Repeater::WsEngine::OutMsg)
       ws_out_messages_raw.map do |m|
         # `Env.expand` scans BYTES and copies every unmatched span through untouched, so a
@@ -647,37 +696,6 @@ module Gori::Tui
       @decoded.set_text(joined) unless same
       @ws_out_seed = messages
       @ws_out_edited = false
-    end
-
-    # The env tokens in the outbound message lines that resolve to nothing — what
-    # `ws_out_messages` would leave on the wire as their own characters. Empty means every
-    # token resolved. A QUERY, deliberately separate from `ws_out_messages`: that one also
-    # feeds the COPY menu (repeater_controller#repeater_request_options), a display path
-    # where a literal `$KEY` is the honest answer. Only the SEND path consults this (#524).
-    #
-    # Whole line, not `Env.unresolved_wire`'s head: a frame has no head/body split to take,
-    # and every line here becomes a TEXT frame — UTF-8 the operator typed into the editor,
-    # the same provenance as a header value, which #519 already checks in full.
-    #
-    # `valid_encoding?` is where the CLI/MCP paths check `m.text?` instead, and it is the
-    # SAME question. The pane is seeded from the session's stored OUT frames with no opcode
-    # filter (repeater_controller: `String.new(m.payload)`), so a captured BINARY frame
-    # arrives here as a line of arbitrary bytes. RFC 6455 §5.6 makes UTF-8 the definition of
-    # a text frame, so a line that is not valid UTF-8 is a binary payload the pane happens to
-    # be displaying, not text an operator typed — and `$` followed by `[A-Za-z_]` turns up in
-    # such bytes roughly once per 1.2KB by chance (#519). Without this the pane refused a
-    # real captured binary frame, naming the `$A` inside a JPEG.
-    #
-    # Empty for an EVIDENCE tab, because nothing on that path expands: a check that refuses
-    # a send the expansion would not have touched is not a check, it is a second policy.
-    def ws_unresolved_env : Array(String)
-      return [] of String if @evidence
-      # The list that is actually going out (`ws_out_messages_raw`), for the same reason
-      # `ws_out_messages` reads it: a check run against a different list than the send is not
-      # a check. Pre-splice this branched on `ws_out_seeded?` and read the pane's raw lines.
-      ws_out_messages_raw.select(&.text?).map { |m| String.new(m.payload) }
-        .select { |line| !line.empty? && line.valid_encoding? }
-        .flat_map { |line| Env.unresolved(line) }.uniq!
     end
 
     # The outbound messages to persist (env tokens UNexpanded). The store masks secrets and
@@ -816,6 +834,7 @@ module Gori::Tui
     def load_grpc(detail : Store::FlowDetail) : Nil
       @flow = detail
       @evidence = true
+      @markers_declared = false
       @grpc_mode = true
       @ws_mode = false
       @http2 = true # gRPC is HTTP/2
@@ -845,6 +864,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(origin_head_text(detail))
+      seed_pipeline_baseline
       @original_lines = [] of String
       @result = nil
       @prev_result = nil
@@ -894,6 +914,7 @@ module Gori::Tui
     private def seed_decode(detail : Store::FlowDetail, kind : Symbol, payload : String) : Nil
       @flow = detail
       @evidence = true
+      @markers_declared = false
       @decode_kind = kind
       @ws_mode = false
       @grpc_mode = false
@@ -904,6 +925,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(origin_form_text(detail))
+      seed_pipeline_baseline
       @decoded.set_text(payload)
       @req_pane = :envelope
       @decoded_dirty = false
@@ -1129,20 +1151,73 @@ module Gori::Tui
 
     # A lone line of exactly this (trimmed) splits the editor into the requests a "send
     # group" pipelines on one connection.
-    PIPELINE_SEP = "%%%"
+    #
+    # Aliased to the ENGINE's constant rather than spelling `"%%%"` again. It was duplicated
+    # for a real reason — nothing in `cli/` or `mcp/` may reach into `tui/`, so the headless
+    # minimize surfaces could not have taken it from here — but the dependency runs the other
+    # way and the TUI can take it from them. Four surfaces now refuse or split on this
+    # separator; two spellings of it was the last drift left in that set, and a separator the
+    # TUI and the engine disagreed about is precisely the "two places decide the split"
+    # failure this whole seam exists to prevent. The local name stays: the comments here are
+    # about pipelining, not about minimize.
+    PIPELINE_SEP = Repeater::Minimize::GROUP_SEP
 
     # A group send is meaningful only in plain HTTP text mode (hex / gRPC / WS / decode /
     # MARK have their own byte semantics), over HTTP/1.1 (send_pipeline is an h1 primitive).
     def group_sendable? : Bool
-      !(@req_hex_edit || @grpc_mode || @ws_mode || @decode_kind || @http2)
+      !@req_hex_edit && group_framing_applies?
+    end
+
+    # The modes in which a lone `%%%` line means "group" at all — `group_sendable?` minus the
+    # hex clause. Split out because the two questions differ on exactly that clause: you
+    # cannot RUN a group send from hex, but the hex buffer is a SNAPSHOT of the chunked pane
+    # taken before `^X`, so it is still carrying a group's Content-Length and must still be
+    # refused a whole-buffer send. Folding hex into this predicate is what let the sharpest
+    # face of the defect through on the first attempt at the fix.
+    private def group_framing_applies? : Bool
+      !(@grpc_mode || @ws_mode || @decode_kind || @http2)
     end
 
     # "Minimize request" removes header/cookie/param lines from the plain-text request and
-    # re-sends to verify the response is unchanged — so it needs plain HTTP text: hex / gRPC
-    # / WS / decode carry their own byte semantics, and §…§ markers make line-removal +
-    # resolution ambiguous. h2 is fine (H2Engine reframes the h1-form text).
+    # re-sends to verify the response is unchanged.
     def minimizable? : Bool
-      !(@req_hex_edit || @grpc_mode || @ws_mode || @decode_kind) && marker_regions.empty?
+      minimize_refusal.nil?
+    end
+
+    # Why minimize cannot run on this buffer, or nil. Public and NAMED because these are three
+    # different problems and "not minimizable" answers none of them; `minimizable?` is defined
+    # in terms of it so the predicate and the sentence cannot drift.
+    #
+    # The `%%%` clause is the third whole-buffer reader on this branch. `repeater_minimize`
+    # never calls `request_bytes` — it snapshots `request_text` and re-syncs Content-Length
+    # over the whole buffer in its own `resolve` — so the framing `^R` now refuses ONCE, a
+    # minimize did up to `Minimize::SEND_CAP` times in one keypress:
+    #
+    #   pane     Content-Length: 3     minimizable?  true
+    #   resolve  Content-Length: 60    ×hundreds of probe sends
+    #
+    # Unlike `group_framing_refusal` this is NOT scoped to auto-CL: `Minimize.run` reads
+    # `base_text` STRUCTURALLY as one request (head/body split, then header/cookie/param
+    # candidates), so on a group buffer it strips lines out of the operator's SECOND request
+    # and reports them as headers removed from the first — meaningless whether or not gori
+    # wrote the Content-Length. With `^L` off a whole-buffer `^R` is still a legitimate
+    # byte-exact send, which is why that one stays allowed and this one does not.
+    #
+    # h2 is fine, via `group_framing_applies?`: `%%%` is not a group there (send_pipeline is
+    # an h1 primitive), the pane already reflects the whole buffer, and there is nothing
+    # chunk-scoped to misread.
+    def minimize_refusal : String?
+      if @req_hex_edit || @grpc_mode || @ws_mode || @decode_kind
+        return "minimize needs a plain HTTP text request (not hex/gRPC/WS/decode)"
+      end
+      unless marker_regions.empty?
+        return "minimize does not render §…§ markers — clear them first (line removal and chain resolution are ambiguous together)"
+      end
+      if group_document?(@editor.wire_lines)
+        return "request holds a %%% separator, so minimize would read several requests as one — " \
+               "remove it, or minimize each request in its own tab"
+      end
+      nil
     end
 
     # The requests a "send group" pipelines: the editor text split on a lone `%%%` line,
@@ -1163,12 +1238,109 @@ module Gori::Tui
       end
     end
 
+    # PROVENANCE, the `%%%` half of `markers_live?` — and the reason that one is not enough.
+    # `%%%` is draft syntax too: it means "split here" only because the OPERATOR typed it.
+    # A capture whose body happens to hold a lone `%%%` line (a diff hunk, a delimiter, a
+    # template fragment) is not two requests, and treating it as two produced the same three
+    # faces the `§` defect did — the visible `Content-Length` covering only the pre-`%%%`
+    # bytes while `^R` sent the whole 17, `^X` snapshotting that head into a byte-exact send,
+    # and `space ▸ g` manufacturing a second request whose request LINE was the capture's own
+    # `line2`. Nobody authored that request.
+    #
+    # Unlike `§` there is no marking VERB to declare with, so the declaration is the count:
+    # a separator the buffer holds beyond the ones the capture arrived with is one the
+    # operator typed. Same question as `markers_live?` ("did the operator author this
+    # token?"), answered with the strongest signal this seam has. Once they add one the whole
+    # buffer is a group draft, captured separators included — the honest reading, and visible
+    # in the per-chunk Content-Lengths the reflection immediately writes.
+    #
+    # A draft is unaffected: `@evidence` is false, so every `%%%` in it splits as it always
+    # has. A restore lands with the baseline set from the restored text, for the same reason
+    # `@markers_declared` lands false — the row says nothing about who typed which line, and
+    # when gori cannot know, evidence wins.
+    private def pipeline_live?(wl : Array({String, String})) : Bool
+      !@evidence || pipeline_sep_count(wl) > @evidence_pipeline_seps
+    end
+
+    private def pipeline_sep_count(wl : Array({String, String})) : Int32
+      wl.count { |(l, _)| l.strip == PIPELINE_SEP }
+    end
+
+    # The reason a WHOLE-BUFFER send is refused, or nil.
+    #
+    # A buffer holding a live `%%%` is TWO documents in one: the operator wrote requests, and
+    # `reflect_content_length_in_editor` writes each one's OWN Content-Length into it — the
+    # numbers `space ▸ g` puts on the wire, and the only reading of that pane that means
+    # anything (no request in it has a whole-buffer-sized body). `^R` and the `^X` snapshot
+    # then read the same buffer WHOLE, and one number cannot be right for both framings:
+    #
+    #   pane      Content-Length: 3     ← chunk 1's body, "AAA"
+    #   ^R        Content-Length: 60    ← re-synced by finalize_wire; self-consistent, but the
+    #                                     pane never said 60 and the operator authored 2 requests
+    #   ^X then ^R  Content-Length: 3 over a 60-byte body  ← hex sends the snapshot verbatim:
+    #                                     a CL/body desync gori INVENTED out of a correct draft
+    #
+    # So the whole-buffer framing is the one that has no meaning here, and it is refused by
+    # name rather than picked silently. The alternative — reflecting the whole-buffer number
+    # instead — only moves the lie onto `g`, which this method's own neighbour already calls
+    # "the worse way round for a tool whose whole job is telling the operator what it sent".
+    #
+    # Scoped to auto-CL ON, because that is exactly when gori has written a number of its
+    # own. With `^L` off the pane, `^R` and `g` all carry the operator's numbers unchanged,
+    # nothing is invented, and a literal `%%%` line in a body stays expressible — which is
+    # why the message names `^L` as the second remedy and not just `space ▸ g`.
+    #
+    # An EVIDENCE buffer whose capture merely CONTAINS `%%%` never reaches this: its separator
+    # is not live (see `pipeline_live?`), nothing chunks, and `^R` sends it byte-exact.
+    private def group_framing_refusal : String?
+      return nil unless chunked_reflection?(@editor.wire_lines)
+      "request holds a %%% separator, so its Content-Length describes the first request only — " \
+      "space ▸ g sends the group on one connection, or turn ^L off to send the buffer whole as one request"
+    end
+
+    # Is the visible head carrying CHUNK-scoped Content-Lengths? The single predicate behind
+    # both the reflection that writes them and the refusal that stops a whole-buffer send from
+    # reading them — they are the same question, and letting them drift apart is the bug.
+    #
+    # `group_document?` is the structural half — "this buffer is SEVERAL requests" — and the
+    # auto-CL clause is the "…and gori wrote a number for the first one" half. Split because
+    # the two readers need different halves: `^R`/`^X` only lie when gori wrote the number
+    # (with `^L` off a whole-buffer send is byte-exact and legitimate), while minimize is
+    # meaningless on several requests whatever the number is. See `minimize_refusal`.
+    private def chunked_reflection?(wl : Array({String, String})) : Bool
+      @auto_content_length && group_document?(wl)
+    end
+
+    # Is this buffer several requests rather than one? `group_framing_applies?` (NOT
+    # `group_sendable?` — see there): in gRPC / WS / decode / h2 a lone `%%%` is not a
+    # separator at all, so those modes reflect the whole buffer and need no refusal. Hex is
+    # in, because its bytes are a snapshot of a chunked pane.
+    private def group_document?(wl : Array({String, String})) : Bool
+      group_framing_applies? && pipeline_live?(wl) && pipeline_sep_count(wl) > 0
+    end
+
+    # Record how many `%%%` lines the just-seeded buffer arrived with. Called from every
+    # loader AFTER the editor is set, so the baseline is always the bytes gori was handed
+    # rather than anything typed since. On a draft it is 0 either way (`pipeline_live?`
+    # short-circuits on `@evidence`); recording it anyway keeps a later `duplicate_from`
+    # or an evidence flip from inheriting a stale number.
+    private def seed_pipeline_baseline : Nil
+      @evidence_pipeline_seps = pipeline_sep_count_in(@editor.wire_text)
+    end
+
+    # The same count over raw text, for seeding the baseline at load/restore.
+    private def pipeline_sep_count_in(text : String) : Int32
+      text.split('\n').count { |l| l.strip(" \t\r") == PIPELINE_SEP }
+    end
+
     # EDITOR line ranges of each `%%%` chunk, blank edges trimmed. The one place the group
     # split is decided, so the bytes `pipeline_requests` sends and the Content-Length
     # `reflect_content_length_in_editor` shows are derived from the SAME chunking — they used
     # to disagree, and the visible header was the one that was wrong. No separator ⇒ one span
-    # covering the whole buffer, which is the ordinary single-request case.
+    # covering the whole buffer, which is the ordinary single-request case, and so does a
+    # separator that is the CAPTURE's rather than the operator's (see `pipeline_live?`).
     private def chunk_line_spans(wl : Array({String, String})) : Array(Range(Int32, Int32))
+      return [0...wl.size] unless pipeline_live?(wl)
       spans = [] of Range(Int32, Int32)
       push = ->(a : Int32, b : Int32) do
         while a < b && wl[a][0].strip.empty? # drop blank lines around the separator
@@ -1267,6 +1439,11 @@ module Gori::Tui
       # same carrier `FuzzerView`/`MinerView` restore from. Without it a reopened capture
       # silently reverted to a draft on the next gori start.
       @evidence = evidence
+      # …and provenance is all that arrives: the row holds the request TEXT and the flow id,
+      # nothing that says which `§` in it the operator typed. Undeclared is the answer gori
+      # can defend — see `markers_live?`. (A marked-up capture reopens with its markers inert
+      # and the border chip saying so; ^K re-declares.)
+      @markers_declared = false
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
 
       @original_lines = [] of String
@@ -1300,6 +1477,8 @@ module Gori::Tui
                            ws_keep_key : Bool = false,
                            evidence : Bool = false) : Nil
       @evidence = evidence
+      # A peer's row carries the same two facts a restore does, so the same answer: see restore.
+      @markers_declared = false
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
       @req_hex_edit = nil
       # Leave @result / @prev_result / @focus / @scroll / @resp_mode / @original_lines alone.
@@ -1358,6 +1537,7 @@ module Gori::Tui
       end
 
       @auto_content_length = auto_cl
+      seed_pipeline_baseline
       @loaded = true
       @dirty = false
     end
@@ -1381,7 +1561,8 @@ module Gori::Tui
     # scaffold URL is a placeholder you almost always change first.
     def load_blank : Nil
       @flow = nil
-      @evidence = false # ^N: a draft the operator is about to type
+      @evidence = false         # ^N: a draft the operator is about to type
+      @markers_declared = false # moot on a draft (markers_live? is true either way) — kept in lockstep
       @http2 = false
       @target = BLANK_TARGET
       @link_host_to_target = true # first target edit mirrors into the Host header (see the field)
@@ -1390,6 +1571,7 @@ module Gori::Tui
       @scx = 0
       @target_field = :url
       @editor.set_text(BLANK_REQUEST)
+      @evidence_pipeline_seps = 0 # a draft: every `%%%` in it is the operator's
       @original_lines = [] of String
       @result = nil
       @prev_result = nil
@@ -1410,7 +1592,9 @@ module Gori::Tui
     # chip name (+ " copy"). Drops source flow linkage, inflight state, and scroll/cursor.
     def duplicate_from(src : RepeaterView) : Nil
       @flow = nil
-      @evidence = src.evidence? # the same bytes carry the same provenance
+      @evidence = src.evidence?                             # the same bytes carry the same provenance
+      @markers_declared = src.@markers_declared             # …and the same reading of their §
+      @evidence_pipeline_seps = src.@evidence_pipeline_seps # …and of their `%%%`
       @http2 = src.@http2
       @target = src.@target
       @tcx = @target.size
@@ -1498,6 +1682,12 @@ module Gori::Tui
     end
 
     def request_bytes : Bytes
+      # BEFORE the hex branch on purpose — the hex buffer is a SNAPSHOT of this same editor,
+      # so it carries the same chunk-scoped Content-Length and sending it verbatim is the
+      # sharpest face of the refusal below.
+      if reason = group_framing_refusal
+        raise Fuzz::ChainError.new(reason)
+      end
       return grpc_request_bytes if @grpc_mode                  # edited head + reframed body (owns its own hex buffer)
       return @req_hex_edit.not_nil!.to_bytes if @req_hex_edit  # byte-exact; NO auto-CL in hex mode
       return decoded_request_bytes if @decode_kind             # envelope + re-encoded decoded payload
@@ -1761,6 +1951,7 @@ module Gori::Tui
     def focus_chain_pane : String?
       return "not available in hex edit" if request_hex?
       return "move to the REQUEST pane first (↹)" unless @focus == :request
+      return literal_marker_hint unless markers_live?
       chain = Fuzz::Template.chain_at(@editor.text, @editor.cursor_offset)
       return "put the cursor in a §…§ marker · ^A mark all · ^T insert §" if chain.nil?
       @chain_marker_cursor = @editor.cursor_offset
@@ -1809,11 +2000,18 @@ module Gori::Tui
     end
 
     # --- marking (§…§ Decoder-chain positions) -------------------------------
-    # These mirror the Fuzzer's marking helpers, gated on the REQUEST pane (markers are
-    # always meaningful on send now — a marked value renders through its chain). All
-    # delegate to the shared Fuzz::Template helpers.
+    # These mirror the Fuzzer's marking helpers, gated on the REQUEST pane (a marked value
+    # renders through its chain on send). All delegate to the shared Fuzz::Template helpers.
+    # Each of the three that CREATES a marker also declares the buffer a template — see
+    # `markers_live?` for why an evidence tab needs to be told.
     def auto_mark : String
       return mark_hint unless markable?
+      # `Fuzz::Template.auto_mark` is a documented no-op once the text holds ANY `§`, so on a
+      # capture that carries one there is nothing to gain by declaring — and everything to
+      # lose: the capture's own `§` would become live positions in exchange for zero new ones.
+      # Name that instead of doing it silently.
+      return "the capture's own § would become markers and auto-mark adds none — ^K marks the token at the cursor" if literal_markers?
+      declare_markers
       @editor.set_text(Fuzz::Template.auto_mark(@editor.text))
       @dirty = true
       n = Fuzz::Template.parse(@editor.text).position_count
@@ -1825,29 +2023,104 @@ module Gori::Tui
       before = @editor.text
       after = Fuzz::Template.mark_word(before, @editor.cursor_offset)
       return "no word at the cursor — place it on a token (or auto-mark)" if after == before
+      note = adopted_literals_note
+      declare_markers
       @editor.set_text(after)
       @dirty = true
-      Fuzz::Template.parse(after).position_count < Fuzz::Template.parse(before).position_count ? "unmarked position" : "marked position"
+      msg = Fuzz::Template.parse(after).position_count < Fuzz::Template.parse(before).position_count ? "unmarked position" : "marked position"
+      "#{msg}#{note}"
     end
 
     def insert_marker : String
       return mark_hint unless markable?
+      note = adopted_literals_note
+      declare_markers
       @editor.insert(Fuzz::Template::MARKER)
       @editor.set_preedit("")
       @dirty = true
       if @editor.text.count(Fuzz::Template::MARKER).odd?
-        "marker opened — move the cursor and mark again to close the region"
+        "marker opened — move the cursor and mark again to close the region#{note}"
       else
         n = Fuzz::Template.parse(@editor.text).position_count
-        "marked point — #{n} position#{n == 1 ? "" : "s"}"
+        "marked point — #{n} position#{n == 1 ? "" : "s"}#{note}"
       end
     end
 
+    # NOT a declaring action: `Template.clear_markers` renders the defaults, i.e. it DELETES
+    # every `§` in the buffer. On an evidence tab those are the capture's bytes, so running
+    # it would do exactly the damage this whole gate exists to prevent — refuse by name.
     def clear_marks : String
       return mark_hint unless markable?
+      return literal_marker_hint unless markers_live?
       @editor.set_text(Fuzz::Template.clear_markers(@editor.text))
+      @markers_declared = false # back to a buffer with no markers of its own
+      invalidate_marker_caches
       @dirty = true
       "cleared all § markers"
+    end
+
+    # PROVENANCE: `§…§` (and its `¦chain`) is the operator's DRAFT language, not a value the
+    # wire can carry. A `§` that arrived as captured evidence is DATA — U+00A7 is ordinary
+    # text, ubiquitous in German and legal bodies — and rendering it as syntax deletes two
+    # bytes the origin really sent, silently, with `Content-Length` re-synced behind it so
+    # the loss leaves no trace. `gori run repeater <id>` and MCP `send_request` both replay
+    # those bytes exactly; the TUI was the one surface that did not.
+    #
+    # So on an EVIDENCE tab markers start INERT and the operator declares them — by marking
+    # (^A / ^K / insert §), the same explicit act the Fuzzer's ⇧I → ^A workflow already is.
+    # Declaring is per-buffer and monotone: from then on every `§` in the buffer is a marker
+    # (the status line says so when the capture carried one), which is the honest reading of
+    # "this buffer is now a template".
+    #
+    # Deliberately NOT keyed on `@dirty`. `evidence?` documents that an operator edit does
+    # not clear provenance — editing a header does not make the `§` in the body something the
+    # operator typed — and gating on the first keystroke would put the deletion straight back
+    # on the commonest workflow there is (seed a capture, tweak a header, send).
+    #
+    # A restore()/reconcile lands undeclared: the persisted row carries the request text and
+    # its `flow_id`, and nothing that says which `§` in it the operator typed. gori does not
+    # know, and for evidence the answer when gori does not know is the wire's. The REQUEST
+    # border chip says which state the tab is in whenever a `§` is present at all.
+    private def markers_live? : Bool
+      !@evidence || @markers_declared
+    end
+
+    # Public for the send-path guards that live in the controller (group send / minimize):
+    # "are there §…§ regions this send has to render?", provenance included, so a capture's
+    # own `§` neither renders nor blocks an unrelated action.
+    def markers_active? : Bool
+      !marker_regions.empty?
+    end
+
+    # True when the buffer holds a `§` that is being treated as literal capture bytes — the
+    # only state the REQUEST border needs a chip for (a marker-free request renders exactly
+    # as before).
+    def literal_markers? : Bool
+      !markers_live? && Fuzz::Template.marker_bytes_in?(@editor.text.to_slice)
+    end
+
+    private def declare_markers : Nil
+      return if @markers_declared
+      @markers_declared = true
+      invalidate_marker_caches
+    end
+
+    # The caches key on `@editor.edits`, which a pure state flip does not bump.
+    private def invalidate_marker_caches : Nil
+      @marker_regions_rev = -1
+      @marker_spans_rev = -1
+      @chain_rev = -1
+    end
+
+    # Named in the status line when declaring adopts `§` the capture brought with it: those
+    # bytes stop being data on the very next send, and that is not something to discover from
+    # a 4-byte-shorter request.
+    private def adopted_literals_note : String
+      literal_markers? ? " — the capture's own § are markers now (^Z undoes)" : ""
+    end
+
+    private def literal_marker_hint : String
+      "§ here is captured data, not a marker — ^K marks a token (the capture's § become markers too)"
     end
 
     # Insert an OAST payload URL at the request-editor caret (cross-tab "Insert OAST
@@ -1900,10 +2173,15 @@ module Gori::Tui
       return if @decode_kind && @req_pane == :decoded
 
       wl = @editor.wire_lines
-      if wl.none? { |(l, _)| l.strip == PIPELINE_SEP }
-        reflect_chunk_content_length(@editor.wire_text, wl, 0...wl.size)
-      else
+      # `chunked_reflection?`, not "is there a `%%%` anywhere". A separator the CAPTURE brought
+      # is not live, and a mode that cannot group-send has no chunks — in both cases chunking
+      # would put chunk 1's length in the visible head while ^R (and the `^X` snapshot of that
+      # head) frame the whole buffer. Where it IS chunked, `group_framing_refusal` reads the
+      # same predicate and stops the whole-buffer send rather than let the two disagree.
+      if chunked_reflection?(wl)
         chunk_line_spans(wl).each { |sp| reflect_chunk_content_length(chunk_text(wl, sp), wl, sp) }
+      else
+        reflect_chunk_content_length(@editor.wire_text, wl, 0...wl.size)
       end
     end
 
@@ -2869,6 +3147,7 @@ module Gori::Tui
     end
 
     private def marker_spans : Array({Int32, Int32})
+      return NO_SPANS unless markers_live?
       if @editor.edits != @marker_spans_rev
         @marker_spans_rev = @editor.edits
         @marker_spans_cache = Fuzz::Template.marked_spans(@editor.text)
@@ -2880,6 +3159,7 @@ module Gori::Tui
     # no chain). Cached on {editor revision, cursor} so a stationary cursor doesn't re-join +
     # re-scan the whole buffer every render frame the CHAIN pane is visible.
     private def chain_under_cursor : String?
+      return nil unless markers_live? # a captured `¦` isn't a chain — no tooltip over evidence
       cur = @editor.cursor_offset
       if @editor.edits != @chain_rev || cur != @chain_cursor
         @chain_rev = @editor.edits
@@ -3049,7 +3329,13 @@ module Gori::Tui
       end
       cl_x = Frame.toggle_badge(screen, send_edge, rect.y, min_x, "^L", "CL", @auto_content_length)
       mode_x = Frame.toggle_badge(screen, cl_x, rect.y, min_x, "^U", "PRETTY", false)
-      Frame.mode_badge(screen, mode_x, rect.y, min_x, ins)
+      mark_x = Frame.mode_badge(screen, mode_x, rect.y, min_x, ins)
+      # Only when a `§` is actually in the buffer, so a request without one draws exactly the
+      # border it drew before. Unlit = the capture's § are literal bytes (^K declares them);
+      # lit = this buffer is a template and ^R renders them. See `markers_live?`.
+      if literal_markers? || (@evidence && markers_active?)
+        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^K", "MARK", markers_live?)
+      end
       update_request_marker_tint
       inner = rect.inset(1, 1)
       @editor.render(screen, inner, cursor: ins, highlight: :request, peek: focused, gauge: true, gauge_focused: focused)
@@ -3124,13 +3410,23 @@ module Gori::Tui
     # {open, sep, close} marker regions cached on the editor revision — update_request_marker_tint
     # (and request_bytes / chain_split_visible?) read it every render; the cache skips
     # marker_regions' 2× whole-buffer `text.chars` on an unchanged request buffer.
+    #
+    # Empty while the markers are INERT (see `markers_live?`), which is the one place that
+    # decision has to live: every consumer — the send (`request_bytes`), the Content-Length
+    # reflection, the tint/conceal paint, `minimizable?`, the editor's delimiter guards —
+    # reads it, and they must not be able to disagree about whether a `§` in this buffer is
+    # syntax or data.
     private def marker_regions : Array({Int32, Int32, Int32})
+      return NO_REGIONS unless markers_live?
       if @editor.edits != @marker_regions_rev
         @marker_regions_rev = @editor.edits
         @marker_regions_cache = Fuzz::Template.marker_regions(@editor.text)
       end
       @marker_regions_cache
     end
+
+    NO_REGIONS = [] of {Int32, Int32, Int32}
+    NO_SPANS   = [] of {Int32, Int32}
 
     private def render_ws_handshake(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2

@@ -419,8 +419,20 @@ module Gori
         if err = bind_from_blocker(bindings)
           abort "#{cmd}: #{err}"
         end
+        # `evidence: true` is not conditional here and cannot be: `built` is
+        # `Repeater::FlowRequest.build(detail)`, which reads `request_head`/`request_body` and
+        # nothing else, and the operator supplied one integer. There is no draft on this path
+        # — every byte is a capture — so it is exactly the case `Sender#evidence?` describes.
+        #
+        # Ordering makes it look harmless and is precisely why it must be set: the binding
+        # table is empty at this instant (that is what the replay is FOR), so nothing
+        # substitutes today. But `Env.layer` is a per-project global that any surface may have
+        # filled — and `--bind-from` is the one command whose contract is "these are somebody
+        # else's bytes, sent to mint a token". A seed that spliced an already-held token into
+        # the capture would corrupt the very response the run's bindings are read from.
         sender = Repeater::Sender.new(outbound, scheme: scheme, host: host, port: port,
-          verify: !insecure, http2: built.http2, sni: built.sni, overrides: overrides)
+          verify: !insecure, http2: built.http2, sni: built.sni, overrides: overrides,
+          evidence: true)
         result = sender.send(built.bytes)
         if err = result.error
           abort "#{cmd}: --bind-from: replaying flow ##{flow_id} failed: #{err}"
@@ -432,25 +444,6 @@ module Gori
                 "host glob, condition and selector with `gori run rewriter extract`"
         end
         STDERR.puts "bind-from: flow ##{flow_id} replayed → bound #{Env.token_list(bound)}"
-      end
-
-      # What a headless operator has to know when a send is refused for an unbound binding:
-      # that no amount of retrying will help, and which flag does. `Env.unbound_error` is the
-      # shared FACT ("unbound session binding $SESS"); this is `gori run`'s own prescription,
-      # the #525 shape.
-      private def self.bindings_headless_hint(cmd : String) : String
-        "#{cmd} runs as ONE process and holds no bindings from a previous invocation — " \
-        "a binding is never persisted. Replay the flow that mints the token first with " \
-        "--bind-from FLOW-ID, or drive the two steps over one `gori mcp` session."
-      end
-
-      # An engine's `blocked_reason` with `gori run`'s own prescription attached when — and
-      # only when — the refusal is the unbound-binding one. A binding can also come UNSTUCK
-      # mid-run (a token rotated, an operator cleared it), which the pre-flight cannot see, so
-      # the hint has to exist on this end of the run too.
-      private def self.blocked_reason_line(reason : String?, cmd : String) : String?
-        return nil unless reason
-        reason.starts_with?(Env::UNBOUND_PREFIX) ? "#{reason}. #{bindings_headless_hint(cmd)}" : reason
       end
 
       # Why `--bind-from` cannot bind anything in this project, or nil to go ahead. Shared by
@@ -486,16 +479,6 @@ module Gori
         return unless bind_from
         err = bind_from_blocker(Env.layer.as?(Gori::Bindings))
         abort "#{cmd}: #{err}" if err
-      end
-
-      # Refuse BEFORE the sweep when the template names a declared-but-unbound binding and no
-      # --bind-from was given. Without this the run still starts and every single row comes
-      # back refused, which reads like a target problem rather than a missing step.
-      private def self.preflight_bindings(text : String, bind_from : Int64?, cmd : String) : Nil
-        return if bind_from
-        unbound = Env.unbound(text)
-        return if unbound.empty?
-        abort "#{cmd}: #{Env.unbound_error(unbound)}. #{bindings_headless_hint(cmd)}"
       end
 
       # One sentence for every `gori run` tool whose builder refused an env token that

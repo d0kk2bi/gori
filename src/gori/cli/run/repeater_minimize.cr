@@ -52,7 +52,7 @@ module Gori
         outbound = project_outbound(project_name, db_path, allow_unscoped)
 
         text = String.new(rec.request)
-        scheme, host, port = minimize_target_or_abort(id, rec, text, outbound, verbatim)
+        scheme, host, port = minimize_target_or_abort(id, rec, text, outbound)
         # `--verbatim` means exactly what it means on `repeater send`: the stored bytes ARE
         # the message. So the resolver stops expanding AND stops re-framing, and `auto_cl`
         # goes off with it — which also takes body params out of the candidate set, because
@@ -63,10 +63,14 @@ module Gori
         resolve = minimize_resolver(id, text, verbatim, auto_cl)
         # Fuzz::Sender applies the Outbound gate (Sandbox / exclude) at the socket seam;
         # CappedBackend bounds total sends. Same stack the TUI builds.
+        # `evidence: verbatim` is the SEND-seam half of the same flag `resolve` honours just
+        # above — see `Fuzz::Sender#evidence?`. Without it `--verbatim` stopped `$KEY`
+        # expansion and then let the session-binding pass substitute a live token into the
+        # captured body of every one of up to SEND_CAP probes.
         backend = Fuzz::CappedBackend.new(
           Fuzz::Sender.new(Fuzz::Origin.new(scheme, host, port), outbound, rec.http2?,
             !insecure, rec.sni.try { |v| Env.expand(v) }, timeout: 10.seconds,
-            overrides: host_overrides),
+            overrides: host_overrides, evidence: verbatim),
           Repeater::Minimize::SEND_CAP)
 
         meter = STDERR.tty?
@@ -174,8 +178,8 @@ module Gori
       # The validated {scheme, host, port} to minimize against, or an abort. Split out of
       # cmd_repeater_minimize to keep it under the cyclomatic-complexity bar.
       private def self.minimize_target_or_abort(id : Int64, rec : Store::RepeaterRecord,
-                                                text : String, outbound : Gori::Outbound,
-                                                verbatim : Bool = false) : {String, String, Int32}
+                                                text : String,
+                                                outbound : Gori::Outbound) : {String, String, Int32}
         if Repeater::WsEngine.upgrade_request?(text)
           abort "gori run repeater minimize: session ##{id} is a WebSocket upgrade — minimize works on plain HTTP requests"
         end
@@ -187,25 +191,27 @@ module Gori
         unless Fuzz::Template.marker_regions(text).empty?
           abort "gori run repeater minimize: session ##{id} contains §fuzz§ markers — remove them first, or use `gori run fuzz` to sweep them"
         end
+        # The TUI refuses this too (repeater_view.cr#minimize_refusal). A saved request
+        # holding a lone `%%%` line is SEVERAL requests: minimize reads it as one, strips
+        # lines out of the operator's second request and reports them as removals from the
+        # first — and --apply then stores the remnant over the session. Reproduced: an
+        # 8-send run reporting `[param] %%%\nGET /g2?other` and saving request 1 alone.
+        if Repeater::Minimize.group_document?(text)
+          abort "gori run repeater minimize: session ##{id} holds a %%% separator — it is several requests, and minimize would read them as one (--apply would store the remnant); split them into one session each"
+        end
         # Minimize dials `Fuzz::Sender` directly rather than through `Repeater::Plan`, by
-        # design, so the builder's unresolved-token refusal (#519) never runs for it and this
-        # is the only place that check can happen (#524). Checked BEFORE the target parse: an
-        # unresolved `$HOST` survives `Env.expand` as the literal host, which would otherwise
-        # surface as an unparseable-target abort naming no variable at all.
+        # design, so the builder's dial-tuple refusal never runs for it and this is the only
+        # place that check can happen (#524). Checked BEFORE the target parse: an unresolved
+        # `$HOST` survives `Env.expand` as the literal host, which would otherwise surface as
+        # an unparseable-target abort naming no variable at all.
         #
-        # Head-only on the REQUEST (`unresolved_wire`) for #519's reason — a `$` in a captured
-        # body is a byte, and a whole-request check refuses nearly every binary-body session —
-        # but whole-string on the target and SNI, which are short operator-typed fields with no
-        # body to exclude. The MCP and TUI minimize paths carry the same three checks.
-        #
-        # Under `--verbatim` the REQUEST drops out of that check, exactly as it does on
-        # `repeater send --verbatim`: the operator has said the bytes are the message, so a
-        # literal `$user.name` / `$IFS` / OData `$top` is the payload and refusing it makes
-        # the flag unable to minimize its own advertised content. The TARGET and SNI are
-        # still checked — those are short operator-typed fields that `Env.expand` resolves
-        # below either way, and an unresolved `$HOST` there is a dial address, not a payload.
-        names = (verbatim ? [] of String : Env.unresolved_wire(text)) |
-                Env.unresolved(rec.target) |
+        # The REQUEST is no longer checked at all. A `$NAME` with no value is a literal string
+        # on the wire everywhere now (see `Env::Escape`), so a captured OData `$filter`, a
+        # Mongo `$where` or a GraphQL `$id` in a query string minimizes as authored. Only the
+        # TARGET and SNI are refused — `$` is not a legal byte in a hostname, and a literal one
+        # there comes back as an unparseable target or an out-of-scope block, naming the wrong
+        # gate. The MCP and TUI minimize paths carry the same two checks.
+        names = Env.unresolved(rec.target) |
                 (rec.sni.try { |s| Env.unresolved(s) } || [] of String)
         unless names.empty?
           abort "gori run repeater minimize: " +
