@@ -13,6 +13,20 @@ private def with_store(events : Channel(Gori::Store::FlowEvent)? = nil, &)
   end
 end
 
+private def with_masking_env(*pairs : {String, String}, &)
+  saved_vars = Gori::Settings.env_vars
+  saved_project = Gori::Settings.project_env_vars
+  saved_prefix = Gori::Settings.env_prefix
+  Gori::Settings.env_vars = pairs.to_a
+  Gori::Settings.project_env_vars = [] of {String, String}
+  Gori::Settings.env_prefix = "$"
+  yield
+ensure
+  Gori::Settings.env_vars = saved_vars || [] of {String, String}
+  Gori::Settings.project_env_vars = saved_project || [] of {String, String}
+  Gori::Settings.env_prefix = saved_prefix || "$"
+end
+
 private def sample_request(method = "GET", host = "acme.test", target = "/")
   Gori::Store::CapturedRequest.new(
     created_at: 1_000_i64,
@@ -395,6 +409,42 @@ describe Gori::Store do
       store.flush
       store.ws_messages_for_repeater(rid).size.should eq(2)
       store.write_failures.should eq(0)
+    end
+  end
+
+  it "update_repeater_ws_messages persists the author's verbatim payload, not a $KEY mask (provenance)" do
+    # A store row is a claim that those EXACT bytes are the author's. A WS payload whose
+    # bytes happen to match a session binding's VALUE must be persisted verbatim — masking
+    # it to `$TOKEN` at the write seam would put `$TOKEN` on the wire from every later send
+    # (TUI evidence path, `gori run`, MCP), which is not what the author wrote. Binding
+    # expansion is a SEND-time transform, not a store-write one — same seam and same reason
+    # as `insert_repeater` (which stores the request bytes verbatim) and `insert_ws_one`
+    # (which stores a captured frame verbatim).
+    with_masking_env({"TOKEN", "SECRETVAL"}) do
+      with_store do |store|
+        rid = store.insert_repeater("wss://acme.test/ws", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, false, nil, 0)
+        store.update_repeater_ws_messages(rid, [Gori::Store::WsOutMessage.text("hello SECRETVAL")])
+        store.flush
+        stored = store.ws_messages_for_repeater(rid)
+        stored.size.should eq(1)
+        String.new(stored[0].payload).should eq("hello SECRETVAL") # NOT "hello $TOKEN"
+      end
+    end
+  end
+
+  it "update_repeater_ws_messages keeps a literal $KEY the author typed (no store-time expansion)" do
+    # The complement: a literal `$TOKEN` the author actually typed must survive verbatim in
+    # the store (it expands only at SEND time, or stays literal under --verbatim). This
+    # proves the write seam neither masks nor expands — it just records the author's bytes.
+    with_masking_env({"TOKEN", "SECRETVAL"}) do
+      with_store do |store|
+        rid = store.insert_repeater("wss://acme.test/ws", "GET /ws HTTP/1.1\r\n\r\n".to_slice, false, false, nil, 0)
+        store.update_repeater_ws_messages(rid, [Gori::Store::WsOutMessage.text("hello $TOKEN")])
+        store.flush
+        stored = store.ws_messages_for_repeater(rid)
+        stored.size.should eq(1)
+        String.new(stored[0].payload).should eq("hello $TOKEN") # stays literal; expands only at send
+      end
     end
   end
 
