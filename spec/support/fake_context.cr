@@ -515,6 +515,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:sitemap_open_flow)
   end
 
+  def sitemap_scope_add : Nil
+    rec(:sitemap_scope_add)
+  end
+
   def sitemap_mark_toggle : Nil
     rec(:sitemap_mark_toggle)
   end
