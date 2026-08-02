@@ -57,13 +57,15 @@ Saved chains can call each other. A recursive definition fails that step with a 
 
 | Category | Examples |
 |----------|----------|
-| **Encoding** | `base64-encode` / `base64-decode`, `base64url-encode`, `url-encode` / `url-decode`, `hex-encode` / `hex-decode`, `base32`, `ascii85`, `base58` |
+| **Encoding** | `base64-encode` / `base64-decode`, `base64url-encode`, `url-encode` / `url-decode`, `hex-encode` / `hex-decode`, `base32`, `ascii85`, `base58`, `base36`, `base62`, `quoted-printable`, `punycode-encode` / `punycode-decode` |
 | **Number bases** | `decimal-encode` / `decimal-decode`, `binary-encode` / `binary-decode`, `octal-encode` / `octal-decode` |
 | **Compression** | `gzip-compress` / `gzip-decompress`, `zlib-compress` / `zlib-decompress`, `deflate-raw` / `inflate-raw` (headerless, RFC 1951) |
 | **Token** | `jwt-decode` (header + payload; signature shown, not verified) |
 | **Hash** | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`, `crc32` |
-| **Escape** | `html-escape` / `html-unescape`, `json-escape` / `json-unescape`, `unicode-escape` / `unicode-unescape` |
-| **Text** | `rot13`, `rot47`, `upper`, `lower`, `reverse` |
+| **Escape** | `html-escape` / `html-unescape`, `json-escape` / `json-unescape`, `unicode-escape` / `unicode-unescape`, `xml-escape` / `xml-unescape`, `c-string-escape` / `c-string-unescape`, `shell-escape`, `powershell-escape` |
+| **Text** | `rot13`, `rot47`, `upper`, `lower`, `reverse`, `homoglyph`, `typo` |
+
+A few entries only go one way, and the chain will not undo them. `shell-escape` and `powershell-escape` wrap a value in a quoted literal. `homoglyph` swaps ASCII letters for Unicode lookalikes, and is partial: a letter with no established confusable is left alone. `typo` is a generator rather than a transform, emitting one near-miss variant per line, built from omissions, adjacent-character swaps, and QWERTY neighbour keys.
 
 OUTPUT can cycle display modes (text → hex → base64) for binary results. Copy with `y` in READ mode, or use the space menu.
 

@@ -64,6 +64,30 @@ module Gori::Decoder
     r.register decode("base58-decode", "unbase58",
       category: Category::Encoding, description: "Base58 decode (Bitcoin alphabet)") { |s| Codecs.base58_decode(s) }
 
+    r.register encode("base36-encode", "base36", "b36",
+      category: Category::Encoding, description: "Base36 encode (0-9a-z, leading NULs kept as '0')") { |b| Codecs.base36_encode(b) }
+    r.register decode("base36-decode", "unbase36",
+      category: Category::Encoding, description: "Base36 decode (case-insensitive)") { |s| Codecs.base36_decode(s) }
+
+    r.register encode("base62-encode", "base62", "b62",
+      category: Category::Encoding, description: "Base62 encode (0-9A-Za-z, leading NULs kept as '0')") { |b| Codecs.base62_encode(b) }
+    r.register decode("base62-decode", "unbase62",
+      category: Category::Encoding, description: "Base62 decode (case-sensitive)") { |s| Codecs.base62_decode(s) }
+
+    r.register encode("quoted-printable-encode", "quoted-printable", "qp", "qp-encode",
+      category: Category::Encoding,
+      description: "Quoted-printable encode (RFC 2045, 76-col soft breaks)") { |b| Codecs.quoted_printable_encode(b) }
+    r.register decode("quoted-printable-decode", "qp-decode", "unqp",
+      category: Category::Encoding,
+      description: "Quoted-printable decode (=XX plus soft line breaks)") { |s| Codecs.quoted_printable_decode(s) }
+
+    r.register text("punycode-encode", "punycode", "idn-encode",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "Punycode/IDN encode per dot-label (RFC 3492, adds xn--)") { |s| Codecs.punycode_encode(s) }
+    r.register text("punycode-decode", "idn-decode", "unpunycode",
+      category: Category::Encoding, direction: Direction::Decode,
+      description: "Punycode/IDN decode per dot-label (xn-- labels only)") { |s| Codecs.punycode_decode(s) }
+
     # ---------------- ENCODING: number bases (byte-oriented, space-separated) ----------------
     r.register encode("decimal-encode", "decimal", "to-decimal", "dec",
       category: Category::Encoding, description: "Bytes to space-separated decimal (0-255)") { |b| Codecs.decimal_encode(b) }
@@ -136,6 +160,27 @@ module Gori::Decoder
       category: Category::Escape, direction: Direction::Decode,
       description: "Decode \\uXXXX (incl. surrogate pairs)") { |s| Codecs.unicode_unescape(s) }
 
+    r.register text("xml-escape", "xml-encode", "xml",
+      category: Category::Escape, direction: Direction::Encode,
+      description: "XML-escape & < > \" ' (the five predefined entities)") { |s| Codecs.xml_escape(s) }
+    r.register text("xml-unescape", "xml-decode", "unxml",
+      category: Category::Escape, direction: Direction::Decode,
+      description: "XML-unescape the five entities + &#NN; / &#xNN;") { |s| Codecs.xml_unescape(s) }
+
+    r.register text("shell-escape", "sh-escape", "bash-escape", "shell-quote",
+      category: Category::Escape, direction: Direction::Encode,
+      description: "POSIX shell single-quote (wraps; one-way)") { |s| Codecs.shell_escape(s) }
+    r.register text("powershell-escape", "ps-escape", "pwsh-escape", "powershell-quote",
+      category: Category::Escape, direction: Direction::Encode,
+      description: "PowerShell single-quote (doubles ', wraps; one-way)") { |s| Codecs.powershell_escape(s) }
+
+    r.register encode("c-string-escape", "c-escape", "cstring-escape",
+      category: Category::Escape,
+      description: "C string-literal escape (\\n, \\xNN; body only, no quotes)") { |b| Codecs.c_string_escape(b) }
+    r.register decode("c-string-unescape", "c-unescape", "cstring-unescape",
+      category: Category::Escape,
+      description: "C string-literal unescape (\\xNN, \\NNN, \\uXXXX, \\n …)") { |s| Codecs.c_string_unescape(s) }
+
     # ---------------- TEXT ----------------
     r.register text("rot13", category: Category::Text, direction: Direction::Transform,
       description: "ROT13 letters") { |s| Codecs.rot13(s) }
@@ -147,6 +192,13 @@ module Gori::Decoder
       description: "Reverse characters") { |s| s.reverse }
     r.register text("rot47", category: Category::Text, direction: Direction::Transform,
       description: "ROT47 (printable ASCII 33-126, self-inverse)") { |s| Codecs.rot47(s) }
+
+    r.register text("homoglyph", "homoglyphs", "confusable",
+      category: Category::Text, direction: Direction::Transform,
+      description: "ASCII letters to Unicode lookalikes (lossy, one-way)") { |s| Codecs.homoglyph(s) }
+    r.register text("typo", "typos", "typosquat",
+      category: Category::Text, direction: Direction::Transform,
+      description: "Near-miss variants, one per line (omit/swap/adjacent-key)") { |s| Codecs.typo(s) }
 
     r
   end

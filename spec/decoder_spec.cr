@@ -11,6 +11,42 @@ private def conv_bytes(name : String, input : Bytes) : Bytes
   REG[name].not_nil!.apply(input)
 end
 
+# What "bidirectional" has to mean for every codec that claims it: empty input, plain
+# ASCII, the codecs' own metacharacters, multibyte non-ASCII, CR/LF/tab plus trailing
+# whitespace (which quoted-printable must promote), and enough length to cross a
+# line-wrapping boundary.
+private TEXT_SAMPLES = [
+  "",
+  "hello world",
+  "a=b&c=d <tag> 'quo' \"dq\" \\esc",
+  "안녕하세요 überstraße",
+  "line1\r\nline2\ttrailing ",
+  "x" * 200,
+]
+
+# The same contract at the byte level, for the codecs whose declared domain is arbitrary
+# bytes: NULs (leading, so the bignum bases have to carry them out-of-band), high bytes,
+# and a hex digit right after a non-printable (the C-string \xNN run-on trap).
+private BINARY_SAMPLES = [
+  Bytes.empty,
+  Bytes[0],
+  Bytes[0, 0, 1, 2],
+  Bytes[0xff, 0xfe, 0x00, 0x7f],
+  Bytes[0x01, 0x41, 0xff, 0x61, 0x1b, 0x5b, 0x30, 0x6d],
+]
+
+private def round_trips_text(encoder : String, decoder : String)
+  TEXT_SAMPLES.each do |s|
+    conv(decoder, conv(encoder, s)).should eq s
+  end
+end
+
+private def round_trips_bytes(encoder : String, decoder : String)
+  BINARY_SAMPLES.each do |b|
+    conv_bytes(decoder, conv_bytes(encoder, b).dup).should eq b
+  end
+end
+
 # Publish a named-chain library, hand the rebuilt registry to the block, and ALWAYS put the
 # previous one back: `Decoder.library` is process-global, so a leaked fixture would make a
 # later spec's chain resolve a name it never registered.
@@ -150,6 +186,75 @@ describe Gori::Decoder do
       conv("base58-decode", enc).should eq "hello world"
       rt = conv_bytes("base58-decode", conv_bytes("base58-encode", Bytes[0, 0, 1, 2, 3]).to_slice.dup)
       rt.should eq Bytes[0, 0, 1, 2, 3]
+      # The shared bignum radix codec must not have moved base58's known answer.
+      enc.should eq "StV1DL6CwTryKyV"
+    end
+
+    it "base36 / base62 round-trip and preserve leading NUL bytes" do
+      round_trips_text("base36-encode", "base36-decode")
+      round_trips_text("base62-encode", "base62-decode")
+      round_trips_bytes("base36-encode", "base36-decode")
+      round_trips_bytes("base62-encode", "base62-decode")
+      # A leading zero byte is worth nothing to the bignum, so it rides out-of-band as the
+      # alphabet's zero digit — without that, "\0\0\x01\x02" would decode back two bytes short.
+      conv("base36-encode", "").should eq ""
+      conv_bytes("base36-encode", Bytes[0, 0, 1, 2]).should eq "0076".to_slice
+      conv_bytes("base36-decode", "0076".to_slice).should eq Bytes[0, 0, 1, 2]
+    end
+
+    it "folds case for base36 but not base62 (its alphabet uses both)" do
+      conv_bytes("base36-decode", "2WVWKS".to_slice).should eq conv_bytes("base36-decode", "2wvwks".to_slice)
+      conv_bytes("base62-decode", "aB".to_slice).should_not eq conv_bytes("base62-decode", "Ab".to_slice)
+      expect_raises(Gori::Decoder::DecoderError, /invalid base36 char/) { conv("base36-decode", "abc!") }
+      expect_raises(Gori::Decoder::DecoderError, /invalid base62 char/) { conv("base62-decode", "ab_") }
+    end
+
+    it "quoted-printable round-trips arbitrary bytes and stays inside 76 columns" do
+      round_trips_text("quoted-printable-encode", "quoted-printable-decode")
+      round_trips_bytes("quoted-printable-encode", "quoted-printable-decode")
+      conv("quoted-printable-encode", "a=b").should eq "a=3Db"
+      conv("quoted-printable-encode", "über").should eq "=C3=BCber"
+      conv("quoted-printable-encode", "abc " * 40).split("\r\n").each(&.size.should(be <= 76))
+    end
+
+    it "quoted-printable encodes CR/LF and any line-final whitespace" do
+      # Encoding CR/LF is what makes the codec byte-exact: a hard break in the data can
+      # never be confused with a soft break the encoder inserted.
+      conv("quoted-printable-encode", "a\r\nb").should eq "a=0D=0Ab"
+      # Trailing whitespace does not survive transport, so it must not be emitted literally.
+      conv("quoted-printable-encode", "trail ").should eq "trail=20"
+      conv("quoted-printable-encode", "trail\t").should eq "trail=09"
+    end
+
+    it "quoted-printable-decode drops soft breaks and keeps a malformed '=' verbatim" do
+      conv("quoted-printable-decode", "Hello=20World=\r\n!=3D").should eq "Hello World!="
+      conv("quoted-printable-decode", "soft=\nbreak").should eq "softbreak" # bare-LF variant
+      conv("quoted-printable-decode", "a=zb").should eq "a=zb"              # not a hex pair — literal
+      conv("quoted-printable-decode", "trailing=").should eq "trailing="    # nothing follows
+    end
+
+    it "punycode matches the IANA/RFC 3492 vectors, per dot-label" do
+      conv("punycode-encode", "münchen.de").should eq "xn--mnchen-3ya.de"
+      conv("punycode-encode", "bücher").should eq "xn--bcher-kva"
+      conv("punycode-encode", "日本語.jp").should eq "xn--wgv71a119e.jp"
+      conv("punycode-decode", "xn--maana-pta.com").should eq "mañana.com"
+      conv("punycode-decode", "xn--r8jz45g.xn--zckzah").should eq "例え.テスト"
+      # Astral plane (a surrogate pair in UTF-16 terms) must survive the bootstring.
+      conv("punycode-encode", "💩.la").should eq "xn--ls8h.la"
+    end
+
+    it "punycode leaves ASCII labels alone, so a plain hostname round-trips unchanged" do
+      ["", "ascii.example.com", "a-b-c.com", "-hyphen.com", "xn--"].each do |s|
+        conv("punycode-encode", s).should eq s
+        conv("punycode-decode", s).should eq s
+      end
+      ["münchen.de", "münchen.例え.com", "bücher", "💩.la"].each do |s|
+        conv("punycode-decode", conv("punycode-encode", s)).should eq s
+      end
+    end
+
+    it "punycode-decode rejects a malformed xn-- label instead of emitting garbage" do
+      expect_raises(Gori::Decoder::DecoderError, /invalid punycode/) { conv("punycode-decode", "xn--a-!!") }
     end
   end
 
@@ -276,6 +381,55 @@ describe Gori::Decoder do
       conv("unicode-unescape", "\\u_ABC").should eq "\\u_ABC"
       conv("unicode-unescape", "\\uABCD").should eq "ꯍ" # a genuine 4-hex-digit escape still decodes
     end
+
+    it "xml escape/unescape round-trips and covers the five predefined entities" do
+      round_trips_text("xml-escape", "xml-unescape")
+      conv("xml-escape", %(a & b < c > d " e ' f)).should eq "a &amp; b &lt; c &gt; d &quot; e &apos; f"
+      conv("xml-unescape", "&lt;tag attr=&quot;v&quot;&gt;it&apos;s&lt;/tag&gt; &amp;").should eq %(<tag attr="v">it's</tag> &)
+      # '&' is escaped first, so an entity in the SOURCE text survives the round-trip.
+      conv("xml-escape", "&amp;").should eq "&amp;amp;"
+    end
+
+    it "xml-unescape resolves numeric references and leaves unknown entities alone" do
+      conv("xml-unescape", "&#65;&#x42;&#x1F600;").should eq "AB😀"
+      # &nbsp; is an HTML entity, not one of XML's five — keep it verbatim rather than
+      # dropping it, since this reads captured values instead of validating them.
+      conv("xml-unescape", "&nbsp; bare & here &#xZZ;").should eq "&nbsp; bare & here &#xZZ;"
+    end
+
+    it "shell-escape wraps in POSIX single quotes and neutralizes an embedded quote" do
+      conv("shell-escape", "it's a $VAR; rm -rf /").should eq %('it'\\''s a $VAR; rm -rf /')
+      conv("shell-escape", "").should eq "''"
+      conv("shell-escape", "line1\nline2").should eq "'line1\nline2'" # a newline is literal inside ''
+    end
+
+    it "powershell-escape wraps in single quotes and doubles an embedded quote" do
+      conv("powershell-escape", "it's $env:PATH").should eq "'it''s $env:PATH'"
+      conv("powershell-escape", "").should eq "''"
+    end
+
+    it "c-string escape/unescape round-trips text and arbitrary bytes" do
+      round_trips_text("c-string-escape", "c-string-unescape")
+      round_trips_bytes("c-string-escape", "c-string-unescape")
+      conv("c-string-escape", "a\tb\"c\\d\ne").should eq %(a\\tb\\"c\\\\d\\ne)
+      conv("c-string-unescape", %(\\x41\\102\\n\\u0043)).should eq "AB\nC"
+    end
+
+    it "c-string-escape falls back to octal when \\xNN would run on into the next byte" do
+      # \xNN is greedy in C: "\x01" + 'A' compiles as the single byte 0x1A. The fixed-width
+      # 3-digit octal form cannot run on, so it is used exactly when the next byte is a hex digit.
+      conv_bytes("c-string-escape", Bytes[0x01, 0x41]).should eq "\\001A".to_slice
+      conv_bytes("c-string-escape", Bytes[0xff, 0x7a]).should eq "\\xffz".to_slice # 'z' is not a hex digit
+      conv_bytes("c-string-unescape", "\\001A".to_slice).should eq Bytes[0x01, 0x41]
+      conv_bytes("c-string-unescape", "\\xffz".to_slice).should eq Bytes[0xff, 0x7a]
+    end
+
+    it "c-string-unescape keeps an unknown or truncated escape verbatim" do
+      conv("c-string-unescape", "\\q").should eq "\\q"
+      conv("c-string-unescape", "\\x").should eq "\\x"         # \x with no digits
+      conv("c-string-unescape", "\\ud800").should eq "\\ud800" # a lone surrogate has no UTF-8 form
+      conv("c-string-unescape", "trailing\\").should eq "trailing\\"
+    end
   end
 
   describe "text transforms" do
@@ -290,6 +444,28 @@ describe Gori::Decoder do
       conv("rot47", "Hello").should eq "w6==@"
       conv("rot47", conv("rot47", "Hello, World! 123")).should eq "Hello, World! 123"
       conv("rot47", " ").should eq " " # space (0x20) is below 33 → passes through unchanged
+    end
+
+    it "homoglyph swaps ASCII letters for confusables and leaves the rest alone" do
+      conv("homoglyph", "google.com").should eq "ɡооɡⅼе.соm"
+      # Lossy and partial by design: 'D'/'N' have no established lookalike here, and the
+      # separators/digits stay ASCII so the result is still a usable hostname shape.
+      conv("homoglyph", "ADMIN-1").should eq "АDМІN-1"
+      conv("homoglyph", "").should eq ""
+    end
+
+    it "typo generates deduped near-miss variants, one per line, excluding the input" do
+      variants = conv("typo", "ab").lines
+      variants.should eq ["b", "a", "ba", "qb", "sb", "zb", "av", "ag", "ah", "an"]
+      variants.should_not contain "ab" # the input itself is never a variant
+      variants.size.should eq variants.uniq.size
+      conv("typo", "").should eq ""
+      conv("typo", "a").should eq "q\ns\nz" # the empty omission is dropped
+    end
+
+    it "typo mirrors case on an adjacent-key substitution and caps its input" do
+      conv("typo", "Ab").lines.should contain "Qb"
+      expect_raises(Gori::Decoder::DecoderError, /too long/) { conv("typo", "a" * 129) }
     end
   end
 
