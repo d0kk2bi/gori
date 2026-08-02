@@ -398,6 +398,47 @@ describe Gori::Tui::SitemapView do
     end
   end
 
+  it "seeds a scope rule from the cursor: host row -> host rule, path row -> host+path string" do
+    tmp_store do |store|
+      capture(store, "acme.test", "GET", "/api/users")
+
+      view = SitemapView.new
+      view.reload(store)
+
+      # Row 0 is the host: the whole site, so the precise `host` type (subdomain/glob aware).
+      seed = view.selected_scope_seed.should_not be_nil
+      seed[:match_type].should eq("host")
+      seed[:pattern].should eq("acme.test")
+
+      # Any path row narrows to a substring of scheme://host/target — Scope has no path type.
+      view.move(1) # /api
+      seed = view.selected_scope_seed.should_not be_nil
+      seed[:match_type].should eq("string")
+      seed[:pattern].should eq("acme.test/api")
+
+      view.move(1) # /api/users
+      view.selected_scope_seed.not_nil![:pattern].should eq("acme.test/api/users")
+    end
+  end
+
+  it "seeds a fold's scope rule from its CONTAINER, not one folded child" do
+    tmp_store do |store|
+      capture(store, "acme.test", "GET", "/users/3f2a8b1c-1234-5678-9abc-def012345678")
+      capture(store, "acme.test", "GET", "/users/a1b2c3d4-5566-7788-99aa-bbccddeeff00")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.move(1)
+      view.move(1) # the {uuid} fold
+
+      seed = view.selected_scope_seed.should_not be_nil
+      # A rule pinned to one uuid would scope out every OTHER user — and `{uuid}` is not a
+      # real path, so it could never match at all.
+      seed[:match_type].should eq("string")
+      seed[:pattern].should eq("acme.test/users")
+    end
+  end
+
   it "refuses to tag a template fold" do
     tmp_store do |store|
       capture(store, "acme.test", "GET", "/users/3f2a8b1c-1234-5678-9abc-def012345678")

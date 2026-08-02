@@ -564,6 +564,26 @@ module Gori::Tui
       endpoint_of(node, host)
     end
 
+    # The cursor row's scope-rule seed — what "add THIS to the scope" means at this depth:
+    #   host row (depth 0) → a `host` rule for the whole site
+    #   path row           → a `string` rule on "host/path", because Scope has no path type.
+    #                        A string rule is a substring of the same `scheme://host/target`
+    #                        the SQL lens builds (QL::URL_EXPR, port-free), so "example.com/api"
+    #                        covers the subtree under /api on any port.
+    # A fold resolves to its CONTAINER ("/users", not one uuid child) — the same reading
+    # `selected_endpoint(:container)` gives Discover, and the only one a scope prefix can mean.
+    def selected_scope_seed : {match_type: String, pattern: String}?
+      return nil unless row = visible_rows[@selected]?
+      node = row.node
+      return {match_type: "host", pattern: row.host} if row.depth == 0
+      path = node.grouped ? node.fold_parent : node.path
+      return nil unless path
+      # A fold sitting directly under the host root has no container path to prefix with —
+      # scoping it is scoping the host.
+      return {match_type: "host", pattern: row.host} if path.empty?
+      {match_type: "string", pattern: "#{row.host}#{path}"}
+    end
+
     # One node's {host, method, target}, GET-preferred. A node with no captured method of
     # its own (an intermediate folder, a host row) still yields a tuple — it just resolves
     # to no flow at the store, which is the same "no captured request for this path" the

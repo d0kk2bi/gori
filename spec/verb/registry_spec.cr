@@ -476,6 +476,10 @@ private class FakeContext < ExecContext
     @calls << :sitemap_open_flow
   end
 
+  def sitemap_scope_add : Nil
+    @calls << :sitemap_scope_add
+  end
+
   def sitemap_mark_toggle : Nil
     @calls << :sitemap_mark_toggle
   end
@@ -506,6 +510,10 @@ private class FakeContext < ExecContext
 
   def discover_toggle_pause : Nil
     @calls << :discover_toggle_pause
+  end
+
+  def discover_dismiss : Nil
+    @calls << :discover_dismiss
   end
 
   def oast_listen : Nil

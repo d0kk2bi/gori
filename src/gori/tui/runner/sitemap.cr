@@ -63,6 +63,26 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
   end
 
+  # `a` — put the cursor row into the project scope, through the SAME popup the Project
+  # tab's `a` opens, pre-filled from where the cursor sits: a host row seeds a `host` rule,
+  # a path row seeds a "host/path" `string` rule (see SitemapView#selected_scope_seed).
+  # Pre-filled, not written blind: the form is where you widen "/api/v1" to "/api", flip
+  # include→exclude, or bail — and it is the one place scope patterns are validated.
+  #
+  # Cursor-only even with marks set (SITEMAP_CURSOR_ONLY): the form edits ONE pattern, so
+  # a marked set has nothing to mean here.
+  def sitemap_scope_add : Nil
+    seed = sitemap_controller.view.selected_scope_seed
+    unless seed
+      @toast = "select a host or path to scope"
+      return
+    end
+    # Reload on success: the tree shows a scope marker per host whenever rules EXIST (lens or
+    # not), and with the lens on the rule also re-filters the rows under the cursor.
+    open_scope_rule_editor(nil, "include", seed[:match_type], seed[:pattern],
+      on_applied: -> { sitemap_controller.reload })
+  end
+
   # Open the bytes behind the cursor row. CROSS-TAB mediator: resolves the tree node through
   # the store, then drives the History controller + detail overlay — exactly the hop
   # issue_open_flow (runner/issues.cr) makes from an issue to its evidence.
