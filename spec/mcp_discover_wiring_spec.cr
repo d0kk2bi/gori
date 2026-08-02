@@ -197,3 +197,32 @@ describe "MCP discover reports a budget-capped sweep as incomplete" do
     end
   end
 end
+
+# Round 4 / F6. `fuzz_start` / `mine_start` / `sequence_start` all accept `sni` and all three
+# land it on the ClientHello; `discover_start`'s accepted arguments named neither `sni` nor
+# `http2`, so an agent had no way to sweep a name-based vhost by IP — the crawler owns its own
+# `Host:` header, so there was no second route in.
+describe "MCP discover_start — sni / http2 parity" do
+  it "advertises both properties in its tool schema" do
+    with_store do |store|
+      listing = JSON.parse(JSON.build { |j| tools_for(store).list(j) })
+      tool = listing.as_a.find! { |t| t["name"].as_s == "discover_start" }
+      props = tool["inputSchema"]["properties"].as_h
+      props["sni"]["type"].as_s.should eq("string")
+      props["http2"]["type"].as_s.should eq("boolean")
+    end
+  end
+
+  it "accepts them without complaint" do
+    with_store do |store|
+      tools = tools_for(store)
+      # `url` names a closed port on purpose: this asserts ARGUMENT acceptance, not a crawl.
+      text, err = call_raw(tools, "discover_start",
+        {"url" => "https://127.0.0.1:1/", "sni" => "vhost.local", "http2" => true,
+         "bruteforce" => false, "keep_alive" => false, "retries" => 0,
+         "max_requests" => 1, "allow_unscoped" => true}.to_json)
+      fail "discover_start refused sni/http2: #{text}" if err
+      poll_until_done(tools, "discover_status", JSON.parse(text)["job_id"].as_s, 45)
+    end
+  end
+end

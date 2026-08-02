@@ -63,6 +63,16 @@ module Gori::Discover
     property config : Config
     # Verify upstream TLS certificates.
     property? verify : Bool
+    # TLS SNI override — the name presented in the ClientHello (and, under verify, the name
+    # the certificate is checked against) WITHOUT changing the dialed host:port. Mirrors
+    # `Miner::PlanOptions#sni` / `Fuzz` / `Sequencer`; discover was the one engine of the four
+    # that could not carry it, which made an IP-direct sweep of a name-based vhost
+    # inexpressible (the crawler also owns its `Host:` header, so there was no second way in).
+    property sni : String?
+    # Send over HTTP/2 (TLS + ALPN `h2`, or h2c prior-knowledge on http://). `Discover::Sender`
+    # has always had the field; nothing could set it, so an h2-only origin was unreachable
+    # from this engine while the other three took `--http2`.
+    property? http2 : Bool
     # The project's hostname overrides, or nil when the surface has no project to load them
     # from. Only a surface can reach a Store, so this is passed in rather than loaded — and
     # the TUI passes its LIVE `Session#host_overrides` so a mid-session edit is honoured
@@ -73,6 +83,8 @@ module Gori::Discover
                    *,
                    @config : Config = Config.new,
                    @verify : Bool = true,
+                   @sni : String? = nil,
+                   @http2 : Bool = false,
                    @overrides : Gori::HostOverrides? = nil)
     end
   end
@@ -150,6 +162,7 @@ module Gori::Discover
       # `idle_conns` is the run's concurrency for the reason Fuzz uses it: one worker fiber
       # can hold at most one socket per origin, so a larger pool would only keep dead ones open.
       sender = Sender.new(verify: options.verify?, timeout: config.timeout,
+        http2: options.http2?, sni: options.sni,
         headers: Headers.expand(config.headers), overrides: options.overrides,
         keep_alive: config.keep_alive?, idle_conns: config.concurrency)
       new(engine: Engine.new(seed, words, sender, config, policy), seed: seed, host: parts.host,

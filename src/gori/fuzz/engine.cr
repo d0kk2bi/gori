@@ -67,6 +67,15 @@ module Gori::Fuzz
     # the connection-per-send backends stay three-line classes.
     def close : Nil
     end
+
+    # Requests this backend put on the wire BELOW the caller's own count. Today that is only
+    # `ConnPool`'s stale re-sends, which happen inside one `send` call: `CappedBackend` counts
+    # calls, so without this a run that re-sent three requests reported the traffic of four
+    # when seven left the machine. `Progress#requests` documents itself as "REQUESTS actually
+    # put on the wire", which is the number a tester works an agreed budget against.
+    def extra_requests : Int64
+      0_i64
+    end
   end
 
   # Production backend over the Repeater engines (fresh connection per send — there is
@@ -144,6 +153,10 @@ module Gori::Fuzz
     def close : Nil
       @pool.try(&.close_all)
     end
+
+    def extra_requests : Int64
+      @pool.try(&.stale_retries) || 0_i64
+    end
   end
 
   # Enforces a HARD ceiling on the total number of real network sends. Wraps any Backend
@@ -178,6 +191,12 @@ module Gori::Fuzz
       @inner.blocked_reason
     end
 
+    # Delegated for the same reason as `blocked`: this wrapper is what the Engine holds, so a
+    # default 0 here would hide every re-send the pool underneath it made.
+    def extra_requests : Int64
+      @inner.extra_requests
+    end
+
     def send(bytes : Bytes) : Repeater::Result
       return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR) if cap_reached?
       @sent += 1
@@ -202,6 +221,10 @@ module Gori::Fuzz
 
     def origin : Origin
       @inner.origin
+    end
+
+    def extra_requests : Int64
+      @inner.extra_requests
     end
 
     def send(bytes : Bytes) : Repeater::Result
@@ -441,6 +464,10 @@ module Gori::Fuzz
     private def follow_redirects(raw : Repeater::Result) : Repeater::Result
       current = raw
       total_us = raw.duration_us
+      # A keep-alive re-send ANYWHERE in the chain has to reach the row: the collapsed Result
+      # below keeps the last hop's fields, so without this an original request that was
+      # re-sent and then redirected would report as a single clean send.
+      retried = raw.retried?
       hops = 0
       while hops < @config.max_redirects
         resp = current.response
@@ -450,13 +477,15 @@ module Gori::Fuzz
         nxt = redirect_request(loc)
         break unless nxt
         current = @backend.send(nxt)
+        retried ||= current.retried?
         total_us += current.duration_us
         hops += 1
         break unless current.error.nil?
       end
       # Report the whole chain's end-to-end time, not just the final hop's — otherwise a
       # slow original request that 3xx's to a fast resource masks a time-based signal.
-      hops > 0 ? Repeater::Result.new(current.head, current.body, current.response, total_us, current.error, current.incomplete?) : current
+      hops > 0 ? Repeater::Result.new(current.head, current.body, current.response, total_us,
+        current.error, current.incomplete?, current.delivered?, retried) : current
     end
 
     private def redirect_request(loc : String) : Bytes?
@@ -547,7 +576,7 @@ module Gori::Fuzz
 
     private def snapshot : Progress
       Progress.new(@sent, total, @matched, @errors, @backend.blocked, @backend.blocked_reason,
-        @backend.sent)
+        @backend.sent + @backend.extra_requests)
     end
   end
 end

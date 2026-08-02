@@ -106,6 +106,9 @@ module Gori
         # Scope gate — see cmd_fuzz / optional_project_outbound: refuse an out-of-scope host unless
         # --allow-unscoped, and enforce Sandbox + exclude rules on every send. (The
         # --tokens path returned above without touching the network, so it needs none.)
+        # Ahead of Plan.build — see CLI::Run.preflight_bind_from (the builder's unresolved-env
+        # refusal otherwise discards this flag without a word).
+        preflight_bind_from(bind_from, "gori run sequence")
         outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped)
         plan = begin
           Sequencer::Plan.build(options, outbound)

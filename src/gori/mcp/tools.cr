@@ -1564,6 +1564,8 @@ module Gori
               s.field "timeout_ms", intprop("per-request connect + idle timeout in milliseconds")
               s.field "retries", intprop("retries per request on a network error")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni). The crawler owns its own Host header, so this is the only way to sweep a name-based vhost by IP.")
+              s.field "http2", boolprop("send over HTTP/2 (TLS+ALPN h2, or h2c prior-knowledge on http://) instead of HTTP/1.1 (default false, mirrors CLI --http2)")
               s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
               s.field "max_requests", intprop("caller cap on total requests")
               s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection per origin across many probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is the largest cost of a brute-force pass. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")

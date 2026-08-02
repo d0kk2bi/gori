@@ -410,9 +410,11 @@ module Gori
         built = Repeater::FlowRequest.build(detail)
         scheme, host, port = Repeater::FlowRequest.parse_target(built.target)
         bindings = Env.layer.as?(Gori::Bindings)
-        if bindings.nil? || bindings.declared.empty?
-          abort "#{cmd}: --bind-from: this project declares no extract rules, so a replay has " \
-                "nothing to bind — add one with `gori run rewriter extract add`"
+        # Split from the shared check below only so the compiler can narrow `bindings` for the
+        # `values` read further down; `bind_from_blocker(nil)` returns this same sentence.
+        abort "#{cmd}: #{BIND_FROM_NO_RULES}" if bindings.nil?
+        if err = bind_from_blocker(bindings)
+          abort "#{cmd}: #{err}"
         end
         sender = Repeater::Sender.new(outbound, scheme: scheme, host: host, port: port,
           verify: !insecure, http2: built.http2, sni: built.sni, overrides: overrides)
@@ -448,6 +450,41 @@ module Gori
         reason.starts_with?(Env::UNBOUND_PREFIX) ? "#{reason}. #{bindings_headless_hint(cmd)}" : reason
       end
 
+      # Why `--bind-from` cannot bind anything in this project, or nil to go ahead. Shared by
+      # `seed_bindings` (which owns the replay) and `preflight_bind_from` (which runs the same
+      # test before the plan exists), so the two can never disagree about what "this project
+      # has nothing to bind" means.
+      #
+      # The all-disabled case is called out separately: `declared` filters on `enabled?`, so a
+      # project whose only extract rule is switched off used to be told it "declares no extract
+      # rules" and to add one — which is both false and the wrong action.
+      BIND_FROM_NO_RULES = "--bind-from: this project declares no extract rules, so a replay has " \
+                           "nothing to bind — add one with `gori run rewriter extract add`"
+
+      private def self.bind_from_blocker(bindings : Gori::Bindings?) : String?
+        return BIND_FROM_NO_RULES if bindings.nil?
+        return nil unless bindings.declared.empty?
+        disabled = bindings.disabled_rule_ids
+        return BIND_FROM_NO_RULES if disabled.empty?
+        ids = disabled.values.sort!.join(", ")
+        "--bind-from: every extract rule in this project is disabled, so a replay has nothing " \
+        "to bind — enable one with `gori run rewriter extract enable #{disabled.values.min}` " \
+        "(disabled: ##{ids})"
+      end
+
+      # The same refusal, hoisted AHEAD of the plan build.
+      #
+      # `Plan.build`'s unresolved-env check runs first and fires on exactly the template
+      # `--bind-from` was passed for (`Authorization: Bearer $TOKEN` with the rule switched
+      # off), so the flag was discarded without a word — `seed_bindings` was never reached.
+      # This needs only `Env.layer`, which the surface's `open_store` has already hydrated by
+      # the time it runs, so it can move ahead of the plan without the store or the outbound.
+      private def self.preflight_bind_from(bind_from : Int64?, cmd : String) : Nil
+        return unless bind_from
+        err = bind_from_blocker(Env.layer.as?(Gori::Bindings))
+        abort "#{cmd}: #{err}" if err
+      end
+
       # Refuse BEFORE the sweep when the template names a declared-but-unbound binding and no
       # --bind-from was given. Without this the run still starts and every single row comes
       # back refused, which reads like a target problem rather than a missing step.
@@ -467,8 +504,49 @@ module Gori
       # on the FACT, not after the remedy — "...or remove the token for session #3" reads as
       # if the token were the session's.
       private def self.env_unresolved_error(detail : String?, where : String = "") : String
-        "unresolved env #{detail}#{where} — set it with `gori run project env set KEY value`, " \
-        "or remove the token"
+        hits, rest = split_disabled_rule_tokens(detail)
+        return "unresolved env #{detail}#{where} — set it with `gori run project env set KEY value`, " \
+               "or remove the token" if hits.empty?
+        names = hits.map { |(name, id)| "#{Settings.env_prefix}#{name} (extract rule ##{id})" }.join(", ")
+        enable = hits.map { |(_, id)| "`gori run rewriter extract enable #{id}`" }.join(", ")
+        tail = rest.empty? ? "" : " · #{Env.token_list(rest)} is not declared by any rule — " \
+                                  "set it with `gori run project env set KEY value`, or remove the token"
+        "#{names}#{where} #{hits.size == 1 ? "is" : "are"} declared by an extract rule that is " \
+        "DISABLED, so nothing resolves the token — re-enable with #{enable}, then bind it for " \
+        "this run with --bind-from FLOW-ID. Not `gori run project env set`: that persists the " \
+        "value into the project, which is what a session binding exists to avoid, and it is " \
+        "stale by the next run#{tail}"
+      end
+
+      # Split a builder's refused-token list into the names a DISABLED extract rule declares
+      # (with its id) and the names nothing declares at all.
+      #
+      # `Bindings#declared` filters on `enabled?` — deliberately, so that disabling the writer
+      # cannot leave a reader injecting a stale value — which means a switched-off rule's name
+      # arrives here indistinguishable from a typo. The generic remedy for that is
+      # `gori run project env set`, and following it stores a live session token in the project
+      # DB: precisely the outcome `bindings.cr` documents itself as preventing ("The rule
+      # persists; the value never does"), and stale on the next run. So the two cases have to
+      # be told apart before the sentence is chosen.
+      #
+      # `detail` is the builder's own `Env.token_list` output, so it is parsed back with the
+      # same prefix that produced it.
+      private def self.split_disabled_rule_tokens(detail : String?) : {Array({String, Int64}), Array(String)}
+        hits = [] of {String, Int64}
+        rest = [] of String
+        return {hits, rest} unless detail
+        ids = Env.layer.as?(Gori::Bindings).try(&.disabled_rule_ids)
+        return {hits, rest} unless ids && !ids.empty?
+        prefix = Settings.env_prefix
+        detail.split(", ").each do |token|
+          name = token.starts_with?(prefix) ? token[prefix.size..] : token
+          if (id = ids[name]?)
+            hits << {name, id}
+          else
+            rest << name
+          end
+        end
+        {hits, rest}
       end
 
       # QL negation terms ("-field:value" / "-field~rx") begin with '-', so OptionParser

@@ -154,6 +154,25 @@ module Gori
       @mutex.synchronize { @compiled.select(&.rule.enabled?).map(&.rule.name) }
     end
 
+    # The OTHER half of `declared`: `{name => rule id}` for every rule that is switched OFF.
+    #
+    # `declared` filtering on `enabled?` is what makes plan-build refuse `$NAME` when its
+    # writer is disabled, and that refusal is right. What was wrong is the sentence it
+    # produced: with nothing able to tell "this name has no writer at all" from "this name's
+    # writer is one keystroke away from being back on", every surface fell through to the
+    # generic env remedy and told the operator to run `gori run project env set TOKEN <value>`
+    # — which PERSISTS a live session token into the project DB, the precise outcome the class
+    # doc above says this feature exists to prevent, and stale on the next run besides.
+    #
+    # Returns the id so the refusal can name the exact `rewriter extract enable N`.
+    def disabled_rule_ids : Hash(String, Int64)
+      @mutex.synchronize do
+        h = {} of String => Int64
+        @rules.each { |r| h[r.name] = r.id unless r.enabled? }
+        h
+      end
+    end
+
     # Values an ENABLED rule declares. This is what `Env.expand_bindings` and
     # `Rules#substitute` resolve `$NAME` against, so the enabled test has to be HERE and not
     # only on `declared`: `substitute` asks `vars.has_key?(key)` FIRST and emits the value it

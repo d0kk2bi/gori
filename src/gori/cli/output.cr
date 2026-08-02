@@ -176,6 +176,9 @@ module Gori
           j.field "matched", r.matched?
           j.field "error", r.error
           j.field "extracted", r.extracted
+          # Only when true. This is an exception rather than a per-row property, and a `false`
+          # on every row of every clean run would bury the one row that matters.
+          j.field "retried", true if r.retried?
         end
       end
 
@@ -358,6 +361,9 @@ module Gori
           io << "  " << "#{r.words}w".ljust(7)
           io << "  " << human_us(r.duration_us)
           io << "  ⟦" << r.extracted << '⟧' if r.extracted
+          # Before the error text, because it qualifies the SEND rather than the response: this
+          # request went out twice (see `Fuzz::Result#retried?`).
+          io << "  re-sent" if r.retried?
           io << "  " << r.error if r.error
         end
       end
