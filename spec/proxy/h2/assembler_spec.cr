@@ -15,6 +15,24 @@ private def data_frame(stream : UInt32, flags : UInt8, body : String) : Frame::H
   Frame::Header.new(Frame::Type::Data.value, flags, stream, body.to_slice)
 end
 
+# An RFC 8441 extended CONNECT head — `:method CONNECT` with a `:protocol` pseudo-header,
+# which is how a WebSocket is opened over HTTP/2. Encoded rather than hard-coded because
+# `:protocol` is not in the HPACK static table.
+private def connect_block : Bytes
+  Gori::Proxy::H2::HPACK::Encoder.new.encode([
+    {":method", "CONNECT"}, {":protocol", "websocket"}, {":scheme", "https"},
+    {":path", "/chat"}, {":authority", "ws.example.com"},
+    {"sec-websocket-version", "13"},
+  ])
+end
+
+# The same shape WITHOUT `:protocol`: an ordinary CONNECT tunnel.
+private def plain_connect_block : Bytes
+  Gori::Proxy::H2::HPACK::Encoder.new.encode([
+    {":method", "CONNECT"}, {":authority", "tunnel.example.com:443"},
+  ])
+end
+
 # Records emitted flows (decoded projection) without a DB.
 private class RecSink < Gori::Proxy::FlowSink
   getter requests = [] of Gori::Store::CapturedRequest
@@ -436,5 +454,79 @@ describe Gori::Proxy::H2::Assembler do
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     sink.requests.size.should eq(1)
     sink.requests.first.method.should eq("GET")
+  end
+  # --- RFC 8441 extended CONNECT (a WebSocket over h2) ----------------------------------
+  #
+  # The relay works end to end, and that is exactly the problem these cover: the flow it
+  # leaves behind said nothing. `extended_connect_note` hung off `finalize_stream`, which is
+  # reached only when a stream ABORTS — so the normal teardown (a WebSocket Close handshake
+  # and END_STREAM, what every conforming client does) completed through `emit_ready` with
+  # `error` NULL and `advisory` NULL, and `synth_request`'s pseudo filter dropped `:protocol`
+  # from the stored head. Nothing on disk — History, the QL, `run show`, HAR, MCP `get_flow` —
+  # could identify the flow as a WebSocket that ran with no transcript, no message intercept
+  # and no Match&Replace.
+  it "advises on a CLEANLY closed extended CONNECT stream, not only on an aborted one" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block))
+    # The origin accepts, relays frames, and both halves END_STREAM: state Complete.
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
+    assembler.feed("in", data_frame(1_u32, Frame::END_STREAM, "\x81\x03one"))
+    assembler.feed("out", data_frame(1_u32, Frame::END_STREAM, "\x88\x02\x03\xe8"))
+
+    sink.requests.size.should eq(1)
+    sink.responses.size.should eq(1)
+    resp = sink.responses.first
+    resp.state.should eq(Gori::Store::FlowState::Complete)
+    resp.error.should be_nil # the stream really did complete — this is not a failure
+    # `advisory_of` joins the accumulated set onto BOTH halves, so it survives to the request
+    # row and the response row alike (`update_one` writes the column outright).
+    sink.requests.first.advisory.not_nil!.should contain("RFC 8441 extended CONNECT")
+    sink.requests.first.advisory.not_nil!.should contain(":protocol \"websocket\"")
+    resp.advisory.not_nil!.should contain("no message transcript")
+    # ... and the head names the stream shape, which the pseudo filter dropped entirely.
+    String.new(sink.requests.first.head).should contain("X-Gori-Protocol: websocket")
+  end
+
+  # The same stream ABORTED: the reason on `flows.error` still explains itself (that path is
+  # what an operator reads first), and the advisory is there too rather than instead.
+  it "keeps the aborted extended CONNECT reason AND writes the advisory" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block))
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
+    assembler.finalize_all("h2 connection closed")
+
+    resp = sink.responses.first
+    resp.state.should eq(Gori::Store::FlowState::Aborted)
+    resp.error.not_nil!.should contain("h2 connection closed")
+    resp.error.not_nil!.should contain("RFC 8441 extended CONNECT")
+    resp.advisory.not_nil!.should contain("RFC 8441 extended CONNECT")
+  end
+
+  # The complement that decides whether either of the above means anything: an ordinary
+  # CONNECT tunnel — no `:protocol` pseudo — must get NO advisory and NO head marker, or the
+  # signal is on every CONNECT and says nothing.
+  it "leaves an ordinary CONNECT tunnel unannotated" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, plain_connect_block))
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
+    assembler.feed("in", data_frame(1_u32, Frame::END_STREAM, "bytes"))
+    assembler.feed("out", data_frame(1_u32, Frame::END_STREAM, "bytes"))
+
+    sink.requests.first.advisory.should be_nil
+    sink.responses.first.advisory.should be_nil
+    String.new(sink.requests.first.head).should_not contain("X-Gori-Protocol")
+  end
+
+  # ... and neither does an ordinary GET, which is what every other flow on the connection is.
+  it "leaves an ordinary request unannotated" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    sink.requests.first.advisory.should be_nil
+    String.new(sink.requests.first.head).should_not contain("X-Gori-Protocol")
   end
 end

@@ -12,19 +12,40 @@ module Gori
       Grpc
       Sse
 
-      # Short uppercase tag for the History PROTO column (WS/GRPC/SSE); the Http
-      # member has no tag of its own — the column falls back to the scheme
-      # (HTTP/HTTPS) so the plaintext-vs-TLS signal is preserved for normal flows.
-      def label : String
+      # Short uppercase tag for the History PROTO column, TRANSPORT INCLUDED.
+      #
+      # The column has always distinguished HTTP from HTTPS, and this used to return a bare
+      # WS/GRPC/SSE tag that REPLACED the scheme — so for exactly the three protocols where
+      # gori has something extra to say, it dropped the one fact the Http member's fallback
+      # existed to preserve. A `ws://` row and a `wss://` row were pixel-identical: same
+      # METHOD, same PROTO, same HOST (the column carries no port), and "the app opened a
+      # CLEARTEXT WebSocket and put a session token in the first frame" is a finding the
+      # triage list could not express, while the store had the answer and the QL already
+      # filtered on it.
+      #
+      # `S` means TLS here for the same reason it does in HTTPS. Every string this can
+      # return is a value the `proto:` filter accepts (`Proto.split_transport` + `parse?`),
+      # which is the module's own claim: the label you see and the value you filter on
+      # cannot drift.
+      def label(scheme : String) : String
+        secure = Proto.secure?(scheme)
         case self
-        in Http then "HTTP"
-        in Ws   then "WS"
-        in Grpc then "GRPC"
-        in Sse  then "SSE"
+        in Http then secure ? "HTTPS" : "HTTP"
+        in Ws   then secure ? "WSS" : "WS"
+        in Grpc then secure ? "GRPCS" : "GRPC"
+        in Sse  then secure ? "SSES" : "SSE"
         end
       end
 
-      # Parse a QL `proto:` value. `websocket` is accepted as an alias for `ws`.
+      # Parse a QL `proto:` value's APPLICATION-protocol half. `websocket` is accepted as an
+      # alias for `ws`.
+      #
+      # Deliberately NOT an alias table that folds `wss` in here. This is also what the
+      # intercept catch condition canonicalizes through (`InterceptFilter.fold`), which has
+      # one field per leaf and so cannot carry a transport term — folding `wss` to `ws` there
+      # would silently WIDEN an operator's condition to cleartext sockets. The transport is
+      # split off first, by `Proto.split_transport`, and re-applied by the caller that can
+      # express it.
       def self.parse?(value : String) : Kind?
         case value.downcase
         when "http"            then Http
@@ -33,6 +54,31 @@ module Gori
         when "sse"             then Sse
         else                        nil
         end
+      end
+    end
+
+    # Is a flow's stored scheme a TLS one? The store keeps the HTTP scheme (`http`/`https`)
+    # even for a WebSocket — a `wss://` URL is a 101 handshake inside a CONNECT tunnel — so
+    # the `wss` spelling is accepted alongside for any caller that has a URL rather than a
+    # flow row. One place decides it, for the PROTO column and the QL alike.
+    def self.secure?(scheme : String) : Bool
+      scheme == "https" || scheme == "wss"
+    end
+
+    # Split a `proto:` value into its application-protocol spelling and the transport the
+    # operator NAMED, if any. `{value, nil}` when they named none — "either transport".
+    #
+    # The PROTO column prints the TLS spellings (`HTTPS`/`WSS`/`GRPCS`/`SSES`), so they have
+    # to be typeable; and they have to MEAN the transport they name rather than widening to
+    # the base protocol, which is why this returns a pair instead of aliasing inside
+    # `Kind.parse?`. `QL.proto_cond` turns the `true` half into a `scheme` term.
+    def self.split_transport(value : String) : {String, Bool?}
+      case value.downcase
+      when "https" then {"http", true}
+      when "wss"   then {"ws", true}
+      when "grpcs" then {"grpc", true}
+      when "sses"  then {"sse", true}
+      else              {value, nil}
       end
     end
 

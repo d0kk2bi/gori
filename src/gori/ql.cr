@@ -273,19 +273,26 @@ module Gori
     # guard so `http` can negate them NULL-safely — a pending/typeless flow (NULL
     # content_type) counts as http, and `-proto:grpc` correctly keeps it. An
     # unknown value (proto:foo) drops the term, like a bad status: (never matches
-    # all). `websocket` is an alias for `ws`.
+    # all). `websocket` is an alias for `ws`, and `wss`/`grpcs`/`sses`/`https` add the
+    # transport the operator named — the spellings the PROTO column prints.
     GRPC_SQL = "(content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%')"
     SSE_SQL  = "(content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%')"
 
     private def self.proto_cond(value : String) : {String, Array(DB::Any)}?
+      # The TLS spellings the History PROTO column prints (`WSS`/`GRPCS`/`SSES`/`HTTPS`) are
+      # accepted and mean what the column means: the application protocol AND the transport.
+      # Without the second half `proto:wss` would quietly return the cleartext rows too —
+      # the exact signal the column was changed to stop dropping.
+      base, secure = Proto.split_transport(value)
       no_args = [] of DB::Any
-      case Proto::Kind.parse?(value)
-      in Proto::Kind::Ws   then {"status = 101", no_args}
-      in Proto::Kind::Grpc then {GRPC_SQL, no_args}
-      in Proto::Kind::Sse  then {SSE_SQL, no_args}
-      in Proto::Kind::Http then {"(status IS NULL OR status <> 101) AND NOT #{GRPC_SQL} AND NOT #{SSE_SQL}", no_args}
-      in nil               then nil
-      end
+      sql = case Proto::Kind.parse?(base)
+            in Proto::Kind::Ws   then "status = 101"
+            in Proto::Kind::Grpc then GRPC_SQL
+            in Proto::Kind::Sse  then SSE_SQL
+            in Proto::Kind::Http then "(status IS NULL OR status <> 101) AND NOT #{GRPC_SQL} AND NOT #{SSE_SQL}"
+            in nil               then return nil
+            end
+      secure.nil? ? {sql, no_args} : {"(#{sql}) AND scheme = 'https'", no_args}
     end
 
     # size: → the TOTAL bytes (request + response), so it matches the displayed/JSON
