@@ -21,6 +21,7 @@ module Gori
       Token       # jwt-decode
       Escape      # html, json-string, unicode
       Text        # rot13, upper, lower, reverse
+      Saved       # a named chain from the user's library, callable as one step (decoder/library.cr)
 
       def label : String
         to_s.downcase

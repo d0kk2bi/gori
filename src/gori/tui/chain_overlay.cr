@@ -97,13 +97,15 @@ module Gori::Tui
       end
     end
 
-    # {name colour, output colour, output text} for one step's row.
+    # {name colour, output colour, output text} for one step's row. A step that resolved to a
+    # SAVED chain from the library is named in the marker accent: it is one row here but many
+    # converters on the wire, and that distinction is invisible from the name alone.
     private def self.step_row(step : Decoder::StepResult) : {Color, Color, String}
       case step.state
       when .ok?
         bytes = step.output
         shown = bytes ? Decoder.display(bytes)[0] : ""
-        {Theme.text, Theme.green, shown}
+        {step.converter.try(&.category.saved?) ? Theme.marker_accent : Theme.text, Theme.green, shown}
       when .skipped?
         {Theme.muted, Theme.muted, "(skipped)"}
       else # failed / unknown

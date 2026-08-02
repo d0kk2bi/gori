@@ -11,6 +11,19 @@ private def conv_bytes(name : String, input : Bytes) : Bytes
   REG[name].not_nil!.apply(input)
 end
 
+# Publish a named-chain library, hand the rebuilt registry to the block, and ALWAYS put the
+# previous one back: `Decoder.library` is process-global, so a leaked fixture would make a
+# later spec's chain resolve a name it never registered.
+private def with_library(entries : Array({String, String}), &)
+  before = Gori::Decoder.library
+  Gori::Decoder.library = entries
+  begin
+    yield Gori::Decoder.shared_registry
+  ensure
+    Gori::Decoder.library = before
+  end
+end
+
 describe Gori::Decoder do
   describe "registry" do
     it "resolves canonical names, aliases, and is case/separator insensitive" do
@@ -386,6 +399,96 @@ describe Gori::Decoder do
       res.steps[0].state.should eq Gori::Decoder::StepState::Ok # gzip → binary
       res.steps[1].state.should eq Gori::Decoder::StepState::Failed
       res.steps[1].error.not_nil!.should contain("not valid text") # was "Regex match error: UTF-8 error…"
+    end
+  end
+
+  # The global named-chain library (settings.json `decoder.chains`) registered as converters,
+  # so a saved name is a chain STEP everywhere a spec runs — the Decoder tab, the
+  # Repeater/Fuzzer §value¦chain§ marker, `gori run decoder`, MCP `decode`.
+  describe "saved-chain library" do
+    it "calls a saved chain by name, as one step, next to built-ins" do
+      with_library([{"myenc", "base64-encode > upper"}]) do |reg|
+        res = Gori::Decoder.run(reg, "abc".to_slice, "myenc > lower")
+        res.ok?.should be_true
+        res.steps.size.should eq 2 # the saved chain is ONE row, not its two converters
+        res.steps[0].name.should eq "myenc"
+        String.new(res.steps[0].output.not_nil!).should eq "YWJJ" # base64("abc")=YWJj, uppercased
+        String.new(res.output.not_nil!).should eq "ywjj"
+      end
+    end
+
+    it "offers saved names to the chain autocomplete" do
+      with_library([{"myenc", "base64-encode"}]) do |reg|
+        reg.match("mye").map(&.name).should contain "myenc"
+      end
+    end
+
+    it "resolves a saved chain that references another, in either definition order" do
+      with_library([{"inner", "base64-encode"}, {"outer", "inner > upper"}]) do |reg|
+        String.new(Gori::Decoder.run(reg, "abc".to_slice, "outer").output.not_nil!).should eq "YWJJ"
+      end
+      with_library([{"outer", "inner > upper"}, {"inner", "base64-encode"}]) do |reg|
+        String.new(Gori::Decoder.run(reg, "abc".to_slice, "outer").output.not_nil!).should eq "YWJJ"
+      end
+    end
+
+    it "matches a saved name case- and separator-insensitively, like any converter" do
+      with_library([{"My Chain", "upper"}]) do |reg|
+        String.new(Gori::Decoder.run(reg, "ab".to_slice, "my-chain").output.not_nil!).should eq "AB"
+        String.new(Gori::Decoder.run(reg, "ab".to_slice, "MY_CHAIN").output.not_nil!).should eq "AB"
+      end
+    end
+
+    it "never lets a saved name shadow a built-in name OR alias" do
+      with_library([{"hex", "upper"}, {"base64-encode", "lower"}]) do |reg|
+        String.new(Gori::Decoder.run(reg, "a".to_slice, "hex").output.not_nil!).should eq "61"
+        String.new(Gori::Decoder.run(reg, "A".to_slice, "base64-encode").output.not_nil!).should eq "QQ=="
+      end
+    end
+
+    it "fails a recursive definition as a step instead of hanging" do
+      with_library([{"a", "b > upper"}, {"b", "a"}]) do |reg|
+        res = Gori::Decoder.run(reg, "x".to_slice, "a")
+        res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+        res.steps[0].error.not_nil!.should contain "recursive"
+      end
+    end
+
+    it "names the inner step that broke, not just the saved chain" do
+      with_library([{"peel", "upper > gunzip"}]) do |reg|
+        res = Gori::Decoder.run(reg, "not gzip".to_slice, "peel")
+        res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+        err = res.steps[0].error.not_nil!
+        err.should contain "peel"
+        err.should contain "gunzip"
+      end
+    end
+
+    it "reports an unresolvable token inside a saved chain against that token" do
+      with_library([{"x", "base64-encode > bogus"}]) do |reg|
+        res = Gori::Decoder.run(reg, "a".to_slice, "x")
+        res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+        res.steps[0].error.not_nil!.should contain "bogus"
+      end
+    end
+
+    it "treats an empty saved chain as the identity" do
+      with_library([{"nop", "  "}]) do |reg|
+        res = Gori::Decoder.run(reg, "hi".to_slice, "nop")
+        res.ok?.should be_true
+        String.new(res.output.not_nil!).should eq "hi"
+      end
+    end
+
+    it "publishes through the Settings setter, so every surface sees the same library" do
+      before = Gori::Settings.decoder_chains
+      begin
+        Gori::Settings.decoder_chains = [{"fromsettings", "upper"}]
+        String.new(Gori::Decoder.run(Gori::Decoder.shared_registry, "ab".to_slice, "fromsettings")
+          .output.not_nil!).should eq "AB"
+      ensure
+        Gori::Settings.decoder_chains = before
+      end
     end
   end
 
