@@ -226,25 +226,57 @@ module Gori::Fuzz
     # Map each payload through its position's Decoder chain (empty chain = identity),
     # returning a new payload array to feed `render`. A chain that fails on THIS payload — a
     # step that raised on these bytes, or output over MAX_OUT — leaves that value
-    # UNTRANSFORMED: Decoder.run never raises, and a streaming fuzz run has nowhere to
-    # surface a per-position error (validate chains in the Decoder tab).
+    # UNTRANSFORMED (Decoder.run never raises). This is the VALUES-only view, for callers that
+    # do not report a per-row chain failure — the baseline/calibration seeds and the Repeater
+    # preview, which shows the same rendered bytes it sends. A REPORTED fuzz request uses
+    # `apply_chains_reported`, which also returns the named reason so the row can carry it
+    # rather than passing a wrong-on-the-wire request off as clean.
     #
-    # What this must NOT be reached with any more is a chain that could never run at all —
-    # an unknown token, or a saved chain the library registered as unusable (recursive, past
-    # MAX_TOKENS). Those are a property of the TEMPLATE, not of a payload, so they are refused
-    # once at `Fuzz::Plan.build` (`refuse_unusable_chains`) before the first dial rather than
-    # silently swallowed here on every request of the sweep. What is left is genuinely
-    # per-payload — `base64-decode` over a payload that isn't base64 — where the next payload
-    # may well succeed and there is nothing to refuse up front. Decoder works
-    # on Bytes but the template splices Strings, so the transformed bytes are rewrapped
-    # with String.new — encoders (base64/url/hex/hash/escape) stay ASCII; a decoder that
-    # produces raw bytes may lose fidelity, the same limit binary bodies already have.
+    # What this must NOT be reached with is a chain that could never run at all — an unknown
+    # token, or a saved chain the library registered as unusable (recursive, past MAX_TOKENS).
+    # Those are a property of the TEMPLATE, not of a payload, so they are refused once at
+    # `Fuzz::Plan.build` (`refuse_unusable_chains`) before the first dial. What is left is
+    # genuinely per-payload — `base64-decode` over a payload that isn't base64, `shell-escape`
+    # over a non-UTF-8 payload — where the next payload may well succeed and there is nothing
+    # to refuse up front. Decoder works on Bytes but the template splices Strings, so the
+    # transformed bytes are rewrapped with String.new — encoders (base64/url/hex/hash/escape)
+    # stay ASCII; a decoder that produces raw bytes may lose fidelity, the same limit binary
+    # bodies already have.
     def apply_chains(payloads : Array(String), registry : Decoder::Registry) : Array(String)
+      apply_chains_reported(payloads, registry).map(&.[0])
+    end
+
+    # Like `apply_chains`, but returns `{value, chain_error}` per payload: the transformed
+    # value AND — when the chain FAILED on THIS payload — the named reason it did not run
+    # (nil when it ran, or when there was no chain). The value in the failing case is the
+    # payload UNTRANSFORMED, a different request than the operator declared, so the reason
+    # rides out with it: a per-request `Fuzz::Result` already carries `error`/`retried`, so
+    # `chain_error` lands beside them and is counted in the run's error tally rather than
+    # swallowed under `0 errors` (#567/H3 Finding 1). Kept separate from `apply_chains` so the
+    # Repeater preview and baseline seeds — which have no per-row surface — need no change.
+    def apply_chains_reported(payloads : Array(String), registry : Decoder::Registry) : Array({String, String?})
       payloads.map_with_index do |p, k|
         spec = @positions[k]?.try(&.chain)
-        next p if spec.nil? || spec.empty?
+        next {p, nil} if spec.nil? || spec.empty?
         res = Decoder.run(registry, p.to_slice, spec)
-        (res.ok? && (o = res.output)) ? String.new(o) : p
+        if res.ok? && (o = res.output)
+          {String.new(o), nil}
+        else
+          {p, chain_failure_reason(spec, res)}
+        end
+      end
+    end
+
+    # A named, operator-facing reason a chain did not run on a payload, in the shape
+    # `gori run decoder` already prints one screen away — "chain '<spec>' step '<name>'
+    # failed: <message>" — so the row says WHY the payload went out raw, not merely that it
+    # did. Read-only over Decoder's public `ChainResult` (the codec package owns that struct).
+    private def chain_failure_reason(spec : String, res : Decoder::ChainResult) : String
+      if (i = res.failed_at) && (step = res.steps[i]?)
+        detail = step.error || (step.state.unknown? ? "unknown converter" : "failed")
+        "chain '#{spec}' step '#{step.name}' failed: #{detail}"
+      else
+        "chain '#{spec}' produced no output"
       end
     end
 

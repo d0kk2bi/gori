@@ -332,8 +332,10 @@ module Gori
       private def self.emit_fuzz_result(r : Fuzz::Result, format : Symbol, buffer : Array(Fuzz::Result)) : Bool
         # A re-sent row is shown even when it neither matched nor errored: it is the one row of
         # the run whose request reached the origin twice, and dropping it here would put the
-        # duplicate back where it was — invisible outside the connections summary.
-        return false unless r.matched? || r.error || r.retried?
+        # duplicate back where it was — invisible outside the connections summary. A row whose
+        # `¦chain` did not run is shown for the same reason: its payload went out untransformed,
+        # and hiding it would return it to `0 errors` invisibility.
+        return false unless r.matched? || r.error || r.retried? || r.chain_error
         case format
         when :jsonl then puts CLI::Output.fuzz_row_json(r)
         when :json  then buffer << r

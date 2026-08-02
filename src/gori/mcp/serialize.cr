@@ -238,6 +238,10 @@ module Gori
           j.field "lines", r.lines
           j.field "duration_us", r.duration_us
           j.field "error", text(r.error)
+          # A declared `¦chain` that could not run on this payload — it went out UNTRANSFORMED.
+          # Emitted only when set, so an agent never reads a clean row for a request that sent a
+          # different test than asked. `error` stays the network/send failure; this is distinct.
+          j.field "chain_error", text(r.chain_error) if r.chain_error
           j.field "extracted", text(r.extracted)
           # This variation's request reached the origin TWICE: the keep-alive pool found its
           # parked socket closed and re-sent (see `Fuzz::Result#retried?`). Emitted only when
