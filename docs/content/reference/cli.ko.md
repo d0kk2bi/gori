@@ -214,7 +214,7 @@ gori run repeater create --flow 42 --name "clone of 42"
 |-------|---------|
 | Transport | `--target=URL` (`--request`/stdin에 필수), `--http2`, `--sni=HOST`, `-k`/`--insecure-upstream` |
 | Mode | `--mode=` `sniper` (기본값), `batteringram`, `pitchfork`, `clusterbomb` |
-| Payloads | `-w`/`--wordlist`, `--payloads=LIST`, `--numbers=FROM-TO[:STEP]`, `--null=N`, `--brute=CHARSET:MIN-MAX` |
+| Payloads | `-w`/`--wordlist`, `--preset=NAME[:FILE]` (내장: `sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`), `--payloads=LIST`, `--numbers=FROM-TO[:STEP]`, `--null=N`, `--brute=CHARSET:MIN-MAX` |
 | Processors | `--prefix`, `--suffix`, `--encode` (`url`\|`urlall`\|`base64`\|`hex`), `--case` (`upper`\|`lower`), `--hash` (`md5`\|`sha1`\|`sha256`), `--regex-replace=/pat/rep/` |
 | Rate | `--concurrency` (20), `--rate=RPS`, `--throttle=MS`, `--timeout=SEC`, `--retries=N`, `--follow-redirects`, `--no-keep-alive` |
 | Matchers | `--mc`/`--fc` status, `--ms`/`--fs` size, `--mw`/`--fw` words, `--ml`/`--fl` lines, `--mr`/`--fr` body regex, `--extract=REGEX`, `--ac` auto-calibrate |

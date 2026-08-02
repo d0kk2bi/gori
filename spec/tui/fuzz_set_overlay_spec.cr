@@ -84,10 +84,37 @@ describe Gori::Tui::FuzzSetOverlay do
 
   it "cycling the Type row wraps back to List" do
     ov = FuzzSetOverlay.for_list
-    5.times { ov.handle_key(okey(Termisu::Input::Key::Right)) } # list→…→brute→list
+    6.times { ov.handle_key(okey(Termisu::Input::Key::Right)) } # list→…→brute→preset→list
     ov.handle_key(okey(Termisu::Input::Key::Down))              # values editor
     otype(ov, "x")
     ov.build_spec.not_nil!.kind.should eq(:list)
+  end
+
+  it "Preset: selecting the type yields a :preset set with a built-in name (←/→ cycles)" do
+    ov = FuzzSetOverlay.for_list
+    5.times { ov.handle_key(okey(Termisu::Input::Key::Right)) } # List → … → Preset (last)
+    spec = ov.build_spec.not_nil!
+    spec.kind.should eq(:preset)
+    Gori::Fuzz::Presets.names.should contain(spec.value) # a real preset name
+    ov.handle_key(okey(Termisu::Input::Key::Down))  # Type row → the Preset selector
+    ov.handle_key(okey(Termisu::Input::Key::Right)) # cycle to the next preset
+    ov.build_spec.not_nil!.value.should_not eq(spec.value)
+  end
+
+  it "seeds a :preset set back onto its selector" do
+    ov = FuzzSetOverlay.editing(Gori::Tui::SetSpec.new(:preset, "traversal"), 1)
+    spec = ov.build_spec.not_nil!
+    spec.kind.should eq(:preset)
+    spec.value.should eq("traversal")
+  end
+
+  it "renders the preset selector with the available names" do
+    ov = FuzzSetOverlay.editing(Gori::Tui::SetSpec.new(:preset, "sqli"), 0)
+    backend = MemoryBackend.new(120, 30)
+    ov.render(Screen.new(backend), Rect.new(0, 0, 120, 30))
+    backend.contains?("Preset").should be_true
+    backend.contains?("sqli").should be_true
+    backend.contains?("payloads").should be_true # the count meta line
   end
 
   it "seeds a Numbers set back into its from/to/step fields" do

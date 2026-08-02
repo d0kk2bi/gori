@@ -1163,6 +1163,7 @@ module Gori::Tui
       case s.kind
       when :list    then Fuzz::InlineList.new(s.value.split(','))
       when :file    then Fuzz::WordlistFile.new(s.value)
+      when :preset  then Fuzz::PresetSource.new(s.value)
       when :null    then Fuzz::NullPayloads.new(s.value.to_i? || 1)
       when :numbers then build_numbers(s.value)
       when :brute   then build_brute(s.value)
@@ -1631,6 +1632,7 @@ module Gori::Tui
       case k
       when "list"    then :list
       when "file"    then :file
+      when "preset"  then :preset
       when "numbers" then :numbers
       when "null"    then :null
       when "brute"   then :brute

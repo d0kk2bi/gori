@@ -123,6 +123,38 @@ describe "MCP fuzz tools" do
     end
   end
 
+  # A built-in preset (issue #566) is selectable as a payload SOURCE, composes with a
+  # second set, and merges an optional user file — the same model the CLI/TUI use.
+  it "accepts a built-in preset as a payload set, and merges a user file" do
+    port = start_origin
+    with_store do |store|
+      tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+      base = {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:#{port}",
+        "allow_unscoped" => true,
+      }
+      sqli = Gori::Fuzz::Presets.load("sqli").size
+      # A bare preset set resolves to the whole built-in list.
+      one = call_json(tools, "fuzz_start", base.merge({"payloads" => [{"preset" => "sqli"}]}).to_json)
+      one["total"].as_i.should eq(sqli)
+      # A "file" sibling merges into the built-in (built-in first, de-duped).
+      path = File.tempname("gori-mcp-preset")
+      File.write(path, "EXTRA-1\nEXTRA-2\n")
+      begin
+        merged = call_json(tools, "fuzz_start",
+          base.merge({"payloads" => [{"preset" => "sqli", "file" => path}]}).to_json)
+        merged["total"].as_i.should eq(sqli + 2)
+      ensure
+        File.delete(path) rescue nil
+      end
+      # An unknown preset name is a clean arg error listing the alternatives.
+      text, bad = call_raw(tools, "fuzz_start", base.merge({"payloads" => [{"preset" => "nope"}]}).to_json)
+      bad.should be_true
+      text.should contain("unknown preset")
+    end
+  end
+
   # `list` entries are JSON strings, so a payload reached the wire as its UTF-8 ENCODING:
   # `é` went out as `\xc3\xa9` and a byte-level set (0x00-0xFF, overlong/invalid UTF-8) could
   # not be expressed at all — the only escape hatch was a `wordlist` FILE on the server disk.
