@@ -828,8 +828,10 @@ describe Gori::Proxy::WS do
     it "forwards an empty leading fragment identically with and without a rule armed" do
       lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, Bytes.empty, fin: false)
       ping = masked_op_frame(Gori::Proxy::WS::OP_PING, "pi".to_slice)
-      tailer = masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice)
-      wire = lead + ping + tailer
+      # The message never FINs — the socket just ends. A message that DOES complete was never
+      # affected (`emit_message` puts `@raw` back on the wire whole), which is why three rounds
+      # of fragmentation tests walked past this.
+      wire = lead + ping
 
       relayed = ->(rewriter : Gori::Proxy::HeadRewriter?) do
         cs_r, cs_w = IO.pipe
@@ -850,10 +852,10 @@ describe Gori::Proxy::WS do
       plain_bytes, plain_rows = relayed.call(nil)
       plain_bytes.should eq(wire) # the byte-exact pump has always done this
       armed_bytes.should eq(plain_bytes)
-      # ... and the two pumps have to agree about the rows as well. Two frames of payload —
-      # the empty one counts — and no row of its own for a zero-byte fragment.
+      # ... and the two pumps have to agree about the rows as well: the PING's arrival, and no
+      # row of its own for a zero-byte fragment.
       armed_rows.should eq(plain_rows)
-      armed_rows.should eq([{"out", 9, "pi"}, {"out", 1, "BBB"}])
+      armed_rows.should eq([{"out", 9, "pi"}])
     end
 
     # The complement of "empty": one byte of payload in the leading fragment took the branch
