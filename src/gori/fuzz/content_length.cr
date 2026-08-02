@@ -22,8 +22,20 @@ module Gori::Fuzz
     # `Transfer-Encoding: chunked` (CL is unused — chunk re-framing is out of scope),
     # or the header is absent and `add_when_missing` is false (keeps GETs clean).
     def self.sync(bytes : Bytes, add_when_missing : Bool = false) : Bytes
+      sync_at(bytes, add_when_missing)[0]
+    end
+
+    # `sync`, plus WHERE it edited and by how much: `{bytes, at, delta}`, where every byte
+    # offset `>= at` in the input has moved by `delta` in the output. `{bytes, 0, 0}` on
+    # every no-op path.
+    #
+    # A caller holding offsets INTO the pre-sync bytes — `Fuzz::Generator`, which knows each
+    # payload's span — cannot re-derive them afterwards, because this rewrite happens between
+    # the splice and the socket and can change the head's length. Returning the edit instead
+    # of the whole mapping keeps the (dominant) untouched-request path allocation-free.
+    def self.sync_at(bytes : Bytes, add_when_missing : Bool = false) : {Bytes, Int32, Int32}
       sep, sep_w, eol = boundary(bytes)
-      return bytes if sep.nil?
+      return {bytes, 0, 0} if sep.nil?
 
       body_start = sep + sep_w
       body_len = bytes.size - body_start
@@ -33,19 +45,26 @@ module Gori::Fuzz
         # No Content-Length header. Both the "leave GETs clean" default and a chunked
         # request return the input unchanged, so we never build a head String or run the
         # chunked scan on this (dominant) path — only when actually adding a header.
-        return bytes unless add_when_missing && body_len > 0
-        return bytes if chunked?(bytes, sep, eol)
-        return append_cl(bytes, sep, body_start, body_len, eol)
+        return {bytes, 0, 0} unless add_when_missing && body_len > 0
+        return {bytes, 0, 0} if chunked?(bytes, sep, eol)
+        # The insertion goes in at `sep`, so everything from the head/body separator on has
+        # moved by the line it added (its own eol + name + digits).
+        return {append_cl(bytes, sep, body_start, body_len, eol), sep,
+                eol.bytesize + CL_CANON.bytesize + body_len.to_s.bytesize}
       end
 
       # CL present: a chunked request keeps its (unused) header verbatim (out of scope).
-      return bytes if chunked?(bytes, sep, eol)
+      return {bytes, 0, 0} if chunked?(bytes, sep, eol)
       ls, le = cl
       # Skip the rebuild when the line is already exactly the canonical form we'd emit —
       # same early-out as the old `lines[idx] == "Content-Length: #{body_len}"` guard.
       canon = "#{CL_CANON}#{body_len}"
-      return bytes if line_eq?(bytes, ls, le, canon)
-      replace_cl(bytes, ls, le, sep, body_start, body_len, eol, canon)
+      return {bytes, 0, 0} if line_eq?(bytes, ls, le, canon)
+      # `[ls, le)` is replaced by `canon`, so `le` onwards moves. Offsets INSIDE the old line
+      # have no image in the output at all — a payload spliced into the Content-Length VALUE
+      # is what this pass overwrites, and the caller is told the region ends at `le`.
+      {replace_cl(bytes, ls, le, sep, body_start, body_len, eol, canon), le,
+       canon.bytesize - (le - ls)}
     end
 
     # ── head scanning (byte level, no String/Array allocation) ────────────────────

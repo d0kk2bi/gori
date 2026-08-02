@@ -1160,6 +1160,12 @@ module Gori
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
               s.field "allow_unscoped", boolprop("connect even when the target host is outside (or without) a configured scope (default false)")
               s.field "issue_id", intprop("optional issue to link to this repeater before sending")
+              # Parity with `gori run repeater send --verbatim`. Without it a `messages`
+              # payload carrying a literal `$where`/`$IFS`/`$user.name` — a NoSQL, shell or
+              # SSTI probe — could not be expressed from MCP at all: the token was either
+              # substituted or the call was refused. (Stored frames of a flow-seeded session
+              # are evidence and are already sent byte-exact without this flag.)
+              s.field "verbatim", boolprop("send the bytes EXACTLY: no $VAR expansion in the handshake head or in a 'messages' payload, no bare-LF→CRLF promotion, no Content-Length resync. Use it when a literal $NAME is the payload (default false)")
             end
 
             tool j, "create_repeater", "Create a new repeater tab/session in the database. Provide either ('target' and 'request') OR ('flow_id') OR ('issue_id')." do |s|
@@ -1564,6 +1570,8 @@ module Gori
               s.field "timeout_ms", intprop("per-request connect + idle timeout in milliseconds")
               s.field "retries", intprop("retries per request on a network error")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni). The crawler owns its own Host header, so this is the only way to sweep a name-based vhost by IP.")
+              s.field "http2", boolprop("send over HTTP/2 (TLS+ALPN h2, or h2c prior-knowledge on http://) instead of HTTP/1.1 (default false, mirrors CLI --http2)")
               s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
               s.field "max_requests", intprop("caller cap on total requests")
               s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection per origin across many probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is the largest cost of a brute-force pass. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")

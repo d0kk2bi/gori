@@ -46,11 +46,19 @@ module Gori
     # Content-Length synced. `position` is the fuzzed position for Sniper (nil
     # otherwise). `index` is the monotonic emit order (results stream back out of
     # order, so every row carries it).
+    #
+    # `payload_spans` are the byte ranges of `bytes` the payloads occupy, in splice order —
+    # the one fact that distinguishes the operator's TEST CASE from the template around it
+    # once the request is one flat slice. `Fuzz::Sender` skips them when it substitutes
+    # session bindings, so a payload of `$TOKEN` is sent as those six characters instead of
+    # as the live session credential. Empty for a `Job` a spec or a non-generator caller
+    # built by hand, which means "no exclusions" — the pre-existing behaviour.
     record Job,
       index : Int64,
       payloads : Array(String),
       position : Int32?,
-      bytes : Bytes
+      bytes : Bytes,
+      payload_spans : Array({Int32, Int32}) = [] of {Int32, Int32}
 
     # One emitted result row. `length`/`words`/`lines` are computed over the DECODED
     # response body (gzip/deflate/br/zstd inflated). `head`/`body`/`request` are
@@ -69,6 +77,11 @@ module Gori
       getter error : String?
       getter? matched : Bool
       getter? incomplete : Bool
+      # This variation went out TWICE: the keep-alive pool found its parked socket closed and
+      # re-sent on a fresh connection (`Repeater::Result#retried?`). "No response arrived" does
+      # not prove the origin never processed the first copy, so the row — not just the run's
+      # connections line — has to say which payload was duplicated.
+      getter? retried : Bool
       getter extracted : String?
       getter head : Bytes?
       getter body : Bytes?
@@ -76,7 +89,7 @@ module Gori
 
       def initialize(@index, @payloads, @position, @status, @length, @words, @lines,
                      @duration_us, @error, @matched, @incomplete, @extracted,
-                     @head = nil, @body = nil, @request = nil)
+                     @head = nil, @body = nil, @request = nil, @retried = false)
       end
     end
 

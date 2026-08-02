@@ -17,12 +17,20 @@ end
 # A keep-alive origin that answers every request on the SAME socket and counts how many
 # connections it ever accepted. `close_after` (when set) makes it hang up after serving
 # that many requests on one connection, so a spec can drive the stale-socket path.
+#
+# `drop_every N` is the OTHER shape, and it is the one the pool's contract used to get wrong:
+# every Nth request across the whole run is read IN FULL and then the connection is closed
+# WITHOUT a response. That is a load-shedding origin, a WAF dropping a payload class, or any
+# drop-on-match rule — the request reached the application and was acted on, and gori hears
+# nothing back. `requests` counts what the origin actually read, so a spec can prove whether a
+# payload was sent once or twice.
 private class KeepAliveOrigin
   getter port : Int32
   getter connections : Int32 = 0
   getter requests : Int32 = 0
 
-  def initialize(@close_after : Int32? = nil, @announce_close : Bool = false)
+  def initialize(@close_after : Int32? = nil, @announce_close : Bool = false,
+                 @drop_every : Int32? = nil)
     @server = TCPServer.new("127.0.0.1", 0)
     @port = @server.local_address.port
     spawn { accept_loop }
@@ -53,6 +61,10 @@ private class KeepAliveOrigin
       end
       @requests += 1
       served += 1
+      # Read in full, then vanish. No response byte ever reaches gori.
+      if (n = @drop_every) && n > 0 && (@requests % n) == 0
+        break
+      end
       body = "pong"
       last = @close_after == served
       conn << "HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}"
@@ -342,6 +354,139 @@ describe F::ConnPool do
       pool.dialed.should be >= 2 # the poisoned socket was retired, not reused
       pool.close_all
       origin.close
+    end
+  end
+
+  # Round 4 / F3. The class contract justified re-sending ANY method with "the request never
+  # reached the application". An origin that reads a request in full and then closes without
+  # answering falsifies that: the request-read and the response-write are independent events,
+  # and `delivered?` can only see the second. Measured before the gate existed: 4 POST payloads
+  # produced SEVEN POSTs at the origin, all four reported `200`, `0 errors` — while the same
+  # run with `--no-keep-alive` honestly reported two failures.
+  describe ".replayable? (RFC 7230 §6.3.1)" do
+    it "accepts the safe/idempotent set, case-insensitively" do
+      %w[GET HEAD OPTIONS TRACE get Head oPtIoNs].each do |m|
+        F::ConnPool.replayable?(m).should be_true
+      end
+    end
+
+    it "refuses POST and every other method, including the RFC-idempotent PUT/DELETE" do
+      %w[POST PUT DELETE PATCH post LOCK BREW].each do |m|
+        F::ConnPool.replayable?(m).should be_false
+      end
+    end
+  end
+
+  describe "an origin that reads a request and then closes without answering" do
+    it "does NOT re-send a POST, and reports what --no-keep-alive would" do
+      origin = KeepAliveOrigin.new(drop_every: 2)
+      body = "op=charge&amt=1"
+      tmpl = F::Template.parse("POST /pay HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                               "Content-Length: #{body.bytesize}\r\n\r\nop=charge&amt=§1§")
+      set = F::PayloadSet.new(F::InlineList.new((1..4).map(&.to_s)))
+      cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1)
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+        http2: false, verify: false, keep_alive: true, idle_conns: 1)
+      engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+      results = [] of F::Result
+      engine.run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+
+      results.size.should eq(4)
+      # ONE request per payload at the origin — no doubled charge.
+      origin.requests.should eq(4)
+      # The dropped ones come back as errors, not as false 200s.
+      results.count { |r| r.error }.should eq(2)
+      results.none?(&.retried?).should be_true
+      pool = sender.pool.should_not be_nil
+      pool.stale_retries.should eq(0)
+      pool.unsafe_stale.should eq(2)
+      sender.close
+      origin.close
+    end
+
+    it "DOES re-send an idempotent GET, and marks the row that went out twice" do
+      origin = KeepAliveOrigin.new(drop_every: 2)
+      tmpl = F::Template.parse("GET /pay?amt=§1§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+      set = F::PayloadSet.new(F::InlineList.new((1..4).map(&.to_s)))
+      cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1)
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+        http2: false, verify: false, keep_alive: true, idle_conns: 1)
+      engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+      results = [] of F::Result
+      done = nil.as(F::DoneEvent?)
+      engine.run do |ev|
+        results << ev.result if ev.is_a?(F::ResultEvent)
+        done = ev if ev.is_a?(F::DoneEvent)
+      end
+
+      results.size.should eq(4)
+      results.all? { |r| r.status == 200 && r.error.nil? }.should be_true
+      pool = sender.pool.should_not be_nil
+      pool.stale_retries.should be > 0
+      pool.unsafe_stale.should eq(0)
+      # The re-sent request reached the origin twice, and the ROW says so — the run-level
+      # connections line cannot say WHICH payload was duplicated.
+      retried = results.select(&.retried?)
+      retried.size.should eq(pool.stale_retries)
+      origin.requests.should eq(4 + pool.stale_retries)
+      # …and `requests` (what a caller measures an agreed budget against) counts them.
+      ev = done.should_not be_nil
+      ev.progress.requests.should eq(origin.requests.to_i64)
+      # The mark reaches both machine-readable surfaces.
+      row = Gori::CLI::Output.fuzz_row_json(retried.first)
+      row.should contain(%("retried":true))
+      Gori::CLI::Output.fuzz_row_text(retried.first).should contain("re-sent")
+      # A clean row does not grow the field.
+      clean = results.find { |r| !r.retried? }.should_not be_nil
+      Gori::CLI::Output.fuzz_row_json(clean).should_not contain("retried")
+      sender.close
+      origin.close
+    end
+
+    it "still re-sends a GET after a genuine keep-alive idle close (the pool's whole point)" do
+      # The complement of the drop case: the origin ANSWERS and then hangs up, so the next
+      # checkout finds a socket the application never saw a request on. That retry must
+      # survive, or pooling is worse than not pooling.
+      origin = KeepAliveOrigin.new(close_after: 1)
+      tmpl = F::Template.parse("GET /?q=§a§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+      set = F::PayloadSet.new(F::InlineList.new((1..6).map(&.to_s)))
+      cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1)
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+        http2: false, verify: false, keep_alive: true, idle_conns: 1)
+      engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+      results = [] of F::Result
+      engine.run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+
+      results.size.should eq(6)
+      results.all? { |r| r.status == 200 && r.error.nil? }.should be_true
+      pool = sender.pool.should_not be_nil
+      pool.stale_retries.should be > 0
+      pool.unsafe_stale.should eq(0)
+      sender.close
+      origin.close
+    end
+
+    it "gives the pooled and unpooled POST runs the SAME verdict" do
+      # The second half of F3: with the pool on, exactly the payloads the origin dropped came
+      # back 200, so the same run answered differently depending on --no-keep-alive.
+      counts = [true, false].map do |keep_alive|
+        origin = KeepAliveOrigin.new(drop_every: 2)
+        body = "op=charge&amt=1"
+        tmpl = F::Template.parse("POST /pay HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                                 "Content-Length: #{body.bytesize}\r\n\r\nop=charge&amt=§1§")
+        set = F::PayloadSet.new(F::InlineList.new((1..4).map(&.to_s)))
+        cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1, keep_alive: keep_alive)
+        sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+          http2: false, verify: false, keep_alive: cfg.keep_alive?, idle_conns: 1)
+        engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+        results = [] of F::Result
+        engine.run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+        sender.close
+        n = origin.requests
+        origin.close
+        {results.count { |r| r.error }, n}
+      end
+      counts[0].should eq(counts[1])
     end
   end
 end

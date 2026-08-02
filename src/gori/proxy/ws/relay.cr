@@ -100,10 +100,25 @@ module Gori::Proxy::WS
     # bounds the parked bytes too.
     MAX_PARKED_CONTROLS = 8
 
-    # Prefix on a row this relay wrote about the SOCKET rather than about a frame a peer
-    # sent. Already the convention for the oversized-frame and ping-flood markers; a notice
-    # from the handshake is the same kind of statement and must be as unmistakable.
-    NOTICE_PREFIX = "[gori] "
+    # The direction column every notice row is written on, and it is NOT the direction the
+    # notice is about.
+    #
+    # A notice is gori's own statement, and a `ws_messages` row on the OUT direction is not
+    # only a record — it is a repeater SEED. `run repeater create --flow`, MCP
+    # `create_repeater` and the TUI all take every `direction == "out"` row's opcode and
+    # bytes straight across, by design (a binary frame and an invalid-UTF-8 text frame both
+    # have to round-trip), so a 242-byte `[gori] …` sentence written on "out" is replayed to
+    # the application under test as a masked client→server TEXT frame the client never sent —
+    # a fabricated, malformed message injected into the operator's own test case, and a
+    # `sent 11 message(s)` for 10 client frames. **A diagnostic is not traffic.**
+    #
+    # "in" is what `record_notice` has always used and is what made the `Sec-WebSocket-
+    # Extensions` advisory safe; the parking-ceiling advisory was built on that precedent and
+    # broke exactly the property that made it safe. The cost is that the row no longer says
+    # which side it is about, so the SENTENCE has to — see `AssemblingPump#side`. Readers get
+    # a second, independent guard in `Store::WsMessage#notice?`, because a flow captured by an
+    # older build still carries an "out" notice row.
+    NOTICE_DIRECTION = "in"
 
     # `rewriter` is the Match & Replace seam (#500 step 1) and `interceptor` the hold seam
     # (step 2); `ctx` is the 101 handshake's identity, which both scope on. All three default
@@ -186,13 +201,14 @@ module Gori::Proxy::WS
       done.receive if second_pending
     end
 
-    # The handshake's advisory as a `ws_messages` row, ahead of any frame. Direction "in":
-    # what it reports is what gori did to (or found in) the ORIGIN's 101. Best-effort — a
-    # capture write that fails must never stop the socket from relaying.
+    # The handshake's advisory as a `ws_messages` row, ahead of any frame. What it reports is
+    # what gori did to (or found in) the ORIGIN's 101, and `NOTICE_DIRECTION` is why it is
+    # written where it is. Best-effort — a capture write that fails must never stop the socket
+    # from relaying.
     private def self.record_notice(sink : FlowSink, flow_id : Int64, notice : String?) : Nil
       n = notice
       return if n.nil? || n.empty?
-      sink.on_ws_message(flow_id, "in", OP_TEXT.to_i, "#{NOTICE_PREFIX}#{n}".to_slice)
+      sink.on_ws_message(flow_id, NOTICE_DIRECTION, OP_TEXT.to_i, "#{NOTICE_PREFIX}#{n}".to_slice)
     rescue
       nil
     end
@@ -340,7 +356,15 @@ module Gori::Proxy::WS
     private def self.emit_pending(assembling : IO::Memory, direction : String, flow_id : Int64,
                                   sink : FlowSink, message_opcode : UInt8,
                                   shape : MessageShape) : IO::Memory
-      return assembling if assembling.size == 0
+      if assembling.size == 0
+        # No row for a zero-byte message — but the accumulator still has to be cleared when a
+        # fragment WAS noted, because a LEADING FRAGMENT MAY BE EMPTY. `TEXT fin=0 ""` then
+        # `TEXT fin=1 "BBB"` left the empty frame's note standing, so "BBB" surfaced as a
+        # two-frame message that never ended. `AssemblingPump#flush_withheld` states the same
+        # rule; the two pumps have to record identical facts about identical bytes.
+        shape.reset if shape.frames > 0
+        return assembling
+      end
       sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)
       assembling.size > RESET_THRESHOLD ? IO::Memory.new : assembling.tap(&.clear)
     end
@@ -364,8 +388,12 @@ module Gori::Proxy::WS
       elsif n == MAX_CONTROL_CAPTURE + 1
         # One marker, then silence — but the operator is told which it is. A capture that
         # simply stops looks exactly like a peer that stopped pinging.
-        marker = "[gori] more than #{MAX_CONTROL_CAPTURE} ping/pong frames on this direction; " \
-                 "the rest are forwarded but not recorded".to_slice
+        # Keeps the flooding frame's OWN opcode and direction, so it sits in the ping stream
+        # it stands for. That makes it a row a repeater seed would otherwise replay as a PING
+        # carrying this sentence; `NOTICE_PREFIX` is what `Store::WsMessage#notice?` reads to
+        # refuse it, which is why this marker is built from the constant and not a literal.
+        marker = "#{NOTICE_PREFIX}more than #{MAX_CONTROL_CAPTURE} ping/pong frames on this " \
+                 "direction; the rest are forwarded but not recorded".to_slice
         sink.on_ws_message(flow_id, direction, frame.opcode.to_i, marker, frame.shape)
       end
       n
@@ -479,12 +507,51 @@ module Gori::Proxy::WS
       # `MessageGate`'s header exist to prevent, so the answer is to write the frames, not to
       # stop recording them. `Relay.run` calls this while both sockets are still open, right
       # after `settle` — the same moment, and for the same reason.
+      #
+      # It is also the one flush that is normally reached BECAUSE the peer died, so it is the
+      # one whose write can fail — and a control frame's capture row is written at ARRIVAL
+      # (`Relay.capture_control`, whose own comment says "the forward already happened"),
+      # which was harmless only while a control frame went out the instant it arrived. Parking
+      # made "arrived" and "was delivered" two events and this is exactly where they diverge:
+      # against an origin that hard-RSTs, the origin's own accounting says 0 bytes received
+      # while gori's capture carries a PING row. The row is not wrong about the arrival — the
+      # client really did send that PING, and deleting the row would throw away evidence gori
+      # holds — so what was missing is the sentence saying it never got out. `MessageGate`'s
+      # `write_message` states the same contract from the other side ("a `ws_messages` row is
+      # gori's claim that the peer saw these bytes"), and a refusal has to name itself.
       def flush_at_teardown : Nil
         return if @torn_down
         @torn_down = true
-        bypass("the socket is closing") { flush_withheld }
+        # Snapshotted BEFORE the attempt: `flush_parked` empties `@parked` ahead of its own
+        # write, so after a raise there is nothing left to count.
+        owed_controls = @parked.size
+        owed_bytes = @passthrough ? 0 : @buffer.size
+        begin
+          bypass("the socket is closing") { flush_withheld }
+        rescue
+          warn_teardown_loss(owed_controls, owed_bytes)
+        end
       rescue
         nil
+      end
+
+      # The teardown flush could not reach the peer. Say so on the flow's own `ws_messages`
+      # stream, positioned after every row it corrects, so `run show`, MCP `get_flow`, the WS
+      # pane and an export all carry it. `gori.log` reaches only an operator who knew to tail
+      # it, and the frames this is about are the ones an operator arms a fragmentation test to
+      # watch.
+      private def warn_teardown_loss(controls : Int32, bytes : Int32) : Nil
+        return if controls == 0 && bytes == 0
+        parts = [] of String
+        if controls > 0
+          parts << "#{controls} control frame(s) parked between its fragments — the ping/pong " \
+                   "row(s) above record their ARRIVAL, not their delivery"
+        end
+        parts << "#{bytes} byte(s) of its payload, which reached no row at all" if bytes > 0
+        note = "the #{side} socket died before an unfinished message could be flushed: " \
+               "#{parts.join("; and ")}"
+        ::Log.warn { "ws #{@direction}: #{note}" }
+        record_notice(note)
       end
 
       # A control frame (ping/pong/close) never takes part in a rewrite or a hold, and it is
@@ -623,16 +690,29 @@ module Gori::Proxy::WS
         return if @parked_overflowed
         @parked_overflowed = true
         note = "more than #{MAX_PARKED_CONTROLS} control frames arrived between the fragments " \
-               "of one message; they were forwarded ahead of it so the peer's ping timer still " \
-               "sees a reply. The frames are byte-exact; their position relative to this " \
-               "message's fragments is not"
+               "of one #{side} message; they were forwarded ahead of it so the peer's ping " \
+               "timer still sees a reply. The frames are byte-exact; their position relative " \
+               "to that message's fragments is not"
         ::Log.warn { "ws #{@direction}: #{note}" }
-        begin
-          @sink.on_ws_message(@flow_id, @direction, OP_TEXT.to_i, "#{NOTICE_PREFIX}#{note}".to_slice)
-        rescue
-          # Capture is best-effort here exactly as it is in `record_notice`: a row that fails
-          # to write must never stop the relay from forwarding.
-        end
+        record_notice(note)
+      end
+
+      # A statement about this SOCKET as a `ws_messages` row. Best-effort exactly as
+      # `Relay.record_notice` is — a row that fails to write must never stop the relay from
+      # forwarding — and on `NOTICE_DIRECTION` for the reason stated there.
+      private def record_notice(note : String) : Nil
+        @sink.on_ws_message(@flow_id, NOTICE_DIRECTION, OP_TEXT.to_i,
+          "#{NOTICE_PREFIX}#{note}".to_slice)
+      rescue
+        nil
+      end
+
+      # This direction in words. `@direction`'s own "out"/"in" is the row's COLUMN, and a
+      # notice row is written on `NOTICE_DIRECTION` rather than here — so the sentence is the
+      # only thing left that can say which side it is about, and without it a notice about the
+      # client's frames would read as something the origin did.
+      private def side : String
+        @direction == "out" ? "client→server" : "server→client"
       end
 
       # A new message begins.
@@ -657,11 +737,12 @@ module Gori::Proxy::WS
         # `LEAKSECOND` on the wire as one TEXT frame. Its bytes need no flush (they were
         # already written frame by frame) but they must not stay in the buffer.
         #
-        # `@parked` is asked about separately because a LEADING FRAGMENT MAY BE EMPTY: an
-        # empty `TEXT fin=0` puts bytes in `@raw` and none in `@buffer`, so a control frame
-        # can be parked inside a message the buffer test calls "not there" — and `reset_raw`
-        # below would then discard it silently. Same rule `flush_withheld` already states.
-        if @buffer.size > 0 || !@parked.empty?
+        # `@shape.frames` and not `@buffer.size` decides, for the reason `flush_withheld`
+        # states: a LEADING FRAGMENT MAY BE EMPTY, so `TEXT fin=0 ""` then `TEXT fin=1 "BBB"`
+        # is a message half-assembled with an empty buffer — and asking the buffer skipped the
+        # flush, after which `reset_raw` discarded the empty frame's own wire bytes. The
+        # byte-exact pump forwards it.
+        if @shape.frames > 0 || !@parked.empty?
           bypass("a message arrived before the previous one sent its FIN") { flush_withheld }
         end
         @opcode = opcode
@@ -680,7 +761,12 @@ module Gori::Proxy::WS
         # the "[gori] N-byte … too large to capture" marker ABOVE the fragment it followed, so
         # the two pumps disagreed about an identical frame sequence.
         prefix = @buffer.size > 0 ? @buffer.to_slice.dup : nil
-        prefix.try { |p| @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, p, @shape.take) }
+        # Taken whether or not there is a prefix ROW to hang it on: an empty leading fragment
+        # is still a noted frame, and leaving the accumulator standing would put its FIN, its
+        # RSV bits and its place in `frames` on the next message — and would leave
+        # `flush_withheld` believing a fragment is still owed.
+        shape = @shape.take
+        prefix.try { |p| @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, p, shape) }
         forwarded = bypassing("a frame too large to buffer arrived") do
           flush_buffered unless @passthrough
           Relay.forward_oversized_frame(@src, @dst, h, @direction, @flow_id, @sink, @opcode, @scratch)
@@ -804,20 +890,23 @@ module Gori::Proxy::WS
       # cap) is the prefix re-framed, as a NON-final frame carrying the message opcode rather
       # than OP_CONT: this is reached at most once per message, so it is always the leading one.
       private def flush_buffered : Nil
-        if @buffer.size == 0
-          # Nothing is owed for the payload, but a control frame parked between fragments
-          # still is — a leading fragment may be empty, and every caller here goes on to
-          # `reset_raw`, which drops `@parked` on the floor. `flush_withheld` states the same
-          # rule for the same reason.
-          flush_parked
-          return
-        end
         if @raw_kept && @raw.size > 0
-          write_direct(interleaved_raw) # the peer's frames, control-frame interleave and all
+          # The peer's frames, control-frame interleave and all. Asked FIRST, and about `@raw`
+          # rather than about `@buffer`, because a LEADING FRAGMENT MAY BE EMPTY: `TEXT fin=0`
+          # with a zero-byte payload is how a sender opens a message, and it puts bytes in
+          # `@raw` and none in `@buffer`. Testing the buffer first sent that frame nowhere —
+          # every caller goes on to `reset_raw` — so a socket with a `part: ws` rule armed and
+          # matching nothing silently dropped a frame the byte-exact pump forwards, which is
+          # the one invariant this pump exists to keep.
+          write_direct(interleaved_raw)
           @parked.clear
-        else
+        elsif @buffer.size > 0
           flush_parked # re-framed: nowhere to put them but in front
           write_direct(WS.encode(@opcode, @buffer.to_slice, mask: @mask, fin: false))
+        else
+          # Nothing of this message's own is owed (passthrough, or past the raw cap with an
+          # empty buffer), but a control frame parked between its fragments still is.
+          flush_parked
         end
       end
 
@@ -828,12 +917,27 @@ module Gori::Proxy::WS
       #
       # Emitted NON-final, so gori does not invent a FIN the sender never sent.
       private def flush_withheld : Nil
-        # A control frame parked between fragments still owes the wire even when the
-        # fragments left nothing to flush (a leading fragment with an empty payload).
-        flush_parked if @buffer.size == 0
-        return if @buffer.size == 0
+        # `@shape.frames` and not `@buffer.size` answers "is a fragment still owed?" — the
+        # accumulator's own header says so, and this is the caller it was written for. A
+        # LEADING FRAGMENT MAY BE EMPTY, so a message can be half-assembled with an empty
+        # payload buffer; the buffer test called that "nothing here" and `reset_raw` then
+        # dropped the frame. Only a control frame parked between fragments is owed when
+        # nothing at all is being assembled — and even that cannot happen today, since
+        # `park_control?` declines while `@raw` is empty.
+        if @shape.frames == 0
+          flush_parked
+          return
+        end
         flush_buffered unless @passthrough
-        @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, @buffer.to_slice.dup, @shape.take)
+        # A zero-byte message gets no row, matching `Relay.emit_pending` — the byte-exact
+        # pump's equivalent — because the two pumps have to record identical facts about
+        # identical bytes. The accumulator is still taken: left standing, this fragment's FIN
+        # and RSV bits and its place in `frames` would be claimed by the NEXT message's row.
+        if @buffer.size > 0
+          @sink.on_ws_message(@flow_id, @direction, @opcode.to_i, @buffer.to_slice.dup, @shape.take)
+        else
+          @shape.take
+        end
         reset_buffer
       end
 
@@ -922,7 +1026,10 @@ module Gori::Proxy::WS
       dst.flush
       return false unless forwarded # peer died mid-payload
       if h.data?
-        marker = "[gori] #{h.len}-byte WebSocket frame forwarded; too large to capture".to_slice
+        # Stands in for a real frame at that frame's own position, so it keeps the message's
+        # opcode and this direction — and is therefore a row a seed would replay. Built from
+        # `NOTICE_PREFIX` so `Store::WsMessage#notice?` refuses it.
+        marker = "#{NOTICE_PREFIX}#{h.len}-byte WebSocket frame forwarded; too large to capture".to_slice
         # The marker row still carries the frame's own header facts — its FIN, its RSV bits
         # and its mask key are exactly what an operator is asking about when a frame is this
         # size, and they are the part gori DID read.

@@ -257,11 +257,18 @@ module Gori
       # not an empty log: the listing can skip and count, but `show <id> --format har` named
       # this flow, so silently handing back `entries: []` would answer a different question.
       private def self.show_har(detail : Store::FlowDetail) : Nil
+        # The refusal names the REAL cause where the store has one: a flow gori itself
+        # refused to send carries it in `error` ("request framing rejected: …"), and
+        # "has no captured response" alone reads like the origin's fault.
+        because = detail.error.presence.try { |e| " (#{e})" } || ""
         case Export::Har.skip_reason(detail)
         in Export::Har::Skip::WebSocket
           abort "gori run show: flow ##{detail.row.id} is a WebSocket flow — HAR has no representation for its messages (use --format json or raw)"
         in Export::Har::Skip::NoResponse
-          abort "gori run show: flow ##{detail.row.id} has no captured response — a HAR entry requires one"
+          abort "gori run show: flow ##{detail.row.id} has no captured response — a HAR entry requires one#{because}"
+        in Export::Har::Skip::Incomplete
+          abort "gori run show: flow ##{detail.row.id} did not complete — HAR cannot record a partial response, " \
+                "so the entry would read as a successful exchange#{because} (use --format json or raw)"
         in Nil
           # exportable
         end

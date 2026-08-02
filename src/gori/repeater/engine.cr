@@ -28,13 +28,41 @@ module Gori
       # effect. Only set on the error paths; a normal Result carries a non-nil `response`, where
       # this is irrelevant.
       getter? delivered : Bool
+      # The read ended on an IDLE TIMEOUT — the origin held the socket open and simply stopped
+      # sending — rather than on a close or a completed body. `incomplete?` says the captured
+      # response is short; this says which of the two events cut it, and without it the
+      # renderers of "incomplete — origin closed before the framed body finished" were blaming
+      # the origin for a connection it never closed. Set by the h2 engine, which computes it
+      # per read; false everywhere else.
+      getter? timed_out : Bool
+
+      # This exchange is the SECOND copy of its request on the wire: a parked keep-alive
+      # socket turned out closed, and `ConnPool` re-sent on a fresh connection. It is set
+      # only for the methods the pool is willing to replay (see `ConnPool.replayable?`), and
+      # it must reach the ROW a surface prints, not only the run's connections line — an
+      # origin that reads a request and answers nothing has still processed it, so a replayed
+      # request may have been acted on twice. `--format json` and MCP `fuzz_results` are where
+      # an agent reads this, and both showed a clean single send.
+      getter? retried : Bool
 
       def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false,
-                     @delivered = false)
+                     @delivered = false, @timed_out = false, @retried = false)
       end
 
       def ok? : Bool
         @error.nil?
+      end
+
+      # The same outcome, flagged as a re-send. A struct, so this returns a copy rather than
+      # mutating: `ConnPool` builds the Result through `Engine.exchange` and only then knows
+      # it was a retry.
+      def as_retried : Result
+        # Named, not positional. Two fixers added a field to this constructor in the same round
+        # and the merge reordered the tail — a positional `true` here silently set `timed_out`
+        # instead, and the pool's re-send marker vanished with the suite still green but for the
+        # one spec that asserted it.
+        Result.new(@head, @body, @response, @duration_us, @error, @incomplete, @delivered,
+          timed_out: @timed_out, retried: true)
       end
     end
 
@@ -240,20 +268,38 @@ module Gori
       # "host unreachable (DNS/refused/timeout)" naming the ORIGIN, so the next hour went on
       # DNS and firewall rules for a host gori had never tried to contact.
       #
-      # With no detail the fallback is the old sentence, which is still right: a bare Connect
-      # really is DNS/refused/timeout, and under verify-on an https dial genuinely cannot tell
-      # a failed handshake from an unreachable host without asking OpenSSL for more than the
-      # socket carries.
+      # With no detail the KIND still answers which layer broke, and that is the whole reason
+      # `DialErrorKind` exists (`upstream.cr`: "a surface can say WHICH LAYER broke instead of
+      # a blanket 'connect failed'"). `dial_tls_result` returns `Tls` only after the TCP
+      # connect SUCCEEDED and the handshake raised, and `Connect` whenever the socket itself
+      # never came up — so the three cases an operator has to tell apart (a firewall/DNS
+      # problem, an untrusted origin cert, and "this port is not TLS") are already separated
+      # by the time this runs. The proxy path has said all three since #323
+      # (`client_conn.cr#upstream_error_message`); every DIRECT sender — repeater, fuzz, mine,
+      # sequence, discover, probe active, and `ConnPool` — collapsed them into one sentence
+      # that named the first, which sent operators to debug DNS for a self-signed cert.
+      #
+      # `scheme` is no longer consulted: only an https dial can produce a `Tls` kind, and a
+      # Connect kind means the TCP layer, whatever the scheme. It stays in the signature
+      # because every send path passes it positionally and it is what the sentence would be
+      # keyed on if a third transport ever appears.
       def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool,
                              err : Proxy::Upstream::DialError? = nil) : String
         if detail = err.try(&.detail)
           return "connect failed: #{detail}"
         end
-        if scheme == "https" && verify
-          "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout) or the origin's TLS certificate failed verification (e.g. self-signed/expired)"
-        else
-          "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout)"
+        if err.try(&.tls?)
+          if verify
+            return "TLS verification failed: #{host}:#{port} — the origin's certificate is not " \
+                   "trusted (self-signed/expired/wrong name); retry with -k/--insecure-upstream " \
+                   "or set SSL_CERT_FILE"
+          end
+          return "TLS handshake failed: #{host}:#{port} — the port may not be TLS, or the origin " \
+                 "refused the protocol/cipher"
         end
+        # Reached only when the TCP layer is what failed, so the TLS clause that used to ride
+        # along here (and made this a catch-all) is gone.
+        "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout)"
       end
 
       private def self.elapsed(started : Time::Instant) : Int64

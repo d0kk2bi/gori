@@ -142,17 +142,28 @@ module Gori
     # sentence above is the designed case, so the split is by POSITION rather than by value.
     # A name whose value is withheld stays LITERAL, `Env.expand`'s documented contract for an
     # unknown key — visible in the request rather than silently dropped.
-    def self.expand_bindings(bytes : Bytes) : Bytes
+    #
+    # `verbatim` names byte ranges of `bytes` that this pass must copy through with no scan
+    # at all. The doc above justifies scanning the WHOLE message by naming the cases that
+    # want it — a `Replace` rule with `part: Body`, an operator's Repeater template — and a
+    # FUZZ PAYLOAD is not one of them: the operator authored `$TOKEN` as the thing under
+    # test, and substituting the live session token there both sends a request nobody wrote
+    # and puts a real credential in an arbitrary position of it, where it lands in the
+    # target's access log. `Fuzz::Generator#emit` already computes each payload's span in
+    # order to splice it, so the template resolves and the payload does not.
+    def self.expand_bindings(bytes : Bytes, verbatim : Array({Int32, Int32})? = nil) : Bytes
       vals = binding_values
       return bytes if vals.empty?
       prefix = Settings.env_prefix
       return bytes if prefix.empty? || !contains_prefix?(bytes, prefix)
       safe = boundary_safe(vals)
       boundary = head_body_boundary(bytes)
-      head = expand(String.new(bytes[0...boundary]), safe, prefix).to_slice
+      head = expand(String.new(bytes[0...boundary]), safe, prefix,
+        clip_spans(verbatim, 0, boundary)).to_slice
       return head if boundary >= bytes.size
       raw_body = bytes[boundary..]
-      body = expand(String.new(raw_body), vals, prefix).to_slice
+      body = expand(String.new(raw_body), vals, prefix,
+        clip_spans(verbatim, boundary, bytes.size)).to_slice
       unless body.size == raw_body.size
         shifted = shift_content_length(head, body.size - raw_body.size)
         warn_unshiftable_framing if shifted.same?(head)
@@ -324,6 +335,24 @@ module Gori
       expand(text, guard_boundary ? boundary_safe(vals) : vals, Settings.env_prefix)
     end
 
+    # `spans` restricted to `[from, to)` and rebased so 0 is `from` — what a half of a
+    # head/body split needs when the caller's offsets are into the whole message. Returns
+    # nil (not an empty Array) when nothing survives, so the scans below keep their
+    # allocation-free fast path on the overwhelmingly common "no verbatim regions" call.
+    # Spans arrive sorted and disjoint (`Fuzz::Generator` emits them in splice order) and
+    # come out that way, which is what lets the scanners walk them with one cursor.
+    private def self.clip_spans(spans : Array({Int32, Int32})?, from : Int32,
+                                to : Int32) : Array({Int32, Int32})?
+      return nil if spans.nil? || spans.empty?
+      out = [] of {Int32, Int32}
+      spans.each do |(a, b)|
+        s = a > from ? a : from
+        e = b < to ? b : to
+        out << {s - from, e - from} if e > s
+      end
+      out.empty? ? nil : out
+    end
+
     # `vals` minus every value that would forge a message boundary where it is injected.
     # Returns the SAME Hash when nothing is withheld, which is the common case.
     private def self.boundary_safe(vals : Hash(String, String)) : Hash(String, String)
@@ -334,11 +363,15 @@ module Gori
     # Declared binding names in `bytes` that have no value yet, first-appearance order.
     # A send seam asks this BEFORE `expand_bindings` and refuses, naming what it wants —
     # the same shape #525 gave plan-build, one stage later.
-    def self.unbound(bytes : Bytes) : Array(String)
-      unbound(String.new(bytes))
+    # `verbatim` is `expand_bindings`' argument, and it has to be the SAME list: a payload
+    # this seam refuses to expand must not be the reason it refuses the send either. With
+    # the name unbound the refusal's own advice ("replay the flow that mints the token
+    # first") produces exactly the substitution the exclusion exists to stop.
+    def self.unbound(bytes : Bytes, verbatim : Array({Int32, Int32})? = nil) : Array(String)
+      unbound(String.new(bytes), verbatim)
     end
 
-    def self.unbound(text : String) : Array(String)
+    def self.unbound(text : String, verbatim : Array({Int32, Int32})? = nil) : Array(String)
       declared = declared_bindings
       return [] of String if declared.empty?
       prefix = Settings.env_prefix
@@ -348,7 +381,7 @@ module Gori
       # declared one: an unknown `$FOO` is plan-build's business (#525) and reporting it
       # again from a send seam would be the second behaviour for one syntax the design
       # rules out.
-      names = scan_unresolved(text.to_slice, vals, prefix, nil)
+      names = scan_unresolved(text.to_slice, vals, prefix, nil, verbatim)
       names.select { |n| declared.includes?(n) }
     end
 
@@ -398,6 +431,32 @@ module Gori
       buf.to_slice
     end
 
+    # `expand_wire` MINUS the expansion: the head's bare LFs promoted to CRLF, every body
+    # byte copied through untouched.
+    #
+    # `expand_wire` is two passes welded together and EVIDENCE wants exactly one of them.
+    # Substituting a project value into a captured `$filter` / `$where` sends a request
+    # nobody captured (`Repeater::PlanOptions#evidence?` argues this at length); promoting a
+    # bare LF in the head is different — the TUI editors hold a request as an LF-joined line
+    # buffer and `TextArea#insert_newline` names `expand_wire` as what promotes a typed
+    # line's terminator back, so an evidence path that skipped it would put a bare-LF header
+    # terminator — itself a front-end/back-end desync primitive — on the wire.
+    #
+    # Public and here rather than re-derived per surface: `FuzzerView#evidence_template`
+    # already spells this out by hand, and a fourth copy is how two surfaces come to
+    # disagree about the bytes they send for one flow.
+    def self.normalize_wire(text : String) : Bytes
+      bytes = text.to_slice
+      boundary = head_body_boundary(bytes)
+      head = normalize_crlf(bytes[0...boundary])
+      return head if boundary >= bytes.size
+      body = bytes[boundary..]
+      buf = IO::Memory.new(head.size + body.size)
+      buf.write(head)
+      buf.write(body)
+      buf.to_slice
+    end
+
     # Substitute registered `prefix+KEY` tokens; unknown keys stay literal.
     #
     # Operates on raw bytes, not `String#chars`. `prefix` and KEY names are always
@@ -410,8 +469,15 @@ module Gori
     # on every send — even when the text has no `$KEY` token at all. Scanning
     # bytes instead means every span that isn't part of a matched token — valid
     # UTF-8 or not — is copied through byte-for-byte, unchanged.
+    #
+    # `verbatim` byte ranges are copied through with no token scan at all. Not the same
+    # thing as "no variable happened to match there": the ranges are bytes whose PROVENANCE
+    # differs from the rest of the message (today, a fuzz payload spliced into a template),
+    # so a `$NAME` inside one is the operator's test case rather than a reference. nil — the
+    # overwhelmingly common call — keeps the loop exactly as it was.
     def self.expand(text : String, vars : Hash(String, String) = effective_vars,
-                    prefix : String = Settings.env_prefix) : String
+                    prefix : String = Settings.env_prefix,
+                    verbatim : Array({Int32, Int32})? = nil) : String
       return text if prefix.empty?
       return text unless text.byte_index(prefix) # fast, lossless no-op when the prefix never occurs
 
@@ -421,7 +487,20 @@ module Gori
       plen = prefix_bytes.size
       buf = IO::Memory.new(n)
       i = 0
+      vi = 0 # cursor into `verbatim`; sorted + disjoint, so one pass suffices
       while i < n
+        if verbatim
+          while vi < verbatim.size && verbatim[vi][1] <= i
+            vi += 1
+          end
+          if vi < verbatim.size && verbatim[vi][0] <= i
+            stop = verbatim[vi][1]
+            stop = n if stop > n
+            buf.write(bytes[i, stop - i])
+            i = stop
+            next
+          end
+        end
         if i + plen <= n && prefix_bytes.each_with_index.all? { |b, j| bytes[i + j] == b }
           if parsed = read_key_bytes(bytes, i + plen, n)
             key, consumed = parsed
@@ -526,14 +605,26 @@ module Gori
     UNBOUND_PREFIX = "unbound session binding"
 
     private def self.scan_unresolved(bytes : Bytes, vars : Hash(String, String),
-                                     prefix : String, deferred : Array(String)?) : Array(String)
+                                     prefix : String, deferred : Array(String)?,
+                                     verbatim : Array({Int32, Int32})? = nil) : Array(String)
       names = [] of String
       seen = Set(String).new
       prefix_bytes = prefix.to_slice
       n = bytes.size
       plen = prefix_bytes.size
       i = 0
+      vi = 0 # see `expand`: the same walk over the same sorted, disjoint list
       while i < n
+        if verbatim
+          while vi < verbatim.size && verbatim[vi][1] <= i
+            vi += 1
+          end
+          if vi < verbatim.size && verbatim[vi][0] <= i
+            stop = verbatim[vi][1]
+            i = stop > n ? n : stop
+            next
+          end
+        end
         if i + plen <= n && prefix_bytes.each_with_index.all? { |b, j| bytes[i + j] == b }
           if parsed = read_key_bytes(bytes, i + plen, n)
             key, consumed = parsed

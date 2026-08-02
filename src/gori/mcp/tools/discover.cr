@@ -55,6 +55,10 @@ module Gori
         end
         options = Discover::PlanOptions.new(str(h, "url") || "", config: config,
           verify: !bool_arg(h, "insecure", false) && @verify_upstream,
+          # Parity with fuzz_start / mine_start / sequence_start, which have all carried these
+          # two. Without `sni` an IP-direct sweep of a name-based vhost was inexpressible from
+          # this tool (the crawler owns its own `Host:` header, so there was no second way in).
+          sni: str(h, "sni").presence, http2: bool_arg(h, "http2", false),
           overrides: HostOverrides.load(store))
         Discover::Plan.build(options, ob)
       rescue ex : Discover::PlanError

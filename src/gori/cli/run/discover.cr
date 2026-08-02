@@ -22,6 +22,8 @@ module Gori
         max_requests : Int64? = nil
         keep_alive = true
         insecure = false
+        sni : String? = nil
+        http2 = false
         allow_unscoped = false
         bind_from : Int64? = nil
         force = false
@@ -49,6 +51,8 @@ module Gori
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
           p.on("--no-keep-alive", "Dial a fresh connection for every probe (default: reuse)") { keep_alive = false }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
+          p.on("--http2", "Force HTTP/2") { http2 = true }
+          p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
           p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run discover") }
           p.on("--allow-unscoped", "Run even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--force", "Bypass the unbounded-run safety gate") { force = true }
@@ -108,7 +112,12 @@ module Gori
           end
           # `.to_s` rather than `|| ""`: an OptionParser-closured var never narrows out of String?.
           options = Discover::PlanOptions.new(target_override.to_s, config: config,
-            verify: !insecure, overrides: Gori::HostOverrides.load(store))
+            verify: !insecure, sni: sni, http2: http2,
+            overrides: Gori::HostOverrides.load(store))
+          # Ahead of Plan.build — see CLI::Run.preflight_bind_from (the builder's unresolved-env
+          # refusal otherwise discards this flag without a word). `open_store` above has already
+          # hydrated `Env.layer`, which is all this needs.
+          preflight_bind_from(bind_from, "gori run discover")
           plan = begin
             Discover::Plan.build(options, outbound)
           rescue ex : Discover::PlanError

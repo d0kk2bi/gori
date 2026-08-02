@@ -116,9 +116,10 @@ module Gori
 
       private def self.resolve_url(raw : String, vars : Vars::Table, missing : Set(String)) : String
         url = Vars.expand(raw.strip, vars)
-        # `Builder::HOST_INVALID` does not reject `{`/`}`, so `https://{{baseUrl}}/x` would
-        # otherwise be STORED with a literal host of `{{baseUrl}}` — a flow that can never be
-        # sent, indistinguishable in History from a real one. Record the names and skip.
+        # `https://{{baseUrl}}/x` would otherwise be STORED with a literal host of
+        # `{{baseUrl}}` — a flow that can never be sent, indistinguishable in History from a
+        # real one. `Builder::HOST_VALID` now refuses that host as well, but this branch is
+        # what records WHICH variables were missing, so keep skipping here. Record and skip.
         left = Vars.unresolved(url)
         unless left.empty?
           left.each { |n| missing << n }

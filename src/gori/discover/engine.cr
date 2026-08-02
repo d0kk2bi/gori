@@ -102,10 +102,15 @@ module Gori::Discover
     # https a TLS — handshake for every one of them. `idle_conns` bounds the sockets one
     # origin may park and should be the run's concurrency (one per worker fiber is the most
     # that can ever be checked out at once), capped at MAX_IDLE_PER_POOL.
+    # `sni` overrides the name in the ClientHello (and, under verify, the name the certificate
+    # is checked against) without changing the dialed host:port — `Repeater::Engine`'s own
+    # rule, threaded here so an IP-direct sweep of a name-based vhost is expressible. It is
+    # the ORIGIN's name, so every pool and every dial this Sender makes carries the same one.
     def initialize(@verify : Bool, @timeout : Time::Span? = nil, @http2 : Bool = false,
                    headers : Array({String, String}) = [] of {String, String},
                    @overrides : Gori::HostOverrides? = nil,
-                   keep_alive : Bool = false, idle_conns : Int32 = 0)
+                   keep_alive : Bool = false, idle_conns : Int32 = 0,
+                   @sni : String? = nil)
       # Merge the user headers over the defaults once — the block is identical for
       # every send (only Host varies, per target). Host + Connection are emitted
       # separately in build_get and never come from user input.
@@ -123,6 +128,12 @@ module Gori::Discover
       @idle_conns = idle_conns.clamp(1, MAX_IDLE_PER_POOL)
       @pools = @keep_alive ? Hash(String, Repeater::ConnPool).new : nil
     end
+
+    # The name this sender presents in the ClientHello, and whether it frames HTTP/2. Exposed
+    # for the same reason `pool_stats` is: `Plan` hands the Sender out, and these are the parts
+    # of the wire decision nothing else on the plan can show.
+    getter sni : String?
+    getter? http2 : Bool
 
     # Handshake accounting summed over every origin's pool. Nil when keep-alive is off — the
     # question "how many handshakes did this run pay" has no pool to ask.
@@ -158,12 +169,12 @@ module Gori::Discover
       req = build_get(scheme, host, port, target, headers)
       if @http2
         Repeater::H2Engine.send(req, scheme: scheme, host: host, port: port,
-          verify_upstream: @verify, timeout: @timeout, overrides: @overrides)
+          verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
       elsif pool = pool_for(scheme, host, port)
         pool.send(req)
       else
         Repeater::Engine.send(req, scheme: scheme, host: host, port: port,
-          verify_upstream: @verify, timeout: @timeout, overrides: @overrides)
+          verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
       end
     end
 
@@ -187,7 +198,7 @@ module Gori::Discover
         return existing
       end
       return nil if pools.size >= MAX_POOLS
-      pool = Repeater::ConnPool.new(scheme, host, port, @verify, nil, @timeout,
+      pool = Repeater::ConnPool.new(scheme, host, port, @verify, @sni, @timeout,
         @overrides, @idle_conns)
       pools[key] = pool
       pool

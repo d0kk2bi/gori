@@ -43,13 +43,18 @@ module Gori::Tui
         ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         request_text = String.new(r.request)
         if Repeater::WsEngine.upgrade_request?(request_text)
-          ws_msgs = @host.session.store.ws_messages_for_repeater(r.id).compact_map do |m|
-            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload, m.shape) : nil
-          end
+          # A `[gori]` advisory row is gori talking ABOUT the socket; replaying one would
+          # put its own sentence on the wire as a client frame (CLI::Run.ws_seed_rows).
+          ws_msgs = CLI::Run.ws_seed_rows(@host.session.store.ws_messages_for_repeater(r.id))[0]
+            .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
         end
+        # `r.flow_id` is the only provenance that survives a restart — `@flow` is not
+        # persisted — and nothing but a flow seed ever sets it. Same carrier the Fuzzer and
+        # Miner tabs restore from. See `RepeaterView#evidence?`.
         view.restore(r.target, request_text, r.http2?, r.auto_content_length?,
           r.response_head, r.response_body, r.response_error, r.response_duration_us,
-          sni: r.sni || "", ws_messages: ws_msgs, ws_keep_key: r.ws_keep_key?)
+          sni: r.sni || "", ws_messages: ws_msgs, ws_keep_key: r.ws_keep_key?,
+          evidence: !r.flow_id.nil?)
         view.name = r.name                       # custom sub-tab label survives reopen
         view.tags = Repeater::Tags.parse(r.tags) # flat tags survive reopen (V31)
         seed_repeater_original(view, r.flow_id)
@@ -1025,12 +1030,12 @@ module Gori::Tui
         ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
         if Repeater::WsEngine.upgrade_request?(row_request_text)
-          ws_msgs = @host.session.store.ws_messages_for_repeater(row.id).compact_map do |m|
-            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload, m.shape) : nil
-          end
+          ws_msgs = CLI::Run.ws_seed_rows(@host.session.store.ws_messages_for_repeater(row.id))[0]
+            .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) } # see above
         end
         v.apply_peer_request(row.target, row_request_text, row.http2?, row.auto_content_length?,
-          sni: row.sni || "", ws_messages: ws_msgs, ws_keep_key: row.ws_keep_key?)
+          sni: row.sni || "", ws_messages: ws_msgs, ws_keep_key: row.ws_keep_key?,
+          evidence: !row.flow_id.nil?)
         seed_repeater_original(v, row.flow_id) # baseline may need re-seed if it was empty
       end
 
@@ -1041,12 +1046,12 @@ module Gori::Tui
         ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
         if Repeater::WsEngine.upgrade_request?(row_request_text)
-          ws_msgs = @host.session.store.ws_messages_for_repeater(row.id).compact_map do |m|
-            m.direction == "out" ? Store::WsOutMessage.new(m.opcode, m.payload, m.shape) : nil
-          end
+          ws_msgs = CLI::Run.ws_seed_rows(@host.session.store.ws_messages_for_repeater(row.id))[0]
+            .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) } # see above
         end
         view.restore(row.target, row_request_text, row.http2?, row.auto_content_length?,
-          sni: row.sni || "", ws_messages: ws_msgs, ws_keep_key: row.ws_keep_key?)
+          sni: row.sni || "", ws_messages: ws_msgs, ws_keep_key: row.ws_keep_key?,
+          evidence: !row.flow_id.nil?)
         seed_repeater_original(view, row.flow_id)
         @repeaters << RepeaterTab.new(view, row.flow_id, row.id)
       end
@@ -1084,7 +1089,9 @@ module Gori::Tui
       if detail.row.status == 101
         # WebSocket: seed the editor with the recorded client→server messages. The tab is
         # session-only (db_id nil) — WS transcripts aren't persisted/synced.
-        all_out = @host.session.store.ws_messages(id).select { |m| m.direction == "out" }
+        # A `[gori]` advisory is a diagnostic gori wrote ABOUT the socket, never a frame the
+        # client sent — the drop is named on the status line below, not made in silence.
+        all_out, notice_dropped = CLI::Run.ws_seed_rows(@host.session.store.ws_messages(id))
         view.load_ws(detail, all_out.map { |m| Store::WsOutMessage.new(m.opcode, m.payload, CLI::Run.seed_shape(m.shape)) })
         @repeaters << RepeaterTab.new(view, id, nil)
         # The pane is text-only (one message per line), so a frame it cannot represent is not
@@ -1096,6 +1103,7 @@ module Gori::Tui
         # cannot say which of those it is.
         unshown = view.ws_unshown_seed
         note = unshown.empty? ? "" : " — #{unshown.size} frame#{unshown.size == 1 ? "" : "s"} not shown (#{unshown.join(", ")}); #{unshown.size == 1 ? "it replays" : "they replay"} unless you edit the list"
+        note += " · #{CLI::Run.ws_notice_dropped_note(notice_dropped)}" if notice_dropped > 0
         @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{note} · ^R send · esc back")
       elsif grpc_flow?(detail)
         # gRPC: head editable as text; a unary call's message payload is hex-editable (^X)
@@ -1287,7 +1295,12 @@ module Gori::Tui
       # body is a byte, and a whole-request check refuses nearly every binary-body session —
       # but whole-string on the target and SNI, which are short operator-typed fields with no
       # body to exclude. The CLI and MCP minimize paths carry the same three checks.
-      env_names = Env.unresolved_wire(view.request_text) | Env.unresolved(view.target) |
+      # The REQUEST half drops out for an EVIDENCE tab, for the same reason `^R` no longer
+      # expands one: a capture's `$filter`/`$where` is not a variable anybody typed, so it is
+      # neither refusable nor resolvable. The TARGET and SNI stay checked either way — those
+      # are operator-typed fields on any tab.
+      req_names = view.evidence? ? [] of String : Env.unresolved_wire(view.request_text)
+      env_names = req_names | Env.unresolved(view.target) |
                   (view.sni_override.try { |s| Env.unresolved(s) } || [] of String)
       unless env_names.empty?
         @host.status("minimize: unresolved env #{Env.token_list(env_names)} — add it in the Project tab's ENV pane")
@@ -1304,8 +1317,14 @@ module Gori::Tui
       # env-expand → Content-Length resync (only when Auto-CL is on).
       text = view.request_text
       auto_cl = view.auto_content_length?
+      # `evidence` here is the same call `expanded_text_to_bytes` makes: on a captured
+      # request the CRLF promotion is still owed to the wire, the `$KEY` substitution is not.
+      # Minimize sends up to SEND_CAP probes derived from these bytes, so a substitution here
+      # is the ^R defect multiplied — and it would also make the minimizer's verdict a
+      # verdict about a request the operator never captured.
+      evidence = view.evidence?
       resolve = ->(t : String) do
-        raw = Env.expand_wire(t)
+        raw = evidence ? Env.normalize_wire(t) : Env.expand_wire(t)
         auto_cl ? Repeater::FlowRequest.resync_content_length(raw) : raw
       end
       # Minimize dials Fuzz::Sender directly (many capped probe sends) rather than through
@@ -1456,8 +1475,15 @@ module Gori::Tui
     # rather than expanding a second time.
     private def repeater_plan(view : RepeaterView, requests : Array(Bytes), *,
                               http2 : Bool = false) : Repeater::Plan?
+      # `evidence:` is NOT the same knob as `expand_request: false`, which is why passing
+      # only the latter left this tab substituting into a capture. `expand_request` says
+      # "these bytes are already final"; the view had already run `Env.expand_wire` over
+      # them, so the substitution had happened one layer up and the builder never saw a
+      # `$KEY` to leave alone. `evidence:` is what tells the SENDER (session bindings) and
+      # the unresolved-`$KEY` refusal that these bytes are a capture. See
+      # `RepeaterView#evidence?` and `Repeater::Sender#evidence?`.
       Repeater::Plan.build(Repeater::PlanOptions.new(requests,
-        expand_request: false, auto_content_length: false,
+        expand_request: false, auto_content_length: false, evidence: view.evidence?,
         target: view.target, http2: http2, sni: view.sni_override,
         verify: !@host.session.config.insecure_upstream?,
         # The session's LIVE instance, not a fresh `HostOverrides.load` — the proxy reads

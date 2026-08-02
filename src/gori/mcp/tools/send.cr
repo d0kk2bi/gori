@@ -261,6 +261,26 @@ module Gori
       # "truncated at".
       TRUNCATED_REQUEST_PHRASE = "truncated at"
 
+      # The one `flow_stalled` variant that is a DEADLINE, not origin misbehaviour: gori's own
+      # budget for the whole exchange expired while the origin was still granting window in
+      # increments too small to finish the body. Its siblings — "the origin closed the
+      # connection before granting window", "the origin never granted flow-control window" —
+      # are the origin refusing to make progress, and `protocol` / non-retryable is right for
+      # those: retrying reproduces them and the refusal IS the finding.
+      #
+      # This one is different in the one way that matters to an agent: nothing about the
+      # target changed, only the clock ran out, and the correct next move is to raise
+      # `timeout_ms` — which `retryable: false` tells a caller not to attempt. It is the same
+      # shape as gori's ordinary idle timeout, which is already `timeout` / NETWORK_ERROR, so
+      # it is folded into that kind rather than given a fourth code: a deadline is a deadline.
+      #
+      # Keyed on this PHRASE and not on the whole sentence, and not on "NOT fully sent" —
+      # which every flow_stalled variant ends with, so matching that would sweep the siblings
+      # in with it. The phrase must stay in step with `H2Engine.flow_stalled`; the spec pins
+      # both it and a sibling sentence as DATA so a reword there cannot silently flip a
+      # verdict here.
+      EXCHANGE_BUDGET_PHRASE = "budget for the whole exchange"
+
       # Coarse category for a send's network error, from the engine's error text
       # (gori's own controlled strings). "connect" (the dialer collapses DNS /
       # refused / connect-timeout / TLS-verify into one failure — finer split would
@@ -280,6 +300,8 @@ module Gori
         m = message.downcase
         return "connect" if m.starts_with?("connect failed")
         return "timeout" if m.includes?("timed out") || m.includes?("timeout")
+        # Ahead of PROTOCOL_ERROR_PHRASES (the sentence says "h2 ") — see the constant.
+        return "timeout" if m.includes?(EXCHANGE_BUDGET_PHRASE)
         # Both ahead of PROTOCOL_ERROR_PHRASES on purpose — see their own comments.
         return "other" if RETRYABLE_H2_PHRASES.any? { |p| m.includes?(p) }
         return "no_response" if NO_RESPONSE_PHRASES.any? { |p| m.includes?(p) }
@@ -541,7 +563,14 @@ module Gori
               j.field "sensitive_headers_redacted", redacted
             end
             j.field "duration_us", result.duration_us
-            j.field "incomplete", true if result.incomplete?
+            if result.incomplete?
+              j.field "incomplete", true
+              # `incomplete: true` alone said only THAT the body was short, never why, so an
+              # agent could not tell gori's own capture ceiling from an origin that closed
+              # from a read deadline that expired — three different next moves. The CLI has
+              # named them since round 3; this is the same classifier, not a second one.
+              j.field "incomplete_reason", CLI::Run.incomplete_reason(result, result.timed_out?)
+            end
             Serialize.emit_body(j, "body", result.head, result.body, false, body_cap, body_omit)
           end
         end
@@ -591,6 +620,7 @@ module Gori
         # entry became `OutMsg.new(1, …)`, so this tool could send exactly one frame shape.
         source = [] of Store::WsOutMessage
         field = "repeater_id"
+        notice_dropped = 0
         if present?(h, "messages")
           arr = h["messages"]?.try(&.as_a?)
           return Result.new("invalid 'messages' (expected an array of strings or objects)", is_error: true) unless arr
@@ -601,19 +631,31 @@ module Gori
           end
           field = "messages"
         else
-          source = store.ws_messages_for_repeater(repeater_id).select { |m| m.direction == "out" }
-            .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
+          # A `[gori]` advisory captured on the out direction is gori talking about the
+          # socket, not a frame the client sent — and the drop is reported, not silent.
+          rows, notice_dropped = CLI::Run.ws_seed_rows(store.ws_messages_for_repeater(repeater_id))
+          source = rows.map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
         end
-        if e = ws_unresolved_env_error(source.select(&.text?).map { |m| String.new(m.payload) }, field)
-          return e
+        # PROVENANCE, keyed on the session's `flow_id` exactly as `gori run repeater send`
+        # keys it: stored rows of a flow-seeded session are the CLIENT's captured frames, so
+        # a `$where` / `$ref` / `$filter` in one is a byte the origin saw. Expanding them
+        # made a MongoDB-injection capture unreplayable from here at all — the refusal fired
+        # with no `verbatim` to escape it, and setting the env vars it recommends sent
+        # `{"WHEREVAL":…}`. A `messages` argument is the agent's draft and is unaffected.
+        seeded = field == "repeater_id" && !repeater.flow_id.nil?
+        verbatim = bool_arg(h, "verbatim", false)
+        unless seeded || verbatim
+          if e = ws_unresolved_env_error(source.select(&.text?).map { |m| String.new(m.payload) }, field)
+            return e
+          end
         end
         # No `.scrub`: `Env.expand` scans BYTES and copies every span that is not a matched
         # token through unchanged, so an invalid-UTF-8 TEXT payload — the §8.1/§5.6 validation
         # test case — reaches the wire as the operator captured it. Scrubbing rewrote it to
         # U+FFFD, changing 9 bytes into 13, and sent that with no warning.
         out_messages = source.map do |m|
-          payload = m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload
-          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape)
+          payload = m.text? && !seeded && !verbatim ? Env.expand(String.new(m.payload)).to_slice : m.payload
+          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape, seeded)
         end
 
         # Scope gate before the outbound handshake (same policy as send_request).
@@ -626,6 +668,13 @@ module Gori
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new([repeater.request],
             default_target: repeater.target, sni: repeater.sni, verify: verify,
+            # `verbatim` reaches the handshake HEAD, exactly as `gori run repeater send`
+            # threads it through `session_plan_options`. (The head deliberately does NOT take
+            # the `seeded` provenance the MESSAGES take: `repeaters.request` is rewritable by
+            # `update_repeater` while `flow_id` persists, so a flow id is not evidence that
+            # THOSE bytes are still the capture's — while nothing but a flow seed ever writes
+            # a captured `ws_messages` row's payload.)
+            expand_request: !verbatim, refuse_unresolved_env: !verbatim,
             overrides: HostOverrides.load(store)), ob)
         rescue ex : Repeater::PlanError
           return send_plan_error(ex, "repeater_id")
@@ -659,6 +708,12 @@ module Gori
             j.field "duration_us", result.duration_us
             j.field "close_code", result.close_code if result.close_code
             j.field "note", Env.mask_secrets(result.note.not_nil!) if result.note
+            # Only when it FIRED: the session's stored list held gori's own advisory rows and
+            # this send is one frame per row short of the capture. See `CLI::Run.ws_seed_rows`.
+            if notice_dropped > 0
+              j.field "ws_notice_rows_dropped", notice_dropped
+              j.field "ws_notice_note", CLI::Run.ws_notice_dropped_note(notice_dropped)
+            end
             if err = result.error
               kind = network_error_kind(err)
               j.field "error", Env.mask_secrets(err)
@@ -675,7 +730,16 @@ module Gori
             end
             j.field "messages" do
               j.array do
+                # `WsEngine.send` frames every outbound message before it reads a single
+                # inbound frame, so the "out" rows appear here in `out_messages` order and
+                # this counter is a safe index back into what was HANDED to the engine.
+                out_seen = 0
                 result.messages.each do |message|
+                  authored = if message.direction == "out"
+                               src = source[out_seen]?
+                               out_seen += 1
+                               src
+                             end
                   j.object do
                     j.field "direction", message.direction
                     j.field "opcode", message.opcode
@@ -690,18 +754,38 @@ module Gori
                       reason = message.payload[2, message.payload.size - 2]
                       j.field "close_reason", Serialize.text(String.new(reason).scrub) unless reason.empty?
                     end
+                    # ONE masked buffer feeds both renderings, so they cannot disagree.
+                    # They did: `payload` ran through `mask_secrets` while `payload_base64`
+                    # beside it was a bare encode of the raw bytes — and since masking is
+                    # the exact inverse of the expansion, the same object reported the
+                    # STORED spelling in one field and printed the substituted value in the
+                    # clear in the next (`bad\xff\xfeWHEREVAL`, base64, unmasked). Masking a
+                    # value in one rendering and not another is not masking it.
+                    masked = Env.mask_secrets(String.new(message.payload)).to_slice
                     if message.opcode == 1
-                      j.field "payload", Env.mask_secrets(String.new(message.payload).scrub)
+                      j.field "payload", String.new(masked).scrub
                       # JSON-RPC has no way to carry a byte that is not valid UTF-8, so
                       # `payload` above is U+FFFD-substituted for exactly the payload an
                       # §8.1/§5.6 test is about. The real bytes go beside it instead of
                       # being unreadable on every surface (they are in the BLOB column).
-                      unless String.new(message.payload).valid_encoding?
-                        j.field "payload_base64", Base64.strict_encode(message.payload)
+                      unless String.new(masked).valid_encoding?
+                        j.field "payload_base64", Base64.strict_encode(masked)
                       end
                     else
                       j.field "binary", true
-                      j.field "payload_base64", Base64.strict_encode(message.payload)
+                      j.field "payload_base64", Base64.strict_encode(masked)
+                    end
+                    # Only when it FIRED — the same rule `request_line_rewritten` follows
+                    # (`send_request`): gori changed the operator's bytes, so the surface
+                    # reporting the send has to say so. Masking makes the change invisible
+                    # in `payload` on its own, because it maps the substituted value back to
+                    # the `$NAME` that produced it, and the result then reads exactly like a
+                    # byte-exact replay. The AUTHORED form goes beside it so an agent can see
+                    # both ends of the substitution rather than infer one.
+                    if authored && authored.payload != message.payload
+                      j.field "payload_expanded", true
+                      j.field "payload_authored",
+                        Serialize.text(Env.mask_secrets(String.new(authored.payload)).scrub)
                     end
                   end
                 end
@@ -890,8 +974,22 @@ module Gori
           # With expansion off there is no expansion to resync a Content-Length after, so
           # `resync_cl_after_expansion` goes with it: the stored framing ships exactly as
           # captured, which is what a CL/TE desync capture is for.
+          # `evidence: true` ALONGSIDE the two flags, not instead of them, and this is the
+          # second time that distinction has cost a round. The flags reach the BUILDER;
+          # `evidence` is what reaches the SENDER, where a DECLARED session binding is
+          # deliberately deferred to (`expand_requests`' own comment says so). Without it an
+          # extract rule named `TOKEN`/`filter`/`where` rewrote a stored `GET /api?$TOKEN=1`
+          # into `GET /api?SECRETTOKEN123=1` on the wire while this tool still reported the
+          # stored target — the exact thing `expand_request: false` was added to stop, one
+          # layer further down. `gori run repeater <flow-id>` already passed `evidence: true`,
+          # so the two surfaces reached "the same end state" by different mechanisms and only
+          # one of them was actually byte-exact.
+          #
+          # The flags stay because they are NOT implied: `expand_request: false` is also what
+          # keeps `downgrade_request_line` off this path, and an `HTTP/2` version line in a
+          # capture is the operator's to replay.
           {Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
-            expand_request: false, refuse_unresolved_env: false,
+            expand_request: false, refuse_unresolved_env: false, evidence: true,
             auto_content_length: false,
             http2: bool_arg(h, "http2", flow.http2), sni: flow.sni, verify: verify,
             timeout: timeout, overrides: overrides), flow.rewrote_request_line}

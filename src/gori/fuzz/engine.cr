@@ -44,6 +44,17 @@ module Gori::Fuzz
     abstract def send(bytes : Bytes) : Repeater::Result
     abstract def origin : Origin
 
+    # `verbatim`: byte ranges of `bytes` whose PROVENANCE is not the template's — today,
+    # the fuzz payloads `Fuzz::Generator` spliced in (`Job#payload_spans`). A backend that
+    # rewrites the request before the socket must leave them alone; one that does not
+    # rewrite anything ignores the argument, which is why this is a concrete delegation
+    # rather than a second abstract: every spec double and every wrapper backend in the tree
+    # keeps compiling as a three-line class, and only `Sender` — the one that substitutes
+    # session bindings — overrides it.
+    def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
+      send(bytes)
+    end
+
     # Sends this backend REFUSED before the socket — Sandbox, an explicit exclude rule, or
     # a session binding nothing has bound yet. Zero for a backend with no gate.
     #
@@ -66,6 +77,15 @@ module Gori::Fuzz
     # sockets). Called once when a run ends. A no-op by default so the spec doubles and
     # the connection-per-send backends stay three-line classes.
     def close : Nil
+    end
+
+    # Requests this backend put on the wire BELOW the caller's own count. Today that is only
+    # `ConnPool`'s stale re-sends, which happen inside one `send` call: `CappedBackend` counts
+    # calls, so without this a run that re-sent three requests reported the traffic of four
+    # when seven left the machine. `Progress#requests` documents itself as "REQUESTS actually
+    # put on the wire", which is the number a tester works an agreed budget against.
+    def extra_requests : Int64
+      0_i64
     end
   end
 
@@ -103,6 +123,19 @@ module Gori::Fuzz
     end
 
     def send(bytes : Bytes) : Repeater::Result
+      send(bytes, nil)
+    end
+
+    # `verbatim` excludes the run's PAYLOAD bytes from both halves below. A payload is the
+    # operator's test case, not a draft: SSTI / template-injection / env-reflection payload
+    # sets are made of `$X` strings, and with an extract rule up, `--payloads '$TOKEN'` went
+    # out as the live session token — a real credential in an arbitrary query or body
+    # position of a request aimed at the target, landing in its access log, while every
+    # surface (the terminal row, `--format json`, MCP `fuzz_results`) still reported
+    # `$TOKEN`. The refusal half is excluded for the same reason and not as a convenience:
+    # unbound, the same payload refused the send with advice ("replay the flow that mints
+    # the token first") that produces exactly that substitution.
+    def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
       # Session bindings (#501) resolve HERE, per send, not at plan-build: a rotating token
       # can change between request 1 and request 20 of the same run, which is exactly the
       # run that otherwise produces a page of 401s. Env vars are untouched — the plan
@@ -112,7 +145,7 @@ module Gori::Fuzz
       # A declared-but-unbound name REFUSES rather than shipping `""` or the literal
       # `$SESSION`, and is charged to `blocked` rather than to a second counter — the same
       # argument the comment below makes for the scope gate. The refusal names the binding.
-      if (unbound = Gori::Env.unbound(bytes)).present?
+      if (unbound = Gori::Env.unbound(bytes, verbatim)).present?
         @blocked += 1
         reason = Gori::Env.unbound_error(unbound)
         @blocked_reason ||= reason
@@ -120,7 +153,7 @@ module Gori::Fuzz
       end
       # BEFORE the scope gate, because the gate keys on the target actually sent — the same
       # rule `ClientConn` states for Match&Replace on the proxy path.
-      bytes = Gori::Env.expand_bindings(bytes)
+      bytes = Gori::Env.expand_bindings(bytes, verbatim)
       # Sandbox mode / an explicit EXCLUDE rule hard-blocks BEFORE the socket, so a
       # blocked attempt never reaches the network. It still costs a request from the
       # engine's budget, exactly as CappedBackend already charges retries and redirect
@@ -143,6 +176,10 @@ module Gori::Fuzz
 
     def close : Nil
       @pool.try(&.close_all)
+    end
+
+    def extra_requests : Int64
+      @pool.try(&.stale_retries) || 0_i64
     end
   end
 
@@ -178,10 +215,20 @@ module Gori::Fuzz
       @inner.blocked_reason
     end
 
+    # Delegated for the same reason as `blocked`: this wrapper is what the Engine holds, so a
+    # default 0 here would hide every re-send the pool underneath it made.
+    def extra_requests : Int64
+      @inner.extra_requests
+    end
+
     def send(bytes : Bytes) : Repeater::Result
+      send(bytes, nil)
+    end
+
+    def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
       return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR) if cap_reached?
       @sent += 1
-      @inner.send(bytes)
+      @inner.send(bytes, verbatim)
     end
 
     def close : Nil
@@ -204,14 +251,22 @@ module Gori::Fuzz
       @inner.origin
     end
 
+    def extra_requests : Int64
+      @inner.extra_requests
+    end
+
     def send(bytes : Bytes) : Repeater::Result
+      send(bytes, nil)
+    end
+
+    def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
       o = origin
       if err = @outbound.sweep_block(o.scheme, o.host, Gori::Outbound.request_target(bytes))
         @blocked += 1
         @blocked_reason ||= err
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err)
       end
-      @inner.send(bytes)
+      @inner.send(bytes, verbatim)
     end
 
     def close : Nil
@@ -422,7 +477,9 @@ module Gori::Fuzz
     private def run_one(job : Job) : Result
       attempts = 0
       loop do
-        raw = @backend.send(job.bytes)
+        # The payload spans ride with the bytes: `Sender` needs them to tell the operator's
+        # test case from the template it was spliced into (see `Backend#send`).
+        raw = @backend.send(job.bytes, job.payload_spans)
         # Don't burn retries/sleep on a permanent max-requests stop — further send()s
         # are also refused. Real network errors still retry as configured.
         if raw.error && raw.error != CappedBackend::CAP_ERROR && attempts < @config.retries
@@ -441,6 +498,10 @@ module Gori::Fuzz
     private def follow_redirects(raw : Repeater::Result) : Repeater::Result
       current = raw
       total_us = raw.duration_us
+      # A keep-alive re-send ANYWHERE in the chain has to reach the row: the collapsed Result
+      # below keeps the last hop's fields, so without this an original request that was
+      # re-sent and then redirected would report as a single clean send.
+      retried = raw.retried?
       hops = 0
       while hops < @config.max_redirects
         resp = current.response
@@ -450,13 +511,15 @@ module Gori::Fuzz
         nxt = redirect_request(loc)
         break unless nxt
         current = @backend.send(nxt)
+        retried ||= current.retried?
         total_us += current.duration_us
         hops += 1
         break unless current.error.nil?
       end
       # Report the whole chain's end-to-end time, not just the final hop's — otherwise a
       # slow original request that 3xx's to a fast resource masks a time-based signal.
-      hops > 0 ? Repeater::Result.new(current.head, current.body, current.response, total_us, current.error, current.incomplete?) : current
+      hops > 0 ? Repeater::Result.new(current.head, current.body, current.response, total_us,
+        current.error, current.incomplete?, current.delivered?, retried) : current
     end
 
     private def redirect_request(loc : String) : Bytes?
@@ -547,7 +610,7 @@ module Gori::Fuzz
 
     private def snapshot : Progress
       Progress.new(@sent, total, @matched, @errors, @backend.blocked, @backend.blocked_reason,
-        @backend.sent)
+        @backend.sent + @backend.extra_requests)
     end
   end
 end

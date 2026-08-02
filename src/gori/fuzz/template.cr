@@ -191,18 +191,36 @@ module Gori::Fuzz
     # Splice payloads into the marked positions. `payloads.size` must equal
     # `position_count`. Bytes are returned BEFORE any Content-Length sync.
     def render(payloads : Array(String)) : Bytes
+      render_spans(payloads)[0]
+    end
+
+    # `render`, plus the byte span `[start, end)` each payload occupies in the result.
+    #
+    # The spans exist so a send seam can tell TEMPLATE bytes from PAYLOAD bytes. Everything
+    # downstream of here sees one flat request, which is how `$TOKEN` as a payload came to be
+    # replaced by the live session token: `Env.expand_bindings` scans the whole message by
+    # design, and nothing between the splice and the socket knew which bytes the operator had
+    # nominated as the thing under test. Computed here rather than re-derived later because
+    # this is the only place that knows — a payload can contain any bytes, including the
+    # segment text around it.
+    def render_spans(payloads : Array(String)) : {Bytes, Array({Int32, Int32})}
       # Pre-size to the exact output length (segments + payloads, both written once) so a
       # KB-scale request doesn't regrow the default 64B buffer 64→128→…→N every emit on the
       # fuzz build path. bytesize is O(1) and both arrays are tiny (position_count+1); on the
       # parse contract (segments.size == positions.size + 1) the sum is exact, and off-contract
       # it can only OVER-estimate (fewer segments written) — never under, so never a truncation.
       io = IO::Memory.new(@segments.sum(&.bytesize) + payloads.sum(&.bytesize))
+      spans = Array({Int32, Int32}).new(payloads.size)
       io << @segments[0]?
       payloads.each_with_index do |p, k|
+        start = io.pos.to_i32
         io << p
+        # An EMPTY payload gets an empty span rather than none: the list stays 1:1 with
+        # `payloads` (a consumer indexes it), and a zero-width range matches nothing.
+        spans << {start, io.pos.to_i32}
         io << @segments[k + 1]?
       end
-      io.to_slice
+      {io.to_slice, spans}
     end
 
     # Map each payload through its position's Decoder chain (empty chain = identity),

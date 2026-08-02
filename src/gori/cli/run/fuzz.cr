@@ -126,6 +126,10 @@ module Gori
         # sender enforces Sandbox mode + explicit exclude rules on EVERY send regardless of
         # that flag. No project (--request/stdin) is an explicit Unscoped(NoProject), not a
         # silently skipped gate.
+        # Ahead of Plan.build on purpose: the builder's unresolved-env refusal fires on the very
+        # template `--bind-from` was passed for, so the flag was being discarded silently. See
+        # CLI::Run.preflight_bind_from.
+        preflight_bind_from(bind_from, "gori run fuzz")
         outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped)
         plan = begin
           Fuzz::Plan.build(options, outbound)
@@ -232,6 +236,10 @@ module Gori
         total = fuzz_preflight(engine, mode, scheme, host, port, force)
         matched = 0
         errored = 0
+        # Rows printed. Kept apart from `matched + errored` because a row can now be shown for
+        # a THIRD reason — it was re-sent — and folding that into `errored` would both
+        # over-report the error count and flip the exit code of a clean run.
+        shown = 0
         had_error = false
         buffer = [] of Fuzz::Result
         engine.run do |ev|
@@ -240,9 +248,11 @@ module Gori
           when Fuzz::ResultEvent
             r = ev.result
             if emit_fuzz_result(r, format, buffer)
-              r.matched? ? (matched += 1) : (errored += 1)
+              shown += 1
+              matched += 1 if r.matched?
+              errored += 1 if r.error && !r.matched?
             end
-          when Fuzz::DoneEvent  then fuzz_done(ev, matched + errored, pool, max_requests)
+          when Fuzz::DoneEvent  then fuzz_done(ev, shown, pool, max_requests)
           when Fuzz::ErrorEvent then had_error = true; STDERR.puts "fuzz error: #{ev.message}"
           end
         end
@@ -311,6 +321,7 @@ module Gori
         return unless pool && pool.dialed > 0
         STDERR.puts "connections · #{pool.dialed} dialed · #{pool.reused} reused" \
                     "#{pool.stale_retries > 0 ? " · #{pool.stale_retries} re-sent on a closed connection" : ""}" \
+                    "#{pool.unsafe_stale > 0 ? " · #{pool.unsafe_stale} not re-sent (non-idempotent method)" : ""}" \
                     "#{pool.pooling? ? "" : " · keep-alive gave up (origin closes every connection)"}"
       end
 
@@ -318,7 +329,10 @@ module Gori
       # (the row helpers render "ERR" + the message / `error` field), so a headless run has the
       # same visibility as the TUI — a scope-block or a dead target is no longer silently dropped.
       private def self.emit_fuzz_result(r : Fuzz::Result, format : Symbol, buffer : Array(Fuzz::Result)) : Bool
-        return false unless r.matched? || r.error
+        # A re-sent row is shown even when it neither matched nor errored: it is the one row of
+        # the run whose request reached the origin twice, and dropping it here would put the
+        # duplicate back where it was — invisible outside the connections summary.
+        return false unless r.matched? || r.error || r.retried?
         case format
         when :jsonl then puts CLI::Output.fuzz_row_json(r)
         when :json  then buffer << r

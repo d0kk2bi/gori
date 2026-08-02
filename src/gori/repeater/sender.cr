@@ -29,10 +29,28 @@ module Gori
       getter port : Int32
       getter? http2 : Bool
 
+      # PROVENANCE, carried from `PlanOptions#evidence?`. `Plan` stopped expanding `$KEY`
+      # into captured bytes, and `plan.cr` names the one exception it deliberately left
+      # open: "except a DECLARED session binding, which `Env.expand` deliberately leaves
+      # for `Env.expand_bindings` at the send seam." THIS is that seam, and it ran
+      # unconditionally — so an extract rule declaring an ordinary name (`filter`, `top`,
+      # `token`, `user`, `where`) rewrote a captured `GET /api?$filter=…` exactly the way
+      # the project env var used to, one seam past the one that was closed. Reproduced from
+      # MCP over one process: a `send_request` that binds `$TOKEN`, then a replay of a
+      # stored `GET /api?$TOKEN=1` — the origin logged `GET /api?SECRETTOKEN123=1` while
+      # the tool result still reported the stored target.
+      #
+      # The cost is the mirror of the engine tabs' (`FuzzerView#evidence_template`): an
+      # operator's own `$TOKEN` merged into evidence — `gori run repeater -H`, a TUI edit
+      # over a seeded capture — now ships literally rather than resolving. That is the
+      # direction that can only be READ WRONG, never SENT wrong, and a surface that wants
+      # both can expand at its own merge seam, where it still knows whose bytes are whose.
+      getter? evidence : Bool
+
       def initialize(@outbound : Gori::Outbound, *, @scheme : String, @host : String, @port : Int32,
                      @verify : Bool, @http2 : Bool = false, @sni : String? = nil,
                      @timeout : Time::Span? = nil, @overrides : Gori::HostOverrides? = nil,
-                     @preserve_field_case : Bool = false)
+                     @preserve_field_case : Bool = false, @evidence : Bool = false)
       end
 
       # The reason this request may not go out, or nil to proceed. Two rules stop a
@@ -43,7 +61,12 @@ module Gori
       # caller that already asks `refusal` in order to report a block in its own idiom — a
       # TUI status line, a CLI abort, an MCP error — reports this one the same way, with no
       # per-surface change. `send_group` and `send_ws` inherit it through `refusal` too.
+      #
+      # Both halves are off for EVIDENCE (see `evidence?`): a `$filter` in a stored request
+      # line is neither a reference to resolve nor a name to refuse over — it is a byte the
+      # origin saw. The scope gate still runs, on the bytes that will actually go out.
       def refusal(bytes : Bytes) : String?
+        return @outbound.send_block(@scheme, @host, Gori::Outbound.request_target(bytes)) if @evidence
         if (unbound = Gori::Env.unbound(bytes)).present?
           return Gori::Env.unbound_error(unbound)
         end
@@ -51,6 +74,7 @@ module Gori
       end
 
       def refusal(text : String) : String?
+        return @outbound.send_block(@scheme, @host, Gori::Outbound.request_target(text)) if @evidence
         if (unbound = Gori::Env.unbound(text)).present?
           return Gori::Env.unbound_error(unbound)
         end
@@ -74,6 +98,7 @@ module Gori
       # the problem. Asked separately rather than by re-typing `refusal`, so the surfaces that
       # correctly treat it as one string stay untouched.
       def unbound_refusal?(requests : Array(Bytes)) : Bool
+        return false if @evidence
         requests.any? { |b| Gori::Env.unbound(b).present? }
       end
 
@@ -81,7 +106,7 @@ module Gori
         if reason = refusal(bytes)
           return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
         end
-        bytes = Gori::Env.expand_bindings(bytes)
+        bytes = Gori::Env.expand_bindings(bytes) unless @evidence
         result =
           if @http2
             H2Engine.send(bytes, scheme: @scheme, host: @host, port: @port,
@@ -116,7 +141,7 @@ module Gori
         if reason = group_refusal(requests)
           return requests.map { Result.new(Bytes.new(0), nil, nil, 0_i64, reason) }
         end
-        requests = requests.map { |b| Gori::Env.expand_bindings(b) }
+        requests = requests.map { |b| Gori::Env.expand_bindings(b) } unless @evidence
         results = Engine.send_pipeline(requests, scheme: @scheme, host: @host, port: @port,
           verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
         # A group is ONE connection carrying a deliberate sequence, so every member is as
@@ -149,8 +174,13 @@ module Gori
       end
 
       # The first declared-but-unbound name across the outgoing frames, as a refusal.
+      #
+      # A CAPTURED frame is skipped, the same rule `refusal` applies to a captured request:
+      # its `$where` / `$filter` is a byte the origin saw, so there is nothing to resolve and
+      # nothing to refuse. See `WsEngine::OutMsg#evidence`.
       private def ws_message_refusal(messages : Array(WsEngine::OutMsg)) : String?
         messages.each do |m|
+          next if m.evidence
           unbound = Gori::Env.unbound(m.payload)
           return Gori::Env.unbound_error(unbound) if unbound.present?
         end
@@ -161,11 +191,12 @@ module Gori
       # so nothing here is a message boundary and the value goes in as it was observed.
       private def expand_messages(messages : Array(WsEngine::OutMsg)) : Array(WsEngine::OutMsg)
         messages.map do |m|
+          next m if m.evidence # captured bytes: see `ws_message_refusal`
           expanded = Gori::Env.expand_bindings(String.new(m.payload), guard_boundary: false).to_slice
           # `m.shape` rides along. Rebuilding without it silently reset every frame a binding
           # touched back to FIN=1/RSV=0/fresh-mask — the exact shape this round exists to stop
           # being the only one.
-          expanded == m.payload ? m : WsEngine::OutMsg.new(m.opcode, expanded, m.shape)
+          expanded == m.payload ? m : WsEngine::OutMsg.new(m.opcode, expanded, m.shape, m.evidence)
         end
       end
 

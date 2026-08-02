@@ -34,8 +34,13 @@ module Gori
     #     re-imports it as origin-form, so the re-imported request line — and with it
     #     `headersSize` — is shorter by the authority. Nothing else moves, and the proxy
     #     rewrites absolute→origin on forward anyway.
-    # Everything a HAR carries — method, url, version, ordered headers, body bytes, status,
-    # reason, timing — survives, and export→import→export is a fixed point.
+    # For a COMPLETE flow everything a HAR carries — method (its exact case included), url,
+    # version, ordered headers with their framing, body bytes, status, reason, timing —
+    # survives, and export→import→export is a fixed point apart from the absolute-form
+    # request line and the `headersSize` that follows from it, above. A flow that is NOT
+    # complete has no fixed point to be: HAR records neither `state` nor gori's `error`
+    # string, so a pending / refused / aborted flow is SKIPPED by name and counted
+    # (`skip_reason`), never written as a fabricated success.
     module Har
       SPEC_VERSION = "1.2"
 
@@ -65,7 +70,8 @@ module Gori
       # Why a flow has no HAR representation at all.
       enum Skip
         WebSocket  # a 101 flow — see skip_reason
-        NoResponse # pending / error / aborted — see skip_reason
+        NoResponse # nothing came back at all: pending, or a request gori REFUSED to send
+        Incomplete # a response head exists but the exchange died mid-flight (aborted/error)
       end
 
       # What `log` wrote, what it refused to write, and what it wrote with a caveat.
@@ -75,10 +81,11 @@ module Gori
         property written = 0
         property websocket = 0
         property no_response = 0
+        property incomplete = 0
         property truncated = 0
 
         def skipped : Int32
-          websocket + no_response
+          websocket + no_response + incomplete
         end
 
         # One line per non-empty caveat, for a caller to print (CLI: on STDERR, so STDOUT
@@ -90,6 +97,10 @@ module Gori
           end
           if no_response > 0
             msgs << "skipped #{plural(no_response, "flow")} with no captured response: a HAR entry requires a response object"
+          end
+          if incomplete > 0
+            msgs << "skipped #{plural(incomplete, "flow")} whose exchange did not complete: HAR cannot record " \
+                    "a partial response, so the entry would import back as a successful one"
           end
           if truncated > 0
             verb = truncated == 1 ? "entry carries" : "entries carry"
@@ -110,10 +121,22 @@ module Gori
         # that followed — the whole point of capturing it. HAR has no frame log, so skip the
         # flow outright and let the caller say so (#495).
         return Skip::WebSocket if detail.row.status == 101
-        # HAR 1.2 makes `response` a required member of an entry. A pending / error / aborted
-        # flow has none. Synthesizing a status-0 response would import back as a COMPLETE
-        # flow with status 0, so it is skipped rather than faked.
-        return Skip::NoResponse if detail.response_head.nil?
+        # HAR 1.2 makes `response` a required member of an entry, and gives no field for
+        # "this exchange did not finish". A pending flow, a request gori REFUSED to send,
+        # and a flow whose connection died mid-response all lack a response to write.
+        # Synthesizing a status-0 one would import back as a COMPLETE flow with status 0,
+        # so those are skipped rather than faked.
+        #
+        # `response_head.nil?` alone was NOT that test. Only a Pending flow has a NULL head:
+        # an Error or Aborted flow is persisted with an EMPTY one (the cause lives in
+        # `error`, which HAR has nowhere to put), so a request gori refused to send fell
+        # through to `entry` and was written as `"status": 0` — which `Import::Har` plus
+        # `Builder.complete_flow` read straight back as `state = Complete`, the exact
+        # outcome the paragraph above exists to prevent. The store already knows the fact,
+        # so ask it: anything but Complete is skipped and counted.
+        head = detail.response_head
+        return Skip::NoResponse if head.nil? || head.empty?
+        return Skip::Incomplete unless detail.row.state.complete?
         nil
       end
 
@@ -138,6 +161,7 @@ module Gori
                       case skip_reason(detail)
                       when Skip::WebSocket  then report.websocket += 1
                       when Skip::NoResponse then report.no_response += 1
+                      when Skip::Incomplete then report.incomplete += 1
                       else
                         entry(j, detail)
                         report.written += 1

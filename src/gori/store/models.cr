@@ -224,6 +224,34 @@ module Gori
         @opcode >= 8
       end
 
+      # A row gori wrote ABOUT this socket rather than a frame a peer sent — the handshake
+      # advisory, the §5.4 parking-ceiling advisory, the teardown-loss notice, the ping-flood
+      # marker, the oversized-frame marker.
+      #
+      # **A diagnostic is not traffic.** Every surface that seeds a WebSocket repeater from a
+      # captured flow — `run repeater create --flow`, MCP `create_repeater`, the TUI — takes
+      # each `direction == "out"` row's opcode and BYTES straight across, deliberately and
+      # with no interpretation, because a binary frame and an invalid-UTF-8 text frame both
+      # have to round-trip. A notice row taken that way is replayed to the application under
+      # test as a message the operator never authored: a masked 242-byte TEXT frame of gori's
+      # own prose, or a PING carrying the flood marker. For anything that parses its inbound
+      # text — JSON-RPC, STOMP, a game protocol — that is a fabricated malformed message
+      # injected into the operator's own test case, and the send count says one more message
+      # than the client ever sent. **Every seed reader must reject these rows.**
+      #
+      # `Relay::NOTICE_DIRECTION` keeps new advisories off the direction a seed reads, so this
+      # is the second guard rather than the only one — but it is the one that covers a flow
+      # captured by an OLDER build, and the two markers that legitimately keep the frame's own
+      # opcode and direction because they stand in for a real frame at its own position.
+      #
+      # A prefix test and not a column: it is what makes an already-stored row readable, and
+      # the prefix has been the convention for these rows since they existed. The cost is a
+      # genuine peer message that happens to open with `[gori] ` — a seed reader that drops
+      # one should say which row it dropped rather than go quiet.
+      def notice? : Bool
+        Gori::Proxy::WS.notice?(@payload)
+      end
+
       # A CLOSE frame's status code (§5.5.1: 2 bytes, network order), or nil when the frame
       # is not a CLOSE or carries no code. The single most diagnostic thing a failed
       # WebSocket test produces, and it existed nowhere on the proxy path.
@@ -266,6 +294,13 @@ module Gori
 
       def control? : Bool
         @opcode >= 8
+      end
+
+      # As `Store::WsMessage#notice?`, for the surfaces that hold an already-converted seed —
+      # the TUI takes its `Array(WsOutMessage)` from a caller — so the guard is reachable on
+      # whichever side of the conversion a reader sits.
+      def notice? : Bool
+        Gori::Proxy::WS.notice?(@payload)
       end
 
       # The frame this message asks for, in the notation the CLI's `--message-frame` and the

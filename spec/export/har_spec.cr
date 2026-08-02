@@ -64,6 +64,37 @@ private def pending_flow(store) : Gori::Store::FlowDetail
   store.get_flow(id).not_nil!
 end
 
+# A request gori REFUSED to send (`Codec::Body.request_framing` on a CL+TE message, say).
+# The response side is persisted as an EMPTY head with the cause in `error` — NOT as a NULL
+# head, which is only the Pending shape.
+private def refused_flow(store) : Gori::Store::FlowDetail
+  id = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_780_000_000_000_000_i64, scheme: "http", host: "shop.test", port: 80,
+    method: "POST", target: "/clte", http_version: "HTTP/1.1",
+    head: "POST /clte HTTP/1.1\r\nHost: shop.test\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n".to_slice,
+    body: "5\r\nhello\r\n0\r\n\r\n".to_slice))
+  # Built by the SAME producer the proxy uses, because the empty-vs-NULL distinction this
+  # example turns on is exactly what a hand-rolled DTO would get wrong.
+  store.update_response(Gori::FlowMapper.error_response(
+    id, "request framing rejected: Transfer-Encoding and Content-Length both present"))
+  store.get_flow(id).not_nil!
+end
+
+# A response that started arriving and never finished: a REAL head, a partial body, and
+# `state = Aborted`.
+private def aborted_flow(store) : Gori::Store::FlowDetail
+  id = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_780_000_000_000_000_i64, scheme: "https", host: "shop.test", port: 443,
+    method: "GET", target: "/chunked", http_version: "HTTP/1.1",
+    head: "GET /chunked HTTP/1.1\r\nHost: shop.test\r\n\r\n".to_slice))
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: 200, reason: "OK", content_type: "text/plain",
+    head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n".to_slice,
+    body: "5\r\nhel\nlo\r\n".to_slice, state: Gori::Store::FlowState::Aborted,
+    error: "upstream closed before response body complete"))
+  store.get_flow(id).not_nil!
+end
+
 private def export(details : Array(Gori::Store::FlowDetail)) : {String, Gori::Export::Har::Report}
   io = IO::Memory.new
   report = Gori::Export::Har.log(io, details)
@@ -430,6 +461,59 @@ describe Gori::Export::Har do
         report.websocket.should eq(1)
         report.no_response.should eq(1)
         JSON.parse(har)["log"]["entries"].as_a.size.should eq(1)
+      end
+    end
+
+    # R4-F3. `response_head.nil?` was written against the PENDING shape and never re-tested
+    # against Error/Aborted, which persist an EMPTY head instead. A request gori refused to
+    # send therefore fell through to `entry` as `"status": 0` and came back in as a COMPLETE
+    # flow — the outcome `skip_reason`'s own comment says it exists to prevent.
+    it "skips a request gori REFUSED to send, rather than writing it as a status-0 entry" do
+      with_store do |store|
+        detail = refused_flow(store)
+        # The shape that fooled the old predicate: not NULL, empty.
+        detail.response_head.should_not be_nil
+        detail.response_head.not_nil!.empty?.should be_true
+        detail.row.state.should eq(Gori::Store::FlowState::Error)
+
+        Gori::Export::Har.skip_reason(detail).should eq(Gori::Export::Har::Skip::NoResponse)
+        har, report = export([detail])
+        report.no_response.should eq(1)
+        report.written.should eq(0)
+        JSON.parse(har)["log"]["entries"].as_a.should be_empty
+      end
+    end
+
+    # …and the reason that matters: what the fabricated entry did on the way back in.
+    it "never lets a refused flow re-import as a successful exchange" do
+      with_store do |store|
+        har, _ = export([refused_flow(store), capture_flow(store)])
+        entries = JSON.parse(har)["log"]["entries"].as_a
+        entries.size.should eq(1)
+        entries.none? { |e| e["response"]["status"].as_i == 0 }.should be_true
+        # The one entry that IS written is the flow that genuinely succeeded, and it comes
+        # back Complete — the complement, so the skip is not just "export nothing".
+        back = reimport(har)
+        back.row.status.should eq(200)
+        back.row.state.should eq(Gori::Store::FlowState::Complete)
+      end
+    end
+
+    it "skips an ABORTED flow by its own name: a partial response is not a response" do
+      with_store do |store|
+        detail = aborted_flow(store)
+        # Unlike the refused flow, this one HAS a head — the nullity/emptiness of the head
+        # cannot tell them apart, only the state can.
+        detail.response_head.not_nil!.empty?.should be_false
+        Gori::Export::Har.skip_reason(detail).should eq(Gori::Export::Har::Skip::Incomplete)
+
+        har, report = export([detail])
+        report.incomplete.should eq(1)
+        report.no_response.should eq(0)
+        report.skipped.should eq(1)
+        report.written.should eq(0)
+        JSON.parse(har)["log"]["entries"].as_a.should be_empty
+        report.notes.join(" ").should contain("did not complete")
       end
     end
   end

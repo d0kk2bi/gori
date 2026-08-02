@@ -142,7 +142,10 @@ module Gori
       end
 
       private def store_fuzz_result(fjob : FuzzJob, r : Fuzz::Result, flow_id : Int64?) : Nil
-        return unless r.matched?
+        # A RE-SENT row is stored even when it did not match: its request reached the origin
+        # twice, and "stored results are matched-only" would put the duplicate back out of an
+        # agent's reach entirely (the CLI at least printed a connections summary).
+        return unless r.matched? || r.retried?
         if fjob.results.size < FUZZ_MAX_STORED
           fjob.results << r
           fjob.result_flow_ids << flow_id
@@ -188,8 +191,9 @@ module Gori
       private def fuzz_results(h) : Result
         fjob = lookup_fuzz_job(h)
         return fjob if fjob.is_a?(Result)
-        # Stored results are matched-only, so matched_only is a no-op; iterate by
-        # index to keep each row aligned with its recorded History flow id.
+        # Stored results are the matched ones plus any row whose request was re-sent (see
+        # store_fuzz_result), so matched_only is very nearly a no-op; iterate by index to keep
+        # each row aligned with its recorded History flow id.
         rows = fjob.results
         flow_ids = fjob.result_flow_ids
         offset = clamp_nonneg(int(h, "offset"))
