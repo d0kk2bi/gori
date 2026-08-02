@@ -15,6 +15,18 @@ module Gori::Settings
   # what was run THROUGH it is project data.
   class_property decoder_chains : Array({String, String}) = [] of {String, String}
 
+  # Drop a named chain from the library and persist. `name` is the key the whole library is
+  # addressed by (save_chain already replaces a same-named entry), so there is no id to
+  # carry. Returns whether the write reached disk; a name that is not there is a successful
+  # no-op, because the caller's intent — "this chain is not in the library" — already holds.
+  #
+  # Unlike drop_legacy_decoder_sessions this CAN go through `save`: `chains` is still
+  # serialized, so the 3-way merge sees the section change and this process wins it.
+  def self.delete_decoder_chain(name : String) : Bool
+    self.decoder_chains = decoder_chains.reject { |(n, _)| n == name }
+    save
+  end
+
   # Erase a pre-upgrade `decoder.sessions` block from settings.json, keeping every other
   # section (including `decoder.chains`) byte-identical. Returns whether the file is now free
   # of it. Called once, by DecoderController#restore_sessions, after the sessions have been

@@ -1071,6 +1071,7 @@ class FakeExecContext < Gori::Verb::ExecContext
   end
 
   property rewriter_rule_selected : Bool = false # settable so the has-rule gate can be exercised
+  property rewriter_rules_sub : Bool = true      # settable so the RULES-sub-tab gate (load-preset) can be exercised
 
   def rewriter_add : Nil
     rec(:rewriter_add)
@@ -1102,6 +1103,18 @@ class FakeExecContext < Gori::Verb::ExecContext
 
   def rewriter_rule_selected? : Bool
     @rewriter_rule_selected
+  end
+
+  def rewriter_rules_sub? : Bool
+    @rewriter_rules_sub
+  end
+
+  def rewriter_save_preset : Nil
+    rec(:rewriter_save_preset)
+  end
+
+  def rewriter_load_preset : Nil
+    rec(:rewriter_load_preset)
   end
 
   def notes_new : Nil

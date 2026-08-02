@@ -32,7 +32,7 @@ private EXPECTED_OVERLAY_SYMS = {
   :settings, :tabs, :hosts, :env, :hotkeys, :notifications, :passthrough, :listeners, :probe_active,
   :discover_config, :discover_headers, :fuzz_set, :fuzz_advanced, :oast_provider,
   :probe_rule, :rewriter_rule, :extract_rule, :rewriter_stub, :ca_import, :import, :export, :scope_rule, :sequence_config,
-  :mine_config, :copy_as, :send_to,
+  :mine_config, :name_prompt, :library_pick, :copy_as, :send_to,
 }
 
 # The migration ledger — THE one line a Phase 1 batch edits in this file. Each batch
@@ -88,6 +88,10 @@ private MIGRATED_KINDS = [
   # ExtractRule (#501) — born on the seam (the Rewriter tab's `extract` sub-tab), so
   # likewise never in MODAL_OVERLAYS.
   OverlayKind::ExtractRule,
+  # The named-library pair — born on the seam (Decoder chains, Rewriter rule presets), so
+  # likewise never in MODAL_OVERLAYS.
+  OverlayKind::NamePrompt,
+  OverlayKind::LibraryPick,
 ]
 
 # Never in MODAL_OVERLAYS by design, migrated or not. `None` is "no modal at all" and

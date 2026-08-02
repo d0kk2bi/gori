@@ -913,6 +913,23 @@ describe Gori::Settings do
       File.write(Gori::Settings.path, %({"decoder":{"chains":[{"name":"ok","spec":"hex"},{"name":""},{"spec":"md5"}]}}))
       Gori::Settings.load
       Gori::Settings.decoder_chains.should eq([{"ok", "hex"}])
+
+      # The picker's ^X. Name is the key the library is addressed by, so there is no id.
+      Gori::Settings.decoder_chains = [{"a", "hex"}, {"b", "md5"}]
+      Gori::Settings.delete_decoder_chain("a").should be_true
+      Gori::Settings.decoder_chains.should eq([{"b", "md5"}])
+      Gori::Settings.load
+      Gori::Settings.decoder_chains.should eq([{"b", "md5"}]) # it really reached disk
+
+      # A name that is not there is a successful no-op — the caller's intent already holds.
+      Gori::Settings.delete_decoder_chain("gone").should be_true
+      Gori::Settings.decoder_chains.should eq([{"b", "md5"}])
+
+      # Emptying the library drops the whole section, so a cleared workbench leaves no
+      # "decoder" key behind (serialize_decoder omits it) rather than an empty array.
+      Gori::Settings.delete_decoder_chain("b").should be_true
+      Gori::Settings.decoder_chains.should be_empty
+      File.read(Gori::Settings.path).includes?("decoder").should be_false
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
@@ -988,6 +1005,86 @@ describe Gori::Settings do
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
       Gori::Settings.decoder_sessions = [] of {String, String, String}
+    end
+  end
+
+  # The Rewriter's global rule-preset library — the Decoder's named chains, one table over.
+  it "round-trips the Rewriter rule presets" do
+    dir = File.tempname("gori-settings-rewriter")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      ok, existed = Gori::Settings.save_rewriter_preset("strip csp", "response", "head",
+        "Content-Security-Policy", "", "remove_header", "literal", "*.corp.internal", "")
+      ok.should be_true
+      existed.should be_false
+
+      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      Gori::Settings.load
+      Gori::Settings.rewriter_presets.size.should eq(1)
+      p = Gori::Settings.rewriter_presets.first
+      p.name.should eq("strip csp")
+      p.op.should eq("remove_header")
+      p.host.should eq("*.corp.internal")
+
+      # Saving the same NAME updates in place (and keeps the id) rather than forking a
+      # duplicate the picker would then show twice.
+      id = p.id
+      _, existed2 = Gori::Settings.save_rewriter_preset("strip csp", "request", "head",
+        "X-Debug", "1", "set_header", "literal", "", "")
+      existed2.should be_true
+      Gori::Settings.rewriter_presets.size.should eq(1)
+      Gori::Settings.rewriter_presets.first.id.should eq(id)
+      Gori::Settings.rewriter_presets.first.op.should eq("set_header")
+
+      # a file with no "rewriter" key keeps the current in-memory value
+      File.write(Gori::Settings.path, %({"theme":"goridark"}))
+      Gori::Settings.load
+      Gori::Settings.rewriter_presets.size.should eq(1)
+
+      # Malformed presets tolerated: entries missing id/name/pattern are dropped, and an
+      # unknown enum label is CLAMPED rather than raised. `from_label` would raise, and
+      # load's blanket rescue would turn one typo into a full factory reset of every
+      # section — so the clamp is what makes RulePreset#to_rule total.
+      File.write(Gori::Settings.path, %({"rewriter":{"presets":[\
+{"id":"a1","name":"ok","pattern":"foo","op":"nonsense","part":"nope","target":"sideways","match_kind":"fuzzy"},\
+{"id":"","name":"noid","pattern":"x"},\
+{"id":"b2","name":"","pattern":"x"},\
+{"id":"c3","name":"nopattern"}]}}))
+      Gori::Settings.load
+      Gori::Settings.rewriter_presets.size.should eq(1)
+      kept = Gori::Settings.rewriter_presets.first
+      kept.name.should eq("ok")
+      kept.op.should eq("replace")
+      kept.part.should eq("head")
+      kept.target.should eq("request")
+      kept.match_kind.should eq("literal")
+      kept.to_rule.op.replace?.should be_true # the clamped labels really rebuild a rule
+
+      Gori::Settings.delete_rewriter_preset("a1").should be_true
+      Gori::Settings.rewriter_presets.should be_empty
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+    end
+  end
+
+  it "omits the rewriter key entirely when the preset library is empty" do
+    dir = File.tempname("gori-settings-norewriter")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      Gori::Settings.save.should be_true
+      File.read(Gori::Settings.path).includes?("rewriter").should be_false
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
     end
   end
 

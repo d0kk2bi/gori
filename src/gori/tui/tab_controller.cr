@@ -39,6 +39,14 @@ module Gori::Tui
     # Open the Rewriter (Match & Replace) rule popup (nil = add; else edit the given rule).
     abstract def open_rewriter_rule_editor(rule : Store::MatchRule?) : Nil
     abstract def open_extract_rule_editor(rule : Store::ExtractRule?) : Nil
+    # The Decoder's named-chain library (global settings.json): the "save under a name"
+    # prompt and the picker over what is already saved. Here rather than driven from the
+    # verbs alone because the Decoder body also binds them directly (^S / ^O), and a
+    # controller cannot open an overlay itself.
+    abstract def open_chain_save : Nil
+    abstract def open_chain_load : Nil
+    # The Rewriter's preset library has no Host pair: like `c`/`u`/`n`/`r`, its save/load
+    # are space-menu-only, so the verb bodies reach the Runner's openers directly.
     # Open the OAST provider add/edit popup (nil = add a new provider; else edit the given
     # provider — global or project scope, per Oast::ProviderConfig#scope).
     abstract def open_oast_provider_editor(provider : Oast::ProviderConfig?) : Nil
