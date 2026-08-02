@@ -344,6 +344,10 @@ private class FakeContext < ExecContext
     @calls << :fuzz_toggle_http2
   end
 
+  def fuzz_toggle_sni : Nil
+    @calls << :fuzz_toggle_sni
+  end
+
   def fuzz_clear_marks : Nil
     @calls << :fuzz_clear_marks
   end
