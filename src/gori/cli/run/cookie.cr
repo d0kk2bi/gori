@@ -38,7 +38,13 @@ module Gori
           p.on("--value=B64", "Base64 Marshal cookie value (Rack --forge, opaque)") { |v| value = v }
           p.on("--salt=SALT", "Flask/Django signing salt") { |v| salt = v }
           p.on("--algorithm=ALG", "Django HMAC algorithm: sha256 (default) | sha1") { |v| algorithm = v.downcase }
-          p.on("--timestamp=UNIX", "Unix second to stamp (--forge; default: now)") { |v| timestamp = v.to_i64? }
+          p.on("--timestamp=UNIX", "Unix second to stamp (--forge; default: now)") do |v|
+            begin
+              timestamp = parse_forge_timestamp(v)
+            rescue ex : ArgumentError
+              abort "gori run cookie: #{ex.message}"
+            end
+          end
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |rest, _| positional = rest }
@@ -61,6 +67,18 @@ module Gori
         rescue ex : Cookie::CookieError
           abort "gori run cookie: #{ex.message}"
         end
+      end
+
+      # Parse a `--forge --timestamp` value. A nil from `to_i64?` (unparseable or
+      # out-of-Int64-range) is NOT "absent" — the operator typed a value — so refuse it
+      # by name rather than let the `|| now` fallback at forge time silently stamp the
+      # current wall-clock time. Negatives can't be represented as an itsdangerous/Django
+      # signed timestamp, so refuse those too. "Absent → now" stays in emit_cookie_forge.
+      private def self.parse_forge_timestamp(v : String) : Int64
+        n = v.to_i64?
+        raise ArgumentError.new("invalid --timestamp #{v.inspect}") if n.nil?
+        raise ArgumentError.new("invalid --timestamp #{v.inspect} (must not be negative)") if n < 0
+        n
       end
 
       # The cookie subject: positional argument or STDIN (mirrors jwt_token_input).
