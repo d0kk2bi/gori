@@ -52,9 +52,15 @@ module Gori::Fuzz
           raise Gori::Error.new("preset merge file not found: #{path}") unless File.exists?(path)
           raise Gori::Error.new("preset merge file is a directory, not a file: #{path}") if File.directory?(path)
           raise Gori::Error.new("preset merge file not readable: #{path}") unless File::Info.readable?(path)
-          File.each_line(path) do |line|
-            stripped = line.strip
-            values << stripped unless stripped.empty? || stripped.starts_with?('#')
+          # The user merge file is operator MATERIAL, not a curated gori asset: read it
+          # with the SAME fidelity as `WordlistFile` (payload.cr, `gets(chomp: true)`) —
+          # chomp the line ending only, keeping leading/trailing whitespace, `#`-leading
+          # lines (a SQL `#` comment, `#{7*7}` SSTI, a `#!/bin/sh` shebang are all valid
+          # payloads) and blank lines (an intentional empty payload, sent by `-w` too).
+          # The strip + comment/blank skip below in `parse` is correct ONLY for the
+          # built-in `.txt` sets, whose headers document `#`/blank as comments.
+          File.each_line(path, chomp: true) do |line|
+            values << line
           end
         end
       end
