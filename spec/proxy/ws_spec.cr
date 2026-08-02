@@ -359,7 +359,7 @@ describe Gori::Proxy::WS do
 
       sink = WsSink.new
       Gori::Proxy::WS::Relay.run(relay_client, relay_upstream, 9_i64, sink)
-      drain.receive
+      receive_within(drain)
       client_side.close rescue nil
 
       fwd = forwarded.to_slice
@@ -407,7 +407,7 @@ describe Gori::Proxy::WS do
 
       sink = WsSink.new
       Gori::Proxy::WS::Relay.run(relay_client, relay_upstream, 11_i64, sink)
-      drain.receive
+      receive_within(drain)
       client_side.close rescue nil
 
       # The leading "abc" fragment reaches the sink (not silently discarded because the
@@ -1028,8 +1028,8 @@ describe "WebSocket through the proxy (end-to-end)" do
     echoed = Gori::Proxy::WS.read_frame(client).not_nil!
     String.new(echoed.payload).should eq("ping") # round-tripped through gori
 
-    ws_chan.receive # out
-    ws_chan.receive # in
+    receive_within(ws_chan) # out
+    receive_within(ws_chan) # in
     client.close
     proxy.stop
 
@@ -1073,7 +1073,7 @@ describe "WebSocket through the proxy (end-to-end)" do
               "User-Agent: probe\r\n\r\n"
     client.flush
 
-    origin_head = seen.receive
+    origin_head = receive_within(seen)
     origin_head.downcase.should_not contain("sec-websocket-extensions")
     origin_head.should contain("Sec-WebSocket-Key: dGhlIHNhbXBsZQ==") # everything else survives
     origin_head.should contain("User-Agent: probe")
@@ -1084,8 +1084,8 @@ describe "WebSocket through the proxy (end-to-end)" do
     client.write(masked_frame("hello"))
     client.flush
     Gori::Proxy::WS.read_frame(client).not_nil!
-    ws_chan.receive # out
-    ws_chan.receive # in
+    receive_within(ws_chan) # out
+    receive_within(ws_chan) # in
     client.close
     proxy.stop
 
@@ -1132,7 +1132,7 @@ describe "WebSocket through the proxy (end-to-end)" do
               "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
     client.flush
 
-    seen.receive.downcase.should_not contain("sec-websocket-extensions") # the offer, as before
+    receive_within(seen).downcase.should_not contain("sec-websocket-extensions") # the offer, as before
     resp_head = String.new(Gori::Proxy::Codec::Http1.read_head(client).not_nil!)
     resp_head.should contain("101")
     # ... and now the acceptance too, so the client never turns permessage-deflate on.
@@ -1184,7 +1184,7 @@ describe "WebSocket through the proxy (end-to-end)" do
               "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     client.flush
 
-    seen.receive
+    receive_within(seen)
     resp_head = String.new(Gori::Proxy::Codec::Http1.read_head(client).not_nil!)
     resp_head.should contain("Sec-WebSocket-Extensions: permessage-deflate") # P7: untouched
     expect_ws_rows(ws_chan, 1)                                               # the notice row
@@ -1220,7 +1220,7 @@ describe "WebSocket through the proxy (end-to-end)" do
               "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
     client.flush
 
-    seen.receive.should contain("Sec-WebSocket-Extensions: permessage-deflate")
+    receive_within(seen).should contain("Sec-WebSocket-Extensions: permessage-deflate")
     Gori::Proxy::Codec::Http1.read_head(client)
     client.close
     proxy.stop

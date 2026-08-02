@@ -65,6 +65,31 @@ describe "gori run history — CLI::Output rows" do
     rel.should contain("api.test/a")
   end
 
+  # R4. `target.starts_with?("http")` is not the absolute-form test — RFC 3986 §3.1 makes a
+  # URI scheme case-insensitive, and gori captures the request line the client wrote. Driven
+  # live through the proxy: `GET HTTP://127.0.0.1:19594/upper HTTP/1.1` printed as
+  # `127.0.0.1HTTP://127.0.0.1:19594/upper`, the doubling `FlowRow.absolute_form?` exists to
+  # stop. `Gori::Url.location` is the one spelling now.
+  it "does not double the authority when the captured scheme is UPPERCASE" do
+    txt = Gori::CLI::Output.flow_row_text(flow_row(
+      target: "HTTP://127.0.0.1:19594/upper", host: "127.0.0.1", status: 200,
+      state: Gori::Store::FlowState::Complete))
+    txt.should contain("HTTP://127.0.0.1:19594/upper")
+    txt.should_not contain("127.0.0.1HTTP://")
+  end
+
+  # R4. `[!]` is the scannable pointer, exactly like `[stub]` beside it: a text-mode reader
+  # must be able to see that gori has something to SAY about a row without opening it.
+  it "chips a row gori has an advisory about, and leaves an ordinary row unmarked" do
+    plain = flow_row(target: "/a", host: "h", status: 200, state: Gori::Store::FlowState::Complete)
+    Gori::CLI::Output.flow_row_text(plain).should_not contain("[!]")
+    noted = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "https", method: "GET", host: "h", port: 443,
+      target: "/a", status: 200, size: 0_i64, state: Gori::Store::FlowState::Complete,
+      advisory: "Match&Replace was NOT applied to this request head")
+    Gori::CLI::Output.flow_row_text(noted).should contain("[!]")
+  end
+
   it "marks a pending flow with a dash status and a state tag" do
     txt = Gori::CLI::Output.flow_row_text(flow_row(target: "/p", host: "h", status: nil, state: Gori::Store::FlowState::Pending))
     txt.should contain("—")
@@ -144,6 +169,23 @@ describe "gori run history — CLI::Output rows" do
     cli.should contain("time")               # CLI names it `time`
     mcp.should contain("created_at_iso")     # MCP names it `created_at_iso`
     cli.should_not contain("created_at_iso") # …and neither carries both
+  end
+
+  # The same lockstep for the field this round added, since a conditional field is exactly
+  # the kind that gets added to one serializer and forgotten in the other.
+  it "keeps `advisory` in lockstep too, and omits it on an ordinary row" do
+    noted = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "https", method: "GET", host: "h", port: 443,
+      target: "/a", status: 200, size: 0_i64, state: Gori::Store::FlowState::Complete,
+      advisory: "line one\nline two")
+    cli = JSON.parse(Gori::CLI::Output.flow_row_json(noted))
+    mcp = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.flow_row(j, noted) })
+    cli["advisory"].as_a.map(&.as_s).should eq(["line one", "line two"])
+    mcp["advisory"].as_a.map(&.as_s).should eq(["line one", "line two"])
+
+    plain = flow_row(target: "/a", host: "h", status: 200, state: Gori::Store::FlowState::Complete)
+    JSON.parse(Gori::CLI::Output.flow_row_json(plain)).as_h.has_key?("advisory").should be_false
+    JSON.parse(JSON.build { |j| Gori::MCP::Serialize.flow_row(j, plain) }).as_h.has_key?("advisory").should be_false
   end
 
   it "humanises sizes and durations" do

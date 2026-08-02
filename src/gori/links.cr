@@ -1,4 +1,5 @@
 require "./store"
+require "./url"
 
 module Gori
   # Resolves `entity_links` rows into human-readable labels/URLs for the TUI and export.
@@ -74,8 +75,12 @@ module Gori
       end
     end
 
+    # `Gori::Url.location`, not the `target.starts_with?("http")` this used to spell out: that
+    # predicate is not the absolute-form test (RFC 3986 §3.1 makes a scheme case-insensitive),
+    # so a captured `GET HTTP://host/x` was glued into `hostHTTP://host/x` — the exact doubling
+    # `Store::FlowRow.absolute_form?`'s comment says the check exists to prevent.
     private def self.flow_location(f : Store::FlowRow) : String
-      f.target.starts_with?("http") ? f.target : "#{f.host}#{f.target}"
+      Gori::Url.location(f.host, f.target)
     end
 
     private def self.first_line(s : String) : String?

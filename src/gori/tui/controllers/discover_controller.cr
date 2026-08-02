@@ -196,6 +196,17 @@ module Gori::Tui
     # dial the real DNS answer while `gori run discover` pinned it.
     private def build_engine(run : DiscoverRun) : {Discover::Engine?, String?}
       session = @host.session
+      # The realistic half of the header check, and the one the overlay cannot make: the
+      # line the operator typed is fine and the ENV VAR is not (`Authorization: Bearer
+      # $TOKEN` where TOKEN was read from a file and kept its trailing newline). It has to
+      # run HERE — after the project's env is hydrated, before any traffic — because
+      # `Headers.expand`'s send-time backstop drops the header on every probe without a
+      # word, and by then the crawl is already running. `Headers.unsafe_expanded` had
+      # exactly one caller in the tree (`gori run discover`); this is the second.
+      if unsafe = Discover::Headers.unsafe_expanded(run.config.headers).first?
+        return {nil, "header #{unsafe.inspect} rejected — its value contains CR or LF after " \
+                     "$VAR expansion, which would splice extra headers into every probe"}
+      end
       options = Discover::PlanOptions.new(run.target, config: run.config,
         verify: !session.config.insecure_upstream?, overrides: session.host_overrides)
       {Discover::Plan.build(options, Gori::Outbound.interactive(session.scope)).engine, nil}
@@ -265,8 +276,19 @@ module Gori::Tui
         run.sent = ev.progress.sent
         run.found = ev.progress.found
         run.errors = ev.progress.errors
+        run.queued = ev.progress.queued
         run.stats = ev.stats
-        run.status = ev.stopped ? :stopped : :done
+        # A sweep that stopped on its BUDGET is not the same sweep as one that finished, and
+        # `:done` over an unfinished crawl reads as "that is the whole surface". The engine
+        # already says which (`Discover::DoneEvent#budget_exhausted` — discover has no stable
+        # denominator a consumer could derive it from); this was the one consumer ignoring it.
+        run.status = if ev.stopped
+                       :stopped
+                     elsif ev.budget_exhausted
+                       :budget_exhausted
+                     else
+                       :done
+                     end
         finish_job(run, ev)
       when Discover::ErrorEvent
         run.status = :error
@@ -282,7 +304,14 @@ module Gori::Tui
     private def finish_job(run : DiscoverRun, ev : Discover::DoneEvent) : Nil
       n = run.findings.size
       @host.jobs.finish(run.job_id, :done, "#{n} found")
-      msg = "Discover: #{n} endpoint#{n == 1 ? "" : "s"} on #{run.target}#{ev.stopped ? " (stopped)" : ""}"
+      tail = if ev.stopped
+               " (stopped)"
+             elsif ev.budget_exhausted
+               " — budget exhausted, #{ev.progress.queued} queued unexplored (raise max requests to finish)"
+             else
+               ""
+             end
+      msg = "Discover: #{n} endpoint#{n == 1 ? "" : "s"} on #{run.target}#{tail}"
       level = n > 0 ? :success : :info
       log_event(run, level, msg)
       push_notification(run, level, msg)

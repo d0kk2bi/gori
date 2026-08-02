@@ -565,6 +565,59 @@ describe "Intercept verbs (P1)" do
     keymap.lookup(Gori::Verb::Chord.new("3"), Gori::Verb::Scope::Body).should eq("nav.pos3")
   end
 
+  # R4. `Item#refuse_edit` is asked by the CLI/MCP drain (`Runner#apply_intercept_command`)
+  # and was NOT asked here, so a human editing an h2 message whose head has no HTTP/1.1 text
+  # form got `forwarded …` in the status bar while the settle side discarded the edit and the
+  # ORIGINAL message went on the wire. Verified live: the TUI said forwarded, the origin
+  # logged the untouched request.
+  it "reports why a pending edit would be refused, so the forward can refuse instead" do
+    tmp_interceptor do |ic|
+      item = ic.enqueue_request("GET /unf HTTP/2\r\nHost: h\r\nx-evil: a\\r\\nx: 1\r\n\r\n".to_slice,
+        method: "GET", target: "/unf", host: "h", port: 443, scheme: "https",
+        edit_refusal: "the value of \"x-evil\" carries a CR or LF", head_only: true).not_nil!
+      view = InterceptView.new
+      view.reload(ic)
+      # Clean editor: nothing is being edited, so nothing can be refused — merely LOOKING at
+      # a held message must never make it unforwardable.
+      view.refused_edit.should be_nil
+
+      view.toggle_edit
+      view.replace_editor("GET /EDITED HTTP/2\r\nHost: h\r\n\r\n")
+      refusal = view.refused_edit.not_nil!
+      refusal[0].id.should eq(item.id)
+      refusal[1].should contain("x-evil")
+    end
+  end
+
+  # The complement: the same head-only hold with NO refusal recorded. A head edit applies;
+  # only an edit that adds a BODY has nowhere to go on h2.
+  it "refuses an edit that adds a body to a head-only hold, and allows a head-only edit" do
+    tmp_interceptor do |ic|
+      ic.enqueue_request("GET /h HTTP/2\r\nHost: h\r\n\r\n".to_slice, method: "GET",
+        target: "/h", host: "h", port: 443, scheme: "https", head_only: true).not_nil!
+      view = InterceptView.new
+      view.reload(ic)
+      view.toggle_edit
+      view.replace_editor("GET /EDITED HTTP/2\r\nHost: h\r\n\r\n")
+      view.refused_edit.should be_nil
+
+      view.replace_editor("GET /EDITED HTTP/2\r\nHost: h\r\n\r\nOPERATORBODY")
+      view.refused_edit.not_nil![1].should contain("HEAD only")
+    end
+  end
+
+  # And the h1 complement: head+body held, forwarded byte-exact, nothing ever refused.
+  it "never refuses an edit on an h1 hold" do
+    tmp_interceptor do |ic|
+      hold_req(ic, "acme.test", "/p", "POST /p HTTP/1.1\r\nHost: acme.test\r\n\r\nab")
+      view = InterceptView.new
+      view.reload(ic)
+      view.toggle_edit
+      view.replace_editor("POST /p HTTP/1.1\r\nHost: acme.test\r\n\r\nZZZZ")
+      view.refused_edit.should be_nil
+    end
+  end
+
   describe "a held WebSocket message (#500 step 2)" do
     it "renders a WS badge, the socket, and the payload's first line" do
       tmp_interceptor do |ic|

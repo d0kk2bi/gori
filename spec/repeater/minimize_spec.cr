@@ -336,3 +336,54 @@ describe "gori run repeater minimize --verbatim — the resolver" do
     end
   end
 end
+
+# The REPORT is the third form (after "what was sent" and "what was printed"), and it is the
+# one that is kept: `gori run repeater minimize --apply` and `minimize_repeater{apply:true}`
+# both store `minimized_text` back over the session, and `minimized_source` /
+# `minimized_request` print it.
+#
+# `Minimize` used to LF-normalize the whole request on the way in and blanket
+# `gsub("\n", "\r\n")` it on the way out. Both halves corrupt a BODY: the way in flattened a
+# multipart body's own CRLF boundaries, the way out promoted a body's bare LF, so a captured
+# body ending in one came back a byte longer under a Content-Length that no longer described
+# it. In a head a 0x0A is a line ending; in a body it is a byte — head-only is the rule every
+# other site on this branch follows (`Env.expand_wire`, `gori run intercept edit`).
+describe "Gori::Repeater::Minimize — body bytes on the round trip" do
+  it "keeps a body's trailing bare LF out of the report — the CL-desync evidence" do
+    text = "POST /bk HTTP/1.1\r\nHost: h\r\nUser-Agent: Mozilla/5.0\r\n" \
+           "Content-Length: 22\r\n\r\n{\"q\":\"$where 1==1 ab\"}\n"
+    report = minimize(StaticOrigin.new, text)
+    body = report.minimized_text.split("\r\n\r\n", 2)[1]
+    body.should eq("{\"q\":\"$where 1==1 ab\"}\n") # 23 bytes, exactly as handed in
+    body.should_not contain("\r\n")
+    # The head is still restored to the terminator the caller used.
+    report.minimized_text.should start_with("POST /bk HTTP/1.1\r\nHost: h\r\n")
+    # ...and the cosmetic header really was removed, so this is the minimize path, not a
+    # short-circuit through the "nothing removable" branch.
+    report.removed.map(&.label).should contain("User-Agent")
+  end
+
+  it "keeps a multipart body's OWN CRLF boundaries intact" do
+    body = "--B\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n--B--\r\n"
+    text = "POST /up HTTP/1.1\r\nHost: h\r\nUser-Agent: Mozilla/5.0\r\n" \
+           "Content-Type: multipart/form-data; boundary=B\r\n" \
+           "Content-Length: #{body.bytesize}\r\n\r\n#{body}"
+    report = minimize(StaticOrigin.new, text)
+    report.minimized_text.split("\r\n\r\n", 2)[1].should eq(body)
+  end
+
+  it "leaves a binary body byte-for-byte, including a lone CR and a NUL" do
+    body = String.new(Bytes[0x0A, 0x00, 0x0D, 0xEF, 0x0A])
+    text = "POST /b HTTP/1.1\r\nHost: h\r\nAccept: */*\r\nContent-Length: 5\r\n\r\n#{body}"
+    report = minimize(StaticOrigin.new, text)
+    report.minimized_text.to_slice[-5..].to_a.should eq([0x0A, 0x00, 0x0D, 0xEF, 0x0A])
+  end
+
+  it "asks about the HEAD's terminators, not a CRLF that only appears in the body" do
+    text = "POST /b HTTP/1.1\nHost: h\nAccept: */*\n\nline1\r\nline2"
+    report = minimize(StaticOrigin.new, text)
+    # An LF head stays an LF head even though the body carries a CRLF pair.
+    report.minimized_text.split("\n\n", 2)[0].should_not contain('\r')
+    report.minimized_text.should end_with("line1\r\nline2")
+  end
+end

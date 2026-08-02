@@ -34,6 +34,37 @@ describe "Gori::CLI::Run.normalize_head_crlf" do
   end
 end
 
+# MCP has carried `intercept_forward_edit{update_content_length}` since the desync switch was
+# made a declared argument; the CLI resynced unconditionally, so the whole CL-desync probe
+# class (CL shorter than the body, CL longer than the body, CL alongside Transfer-Encoding —
+# the RFC 9113 §8.1.1 shape) was unreachable from `gori run intercept edit`, even though the
+# gate on the other end already honours a value the caller declared. `--raw-file` advertised
+# itself as the byte-exact channel while being the one path that could not hold a length.
+describe "Gori::CLI::Run.intercept_edit_bytes" do
+  it "resyncs Content-Length to the edited body by default" do
+    raw = "POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nlonger-body"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, true))
+      .should eq("POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nlonger-body")
+  end
+
+  it "forwards a DELIBERATELY short Content-Length untouched with the resync off" do
+    raw = "POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nlonger-body"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, false)).should eq(raw)
+  end
+
+  it "keeps Content-Length ALONGSIDE Transfer-Encoding — the CL.TE smuggling pair" do
+    raw = "POST /h HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n" \
+          "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, false)).should eq(raw)
+  end
+
+  it "still CRLF-terminates the head with the resync off, and adds no Content-Length" do
+    raw = "POST /h HTTP/1.1\nHost: h\n\nalpha\ngamma"
+    String.new(Gori::CLI::Run.intercept_edit_bytes(raw, false))
+      .should eq("POST /h HTTP/1.1\r\nHost: h\r\n\r\nalpha\ngamma")
+  end
+end
+
 # `HeldRow#target` carries TWO different things depending on `kind`: a request's target, or a
 # RESPONSE's status reason. The row builder never branched on it, so a held response rendered
 # as `http://127.0.0.1200 OK` — a string that looks like a URL, is not one, drops the port,
@@ -64,5 +95,52 @@ describe "Gori::CLI::Run.intercept_row_where" do
   it "hangs an origin-form request off the authority — INCLUDING the port" do
     Gori::CLI::Run.intercept_row_where(held("request", "/held"))
       .should eq("http://127.0.0.1:19501/held")
+  end
+end
+
+# R4. The refusal is decided when the message is HELD, and it reached no read surface: the
+# operator (or the agent) composed an edit against a message described as ordinarily editable
+# and learned otherwise from the ack. Both projections say so up front now.
+private def refusing_row(refusal : String? = nil, head_only : Bool = false) : Gori::Store::HeldRow
+  Gori::Store::HeldRow.new(
+    session_token: "t", item_id: 1_i64, kind: "request", method: "GET", host: "h",
+    port: 443, scheme: "https", target: "/a",
+    raw: "GET /a HTTP/2\r\nHost: h\r\n\r\n".to_slice, held_at_ms: 0_i64,
+    edit_refusal: refusal, head_only: head_only)
+end
+
+describe "held-item edit refusal on the read surfaces" do
+  it "emits the reason and the head-only hold in the MCP list and detail projections" do
+    row = refusing_row("the value of \"x-evil\" carries a CR or LF", head_only: true)
+    listed = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) })
+    listed["edit_refusal"].as_s.should contain("x-evil")
+    listed["head_only"].as_bool.should be_true
+    detail = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_detail(j, row, false, 0_i64) })
+    detail["edit_refusal"].as_s.should contain("x-evil")
+  end
+
+  # EVERY h2 hold is head-only (`H2::StreamGate` passes `head_only: true` on both legs), so
+  # folding that into `edit_refusal` would mark every held HTTP/2 message uneditable — head
+  # edits DO apply, only a body has nowhere to go. Two statements, two fields.
+  it "does not report a head-only hold as a refusal" do
+    row = refusing_row(nil, head_only: true)
+    row.edit_refusal.should be_nil
+    row.head_only_note.not_nil!.should contain("HEAD only")
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) }).as_h
+    obj["head_only"].as_bool.should be_true
+    obj["head_only_note"].as_s.should contain("ADDS A BODY")
+    obj.has_key?("edit_refusal").should be_false
+  end
+
+  # The complement: an h1 hold covers head+body and forwards byte-exact, so no field is
+  # emitted and a client keying off field presence sees exactly the shape it saw before.
+  it "says nothing at all about an ordinary h1 hold" do
+    row = refusing_row
+    row.edit_refusal.should be_nil
+    row.head_only_note.should be_nil
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) }).as_h
+    obj.has_key?("edit_refusal").should be_false
+    obj.has_key?("head_only").should be_false
+    obj.has_key?("head_only_note").should be_false
   end
 end

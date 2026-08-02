@@ -59,8 +59,13 @@ describe Gori::Tui::Url do
       Gori::Tui::Url.origin_path("https://example.com/secure").should eq("/secure")
     end
 
-    it "is case-sensitive on the scheme (uppercase passes through)" do
-      Gori::Tui::Url.origin_path("HTTP://example.com/x").should eq("HTTP://example.com/x")
+    # Was "case-sensitive on the scheme (uppercase passes through) — asserting actual". It is
+    # `Gori::Url.origin_path` now, shared with `Interceptor::Item`, `CLI::Output` and `Links`,
+    # and it uses `absolute_form?`'s case-insensitive test: RFC 3986 §3.1 makes a URI scheme
+    # case-insensitive, and letting `HTTP://` through is how `127.0.0.1HTTP://127.0.0.1/x`
+    # reached `gori run history`.
+    it "is case-INSENSITIVE on the scheme (RFC 3986 §3.1)" do
+      Gori::Tui::Url.origin_path("HTTP://example.com/x").should eq("/x")
     end
 
     it "passes through a scheme-relative URL (no scheme prefix)" do

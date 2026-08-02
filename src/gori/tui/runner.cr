@@ -573,8 +573,13 @@ module Gori::Tui
     private def publish_intercept_snapshot(ic : Interceptor) : Nil
       token = @session.intercept_token
       rows = ic.pending.map do |it|
+        # `edit_refusal`/`head_only` ride along so the MCP process and `gori run intercept
+        # get`/`list` can say "edits cannot be applied to this message" BEFORE one is written.
+        # They are known at hold time and were dropped here, which is why every cross-process
+        # surface described a CRLF-carrying h2 message as ordinarily editable.
         Store::HeldRow.new(token, it.id, it.kind.to_s.downcase, it.method, it.host, it.port,
-          it.scheme, it.target, it.raw, it.held_at_ms, it.flow_id, false)
+          it.scheme, it.target, it.raw, it.held_at_ms, it.flow_id, false, 0_i64,
+          it.edit_refusal, it.head_only?)
       end
       @session.store.publish_intercept_held(token, rows)
     end

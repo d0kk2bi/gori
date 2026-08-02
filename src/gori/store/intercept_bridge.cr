@@ -22,8 +22,9 @@ module Gori
           placeholders = Array.new(rows.size, "?").join(",")
           c.exec("DELETE FROM intercept_held WHERE session_token = ? AND item_id NOT IN (#{placeholders})", args: keep)
           rows.each do |r|
-            c.exec("INSERT OR IGNORE INTO intercept_held (session_token, item_id, kind, method, host, port, scheme, target, flow_id, raw, held_at_ms, edited) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-              token, r.item_id, r.kind, r.method, r.host, r.port, r.scheme, r.target, r.flow_id, r.raw, r.held_at_ms, r.edited ? 1 : 0)
+            c.exec("INSERT OR IGNORE INTO intercept_held (session_token, item_id, kind, method, host, port, scheme, target, flow_id, raw, held_at_ms, edited, edit_refusal, head_only) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              token, r.item_id, r.kind, r.method, r.host, r.port, r.scheme, r.target, r.flow_id, r.raw, r.held_at_ms, r.edited ? 1 : 0,
+              r.edit_refusal, r.head_only? ? 1 : 0)
           end
         end
         nil
@@ -32,7 +33,7 @@ module Gori
 
     def intercept_held(token : String) : Array(HeldRow)
       rows = [] of HeldRow
-      @db.query("SELECT session_token, item_id, kind, method, host, port, scheme, target, flow_id, raw, held_at_ms, edited, viewed_ms FROM intercept_held WHERE session_token = ? ORDER BY item_id", token) do |rs|
+      @db.query("SELECT session_token, item_id, kind, method, host, port, scheme, target, flow_id, raw, held_at_ms, edited, viewed_ms, edit_refusal, head_only FROM intercept_held WHERE session_token = ? ORDER BY item_id", token) do |rs|
         rs.each { rows << read_held(rs) }
       end
       rows
@@ -57,7 +58,9 @@ module Gori
       scheme = rs.read(String); target = rs.read(String); flow_id = rs.read(Int64?)
       raw = rs.read(Bytes); held_at_ms = rs.read(Int64); edited = rs.read(Int32) != 0
       viewed_ms = rs.read(Int64)
-      HeldRow.new(token, item_id, kind, method, host, port, scheme, target, raw, held_at_ms, flow_id, edited, viewed_ms)
+      edit_refusal = rs.read(String?); head_only = rs.read(Int32) != 0
+      HeldRow.new(token, item_id, kind, method, host, port, scheme, target, raw, held_at_ms, flow_id, edited, viewed_ms,
+        edit_refusal, head_only)
     end
 
     # Append one MCP->TUI intercept command. Returns last_insert_rowid (0 on a dropped write —

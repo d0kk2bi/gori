@@ -56,10 +56,23 @@ module Gori
         auto_cl = !verbatim && rec.auto_content_length?
         # Mirrors the TUI/CLI resolve: env-expand, then Content-Length resync only when
         # Auto-CL is on (the same gate that lets body params be removed at all). `verbatim`
-        # drops the whole draft pass — no `$VAR` substitution and no bare-LF→CRLF promotion —
-        # exactly as `--verbatim`/`expand_request: false` does on the send path.
+        # drops the whole draft pass — no `$VAR` substitution and no `$`-refusal — exactly as
+        # `--verbatim`/`expand_request: false` does on the send path.
+        #
+        # It does NOT drop the head's line terminators, which is what `t.to_slice` used to do:
+        # `Minimize.run` hands this proc its head-LF working form, so a CRLF-stored session
+        # went on the wire bare-LF — verbatim INVENTING the very desync primitive the flag
+        # exists to preserve. `gori run repeater minimize --verbatim` fixed this on its side
+        # in #556; this is the same restore, through the engine's own (idempotent) helper, so
+        # the report's already-CRLF text round-trips through it unchanged. The BODY is byte
+        # for byte either way — `restore_eol` is head-only.
+        stored_crlf = Repeater::Minimize.head_crlf?(text)
         resolve = ->(t : String) do
-          raw = verbatim ? t.to_slice : Env.expand_wire(t)
+          raw = if verbatim
+                  stored_crlf ? Repeater::Minimize.restore_eol(t, true).to_slice : t.to_slice
+                else
+                  Env.expand_wire(t)
+                end
           auto_cl ? Repeater::FlowRequest.resync_content_length(raw) : raw
         end
         # Minimize dials Fuzz::Sender directly (many capped probe sends) rather than through

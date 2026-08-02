@@ -1,4 +1,5 @@
 require "../ascii_bytes"
+require "../url"
 require "../token_extract"
 require "../proxy/ws/frame"
 
@@ -37,12 +38,15 @@ module Gori
       # dialed (#511). Carried on the request DTO because the proxy decides it before the
       # response exists; `Store#insert_one` persists it to `flows.short_circuited`.
       getter? short_circuited : Bool
+      # What gori has to SAY about this flow that its bytes cannot — see `FlowRow#advisory`.
+      getter advisory : String?
 
       def initialize(@created_at, @scheme, @host, @port, @method, @target,
                      @http_version, @head, @body = nil,
                      @sni = nil, @alpn = nil, @tls_version = nil,
                      @body_truncated = false, @body_size = nil,
-                     @h2_conn_id = nil, @h2_stream_id = nil, @short_circuited = false)
+                     @h2_conn_id = nil, @h2_stream_id = nil, @short_circuited = false,
+                     @advisory = nil)
       end
     end
 
@@ -64,11 +68,16 @@ module Gori
       getter duration_us : Int64?
       getter state : FlowState
       getter error : String?
+      # See `FlowRow#advisory`. nil means "nothing new to say", which is NOT the same as ""
+      # — a response-side advisory has to be able to leave the request side's alone, so
+      # `Store#update_one` only writes the column when this is non-nil.
+      getter advisory : String?
 
       def initialize(@flow_id, @status, @head, @body = nil, @reason = nil,
                      @content_type = nil, @ttfb_us = nil, @duration_us = nil,
                      @state = FlowState::Complete, @error = nil,
-                     @body_truncated = false, @body_size = nil, @content_encoding = nil)
+                     @body_truncated = false, @body_size = nil, @content_encoding = nil,
+                     @advisory = nil)
       end
     end
 
@@ -92,10 +101,35 @@ module Gori
       # dialed (#511). In the LIST projection, not just the detail, because the whole point
       # is that a fabricated response must not look like an ordinary row while scrolling.
       getter? short_circuited : Bool
+      # What gori has to say about this flow that neither its bytes nor its `error` can.
+      #
+      # A WebSocket flow has had this since #518: `WS::Relay` writes `[gori] …` rows into
+      # `ws_messages`, so "the handshake's `Sec-WebSocket-Extensions` was stripped" or "the
+      # §5.4 interleave was given up" travels with the flow into History, `gori run show`,
+      # MCP `get_flow` and an export. An HTTP flow had nowhere to put the same kind of
+      # statement, so two facts gori KNOWS ended up as a `gori.log`/STDERR line correlated
+      # with nothing (a Match&Replace rule that structurally could not run on this message)
+      # or as a header synthesized into the stored request head (a server PUSH_PROMISE).
+      #
+      # A COLUMN and not a rows table, unlike the WebSocket case, because the two differ in
+      # what the record is about: a `ws_messages` advisory is positioned IN a stream of
+      # messages and its position names the frames it applies to, while an HTTP advisory is
+      # a property of the exchange as a whole. A join on every History page for a value that
+      # is NULL on all but a handful of rows buys nothing; `error` is the same shape and the
+      # surfaces already know how to read a nullable flow-level string.
+      #
+      # Newline-separated when more than one applies (request- and response-direction
+      # advisories can land on one flow). NULL — not "" — when there is nothing to say.
+      getter advisory : String?
 
       def initialize(@id, @created_at, @scheme, @method, @host, @port, @target,
                      @status, @size, @state, @response_size = nil, @duration_us = nil,
-                     @content_type = nil, @short_circuited = false)
+                     @content_type = nil, @short_circuited = false, @advisory = nil)
+      end
+
+      # The advisory as a list of statements, empty when there is none.
+      def advisories : Array(String)
+        @advisory.try { |a| a.split('\n').reject(&.empty?) } || [] of String
       end
 
       # True when `target` already carries its own scheme+authority — an ABSOLUTE-FORM
@@ -111,13 +145,15 @@ module Gori
       # raise reached `Outbound.scope_url` inside a worker fiber and killed the whole sweep,
       # unhandled, the first time a payload carried a high byte. A URI scheme is ASCII by
       # definition, so nothing about the check needed a Regex.
+      # The rule itself moved to core `Gori::Url` (three other surfaces spell it out and one
+      # of them, `Interceptor::Item`, cannot require the store); this stays as the name its
+      # existing callers — `Scope.request_url`, `Outbound`, `CLI::Output` — already use.
       def self.absolute_form?(target : String) : Bool
-        b = target.to_slice
-        AsciiBytes.starts_with_ci?(b, HTTP_PREFIX) || AsciiBytes.starts_with_ci?(b, HTTPS_PREFIX)
+        Gori::Url.absolute_form?(target)
       end
 
-      HTTP_PREFIX  = "http://".to_slice
-      HTTPS_PREFIX = "https://".to_slice
+      HTTP_PREFIX  = Gori::Url::HTTP_PREFIX
+      HTTPS_PREFIX = Gori::Url::HTTPS_PREFIX
 
       # The full absolute URL of the request. Plaintext forward-proxy requests are captured
       # ABSOLUTE-form (`http://host:port/path` — the wire truth, P7), so `target` already
@@ -877,9 +913,34 @@ module Gori
       # Wall-clock of the last MCP intercept_list/get that returned this item — the agent's
       # "I'm still watching" signal for the auto-forward reaper (0 = never viewed by an agent).
       getter viewed_ms : Int64
+      # Mirrors `Interceptor::Item#edit_refusal` / `#head_only?` across the process boundary.
+      #
+      # Both are known the moment the message is HELD (on HTTP/2 the answer is
+      # `HeadCodec.h1_unfaithful_reason`, a pure function of the block's decoded fields), and
+      # without them on this row `gori run intercept get`/`list` and MCP `intercept_get`
+      # showed an ordinary editable message. An operator — or an agent — then composed an
+      # edit, submitted it, and only THEN learned it could never be applied. That is the
+      # state a CRLF-injection probe INDUCES: reflect `%0d%0a` into one header value and
+      # every later message on that stream is in it.
+      getter edit_refusal : String?
+      getter? head_only : Bool
 
       def initialize(@session_token, @item_id, @kind, @method, @host, @port, @scheme,
-                     @target, @raw, @held_at_ms, @flow_id = nil, @edited = false, @viewed_ms = 0_i64)
+                     @target, @raw, @held_at_ms, @flow_id = nil, @edited = false, @viewed_ms = 0_i64,
+                     @edit_refusal = nil, @head_only = false)
+      end
+
+      # The head-only CAVEAT, and deliberately NOT folded into `edit_refusal`.
+      #
+      # Every h2 hold is head-only (`H2::StreamGate` passes `head_only: true` on both legs),
+      # so treating it as a refusal would mark every held HTTP/2 message uneditable — and head
+      # edits DO apply. Only a body has nowhere to go. Two different statements, so two
+      # accessors: a surface that chips "cannot be edited" must key on `edit_refusal` alone.
+      # nil when the hold covers head+body (h1), where an edit is forwarded byte-exact.
+      def head_only_note : String?
+        return nil unless @head_only
+        "this HTTP/2 hold covers the HEAD only — an edit that ADDS A BODY will be refused " \
+        "(DATA frames stream past the intercept gate untouched); a head edit applies normally"
       end
     end
 

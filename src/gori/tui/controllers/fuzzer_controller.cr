@@ -774,6 +774,10 @@ module Gori::Tui
         v.append_result(ev.result)
         probe_scan_fuzz_result(ev.result, v)
       when Fuzz::DoneEvent
+        # The terminal progress is the only one carrying the run's FINAL wire count, and
+        # ProgressEvent is droppable (latest wins) — so without this the header could keep
+        # rendering a mid-run snapshot forever. See `Fuzz::Progress#requests`.
+        v.apply_progress(ev.progress)
         v.finish_run
         finish_job(v, ev)
       when Fuzz::ErrorEvent
@@ -813,7 +817,14 @@ module Gori::Tui
       n = v.matched_count
       @host.jobs.finish(v.job_id, :done, "#{n} hit")
       level = n > 0 ? :success : :info
-      msg = "Fuzzer: #{n} hit#{n == 1 ? "" : "s"} / #{v.result_count} sent on #{v.summary}#{ev.stopped ? " (stopped)" : ""}"
+      # `requests` only when it DIFFERS from the payload count — retries and redirect hops
+      # are the two things that make them diverge, and a run with neither should not grow a
+      # second number saying the same thing twice. This is what the CLI's done line does,
+      # and the number a tester inside an agreed request budget actually needs: a 3-payload
+      # sweep down a redirect chain put 18 requests on the target and said "3 sent".
+      p = ev.progress
+      wire = p.requests > p.sent ? " / #{p.requests} requests" : ""
+      msg = "Fuzzer: #{n} hit#{n == 1 ? "" : "s"} / #{v.result_count} sent#{wire} on #{v.summary}#{ev.stopped ? " (stopped)" : ""}"
       log_event(v, level, msg)
       @host.notifications.push(level, msg, goto_for(v), source: "fuzzer")
       @host.status(msg) if Settings.notify_toast?
@@ -904,7 +915,12 @@ module Gori::Tui
       ensure
         v.finish_run # backstop — the drain's Done also clears it + shows the summary
       end
-      @host.status("fuzzing #{v.target_origin} — ^X stop")
+      # The CL note rides the run-start line, the way `gori run fuzz` prints it on stderr
+      # before the first send: once, up front, naming the switch that turns it off. Silent
+      # rewriting is the half that bites even an operator who does not want the switch —
+      # they typed `Content-Length: 5`, the pane still says 5, and the wire carried 37.
+      note = v.rewrites_content_length? ? " · note: #{FuzzerView::CL_REWRITE_NOTE}" : ""
+      @host.status("fuzzing #{v.target_origin} — ^X stop#{note}")
     end
 
     def fuzz_stop : Nil

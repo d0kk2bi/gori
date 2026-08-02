@@ -412,7 +412,11 @@ module Gori::Tui
     # --- start / reconfigure sessions (called by the Runner after the overlay confirms) ---
     def start_session(seed : SequenceSeed, config : Sequencer::Config) : Nil
       view = SequencerView.new
-      view.load(seed.target, seed.request, seed.http2, seed.sni, config)
+      # `flow_id != nil` IS the provenance test: `build_seed_from_flow` is the only
+      # constructor that sets it, and its bytes come straight from `FlowRequest.build`.
+      # Same one-line test `gori run sequence` makes on `--flow`.
+      view.load(seed.target, seed.request, seed.http2, seed.sni, config,
+        evidence: !seed.flow_id.nil?)
       open_session(view, seed.flow_id) # NB: NO goto_tab — the collection runs in the background
       start_run(view)
     end
@@ -522,10 +526,15 @@ module Gori::Tui
       case ev
       when Sequencer::SampleEvent then v.append_sample(ev.sample)
       when Sequencer::ProgressEvent
-        v.apply_progress(ev.collected, ev.sent, ev.goal, ev.errors)
+        v.apply_progress(ev.collected, ev.sent, ev.goal, ev.errors, ev.requests)
         denom = ev.goal <= 0 ? ev.collected : ev.goal
         @host.jobs.progress(v.job_id, ev.collected, denom, "#{ev.collected} tokens")
       when Sequencer::DoneEvent
+        # The terminal event carries the run's FINAL counts and ProgressEvent is droppable,
+        # so without this the pane could keep showing a mid-run snapshot. `goal` is not on
+        # DoneEvent — the config's is the one the run was given, and it is what
+        # `budget_exhausted?` compares against.
+        v.apply_progress(ev.collected, ev.sent, v.config.goal, v.errors_count, ev.requests)
         v.finish_run
         finish_job(v, ev)
       when Sequencer::ErrorEvent
@@ -544,7 +553,14 @@ module Gori::Tui
       rep = v.report
       n = rep.usable_count
       @host.jobs.finish(v.job_id, :done, "#{n} · #{rep.rating.label.downcase}")
-      msg = "Sequencer: #{n} token#{n == 1 ? "" : "s"} on #{v.summary} — #{rep.rating.label}#{ev.stopped ? " (stopped)" : ""}"
+      tail = if ev.stopped
+               " (stopped)"
+             elsif v.budget_exhausted?
+               " — #{v.budget_note}"
+             else
+               ""
+             end
+      msg = "Sequencer: #{n} token#{n == 1 ? "" : "s"} on #{v.summary} — #{rep.rating.label}#{tail}"
       level = rep.rating.value <= Sequencer::Stats::Rating::Weak.value ? :warning : :success
       log_event(v, level, msg)
       push_notification(v, level, msg, collected: n)
