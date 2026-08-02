@@ -234,12 +234,20 @@ module Gori::Decoder
       (group.size - 1).times { |k| sink.write_byte(bytes[k]) }
     end
 
-    # ---- base58 (Bitcoin alphabet) — BigInt, O(n^2), so input is capped ----
-    B58        = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    B58_MAX_IN = 4 * 1024 # base58 is for keys/hashes, not blobs
+    # ---- bignum radix bases (base58 / base36 / base62) — BigInt, O(n^2), so input is capped ----
+    B58           = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    BASE36        = "0123456789abcdefghijklmnopqrstuvwxyz"
+    BASE62        = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    B58_MAX_IN    = 4 * 1024 # base58 is for keys/hashes, not blobs
+    BASE_X_MAX_IN = 4 * 1024 # same for base36/62 — short IDs and tokens, not blobs
 
-    def base58_encode(data : Bytes) : String
-      raise DecoderError.new("input too large for base58 (max #{B58_MAX_IN}B)") if data.size > B58_MAX_IN
+    # Shared bignum radix codec. Leading zero BYTES carry no value through the bignum, so
+    # they are preserved out-of-band as leading zero DIGITS (`alphabet[0]`) and restored on
+    # decode — the Bitcoin base58 convention, applied uniformly so all three round-trip
+    # byte-exactly instead of silently eating a NUL prefix.
+    private def base_x_encode(data : Bytes, alphabet : String, label : String, max_in : Int32) : String
+      raise DecoderError.new("input too large for #{label} (max #{max_in}B)") if data.size > max_in
+      radix = alphabet.size
       zeros = 0
       while zeros < data.size && data[zeros] == 0
         zeros += 1
@@ -248,32 +256,36 @@ module Gori::Decoder
       data.each { |b| num = num * 256 + b }
       chars = [] of Char
       while num > 0
-        num, rem = num.divmod(58)
-        chars << B58[rem.to_i]
+        num, rem = num.divmod(radix)
+        chars << alphabet[rem.to_i]
       end
       String.build do |io|
-        zeros.times { io << '1' }
+        zeros.times { io << alphabet[0] }
         chars.reverse_each { |c| io << c }
       end
     end
 
-    def base58_decode(s : String) : Bytes
+    # `fold_case` is per-alphabet, not a convenience: base36 is case-insensitive because its
+    # alphabet holds one case, while base58/base62 use BOTH cases as distinct digits and
+    # folding them would decode a different number.
+    private def base_x_decode(s : String, alphabet : String, label : String, max_in : Int32, fold_case : Bool) : Bytes
       s = s.strip
-      raise DecoderError.new("input too large for base58") if s.size > B58_MAX_IN * 2
+      raise DecoderError.new("input too large for #{label}") if s.size > max_in * 2
+      radix = alphabet.size
       num = BigInt.new(0)
-      # Count leading '1' (zero) chars over the SAME whitespace-skipping pass as the value
+      # Count leading zero-digit chars over the SAME whitespace-skipping pass as the value
       # accumulation — a stray space inside the leading run would otherwise desync the two.
       leading = 0
       seen_nonzero = false
       s.each_char do |c|
         next if c.whitespace?
-        v = B58.index(c) || raise DecoderError.new("invalid base58 char: #{c}")
+        v = alphabet.index(fold_case ? c.downcase : c) || raise DecoderError.new("invalid #{label} char: #{c}")
         if seen_nonzero || v != 0
           seen_nonzero = true
         else
           leading += 1
         end
-        num = num * 58 + v
+        num = num * radix + v
       end
       hex = num == 0 ? "" : num.to_s(16)
       hex = "0" + hex if hex.size.odd?
@@ -282,6 +294,30 @@ module Gori::Decoder
       leading.times { sink.write_byte(0_u8) }
       sink.write(body)
       sink.to_slice
+    end
+
+    def base58_encode(data : Bytes) : String
+      base_x_encode(data, B58, "base58", B58_MAX_IN)
+    end
+
+    def base58_decode(s : String) : Bytes
+      base_x_decode(s, B58, "base58", B58_MAX_IN, fold_case: false)
+    end
+
+    def base36_encode(data : Bytes) : String
+      base_x_encode(data, BASE36, "base36", BASE_X_MAX_IN)
+    end
+
+    def base36_decode(s : String) : Bytes
+      base_x_decode(s, BASE36, "base36", BASE_X_MAX_IN, fold_case: true)
+    end
+
+    def base62_encode(data : Bytes) : String
+      base_x_encode(data, BASE62, "base62", BASE_X_MAX_IN)
+    end
+
+    def base62_decode(s : String) : Bytes
+      base_x_decode(s, BASE62, "base62", BASE_X_MAX_IN, fold_case: false)
     end
 
     # ---- unicode \uXXXX (surrogate-pair aware) ----
@@ -318,9 +354,14 @@ module Gori::Decoder
     # end-of-string (e.g. `\uAB`) must NOT decode — it stays literal, matching the
     # mid-string case where `\uABX` is left alone because `X` is not a hex digit.
     private def hex4(bytes : Bytes, at : Int32) : Int32?
-      return nil if at + 4 > bytes.size
+      hex_n(bytes, at, 4)
+    end
+
+    # `hex4` generalized to any fixed width (the C-string escapes need 2 and 8 as well).
+    private def hex_n(bytes : Bytes, at : Int32, width : Int32) : Int32?
+      return nil if at + width > bytes.size
       v = 0
-      4.times do |k|
+      width.times do |k|
         d = hex_digit(bytes[at + k])
         return nil if d < 0
         v = (v << 4) | d
@@ -572,6 +613,503 @@ module Gori::Decoder
           end
         end
       end
+    end
+
+    # ---- quoted-printable (RFC 2045) ----
+    # Break budget. A line-final space is promoted to "=20" (+2 chars) and a soft break
+    # adds the trailing '=', so 73 is the largest width that still fits the RFC's 76.
+    QP_SOFT_LIMIT = 73
+
+    def quoted_printable_encode(data : Bytes) : String
+      String.build(data.size) do |io|
+        line = [] of String
+        width = 0
+        data.each do |b|
+          tok = qp_token(b)
+          if width + tok.size > QP_SOFT_LIMIT
+            qp_flush(io, line, soft: true)
+            width = 0
+          end
+          line << tok
+          width += tok.size
+        end
+        qp_flush(io, line, soft: false)
+      end
+    end
+
+    # CR and LF are encoded rather than emitted literally, which is what makes the encoder
+    # byte-exact: a hard line break in the data survives as =0D=0A and can never be mistaken
+    # for one of the soft breaks the encoder itself inserts.
+    private def qp_token(b : UInt8) : String
+      case b
+      when 0x20_u8       then " "
+      when 0x09_u8       then "\t"
+      when 0x3d_u8       then "=3D"
+      when 33_u8..126_u8 then b.unsafe_chr.to_s
+      else                    "=%02X" % b
+      end
+    end
+
+    # Trailing whitespace does not survive transport (MTAs strip it), so a line-final space
+    # or tab is promoted to its =XX form — before a soft break and at the very end alike.
+    private def qp_flush(io : IO, line : Array(String), soft : Bool) : Nil
+      if (last = line.last?) && (last == " " || last == "\t")
+        line[-1] = last == " " ? "=20" : "=09"
+      end
+      line.each { |t| io << t }
+      io << "=\r\n" if soft
+      line.clear
+    end
+
+    # Tolerant: a '=' that starts neither a soft break nor a valid =XX pair is kept verbatim
+    # rather than raising, so a partially-mangled MIME body still yields its readable parts.
+    def quoted_printable_decode(s : String) : Bytes
+      bytes = s.to_slice
+      sink = IO::Memory.new(bytes.size)
+      i = 0
+      while i < bytes.size
+        if bytes[i] == 0x3d_u8 # '='
+          if bytes[i + 1]? == 0x0d_u8 && bytes[i + 2]? == 0x0a_u8
+            i += 3 # soft break "=\r\n"
+            next
+          elsif bytes[i + 1]? == 0x0a_u8
+            i += 2 # soft break "=\n" (bare LF — common in stored bodies)
+            next
+          elsif v = hex_n(bytes, i + 1, 2)
+            sink.write_byte(v.to_u8)
+            i += 3
+            next
+          end
+        end
+        sink.write_byte(bytes[i])
+        i += 1
+      end
+      sink.to_slice
+    end
+
+    # ---- punycode / IDN (RFC 3492 bootstring) ----
+    PUNY_BASE         =   36
+    PUNY_TMIN         =    1
+    PUNY_TMAX         =   26
+    PUNY_SKEW         =   38
+    PUNY_DAMP         =  700
+    PUNY_INITIAL_BIAS =   72
+    PUNY_INITIAL_N    =  128
+    PUNY_MAX_IN       = 4096
+
+    # Domain-aware, because that is the only form an operator ever holds: each dot-separated
+    # label carrying non-ASCII becomes "xn--" + its bootstring encoding, and a pure-ASCII
+    # label passes through untouched (so a plain hostname is its own encoding).
+    def punycode_encode(s : String) : String
+      raise DecoderError.new("input too large for punycode (max #{PUNY_MAX_IN} chars)") if s.size > PUNY_MAX_IN
+      s.split('.').map { |label| label.ascii_only? ? label : "xn--" + puny_encode_label(label) }.join('.')
+    end
+
+    def punycode_decode(s : String) : String
+      raise DecoderError.new("input too large for punycode (max #{PUNY_MAX_IN} chars)") if s.size > PUNY_MAX_IN
+      s.split('.').map { |label| puny_decode_label_maybe(label) }.join('.')
+    end
+
+    # Only an "xn--" label carries bootstring data; everything else is already the name it
+    # decodes to, so it passes through untouched.
+    private def puny_decode_label_maybe(label : String) : String
+      label.size > 4 && label[0, 4].downcase == "xn--" ? puny_decode_label(label[4..]) : label
+    end
+
+    private def puny_encode_label(label : String) : String
+      input = label.chars.map(&.ord)
+      n = PUNY_INITIAL_N
+      delta = 0_i64
+      bias = PUNY_INITIAL_BIAS
+      basic = input.select { |c| c < 0x80 }
+      h = b = basic.size
+      String.build do |io|
+        basic.each { |c| io << c.unsafe_chr }
+        io << '-' if b > 0
+        while h < input.size
+          m = input.select { |c| c >= n }.min
+          delta += (m - n).to_i64 * (h + 1)
+          raise DecoderError.new("punycode overflow") if delta > Int32::MAX
+          n = m
+          input.each do |c|
+            delta += 1 if c < n
+            next unless c == n
+            q = delta
+            k = PUNY_BASE
+            loop do
+              t = puny_threshold(k, bias)
+              break if q < t
+              io << puny_digit((t + ((q - t) % (PUNY_BASE - t))).to_i32)
+              q = (q - t) // (PUNY_BASE - t)
+              k += PUNY_BASE
+            end
+            io << puny_digit(q.to_i32)
+            bias = puny_adapt(delta, h + 1, h == b)
+            delta = 0_i64
+            h += 1
+          end
+          delta += 1
+          n += 1
+        end
+      end
+    end
+
+    private def puny_decode_label(s : String) : String
+      n = PUNY_INITIAL_N
+      i = 0_i64
+      bias = PUNY_INITIAL_BIAS
+      acc = [] of Char
+      chars = s.chars
+      # RFC 3492 §6.2: the basic-code-point run ends at the LAST delimiter. A delimiter at
+      # index 0 means there is no basic run at all (and that '-' then has to parse as a
+      # digit, which it cannot) — so only a strictly-positive index splits.
+      delim = s.rindex('-')
+      pos = 0
+      if delim && delim > 0
+        chars[0, delim].each do |c|
+          raise DecoderError.new("invalid punycode: non-ASCII '#{c}' in the basic part") unless c.ord < 0x80
+          acc << c
+        end
+        pos = delim + 1
+      end
+      while pos < chars.size
+        oldi = i
+        w = 1_i64
+        k = PUNY_BASE
+        loop do
+          raise DecoderError.new("invalid punycode: truncated variable-length integer") if pos >= chars.size
+          digit = puny_digit_value(chars[pos])
+          pos += 1
+          i += digit.to_i64 * w
+          raise DecoderError.new("punycode overflow") if i > Int32::MAX
+          t = puny_threshold(k, bias)
+          break if digit < t
+          w *= (PUNY_BASE - t)
+          raise DecoderError.new("punycode overflow") if w > Int32::MAX
+          k += PUNY_BASE
+        end
+        bias = puny_adapt(i - oldi, acc.size + 1, oldi == 0)
+        n += (i // (acc.size + 1)).to_i32
+        raise DecoderError.new("invalid punycode: U+#{n.to_s(16).upcase} is not a Unicode scalar value") unless puny_scalar?(n)
+        i = i % (acc.size + 1)
+        acc.insert(i.to_i32, n.unsafe_chr)
+        i += 1
+      end
+      acc.join
+    end
+
+    private def puny_scalar?(n : Int32) : Bool
+      0 <= n <= 0x10FFFF && !(0xD800 <= n <= 0xDFFF)
+    end
+
+    private def puny_threshold(k : Int32, bias : Int32) : Int32
+      return PUNY_TMIN if k <= bias
+      return PUNY_TMAX if k >= bias + PUNY_TMAX
+      k - bias
+    end
+
+    private def puny_adapt(delta : Int64, numpoints : Int32, firsttime : Bool) : Int32
+      d = firsttime ? delta // PUNY_DAMP : delta // 2
+      d += d // numpoints
+      k = 0
+      while d > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) // 2
+        d //= (PUNY_BASE - PUNY_TMIN)
+        k += PUNY_BASE
+      end
+      k + (((PUNY_BASE - PUNY_TMIN + 1) * d) // (d + PUNY_SKEW)).to_i32
+    end
+
+    private def puny_digit(v : Int32) : Char
+      v < 26 ? ('a'.ord + v).unsafe_chr : ('0'.ord + v - 26).unsafe_chr
+    end
+
+    private def puny_digit_value(c : Char) : Int32
+      case c
+      when 'a'..'z' then c.ord - 'a'.ord
+      when 'A'..'Z' then c.ord - 'A'.ord
+      when '0'..'9' then c.ord - '0'.ord + 26
+      else               raise DecoderError.new("invalid punycode digit: #{c}")
+      end
+    end
+
+    # ---- XML (the five predefined entities) ----
+    def xml_escape(s : String) : String
+      String.build(s.bytesize) do |io|
+        s.each_char do |c|
+          case c
+          when '&'  then io << "&amp;"
+          when '<'  then io << "&lt;"
+          when '>'  then io << "&gt;"
+          when '"'  then io << "&quot;"
+          when '\'' then io << "&apos;"
+          else           io << c
+          end
+        end
+      end
+    end
+
+    # Byte-level scan (entities are pure ASCII, so a multibyte char is copied through
+    # verbatim). Anything that is not one of the five predefined entities or a numeric
+    # reference — `&nbsp;`, a bare '&' — is left as-is: this reads captured values, it is
+    # not a validating parser, and dropping what it cannot name would lose data.
+    def xml_unescape(s : String) : String
+      bytes = s.to_slice
+      return s unless bytes.includes?(0x26_u8) # '&'
+      String.build(bytes.size) do |io|
+        i = 0
+        while i < bytes.size
+          if bytes[i] == 0x26_u8 && (semi = xml_entity_end(bytes, i + 1)) &&
+             (rep = xml_entity(String.new(bytes[i + 1, semi - i - 1])))
+            io << rep
+            i = semi + 1
+            next
+          end
+          io.write_byte(bytes[i])
+          i += 1
+        end
+      end
+    end
+
+    # Index of the ';' closing an entity that starts at `from`, or nil. Bounded: the longest
+    # thing we resolve is "#x10FFFF" (8 chars), so a stray '&' never scans the whole input.
+    private def xml_entity_end(bytes : Bytes, from : Int32) : Int32?
+      limit = Math.min(bytes.size, from + 9)
+      j = from
+      while j < limit
+        return j if bytes[j] == 0x3b_u8 # ';'
+        j += 1
+      end
+      nil
+    end
+
+    private def xml_entity(body : String) : String?
+      case body
+      when "amp"  then "&"
+      when "lt"   then "<"
+      when "gt"   then ">"
+      when "quot" then "\""
+      when "apos" then "'"
+      else
+        return nil unless body.starts_with?('#')
+        cp = body.starts_with?("#x") || body.starts_with?("#X") ? body[2..].to_i?(16) : body[1..].to_i?(10)
+        return nil unless cp && puny_scalar?(cp)
+        cp.unsafe_chr.to_s
+      end
+    end
+
+    # ---- shell / powershell quoting ----
+    # POSIX single quotes make EVERYTHING inside literal, so the quote itself is the only
+    # thing to handle: close, emit an escaped quote, reopen. Newlines and metacharacters
+    # need nothing. The block form of gsub is deliberate — it never reads '\' in the
+    # replacement as a backreference.
+    def shell_escape(s : String) : String
+      "'" + s.gsub("'") { "'\\''" } + "'"
+    end
+
+    # PowerShell single-quoted strings do no escape processing at all; a literal quote is
+    # written by doubling it. (A double-quoted PS string would also expand $var and `n.)
+    def powershell_escape(s : String) : String
+      "'" + s.gsub("'") { "''" } + "'"
+    end
+
+    # ---- C string literal ----
+    # Bytes in / text out, so arbitrary binary escapes losslessly (a UTF-8 char becomes its
+    # individual \xNN bytes, which is exactly what a C compiler puts back). No surrounding
+    # quotes — the output is a string-literal BODY, ready to paste between them.
+    def c_string_escape(data : Bytes) : String
+      String.build(data.size) do |io|
+        data.each_with_index do |b, i|
+          if esc = C_ESCAPE_OUT[b]?
+            io << esc
+          elsif 0x20_u8 <= b <= 0x7e_u8
+            io << b.unsafe_chr
+          elsif (nx = data[i + 1]?) && hex_digit(nx) >= 0
+            # \xNN is GREEDY in C — it swallows every hex digit that follows, so "\x01" then
+            # 'A' would compile as the single byte 0x1A. When the next byte would extend it,
+            # emit the fixed-width 3-digit octal form instead, which cannot run on.
+            io << "\\" << b.to_s(8).rjust(3, '0')
+          else
+            io << "\\x" << b.to_s(16).rjust(2, '0')
+          end
+        end
+      end
+    end
+
+    # Text in / bytes out: `\xff` is a byte, not a code point, so the result is frequently
+    # not valid UTF-8 and must stay Bytes. `\uXXXX` / `\UXXXXXXXX` (C11) emit the code
+    # point's UTF-8; a lone surrogate has no UTF-8 form, so that escape is left literal
+    # rather than raising — use unicode-unescape for JS-style surrogate PAIRS.
+    def c_string_unescape(s : String) : Bytes
+      bytes = s.to_slice
+      sink = IO::Memory.new(bytes.size)
+      i = 0
+      while i < bytes.size
+        b = bytes[i]
+        unless b == 0x5c_u8 && (nx = bytes[i + 1]?)
+          sink.write_byte(b)
+          i += 1
+          next
+        end
+        if simple = C_SIMPLE_ESCAPES[nx]?
+          sink.write_byte(simple)
+          i += 2
+          next
+        end
+        numeric = case nx
+                  when 0x78_u8, 0x58_u8 then c_hex_run(bytes, i + 2)   # \xNN
+                  when 0x30_u8..0x37_u8 then c_octal_run(bytes, i + 1) # \NNN
+                  when 0x75_u8, 0x55_u8 then c_universal(bytes, i, nx) # \uXXXX / \UXXXXXXXX
+                  end
+        if numeric
+          value, i = numeric
+          sink.write(value)
+        else # an unknown, truncated, or non-scalar escape keeps both bytes — tolerant, never lossy
+          sink.write_byte(b)
+          sink.write_byte(nx)
+          i += 2
+        end
+      end
+      sink.to_slice
+    end
+
+    # `\xNN` is greedy in C — it consumes EVERY hex digit that follows, however many. nil
+    # when no digit does, in which case "\x" is not an escape at all.
+    private def c_hex_run(bytes : Bytes, at : Int32) : {Bytes, Int32}?
+      j = at
+      v = 0
+      while j < bytes.size && (d = hex_digit(bytes[j])) >= 0
+        v = ((v << 4) | d) & 0xff
+        j += 1
+      end
+      j == at ? nil : {Bytes[v.to_u8], j}
+    end
+
+    # `\NNN` octal, capped at 3 digits by the language — which is exactly what keeps it from
+    # running on into a following digit, and why c_string_escape prefers it near one.
+    private def c_octal_run(bytes : Bytes, at : Int32) : {Bytes, Int32}
+      j = at
+      v = 0
+      n = 0
+      while j < bytes.size && n < 3 && 0x30_u8 <= bytes[j] <= 0x37_u8
+        v = (v << 3) | (bytes[j] - 0x30_u8).to_i
+        n += 1
+        j += 1
+      end
+      {Bytes[(v & 0xff).to_u8], j}
+    end
+
+    # C11 universal character names, emitted as the code point's UTF-8. A lone surrogate has
+    # no UTF-8 form, so it yields nil and the escape stays literal — unicode-unescape is the
+    # converter that understands JS-style surrogate PAIRS.
+    private def c_universal(bytes : Bytes, at : Int32, marker : UInt8) : {Bytes, Int32}?
+      width = marker == 0x75_u8 ? 4 : 8
+      cp = hex_n(bytes, at + 2, width)
+      return nil unless cp && puny_scalar?(cp)
+      {cp.unsafe_chr.to_s.to_slice, at + 2 + width}
+    end
+
+    # Byte -> its shortest C escape (escape direction). '\'' is absent on purpose: it needs no
+    # escape inside the double-quoted literal this codec targets.
+    C_ESCAPE_OUT = {
+      0x5c_u8 => "\\\\",
+      0x22_u8 => "\\\"",
+      0x07_u8 => "\\a",
+      0x08_u8 => "\\b",
+      0x09_u8 => "\\t",
+      0x0a_u8 => "\\n",
+      0x0b_u8 => "\\v",
+      0x0c_u8 => "\\f",
+      0x0d_u8 => "\\r",
+    }
+
+    # Escape letter -> byte, for the one-char escapes (unescape direction). Wider than
+    # C_ESCAPE_OUT: it also accepts forms the encoder never emits but real C source contains.
+    C_SIMPLE_ESCAPES = {
+      0x5c_u8 => 0x5c_u8, # \\
+      0x22_u8 => 0x22_u8, # \"
+      0x27_u8 => 0x27_u8, # \'
+      0x3f_u8 => 0x3f_u8, # \?
+      0x61_u8 => 0x07_u8, # \a
+      0x62_u8 => 0x08_u8, # \b
+      0x65_u8 => 0x1b_u8, # \e (GNU extension)
+      0x66_u8 => 0x0c_u8, # \f
+      0x6e_u8 => 0x0a_u8, # \n
+      0x72_u8 => 0x0d_u8, # \r
+      0x74_u8 => 0x09_u8, # \t
+      0x76_u8 => 0x0b_u8, # \v
+    }
+
+    # ---- homoglyphs / typos ----
+    # ASCII -> a visually confusable code point, drawn from the Unicode confusables that
+    # real IDN homograph attacks use (Cyrillic, plus a few Latin/Greek/numeral forms).
+    # Partial by design: a letter with no established lookalike is left alone.
+    HOMOGLYPHS = {
+      'a' => 'а', 'c' => 'с', 'd' => 'ԁ', 'e' => 'е', 'g' => 'ɡ', 'h' => 'һ',
+      'i' => 'і', 'j' => 'ј', 'l' => 'ⅼ', 'o' => 'о', 'p' => 'р', 'q' => 'ԛ',
+      's' => 'ѕ', 'v' => 'ѵ', 'w' => 'ԝ', 'x' => 'х', 'y' => 'у',
+      'A' => 'А', 'B' => 'В', 'C' => 'С', 'E' => 'Е', 'H' => 'Н', 'I' => 'І',
+      'J' => 'Ј', 'K' => 'К', 'M' => 'М', 'O' => 'О', 'P' => 'Р', 'S' => 'Ѕ',
+      'T' => 'Т', 'X' => 'Х', 'Y' => 'У',
+    }
+
+    def homoglyph(s : String) : String
+      String.build(s.bytesize * 2) do |io|
+        s.each_char { |c| io << (HOMOGLYPHS[c]? || c) }
+      end
+    end
+
+    TYPO_MAX_IN = 128
+
+    # US-QWERTY physical neighbours, lowercase only — an uppercase input reuses this map and
+    # re-uppercases the substitution, so "Google" and "google" produce matching variants.
+    TYPO_ADJACENT = {
+      'q' => "wa", 'w' => "qes", 'e' => "wrd", 'r' => "etf", 't' => "ryg", 'y' => "tuh",
+      'u' => "yij", 'i' => "uok", 'o' => "ipl", 'p' => "ol",
+      'a' => "qsz", 's' => "awdx", 'd' => "sefc", 'f' => "drgv", 'g' => "fthb", 'h' => "gyjn",
+      'j' => "hukm", 'k' => "jil", 'l' => "kop",
+      'z' => "asx", 'x' => "zsdc", 'c' => "xdfv", 'v' => "cfgb", 'b' => "vghn", 'n' => "bhjm",
+      'm' => "njk",
+      '0' => "9", '1' => "2", '2' => "13", '3' => "24", '4' => "35", '5' => "46",
+      '6' => "57", '7' => "68", '8' => "79", '9' => "80",
+      '-' => "_", '.' => ",", '_' => "-",
+    }
+
+    # One variant per line — omissions, then adjacent-character transpositions, then
+    # adjacent-key substitutions. Deterministic and deduped, with the input itself excluded,
+    # so the output drops straight into a fuzzer wordlist or a domain-squatting check.
+    # This is a GENERATOR, not a transform: nothing decodes it back.
+    def typo(s : String) : String
+      raise DecoderError.new("input too long for typo (max #{TYPO_MAX_IN} chars)") if s.size > TYPO_MAX_IN
+      chars = s.chars
+      variants = [] of String
+      seen = Set(String).new
+      seen << s
+      chars.size.times do |i|
+        v = chars.dup
+        v.delete_at(i)
+        typo_add(variants, seen, v)
+      end
+      (chars.size - 1).times do |i|
+        v = chars.dup
+        v.swap(i, i + 1)
+        typo_add(variants, seen, v)
+      end
+      chars.each_with_index do |c, i|
+        next unless neighbours = TYPO_ADJACENT[c.downcase]?
+        neighbours.each_char do |nb|
+          v = chars.dup
+          v[i] = c.uppercase? ? nb.upcase : nb
+          typo_add(variants, seen, v)
+        end
+      end
+      variants.join('\n')
+    end
+
+    private def typo_add(variants : Array(String), seen : Set(String), variant : Array(Char)) : Nil
+      str = variant.join
+      return if str.empty? || seen.includes?(str)
+      seen << str
+      variants << str
     end
   end
 end
