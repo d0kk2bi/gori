@@ -39,9 +39,10 @@ module Gori
       end
 
       # The placeholder NAMES still present after `expand`. Callers use this both to reject
-      # an entry (a templated host would otherwise be stored as the literal string
-      # `{{baseUrl}}` — `Builder::HOST_INVALID` does not reject `{`/`}`) and to report which
-      # variables were missing when a whole file resolves to nothing.
+      # an entry and to report which variables were missing when a whole file resolves to
+      # nothing. `Builder::HOST_VALID` would now reject a `{{baseUrl}}` host too, but only as
+      # "invalid URL (bad host)" — this names the variable that was not set, which is the
+      # thing the operator has to act on.
       def self.unresolved(text : String) : Array(String)
         return [] of String unless text.includes?("{{")
         text.scan(PLACEHOLDER).map(&.[1])
@@ -49,10 +50,11 @@ module Gori
 
       # A brace left in the URL's AUTHORITY after expansion, from something `unresolved`
       # cannot see: a variable whose value is a JSON object/array (`{"k":"v"}`), or a
-      # single-brace template form this parser does not speak. `Builder::HOST_INVALID`
-      # rejects control bytes and spaces but NOT `{`/`}`, so without this the flow is stored
-      # with a structurally impossible host. Only the authority is checked — a brace in the
-      # path, query or fragment is the operator's own data and stays verbatim.
+      # single-brace template form this parser does not speak. `Builder::HOST_VALID` is the
+      # backstop for that shape and refuses it too, but generically; this one says a
+      # variable was left unexpanded, which is the actionable statement. Only the authority
+      # is checked — a brace in the path, query or fragment is the operator's own data and
+      # stays verbatim.
       def self.braced_authority?(url : String) : Bool
         s = url
         if i = s.index("://")

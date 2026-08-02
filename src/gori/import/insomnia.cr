@@ -100,8 +100,9 @@ module Gori
       end
 
       # `url` plus the separate `parameters` array (Insomnia's query-param editor). Both are
-      # variable-expanded; a leftover `{{ … }}` in the URL rejects the entry, because
-      # `Builder::HOST_INVALID` would happily store `{{ _.base_url }}` as the host.
+      # variable-expanded; a leftover `{{ … }}` in the URL rejects the entry HERE so the
+      # message names the unset variable — `Builder::HOST_VALID` would refuse
+      # `{{ _.base_url }}` as a host as well, but only as a generic bad-host skip.
       private def self.resolve_url(res : Hash(String, JSON::Any),
                                    vars : Vars::Table, missing : Set(String)) : String
         url = Vars.expand(res["url"]?.to_s.strip, vars)

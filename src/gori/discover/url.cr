@@ -22,7 +22,7 @@ module Gori::Discover
       host = uri.host
       return nil unless host && !host.empty?
       # A host with a request-line breaker in it is refused rather than repaired: percent
-      # encoding is defined for a path, not for a reg-name, and `Import::Builder::HOST_INVALID`
+      # encoding is defined for a path, not for a reg-name, and `Import::Builder::HOST_VALID`
       # already states the rule that a real host never carries one (userinfo, port and the
       # `://` all sit outside `uri.host`). `URI.parse` copies such a host in verbatim —
       # `http://a b/x` yields `"a b"` — so this is the only line that can refuse it, and nil
