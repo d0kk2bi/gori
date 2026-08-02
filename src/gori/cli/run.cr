@@ -54,6 +54,7 @@ require "./run/import"
 require "./run/issues"
 require "./run/links"
 require "./run/jwt"
+require "./run/cookie"
 require "./run/decoder"
 require "./run/rewriter"
 require "./run/project"
@@ -112,6 +113,7 @@ module Gori
         when "notes"    then cmd_notes(rest)
         when "issues"   then cmd_issues(rest)
         when "jwt"      then cmd_jwt(rest)
+        when "cookie"   then cmd_cookie(rest)
         when "decoder"  then cmd_decoder(rest)
         when "rewriter" then cmd_rewriter(rest)
         when "project"  then cmd_project(rest)
@@ -166,6 +168,7 @@ module Gori
         {"issues", "List, export, create, update, or delete issues (text, json, markdown)"},
         {"links", "List/add/delete an issue's or note's evidence links"},
         {"jwt [<token>]", "Decode, re-sign, or generate testing payloads for a JWT"},
+        {"cookie [<cookie>]", "Decode, verify, brute-force, or forge a Flask/Rack/Django session cookie"},
         {"decoder <chain>", "Encode/decode/hash via the Decoder engine (base64, hex, url, gzip …)"},
         {"rewriter", "Manage Match & Replace rules (list, add, rm, enable/disable, preview, extract, bindings)"},
         {"project [list]", "List known projects"},
