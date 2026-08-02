@@ -692,13 +692,62 @@ describe Gori::Proxy::WS do
 
       notices = sink.messages.select { |(_, _, text)| text.starts_with?("[gori] ") }
       notices.size.should eq(1) # once per direction per socket, like the warn
-      notices.first[0].should eq("out")
+      # NOT "out", which is what a WebSocket repeater seed reads: a diagnostic is not traffic.
+      # See the seed-leak example below and `Relay::NOTICE_DIRECTION`.
+      notices.first[0].should eq("in")
       notices.first[2].should contain("more than 8 control frames arrived between the fragments")
+      # The row's column no longer says which side it is about, so the SENTENCE has to — or a
+      # notice about the client's own frames reads as something the origin did.
+      notices.first[2].should contain("client→server")
       # Its POSITION is what names the message: right where gori gave up, after the eight it
       # had parked and before the one that broke the ceiling.
       sink.messages.index(notices.first).should eq(8)
       sink.messages.last.should eq({"out", 1, "AAABBB"})
       _ = tc_r
+    end
+
+    # F1, the regression the row above introduced. A `ws_messages` row on the OUT direction is
+    # not only a record — it is what `run repeater create --flow`, MCP `create_repeater` and
+    # the TUI seed a WebSocket repeater session from, opcode and bytes straight across. Writing
+    # the advisory on the pump's own direction therefore put gori's own 242-byte sentence into
+    # the operator's test case as a masked client→server TEXT frame the client never sent, and
+    # made `run repeater send` report one more message than the client had frames. Round 3
+    # built this row on the `Sec-WebSocket-Extensions` advisory's precedent, and that one is
+    # safe for exactly one reason: it is `direction: "in"`, and seeding takes `out`.
+    #
+    # Asserted as the SEED sees it — every out row, in order — rather than by fishing the
+    # notice out, because "the seed is the client's frames and nothing else" is the property.
+    it "leaves no [gori] row on the direction a WebSocket repeater seeds from" do
+      lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "AAA".to_slice, fin: false)
+      tail = masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice)
+      pings = (0...9).map do |i|
+        masked_op_frame(Gori::Proxy::WS::OP_PING, Bytes[0x70_u8, (0x30 + i).to_u8])
+      end
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      client = IO::Stapled.new(cs_r, tc_w)
+      upstream = IO::Stapled.new(ss_r, ts_w)
+
+      cs_w.write(lead)
+      pings.each { |p| cs_w.write(p) }
+      cs_w.write(tail)
+      cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(client, upstream, 7_i64, sink,
+        WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      seed = sink.messages.select { |(dir, _, _)| dir == "out" }
+      seed.size.should eq(10) # the client sent ten frames; the seed is ten messages
+      seed.each { |(_, _, text)| text.starts_with?("[gori] ").should be_false }
+      seed.last.should eq({"out", 1, "AAABBB"})
+      # ... and the advisory is still recorded, just not where it can be replayed.
+      sink.messages.count { |(_, _, text)| text.starts_with?("[gori] ") }.should eq(1)
+      ts_w.close
+      _ = {ts_r, tc_r}
     end
 
     # The complement, one frame BELOW the ceiling: eight parked controls still ride out inside
@@ -763,10 +812,89 @@ describe Gori::Proxy::WS do
         WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
 
       ts_w.close
-      # The PING reaches the origin ahead of the message that displaced the one it was parked
-      # inside — was: never written at all.
-      ts_r.gets_to_end.to_slice.should eq(ping + second)
+      # The PING and the empty fragment it was parked inside BOTH reach the origin, in arrival
+      # order. Round 3 fixed half of this: the PING was never written at all, and then the
+      # fragment that carried it still was not — `flush_withheld` owed nothing while the
+      # payload buffer was empty and `reset_raw` dropped the frame's own wire bytes. The
+      # byte-exact pump forwards it (asserted below), and "a rule that matches nothing leaves
+      # the socket byte-exact" is the invariant this whole pump exists to keep.
+      ts_r.gets_to_end.to_slice.should eq(lead + ping + second)
       _ = tc_r
+    end
+
+    # The same wire, with no rule armed at all. Written as a pair on purpose: the finding is
+    # not "gori drops an empty fragment", it is "gori drops it only where a rule is live", and
+    # only the two together say that.
+    it "forwards an empty leading fragment identically with and without a rule armed" do
+      lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, Bytes.empty, fin: false)
+      ping = masked_op_frame(Gori::Proxy::WS::OP_PING, "pi".to_slice)
+      tailer = masked_op_frame(Gori::Proxy::WS::OP_CONT, "BBB".to_slice)
+      wire = lead + ping + tailer
+
+      relayed = ->(rewriter : Gori::Proxy::HeadRewriter?) do
+        cs_r, cs_w = IO.pipe
+        ts_r, ts_w = IO.pipe
+        ss_r, ss_w = IO.pipe
+        tc_r, tc_w = IO.pipe
+        cs_w.write(wire); cs_w.close
+        ss_w.close
+        sink = WsSink.new
+        Gori::Proxy::WS::Relay.run(IO::Stapled.new(cs_r, tc_w), IO::Stapled.new(ss_r, ts_w),
+          7_i64, sink, rewriter, WS_CTX)
+        ts_w.close
+        _ = tc_r
+        {ts_r.gets_to_end.to_slice, sink.messages}
+      end
+
+      armed_bytes, armed_rows = relayed.call(WsRewriter.new(to_server: {"absent", "x"}))
+      plain_bytes, plain_rows = relayed.call(nil)
+      plain_bytes.should eq(wire) # the byte-exact pump has always done this
+      armed_bytes.should eq(plain_bytes)
+      # ... and the two pumps have to agree about the rows as well. Two frames of payload —
+      # the empty one counts — and no row of its own for a zero-byte fragment.
+      armed_rows.should eq(plain_rows)
+      armed_rows.should eq([{"out", 9, "pi"}, {"out", 1, "BBB"}])
+    end
+
+    # The complement of "empty": one byte of payload in the leading fragment took the branch
+    # that always worked, which is why the defect survived three rounds of fragmentation tests.
+    it "forwards a NON-empty leading fragment and its parked PING unchanged" do
+      lead = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "X".to_slice, fin: false)
+      ping = masked_op_frame(Gori::Proxy::WS::OP_PING, "pi".to_slice)
+      second = masked_op_frame(Gori::Proxy::WS::OP_TEXT, "second".to_slice)
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+
+      cs_w.write(lead); cs_w.write(ping); cs_w.write(second); cs_w.close
+      ss_w.close
+
+      sink = WsSink.new
+      Gori::Proxy::WS::Relay.run(IO::Stapled.new(cs_r, tc_w), IO::Stapled.new(ss_r, ts_w),
+        7_i64, sink, WsRewriter.new(to_server: {"absent", "x"}), WS_CTX)
+
+      ts_w.close
+      ts_r.gets_to_end.to_slice.should eq(lead + ping + second)
+      sink.messages.should eq([{"out", 9, "pi"}, {"out", 1, "X"}, {"out", 1, "second"}])
+      _ = tc_r
+    end
+
+    # An empty leading fragment is a NOTED frame with no payload, so the shape accumulator has
+    # to be cleared by whoever decides not to write a row for it — on BOTH pumps. Left standing
+    # it was inherited: `TEXT fin=0 ""` then `TEXT fin=1 "BBB"` (a §5.4 violation, two separate
+    # messages) surfaced "BBB" as a two-frame message that had never ended.
+    it "does not let an empty leading fragment's shape leak onto the next message's row" do
+      lead = client_frame(Gori::Proxy::WS::OP_TEXT, Bytes.empty, fin: false)
+      second = client_frame(Gori::Proxy::WS::OP_TEXT, "BBB".to_slice)
+      plain = shape_capture(lead + second)
+      armed = shape_capture(lead + second, WsRewriter.new(to_server: {"absent", "x"}))
+      armed.map { |r| {r[0], r[1], r[2], r[3].frames, r[3].fin} }
+        .should eq(plain.map { |r| {r[0], r[1], r[2], r[3].frames, r[3].fin} })
+      plain.size.should eq(1)
+      plain[0][2].should eq("BBB")
+      plain[0][3].frames.should eq(1) # was 2 — the empty fragment's note, inherited
+      plain[0][3].fin.should be_true
     end
 
     it "hoists an interleaved PING only when the message is actually re-framed" do
@@ -1479,5 +1607,48 @@ describe "Gori::Proxy::WS.encode frame shapes" do
     deferred = Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "h".to_slice,
       Gori::Proxy::WS::Shape.new, mask: true)
     (deferred[1] & 0x80).should eq(0x80)
+  end
+end
+
+# The defensive half of F1. `Relay::NOTICE_DIRECTION` keeps a NEW advisory off the direction a
+# WebSocket repeater seeds from, but a flow captured by an older build still carries one there,
+# and two markers legitimately keep the frame's own opcode and direction because they stand in
+# for a real frame at its own position (the ping-flood marker rides opcode 9, the oversized
+# marker rides the message's). So a seed reader has to be able to recognise a notice row
+# itself — `run repeater create --flow`, MCP `create_repeater` and the TUI all take a row's
+# opcode and BYTES straight across, and replaying gori's own prose to the application under
+# test is a fabricated message the operator never authored.
+private def ws_row(payload : Bytes, opcode = 1) : Gori::Store::WsMessage
+  Gori::Store::WsMessage.new(1_i64, 1_i64, nil, 0_i64, "out", opcode, payload)
+end
+
+describe "Gori::Store::WsMessage#notice?" do
+  it "recognises every shape of [gori] row the relay writes" do
+    ws_row("[gori] more than 8 control frames arrived".to_slice).notice?.should be_true
+    ws_row("[gori] 20000000-byte WebSocket frame forwarded".to_slice).notice?.should be_true
+    ws_row("[gori] more than 64 ping/pong frames".to_slice, 9).notice?.should be_true
+  end
+
+  it "leaves a peer's own message alone" do
+    ws_row("hello".to_slice).notice?.should be_false
+    ws_row(Bytes.empty).notice?.should be_false
+    # Shorter than the prefix, and a near-miss: the test is the whole prefix or nothing.
+    ws_row("[gori".to_slice).notice?.should be_false
+    ws_row("[gori]x more".to_slice).notice?.should be_false
+    ws_row(" [gori] leading space".to_slice).notice?.should be_false
+  end
+
+  it "answers on BYTES, so an invalid-UTF-8 payload is neither decoded nor scrubbed" do
+    # `696e76616c6964fffe` is the §8.1/§5.6 validation payload the send path spent two rounds
+    # learning not to rewrite; asking this question must not be the thing that touches it.
+    invalid = Bytes[0x69, 0x6e, 0x76, 0xff, 0xfe]
+    ws_row(invalid).notice?.should be_false
+    notice = "[gori] ".to_slice + invalid
+    ws_row(notice).notice?.should be_true
+  end
+
+  it "is reachable on the converted seed type too, which is what the TUI holds" do
+    Gori::Store::WsOutMessage.new(1, "[gori] advisory".to_slice).notice?.should be_true
+    Gori::Store::WsOutMessage.text("ordinary").notice?.should be_false
   end
 end

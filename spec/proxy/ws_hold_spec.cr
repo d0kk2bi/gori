@@ -487,6 +487,137 @@ describe Gori::Proxy::WS::MessageGate do
     r.shutdown
   end
 
+  # The teardown flush is the one flush normally reached BECAUSE the peer died, so it is the
+  # one whose write can fail — and a control frame's capture row is written at ARRIVAL, back
+  # when a control frame went out the instant it arrived. Parking made "arrived" and "was
+  # delivered" two events, and against an origin that hard-RSTs the origin's own accounting
+  # says 0 bytes received while gori's capture carries a PING row claiming otherwise. The row
+  # is not wrong about the arrival, so it stays; what was missing is the sentence saying the
+  # frame never got out. `MessageGate#write_message` states the same contract from the other
+  # side: "a `ws_messages` row is gori's claim that the peer saw these bytes".
+  it "says the teardown flush never reached the peer instead of leaving the arrival row to claim it" do
+    first = masked(WS::OP_TEXT, "SECRET".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws body:never-matches-this") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 63_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(ping)
+      wait_until("the PING to be parked") { sink.messages.size == 1 }
+      r.ts_r.close # the origin is gone: every write to the upstream leg raises from here
+      r.cs_w.close
+
+      wait_until("the teardown notice") { sink.messages.size >= 2 }
+      sink.messages[0].should eq({"out", 9, "zz"}) # the arrival, which really happened
+      dir, opcode, text = sink.messages[1]
+      dir.should eq("in") # a diagnostic is not traffic — never the direction a seed reads
+      opcode.should eq(1)
+      text.should start_with("[gori] ")
+      text.should contain("client→server")
+      text.should contain("1 control frame(s)")
+      text.should contain("record their ARRIVAL, not their delivery")
+      text.should contain("6 byte(s)") # ... and the fragment, which has no row at all
+    end
+    r.shutdown
+  end
+
+  # The same failure on a socket armed by a RULE rather than a hold. `flush_at_teardown` is
+  # shared, and the two arming paths reach it from different places (`Relay.run` for a gated
+  # socket, the pump's own `ensure` for this one), so both are asserted.
+  it "reports the same teardown loss on a rule-armed socket with no gate" do
+    first = masked(WS::OP_TEXT, "SECRET".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    spawn { WS::Relay.run(r.client, r.upstream, 64_i64, sink, WsHoldRewriter.new({"absent", "x"}), HOLD_CTX) }
+    r.cs_w.write(first)
+    r.cs_w.write(ping)
+    wait_until("the PING to be parked") { sink.messages.size == 1 }
+    r.ts_r.close
+    r.cs_w.close
+
+    wait_until("the teardown notice") { sink.messages.size >= 2 }
+    sink.messages[1][0].should eq("in")
+    sink.messages[1][2].should contain("1 control frame(s)")
+    r.shutdown
+  end
+
+  # The complement of the two above, and the one that decides whether the notice means
+  # anything: the identical withheld state on a socket whose teardown write SUCCEEDS must
+  # produce no notice at all. (The two "delivers a parked control frame …" examples earlier
+  # assert the exact row list, so a spurious notice fails them too — this one says it in the
+  # words of the fix.)
+  it "writes no teardown notice when the flush does reach the peer" do
+    first = masked(WS::OP_TEXT, "SECRET".to_slice, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws body:never-matches-this") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 65_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(first)
+      r.cs_w.write(ping)
+      wait_until("the PING to be parked") { sink.messages.size == 1 }
+      r.cs_w.close # only the CLIENT goes; the upstream leg is still writable
+
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.gets_to_end.to_slice.should eq(first + ping)
+      sink.messages.should eq([{"out", 9, "zz"}, {"out", 1, "SECRET"}])
+      sink.messages.count { |(_, _, t)| t.starts_with?("[gori] ") }.should eq(0)
+    end
+    r.shutdown
+  end
+
+  # F5 on the GATED path. An empty leading fragment is the case where the payload buffer says
+  # "nothing here" and the raw accumulator disagrees; on a gated socket the flush additionally
+  # runs through `bypass`, which forces the queue out under the gate's own lock, so the two
+  # arming paths do not share the write.
+  it "flushes an EMPTY leading fragment and its parked PING on a gated socket too" do
+    lead = masked(WS::OP_TEXT, Bytes.empty, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws body:never-matches-this") do |ic|
+      spawn { WS::Relay.run(r.client, r.upstream, 66_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(lead)
+      r.cs_w.write(ping)
+      wait_until("the PING to be parked") { sink.messages.size == 1 }
+      r.cs_w.close
+
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.gets_to_end.to_slice.should eq(lead + ping) # was: the PING alone
+      # No row for a zero-byte fragment, matching the byte-exact pump, and no notice: the
+      # write succeeded.
+      sink.messages.should eq([{"out", 9, "zz"}])
+    end
+    r.shutdown
+  end
+
+  # A genuinely HELD message with an empty-leading-fragment message assembling behind it —
+  # the two teardown resolutions in one socket, in the order they have to happen: `settle`
+  # releases what a human owns, then the pump flushes what it is withholding.
+  it "releases a held message ahead of an empty leading fragment assembling behind it" do
+    lead = masked(WS::OP_TEXT, Bytes.empty, fin: false)
+    ping = masked(WS::OP_PING, "zz".to_slice)
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::RequestOnly)
+      spawn { WS::Relay.run(r.client, r.upstream, 67_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(masked(WS::OP_TEXT, "HELD".to_slice))
+      wait_until("the hold") { ic.pending_count == 1 }
+      r.cs_w.write(lead)
+      r.cs_w.write(ping)
+      wait_until("the PING to be parked") { sink.messages.size == 1 }
+      r.cs_w.close
+
+      r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
+      r.ts_r.gets_to_end.to_slice.should eq(masked(WS::OP_TEXT, "HELD".to_slice) + lead + ping)
+      sink.messages.should eq([{"out", 9, "zz"}, {"out", 1, "HELD"}])
+    end
+    r.shutdown
+  end
+
   it "forwards a still-held message at teardown instead of destroying it" do
     # The socket ends while the operator still owns the message. `MessageGate#close` runs
     # from the pump's `ensure`, which is only reached AFTER `Relay.run` has closed both
