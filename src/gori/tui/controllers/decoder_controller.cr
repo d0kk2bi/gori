@@ -53,7 +53,6 @@ module Gori::Tui
 
     def initialize(host : Host)
       super(host)
-      @registry = Decoder.default_registry
       @popup = ChainComplete.new
       @popup_engaged = false # false = passive full-list menu (Tab still navigates panes)
       @chain_pre = ""        # IME preedit for the focused CHAIN field
@@ -85,6 +84,13 @@ module Gori::Tui
       (s.pane == :chain || (s.pane == :input && s.input_mode == InputMode::Insert)) ? :editor : :body
     end
 
+    # Fetched per use, NOT cached in an ivar: `Decoder.library=` swaps the shared registry on
+    # every ^S/^X, and a saved chain has to be callable from the very next keystroke — a
+    # registry captured in the constructor would resolve the library as it stood at startup.
+    private def registry : Decoder::Registry
+      Decoder.shared_registry
+    end
+
     # The current session (always valid: ≥1 session, @idx kept in range).
     private def cur : DecoderSession
       @sessions[@idx]
@@ -94,7 +100,7 @@ module Gori::Tui
     private def make_session(input_text : String, chain : String, name : String?) : DecoderSession
       input = TextArea.new(input_text)
       input.follow_x = true # long input lines scroll horizontally to keep the cursor visible
-      result = Decoder.run(@registry, input.text.to_slice, chain)
+      result = Decoder.run(registry, input.text.to_slice, chain)
       view = DecoderView.new
       view.name = name
       DecoderSession.new(view, input, chain, chain.size, :input, result)
@@ -796,7 +802,7 @@ module Gori::Tui
       # passive discovery menu (engaged? = false → Tab keeps navigating the focus ring,
       # ↓ dives in). A typed token filters AND engages it (Tab/↵ accept). set() opens the
       # popup iff the match list is non-empty.
-      matches = @registry.match(tok).map(&.name).uniq
+      matches = registry.match(tok).map(&.name).uniq
       @popup.set(matches.first(64), ts, te)
       @popup_engaged = !tok.empty?
     end
@@ -822,7 +828,7 @@ module Gori::Tui
 
     private def recompute : Nil
       s = cur
-      s.result = Decoder.run(@registry, s.input.text.to_slice, s.chain)
+      s.result = Decoder.run(registry, s.input.text.to_slice, s.chain)
       s.view.reset_output_scroll
     end
 
@@ -844,13 +850,31 @@ module Gori::Tui
       cur.view.name || ""
     end
 
+    # Two names are refused, and both for the same reason: a saved chain is CALLABLE as a step
+    # (`myenc > url-encode`), so a name that no spec could ever reach would save a library
+    # entry that silently does nothing. A separator inside the name can never be typed as one
+    # token; a built-in's name (or alias) keeps resolving to the built-in, because the catalog
+    # has to win — a library that could shadow `base64-decode` would change what every OTHER
+    # saved chain, and every spec in every project, already means.
     def save_chain(name : String) : Nil
       if name.empty?
         @host.status("chain name required")
         return
       end
-      existing = Settings.decoder_chains.any? { |(n, _)| n == name }
-      chains = Settings.decoder_chains.reject { |(n, _)| n == name }
+      if name.matches?(/[>|,¦§]/)
+        @host.status("chain name cannot contain > | , ¦ or §")
+        return
+      end
+      if (c = registry[name]?) && !c.category.saved?
+        @host.status("\"#{name}\" is a built-in converter — pick another name")
+        return
+      end
+      # Reject by NORMALIZED name, the key the registry resolves on: saving "my chain" while
+      # "my-chain" is in the library would otherwise append a second entry that register_all
+      # then drops as a duplicate, so the save would report success and change nothing.
+      nk = Decoder::Registry.normalize(name)
+      chains = Settings.decoder_chains.reject { |(n, _)| Decoder::Registry.normalize(n) == nk }
+      existing = chains.size != Settings.decoder_chains.size
       chains << {name, cur.chain}
       Settings.decoder_chains = chains
       # ^S is a save gesture, so flush the live sessions at the same moment — otherwise an

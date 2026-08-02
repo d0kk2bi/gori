@@ -640,7 +640,7 @@ Omitted until you apply or star a wordlist.
 | `hostname_overrides` | Global host → IP dial map. See [hostname_overrides](#hostname_overrides) above |
 | `env` | Env-token prefix and global values. See [env](#env) above |
 | `hotkeys` | Keybinding overrides (`os` layer + `command_modifier` + `bindings`). See the [Hotkeys guide](/guide/hotkeys/) |
-| `decoder` | Named Decoder chain specs, shared by every project (open sub-tabs live in the project database) |
+| `decoder` | Named Decoder chain specs, shared by every project and callable as a chain step by name (open sub-tabs live in the project database) |
 | `rewriter` | Saved Match & Replace rules, shared by every project. See [Reusing a rule across projects](/guide/proxy/#reusing-a-rule-across-projects) |
 | `mine` | Saved Param Miner defaults. See [mine](#mine) above |
 | `layout` | History / Probe / Issues previews + Sitemap expand depth. See [layout](#layout) above |

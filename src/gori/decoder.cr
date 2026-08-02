@@ -4,6 +4,7 @@ require "./decoder/registry"
 require "./decoder/codecs"
 require "./decoder/catalog"
 require "./decoder/chain"
+require "./decoder/library"
 
 module Gori::Decoder
   # Output ceiling for any single step / decompression drain — lifted from
@@ -44,6 +45,33 @@ module Gori::Decoder
   @@shared : Registry?
 
   def self.shared_registry : Registry
-    @@shared ||= default_registry
+    @@shared ||= build_registry
+  end
+
+  # The named-chain library (settings.json `decoder.chains`) as the engine sees it. Settings
+  # PUSHES it here on every write (Settings.decoder_chains=), so the engine stays free of the
+  # config layer — it is handed the entries, it never reads them.
+  @@library = [] of {String, String}
+
+  def self.library : Array({String, String})
+    @@library
+  end
+
+  # Rebuilds `shared_registry` as a FRESH Registry rather than registering into the live one:
+  # the shared instance is documented read-only-after-construction because fuzz worker fibers
+  # splice through it concurrently, and a reference swap keeps that true — a fiber holding the
+  # old registry keeps reading immutable data instead of a half-updated hash.
+  def self.library=(entries : Array({String, String})) : Array({String, String})
+    @@library = entries
+    @@shared = build_registry(entries)
+    entries
+  end
+
+  # The catalog plus one converter per saved chain, so `myenc > url-encode` resolves through
+  # the same `Registry#[]?` every surface already uses. See decoder/library.cr.
+  def self.build_registry(entries : Array({String, String}) = @@library) : Registry
+    r = default_registry
+    Library.register_all(r, entries)
+    r
   end
 end

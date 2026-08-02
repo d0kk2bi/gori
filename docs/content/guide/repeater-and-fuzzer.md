@@ -76,6 +76,8 @@ The Fuzzer is an Intruder-style engine: mark positions in a request, attach payl
 
 Mark positions with `§…§` markers in the request, or let gori place them automatically. Payload sets can be a wordlist, an explicit list, a numeric range, N empty (null) payloads, or brute-force character sets. Processors let you transform each payload on the way out: prefix/suffix, URL/base64/hex encoding, case folding, hashing, or a regex replace.
 
+A single marker can also carry a Decoder chain of its own. Put the cursor inside it and press `Ctrl-Y` to open the chain editor, which previews the value through every step before you send. Anything you [saved in the Decoder library](/guide/decoder/#building-a-chain) can be called there by name, so a chain you built once is one word in a marker: `§admin¦myenc > url-encode§`. Repeater markers work the same way.
+
 ### Matching
 
 Filter results with ffuf-style matchers and filters on status, size, words, lines, and body regex, plus auto-calibration to drop noisy baselines. Matched responses are highlighted and can be extracted with a capture regex.

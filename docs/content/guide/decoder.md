@@ -43,6 +43,16 @@ Save a chain under a name (**Save chain by name** from the space menu, or `Ctrl-
 
 Named chains live under the `decoder` section of settings and are shared by every project — the chain is a recipe, while what you run through it stays with the project. The Rewriter keeps [a library of rules](/guide/proxy/#reusing-a-rule-across-projects) the same way.
 
+A saved name is also a **converter**: type it as a step and the whole saved spec runs in that position.
+
+```
+myenc > url-encode
+```
+
+That works everywhere gori accepts a chain, not only in this tab: the `Ctrl-Y` chain editor on a Repeater or Fuzzer `§…§` marker, `gori run decoder`, and the MCP `decode` tool. Autocomplete lists saved names next to the built-in converters, and `gori run decoder list` shows them with the category `saved`.
+
+Saved chains can call each other. A recursive definition fails that step with a message instead of hanging, and a name a built-in already answers to (including its aliases) is refused when you save it, because the built-in has to keep winning: letting the library shadow `base64-decode` would change what every spec in every project already means.
+
 ## Converters
 
 | Category | Examples |

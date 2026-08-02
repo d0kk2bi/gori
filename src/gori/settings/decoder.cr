@@ -1,4 +1,5 @@
 require "json"
+require "../decoder"
 
 # DECODER section: the Decoder tab's named chain specs. See settings.cr for the
 # module-level overview and the load/save/serialize orchestration.
@@ -10,10 +11,24 @@ module Gori::Settings
   # Deliberately NOT serialized — writing it again would recreate the global block.
   class_property decoder_sessions : Array({String, String, String}) = [] of {String, String, String}
 
-  # Named, saved chain specs (name -> spec) the user can re-load with ^O. Global on purpose:
+  # Named, saved chain specs (name -> spec) the user can re-load with ^O — and CALL by name as
+  # a single chain step (`myenc > url-encode`) anywhere a spec is accepted. Global on purpose:
   # a chain like "base64-decode > gunzip" is tool config, reusable in every project — only
   # what was run THROUGH it is project data.
-  class_property decoder_chains : Array({String, String}) = [] of {String, String}
+  @@decoder_chains = [] of {String, String}
+
+  def self.decoder_chains : Array({String, String})
+    @@decoder_chains
+  end
+
+  # Publishing to the Decoder engine rides the SETTER, not the load path. Every write goes
+  # through here — the startup parse, ^S save, ^X delete, a spec fixture — so "a saved chain
+  # is callable as a step" cannot come true in one surface and stay false in another.
+  def self.decoder_chains=(entries : Array({String, String})) : Array({String, String})
+    @@decoder_chains = entries
+    Decoder.library = entries
+    entries
+  end
 
   # Drop a named chain from the library and persist. `name` is the key the whole library is
   # addressed by (save_chain already replaces a same-named entry), so there is no id to

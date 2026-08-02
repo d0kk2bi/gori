@@ -625,7 +625,7 @@ Fuzzer의 Payload 오버레이가 기억하는 워드리스트 경로입니다. 
 | `hostname_overrides` | 전역 host → IP 다이얼 맵. 위의 [hostname_overrides](#hostname_overrides) 참고 |
 | `env` | Env 토큰 접두사와 전역 값. 위의 [env](#env) 참고 |
 | `hotkeys` | 키바인딩 오버라이드 (`os` 계층 + `command_modifier` + `bindings`). [단축키 가이드](/ko/guide/hotkeys/) 참고 |
-| `decoder` | 이름 붙인 Decoder 체인. 모든 프로젝트가 공유합니다(열려 있는 서브탭은 프로젝트 DB에 있습니다) |
+| `decoder` | 이름 붙인 Decoder 체인. 모든 프로젝트가 공유하며 체인 단계에서 이름으로 부를 수 있습니다(열려 있는 서브탭은 프로젝트 DB에 있습니다) |
 | `rewriter` | 저장해 둔 Match & Replace 규칙. 모든 프로젝트가 공유합니다. [프로젝트를 넘어 규칙 재사용하기](/ko/guide/proxy/#reusing-a-rule-across-projects) 참고 |
 | `mine` | Param Miner의 저장된 기본값. 위 [mine](#mine) 참고 |
 | `layout` | History / Probe / Issues 미리보기 + Sitemap 펼침 깊이. 위의 [layout](#layout) 참고 |
