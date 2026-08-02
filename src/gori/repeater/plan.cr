@@ -358,10 +358,15 @@ module Gori::Repeater
       # the run was refused as out-of-scope, naming the wrong gate.
       options.sni.try { |s| refuse_unresolved(Env.unresolved(s, deferred: nil)) }
       sni = options.sni.try { |s| Env.expand(s).presence }
+      # `evidence` reaches the SENDER, not just this builder. The comment on
+      # `expand_requests` says a declared session binding is deliberately left for
+      # `Env.expand_bindings` at the send seam — and that seam ran unconditionally, so
+      # everything `evidence?` turns off here was turned back on one layer down for any
+      # extract rule whose name collides with a token in the capture. See `Sender#evidence?`.
       sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
         verify: options.verify?, http2: options.http2?, sni: sni,
         timeout: options.timeout, overrides: options.overrides,
-        preserve_field_case: options.preserve_field_case?)
+        preserve_field_case: options.preserve_field_case?, evidence: options.evidence?)
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
         http2: options.http2?, websocket: websocket, sni: sni,
         preserve_field_case: options.preserve_field_case?)

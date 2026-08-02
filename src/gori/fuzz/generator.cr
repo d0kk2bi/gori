@@ -169,9 +169,28 @@ module Gori::Fuzz
     # ── helpers ──────────────────────────────────────────────────────────────────
 
     private def emit(idx : Int64, payloads : Array(String), pos : Int32?) : Job
-      raw = @template.render(chained(payloads))
-      bytes = @config.update_content_length? ? ContentLength.sync(raw, @config.add_content_length_when_missing?) : raw
-      Job.new(idx, payloads, pos, bytes) # keep the ORIGINAL payloads for reporting; only the wire bytes are transformed
+      raw, spans = @template.render_spans(chained(payloads))
+      bytes = raw
+      if @config.update_content_length?
+        bytes, at, delta = ContentLength.sync_at(raw, @config.add_content_length_when_missing?)
+        spans = shift_spans(spans, at, delta) unless delta == 0
+      end
+      # keep the ORIGINAL payloads for reporting; only the wire bytes are transformed
+      Job.new(idx, payloads, pos, bytes, spans)
+    end
+
+    # `spans` moved across the Content-Length rewrite, which is the one pass that runs
+    # between the splice and the wire and can change a byte offset. `at`/`delta` come from
+    # `ContentLength.sync_at`: everything at or past `at` moved by `delta`.
+    #
+    # A span that lay INSIDE the rewritten header line is left where it is rather than
+    # dropped. Those payload bytes have no image in the output — the line was replaced by
+    # the canonical `Content-Length: N` — so the range now covers digits gori wrote itself,
+    # and excluding those from a `$NAME` scan is a no-op either way. Dropping it would be a
+    # silent narrowing of the exclusion instead, which is the direction that bites.
+    private def shift_spans(spans : Array({Int32, Int32}), at : Int32,
+                            delta : Int32) : Array({Int32, Int32})
+      spans.map { |(a, b)| a >= at ? {a + delta, b + delta} : {a, b} }
     end
 
     # A random alphanumeric string with no whitespace — safe to drop into a query/body

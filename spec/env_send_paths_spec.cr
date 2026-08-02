@@ -158,7 +158,14 @@ describe "WebSocket message payloads (#524)" do
     end
   end
 
-  it "TUI RepeaterView reports the unresolved tokens in its message pane, and none once set" do
+  # `load_ws` seeds from a CAPTURED 101 flow, so this pane holds frames the WS relay
+  # RECORDED — the premise the old refusal rested on ("a text frame is UTF-8 the operator
+  # typed, the same provenance as a header value") is false for exactly this population.
+  # A captured `{"$where":…}` / `{"t":"$SESSION"}` is replayed as recorded or not at all,
+  # so there is no expansion here and therefore nothing to report unresolved. What the
+  # example was really guarding — that a captured BINARY frame's `$A` never becomes a
+  # refusal, and that the display path stays literal — is asserted on both sides below.
+  it "TUI RepeaterView does not expand or report tokens in a CAPTURED message pane" do
     with_env_store do |store|
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
         created_at: 1_i64, scheme: "https", host: "ws.test", port: 443,
@@ -168,7 +175,8 @@ describe "WebSocket message payloads (#524)" do
       view.load_ws(store.get_flow(id).not_nil!,
         [%({"t":"$SESSION"}), "ping $SESSION", "plain"].map { |t| Gori::Store::WsOutMessage.text(t) })
 
-      view.ws_unresolved_env.should eq(["SESSION"]) # deduplicated across lines
+      view.evidence?.should be_true
+      view.ws_unresolved_env.should be_empty
 
       # A captured BINARY frame is not text an operator typed, and its `$A` is a byte.
       # Refusing on it took out a real WS session (caught driving the built TUI, not by
@@ -177,13 +185,31 @@ describe "WebSocket message payloads (#524)" do
       view.load_ws(store.get_flow(id).not_nil!,
         [Gori::Store::WsOutMessage.new(2, Bytes[0x8B, 0x1F, 0x24, 0x41, 0x00, 0xFE, 0x24, 0x5F]),
          Gori::Store::WsOutMessage.text("ping $SESSION")])
-      view.ws_unresolved_env.should eq(["SESSION"])
+      view.ws_unresolved_env.should be_empty
       # The DISPLAY path is untouched: the copy menu still reads the literal token.
       String.new(view.ws_out_messages[1].payload).should eq("ping $SESSION")
 
+      # …and setting the var does NOT change the wire. That is the whole point: a capture
+      # replayed twice, under two different project configurations, is the same bytes.
       Gori::Settings.env_vars = [{"SESSION", "s3cr3t"}]
       view.ws_unresolved_env.should be_empty
-      String.new(view.ws_out_messages[1].payload).should eq("ping s3cr3t")
+      String.new(view.ws_out_messages[1].payload).should eq("ping $SESSION")
+    end
+  end
+
+  # THE COMPLEMENT, and the half that is still a DRAFT: a hand-authored WS tab (no flow
+  # behind it) keeps reporting an unresolved token and keeps expanding a resolved one.
+  it "TUI RepeaterView still reports and expands tokens in a HAND-AUTHORED message pane" do
+    with_no_vars do
+      view = RepeaterView.new
+      view.restore("ws://ws.test", WS_UPGRADE, false, false,
+        ws_messages: [Gori::Store::WsOutMessage.text("ping $SESSION")])
+      view.evidence?.should be_false
+      view.ws_unresolved_env.should eq(["SESSION"])
+
+      Gori::Settings.env_vars = [{"SESSION", "s3cr3t"}]
+      view.ws_unresolved_env.should be_empty
+      String.new(view.ws_out_messages[0].payload).should eq("ping s3cr3t")
     end
   end
 end

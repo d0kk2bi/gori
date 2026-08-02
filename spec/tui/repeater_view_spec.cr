@@ -424,27 +424,46 @@ describe Gori::Tui::RepeaterView do
     end
   end
 
-  # Same corruption class, but with a `$KEY` token present elsewhere in the request:
-  # substitution must still work for the token while invalid-UTF-8 bytes in the body
-  # (unrelated to the token) pass through unchanged.
-  it "substitutes a known $KEY while leaving an invalid-UTF-8 body untouched" do
+  # Same corruption class, but with a `$KEY` token present elsewhere in the request.
+  #
+  # The substitution half MOVED, and this example was pinning the wrong half of it. A tab
+  # loaded from `load(detail)` holds a CAPTURED request, and a capture is replayed as
+  # recorded — `$TOKEN` in a stored head is a byte the client really sent, and every other
+  # surface already knew it (`gori run repeater <flow-id>` and MCP `send_request{flow_id}`
+  # both send those seven characters). The TUI was the one surface still substituting, so
+  # the SAME flow id in the SAME project produced two different requests. See
+  # `RepeaterView#evidence?` and `Repeater::PlanOptions#evidence?`.
+  #
+  # What the example is actually about — an invalid-UTF-8 body surviving the send path
+  # whatever else happens to the head — is asserted on BOTH sides of that split.
+  it "leaves a CAPTURED $KEY alone, and an invalid-UTF-8 body untouched either way" do
     Gori::Settings.env_vars = [{"TOKEN", "secret"}]
     Gori::Settings.project_env_vars = [] of {String, String}
     repeater_tmp_store do |store|
       body = Bytes[0x41, 0x80, 0x42, 0xE2, 0x28, 0x43]
+      head = "POST /x HTTP/1.1\r\nHost: h.test\r\nAuthorization: $TOKEN\r\nContent-Length: 6\r\n\r\n"
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
         created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
         method: "POST", target: "/x", http_version: "HTTP/1.1",
-        head: "POST /x HTTP/1.1\r\nHost: h.test\r\nAuthorization: $TOKEN\r\nContent-Length: 6\r\n\r\n".to_slice,
-        body: body))
+        head: head.to_slice, body: body))
       detail = store.get_flow(id).not_nil!
 
       view = RepeaterView.new
       view.load(detail)
 
       sent = view.request_bytes
-      String.new(sent).includes?("Authorization: secret").should be_true # $TOKEN substituted
-      sent[-body.size, body.size].should eq(body)                        # body bytes still preserved exactly
+      String.new(sent).includes?("Authorization: $TOKEN").should be_true # evidence: byte-exact
+      String.new(sent).includes?("Authorization: secret").should be_false
+      sent[-body.size, body.size].should eq(body) # body bytes still preserved exactly
+
+      # THE COMPLEMENT: the identical bytes typed as a DRAFT still substitute, and the body
+      # still survives. Provenance is the only thing that differs between the two.
+      draft = RepeaterView.new
+      draft.restore("http://h.test", head, false, false)
+      draft.replace_request(head + String.new(body))
+      draft_sent = draft.request_bytes
+      String.new(draft_sent).includes?("Authorization: secret").should be_true
+      draft_sent[-body.size, body.size].should eq(body)
     end
   ensure
     Gori::Settings.env_vars = [] of {String, String}

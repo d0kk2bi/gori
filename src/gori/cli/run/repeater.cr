@@ -291,7 +291,12 @@ module Gori
               # was dropped with a warning (protobuf/msgpack/CBOR/MQTT-over-WS, i.e. most
               # non-toy WS apps), and a TEXT frame carrying invalid UTF-8 — the §8.1/§5.6
               # validation payload — was silently rewritten to U+FFFD before it was even stored.
-              ws_messages = store.ws_messages(fid).select { |m| m.direction == "out" }
+              # `ws_seed_rows`: a `[gori]` advisory in the capture is gori talking ABOUT
+              # the socket, never a frame the client sent, so it must not become one — and
+              # the drop is announced rather than shrinking the seed in silence.
+              seed_rows, dropped = Run.ws_seed_rows(store.ws_messages(fid))
+              STDERR.puts "gori run repeater create: #{Run.ws_notice_dropped_note(dropped)}" if dropped > 0
+              ws_messages = seed_rows
                 .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, Run.seed_shape(m.shape)) }
             end
           end
@@ -496,8 +501,12 @@ module Gori
         abort_if_out_of_scope!(outbound, plan, "gori run repeater send")
 
         if plan.websocket?
+          # `rec.flow_id` IS the provenance test, the same one the engine tabs and the h1
+          # flow-replay path make: only a `--flow` / MCP `flow_id` seed sets it, and only a
+          # seed puts CAPTURED frames in `ws_messages`. A session built from `--request-raw`
+          # or MCP `ws_out_messages` leaves it nil and its rows stay the operator's draft.
           cmd_repeater_send_ws(id, plan, project_name, db_path, idle_ms, ws_messages, outbound, format,
-            verbatim, ws_keep_key || rec.ws_keep_key?)
+            verbatim, ws_keep_key || rec.ws_keep_key?, !rec.flow_id.nil?)
           return
         end
 
@@ -524,12 +533,13 @@ module Gori
                                             db_path : String?, idle_ms : Int64?,
                                             message_override : Array(Store::WsOutMessage),
                                             outbound : Gori::Outbound, format : Symbol,
-                                            verbatim : Bool, keep_key : Bool) : Nil
+                                            verbatim : Bool, keep_key : Bool,
+                                            evidence : Bool = false) : Nil
         abort_if_blocked!(plan, "gori run repeater send")
 
         store = open_store(resolve_read_project(project_name, db_path))
         out_messages = begin
-          ws_out_messages(store, id, message_override, verbatim)
+          ws_out_messages(store, id, message_override, verbatim, evidence)
         ensure
           store.close
         end
@@ -572,20 +582,70 @@ module Gori
       # that is not a matched token through unchanged (its own header says so), so a TEXT
       # frame carrying invalid UTF-8 survives to the wire; scrubbing it turned 9 bytes into
       # 13 and sent those instead, with no warning.
+      #
+      # `evidence` — the session was seeded from a CAPTURED flow — turns both the refusal
+      # and the expansion off for its stored rows. The rationale this used to carry, "a text
+      # frame is UTF-8 the operator typed, the same provenance as a header value", is simply
+      # false for a seeded session: those rows are the client's frames, recorded by the WS
+      # relay. So a capture of `{"$where":"this.a==1"}` was unreplayable without project env
+      # vars, and setting them the way the refusal advises sent `{"WHEREVAL":"this.a==1"}`.
+      # `--message` / `--message-frame` stay a DRAFT and keep today's policy exactly.
       private def self.ws_out_messages(store : Store, id : Int64,
                                        override : Array(Store::WsOutMessage),
-                                       verbatim : Bool = false) : Array(Repeater::WsEngine::OutMsg)
-        source = if override.empty?
-                   store.ws_messages_for_repeater(id).select { |m| m.direction == "out" }
-                     .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
+                                       verbatim : Bool = false,
+                                       evidence : Bool = false) : Array(Repeater::WsEngine::OutMsg)
+        stored = override.empty?
+        source = if stored
+                   rows, dropped = Run.ws_seed_rows(store.ws_messages_for_repeater(id))
+                   STDERR.puts "gori run repeater send: #{Run.ws_notice_dropped_note(dropped)}" if dropped > 0
+                   rows.map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) }
                  else
                    override
                  end
-        refuse_unresolved_ws(source.select(&.text?).map { |m| String.new(m.payload) }, id) unless verbatim
+        seeded = stored && evidence
+        refuse_unresolved_ws(source.select(&.text?).map { |m| String.new(m.payload) }, id) unless verbatim || seeded
         source.map do |m|
-          payload = m.text? && !verbatim ? Env.expand(String.new(m.payload)).to_slice : m.payload
-          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape)
+          payload = m.text? && !verbatim && !seeded ? Env.expand(String.new(m.payload)).to_slice : m.payload
+          Repeater::WsEngine::OutMsg.new(m.opcode, payload, m.shape, seeded)
         end
+      end
+
+      # Whether a stored WebSocket row is a gori ADVISORY rather than a frame the socket
+      # carried. A diagnostic is not traffic: round 3's parked-control notice was written on
+      # the `out` direction, which is exactly what a repeater seed reads, so replaying a
+      # flow captured by that build put gori's own 242-byte sentence on the wire as a TEXT
+      # message the client never sent. The row is fixed at the source; this is the seed-side
+      # guard, so an older capture already in a project cannot replay one either — and two
+      # PRE-EXISTING markers are seedable today regardless of that fix, because they stand in
+      # for a real frame at its position and legitimately keep its opcode and direction: the
+      # ping-flood marker (opcode 9, and under §5.5's 125-byte cap, so it would replay as a
+      # real PING) and `forward_oversized_frame`'s. Hence NO opcode filter here — the prefix
+      # is the whole test, and an opcode-1 test would have let the PING through.
+      #
+      # Byte-level: a notice row is compared, never decoded. `scrub` on a payload that is not
+      # valid UTF-8 would rewrite the bytes being tested.
+      def self.ws_notice_row?(opcode : Int32, payload : Bytes) : Bool
+        marker = Gori::Proxy::WS::Relay::NOTICE_PREFIX.to_slice
+        return false if payload.size < marker.size
+        marker.each_with_index { |b, i| return false unless payload[i] == b }
+        true
+      end
+
+      # The `out` frames of a captured flow, minus gori's own advisory rows, and HOW MANY
+      # were dropped. Every seed reader goes through this rather than repeating the filter,
+      # and none of them may go quiet about it: a seed that silently holds fewer frames than
+      # the capture is the same class of problem as one that holds an extra.
+      def self.ws_seed_rows(rows : Array(Store::WsMessage)) : {Array(Store::WsMessage), Int32}
+        out = rows.select { |m| m.direction == "out" }
+        kept = out.reject { |m| ws_notice_row?(m.opcode, m.payload) }
+        {kept, out.size - kept.size}
+      end
+
+      # The one sentence every surface uses for that drop, so the CLI, MCP and the TUI
+      # cannot describe it differently.
+      def self.ws_notice_dropped_note(n : Int32) : String
+        "#{n} gori advisory row#{n == 1 ? "" : "s"} in this capture #{n == 1 ? "was" : "were"} " \
+        "not seeded — they are diagnostics gori wrote about the socket, not frames the client sent"
       end
 
       # `--message-frame`. The grammar is shared with MCP (`Repeater::WsFrameSpec`) so a
@@ -748,15 +808,26 @@ module Gori
         end
       end
 
-      # WHY the captured response is short. `Result#incomplete?` conflates two causes — the
-      # origin closed before the framed body finished, and gori's own capture ceiling stopping
-      # the read — and the one sentence this printed named only the first, so gori blamed the
-      # target for something gori did. The two are told apart by the only evidence available
-      # here: a body sitting exactly at the ceiling was cut by the ceiling.
-      private def self.incomplete_reason(result : Repeater::Result) : String
+      # WHY the captured response is short. `Result#incomplete?` conflates THREE causes and
+      # this sentence used to name only one of them, so gori blamed the target for something
+      # gori did:
+      #
+      #   * gori's own capture ceiling stopped the read. Told apart by the only evidence
+      #     available here — a body sitting exactly at the ceiling was cut by the ceiling.
+      #   * the read ended on an IDLE TIMEOUT. The socket is still open and the origin
+      #     never closed anything; saying it did points the operator at the wrong end of the
+      #     wire and at the wrong fix (the fix is a longer deadline).
+      #   * the origin really did close before the framed body finished.
+      #
+      # `self.` and public so MCP renders the identical three sentences: two copies of a
+      # three-way classification is how two surfaces come to disagree about one flow.
+      def self.incomplete_reason(result : Repeater::Result, timed_out : Bool = false) : String
         cap = Proxy::Codec::Body::CAPTURE_READ_MAX
         if (b = result.body) && b.size >= cap
           "incomplete — gori stopped reading at its #{cap // (1024 * 1024)} MiB capture ceiling"
+        elsif timed_out
+          "incomplete — the origin stopped sending and the read deadline expired; " \
+          "it did not close the connection (raise the timeout to read the rest)"
         else
           "incomplete — origin closed before the framed body finished"
         end
