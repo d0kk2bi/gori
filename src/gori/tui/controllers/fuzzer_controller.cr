@@ -120,12 +120,15 @@ module Gori::Tui
       stop = Hotkeys.binding_label(reg, "fuzz.stop", "^X")
       mark = Hotkeys.binding_label(reg, "fuzz.automark", "^A")
       read_common = "⇧arrows select · #{y} copy · space cmds"
+      sni = Hotkeys.binding_label(reg, "fuzz.toggle-sni", "^S")
       case v.focus
       when :target
-        if v.target_insert?
-          "type URL · ↵/↓ template · #{run} run · ↹ pane · esc read"
+        if v.editing_sni?
+          "type SNI · #{sni}/↵/esc URL · #{run} run"
+        elsif v.target_insert?
+          "type URL · #{sni} SNI · ↵/↓ template · #{run} run · ↹ pane · esc read"
         else
-          "i/↵ edit · #{read_common} · #{run} run · ↹ pane · esc tabs"
+          "i/↵ edit · #{read_common} · #{sni} SNI · #{run} run · ↹ pane · esc tabs"
         end
       when :template
         if v.template_insert?
@@ -222,6 +225,8 @@ module Gori::Tui
       return v.discard_chain_pane if v.chain_pane_active? # esc in the CHAIN pane → cancel + back (^Y again saves)
       if v.focus == :template && v.template_insert?
         v.exit_template_insert!
+      elsif v.focus == :target && v.editing_sni?
+        v.exit_sni_field # leave the SNI field, back to the URL (value kept)
       elsif v.focus == :target && v.target_insert?
         v.exit_target_insert!
       elsif v.focus == :detail
@@ -257,6 +262,19 @@ module Gori::Tui
         @host.status(err)
       else
         @host.status("pretty-printed template request body")
+      end
+    end
+
+    # ^S on the TARGET pane: edit the TLS SNI the whole sweep presents, leaving the dialed
+    # host alone. Same chord, same focus rule and same status wording as the Repeater's — a
+    # fuzz session seeded from History (⇧I) could otherwise never set one, so an https vhost
+    # sweep always presented the dialed IP.
+    def fuzz_toggle_sni : Nil
+      if (view = current_view) && view.focus == :target
+        view.toggle_sni_field
+        @host.status(view.editing_sni? ? "SNI override: type a domain · ^S/↵/esc back to URL" : "editing target URL")
+      else
+        @host.status("SNI override (^S) applies to the TARGET pane — ↹ to it")
       end
     end
 
@@ -315,6 +333,10 @@ module Gori::Tui
     end
 
     private def edit_target(ev : Termisu::Event::Key, v : FuzzerView) : Bool
+      if v.editing_sni?
+        edit_sni(ev, v)
+        return true
+      end
       return handle_target_read(ev, v) unless v.target_insert?
       key = ev.key
       case
@@ -323,6 +345,19 @@ module Gori::Tui
       else                            edit_target_common(ev, v)
       end
       true
+    end
+
+    # The SNI override sub-field: same single-line editing (the view's target mutators
+    # self-route to it while editing_sni?), but ↵/↑ return to the URL row rather than
+    # advancing panes, and ↓ still drops into the TEMPLATE pane below. Mirrors
+    # `RepeaterController#edit_repeater_sni`.
+    private def edit_sni(ev : Termisu::Event::Key, v : FuzzerView) : Nil
+      key = ev.key
+      case
+      when key.enter?, key.up? then v.exit_sni_field
+      when key.down?           then v.pane_advance(1)
+      else                          edit_target_common(ev, v)
+      end
     end
 
     private def handle_target_read(ev : Termisu::Event::Key, v : FuzzerView) : Bool

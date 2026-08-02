@@ -530,6 +530,16 @@ module Gori
       r.register Verb::Definition.new(
         "fuzz.clear-marks", "Clear markers", "Strip every §…§ marker (and its attached chain) from the template",
         Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'e', section: :template) { |ctx| ctx.fuzz_clear_marks; nil }
+      # Target-pane toggle (SNI override), the twin of repeater.toggle-sni: same ^S, same
+      # two-line editor, same focus rule. `FuzzerView` already carried @sni, persisted it
+      # with the session and handed it to build_engine — a session seeded from History had
+      # no way to REACH it, so an https vhost sweep always presented the dialed IP.
+      # 'i' (from SNI), not 's': 's' is fuzz.stop in Fuzzer COMMON, and COMMON renders
+      # alongside every section (see fuzz.find-subtab's 'f' for the same trade).
+      r.register Verb::Definition.new(
+        "fuzz.toggle-sni", "Toggle SNI override", "Override the TLS SNI the whole sweep presents (dialed host unchanged)",
+        Verb::Scope::Fuzzer, [Verb::Chord.new("s", ctrl: true)],
+        available: in_fuzzer, mnemonic: 'i', section: :target) { |ctx| ctx.fuzz_toggle_sni; nil }
       in_fuzzer_read = ->(ctx : Verb::ExecContext) { ctx.current_tab == :fuzzer && ctx.fuzzer_read_mode? }
       # The single smart Copy (see repeater.copy above) — copy-all is gone.
       r.register Verb::Definition.new(

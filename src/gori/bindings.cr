@@ -25,10 +25,14 @@ module Gori
   # and injecting it produces exactly the 401s this feature exists to remove; and
   # re-extracting costs one request, so there is nothing to save.
   #
-  # The guarantee is BOUNDED and stated as such: a binding value never appears in
+  # The guarantee is BOUNDED and stated as such: gori never WRITES a binding value into
   # `settings.json`, the project DB, the event feed, an issue, a note, or a log line. It
   # DOES appear in captured traffic, because that is where it came from — masking a
-  # capture would be a P7 violation, not a fix.
+  # capture would be a P7 violation, not a fix. The same exception covers an author's own
+  # bytes: a request draft in which the OPERATOR (TUI editor, `gori run repeater`) or an
+  # AGENT (MCP `create_repeater`/`update_repeater`) typed the value is stored as typed.
+  # Rewriting a draft to `$NAME` is that same P7 violation one surface earlier, and it split
+  # the surfaces apart — see `MCP::Tools#stored_request`.
   #
   # One instance is SHARED between the TUI (which edits rules and reads the table), the
   # Repeater send path (which writes it) and every send seam (which reads it), so a Mutex

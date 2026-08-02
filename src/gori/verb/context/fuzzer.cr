@@ -3,6 +3,7 @@
 abstract class Gori::Verb::ExecContext
   abstract def fuzz_pretty_template : Nil
   abstract def fuzz_toggle_http2 : Nil # flip the fuzz transport h1↔h2 (override seed protocol)
+  abstract def fuzz_toggle_sni : Nil   # edit the TLS SNI the sweep presents (TARGET pane; dialed host unchanged)
 
   # fuzzer workbench (run/stop/marking handled inline; these power the palette + cross-tab)
   abstract def fuzz_selected : Nil            # send History's selection to the Fuzzer tab
