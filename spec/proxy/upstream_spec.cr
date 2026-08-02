@@ -521,7 +521,12 @@ describe Gori::Proxy::Upstream do
         _, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: true,
           io_timeout: 3.seconds)
         cause = err.try(&.cause).to_s
-        cause.should_not be_empty
+        # NOT asserted non-empty. Whether the TLS library has words for a connection reset
+        # mid-handshake is platform-dependent — macOS yields an IO error carrying a message,
+        # Linux yields one without. That a cause is PRESENT when the library has a verdict is
+        # pinned by the untrusted-certificate example above, which reports `certificate verify
+        # failed` everywhere. This example is about the SHAPE of whatever comes back, and an
+        # absent cause is trivially storable.
         # Crystal decorates an IO failure with the object's inspect
         # ("write (#<TCPSocket:0x104245c80>): Broken pipe"); a heap address in a string the
         # DB keeps and HAR/MCP export makes two identical failures compare unequal.
