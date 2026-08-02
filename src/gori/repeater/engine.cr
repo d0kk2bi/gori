@@ -57,7 +57,12 @@ module Gori
       # mutating: `ConnPool` builds the Result through `Engine.exchange` and only then knows
       # it was a retry.
       def as_retried : Result
-        Result.new(@head, @body, @response, @duration_us, @error, @incomplete, @delivered, true)
+        # Named, not positional. Two fixers added a field to this constructor in the same round
+        # and the merge reordered the tail — a positional `true` here silently set `timed_out`
+        # instead, and the pool's re-send marker vanished with the suite still green but for the
+        # one spec that asserted it.
+        Result.new(@head, @body, @response, @duration_us, @error, @incomplete, @delivered,
+          timed_out: @timed_out, retried: true)
       end
     end
 

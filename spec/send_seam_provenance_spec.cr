@@ -467,7 +467,7 @@ describe "WebSocket message provenance across the three surfaces" do
   end
 
   it "never seeds or sends a [gori] advisory row as a client frame, whatever its opcode" do
-    notice = "#{Gori::Proxy::WS::Relay::NOTICE_PREFIX}more than 8 control frames arrived"
+    notice = "#{Gori::Proxy::WS::NOTICE_PREFIX}more than 8 control frames arrived"
     Gori::CLI::Run.ws_notice_row?(1, notice.to_slice).should be_true
     # NOT keyed on the opcode. Two pre-existing markers stand in for a real frame at its
     # position and keep that frame's own opcode — the ping-flood marker is a PING (9) and
