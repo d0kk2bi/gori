@@ -49,10 +49,11 @@ describe Gori::Fuzz::Presets do
   describe "user-file merge (extensibility)" do
     it "appends the user file built-in-first, order-preserving, de-duped" do
       builtin = F::Presets.load("sqli")
-      # One line that duplicates an existing built-in payload, one brand-new line,
-      # plus a comment and a blank that must be skipped.
+      # One line that duplicates an existing built-in payload, then one brand-new line.
+      # (The merge file is read verbatim — see the byte-exact `-w` spec below — so no
+      # comment/blank lines here; the dedup + order contract is what this covers.)
       path = File.tempname("gori-preset-merge")
-      File.write(path, "#{builtin.first}\n# a comment\n\nCUSTOM-PAYLOAD-#{Random::Secure.hex(3)}\n")
+      File.write(path, "#{builtin.first}\nCUSTOM-PAYLOAD-#{Random::Secure.hex(3)}\n")
       begin
         merged = F::Presets.load("sqli", path)
         # Built-in first, in the original order (the merge is a suffix).
@@ -61,6 +62,32 @@ describe Gori::Fuzz::Presets do
         merged.uniq.size.should eq(merged.size)
         merged.size.should eq(builtin.size + 1) # only the one genuinely-new line
         merged.last.should start_with("CUSTOM-PAYLOAD-")
+      ensure
+        File.delete(path) rescue nil
+      end
+    end
+
+    # H1 FINDING 1 (PROVENANCE): the user merge file is operator MATERIAL and must reach
+    # the wire byte-exact — exactly as the SAME file does through `-w` (WordlistFile,
+    # chomp only). The merge path must NOT strip leading/trailing whitespace, drop
+    # `#`-leading lines (SQL `#`, `#{7*7}` SSTI, a `#!/bin/sh` shebang are real payloads),
+    # or drop a blank line (an intentional empty payload; `-w` sends it too).
+    it "reads the merge file verbatim, byte-identical to `-w` (WordlistFile)" do
+      path = File.tempname("gori-preset-verbatim")
+      # A leading-space payload, a trailing-tab payload, two `#`-leading payloads, an
+      # intentional blank payload, and a normal one — none collide with a built-in.
+      File.write(path, "  SP-LEAD\nTRAIL-TAB\t\n#!/bin/sh\n#{"#"}{7*7}\n\nNORMAL-PAYLOAD\n")
+      begin
+        # The reference: exactly what `-w` puts on the wire for this file.
+        wordlist = [] of String
+        F::WordlistFile.new(path).each { |v| wordlist << v }
+        wordlist.should eq(["  SP-LEAD", "TRAIL-TAB\t", "#!/bin/sh", "#{"#"}{7*7}", "", "NORMAL-PAYLOAD"])
+
+        builtin = F::Presets.load("sqli")
+        merged = F::Presets.load("sqli", path)
+        # Merge is a built-in-first suffix; none of the user lines collide, so the tail
+        # must be byte-identical to the `-w` reference.
+        merged[builtin.size..].should eq(wordlist)
       ensure
         File.delete(path) rescue nil
       end
