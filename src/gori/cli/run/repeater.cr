@@ -625,10 +625,7 @@ module Gori
       # Byte-level: a notice row is compared, never decoded. `scrub` on a payload that is not
       # valid UTF-8 would rewrite the bytes being tested.
       def self.ws_notice_row?(opcode : Int32, payload : Bytes) : Bool
-        marker = Gori::Proxy::WS::Relay::NOTICE_PREFIX.to_slice
-        return false if payload.size < marker.size
-        marker.each_with_index { |b, i| return false unless payload[i] == b }
-        true
+        Gori::Proxy::WS.notice?(payload)
       end
 
       # The `out` frames of a captured flow, minus gori's own advisory rows, and HOW MANY
@@ -783,7 +780,7 @@ module Gori
         if format == :json
           puts repeater_json(result, diff)
         elsif result.ok?
-          STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result)})" : ""}"
+          STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result, result.timed_out?)})" : ""}"
           if d = diff
             print_diff(d)
             n = Repeater::Diff.change_count(d)
@@ -802,7 +799,7 @@ module Gori
           # the head, so the answer that IS the finding was visible on every rendering except
           # the default one.
           unless result.head.empty?
-            STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result)})" : ""}"
+            STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result, result.timed_out?)})" : ""}"
             print_message_text(result.head, new_body, result.body)
           end
         end
@@ -1299,7 +1296,7 @@ module Gori
             # the target for something gori did.
             if result.incomplete?
               j.field "incomplete", true
-              j.field "incomplete_reason", incomplete_reason(result)
+              j.field "incomplete_reason", incomplete_reason(result, result.timed_out?)
             end
             # The head is REMOTE bytes: an 8-bit octet in a header value (the standard
             # header-parsing probe) does not survive `scrub`, which replaces it with U+FFFD.

@@ -569,7 +569,7 @@ module Gori
               # agent could not tell gori's own capture ceiling from an origin that closed
               # from a read deadline that expired — three different next moves. The CLI has
               # named them since round 3; this is the same classifier, not a second one.
-              j.field "incomplete_reason", CLI::Run.incomplete_reason(result)
+              j.field "incomplete_reason", CLI::Run.incomplete_reason(result, result.timed_out?)
             end
             Serialize.emit_body(j, "body", result.head, result.body, false, body_cap, body_omit)
           end
