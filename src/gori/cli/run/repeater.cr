@@ -305,9 +305,15 @@ module Gori
 
           pos = store.repeaters_meta.size
 
+          # The REQUEST is stored as authored, the target (a short operator-typed field with
+          # no wire semantics of its own) is masked as before. Same seam and same reason as
+          # `MCP::Tools#stored_request`: `mask_secrets` here rewrote an author's live value —
+          # or, on `--flow`, a CAPTURE's own bytes — to `$KEY` in the stored row, and the TUI
+          # then read that row through `RepeaterView#evidence?`, which does not expand
+          # `$NAME`. One row, `$KEY` on the wire from the TUI and the value from here.
           id = store.insert_repeater(
             target: Env.mask_secrets(tgt_str),
-            request: Env.mask_secrets(req_content).to_slice,
+            request: req_content.to_slice,
             http2: http2,
             auto_cl: auto_cl,
             flow_id: flow_id,

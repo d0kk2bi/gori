@@ -5,6 +5,59 @@ require "../../store"
 module Gori
   module MCP
     class Tools
+      # The request bytes to PERSIST: the author's own, verbatim.
+      #
+      # These used to be `Env.mask_secrets(request).to_slice`, and that is a draft-time
+      # transform applied to the operator's authored test case — the P7 line. `mask_secrets`
+      # resolves against `Env.masking_vars`, which folds in `Bindings#held_values`, so an
+      # agent that typed a LIVE token had gori rewrite it to `$CTOK` **in the stored row**.
+      # No other writer does this: the TUI persists what the operator typed
+      # (`RepeaterController#save_current_repeater`) and so does `gori run repeater`.
+      #
+      # It was not merely surprising, it SPLIT the surfaces. `flow_id` survives an
+      # `update_repeater` that replaces every byte, and the TUI turns `flow_id` into
+      # `RepeaterView#evidence?` — which by design does NOT expand `$NAME` (a capture's
+      # `$filter` is a byte the origin saw, not a reference anybody wrote). So one stored row
+      # put `Authorization: Bearer $CTOK` on the wire from the TUI and the real token from
+      # MCP and the CLI, under `✓ sent → 200` on all three.
+      #
+      # Redaction is kept where it belongs: on the way OUT. Every field this tool returns to
+      # the LLM (`summary`, `target`, `name`) is still derived from a masked copy, exactly as
+      # `send_request`'s reply already separates `wire` from its masked display. What changes
+      # is that a value the AUTHOR put in a request draft is stored the way they wrote it —
+      # the same standing as an operator typing it into the TUI editor, and the same standing
+      # `flows` already gives it for captured traffic. `bindings.cr`'s redaction guarantee
+      # names this exception alongside the capture one.
+      private def stored_request(request : String) : Bytes
+        request.to_slice
+      end
+
+      # Only when it FIRED. `summary` is the masked projection, so without this an author who
+      # sent a live value reads a summary spelling it `$CTOK` with no statement anywhere that
+      # the two are the same bytes — a silent substitution where a named report belonged.
+      private def emit_secrets_masked(j : JSON::Builder, raw : String, masked : String) : Nil
+        names = masked_names(raw, masked)
+        return if names.empty?
+        j.field("secrets_masked") { j.array { names.each { |n| j.string n } } }
+        j.field "secrets_masked_note",
+          "#{Env.token_list(names)} #{names.size == 1 ? "resolves" : "resolve"} to a value present in this " \
+          "request; the stored request keeps your bytes and only this result masks them"
+      end
+
+      # The names `mask_secrets` rewrote in these bytes, so the reply can name them. gori no
+      # longer edits the stored draft, but an author who handed over a live credential should
+      # be told gori recognised one rather than left to infer it from a `summary` that reads
+      # differently from what they sent. A name the author TYPED as `$NAME` is excluded — it
+      # was already `$NAME` before the pass and nothing was substituted for it.
+      private def masked_names(raw : String, masked : String) : Array(String)
+        return [] of String if raw == masked
+        prefix = Settings.env_prefix
+        return [] of String if prefix.empty?
+        Env.masking_vars.keys
+          .select { |n| masked.includes?("#{prefix}#{n}") && !raw.includes?("#{prefix}#{n}") }
+          .sort!
+      end
+
       private def create_repeater(h) : Result
         issue_id = int(h, "issue_id")
         return Result.new(id_error(h, "issue_id"), is_error: true) if issue_id.nil? && present?(h, "issue_id")
@@ -109,14 +162,16 @@ module Gori
           return Result.new("'position' out of range", is_error: true)
         end
 
-        # Apply Env.mask_secrets
+        # Masked for the REPLY only — see `stored_request`. `target`, `sni` and `name` are
+        # short author-typed fields with no wire semantics of their own and are re-expanded
+        # identically by every surface, so masking those on the way in is harmless and stays.
         masked_target = Env.mask_secrets(target)
         masked_request = Env.mask_secrets(request)
         masked_sni = sni.try { |s| Env.mask_secrets(s) }
         name = str(h, "name").try { |n| Env.mask_secrets(n) }
 
-        # WebSocket mode check
-        is_ws = Repeater::WsEngine.upgrade_request?(masked_request)
+        # WebSocket mode check — on the bytes that will be STORED and sent, not a projection.
+        is_ws = Repeater::WsEngine.upgrade_request?(request)
 
         # Parsed BEFORE the row is inserted: a refused frame must leave nothing behind. Doing
         # it after produced a half-created session — an error result and a persisted repeater
@@ -129,7 +184,7 @@ module Gori
 
         id = store.insert_repeater(
           target: masked_target,
-          request: masked_request.to_slice,
+          request: stored_request(request),
           http2: http2,
           auto_cl: auto_cl,
           flow_id: flow_id,
@@ -174,6 +229,7 @@ module Gori
             # session no longer carries the absolute-form line, so this is the only record
             # that it was ever there.
             j.field "request_line_rewritten", true if rewrote_request_line
+            emit_secrets_masked(j, request, masked_request)
             # How many frames were actually stored, so an agent authoring a multi-frame
             # sequence can assert on it rather than take the count on trust.
             j.field "ws_out_message_count", ws_count if ws_count
@@ -352,7 +408,7 @@ module Gori
         unless store.update_repeater(
                  id: id,
                  target: masked_target,
-                 request: masked_request.to_slice,
+                 request: stored_request(request),
                  http2: http2,
                  auto_cl: auto_cl,
                  sni: masked_sni,
@@ -392,6 +448,21 @@ module Gori
             j.field "summary", summary
             j.field "position", existing.position
             j.field "ws_out_message_count", ws_count if ws_count
+            emit_secrets_masked(j, request, masked_request)
+            # `flow_id` is unchanged by this write, and it is not a label: the TUI turns it
+            # into `RepeaterView#evidence?`, which suppresses `$NAME` expansion because a
+            # capture's `$filter` is a byte and not a reference. Once these bytes are no
+            # longer the flow's, that reading is wrong — so the row is reported as what it
+            # now IS rather than left advertising a provenance none of its bytes have.
+            # Clearing the column outright needs a store change (`update_repeater` does not
+            # write `flow_id` at all); until then the disagreement is stated, not hidden.
+            if (fid = existing.flow_id) && String.new(existing.request) != request
+              j.field "flow_id", fid
+              j.field "derived_from_flow_note",
+                "repeater #{id} is still linked to flow #{fid}, but its request no longer holds that " \
+                "flow's bytes — the TUI reads that link as \"these bytes are a capture\" and sends " \
+                "$NAME literally there"
+            end
           end
         })
       rescue ex : Gori::Error

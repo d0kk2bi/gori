@@ -295,6 +295,7 @@ describe "Gori::Verbs.register_history" do
        "fuzz.list-paste"      => :fuzz_list_paste,
        "fuzz.pretty-template" => :fuzz_pretty_template,
        "fuzz.toggle-http2"    => :fuzz_toggle_http2,
+       "fuzz.toggle-sni"      => :fuzz_toggle_sni,
        "fuzz.clear-marks"     => :fuzz_clear_marks,
       }.each do |id, intent|
         r[id].available?(ctx).should be_true

@@ -202,6 +202,9 @@ module Gori
         # would otherwise return the 100/103 as the repeater result. Read on until the final
         # (>=200) status. 101 Switching Protocols is terminal (a protocol upgrade), NOT skipped.
         interim_seen = 0
+        # The LAST interim status read, for the rescue below: a raise AFTER a 1xx is a
+        # different event from a raise before one, and only this loop knows which happened.
+        interim_status = nil.as(Int32?)
         while resp.status >= 100 && resp.status < 200 && resp.status != 101
           # RFC 9112 §6: a 1xx MUST NOT carry content. One that declares a body
           # (Content-Length / Transfer-Encoding) is malformed and a desync vector
@@ -212,6 +215,7 @@ module Gori
           # Cap the run so an origin streaming endless body-less 103s can't hang the
           # repeater/fuzz worker fiber indefinitely (there is no whole-request deadline).
           interim_seen += 1
+          interim_status = resp.status
           return error("too many interim 1xx responses from #{host}:#{port}", started, delivered: true) if interim_seen > MAX_INTERIM
           head = read_response_head(upstream)
           return error("upstream closed after interim 1xx from #{host}:#{port}", started, delivered: true) unless head
@@ -248,7 +252,29 @@ module Gori
         # on a parked socket) — the pre-delivery case the pool may re-send. A raise AFTER a head
         # was read (an interim-1xx read that then reset) means the origin already has the whole
         # request, so mark it delivered and do not re-send a non-idempotent one.
-        error(ex.message || "repeater error", started, delivered: !head.nil?)
+        error(exchange_error(ex, host, port, interim_status), started, delivered: !head.nil?)
+      end
+
+      # The sentence for a raise DURING the exchange.
+      #
+      # A bare `ex.message` — `"Read timed out"` — names neither the origin nor the one fact
+      # that decides what a caller may do next. An origin that answers `100 Continue` and then
+      # goes silent is the h1 twin of the case `H2Engine.no_response` writes a careful sentence
+      # for, and it read identically to a plain silent origin: same message, same `error_kind`,
+      # and (before `delivered?` reached a surface) the same `retryable: true`. The two are
+      # opposite instructions — the interim proves the origin has the whole request, because
+      # gori writes it up front.
+      #
+      # Only the INTERIM case is reworded. With no interim there is nothing gori knows that
+      # `ex.message` does not, and inventing a host-shaped sentence for every socket error
+      # would blur it into the dialer's own vocabulary.
+      private def self.exchange_error(ex : Exception, host : String, port : Int32,
+                                      interim : Int32?) : String
+        base = ex.message.presence || "repeater error"
+        return base unless interim
+        tail = ex.is_a?(IO::TimeoutError) ? "nothing more before the read timed out" : "the connection failed (#{base})"
+        "no response from #{host}:#{port} — the origin sent an interim #{interim} and then " \
+        "#{tail} (RFC 9110 §15.2: a 1xx precedes the final response, it is not one)"
       end
 
       # Read a response head with a TOTAL head-assembly deadline (parity with the proxy's
