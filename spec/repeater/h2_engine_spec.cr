@@ -1853,10 +1853,16 @@ describe Gori::Repeater::H2Engine do
     # examples on literals would mean an h1-side improvement lands as an h2-side spec failure,
     # which is how the two drifted apart in the first place.
     {
-      {"a TCP connect that never came up", -> { s = TCPServer.new("127.0.0.1", 0); p = s.local_address.port; s.close; p }, false},
-      {"a certificate the client does not trust", -> { start_tls_origin(advertise_h2: true) }, true},
-      {"a plaintext port addressed as https", -> { start_quiet_origin }, false},
-    }.each do |(label, open_port, verify)|
+      # `exact` is false for the plaintext port ALONE, and that is a property of the case, not a
+      # weakened assertion. A port that is not TLS answers the ClientHello when it happens to be
+      # reading and stays silent when it does not, so OpenSSL reports `wrong version number` on
+      # one connection and the handshake times out on the next — and the two sends below are two
+      # connections. Both readings are true, and neither is a certificate claim, which is the
+      # thing this example exists to pin. Demanding one string here would pin the race instead.
+      {"a TCP connect that never came up", -> { s = TCPServer.new("127.0.0.1", 0); p = s.local_address.port; s.close; p }, false, true},
+      {"a certificate the client does not trust", -> { start_tls_origin(advertise_h2: true) }, true, true},
+      {"a plaintext port addressed as https", -> { start_quiet_origin }, false, false},
+    }.each do |(label, open_port, verify, exact)|
       it "says exactly what the h1 engine says about #{label}" do
         port = open_port.call
         args = {"GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice}
@@ -1866,7 +1872,20 @@ describe Gori::Repeater::H2Engine do
           port: port, verify_upstream: verify, timeout: 3.seconds)
 
         error = h2.error.should_not be_nil
-        error.should eq(h1.error)
+        h1_error = h1.error.should_not be_nil
+        if exact
+          error.should eq(h1_error)
+        else
+          # Same layer, and — the point of the example — neither engine BLAMES a certificate.
+          # Note the timeout sentence mentions one on purpose ("no certificate was exchanged, so
+          # -k and SSL_CERT_FILE cannot help"), which is the opposite of a certificate claim, so
+          # the assertion is on the verdict and its remedy rather than on the word.
+          {error, h1_error}.each do |e|
+            e.should start_with("TLS handshake")
+            e.should_not contain("certificate is not trusted")
+            e.should_not contain("retry with -k")
+          end
+        end
         # …and none of the three carries the collapsed sentence's guesses.
         error.should_not contain("no h2 negotiated")
         error.should_not contain("doesn't offer HTTP/2")
