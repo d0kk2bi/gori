@@ -507,6 +507,7 @@ module Gori::Proxy::WS
       # `MessageGate`'s header exist to prevent, so the answer is to write the frames, not to
       # stop recording them. `Relay.run` calls this while both sockets are still open, right
       # after `settle` — the same moment, and for the same reason.
+      #
       # It is also the one flush that is normally reached BECAUSE the peer died, so it is the
       # one whose write can fail — and a control frame's capture row is written at ARRIVAL
       # (`Relay.capture_control`, whose own comment says "the forward already happened"),
