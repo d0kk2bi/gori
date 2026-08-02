@@ -677,7 +677,14 @@ module Gori::Tui
     end
 
     private def repeater_request_options(v : RepeaterView) : Array(CopyMenu::Option)
-      wire = String.new(v.request_bytes)
+      # Same §…§ `¦chain` refusal as the send path: copying an untransformable request would
+      # hand the operator a curl/raw command that sends the raw value — refuse it too.
+      wire = begin
+        String.new(v.request_bytes)
+      rescue ex : Fuzz::ChainError
+        @host.status("repeater: #{ex.message}")
+        return [] of CopyMenu::Option
+      end
       target = Env.expand(v.target)
       ws_messages = if v.ws_mode?
                       v.ws_out_messages.map { |message| String.new(message.payload).scrub }
@@ -1238,7 +1245,16 @@ module Gori::Tui
         return
       end
       results = @repeater_results
-      return unless plan = repeater_plan(view, [view.request_bytes], http2: view.http2?)
+      # A §…§ marker's `¦chain` that can't run refuses the send here rather than putting the
+      # raw, untransformed value on the wire (RepeaterView#refuse_bad_chains, mirroring
+      # Fuzz::Plan). Reported in the tab's own status line, like every other repeater refusal.
+      begin
+        wire = view.request_bytes
+      rescue ex : Fuzz::ChainError
+        @host.status("repeater: #{ex.message}")
+        return
+      end
+      return unless plan = repeater_plan(view, [wire], http2: view.http2?)
       save_current_repeater # persist the request we're about to send (before it goes inflight)
       if reason = plan.refusal
         results.send({view, Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, reason)})

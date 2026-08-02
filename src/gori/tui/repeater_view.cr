@@ -1571,9 +1571,13 @@ module Gori::Tui
     # position's default through its inline Decoder chain (Template#apply_chains), then
     # resync Content-Length as usual. Parsing the CRLF form (not @editor.text, which is LF)
     # keeps render's output in wire form so the existing CRLF-based sync_content_length works
-    # unchanged. A chain-less `§v§` renders `v`; a failing chain passes the value through.
+    # unchanged. A chain-less `§v§` renders `v`.
+    #
+    # `refuse: true` — this is the ONE path that puts these bytes on the wire, so a `¦chain`
+    # that cannot run is REFUSED here (see `refuse_bad_chains`) rather than let
+    # `Template#apply_chains` drop the raw, untransformed value onto the socket.
     private def marked_request_bytes : Bytes
-      finalize_wire(render_marked(expanded_editor_bytes))
+      finalize_wire(render_marked(expanded_editor_bytes, refuse: true))
     end
 
     # Render the §…§ template in `raw` (each marked default through its inline Decoder
@@ -1581,9 +1585,61 @@ module Gori::Tui
     # send AND the CL reflection so both derive Content-Length from the SAME rendered body —
     # otherwise the visible header showed a CL for the raw marked text while ^R sent one for
     # the rendered body.
-    private def render_marked(raw : Bytes) : Bytes
+    #
+    # `refuse` is OFF for the render/CL-reflection caller and ON only for the send: this runs
+    # on every frame while the operator types, so a broken chain must NOT raise here (it would
+    # crash the tab the operator is using to FIX the chain). The send path alone refuses.
+    private def render_marked(raw : Bytes, refuse : Bool = false) : Bytes
       tmpl = Fuzz::Template.parse(String.new(raw))
-      tmpl.render(tmpl.apply_chains(tmpl.default_payloads, Decoder.shared_registry))
+      registry = Decoder.shared_registry
+      refuse_bad_chains(tmpl, registry) if refuse
+      tmpl.render(tmpl.apply_chains(tmpl.default_payloads, registry))
+    end
+
+    # Refuse a send whose `§value¦chain§` markers name a converter that cannot run over the
+    # value about to go on the wire. The twin of `Fuzz::Plan#refuse_unusable_chains`, and it
+    # exists for the same reason: `Template#apply_chains` returns the value UNTRANSFORMED when
+    # its chain does not run (`Decoder.run` never raises), so a §…§ marker whose chain is
+    # unknown, names an unusable saved chain, or simply fails on its value would put the RAW
+    # value on the wire under a clean-looking send — a corrupted request, not a refusal.
+    #
+    # Where the Fuzzer runs many payloads per marked position and so refuses only the two
+    # TEMPLATE-level failures (unknown converter / unusable saved chain), leaving a genuinely
+    # per-payload failure to the next payload, the Repeater sends exactly ONE value — the
+    # marked default — so a chain that fails on THAT value IS the value that would go out
+    # untransformed. The unknown/unusable wording is byte-identical to `Fuzz::Plan` so the two
+    # engines report the same failure the same way (see `Fuzz::ChainError`); the per-value
+    # failure is the extra case a single-send surface must also name.
+    private def refuse_bad_chains(tmpl : Fuzz::Template, registry : Decoder::Registry) : Nil
+      bad = [] of String
+      tmpl.positions.each do |pos|
+        next if pos.chain.empty?
+        # The template-level failures, worded exactly as Fuzz::Plan#refuse_unusable_chains.
+        resolvable = true
+        Decoder.parse_spec(pos.chain).each do |tok|
+          conv = registry[tok]?
+          if conv.nil?
+            bad << "#{tok}: unknown converter"
+            resolvable = false
+          elsif reason = conv.unusable
+            bad << reason # already prefixed with the chain's own name
+            resolvable = false
+          end
+        end
+        # Then the per-value failure: base64-decode over a value that isn't base64, etc. A
+        # Fuzz sweep leaves this to the next payload; a repeater send has no next payload, so
+        # the marked default going out raw is the corruption to refuse.
+        next unless resolvable
+        res = Decoder.run(registry, pos.default.to_slice, pos.chain)
+        unless res.ok?
+          step = res.steps[res.failed_at || 0]
+          bad << "#{step.name}: #{step.error || "chain failed"}"
+        end
+      end
+      return if bad.empty?
+      raise Fuzz::ChainError.new("§…§ chain cannot run: #{bad.uniq.join("; ")}. " \
+                                 "The payload would go out untransformed — fix or remove the chain " \
+                                 "(list the converters with `gori run decoder list`)")
     end
 
     # A repeater round-trip is outstanding (set/cleared by the Runner around the

@@ -588,6 +588,44 @@ describe Gori::Tui::RepeaterView do
     sent.includes?("Content-Length: 99").should be_false
   end
 
+  # A §…§ marker whose `¦chain` cannot run must REFUSE the send with a named ChainError
+  # (mirroring Fuzz::Plan#refuse_unusable_chains) — never drop the raw, untransformed value
+  # onto the wire. See RepeaterView#refuse_bad_chains.
+  it "refuses a §…§ send whose ¦chain names a MISSING converter (no bytes on the wire)" do
+    view = RepeaterView.new
+    view.restore("https://a.test",
+      "POST /x HTTP/1.1\nHost: a.test\n\ntok=§secret¦nosuchconv§", false, true)
+    ex = expect_raises(Gori::Fuzz::ChainError, /nosuchconv/) do
+      view.request_bytes
+    end
+    ex.message.not_nil!.should contain("unknown converter")
+    ex.message.not_nil!.should contain("would go out untransformed")
+  end
+
+  it "refuses a §…§ send whose ¦chain FAILS on its value (hex-decode over non-hex)" do
+    view = RepeaterView.new
+    # hex-decode over "secret" raises (non-hex chars) — the marked default is the one value
+    # going out, so unlike a Fuzz sweep there is no next payload; the raw value must not ship.
+    view.restore("https://a.test",
+      "POST /x HTTP/1.1\nHost: a.test\n\ntok=§secret¦hex-decode§", false, true)
+    expect_raises(Gori::Fuzz::ChainError, /hex-decode/) do
+      view.request_bytes
+    end
+  end
+
+  it "sends byte-exact when a §…§ ¦chain is VALID (the complement — must not over-refuse)" do
+    view = RepeaterView.new
+    view.restore("https://a.test",
+      "POST /x HTTP/1.1\nHost: a.test\n\ntok=§secret¦base64-encode§", false, true)
+    String.new(view.request_bytes).should contain("tok=c2VjcmV0") # runs, no refusal
+  end
+
+  it "leaves a request with NO §…§ marker unaffected by the chain refusal" do
+    view = RepeaterView.new
+    view.restore("https://a.test", "POST /x HTTP/1.1\nHost: a.test\n\nq=hi", false, false)
+    String.new(view.request_bytes).should eq("POST /x HTTP/1.1\r\nHost: a.test\r\n\r\nq=hi")
+  end
+
   it "CHAIN pane: focus a marker, type a chain, commit writes it back" do
     view = RepeaterView.new
     # marker at offset 0 → set_text zeroes the cursor, so it sits inside §v§
