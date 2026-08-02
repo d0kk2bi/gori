@@ -25,6 +25,13 @@ private def body_of(bytes : Bytes) : Bytes
   i ? bytes[i + 4, bytes.size - (i + 4)] : Bytes.empty
 end
 
+# The bytes the returned spans actually cover, concatenated — the exact text a send seam would
+# copy through verbatim (and NOT scan for a `$NAME`). Slices the FINAL bytes at each span, so a
+# wrong offset (e.g. an unshifted Content-Length trap) shows up as the wrong text here.
+private def covered(bytes : Bytes, spans : Array({Int32, Int32})) : String
+  String.build { |s| spans.each { |(a, b)| s.write(bytes[a, b - a]) } }
+end
+
 describe Gori::Miner::Inject do
   it "appends a query param when there is no query string" do
     res = M::Inject.apply(req("GET /a HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Query, [{"p", "v"}])
@@ -216,6 +223,90 @@ describe Gori::Miner::Inject do
   it "strips CR/LF from injected header values (smuggling guard)" do
     res = M::Inject.apply(req("GET /a HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Headers, [{"X-Test", "a\r\nEvil: 1"}])
     text(res).should eq("GET /a HTTP/1.1\r\nHost: h\r\nX-Test: aEvil: 1\r\n\r\n")
+  end
+
+  # `apply_with_spans` must return the byte ranges of the INJECTED name/value in the FINAL
+  # bytes so a send seam marks them verbatim (mirrors Fuzz::Job#payload_spans). If the spans
+  # were wrong the covered text would not equal the injected content, and a `$NAME` in a
+  # wordlist term would expand to a live session credential on the wire. Seed bytes must never
+  # be covered. The Content-Length-syncing locations (form/json/multipart) deliberately cross a
+  # digit boundary so the span-shift-across-sync path is exercised.
+  describe "#apply_with_spans span coverage" do
+    it "query: spans cover exactly the injected pair, seed excluded" do
+      bytes, spans = M::Inject.apply_with_spans(
+        req("GET /a?seedq=SEEDVAL HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Query, [{"pMINE", "vCANARY"}])
+      spans.should_not be_empty
+      covered(bytes, spans).should eq("pMINE=vCANARY")
+    end
+
+    it "form: spans cover the injected pair after Content-Length resync (digit shift)" do
+      # body "x=1" (CL 3) → +"&pMINE=vCANARY" → CL "17": the 1→2 digit growth shifts every
+      # body offset by one, which the span must follow.
+      base = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nx=1"
+      bytes, spans = M::Inject.apply_with_spans(req(base), M::Location::Form, [{"pMINE", "vCANARY"}], add_cl_when_missing: false)
+      text(bytes).should contain("Content-Length: 17")
+      covered(bytes, spans).should eq("pMINE=vCANARY")
+    end
+
+    it "json: spans cover the injected key/value after reserialize + resync" do
+      base = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\n{\"a\":\"1\"}"
+      bytes, spans = M::Inject.apply_with_spans(req(base), M::Location::Json, [{"pMINE", "vCANARY"}])
+      spans.should_not be_empty
+      covered(bytes, spans).should eq("\"pMINE\":\"vCANARY\"")
+      cov = covered(bytes, spans)
+      cov.should_not contain("\"a\"")
+    end
+
+    it "json: an injected key hitting every object node yields one span per node" do
+      base = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 25\r\n\r\n{\"a\":{\"b\":1},\"c\":2}"
+      bytes, spans = M::Inject.apply_with_spans(req(base), M::Location::Json, [{"pMINE", "vCANARY"}])
+      spans.size.should eq(2) # root object + nested {"b":1}
+      spans.each { |(a, b)| String.new(bytes[a, b - a]).should eq("\"pMINE\":\"vCANARY\"") }
+    end
+
+    it "multipart: spans cover the injected part (name and value), seed part excluded" do
+      base = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Type: multipart/form-data; boundary=BB\r\nContent-Length: 40\r\n\r\n--BB\r\nContent-Disposition: form-data; name=\"seedm\"\r\n\r\nSEEDVAL\r\n--BB--\r\n"
+      bytes, spans = M::Inject.apply_with_spans(req(base), M::Location::Multipart, [{"pMINE", "vCANARY"}])
+      spans.should_not be_empty
+      cov = covered(bytes, spans)
+      cov.should contain("name=\"pMINE\"")
+      cov.should contain("vCANARY")
+      cov.should_not contain("seedm")
+      cov.should_not contain("SEEDVAL")
+    end
+
+    it "headers: spans cover the injected header line, not the seed head" do
+      bytes, spans = M::Inject.apply_with_spans(
+        req("GET /a HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Headers, [{"X-Mine", "vCANARY"}])
+      covered(bytes, spans).should eq("X-Mine: vCANARY")
+    end
+
+    it "headers: one span per injected header, filtered names produce none" do
+      bytes, spans = M::Inject.apply_with_spans(
+        req("GET /a HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Headers,
+        [{"X-One", "1"}, {"Content-Length", "9"}, {"X-Two", "2"}]) # CL is a forbidden name → dropped
+      spans.size.should eq(2)
+      covered(bytes, spans).should eq("X-One: 1X-Two: 2")
+    end
+
+    it "cookies: spans cover the appended cookie on an existing Cookie header" do
+      bytes, spans = M::Inject.apply_with_spans(
+        req("GET /a HTTP/1.1\r\nHost: h\r\nCookie: s=1\r\n\r\n"), M::Location::Cookies, [{"pMINE", "vCANARY"}])
+      covered(bytes, spans).should eq("pMINE=vCANARY")
+      text(bytes).should contain("Cookie: s=1; pMINE=vCANARY") # byte-exact, unchanged from before
+    end
+
+    it "cookies: spans cover a freshly added Cookie header's value" do
+      bytes, spans = M::Inject.apply_with_spans(
+        req("GET /a HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Cookies, [{"pMINE", "vCANARY"}])
+      covered(bytes, spans).should eq("pMINE=vCANARY")
+    end
+
+    it "returns no spans when nothing is injected" do
+      bytes, spans = M::Inject.apply_with_spans(
+        req("GET /a HTTP/1.1\r\nHost: h\r\n\r\n"), M::Location::Query, [] of {String, String})
+      spans.should be_empty
+    end
   end
 end
 
