@@ -508,6 +508,10 @@ private class FakeContext < ExecContext
     @calls << :discover_toggle_pause
   end
 
+  def discover_dismiss : Nil
+    @calls << :discover_dismiss
+  end
+
   def oast_listen : Nil
     @calls << :oast_listen
   end

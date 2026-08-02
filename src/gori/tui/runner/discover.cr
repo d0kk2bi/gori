@@ -73,6 +73,10 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     discover_controller.discover_toggle_pause
   end
 
+  def discover_dismiss : Nil
+    discover_controller.discover_dismiss
+  end
+
   def goto_discover : Nil
     focus_tab(:target)
     target_controller.select_discover
