@@ -200,8 +200,10 @@ describe Gori::Tui::SpaceMenu do
     ctx.decoder_read_mode = true # so COMMON's Copy shows too, for a fuller COMMON+CONTEXT picture
     menu = SpaceMenu.new(Gori::Verbs.registry)
 
-    # Tab-bar focus (@focus == :menu): Round 5 moved Save/Load to :tab (session-level),
-    # so this is now COMMON + a real TAB group — New/Close/Copy/Save/Load all present.
+    # Tab-bar focus (@focus == :menu): COMMON + the TAB group (find/filter sub-tabs).
+    # Save/Load are COMMON too — they were :tab, which made the chain library reachable
+    # ONLY from here; see the :subtab and :chain examples below for the other two contexts
+    # that used to be missing it.
     menu.open(Gori::Verb::Scope::Decoder, :tab, ctx)
     ids = menu.entries.map(&.id)
     ids.should contain("decoder.copy")
@@ -226,25 +228,28 @@ describe Gori::Tui::SpaceMenu do
     ids.should contain("decoder.duplicate-subtab")
     menu.verb_for('e').try(&.id).should eq("decoder.rename-subtab")
     menu.verb_for('d').try(&.id).should eq("decoder.duplicate-subtab")
-    ids.should_not contain("decoder.save") # :tab-only, not :subtab — no bleed
+    ids.should contain("decoder.save")            # COMMON as of the library round
+    ids.should_not contain("decoder.find-subtab") # :tab-only, not :subtab — no bleed
 
-    # Body-pane focus: OUTPUT gets Cycle output mode + COMMON's New/Close/Copy —
+    # Body-pane focus: OUTPUT gets Cycle output mode + COMMON's New/Close/Copy/Save/Load —
     # the whole point of Round 4 is New/Close now show INSIDE the body panes too.
     menu.open(Gori::Verb::Scope::Decoder, :output, ctx)
     ids = menu.entries.map(&.id)
     ids.should contain("decoder.mode")
     ids.should contain("decoder.new")
     ids.should contain("decoder.close")
-    ids.should_not contain("decoder.save") # a DIFFERENT group (:tab) — no bleed
+    ids.should contain("decoder.save")
+    ids.should_not contain("decoder.find-subtab") # a DIFFERENT group (:tab) — no bleed
 
-    # CHAIN pane: Round 5 moved Save/Load OUT of :chain (into :tab), so CHAIN has no
-    # actions of its own left — falls back to a flat COMMON-only render (the
-    # single-group-omits-header rule), same as a single-region tab.
+    # CHAIN pane: Save/Load are COMMON, and CHAIN has no actions of its own, so this
+    # renders as a flat COMMON-only group (the single-group-omits-header rule) — which
+    # still carries the chain library, the one thing this pane most obviously wants.
     menu.open(Gori::Verb::Scope::Decoder, :chain, ctx)
     ids = menu.entries.map(&.id)
     ids.should contain("decoder.new")
     ids.should contain("decoder.close")
-    ids.should_not contain("decoder.save")
+    ids.should contain("decoder.save")
+    ids.should contain("decoder.load")
     ids.should_not contain("decoder.mode")
   end
 
@@ -410,10 +415,29 @@ describe Gori::Tui::SpaceMenu do
     ids.should contain("decoder.new")              # COMMON
     ids.should contain("decoder.rename-subtab")    # :subtab
     ids.should contain("decoder.duplicate-subtab") # :subtab
-    ids.should_not contain("decoder.save")         # a DIFFERENT section (:tab) — no bleed
-    ids.should_not contain("decoder.mode")         # a DIFFERENT section (:output) — no bleed
+    ids.should contain("decoder.save")             # COMMON — the strip is where a conversion is managed
+    ids.should contain("decoder.load")
+    ids.should_not contain("decoder.mode")        # a DIFFERENT section (:output) — no bleed
+    ids.should_not contain("decoder.find-subtab") # a DIFFERENT section (:tab) — no bleed
     menu.verb_for('e').try(&.id).should eq("decoder.rename-subtab")
     menu.verb_for('d').try(&.id).should eq("decoder.duplicate-subtab")
+    menu.verb_for('s').try(&.id).should eq("decoder.save")
+    menu.verb_for('o').try(&.id).should eq("decoder.load")
+  end
+
+  # The other context the :tab tagging hid the library from, and the one that reads worst:
+  # the CHAIN pane is where the spec being saved is on screen and under the caret.
+  it "offers Decoder's Save/Load from inside the CHAIN pane" do
+    ctx = FakeExecContext.new
+    ctx.current_tab = :decoder
+    menu = SpaceMenu.new(Gori::Verbs.registry)
+
+    menu.open(Gori::Verb::Scope::Decoder, :chain, ctx)
+    ids = menu.entries.map(&.id)
+    ids.should contain("decoder.save")
+    ids.should contain("decoder.load")
+    menu.verb_for('s').try(&.id).should eq("decoder.save")
+    menu.verb_for('o').try(&.id).should eq("decoder.load")
   end
 
   it "populates Notes' :subtab group with duplicate (content-only clone from the strip)" do

@@ -33,6 +33,24 @@ module Gori
       r.register Verb::Definition.new(
         "rewriter.reload", "Reload rules", "Re-read rules from the project DB (pick up external edits)",
         Verb::Scope::Rewriter, available: in_rw, mnemonic: 'r') { |ctx| ctx.rewriter_reload; nil }
+
+      # The global rule-preset library (settings.json `rewriter.presets`) — the Decoder's
+      # named chains, one table over. A Match & Replace rule is a RECIPE ("strip CSP on
+      # *.corp.internal"): reusable on the next engagement, while which rules are live in
+      # THIS project stays in the project DB. Same 's'/'o' mnemonics the Decoder uses for
+      # the same pair, so the gesture is one thing to learn.
+      #
+      # Save gates on has_rule (there must be a rule to save), load only on the RULES
+      # sub-tab: loading appends to the Match&Replace list, so offering it while the
+      # `extract`/`bindings` sub-tab is on screen would write to a table the operator is
+      # not looking at — the leak `rewriter_rule_selected?` documents, one verb over.
+      in_rules = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter && ctx.rewriter_rules_sub? }
+      r.register Verb::Definition.new(
+        "rewriter.save-preset", "Save rule to library", "Save the selected rule under a name, shared by every project",
+        Verb::Scope::Rewriter, available: has_rule, mnemonic: 's') { |ctx| ctx.rewriter_save_preset; nil }
+      r.register Verb::Definition.new(
+        "rewriter.load-preset", "Load a saved rule", "Add a rule from the global library to this project (^X deletes one)",
+        Verb::Scope::Rewriter, available: in_rules, mnemonic: 'o') { |ctx| ctx.rewriter_load_preset; nil }
     end
   end
 end

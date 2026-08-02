@@ -39,7 +39,9 @@ gzip-decompress | json-unescape
 
 Aliases work the same as the primary name (`b64` → `base64-encode`, `url` → `url-encode`, and so on). Autocomplete helps when the name is fuzzy.
 
-Save a chain under a name (**Save chain by name** from the space menu) and reload it later. Named chains live under the `decoder` section of settings and are shared by every project — the chain is a recipe, while what you run through it stays with the project.
+Save a chain under a name (**Save chain by name** from the space menu, or `Ctrl-S`) and reload it later. The save prompt starts from the sub-tab's own name, and saving under a name that already exists updates it. **Load a saved chain** (`Ctrl-O`) opens a picker over everything you've saved, showing each chain's spec next to its name, so you don't have to remember what you called it — type to filter, and `Ctrl-X` deletes the highlighted entry from the library. Both entries are in the space menu wherever you are in the tab: the sub-tab strip, the tab bar, or inside a pane.
+
+Named chains live under the `decoder` section of settings and are shared by every project — the chain is a recipe, while what you run through it stays with the project. The Rewriter keeps [a library of rules](/guide/proxy/#reusing-a-rule-across-projects) the same way.
 
 ## Converters
 

@@ -11,4 +11,7 @@ abstract class Gori::Verb::ExecContext
   abstract def rewriter_duplicate : Nil         # copy the selected rule
   abstract def rewriter_reload : Nil            # re-read rules from the DB (external edits)
   abstract def rewriter_rule_selected? : Bool   # a rule is selected (gates edit/delete/… verbs)
+  abstract def rewriter_rules_sub? : Bool       # the RULES sub-tab is on screen (gates load-preset)
+  abstract def rewriter_save_preset : Nil       # save the selected rule to the global library (name popup)
+  abstract def rewriter_load_preset : Nil       # add a rule from the global library (picker popup)
 end

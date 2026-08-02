@@ -323,28 +323,15 @@ module Gori::Tui
       Frame.scroll_gauge(screen, body, lines.size, top, focused)
     end
 
+    # Both moved onto `Rules` (rules.cr) when the global rule-preset library started
+    # rendering the same two strings: a preset's picker row and the list row it becomes on
+    # load must read identically, and two copies of this formatting would drift.
     private def op_tag(rule : Store::MatchRule) : String
-      case rule.op
-      when .replace?
-        kind = rule.match_kind.regex? ? "re" : "sub"
-        "#{kind}/#{rule.part.badge}"
-      when .add_header?    then "+hdr"
-      when .set_header?    then "~hdr"
-      when .remove_header? then "-hdr"
-      when .short_circuit? then "stub"
-      else                      "?"
-      end
+      Rules.op_tag(rule)
     end
 
     private def describe(rule : Store::MatchRule) : String
-      case rule.op
-      when .add_header?, .set_header? then "#{rule.pattern}: #{rule.replacement}"
-      when .remove_header?            then rule.pattern
-        # `⇥` (not `→`) because a stub does not transform the request into the response — it
-        # answers instead of forwarding, and the row should not read like the other four ops.
-      when .short_circuit? then "#{rule.pattern} ⇥ #{RuleStub.summary(rule.replacement, rule.body_file)}"
-      else                      "#{rule.pattern} → #{rule.replacement}"
-      end
+      Rules.describe(rule)
     end
 
     # Visible row count inside the list card (for scroll clamping).

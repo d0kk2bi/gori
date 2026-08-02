@@ -56,10 +56,8 @@ module Gori::Tui
       @registry = Decoder.default_registry
       @popup = ChainComplete.new
       @popup_engaged = false # false = passive full-list menu (Tab still navigates panes)
-      @prompt = nil          # :save_as | :load inline mini-prompt (else nil)
-      @prompt_buf = ""
-      @chain_pre = "" # IME preedit for the focused CHAIN field
-      @dirty = false  # session set changed since the last persist
+      @chain_pre = ""        # IME preedit for the focused CHAIN field
+      @dirty = false         # session set changed since the last persist
       # Restore this project's open sub-tabs. Always ≥1 (a blank session when nothing was
       # persisted).
       src = restore_sessions
@@ -241,7 +239,7 @@ module Gori::Tui
           s.view.render(screen, body,
             input: s.input, chain: s.chain, chain_cx: s.chain_cx, chain_pre: @chain_pre,
             result: s.result, pane: s.pane, focused: body_focused,
-            popup: @popup, prompt: @prompt, prompt_buf: @prompt_buf,
+            popup: @popup,
             input_mode: s.input_mode, input_read: s.input_read)
         end
       end
@@ -251,7 +249,6 @@ module Gori::Tui
     # and @focus == :body. READ input/output return false so command letters hit the
     # keymap (rebindable copy + Global breath); INS/chain still swallow printables.
     def handle_body_key(ev : Termisu::Event::Key) : Bool
-      return handle_prompt_key(ev) if @prompt # save/load mini-prompt is modal-in-body
       key = ev.key
       c = ev.char || key.to_char
       if ev.ctrl? && key.lower_p? # mirror notes_controller.cr
@@ -270,9 +267,9 @@ module Gori::Tui
       elsif ev.ctrl? && key.lower_x?
         cycle_output_mode
       elsif ev.ctrl? && key.lower_s?
-        open_prompt(:save_as)
+        @host.open_chain_save
       elsif ev.ctrl? && key.lower_o?
-        open_prompt(:load)
+        @host.open_chain_load
       elsif key.escape?
         @popup.close
         s = cur
@@ -426,8 +423,6 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
-      return "type a name · ↵ save · esc cancel" if @prompt == :save_as
-      return "type a name · ↵ load · esc cancel" if @prompt == :load
       s = cur
       y = Hotkeys.binding_label(@host.session.registry, "decoder.copy", "y")
       case s.pane
@@ -831,31 +826,25 @@ module Gori::Tui
       s.view.reset_output_scroll
     end
 
-    # ---- save / load named chains (in-body mini-prompt; no runner overlay) ----
-    def open_prompt(kind : Symbol) : Nil
-      @prompt = kind
-      @prompt_buf = ""
+    # ---- save / load named chains (global settings.json; the shell owns the modals) ----
+    # The Runner builds NamePromptOverlay / LibraryPicker from these and calls back in — the
+    # library itself is global, but WHICH conversion is being saved into it, and which one a
+    # loaded spec lands on, are this controller's state.
+
+    # The active conversion's chain spec — what a save writes, and the prompt's subject line.
+    def chain_spec : String
+      cur.chain
     end
 
-    private def handle_prompt_key(ev : Termisu::Event::Key) : Bool
-      key = ev.key
-      c = ev.char || key.to_char
-      case
-      when key.escape?
-        @prompt = nil
-      when key.enter?
-        name = @prompt_buf.strip
-        @prompt == :save_as ? save_chain(name) : load_chain(name)
-        @prompt = nil
-      when key.backspace?
-        @prompt_buf = @prompt_buf[0, {@prompt_buf.size - 1, 0}.max]
-      else
-        @prompt_buf += c.to_s if c && !ev.ctrl? && !ev.alt?
-      end
-      true
+    # The prompt's default name: the sub-tab's own chip label. Seeding it is the point of the
+    # popup — an operator who already named the conversion "jwt peel" should not have to type
+    # that again to save its chain under the same name. nil (never renamed) seeds blank
+    # rather than the auto-derived label, which is just the chain spec echoed back.
+    def subtab_name : String
+      cur.view.name || ""
     end
 
-    private def save_chain(name : String) : Nil
+    def save_chain(name : String) : Nil
       if name.empty?
         @host.status("chain name required")
         return
@@ -876,17 +865,16 @@ module Gori::Tui
       end
     end
 
-    private def load_chain(name : String) : Nil
-      if entry = Settings.decoder_chains.find { |(n, _)| n == name }
-        s = cur
-        s.chain = entry[1]
-        s.chain_cx = s.chain.size
-        @popup.close
-        touch
-        @host.status("loaded chain \"#{name}\"")
-      else
-        @host.status("no saved chain \"#{name}\"")
-      end
+    # Apply a library entry to the active conversion. Keyed by SPEC, not by name: the picker
+    # hands back the row the operator actually highlighted, so re-looking it up by name here
+    # would only add a way for the two to disagree.
+    def load_chain(name : String, spec : String) : Nil
+      s = cur
+      s.chain = spec
+      s.chain_cx = s.chain.size
+      @popup.close
+      touch
+      @host.status("loaded chain \"#{name}\"")
     end
   end
 end

@@ -46,13 +46,19 @@ describe "Gori::Verbs.register_decoder" do
     }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
   end
 
-  it "puts save/load in :tab so the tab-bar menu has a group of its own" do
-    # This is what seeds has_section?(Decoder, :tab); without it the tab-bar space menu
-    # falls back to whichever body pane happened to be focused last.
-    r["decoder.save"].section.should eq(:tab)
-    r["decoder.load"].section.should eq(:tab)
+  it "keeps save/load in COMMON so the chain library is reachable from every context" do
+    # These were :tab, which put them ONLY in the tab-bar menu: from the sub-tab strip and
+    # from inside the CHAIN pane — where the spec being saved is on screen — they were
+    # invisible, and saving meant walking focus back up to the tab bar. Same fix New/Close
+    # got in Round 4, and for the same reason.
+    r["decoder.save"].section.should eq(:common)
+    r["decoder.load"].section.should eq(:common)
     verb_intents(r, "decoder.save").should eq([:decoder_save])
     verb_intents(r, "decoder.load").should eq([:decoder_load])
+    # find/filter-subtab are what keep has_section?(Decoder, :tab) alive now, so the
+    # tab-bar menu still renders a deliberate TAB group rather than falling back to
+    # whichever body pane happened to be focused last.
+    Gori::Verbs.registry.has_section?(Gori::Verb::Scope::Decoder, :tab).should be_true
   end
 
   it "gates Copy on a read-mode pane and routes it through the shared read_copy" do

@@ -1089,6 +1089,16 @@ private class FakeContext < ExecContext
     true
   end
 
+  def rewriter_rules_sub? : Bool
+    true
+  end
+
+  def rewriter_save_preset : Nil
+  end
+
+  def rewriter_load_preset : Nil
+  end
+
   def notes_new : Nil
     @calls << :notes_new
   end

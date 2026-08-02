@@ -56,6 +56,12 @@ module Gori::Tui
     ScopeRule
     SequenceConfig
     MineConfig
+    # The two halves of a named GLOBAL library (settings.json), shared by the Decoder's
+    # chain specs and the Rewriter's rule presets: NamePromptOverlay writes, LibraryPicker
+    # reads. One pair rather than four kinds — the modal is the same in both tabs, only
+    # its rows and its injected on_commit differ.
+    NamePrompt
+    LibraryPick
     # Prompt-tier pickers. These two name a modal that `@overlay` NEVER holds: copy-as
     # and send-to float over whatever is underneath (a tab body OR the History detail
     # drill-in) without disturbing it, and are claimed before the ^G/^F/^B guards, so the

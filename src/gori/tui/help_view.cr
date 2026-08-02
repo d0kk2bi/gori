@@ -145,15 +145,31 @@ module Gori::Tui
         Item.new("↹ / ↵", "complete the suggested converter (popup)"),
         Item.new("OUTPUT", "↑/↓ move · ⇧arrows select · y copy · ⇧←/→ h-scroll"),
         Item.new("^Y · ^X", "copy all output · cycle text/hex/base64"),
-        Item.new("^S · ^O", "save chain by name · load a saved chain"),
+        Item.new("^S · ^O", "save the chain under a name · pick from the saved chains"),
+        Item.new("chain library", "shared by every project · picker: type to filter · ^X deletes an entry"),
         Item.new("^N · ^W", "new · close conversion sub-tab"),
         Item.new("^1-9 · r", "switch sub-tab · rename (on the strip)"),
-        Item.new("space", "command menu (on the sub-tab strip)"),
+        Item.new("space", "command menu (anywhere in the tab — Save/Load included)"),
+      ]},
+      {"REWRITER", [
+        Item.new("a · ↵/e", "add a Match & Replace rule · edit the selected one"),
+        Item.new("x · d", "enable/disable · delete the selected rule"),
+        Item.new("⇧J / ⇧K", "reorder — rules apply top to bottom"),
+        Item.new("[ / ]", "switch sub-tab: rules · extract · bindings"),
+        Item.new("↓ past the list", "the editable preview sample, and the same message after the rules run"),
+        # No verb_id: these are space-menu MNEMONICS, not chords. binding_label would swap
+        # the literal for a chord the moment either verb gained one, and the row names two
+        # verbs at once — one chord could not stand for both.
+        Item.new("space → s · o", "save the selected rule to the library · add one from it"),
+        Item.new("rule library", "shared by every project · picker: type to filter · ^X deletes an entry"),
       ]},
       {"OVERLAYS", [
         Item.new("palette / settings", "↑/↓ · ↵ · esc"),
         Item.new("confirm", "←/→ choose · y / n · ↵"),
         Item.new("Settings: Editor", "toggle mouse support (Mouse field)"),
+        # No row for the save/load library modals here: the DECODER and REWRITER sections
+        # each already state it, and the key column truncates at ~20 cols anyway ("save /
+        # load a libra…"), so a third copy would be both redundant and unreadable.
       ]},
     ]
 

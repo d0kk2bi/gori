@@ -479,6 +479,48 @@ module Gori::Tui
       @host.status("rules reloaded")
     end
 
+    # --- the global rule-preset library (settings.json `rewriter.presets`) ---------------
+    # The shell owns the two modals (Runner#open_rule_preset_save / #open_rule_preset_load);
+    # these are the halves that touch the rule set.
+
+    # Copy the rule's FIELDS into the library under `name`. A preset is a recipe, so what
+    # does NOT travel is as deliberate as what does: no id (it names a row in THIS project's
+    # DB), no position (apply order is a property of a list, not of one rule) and no enabled
+    # state (see load_rule_preset).
+    def save_rule_preset(rule : Store::MatchRule, name : String) : Nil
+      if name.empty?
+        @host.status("rule name required")
+        return
+      end
+      ok, existing = Settings.save_rewriter_preset(name, rule.target.label, rule.part.label,
+        rule.pattern, rule.replacement, rule.op.label, rule.match_kind.label,
+        rule.host, rule.body_file)
+      unless ok
+        @host.status("could not save rule to the library")
+        return
+      end
+      @host.status(existing ? "updated saved rule \"#{name}\"" : "saved rule \"#{name}\" to the library")
+    end
+
+    # APPEND the preset as a new rule in this project — never a merge, never a replacement
+    # of the current list. One preset is one rule precisely so loading needs no policy: it
+    # lands at the end of the apply order, where `u`/`n` can move it, and the rules already
+    # there are untouched.
+    #
+    # It arrives ENABLED, like Duplicate and like the editor's Add, so "load" means the same
+    # thing every other way of putting a rule in this list means. That does start rewriting
+    # live traffic, which is why the toast names the rule instead of just saying "loaded".
+    def load_rule_preset(preset : Settings::RulePreset) : Nil
+      r = preset.to_rule
+      rules_engine.add(r.target, r.part, r.pattern, r.replacement,
+        r.op, r.match_kind, r.name, r.host, r.body_file)
+      # `add` refuses an empty pattern silently; the parse layer drops those, so a preset can
+      # never carry one — but select the row by COUNT rather than assuming, so a future
+      # refusal can't leave the cursor pointing past the end.
+      @sel = {rule_list.size - 1, 0}.max
+      @host.status("added rule \"#{preset.name}\" from the library")
+    end
+
     # Commit the editor overlay: add a new rule or update the edited one, then re-select it.
     def apply_rewriter_rule(ov : RewriterRuleOverlay) : Bool
       return false unless ov.valid?
