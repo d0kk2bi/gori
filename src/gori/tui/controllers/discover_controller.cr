@@ -14,6 +14,10 @@ module Gori::Tui
   # MinerController (start_run / drain_events / apply_event + the drain-before-rebind race
   # fix). Composed by TargetController, so it exposes frameless render_content /
   # handle_click_content seams instead of owning the tab frame.
+  #
+  # The body is two panes (RUNS list ↹ FINDINGS table): every launched run keeps a row, and
+  # ^R/^X/p act on the SELECTED row, so a crawl started before the current one is still
+  # reachable — see DiscoverView's note on what the single-card version cost.
   class DiscoverController < TabController
     DRAIN_CAP = 512
 
@@ -45,7 +49,11 @@ module Gori::Tui
 
     def body_hint(focus : Symbol) : String
       return "start from Sitemap/History (space → \"Discover here\")" if @view.empty?
-      "↑/↓ nav · [ / ] runs · ^R run · ^X stop · p pause · space cmds · esc tabs"
+      if @view.focus == :runs
+        "↑/↓ runs · tab findings · ^R run · ^X stop · p pause · d dismiss · space cmds · esc tabs"
+      else
+        "↑/↓ nav · tab runs · [ / ] runs · ^R run · ^X stop · p pause · d dismiss · esc tabs"
+      end
     end
 
     # --- rendering (frameless seam for TargetController) ---
@@ -59,6 +67,7 @@ module Gori::Tui
 
     def handle_click_content(content : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
+      @view.click(content, mx, my)
       true
     end
 
@@ -68,40 +77,78 @@ module Gori::Tui
 
     # --- input ---
     def handle_body_key(ev : Termisu::Event::Key) : Bool
-      key = ev.key
-      if @view.empty?
-        if key.escape? || key.up? || key.lower_k?
-          @host.request_focus(:subtabs) # pop to Target's Sitemap|Discover strip (self-downgrades to :menu with no strip)
-          return true
-        end
-        return false
-      end
-      if key.space? && !ev.ctrl? && !ev.alt?
+      return handle_empty_key(ev) if @view.empty?
+      if ev.key.space? && !ev.ctrl? && !ev.alt?
         @host.open_space_menu
         return true
       end
-      return false if (ev.ctrl? || ev.alt?) && !key.escape? # ^R/^X/^P fall through to the verb keymap
-      c = ev.char || key.to_char
+      return false if (ev.ctrl? || ev.alt?) && !ev.key.escape? # ^R/^X/^P fall through to the verb keymap
+      return true if handle_pane_chord(ev)
+      @view.focus == :runs ? handle_runs_key(ev) : handle_findings_key(ev)
+    end
+
+    private def handle_empty_key(ev : Termisu::Event::Key) : Bool
+      key = ev.key
+      return false unless key.escape? || key.up? || key.lower_k?
+      @host.request_focus(:subtabs) # pop to Target's Sitemap|Discover strip (self-downgrades to :menu with no strip)
+      true
+    end
+
+    # Keys that mean the same thing in either pane.
+    private def handle_pane_chord(ev : Termisu::Event::Key) : Bool
+      c = ev.char || ev.key.to_char
       case
-      when key.escape?             then @host.request_focus(:subtabs)
-      when key.up?, key.lower_k?   then @view.at_top? ? @host.request_focus(:subtabs) : @view.move(-1)
+      when ev.key.escape? then @host.request_focus(:subtabs)
+      when c == '['       then @view.move_run(-1) # cycling still works from either pane
+      when c == ']'       then @view.move_run(1)
+      when c == 'p'       then discover_toggle_pause
+      else                     return false
+      end
+      true
+    end
+
+    # RUNS list: ↑/↓ walk the runs (which is what ^R/^X/p then act on), stepping off the
+    # bottom into the findings table and off the top to the Sitemap|Discover strip.
+    private def handle_runs_key(ev : Termisu::Event::Key) : Bool
+      key = ev.key
+      case
+      when key.up?, key.lower_k?   then @view.runs_at_top? ? @host.request_focus(:subtabs) : @view.move_run(-1)
+      when key.down?, key.lower_j? then @view.runs_at_bottom? ? @view.focus_pane(:findings) : @view.move_run(1)
+      else                              return false
+      end
+      true
+    end
+
+    private def handle_findings_key(ev : Termisu::Event::Key) : Bool
+      key = ev.key
+      case
+      when key.up?, key.lower_k?   then @view.findings_at_top? ? @view.focus_pane(:runs) : @view.move(-1)
       when key.down?, key.lower_j? then @view.move(1)
-      when c == '['                then @view.switch(-1)
-      when c == ']'                then @view.switch(1)
-      when c == 'p'                then discover_toggle_pause
       else                              return false
       end
       true
     end
 
     def body_scroll(delta : Int32) : Bool
-      @view.move(delta)
-      true
+      handle_wheel(delta)
     end
 
     def handle_wheel(step : Int32) : Bool
-      @view.move(step)
+      @view.focus == :runs ? @view.move_run(step) : @view.move(step)
       true
+    end
+
+    # --- focus ring ---
+    def pane_advance(dir : Int32) : Bool
+      @view.empty? ? false : @view.pane_advance(dir)
+    end
+
+    def focus_first : Nil
+      @view.focus_first
+    end
+
+    def focus_last : Nil
+      @view.focus_last
     end
 
     # --- verbs (delegated by the Runner's ExecContext) ---
@@ -119,20 +166,49 @@ module Gori::Tui
       start_run(run)
     end
 
+    # Stops the SELECTED run, not "the" run — with several crawls in flight the operator has
+    # to be told which row ^X landed on, and told when it landed on a finished one instead of
+    # silently doing nothing while another run keeps sending.
     def discover_stop : Nil
-      return unless (run = @view.current) && run.running?
+      run = @view.current
+      unless run && run.running?
+        @host.status(@view.any_running? ? "selected run is not running — ↑/↓ to the running row, then ^X" : "no run to stop")
+        return
+      end
       run.request_stop
-      @host.status("stopping…")
+      @host.status("stopping #{run.label(40)}…")
+    end
+
+    # Remove the selected run's row — the manual half of retention, since the list is append-
+    # only for the session (a long dogfood run otherwise scrolls through dozens of finished
+    # crawls). Refused while it is running or paused: the engine fiber outlives the row and
+    # `drain_events` drops events for a run that left the list, so this would orphan a crawl
+    # that is still sending. Findings already reached the Sitemap via the persist batch, so the
+    # row is the only thing lost.
+    def discover_dismiss : Nil
+      run = @view.current
+      unless run
+        @host.status("no run selected")
+        return
+      end
+      label = run.label(40)
+      unless @view.dismiss(run)
+        @host.status("#{label} is still going — ^X to stop it first")
+        return
+      end
+      @host.status(@view.empty? ? "dismissed #{label} — no runs left" : "dismissed #{label}")
     end
 
     def discover_toggle_pause : Nil
       return unless run = @view.current
       if run.paused?
         run.resume
-        @host.status("resumed")
+        @host.status("resumed #{run.label(40)}")
       elsif run.running?
         run.pause
-        @host.status("paused — p to resume")
+        @host.status("paused #{run.label(40)} — p to resume")
+      else
+        @host.status("selected run is #{run.status} — nothing to pause")
       end
     end
 

@@ -551,6 +551,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:discover_toggle_pause)
   end
 
+  def discover_dismiss : Nil
+    rec(:discover_dismiss)
+  end
+
   def goto_discover : Nil
     rec(:goto_discover)
   end

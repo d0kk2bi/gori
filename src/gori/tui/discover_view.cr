@@ -1,6 +1,7 @@
 require "./screen"
 require "./theme"
 require "./frame"
+require "./fmt"
 require "../discover"
 
 module Gori::Tui
@@ -96,15 +97,35 @@ module Gori::Tui
     end
   end
 
-  # The Discover sub-tab body: a summary/control card + a live findings table for the
-  # SELECTED run (multiple runs cycle with [ / ]). Read-only — runs are launched from the
-  # config overlay (Sitemap/History space menu or ^R here).
+  # The Discover sub-tab body: a RUNS list over every session launched this run of the TUI
+  # (in flight AND finished) + a live findings table for the SELECTED run. Runs are launched
+  # from the config overlay (Sitemap/History space menu, or ^R here to re-run the selected
+  # one); ^X/p act on the SELECTED row.
+  #
+  # Every run stays on screen because every action here is per-run. The pane used to draw a
+  # single summary card for `current` and cycle with [ / ]: launching a second `Discover
+  # here` moved the selection to the new run and left the first one — still crawling — with
+  # no visible row, no status, and no reachable ^X.
   class DiscoverView
+    PANE_ORDER = [:runs, :findings]
+
+    # Run-row column widths. The blocks are laid out from the right edge and DROP when the
+    # body is narrow (counts first, then techniques) so a run's target and its status —
+    # the two things an action needs — survive at any width.
+    RUN_STATUS_W   =  9
+    RUN_TECH_W     = 13
+    RUN_COUNT_W    = 20
+    RUN_TARGET_MIN = 16
+
+    getter focus : Symbol
+
     def initialize
       @runs = [] of DiscoverRun
       @sel = 0
       @fsel = 0
       @scroll = 0
+      @rscroll = 0
+      @focus = :runs
     end
 
     def empty? : Bool
@@ -139,9 +160,7 @@ module Gori::Tui
 
     def select_run_by_id(id : Int32) : Nil
       if idx = @runs.index { |r| r.id == id }
-        @sel = idx
-        @fsel = 0
-        @scroll = 0
+        select_run(idx)
       end
     end
 
@@ -149,7 +168,58 @@ module Gori::Tui
       @runs.any?(&.running?)
     end
 
+    # Drop a finished run's row (the list is otherwise append-only for the whole session).
+    # REFUSES a live one — `DiscoverController#drain_events` skips events whose run is no
+    # longer in `@runs`, so removing a crawling run would leave its engine fiber sending with
+    # nothing on screen to stop it. Returns false when it refused or the run was already gone,
+    # so the caller can say why. The guard lives here, next to the array it protects, rather
+    # than only at the one call site that reports it.
+    def dismiss(run : DiscoverRun) : Bool
+      return false if run.running?
+      idx = @runs.index(&.same?(run))
+      return false unless idx
+      @runs.delete_at(idx)
+      @sel = @sel.clamp(0, {@runs.size - 1, 0}.max)
+      @fsel = 0
+      @scroll = 0
+      @rscroll = 0
+      true
+    end
+
+    # --- focus ring (RUNS list ↹ FINDINGS table) ---
+    def focus_pane(pane : Symbol) : Nil
+      @focus = pane if PANE_ORDER.includes?(pane)
+    end
+
+    def focus_first : Nil
+      @focus = :runs
+    end
+
+    def focus_last : Nil
+      @focus = :findings
+    end
+
+    def pane_advance(dir : Int32) : Bool
+      idx = PANE_ORDER.index(@focus) || 0
+      nidx = idx + dir
+      return false unless 0 <= nidx < PANE_ORDER.size
+      @focus = PANE_ORDER[nidx]
+      true
+    end
+
     # --- nav ---
+    def move_run(d : Int32) : Nil
+      switch(d)
+    end
+
+    def runs_at_top? : Bool
+      @sel <= 0
+    end
+
+    def runs_at_bottom? : Bool
+      @sel >= @runs.size - 1
+    end
+
     def move(d : Int32) : Nil
       return unless r = current
       return if r.findings.empty?
@@ -160,60 +230,160 @@ module Gori::Tui
       current.try(&.findings[@fsel]?)
     end
 
-    def at_top? : Bool
+    def findings_at_top? : Bool
       @fsel == 0
     end
 
     # --- rendering ---
     def render(screen : Screen, rect : Rect, focused : Bool) : Nil
-      sum_h = {rect.h // 3, 7}.min
-      sum_h = rect.h - 3 if sum_h > rect.h - 3
-      sum_rect = Rect.new(rect.x, rect.y, rect.w, {sum_h, 1}.max)
-      res_rect = Rect.new(rect.x, rect.y + sum_rect.h, rect.w, {rect.h - sum_rect.h, 1}.max)
-      render_summary(screen, sum_rect, focused)
-      render_findings(screen, res_rect, focused)
+      runs_rect = Rect.new(rect.x, rect.y, rect.w, runs_pane_height(rect))
+      res_rect = Rect.new(rect.x, rect.y + runs_rect.h, rect.w, {rect.h - runs_rect.h, 1}.max)
+      render_runs(screen, runs_rect, focused && @focus == :runs)
+      render_findings(screen, res_rect, focused && @focus == :findings)
     end
 
-    private def render_summary(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "DISCOVER", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+    # The RUNS card grows a row per run so a second and third crawl are VISIBLE rather than
+    # cycled to. It stops growing once the findings table is down to its last six rows (the
+    # list scrolls from there), and on a body too short for even that the card is clamped to
+    # `rect.h - 3` so the findings card is never squeezed out of existence.
+    private def runs_pane_height(rect : Rect) : Int32
+      # borders(2) + column header(1) + one row per run + divider(1) + detail(2)
+      h = {@runs.size + 6, {rect.h - 6, 7}.max}.min
+      h = rect.h - 3 if h > rect.h - 3
+      {h, 1}.max
+    end
+
+    # {rows_y, rows_cap, detail_y} for the RUNS card's interior — the row band and the
+    # selected-run detail band. Shared by render and the click hit-test so a click can't
+    # land on a row the renderer put somewhere else. `detail_y` is -1 when the card is too
+    # short for the detail band (it is the first thing to go).
+    private def run_bands(card : Rect) : {Int32, Int32, Int32}
+      inner = card.inset(1, 1)
+      return {inner.y, 0, -1} if inner.h <= 0
+      detail_h = inner.h >= 5 ? 3 : 0
+      list_h = inner.h - detail_h
+      hdr = list_h >= 2 ? 1 : 0
+      {inner.y + hdr, {list_h - hdr, 1}.max, detail_h > 0 ? inner.y + list_h : -1}
+    end
+
+    private def render_runs(screen : Screen, rect : Rect, focused : Bool) : Nil
+      title = "RUNS (#{@runs.size})"
+      Frame.card(screen, rect, title, border: Frame.pane_border(focused), bg: Theme.bg)
+      inner = rect.inset(1, 1)
+      return if inner.h <= 0 || inner.w <= 0
       r = current
       unless r
-        screen.text(rect.x + 2, rect.y + 1,
-          "no runs — from Sitemap/History press space → \"Discover here\"", Theme.muted, Theme.bg, width: rect.w - 4)
+        screen.text(inner.x + 1, inner.y,
+          "no runs — from Sitemap/History press space → \"Discover here\"", Theme.muted, Theme.bg, width: inner.w - 1)
         return
       end
-      running = r.running?
-      chord, name = running ? {"^X", "STOP"} : {"^R", "RUN"}
-      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + "DISCOVER".size + 4, chord, name, running)
-      x = rect.x + 2
-      y = rect.y + 1
-      hdr = @runs.size > 1 ? "run #{@sel + 1}/#{@runs.size}  #{r.label(rect.w - 20)}" : r.label(rect.w - 6)
-      screen.text(x, y, hdr, Theme.text_bright, Theme.bg, Attribute::Bold, width: rect.w - 4)
-      y += 1
-      if y < rect.bottom - 1
-        cap = r.config.max_requests.try { |m| " · cap #{m}" } || ""
-        screen.text(x, y, "#{r.techniques} · #{r.config.containment.label} · depth #{r.config.max_depth}#{cap}",
-          Theme.muted, Theme.bg, width: rect.w - 4)
+      # The badge tracks the SELECTED row, which is what ^R/^X act on — so a stopped run
+      # selected while another still crawls offers RUN, not STOP.
+      chord, name = r.running? ? {"^X", "STOP"} : {"^R", "RUN"}
+      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + title.size + 4, chord, name, r.running?)
+
+      rows_y, rows_cap, detail_y = run_bands(rect)
+      runs_header_row(screen, inner) if rows_y > inner.y
+      ensure_run_visible(rows_cap)
+      rows_cap.times do |i|
+        idx = @rscroll + i
+        break if idx >= @runs.size
+        draw_run_row(screen, inner, @runs[idx], idx, rows_y + i, focused)
       end
-      y += 1
-      if y < rect.bottom - 1
-        st = case r.status
-             when :error            then "error: #{r.error_msg}"
-             when :budget_exhausted then "budget exhausted · #{r.queued} queued unexplored — raise max requests to finish"
-             else                        r.status.to_s
-             end
-        screen.text(x, y, st, status_hue(r.status), Theme.bg, width: rect.w - 4)
+      Frame.scroll_gauge(screen, Rect.new(inner.x, rows_y, inner.w, rows_cap), @runs.size, @rscroll, focused)
+      return if detail_y < 0
+      Frame.inner_divider(screen, inner, detail_y, Theme.bg, Frame.pane_border(focused))
+      render_run_detail(screen, inner, detail_y + 1, r)
+    end
+
+    # Column x-offsets for one run row: {target_w, tech_x, status_x, counts_x}, where a
+    # negative x means the block does not fit and is not drawn.
+    private def run_layout(inner : Rect) : {Int32, Int32, Int32, Int32}
+      x = inner.x + 2
+      edge = inner.right
+      counts_x = -1
+      if edge - x >= RUN_TARGET_MIN + RUN_TECH_W + RUN_STATUS_W + RUN_COUNT_W
+        counts_x = edge - RUN_COUNT_W
+        edge = counts_x
       end
-      y += 1
-      if y < rect.bottom - 1
-        screen.text(x, y, "found #{r.found} · #{r.sent} sent · #{r.queued} queued · #{r.errors} err",
-          Theme.muted, Theme.bg, width: rect.w - 4)
+      status_x = edge - RUN_STATUS_W
+      status_x = -1 if status_x < x + 8
+      tech_x = -1
+      tech_x = status_x - RUN_TECH_W if status_x >= 0 && status_x - x >= RUN_TARGET_MIN + RUN_TECH_W
+      right_block = tech_x >= 0 ? tech_x : (status_x >= 0 ? status_x : edge)
+      target_w = {right_block - x - 1, 4}.max
+      {target_w, tech_x, status_x, counts_x}
+    end
+
+    private def runs_header_row(screen : Screen, inner : Rect) : Nil
+      target_w, tech_x, status_x, counts_x = run_layout(inner)
+      screen.text(inner.x + 2, inner.y, "TARGET", Theme.muted, Theme.bg, width: target_w)
+      screen.text(tech_x, inner.y, "HOW", Theme.muted, Theme.bg, width: RUN_TECH_W - 1) if tech_x >= 0
+      screen.text(status_x, inner.y, "STATUS", Theme.muted, Theme.bg, width: RUN_STATUS_W - 1) if status_x >= 0
+      screen.text(counts_x, inner.y, "FOUND·SENT·QUEUE", Theme.muted, Theme.bg, width: RUN_COUNT_W) if counts_x >= 0
+    end
+
+    private def draw_run_row(screen : Screen, inner : Rect, r : DiscoverRun, idx : Int32,
+                             py : Int32, focused : Bool) : Nil
+      sel = idx == @sel
+      bg = sel ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+      screen.fill(Rect.new(inner.x, py, inner.w, 1), bg)
+      screen.cell(inner.x, py, sel ? '▎' : ' ', Theme.accent, bg)
+      target_w, tech_x, status_x, counts_x = run_layout(inner)
+      screen.text(inner.x + 2, py, r.target, sel ? Theme.text_bright : Theme.text, bg, width: target_w)
+      screen.text(tech_x, py, r.techniques, Theme.accent, bg, width: RUN_TECH_W - 1) if tech_x >= 0
+      screen.text(status_x, py, short_status(r), status_hue(r.status), bg, width: RUN_STATUS_W - 1) if status_x >= 0
+      screen.text(counts_x, py, run_counts(r), Theme.muted, bg, width: RUN_COUNT_W) if counts_x >= 0
+    end
+
+    # `:budget_exhausted` shortened for the fixed column — the detail band below spells out
+    # what it cost. Not "done": the crawl left candidates it never looked at.
+    private def short_status(r : DiscoverRun) : String
+      r.status == :budget_exhausted ? "budget" : r.status.to_s
+    end
+
+    # Rounded (`Fmt.count`) so the column stays fixed-width on a long crawl; the detail band
+    # carries the exact figures for the selected run.
+    private def run_counts(r : DiscoverRun) : String
+      "#{Fmt.count(r.found.to_i64)}f · #{Fmt.count(r.sent)}s · #{Fmt.count(r.queued.to_i64)}q"
+    end
+
+    private def render_run_detail(screen : Screen, inner : Rect, y : Int32, r : DiscoverRun) : Nil
+      w = {inner.w - 1, 1}.max
+      cap = r.config.max_requests.try { |m| " · cap #{m}" } || ""
+      screen.text(inner.x + 1, y, "#{r.techniques} · #{r.config.containment.label} · depth #{r.config.max_depth}#{cap}",
+        Theme.muted, Theme.bg, width: w)
+      return if y + 1 >= inner.bottom
+      screen.text(inner.x + 1, y + 1, run_detail_note(r), detail_hue(r.status), Theme.bg, width: w)
+    end
+
+    # What the selected row's status COST the operator: an error's message, a budget stop's
+    # unexplored remainder (never rendered as "done" — see DiscoverRun#status), else the
+    # suppression breakdown once the engine reported stats.
+    private def run_detail_note(r : DiscoverRun) : String
+      case r.status
+      when :error
+        "error: #{r.error_msg}"
+      when :budget_exhausted
+        "budget exhausted · #{r.queued} queued unexplored — raise max requests to finish"
+      else
+        if s = r.stats
+          "fp-cut #{s.calibrated_out} · dedup #{s.dedup_suppressed} · tmpl #{s.template_suppressed} · clust #{s.cluster_suppressed}"
+        else
+          "found #{r.found} · #{r.sent} sent · #{r.queued} queued · #{r.errors} err"
+        end
       end
-      y += 1
-      if (s = r.stats) && y < rect.bottom - 1
-        screen.text(x, y, "fp-cut #{s.calibrated_out} · dedup #{s.dedup_suppressed} · tmpl #{s.template_suppressed} · clust #{s.cluster_suppressed}",
-          Theme.muted, Theme.bg, width: rect.w - 4)
-      end
+    end
+
+    private def detail_hue(s : Symbol) : Color
+      s == :error || s == :budget_exhausted ? status_hue(s) : Theme.muted
+    end
+
+    private def ensure_run_visible(cap : Int32) : Nil
+      return if cap <= 0
+      @rscroll = @sel if @sel < @rscroll
+      @rscroll = @sel - cap + 1 if @sel >= @rscroll + cap
+      @rscroll = 0 if @rscroll < 0
     end
 
     private def status_hue(s : Symbol) : Color
@@ -297,7 +467,30 @@ module Gori::Tui
 
     # --- click hit-test ---
     def pane_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
-      rect.contains?(mx, my) ? :findings : nil
+      return nil unless rect.contains?(mx, my)
+      my < rect.y + runs_pane_height(rect) ? :runs : :findings
+    end
+
+    # Focus the clicked pane, and on a RUNS row select that run — clicking a row is the
+    # discoverable way to reach an earlier crawl before pressing ^X on it.
+    def click(rect : Rect, mx : Int32, my : Int32) : Nil
+      return unless pane = pane_at(rect, mx, my)
+      focus_pane(pane)
+      return unless pane == :runs
+      card = Rect.new(rect.x, rect.y, rect.w, runs_pane_height(rect))
+      rows_y, rows_cap, _ = run_bands(card)
+      row = my - rows_y
+      return unless 0 <= row < rows_cap
+      idx = @rscroll + row
+      return unless 0 <= idx < @runs.size
+      select_run(idx)
+    end
+
+    private def select_run(idx : Int32) : Nil
+      return if idx == @sel
+      @sel = idx
+      @fsel = 0
+      @scroll = 0
     end
   end
 end

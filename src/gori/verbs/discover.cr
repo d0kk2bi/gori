@@ -10,7 +10,7 @@ module Gori
         Verb::Scope::Discover, [Verb::Chord.new("r", ctrl: true)], mnemonic: 'r') { |ctx| ctx.discover_run; nil }
 
       r.register Verb::Definition.new(
-        "discover.stop", "Stop", "Stop the running discovery (in-flight requests finish)",
+        "discover.stop", "Stop", "Stop the selected discovery run (in-flight requests finish)",
         Verb::Scope::Discover, [Verb::Chord.new("x", ctrl: true)], mnemonic: 'x') { |ctx| ctx.discover_stop; nil }
 
       # Plain `p` toggles pause in the body (handled by the controller); the space menu
@@ -18,6 +18,12 @@ module Gori
       r.register Verb::Definition.new(
         "discover.pause", "Pause / resume", "Pause or resume the running discovery",
         Verb::Scope::Discover, [] of Verb::Chord, mnemonic: 'p') { |ctx| ctx.discover_toggle_pause; nil }
+
+      # `d` clears a finished row from the RUNS list, which is append-only for the session.
+      # Never a running one — the controller refuses and says to stop it first.
+      r.register Verb::Definition.new(
+        "discover.dismiss", "Dismiss run", "Remove the selected finished run from the RUNS list",
+        Verb::Scope::Discover, [Verb::Chord.new("d")], mnemonic: 'd') { |ctx| ctx.discover_dismiss; nil }
 
       r.register Verb::Definition.new(
         "discover.to-menu", "Back to sub-tabs", "Move focus up to the Sitemap/Discover strip", Verb::Scope::Discover,
