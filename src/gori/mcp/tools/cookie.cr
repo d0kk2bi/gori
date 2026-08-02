@@ -63,7 +63,11 @@ module Gori
         return Result.new("missing required 'format' (flask/rack/django)", is_error: true) if format.nil? || format.empty?
         secret = str(h, "secret")
         return Result.new("missing required 'secret'", is_error: true) if secret.nil?
-        ts = int(h, "timestamp") || Time.utc.to_unix
+        # An explicitly-present but uncoercible 'timestamp' is a named refusal, not a
+        # silent "now" (optional_int_arg raises Gori::Error → INVALID_ARGUMENT). Absent
+        # still defaults to now. Negatives can't be a signed-cookie timestamp — refuse.
+        ts = optional_int_arg(h, "timestamp") || Time.utc.to_unix
+        raise Gori::Error.new("invalid 'timestamp' (must not be negative)") if ts < 0
         cookie = cookie_forge_build(format, secret, ts, h)
         Result.new(JSON.build { |j| j.object { j.field "cookie", cookie; j.field "format", format } })
       rescue ex : Cookie::CookieError # invalid JSON, missing payload/value, unknown format
