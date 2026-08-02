@@ -947,4 +947,236 @@ describe Gori::Import::Builder do
       Gori::Import::Builder.host_header("https", "::1", 9443).should eq("[::1]:9443")
     end
   end
+
+  # R4-F4. `Content-Length` + `Transfer-Encoding` on one message is THE request-smuggling
+  # primitive, and it was the one framing this Builder could not express: the incoming CL was
+  # dropped unconditionally and `wire_chunked?` then picked a single framing, so the entry
+  # imported as a different, well-formed request and was counted as a clean import.
+  describe "a message stating BOTH Content-Length and Transfer-Encoding" do
+    chunked_body = "5\r\nhello\r\n0\r\n\r\n"
+
+    it "keeps both, in wire order, and synthesizes nothing beside them" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Host", "127.0.0.1:8098"}
+      headers << {"Content-Length", "5"}
+      headers << {"Transfer-Encoding", "chunked"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/clte", "HTTP/1.1",
+        scheme: "http", host: "127.0.0.1", port: 8098, headers: headers,
+        body: chunked_body.to_slice))
+      head.should eq("POST /clte HTTP/1.1\r\nHost: 127.0.0.1:8098\r\n" \
+                     "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n")
+      # Exactly one Content-Length: the source's, not the source's plus a fresh one.
+      head.scan(/^Content-Length:/im).size.should eq(1)
+    end
+
+    it "keeps both even when the body does NOT back the chunked framing" do
+      # `wire_chunked?`'s body-decides rule repairs a head that lies about its body. There is
+      # no repair here that is not a rewrite — the message is already illegal whichever
+      # framing the bytes back — so the operator's two lines both stand.
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Content-Length", "5"}
+      headers << {"Transfer-Encoding", "chunked"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/x", "HTTP/1.1",
+        scheme: "http", host: "h.test", port: 80, headers: headers, body: "hello".to_slice))
+      head.should contain("Content-Length: 5\r\n")
+      head.should contain("Transfer-Encoding: chunked\r\n")
+      head.scan(/^Content-Length:/im).size.should eq(1)
+    end
+
+    it "keeps both on the RESPONSE side too" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Content-Length", "5"}
+      headers << {"Transfer-Encoding", "chunked"}
+      head = String.new(Gori::Import::Builder.response_head("HTTP/1.1", 200, "OK", headers,
+        "hello".to_slice))
+      head.should contain("Content-Length: 5\r\n")
+      head.should contain("Transfer-Encoding: chunked\r\n")
+    end
+
+    # The complements: each framing ALONE keeps the behaviour the surrounding comments
+    # describe, so "keep both" cannot be read as "keep whatever the source said".
+    it "still drops a Content-Length that stands alone and re-states the real one" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Content-Length", "999"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/x", "HTTP/1.1",
+        scheme: "http", host: "h.test", port: 80, headers: headers, body: "hello".to_slice))
+      head.should contain("Content-Length: 5\r\n")
+      head.should_not contain("Content-Length: 999")
+    end
+
+    it "still drops a lone Transfer-Encoding the body does not back" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Transfer-Encoding", "chunked"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/x", "HTTP/1.1",
+        scheme: "http", host: "h.test", port: 80, headers: headers, body: "hello".to_slice))
+      head.should_not contain("Transfer-Encoding")
+      head.should contain("Content-Length: 5\r\n")
+    end
+
+    it "still keeps a lone Transfer-Encoding the body DOES back, with no length beside it" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Transfer-Encoding", "chunked"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/x", "HTTP/1.1",
+        scheme: "http", host: "h.test", port: 80, headers: headers,
+        body: chunked_body.to_slice))
+      head.should contain("Transfer-Encoding: chunked\r\n")
+      head.should_not contain("Content-Length")
+    end
+
+    it "survives a whole HAR import, body byte-exact" do
+      har = File.tempname("gori", ".har")
+      begin
+        File.write(har, {"log" => {"version" => "1.2", "creator" => {"name" => "hand", "version" => "1"},
+                                   "entries" => [{
+                                     "startedDateTime" => "2026-07-31T00:00:00.000Z", "time" => 1.0,
+                                     "request" => {"method" => "POST", "url" => "http://127.0.0.1:19802/clte",
+                                                   "httpVersion" => "HTTP/1.1",
+                                                   "headers" => [{"name" => "Host", "value" => "127.0.0.1:19802"},
+                                                                 {"name" => "Content-Length", "value" => "5"},
+                                                                 {"name" => "Transfer-Encoding", "value" => "chunked"}],
+                                                   "postData" => {"mimeType" => "", "text" => "5\r\nhello\r\n0\r\n\r\n"}},
+                                     "response" => {"status" => 200, "statusText" => "OK", "httpVersion" => "HTTP/1.1",
+                                                    "headers" => [] of String,
+                                                    "content" => {"size" => 0, "mimeType" => ""}},
+                                   }]}}.to_json)
+        with_store do |store|
+          Gori::Import.import_file(store, :har, har).count.should eq(1)
+          detail = store.get_flow(store.recent_flows(2).first.id).not_nil!
+          String.new(detail.request_head).should eq(
+            "POST /clte HTTP/1.1\r\nHost: 127.0.0.1:19802\r\n" \
+            "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n")
+          detail.request_body.should eq("5\r\nhello\r\n0\r\n\r\n".to_slice)
+        end
+      ensure
+        File.delete?(har)
+      end
+    end
+  end
+
+  # R4-F5(a). `Export::Har` writes `req.method` on purpose — "a lowercase or non-standard
+  # method is the operator's" — and the importer upcased it straight back off the wire, so a
+  # method-case bypass probe could not survive gori's own HAR round trip.
+  describe "the method's case" do
+    it "reaches the start line exactly as the source recorded it" do
+      pair = Gori::Import::Builder.pending_request(0_i64, "http://h.test/admin", "get")
+      String.new(pair.request.head).should start_with("get /admin HTTP/1.1\r\n")
+    end
+
+    it "is still UPCASED in the projection column History and QL match on" do
+      pair = Gori::Import::Builder.pending_request(0_i64, "http://h.test/admin", "get")
+      pair.request.method.should eq("GET")
+    end
+
+    it "keeps a non-standard method verbatim on both sides of complete_flow" do
+      empty = Gori::Import::Builder::Headers.new
+      pair = Gori::Import::Builder.complete_flow(
+        0_i64, "http://h.test/x", "PaTcH", empty, nil, "HTTP/1.1", 200, "OK", empty, nil, nil, nil)
+      String.new(pair.request.head).should start_with("PaTcH /x HTTP/1.1\r\n")
+      pair.request.method.should eq("PATCH")
+    end
+
+    it "still refuses a method that would forge a start line" do
+      expect_raises(Gori::Error, /control character/) do
+        Gori::Import::Builder.pending_request(0_i64, "http://h.test/x", "GET\r\nX-Injected: evil")
+      end
+    end
+  end
+
+  # R4-F5(b). A chunked body the SOURCE says was cut short can never reach its zero chunk, so
+  # the strict walk called it "not chunked", dropped the Transfer-Encoding and stated a
+  # Content-Length over raw chunk octets — the head-lies-about-body misframe `chunk_framed?`
+  # exists to prevent, in the case it did not cover.
+  describe "a chunked body the source declares TRUNCATED" do
+    it "keeps the Transfer-Encoding instead of framing raw chunk octets as an entity" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Transfer-Encoding", "chunked"}
+      empty = Gori::Import::Builder::Headers.new
+      # The body walks cleanly as chunks and then simply stops: a 2 MiB-capped capture.
+      partial = "5\r\nhello\r\n5\r\nwor".to_slice
+      pair = Gori::Import::Builder.complete_flow(
+        0_i64, "http://h.test/big", "GET", empty, nil, "HTTP/1.1", 200, "OK",
+        headers, partial, "text/plain", nil, nil, 5_000_i64)
+      head = String.new(pair.response.not_nil!.head)
+      head.should contain("Transfer-Encoding: chunked\r\n")
+      head.should_not contain("Content-Length")
+      pair.response.not_nil!.body_truncated?.should be_true
+    end
+
+    it "does NOT rescue a body that was never chunk framing to begin with" do
+      # The complement, and the reason the relaxation is bounded: a DECODED body a
+      # third-party HAR shipped under a Transfer-Encoding header still loses the header,
+      # truncation flag or no truncation flag.
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Transfer-Encoding", "chunked"}
+      empty = Gori::Import::Builder::Headers.new
+      pair = Gori::Import::Builder.complete_flow(
+        0_i64, "http://h.test/big", "GET", empty, nil, "HTTP/1.1", 200, "OK",
+        headers, "hello world".to_slice, "text/plain", nil, nil, 5_000_i64)
+      head = String.new(pair.response.not_nil!.head)
+      head.should_not contain("Transfer-Encoding")
+      head.should contain("Content-Length: 11\r\n")
+    end
+
+    it "does NOT relax the walk for an UNtruncated body" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Transfer-Encoding", "chunked"}
+      empty = Gori::Import::Builder::Headers.new
+      pair = Gori::Import::Builder.complete_flow(
+        0_i64, "http://h.test/big", "GET", empty, nil, "HTTP/1.1", 200, "OK",
+        headers, "5\r\nhello\r\n5\r\nwor".to_slice, "text/plain", nil, nil, nil)
+      String.new(pair.response.not_nil!.head).should_not contain("Transfer-Encoding")
+    end
+  end
+
+  # R4-F6. `HOST_INVALID` was a C0/space/DEL blacklist, so `https://{/` sailed through and
+  # `gori run import --urls <a HAR>` stored 120 flows with hosts `{`, `},` and `],` — reported
+  # as a successful import. A host is a narrow thing; whitelist it.
+  describe "the host guard" do
+    it "rejects the punctuation a non-URL file is made of" do
+      ["{", "},", "],", "}", "[", "a\"b", "a<b", "a|b", "a\\b", "a^b", "a`b", "not a url at all"]
+        .each do |bad|
+          expect_raises(Gori::Error, /bad host/) do
+            Gori::Import::Builder.endpoint("https://#{bad}/x")
+          end
+        end
+    end
+
+    it "still accepts every host shape a real import carries" do
+      {
+        "https://shop.test/x"             => "shop.test",
+        "http://127.0.0.1:8099/x"         => "127.0.0.1",
+        "https://[::1]:9443/x"            => "::1",
+        "https://[2001:db8::1]/x"         => "2001:db8::1",
+        "https://xn--e1afmkfd.xn--p1ai/x" => "xn--e1afmkfd.xn--p1ai",
+        "https://my_host.internal/x"      => "my_host.internal",
+        "https://Example.COM/x"           => "Example.COM",
+        "https://sub.example.co.uk./x"    => "sub.example.co.uk.",
+      }.each do |url, host|
+        Gori::Import::Builder.endpoint(url)[1].should eq(host)
+      end
+    end
+
+    it "makes a file that is not a URL list fail AS one, rather than importing its punctuation" do
+      urls = File.tempname("gori", ".txt")
+      begin
+        File.write(urls, <<-JSON)
+          {
+            "log": {
+              "entries": [
+                { "request": { "url": "https://a.test/x" } }
+              ]
+            }
+          }
+          JSON
+        with_store do |store|
+          expect_raises(Gori::Error, /all \d+ entries were skipped as malformed/) do
+            Gori::Import.import_file(store, :urls, urls)
+          end
+          store.search(Gori::QL::EMPTY, 10).should be_empty
+        end
+      ensure
+        File.delete?(urls)
+      end
+    end
+  end
 end

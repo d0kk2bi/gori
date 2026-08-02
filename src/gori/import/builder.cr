@@ -55,16 +55,28 @@ module Gori
       # (`Proxy::Conn::ClientConn#resolve_forward` → `origin_form`), so a fix belongs with that
       # one, not here. Until then, do not read the paragraph above as covering NUL.
 
-      # The HOST is the one place import still rejects a control byte or space, because there it
-      # means the string is not a URL at all — a parse failure, not a URL describing a malformed
+      # The HOST is the one place import still rejects malformed bytes, because there they
+      # mean the string is not a URL at all — a parse failure, not a URL describing a malformed
       # request. URI.parse copies a reg-name authority into `host` VERBATIM without validating it,
       # so a `--urls`/HAR line like `not a url at all` becomes a stored "host" of literal spaces
-      # instead of being skipped the way `ftp://…` and empty URLs already are. A real host
-      # (reg-name, IPv4/IPv6 literal, punycode) never contains a space or other C0/DEL byte —
-      # userinfo, port and the `://` sit outside `uri.host` — so reject one in `endpoint`, at the
-      # same raise-to-skip point the scheme/shape checks use. The range covers all of C0, space
-      # (0x20) and DEL (0x7f).
-      HOST_INVALID = /[\x00-\x20\x7f]/
+      # instead of being skipped the way `ftp://…` and empty URLs already are. Userinfo, port and
+      # the `://` sit outside `uri.host`, so what is left is a reg-name, an IPv4 literal, punycode,
+      # or a BRACKETED IP literal — and nothing else. Reject anything else in `endpoint`, at the
+      # same raise-to-skip point the scheme/shape checks use.
+      #
+      # This was a C0/space/DEL blacklist and that was far too narrow: `normalize_url` prepends
+      # `https://` to ANY line, so feeding a JSON document to `--urls` (`gori run import --urls
+      # cap.har`, the flag typo that actually happens) turned its punctuation into 120 stored
+      # flows with hosts `{`, `},` and `],`, reported as a successful import, and polluted
+      # History / Sitemap / scope with fabricated `https://{/` endpoints. A whitelist is the
+      # right shape here: `}` and `{` are not the point, "a host is a narrow thing" is. RFC 3986
+      # also permits sub-delims (`!$&'()*+,;=`) in a reg-name; they are excluded deliberately,
+      # because no http(s) authority in the wild carries one and allowing `,` alone is what let
+      # `],` through. `%` stays for percent-encoded IDN forms and `_` for the illegal-but-common
+      # underscore label. Callers that want a BETTER message for a specific shape still check
+      # first (`Vars.unresolved` for `{{baseUrl}}`, `Oas`/`Postman`/`Insomnia`); this is the
+      # backstop, not their replacement.
+      HOST_VALID = /\A(?:\[[A-Za-z0-9:.%_-]+\]|[A-Za-z0-9._~%-]+)\z/
 
       def self.normalize_url(url : String) : String
         u = url.strip
@@ -77,7 +89,7 @@ module Gori
         uri = URI.parse(normalize_url(url))
         scheme = uri.scheme.not_nil!
         host = uri.host.presence || raise Gori::Error.new("URL missing host: #{url}")
-        raise Gori::Error.new("invalid URL (bad host): #{url.inspect}") if host.matches?(HOST_INVALID)
+        raise Gori::Error.new("invalid URL (bad host): #{url.inspect}") unless host.matches?(HOST_VALID)
         # URI.parse keeps the brackets on an IPv6 literal (`[::1]`); the CONNECT/tunnel path
         # stores the bare inner address (`::1`). Strip the brackets so an imported IPv6 target
         # matches that canonical bracket-free form and Scope host rules see ONE target, not two.
@@ -159,7 +171,8 @@ module Gori
 
       def self.request_head(method : String, target : String, http_version : String,
                             scheme : String, host : String, port : Int32, headers : Headers,
-                            body : Bytes?, content_length : Int64? = nil) : Bytes
+                            body : Bytes?, content_length : Int64? = nil,
+                            truncated : Bool = false) : Bytes
         reject_inject!(method, "method")
         reject_inject!(http_version, "HTTP version")
         # `host` reaches the Host line, so it forges a message boundary the same way a header
@@ -180,7 +193,15 @@ module Gori
         # host actually DIALLED (`Outbound.scope_url`), never this line.
         has_host = headers.any? { |(k, _)| k.compare("host", case_insensitive: true) == 0 }
         String.build do |b|
-          b << method.upcase << ' ' << target << ' ' << http_version << "\r\n"
+          # The METHOD goes on the start line in the case the source recorded it (P7), not
+          # upcased. `Export::Har` deliberately writes `req.method` — "a lowercase or
+          # non-standard method is the operator's" — and upcasing it here destroyed a
+          # method-case bypass probe (`get /admin`) on the way back in, so gori's own HAR
+          # round-trip could not carry the test case it had captured. `reject_inject!` above
+          # already refuses the CR/LF/NUL that would forge a start line. The UPCASED form is
+          # not lost: it is what the `flows.method` projection column stores, which is what
+          # `pending_request`/`complete_flow` pass to the DTO and what History/QL match on.
+          b << method << ' ' << target << ' ' << http_version << "\r\n"
           b << "Host: " << host_header(scheme, host, port) << "\r\n" unless has_host
           # One pass, allocation-free case-insensitive compares. Skip any incoming
           # Content-Length: the stored head must agree with the body we actually build and store,
@@ -194,19 +215,54 @@ module Gori
           # stores the ORIGIN's Content-Length beside a capped BLOB, so honouring the declared
           # size here is what makes a re-imported truncated flow match the captured one instead
           # of advertising the prefix length as the whole entity.
-          wire_chunked = wire_chunked?(headers, body)
+          #
+          # NEITHER of those reasons applies when the source stated BOTH framings — see
+          # `both_framings?`. There the pair IS the payload, so both lines go out verbatim
+          # and nothing is synthesized beside them.
+          wire_chunked = wire_chunked?(headers, body, truncated)
+          both = both_framings?(headers)
           headers.each do |k, v|
-            next if k.compare("content-length", case_insensitive: true) == 0
-            next if !wire_chunked && transfer_encoding?(k)
+            next if !both && k.compare("content-length", case_insensitive: true) == 0
+            next if !both && !wire_chunked && transfer_encoding?(k)
             b << k << ": " << v << "\r\n"
           end
-          b << "Content-Length: " << (content_length || body.size) << "\r\n" if body && !wire_chunked
+          b << "Content-Length: " << (content_length || body.size) << "\r\n" if body && !wire_chunked && !both
           b << "\r\n"
         end.to_slice
       end
 
       private def self.transfer_encoding?(name : String) : Bool
         name.compare("transfer-encoding", case_insensitive: true) == 0
+      end
+
+      # Did the SOURCE state a `Content-Length` and a `Transfer-Encoding` on the same
+      # message? That pair is the canonical request-smuggling primitive — the one shape
+      # `Codec::Body.request_framing` refuses BY NAME on the live MITM path, which is
+      # precisely why an operator imports a HAR carrying it.
+      #
+      # It is also the one framing this Builder could not express. `request_head` dropped
+      # every incoming Content-Length and `wire_chunked?` then picked ONE framing, so a HAR
+      # entry stating both imported as a well-formed TE-only request and was counted as a
+      # clean import: gori silently rewrote the test case into a different, legal message.
+      # (The same round trip through gori's OWN HAR writer lost it, so the format gori
+      # writes could not carry the case gori had captured.) P7 and DESIGN.md §7 put the
+      # illegal pair with "the smuggling payloads an operator tests with, not corruption to
+      # be repaired", so when both are stated both survive, in wire order, and no
+      # Content-Length is synthesized beside them.
+      #
+      # Note this is about what the SOURCE said, not about what the body is: a message
+      # stating both is already illegal whichever framing the bytes back, so there is no
+      # "repair" here that is not a rewrite. The single-framing cases are untouched and keep
+      # `wire_chunked?`'s body-decides rule.
+      private def self.both_framings?(headers : Headers) : Bool
+        has_cl = false
+        has_te = false
+        headers.each do |(k, _)|
+          has_cl = true if !has_cl && k.compare("content-length", case_insensitive: true) == 0
+          has_te = true if !has_te && transfer_encoding?(k)
+          return true if has_cl && has_te
+        end
+        false
       end
 
       # Whether this message is chunk-framed AS STORED — a `Transfer-Encoding` header AND a
@@ -226,9 +282,18 @@ module Gori
       #
       # So the BODY decides and the head is made to describe what is actually stored: keep the
       # TE when the bytes back it, otherwise drop the header and state the real length.
-      private def self.wire_chunked?(headers : Headers, body : Bytes?) : Bool
+      #
+      # `truncated` is the third case: a chunked body the SOURCE says was cut short (a gori
+      # capture capped at `Settings.capture_max`, marked in the HAR by a `bodySize` larger
+      # than the text it ships). Those octets can never reach a zero chunk, so the strict
+      # walk called them "not chunked", dropped the Transfer-Encoding and stated a
+      # Content-Length over raw chunk framing — the head-lies-about-body misframe this
+      # predicate exists to prevent, in the one case it did not cover. When the source has
+      # already told us the bytes are a PREFIX, a clean walk that simply runs out is the
+      # right answer.
+      private def self.wire_chunked?(headers : Headers, body : Bytes?, truncated : Bool = false) : Bool
         return false unless body
-        headers.any? { |(k, _)| transfer_encoding?(k) } && chunk_framed?(body)
+        headers.any? { |(k, _)| transfer_encoding?(k) } && chunk_framed?(body, truncated)
       end
 
       # A strict walk: `<hex-size>[;ext]CRLF <size octets> CRLF` repeated, ending at a zero
@@ -237,12 +302,18 @@ module Gori
       # false positive would keep a `Transfer-Encoding` over a body that is not chunked, which
       # is the misframe this is written to prevent. Real decoded content parsing cleanly as
       # complete chunk framing is not a case that occurs.
-      private def self.chunk_framed?(body : Bytes) : Bool
+      #
+      # `truncated`: the walk may run OUT of bytes (an unfinished size line, or a chunk whose
+      # data is cut short) and still be chunk framing, but only after at least one whole
+      # chunk has been consumed — a body that is not chunked at all fails on its very first
+      # line and must keep failing. Malformation is still malformation: a chunk that ends on
+      # something other than CRLF is rejected either way.
+      private def self.chunk_framed?(body : Bytes, truncated : Bool = false) : Bool
         pos = 0
         loop do
-          size, pos = chunk_size(body, pos) || return false
+          size, pos = chunk_size(body, pos) || return truncated && pos > 0
           return pos == body.size || trailer_only?(body, pos) if size == 0
-          return false if pos + size + 2 > body.size
+          return truncated && pos > 0 if pos + size + 2 > body.size
           return false unless body[pos + size] == 0x0d_u8 && body[pos + size + 1] == 0x0a_u8
           pos += size + 2
         end
@@ -286,16 +357,20 @@ module Gori
       end
 
       def self.response_head(http_version : String, status : Int32, reason : String,
-                             headers : Headers, body : Bytes?) : Bytes
+                             headers : Headers, body : Bytes?, truncated : Bool = false) : Bytes
         reject_inject!(http_version, "HTTP version")
         reject_inject!(reason, "reason phrase")
         reject_header_injection!(headers)
         String.build do |b|
           b << http_version << ' ' << status << ' ' << reason << "\r\n"
           has_cl = false
-          wire_chunked = wire_chunked?(headers, body)
+          wire_chunked = wire_chunked?(headers, body, truncated)
+          # A response stating both framings keeps both, for the reason `both_framings?`
+          # gives: the pair is the operator's evidence, and a response desync is the same
+          # primitive read from the other end.
+          both = both_framings?(headers)
           headers.each do |k, v|
-            next if !wire_chunked && transfer_encoding?(k)
+            next if !both && !wire_chunked && transfer_encoding?(k)
             has_cl = true if !has_cl && k.compare("content-length", case_insensitive: true) == 0
             b << k << ": " << v << "\r\n"
           end
@@ -312,7 +387,7 @@ module Gori
         scheme, host, port, target = endpoint(url)
         stored, trunc, size = capped(body, declared_body_size)
         head = request_head(method, target, http_version, scheme, host, port, headers, body,
-          trunc ? size : nil)
+          trunc ? size : nil, trunc)
         req = Store::CapturedRequest.new(
           created_at: created_at, scheme: scheme, host: host, port: port,
           method: method.upcase, target: target, http_version: http_version,
@@ -332,15 +407,17 @@ module Gori
         scheme, host, port, target = endpoint(url)
         req_stored, req_trunc, req_size = capped(req_body, declared_req_body_size)
         req_head = request_head(method, target, http_version, scheme, host, port, req_headers, req_body,
-          req_trunc ? req_size : nil)
+          req_trunc ? req_size : nil, req_trunc)
         req = Store::CapturedRequest.new(
           created_at: created_at, scheme: scheme, host: host, port: port,
           method: method.upcase, target: target, http_version: http_version,
           head: req_head, body: req_stored, body_truncated: req_trunc, body_size: req_size)
         # `response_head` keeps an incoming Content-Length verbatim, so a truncated response
         # already re-serializes with the origin's true length — no override needed on this side.
-        resp_head = response_head(http_version, status, reason, resp_headers, resp_body)
+        # It does need to KNOW the body was cut short, though, or a capped chunked response
+        # loses its Transfer-Encoding (`wire_chunked?`), so cap first and tell it.
         resp_stored, resp_trunc, resp_size = capped(resp_body, declared_resp_body_size)
+        resp_head = response_head(http_version, status, reason, resp_headers, resp_body, resp_trunc)
         content_encoding = resp_headers.find { |(k, _)| k.compare("content-encoding", case_insensitive: true) == 0 }.try(&.[1])
         resp = Store::CapturedResponse.new(
           flow_id: 0, status: status, reason: reason.presence, content_type: content_type,
