@@ -55,22 +55,56 @@ module Gori::Repeater
   # least likely to have hit the origin's idle timeout.
   class ConnPool
     # A parked socket the origin closed while it sat idle is normal (every server has a
-    # keep-alive idle timeout) and must not surface as a failed result: the request never
-    # reached the application, so it is re-sent once on a fresh connection. Detected as a
-    # clean EOF before ANY response byte — a timeout, or a failure part-way through a
-    # response, is NOT retried, because the origin may well have processed the request.
+    # keep-alive idle timeout) and must not surface as a failed result: for an IDEMPOTENT
+    # request it is re-sent once on a fresh connection. Detected as a clean EOF before ANY
+    # response byte — a timeout, or a failure part-way through a response, is NOT retried,
+    # because the origin may well have processed the request.
     #
     # An origin that refuses reuse outright would otherwise pay that redial on every single
     # send (two connections per request — worse than not pooling). After this many
     # consecutive stale checkouts the pool gives up and runs in dial-per-send mode for the
     # rest of the run.
     #
-    # On `max_requests`: a stale re-send is NOT charged a second time against the cap
-    # (CappedBackend counts calls into the Sender, and this retry happens below it). That
-    # keeps the cap meaning what it says — an upper bound on requests the ORIGIN PROCESSES —
-    # since the re-sent one is precisely the one it demonstrably did not. The observable
-    # slack is TCP connections, not requests, and STALE_GIVE_UP bounds it to a handful.
+    # On `max_requests`: a stale re-send is not charged against the CAP (CappedBackend counts
+    # calls into the Sender, and this retry happens below it), and STALE_GIVE_UP bounds the
+    # slack to a handful. It IS counted in what a run REPORTS as requests, though — see
+    # `Fuzz::Backend#extra_requests`. The old note claimed the re-send was free because the
+    # origin "demonstrably did not process" the first copy; it demonstrably did not ANSWER it,
+    # which is a different fact, so a tester working inside an agreed request budget has to be
+    # told about the extra one.
     STALE_GIVE_UP = 3
+
+    # The methods a closed parked socket may be replayed on.
+    #
+    # RFC 7230 §6.3.1 permits an automatic retry only for an idempotent request; Go's
+    # `http.Transport` retries a reused connection only when the request `isReplayable()`,
+    # which is this same set. The class contract above used to justify retrying ANY method
+    # with "the request never reached the application", and that claim does not hold: the
+    # request-read and the response-write are INDEPENDENT events at the origin, so a
+    # load-shedding server, a WAF dropping a payload class, or any drop-on-match origin reads
+    # the request in full, acts on it, and closes without answering. `delivered?` cannot see
+    # the difference — it only knows no response byte arrived.
+    #
+    # Measured before this gate existed: a 4-payload POST sweep against an origin that reads
+    # every other request and then closes silently put SEVEN POSTs at the origin, reported all
+    # four as `200`, and said `0 errors`; the same run with `--no-keep-alive` honestly reported
+    # two failures. On a client's production system that is a doubled charge or a doubled
+    # account creation, and the sweep's own verdict is inverted for exactly the payloads the
+    # origin dropped. A non-idempotent request now gets the honest `no response from …` the
+    # unpooled path already returns.
+    #
+    # PUT and DELETE are idempotent per RFC 9110 §9.2.2 and are deliberately NOT here: gori
+    # points deliberately odd requests at targets whose handlers are the thing under test, so
+    # "the spec says repeating it is safe" is a weaker guarantee than "no observable side
+    # effect is even claimed". This is the set every other HTTP client draws the line at.
+    REPLAYABLE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+    # Whether a closed parked socket may be replayed for this request method. Case-insensitive
+    # because the method is taken verbatim off the operator's template (`Engine.request_method`),
+    # and a lowercase `get` is a legitimate — if odd — thing to send.
+    def self.replayable?(method : String) : Bool
+      REPLAYABLE_METHODS.any? { |m| method.compare(m, case_insensitive: true) == 0 }
+    end
 
     # Connections dialed (== handshakes paid) and requests served off a parked socket.
     # `dialed + reused == sends` for a run that never hit a stale retry.
@@ -78,6 +112,11 @@ module Gori::Repeater
     getter reused : Int64 = 0_i64
     # Re-sends caused by a parked socket the origin had already closed (see STALE_GIVE_UP).
     getter stale_retries : Int64 = 0_i64
+    # Sends that hit a closed parked socket and were NOT replayed because the method is not
+    # idempotent (see REPLAYABLE_METHODS). These came back as errors, exactly as they would
+    # with keep-alive off — counted so a surface can say why a pooled run and an unpooled one
+    # now agree instead of leaving the operator to wonder where the failures came from.
+    getter unsafe_stale : Int64 = 0_i64
     getter? pooling : Bool = true
 
     # The origin is taken apart rather than as a struct: `Fuzz::Origin` (which folds ws→http)
@@ -114,15 +153,24 @@ module Gori::Repeater
         result = Repeater::Engine.exchange(io, bytes, @host, @port, started)
         if stale?(result)
           close(io)
-          @stale_retries += 1
           @consecutive_stale += 1
           # Give up on pooling for the rest of the run rather than pay a wasted redial on
-          # every send. Already-parked sockets are dropped: they are the same vintage.
+          # every send. Already-parked sockets are dropped: they are the same vintage. Counted
+          # for BOTH outcomes below: an origin that always closes parked sockets is the case
+          # this bound exists for whether or not the method may be replayed.
           if @consecutive_stale >= STALE_GIVE_UP
             @pooling = false
             drain
           end
-          return dial_and_send(bytes, keepable, method)
+          # A non-idempotent request stops here with the result it actually got. Re-sending it
+          # is what turned a dropped POST into a false 200 and charged the origin twice — see
+          # REPLAYABLE_METHODS.
+          unless ConnPool.replayable?(method)
+            @unsafe_stale += 1
+            return result
+          end
+          @stale_retries += 1
+          return dial_and_send(bytes, keepable, method, retried: true)
         end
         @consecutive_stale = 0
         @reused += 1
@@ -138,20 +186,25 @@ module Gori::Repeater
       drain
     end
 
-    private def dial_and_send(bytes : Bytes, keepable : Bool, method : String) : Repeater::Result
+    # `retried` marks the Result as the SECOND copy of this request on the wire, so the row a
+    # surface prints says so — the run-level `stale_retries` line cannot tell an operator
+    # WHICH payload went out twice, and that is the one thing an audit needs.
+    private def dial_and_send(bytes : Bytes, keepable : Bool, method : String,
+                              retried : Bool = false) : Repeater::Result
       # Timed from BEFORE the dial, like `Repeater::Engine.send` — a fresh connection's
       # handshake is part of what that request cost. A reused one honestly reports less.
       started = Time.instant
       io, dial_error = Repeater::Engine.dial_result(@scheme, @host, @port, @verify,
         @sni, @timeout, @overrides)
       unless io
-        return Repeater::Engine.error(
+        err = Repeater::Engine.error(
           Repeater::Engine.connect_error(@scheme, @host, @port, @verify, dial_error), started)
+        return retried ? err.as_retried : err
       end
       @dialed += 1
       result = Repeater::Engine.exchange(io, bytes, @host, @port, started)
       recycle(io, result, keepable, method)
-      result
+      retried ? result.as_retried : result
     end
 
     # Park the socket for the next send, or close it. Same retirement rule `send_pipeline`
@@ -229,10 +282,10 @@ module Gori::Repeater
       false # any probe error ⇒ do not risk parking a bad socket
     end
 
-    # A REUSED socket that failed BEFORE any response byte arrived: the request never reached
-    # the application, so — per the contract at the top of this class — it is re-sent once on
-    # a fresh connection. Only ever consulted on the `@idle.pop?` branch, so "reused" is
-    # implicit.
+    # A REUSED socket that failed BEFORE any response byte arrived. Per the contract at the
+    # top of this class, an IDEMPOTENT request is then re-sent once on a fresh connection;
+    # anything else stops here with this result. Only ever consulted on the `@idle.pop?`
+    # branch, so "reused" is implicit.
     #
     # It used to compare the error string to `no_response_error` exactly, which matches ONLY a
     # clean EOF. An origin that RESET the parked socket failed with an `Errno`-derived message
@@ -244,11 +297,14 @@ module Gori::Repeater
     # The discriminator is "no response byte was DELIVERED", not which IO error ended it.
     # `response.nil?` alone is not that: `exchange` returns `response: nil` for an interim-1xx
     # failure too (`malformed interim` / `too many interim` / `upstream closed after interim`),
-    # and by then the origin has the whole request (gori writes it up front), so re-sending a
-    # non-idempotent POST would DOUBLE its side effect. `delivered?` is false only before any
-    # response byte arrives — a clean EOF, a reset, or a write failure on a parked socket — which
-    # is exactly the re-sendable case. An INCOMPLETE response (head read, body cut) carries a
-    # non-nil `response` and so is already excluded.
+    # and by then the origin has certainly sent something. `delivered?` is false only before any
+    # response byte arrives — a clean EOF, a reset, or a write failure on a parked socket. An
+    # INCOMPLETE response (head read, body cut) carries a non-nil `response` and so is already
+    # excluded.
+    #
+    # What this does NOT establish, and used to be read as establishing, is that the ORIGIN
+    # never saw the request. It only means gori heard nothing back. The method gate in `send`
+    # is what covers the gap.
     private def stale?(result : Repeater::Result) : Bool
       !result.error.nil? && result.response.nil? && !result.delivered?
     end

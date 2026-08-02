@@ -239,6 +239,12 @@ module Gori
           j.field "duration_us", r.duration_us
           j.field "error", text(r.error)
           j.field "extracted", text(r.extracted)
+          # This variation's request reached the origin TWICE: the keep-alive pool found its
+          # parked socket closed and re-sent (see `Fuzz::Result#retried?`). Emitted only when
+          # true — it is an exception, and a `false` on every row would bury the one that is
+          # not. This is where an agent reads it; before, a re-send appeared nowhere but the
+          # CLI's own connections summary.
+          j.field "retried", true if r.retried?
           # Present when record_history recorded this result as a History flow —
           # fetch its full request/response with get_flow (headers redacted).
           j.field "flow_id", flow_id if flow_id

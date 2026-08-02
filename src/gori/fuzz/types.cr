@@ -69,6 +69,11 @@ module Gori
       getter error : String?
       getter? matched : Bool
       getter? incomplete : Bool
+      # This variation went out TWICE: the keep-alive pool found its parked socket closed and
+      # re-sent on a fresh connection (`Repeater::Result#retried?`). "No response arrived" does
+      # not prove the origin never processed the first copy, so the row — not just the run's
+      # connections line — has to say which payload was duplicated.
+      getter? retried : Bool
       getter extracted : String?
       getter head : Bytes?
       getter body : Bytes?
@@ -76,7 +81,7 @@ module Gori
 
       def initialize(@index, @payloads, @position, @status, @length, @words, @lines,
                      @duration_us, @error, @matched, @incomplete, @extracted,
-                     @head = nil, @body = nil, @request = nil)
+                     @head = nil, @body = nil, @request = nil, @retried = false)
       end
     end
 
