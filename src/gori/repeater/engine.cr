@@ -45,7 +45,17 @@ module Gori
       # an agent reads this, and both showed a clean single send.
       getter? retried : Bool
 
-      def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false,
+      # The tail is KEYWORD-ONLY (`*`), and that is load-bearing rather than a style choice.
+      # `delivered`, `timed_out` and `retried` are three same-typed Bools that were appended one
+      # per round by three different fixers; twice, a call site written against the previous
+      # arity kept compiling and silently wrote its `true` into the field that had displaced
+      # the one it meant (`as_retried` in round 4, `Fuzz::Engine#follow_redirects` in round 5 —
+      # the latter still reporting `0 errors` while a row lost its re-send marker and gained a
+      # `timed_out` nothing had observed). A grep cannot catch that reliably: the second site
+      # was missed because the call spanned two lines and the sweep counted commas on the
+      # first. A keyword-only tail turns the whole class of mistake into a compile error, and
+      # leaves the sweep to the compiler.
+      def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false, *,
                      @delivered = false, @timed_out = false, @retried = false)
       end
 
@@ -60,9 +70,10 @@ module Gori
         # Named, not positional. Two fixers added a field to this constructor in the same round
         # and the merge reordered the tail — a positional `true` here silently set `timed_out`
         # instead, and the pool's re-send marker vanished with the suite still green but for the
-        # one spec that asserted it.
-        Result.new(@head, @body, @response, @duration_us, @error, @incomplete, @delivered,
-          timed_out: @timed_out, retried: true)
+        # one spec that asserted it. The constructor now REFUSES a positional tail (see there),
+        # so this shape is the only one that compiles.
+        Result.new(@head, @body, @response, @duration_us, @error, @incomplete,
+          delivered: @delivered, timed_out: @timed_out, retried: true)
       end
     end
 

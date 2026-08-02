@@ -43,6 +43,24 @@ module Gori::Fuzz
     end
   end
 
+  # A `§value¦chain§` marker names a converter this run cannot apply: an unknown token, or a
+  # saved chain gori ITSELF registered as unusable (recursive, or past `Library::MAX_TOKENS`).
+  # Either way the payload would go out un-transformed, which is the one outcome a marked
+  # position must never produce silently.
+  #
+  # Deliberately NOT a `PlanError`. That enum is the machine-readable FACT behind a sentence
+  # each surface writes in its own idiom, naming its own controls (`--mark TOKEN` vs `^A
+  # params · ^K word`) — and this refusal has no surface idiom to write. The chain lives in
+  # settings.json, all four surfaces resolve it through the same `Decoder.shared_registry`, and
+  # the remedy (`gori run decoder list`, or the Decoder tab) is word-for-word the same
+  # everywhere. So the builder writes the sentence once and every surface's EXISTING
+  # `Gori::Error` path carries it unchanged: `gori run fuzz` aborts with it (cli.cr:72), MCP
+  # codes it `INVALID_ARGUMENT` with the message intact (mcp/tools.cr:1644), the Fuzzer tab
+  # shows it in place of the run. That also keeps the change inside the fuzz boundary — a new
+  # `PlanError::Reason` member breaks the exhaustive `case … in` in six files outside it.
+  class ChainError < Gori::Error
+  end
+
   # A normalized, surface-independent description of ONE fuzz run.
   #
   # Each surface's remaining job is to parse ITS OWN input format into this — `OptionParser`
@@ -206,6 +224,10 @@ module Gori::Fuzz
       end
       template = Template.parse(text, options.http2?)
       raise PlanError.new(PlanError::Reason::NoPositions, "the template has no §…§ positions") if template.position_count == 0
+      # The twin of `refuse_unresolved`, one line down and for the same reason: a `¦chain` this
+      # run cannot apply leaves the position's payload UNTRANSFORMED on the wire. See
+      # `refuse_unusable_chains`.
+      refuse_unusable_chains(template, Decoder.shared_registry)
 
       # The string the Layer-1 scope check matches on, taken from the template's BASELINE
       # rendering (every position = its own default) rather than the raw text. The TUI's
@@ -279,6 +301,51 @@ module Gori::Fuzz
       detail = Env.token_list(names)
       raise PlanError.new(PlanError::Reason::UnresolvedEnv,
         "unresolved env #{detail}", detail)
+    end
+
+    # Refuse a run whose `§value¦chain§` markers name a converter the registry cannot apply.
+    #
+    # `Template#apply_chains` returns the payload VERBATIM when its chain does not run, with a
+    # comment arguing that a streaming fuzz run has nowhere to surface a per-position error.
+    # That was written when the only way to reach it was a typo. The saved-chain library added
+    # a class that is not a typo: a name the operator saved, that the `^Y` autocomplete offers
+    # and `gori run decoder list` prints as an ordinary converter, and that the library
+    # registered as an always-raising step precisely so the failure would be VISIBLE — and this
+    # path swallowed the raise. Five marked positions, three of them naming such a chain, put
+    # the raw payload in the query string under `1 sent · 0 errors`, `"error":null`,
+    # `"matched":true`. `gori run decoder` names the identical refusal off the identical
+    # registry one screen away.
+    #
+    # So it is refused HERE, beside `refuse_unresolved`, whose comment makes the same argument
+    # for `$KEY`: this builder is the surface-independent chokepoint every fuzz surface goes
+    # through, and a refusal before the first dial is the only report a sweep of ten thousand
+    # requests can act on.
+    #
+    # Two kinds, both answerable from the registry with no side effect:
+    #   * the token resolves to nothing         → unknown converter
+    #   * it resolves to an UNUSABLE saved chain → `Converter#unusable` carries the reason
+    # The second is why this is not a build-time dry run over each position's default: a dry
+    # run cannot tell "this chain is broken" from "this chain is fine and the DEFAULT value
+    # isn't valid input for it" (`base64-decode` over a `§admin§` default raises, and refusing
+    # that run would block a legitimate sweep). Asking whether the converter can run at all
+    # answers the first question and leaves the second — genuinely per-payload — alone.
+    private def self.refuse_unusable_chains(template : Template, registry : Decoder::Registry) : Nil
+      bad = [] of String
+      template.positions.each do |pos|
+        next if pos.chain.empty?
+        Decoder.parse_spec(pos.chain).each do |tok|
+          conv = registry[tok]?
+          if conv.nil?
+            bad << "#{tok}: unknown converter"
+          elsif reason = conv.unusable
+            bad << reason # already prefixed with the chain's own name
+          end
+        end
+      end
+      return if bad.empty?
+      raise ChainError.new("§…§ chain cannot run: #{bad.uniq.join("; ")}. " \
+                           "The payload would go out untransformed — fix or remove the chain " \
+                           "(list the converters with `gori run decoder list`)")
     end
 
     # Non-overlapping occurrences of a literal token (mirrors what `String#gsub` will

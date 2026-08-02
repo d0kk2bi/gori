@@ -44,8 +44,17 @@ module Gori
       getter direction : Direction
       getter description : String
       getter fn : Proc(Bytes, Bytes)
+      # WHY this converter cannot run, or nil when it can. Only a saved chain sets it: the
+      # library registers a recursive / over-MAX_TOKENS entry anyway, as a step that raises,
+      # so its NAME still resolves and the failure is visible instead of looking like a typo
+      # (see decoder/library.cr). `apply` raises this same sentence — but a caller that must
+      # decide BEFORE it sends anything cannot find out by calling it, and the one that
+      # guessed instead put un-transformed payloads on the wire and reported `0 errors`.
+      # Asking the registry is the same fact, one step earlier and with no side effect.
+      getter unusable : String?
 
-      def initialize(@name, @aliases, @category, @direction, @description, @fn)
+      def initialize(@name, @aliases, @category, @direction, @description, @fn,
+                     @unusable : String? = nil)
       end
 
       def apply(input : Bytes) : Bytes
