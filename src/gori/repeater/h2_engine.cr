@@ -35,6 +35,15 @@ module Gori
       # are neither — a hostile origin can stream them forever without END_STREAM, and the
       # per-op io_timeout only fires on IDLE, so bytes-always-arriving pins the fiber. This
       # bounds the loop the way the h1 engine's MAX_INTERIM does (RFC-hostile-origin guard).
+      #
+      # And it is why there is deliberately NO h2 equivalent of `Repeater::Engine::MAX_INTERIM`,
+      # which round 5 asked about: on h1 that cap exists because "there is no whole-request
+      # deadline" (`engine.cr:202`), and on h2 there are two — this count and `flow.expires_at`,
+      # which does not restart on progress. Measured: 300 interim 103s then silence ends at the
+      # caller's `timeout` with `the origin sent an interim 103 and then nothing more before the
+      # read timed out`, which is what actually happened. A third bound would only replace that
+      # true sentence with a synthetic "too many interim responses" and add a phrase the MCP
+      # error-kind table would have to learn.
       MAX_FRAMES = 100_000
       # RFC 9113 §6.9.1: a flow-control window may never exceed 2^31-1, and a WINDOW_UPDATE
       # increment of 0 is a PROTOCOL_ERROR. Both are plausible real-world server bugs and
@@ -143,6 +152,10 @@ module Gori
       # then clears the fields it carried, so "the status is zero and there are no headers" —
       # the old test for "nothing arrived" — is false for an exchange that has no response at
       # all (RFC 9110 §15.2: a 1xx precedes the final response and is not one).
+      # `late_interim` is the status of an interim header block that arrived AFTER the final
+      # response — an RFC 9110 §15.2 violation the operator has to be told about, because it is
+      # what an h2 response-splitting / header-injection probe produces and what a buggy
+      # gateway emits. It rides alongside the final response rather than replacing it.
       private record Reply,
         status : Int32,
         headers : Array({String, String}),
@@ -152,7 +165,8 @@ module Gori
         rst : String?,
         trailers : Array(String)?,
         timed_out : Bool,
-        final_seen : Bool
+        final_seen : Bool,
+        late_interim : Int32? = nil
 
       def self.send(request : Bytes, *, scheme : String, host : String, port : Int32,
                     verify_upstream : Bool, sni : String? = nil,
@@ -160,8 +174,10 @@ module Gori
                     overrides : Gori::HostOverrides? = nil,
                     preserve_field_case : Bool = false) : Result
         started = Time.instant
-        upstream = open(scheme, host, port, verify_upstream, sni, timeout, overrides)
-        return failure(connect_error(scheme, host, port, verify_upstream), started) unless upstream
+        upstream, dial_failure = open(scheme, host, port, verify_upstream, sni, timeout, overrides)
+        unless upstream
+          return failure(connect_error(scheme, host, port, verify_upstream, dial_failure), started)
+        end
         begin
           headers, body = parse_request(request, scheme, host, port, preserve_field_case)
           exchange(upstream, headers, body, host, port, started, timeout)
@@ -192,8 +208,10 @@ module Gori
                            host : String, port : Int32, verify_upstream : Bool, sni : String? = nil,
                            timeout : Time::Span? = nil, overrides : Gori::HostOverrides? = nil) : Result
         started = Time.instant
-        upstream = open(scheme, host, port, verify_upstream, sni, timeout, overrides)
-        return failure(connect_error(scheme, host, port, verify_upstream), started) unless upstream
+        upstream, dial_failure = open(scheme, host, port, verify_upstream, sni, timeout, overrides)
+        unless upstream
+          return failure(connect_error(scheme, host, port, verify_upstream, dial_failure), started)
+        end
         begin
           exchange(upstream, fields, body, host, port, started, timeout)
         rescue ex
@@ -272,6 +290,16 @@ module Gori
         if violation = flow.violation
           parts << violation unless parts.empty?
         end
+        # Appended AFTER the violation gate on purpose: that gate deliberately reports a
+        # §6.9.1 violation only as a clause on something that already went wrong, and a late
+        # 1xx must not quietly promote it into a standalone failure. This one DOES stand
+        # alone — the response is intact and correct, and the violation is the finding.
+        if late = reply.late_interim
+          parts << "the origin sent an interim #{late} header block AFTER its final response " \
+                   "(RFC 9110 §15.2: a 1xx precedes the final response, it is not one). The " \
+                   "1xx and its fields were discarded; the status, headers and body reported " \
+                   "here are the final response's"
+        end
         parts.empty? ? nil : parts.join(" — ")
       end
 
@@ -343,23 +371,52 @@ module Gori
         (v = flow.violation) ? "#{base} — #{v}" : base
       end
 
+      # Why `open` produced no socket — the two facts the old bare `IO?` return could not
+      # carry, and whose absence made `connect_error` guess.
+      #
+      # `dial_error` is the dialer's own account, the same `DialError` the h1 engine hands
+      # `Repeater::Engine.connect_error`. `alpn` is set ONLY when the dial SUCCEEDED and the
+      # origin then selected something other than h2 — the one failure of the four that gori
+      # OBSERVED rather than inferred — and is the empty string when the origin offered no
+      # ALPN protocol at all. Exactly one of the two is ever set.
+      private record DialFailure,
+        dial_error : Proxy::Upstream::DialError? = nil,
+        alpn : String? = nil
+
+      # Open the connection an h2 send needs, or say why there isn't one.
+      #
+      # `dial_tls_result` / `dial_result` rather than the nil-returning `dial_tls` / `dial`:
+      # the nil variants discard `DialErrorKind` before any caller can ask, which is why four
+      # distinct failures — nothing listening, an untrusted certificate, a plaintext port
+      # addressed as https, and an origin whose ALPN offers only http/1.1 — arrived at the
+      # operator as one sentence while the same tab one `^V` away named three of them.
       private def self.open(scheme : String, host : String, port : Int32, verify : Bool,
                             sni : String? = nil, timeout : Time::Span? = nil,
-                            overrides : Gori::HostOverrides? = nil) : IO?
+                            overrides : Gori::HostOverrides? = nil) : {IO?, DialFailure?}
         ct = timeout || Settings.connect_timeout
         it = timeout || Settings.io_timeout
         if scheme == "https"
-          ssl = Proxy::Upstream.dial_tls(host, port, verify: verify, alpn: "h2", sni: sni, connect_timeout: ct, io_timeout: it, overrides: overrides)
-          return nil unless ssl
+          ssl, err = Proxy::Upstream.dial_tls_result(host, port, verify: verify, alpn: "h2",
+            sni: sni, connect_timeout: ct, io_timeout: it, overrides: overrides)
+          unless ssl
+            return {nil, DialFailure.new(dial_error: err || Proxy::Upstream::DialError::ORIGIN_UNREACHABLE)}
+          end
           # Origin completed the handshake but won't speak h2 — close the live
           # socket before bailing, else it leaks (it's never returned to `ensure`).
-          unless ssl.alpn_protocol == "h2"
+          negotiated = ssl.alpn_protocol
+          unless negotiated == "h2"
             ssl.close rescue nil
-            return nil
+            return {nil, DialFailure.new(alpn: negotiated || "")}
           end
-          ssl
+          {ssl, nil}
         else
-          Proxy::Upstream.dial(host, port, connect_timeout: ct, io_timeout: it, overrides: overrides) # h2c prior-knowledge
+          # h2c prior-knowledge. Nothing here can observe whether the origin speaks h2c — a
+          # plaintext port that does not will CONNECT fine and fail later, on the frames — so
+          # a nil socket is a TCP failure and nothing else, and the old "or the origin doesn't
+          # offer HTTP/2 (h2c) here" clause was a guess at a condition this call cannot see.
+          sock, err = Proxy::Upstream.dial_result(host, port, connect_timeout: ct, io_timeout: it,
+            overrides: overrides)
+          sock ? {sock.as(IO), nil} : {nil, DialFailure.new(dial_error: err || Proxy::Upstream::DialError::ORIGIN_UNREACHABLE)}
         end
       end
 
@@ -672,9 +729,10 @@ module Gori
         goaway = flow.goaway # the origin's stated reason for hanging up
         rst = flow.rst       # the origin's stated reason for killing the stream
         trailers = nil.as(Array(String)?)
-        final_seen = false         # the final (non-interim) response header block is absorbed
-        end_stream_pending = false # END_STREAM seen on a HEADERS frame whose block isn't closed yet
-        timed_out = false          # the read ended on an idle timeout, not on a closed socket
+        late_interim = nil.as(Int32?) # a 1xx block that arrived AFTER the final response
+        final_seen = false            # the final (non-interim) response header block is absorbed
+        end_stream_pending = false    # END_STREAM seen on a HEADERS frame whose block isn't closed yet
+        timed_out = false             # the read ended on an idle timeout, not on a closed socket
         pending = flow.pending
         at = 0
         progress = Time.instant # last time stream 1 actually moved
@@ -761,11 +819,10 @@ module Gori
             # status). Defer completion until END_HEADERS.
             end_stream_pending = frame.end_stream?
             if frame.end_headers?
-              status, names = absorb(header_buf, decoder, headers, status)
-              trailers = note_trailers(trailers, names, final_seen)
-              final_seen ||= !interim?(status)
+              status, final_seen, trailers, late_interim =
+                merge_block(header_buf, decoder, headers, status, final_seen, trailers,
+                  late_interim, end_stream_pending)
               done = clean_eos = true if end_stream_pending
-              headers.clear if !end_stream_pending && interim?(status)
             end
           when Frame::Type::Continuation
             next unless frame.stream_id == 1
@@ -773,11 +830,10 @@ module Gori
             break if header_buf.bytesize + frame.payload.size > MAX_HEADER_BLOCK # flood — abort
             header_buf.write(frame.payload)
             if frame.end_headers?
-              status, names = absorb(header_buf, decoder, headers, status)
-              trailers = note_trailers(trailers, names, final_seen)
-              final_seen ||= !interim?(status)
+              status, final_seen, trailers, late_interim =
+                merge_block(header_buf, decoder, headers, status, final_seen, trailers,
+                  late_interim, end_stream_pending)
               done = clean_eos = true if end_stream_pending
-              headers.clear if !end_stream_pending && interim?(status)
             end
           when Frame::Type::Data
             next unless frame.stream_id == 1
@@ -800,7 +856,58 @@ module Gori
         end
 
         Reply.new(status, headers, body.size == 0 ? nil : body.to_slice, clean_eos,
-          goaway, rst, trailers, timed_out, final_seen)
+          goaway, rst, trailers, timed_out, final_seen, late_interim)
+      end
+
+      # Fold one COMPLETED header block into the response being assembled, and decide what the
+      # block IS. Returns the updated `(status, final_seen, trailers, late_interim)`; `headers`
+      # is written through, as `absorb` already did.
+      #
+      # Four shapes reach here and only two of them used to be told apart:
+      #
+      #   1. the final response head            → keep everything
+      #   2. an interim 1xx BEFORE it           → drop its fields (§15.2: they precede the final
+      #                                           response and are not part of it) and keep
+      #                                           waiting; the status is overwritten by the
+      #                                           final block when it comes
+      #   3. a real trailers block after it     → keep the fields, record their NAMES as trailers
+      #   4. an interim 1xx AFTER it            → the origin violated §15.2; drop the block and
+      #                                           report it, do not let it become the response
+      #
+      # 4 was being handled as 2-and-3 at once: `absorb` overwrote the status with the 1xx's,
+      # `note_trailers` filed its field under trailers, and `headers.clear` — guarded on
+      # `interim?(status)` with no `!final_seen` term — then wiped everything the FINAL block
+      # had contributed. A `HEADERS(:status 200, content-type, content-length)` followed by
+      # `HEADERS(:status 103, link)` and the body was reported, and STORED, as a clean
+      # `status: 103` with no headers and the real 200 gone. That is precisely what an h2
+      # response-splitting probe produces, so gori was reporting a successful injection as a
+      # benign informational response.
+      private def self.merge_block(header_buf : IO::Memory, decoder : HPACK::Decoder,
+                                   headers : Array({String, String}), status : Int32,
+                                   final_seen : Bool, trailers : Array(String)?,
+                                   late_interim : Int32?,
+                                   end_stream_pending : Bool) : {Int32, Bool, Array(String)?, Int32?}
+        count_before = headers.size
+        status_before = status
+        status, names = absorb(header_buf, decoder, headers, status)
+        if final_seen
+          if interim?(status)
+            # Shape 4. Drop exactly what THIS block added — not the whole array — and give the
+            # final response its status back. The event itself is not swallowed: `exchange`
+            # turns `late_interim` into a named clause on the Result.
+            late_interim = status
+            headers.pop(headers.size - count_before)
+            status = status_before
+          else
+            trailers = note_trailers(trailers, names, true) # shape 3
+          end
+        else
+          final_seen = !interim?(status)
+          # Shape 2. Not when END_STREAM rode on the interim block itself: the stream is over,
+          # no final response is coming, and `no_response` reports that instead.
+          headers.clear if !end_stream_pending && !final_seen
+        end
+        {status, final_seen, trailers, late_interim}
       end
 
       # Names decoded from a header block that arrived AFTER the final response block are
@@ -1146,21 +1253,39 @@ module Gori
         Result.new(Bytes.new(0), nil, nil, elapsed(started), message)
       end
 
-      # A nil socket here means no usable HTTP/2 connection — could be unreachable,
-      # an origin that doesn't offer h2 over ALPN, or (for verified https) a cert that
-      # failed verification. Spell that out instead of a bare "connect failed".
+      # Why an h2 send has no connection.
       #
-      # The two conditions are SEPARATE. The guard used to be `scheme == "https" && verify`,
-      # so `-k` / MCP `insecure:true` / `gori mcp --insecure-upstream` routed an **https**
-      # target into the h2c `else` and reported a cleartext prior-knowledge diagnosis for a
-      # failed ALPN negotiation — sending the operator after a problem that does not exist,
-      # on the branch they hit most (`-k` is the normal mode against a lab origin). The
-      # transport decides the ALPN wording; verification only adds a clause.
-      private def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool) : String
-        base = "h2 connect failed (no h2 negotiated): #{host}:#{port}"
-        return "#{base} — host unreachable or the origin doesn't offer HTTP/2 (h2c) here" unless scheme == "https"
-        cert = verify ? ", or its TLS certificate failed verification" : ""
-        "#{base} — host unreachable, the origin doesn't offer HTTP/2 via ALPN#{cert}"
+      # This used to build ONE sentence out of `scheme`/`verify` alone — "host unreachable, the
+      # origin doesn't offer HTTP/2 via ALPN, or its TLS certificate failed verification" — for
+      # four failures with four different fixes (firewall/DNS, add the private CA, "this port is
+      # not TLS", "this origin has no h2"), while the same operator one `^V` away got the h1
+      # engine's named refusals for three of them. `open` discarded the dialer's `DialError`
+      # before this could ask, so the collapse was structural, not a wording slip.
+      #
+      # The three transport failures are `Repeater::Engine.connect_error`'s to word, verbatim:
+      # they are not h2 problems at all — a refused TCP connect and an untrusted certificate
+      # fail identically whatever runs on top — and ONE function is what stops an h1 tab and an
+      # h2 tab ever again disagreeing about the same origin. It is also where the dialer's
+      # `detail` (an upstream proxy's own refusal) is already honoured, so that reaches h2 too.
+      #
+      # The fourth is h2's own, and it is the only one of the four gori can state without
+      # hedging: the handshake COMPLETED and the origin named the protocol it picked. It is
+      # also the case an operator hits constantly against a lab or legacy origin, and it was
+      # buried third in a list of three guesses.
+      private def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool,
+                                     failure : DialFailure? = nil) : String
+        if alpn = failure.try(&.alpn)
+          # gori offers `h2` and nothing else, so an origin that speaks only HTTP/1.1 has no
+          # overlap to select and the negotiated protocol comes back EMPTY — that, not a
+          # counter-offer, is what the common case actually looks like on the wire. The
+          # non-empty branch is for an origin that selects a protocol gori never offered,
+          # which is itself worth naming rather than folding into "no h2".
+          picked = alpn.empty? ? "did not accept `h2` over ALPN (the only protocol gori offered)" : "selected ALPN `#{alpn}`, which gori did not offer"
+          return "h2 not negotiated: #{host}:#{port} — the origin completed the TLS handshake " \
+                 "but #{picked}, so it does not speak HTTP/2 here; send this request as " \
+                 "HTTP/1.1 instead, or use h2c (http://) if the origin takes prior-knowledge h2"
+        end
+        Engine.connect_error(scheme, host, port, verify, failure.try(&.dial_error))
       end
 
       private def self.elapsed(started : Time::Instant) : Int64

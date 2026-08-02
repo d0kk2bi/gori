@@ -3,7 +3,7 @@ require "../proxy/codec/http1"
 require "./engine"
 
 # Non-blocking "is there residue in the read buffer?" — the piece Crystal's public IO has no
-# way to ask. `ConnPool#drained?` needs it because `read_head` reads byte-by-byte through the
+# way to ask. `ConnPool#checkout_state` needs it because `read_head` reads byte-by-byte through the
 # buffered layer, which pulls a large chunk off the socket into `@in_buffer_rem`; any bytes
 # the origin left past the framed body therefore sit in THAT buffer, not on the kernel socket,
 # where an fd-level `MSG_PEEK` cannot see them. `peek` would find them but calls `fill_buffer`
@@ -55,15 +55,22 @@ module Gori::Repeater
   # least likely to have hit the origin's idle timeout.
   class ConnPool
     # A parked socket the origin closed while it sat idle is normal (every server has a
-    # keep-alive idle timeout) and must not surface as a failed result: for an IDEMPOTENT
-    # request it is re-sent once on a fresh connection. Detected as a clean EOF before ANY
-    # response byte — a timeout, or a failure part-way through a response, is NOT retried,
-    # because the origin may well have processed the request.
+    # keep-alive idle timeout) and must not surface as a failed result. There are two moments
+    # it can be discovered, and they are NOT the same fact:
     #
-    # An origin that refuses reuse outright would otherwise pay that redial on every single
-    # send (two connections per request — worse than not pooling). After this many
-    # consecutive stale checkouts the pool gives up and runs in dial-per-send mode for the
-    # rest of the run.
+    #   * at CHECKOUT, before a byte of the next request is written (`Checkout::Closed`) —
+    #     the origin cannot have seen the request, so it goes out on a fresh connection as a
+    #     FIRST send, for any method, unmarked;
+    #   * DURING the exchange, because the FIN landed between the probe and the write
+    #     (`stale?`) — gori cannot tell whether the origin read it, so only an IDEMPOTENT
+    #     request is re-sent, and its Result is marked `retried`.
+    #
+    # Either way a timeout, or a failure part-way through a response, is NOT retried: the
+    # origin may well have processed the request.
+    #
+    # An origin that refuses reuse outright turns every park into a wasted probe and a redial.
+    # After this many consecutive stale checkouts — of EITHER kind — the pool gives up and
+    # runs in dial-per-send mode for the rest of the run.
     #
     # On `max_requests`: a stale re-send is not charged against the CAP (CappedBackend counts
     # calls into the Sender, and this retry happens below it), and STALE_GIVE_UP bounds the
@@ -106,12 +113,34 @@ module Gori::Repeater
       REPLAYABLE_METHODS.any? { |m| method.compare(m, case_insensitive: true) == 0 }
     end
 
+    # What the checkout probe found on a parked socket, right before this request would be
+    # written onto it. Three outcomes, not two, because the third one is the discriminator
+    # the class contract says it does not have (see `stale?`): a FIN that is ALREADY on the
+    # socket proves the origin never saw this request, since nothing has been written yet.
+    enum Checkout
+      # Nothing waiting. Write the request onto it.
+      Clean
+      # Unread bytes from the PREVIOUS exchange (a body past Content-Length, a HEAD-with-body).
+      # Retire: framing this request's response against them is the response-desync gori
+      # exists to DETECT, not to suffer.
+      Residue
+      # The peer's FIN arrived while the socket sat idle, before gori wrote a byte. Retire —
+      # and the re-dial that follows is a FIRST send, for ANY method.
+      Closed
+    end
+
     # Connections dialed (== handshakes paid) and requests served off a parked socket.
     # `dialed + reused == sends` for a run that never hit a stale retry.
     getter dialed : Int64 = 0_i64
     getter reused : Int64 = 0_i64
     # Re-sends caused by a parked socket the origin had already closed (see STALE_GIVE_UP).
     getter stale_retries : Int64 = 0_i64
+    # Parked sockets found ALREADY CLOSED at checkout, before a byte of this request went
+    # onto them. NOT re-sends: nothing had been sent, so the fresh connection carries the
+    # request's FIRST and only copy and no `retried` marker is warranted. Counted separately
+    # from `stale_retries` because the two answer different questions — this one is "how
+    # often did parking turn out to be pointless", which is what STALE_GIVE_UP acts on.
+    getter stale_checkouts : Int64 = 0_i64
     # Sends that hit a closed parked socket and were NOT replayed because the method is not
     # idempotent (see REPLAYABLE_METHODS). These came back as errors, exactly as they would
     # with keep-alive off — counted so a surface can say why a pooled run and an unpooled one
@@ -139,13 +168,34 @@ module Gori::Repeater
       # bytes were consumed — see reusable_response?.
       method = Repeater::Engine.request_method(bytes)
       if keepable && (io = @idle.pop?)
-        # Residue check AT CHECKOUT, not only when we parked it. The previous exchange's leftover
+        # Probe AT CHECKOUT, not only when we parked it. The previous exchange's leftover
         # bytes (a body past Content-Length, a HEAD-with-body) may not have arrived by the time
         # `recycle` ran — the origin can be a peer whose write races our park — so `recycle`'s
         # check is an early retire, and THIS one, right before we write onto the socket, is the
         # reliable one: by now any straggler residue is on the wire. Without it a poisoned socket
         # would frame this request's response against the previous response's leftovers.
-        unless drained?(io)
+        case checkout_state(io)
+        when Checkout::Closed
+          # The origin's FIN was on the socket BEFORE gori wrote a byte of this request. That
+          # proves what `stale?` (below) explicitly cannot: the ORIGIN NEVER SAW THIS REQUEST.
+          # So the re-dial is a FIRST send, not a replay — allowed for EVERY method, unmarked,
+          # and not charged as a stale re-send, because nothing was re-sent.
+          #
+          # Treating this as "drained" and writing the request onto the dead socket anyway
+          # cost half of every POST sweep: `send` wrote, the read failed with a reset, and
+          # the (correct) idempotency gate below then declined to replay a request whose
+          # delivery it could no longer disprove — one call too late. The two changes are
+          # individually right and jointly dropped the request. `stale?` and the method gate
+          # stay for the genuinely ambiguous case: a FIN that lands BETWEEN this probe and
+          # the write.
+          close(io)
+          @stale_checkouts += 1
+          # Still charged against STALE_GIVE_UP. An origin that closes every parked socket
+          # makes parking pointless, and that is the case the bound exists for whether the
+          # deadness is caught here or one exchange later.
+          note_stale
+          return dial_and_send(bytes, keepable, method)
+        when Checkout::Residue
           close(io)
           return dial_and_send(bytes, keepable, method)
         end
@@ -153,21 +203,25 @@ module Gori::Repeater
         result = Repeater::Engine.exchange(io, bytes, @host, @port, started)
         if stale?(result)
           close(io)
-          @consecutive_stale += 1
-          # Give up on pooling for the rest of the run rather than pay a wasted redial on
-          # every send. Already-parked sockets are dropped: they are the same vintage. Counted
-          # for BOTH outcomes below: an origin that always closes parked sockets is the case
-          # this bound exists for whether or not the method may be replayed.
-          if @consecutive_stale >= STALE_GIVE_UP
-            @pooling = false
-            drain
-          end
+          # Counted for BOTH outcomes below: an origin that always closes parked sockets is the
+          # case this bound exists for whether or not the method may be replayed.
+          note_stale
           # A non-idempotent request stops here with the result it actually got. Re-sending it
           # is what turned a dropped POST into a false 200 and charged the origin twice — see
           # REPLAYABLE_METHODS.
           unless ConnPool.replayable?(method)
             @unsafe_stale += 1
-            return result
+            # …and stop pooling AT ONCE, without waiting for STALE_GIVE_UP. That bound is sized
+            # for an idempotent sweep, where a stale checkout costs a wasted redial and the
+            # request still goes out. For a method the pool may not replay it costs a LOST
+            # PAYLOAD — a hole in the sweep, and one the operator cannot tell from a payload the
+            # origin genuinely refused — so the next two attempts before the bound trips would
+            # be two more holes. Measured against an origin that closes 50 ms after answering:
+            # three payloads lost with the shared bound, one with this. A handshake per send is
+            # a cheap price for the rest of the run agreeing with `--no-keep-alive`.
+            @pooling = false
+            drain
+            return unsafe_stale_result(result, method)
           end
           @stale_retries += 1
           return dial_and_send(bytes, keepable, method, retried: true)
@@ -184,6 +238,62 @@ module Gori::Repeater
     # not leave file descriptors open until GC.
     def close_all : Nil
       drain
+    end
+
+    # One more parked socket that turned out to be dead, from EITHER discovery point. Give up
+    # on pooling for the rest of the run rather than pay a wasted probe-and-redial on every
+    # send; already-parked sockets are dropped, because they are the same vintage.
+    private def note_stale : Nil
+      @consecutive_stale += 1
+      return if @consecutive_stale < STALE_GIVE_UP
+      @pooling = false
+      drain
+    end
+
+    # The row for a request that died on a parked socket and may NOT be replayed.
+    #
+    # `Engine.exchange` ends this path with the transport's own exception message, and that is
+    # not an operator-facing sentence. `read (#<TCPSocket:0x102e5cc80>): Connection reset by
+    # peer` on a fuzz row reads as "this payload provoked a reset" — a false positive in a
+    # security sweep — blames the ORIGIN for a socket gori wrote onto after the origin had
+    # closed it, and puts a heap pointer in the terminal, in `--format json` and in MCP
+    # `fuzz_results`. What gori actually knows is stated first; the transport's own words are
+    # kept as a trailing clause because they are the only evidence of HOW the socket died.
+    #
+    # The one thing this must NOT claim is that the request was not delivered. By here the
+    # FIN arrived after the probe said the socket was clean, so gori wrote the request and
+    # cannot know whether the origin read it — which is exactly why it is not replayed.
+    # `delivered?` stays false (gori heard nothing back) and the sentence says so in words.
+    private def unsafe_stale_result(result : Repeater::Result, method : String) : Repeater::Result
+      why = "the parked keep-alive connection to #{@host}:#{@port} was closed by the origin " \
+            "while this #{method} was being sent, and #{method} is not idempotent, so gori did " \
+            "NOT re-send it — this request may or may not have reached the origin"
+      detail = ConnPool.transport_detail(result.error)
+      # Named, not positional, for the three tail flags — same reason `as_retried` says so:
+      # they are the fields appended one per round, and a positional `true` in the wrong slot
+      # has silently set the wrong one twice now. This rebuilds a Result to change ONE field,
+      # so every other value is carried across verbatim.
+      Repeater::Result.new(result.head, result.body, result.response, result.duration_us,
+        detail ? "#{why} (#{detail})" : why, result.incomplete?,
+        delivered: result.delivered?, timed_out: result.timed_out?, retried: result.retried?)
+    end
+
+    # A Crystal `IO::Error` renders the socket's `inspect` into its message, so the transport's
+    # account of a failure arrives as `read (#<TCPSocket:0x102e5cc80>): Connection reset by
+    # peer`. The words after the colon are evidence worth keeping; the heap address is an
+    # implementation detail that means nothing to an operator, differs on every run (so two
+    # otherwise identical rows never compare equal), and has no business in a terminal, in
+    # `--format json` or in an MCP tool result. Pure and `self.` so a spec can pin the shape
+    # without a socket.
+    #
+    # `Upstream::DialError#cause` does the same scrub for the DIAL layer. This is deliberately
+    # separate rather than shared: the string here never passes through a `DialError` at all —
+    # it comes out of `Engine.exchange`, on a socket the pool had already CONNECTED and handed
+    # over, which is the one place a dial-layer scrubber can never see.
+    def self.transport_detail(message : String?) : String?
+      return nil unless message
+      cleaned = message.gsub(/\s*\(#<[^>]*>\)/, "").strip
+      cleaned.empty? ? nil : cleaned
     end
 
     # `retried` marks the Result as the SECOND copy of this request on the wire, so the row a
@@ -216,7 +326,7 @@ module Gori::Repeater
     # CHECKOUT (`send`), not here. Residue can arrive AFTER we would park — the origin's write
     # races our recycle — so checking here would miss a straggler and still hand a poisoned
     # socket to the next send. `reusable_response?` interrogates only the response HEAD and
-    # cannot see the leftover bytes; the checkout-time `drained?` is what catches them, once
+    # cannot see the leftover bytes; the checkout-time `checkout_state` is what catches them, once
     # they are reliably on the wire.
     private def recycle(io : IO, result : Repeater::Result, keepable : Bool, method : String) : Nil
       if @pooling && keepable && @idle.size < @max_idle && ConnPool.reusable_response?(result, method)
@@ -236,50 +346,56 @@ module Gori::Repeater
     # handshake, so a millisecond to prove it is safe is a good trade.
     DRAIN_PROBE = 1.millisecond
 
-    # Whether the socket has NO unread bytes waiting. A parked socket must be empty, or the
-    # next request reads the leftovers as its own response.
+    # What is waiting on a parked socket, asked once, right before this request is written.
+    # A parked socket must be empty, or the next request reads the leftovers as its own
+    # response — and it must be OPEN, or the next request is written into a closed pipe.
     #
     # For a plaintext `TCPSocket` this is an fd-level `MSG_PEEK` — Crystal's socket fd is
     # already non-blocking (evented IO), so `recv` returns immediately: `EAGAIN`/`EWOULDBLOCK`
-    # means nothing is waiting (drained), any byte or an EOF means retire. ~0.3µs, so it costs
-    # the keep-alive fast path nothing. A TLS socket hides its fd and the residue may sit in
-    # OpenSSL's decrypted buffer where a raw peek cannot see it, so it falls back to a short
-    # read probe, which naturally covers both `SSL_pending` and a kernel-buffered record.
-    private def drained?(io : IO) : Bool
+    # means nothing is waiting (Clean), a byte means Residue, and 0 means the peer sent FIN
+    # (Closed). ~0.3µs, so it costs the keep-alive fast path nothing. A TLS socket hides its
+    # fd and the residue may sit in OpenSSL's decrypted buffer where a raw peek cannot see it,
+    # so it falls back to a short read probe, which naturally covers both `SSL_pending` and a
+    # kernel-buffered record.
+    #
+    # EOF used to be folded into "drained", on the reasoning that a closed parked socket is the
+    # idle-timeout race the stale-retry path already handles. That stopped being true when the
+    # idempotency gate landed: for POST/PUT/PATCH/DELETE the stale path can no longer re-send,
+    # so handing back a socket proved dead DROPPED the request. It is now its own answer — and
+    # a better one for every method, because a FIN observed BEFORE the write means the origin
+    # never saw the request at all.
+    private def checkout_state(io : IO) : Checkout
       # 1. Residue already pulled into the buffered layer by `read_head`'s byte reads. This is
       #    where a body-past-Content-Length or a HEAD-with-body actually lands, and it is
       #    non-blocking, so it must be checked FIRST.
-      return false if io.is_a?(IO::Buffered) && io.gori_buffered_residue?
-      # 2. Residue still on the kernel socket. A plaintext `TCPSocket`'s fd is non-blocking
-      #    (evented IO), so `MSG_PEEK` returns at once: `EAGAIN`/`EWOULDBLOCK` = nothing waiting
-      #    (drained), any byte or EOF = retire. ~0.3µs, so the clean plaintext path pays
-      #    nothing. A TLS socket hides its fd and OpenSSL may hold a partial record, so it
-      #    falls back to a short read probe (only ever paid on a socket that turns out clean —
-      #    and a reused TLS socket has already saved a whole handshake).
-      # EOF here (the peer already sent FIN) is deliberately NOT treated as residue: a closed
-      # socket is the idle-timeout race the stale-retry path already handles by re-sending on a
-      # fresh connection, and papering over it here would bypass STALE_GIVE_UP's bookkeeping.
-      # Only actual WAITING BYTES cause misattribution, so only those retire the socket.
+      return Checkout::Residue if io.is_a?(IO::Buffered) && io.gori_buffered_residue?
+      # 2. Residue — or the peer's FIN — still on the kernel socket.
       if io.is_a?(TCPSocket)
         buf = uninitialized UInt8[1]
         n = LibC.recv(io.fd, buf.to_unsafe.as(Void*), LibC::SizeT.new(1), MSG_PEEK)
-        return true if n == 0 # EOF — let stale? handle it
-        n < 0 && {Errno::EAGAIN, Errno::EWOULDBLOCK}.includes?(Errno.value)
+        return Checkout::Closed if n == 0
+        return Checkout::Residue if n > 0
+        {Errno::EAGAIN, Errno::EWOULDBLOCK}.includes?(Errno.value) ? Checkout::Clean : Checkout::Residue
       elsif io.responds_to?(:read_timeout=) && io.responds_to?(:read_timeout)
         prev = io.read_timeout
         begin
           io.read_timeout = DRAIN_PROBE
-          io.read_byte.nil? # nil = EOF (drained, stale? handles it); a byte = residue (retire)
+          # nil = EOF (the peer closed); a byte = residue. The byte is consumed, which is why
+          # this branch only ever runs on a socket that is about to be retired either way.
+          io.read_byte.nil? ? Checkout::Closed : Checkout::Residue
         rescue IO::TimeoutError
-          true
+          Checkout::Clean
         ensure
           io.read_timeout = prev
         end
       else
-        true # an IO with no timeout knob is not a pooled socket; nothing to prove
+        Checkout::Clean # an IO with no timeout knob is not a pooled socket; nothing to prove
       end
     rescue
-      false # any probe error ⇒ do not risk parking a bad socket
+      # Any probe error ⇒ do not risk writing onto this socket. Reported as Residue rather
+      # than Closed: a failed probe proves nothing about whether the peer closed, and Closed
+      # is the answer that licenses re-sending a POST.
+      Checkout::Residue
     end
 
     # A REUSED socket that failed BEFORE any response byte arrived. Per the contract at the
@@ -305,6 +421,10 @@ module Gori::Repeater
     # What this does NOT establish, and used to be read as establishing, is that the ORIGIN
     # never saw the request. It only means gori heard nothing back. The method gate in `send`
     # is what covers the gap.
+    #
+    # `Checkout::Closed` DOES establish it, and is checked first — so by the time this runs the
+    # FIN arrived after the probe, i.e. genuinely while or after gori wrote. This is the narrow
+    # ambiguous window the method gate exists for, not the whole idle-close population.
     private def stale?(result : Repeater::Result) : Bool
       !result.error.nil? && result.response.nil? && !result.delivered?
     end
