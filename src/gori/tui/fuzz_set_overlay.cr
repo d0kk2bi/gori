@@ -6,6 +6,7 @@ require "./text_area"
 require "./text_field"
 require "./path_complete"
 require "../settings"
+require "../fuzz/presets"
 
 module Gori::Tui
   # One payload set: a source kind + a value string in the compact grammar the Fuzz
@@ -27,12 +28,13 @@ module Gori::Tui
   # writes build_spec back into @sets; :stay otherwise. There is no cancel: every exit
   # applies, which is what the shell's apply_close_fuzz_set did on all three paths.
   class FuzzSetOverlay < Overlay
-    PTYPES = [:list, :numbers, :wordlist, :null, :brute]
+    PTYPES = [:list, :numbers, :wordlist, :null, :brute, :preset]
 
     getter edit_index : Int32?
 
     def initialize(@edit_index : Int32? = nil)
       @ptype = :list
+      @preset_name = Gori::Fuzz::Presets.names.first? || "sqli" # the built-in preset selector's value
       @sel = 0 # row cursor: 0 = the Type selector, then the type's fields
       @fields = {
         :from    => TextField.new("1"),
@@ -93,6 +95,9 @@ module Gori::Tui
         @fields[:charset].set(charset)
         @fields[:min].set(lo)
         @fields[:max].set(hi)
+      when :preset
+        @ptype = :preset
+        @preset_name = spec.value if Gori::Fuzz::Presets.exists?(spec.value)
       end
     end
 
@@ -104,6 +109,7 @@ module Gori::Tui
       when :wordlist then [:path]
       when :null     then [:count]
       when :brute    then [:charset, :min, :max]
+      when :preset   then [:preset_name]
       else                [:values]
       end
     end
@@ -163,6 +169,27 @@ module Gori::Tui
       handle_field(ev, f)
     end
 
+    # The built-in-preset selector row: ←/→ cycle the preset name, ↑/↓ move rows, ↵ applies
+    # (it is the only field, so it is always the last row).
+    private def handle_preset_name(ev : Termisu::Event::Key) : Symbol
+      key = ev.key
+      case
+      when key.left?             then cycle_preset(-1)
+      when key.right?            then cycle_preset(1)
+      when key.up?               then move_row(-1)
+      when key.down?             then move_row(1)
+      when key.enter?            then return :commit
+      end
+      :stay
+    end
+
+    private def cycle_preset(d : Int32) : Nil
+      names = Gori::Fuzz::Presets.names
+      return if names.empty?
+      i = names.index(@preset_name) || 0
+      @preset_name = names[(i + d) % names.size]
+    end
+
     private def handle_type_row(ev : Termisu::Event::Key) : Symbol
       key = ev.key
       case
@@ -211,6 +238,7 @@ module Gori::Tui
     end
 
     private def handle_field(ev : Termisu::Event::Key, f : Symbol) : Symbol
+      return handle_preset_name(ev) if f == :preset_name # a selector row, not a TextField
       key = ev.key
       tf = @fields[f]? || return :stay
       # ^D (browser-bookmark convention): toggle the CURRENTLY TYPED path in/out of
@@ -287,6 +315,8 @@ module Gori::Tui
       when :brute
         cs = @fields[:charset].value.strip
         cs.empty? ? nil : SetSpec.new(:brute, "#{cs}:#{num(:min, 1)}-#{num(:max, 1)}")
+      when :preset
+        SetSpec.new(:preset, @preset_name)
       end
     end
 
@@ -307,6 +337,7 @@ module Gori::Tui
 
     private def ptype_label(t : Symbol) : String
       case t
+      when :preset   then "Preset"
       when :numbers  then "Numbers"
       when :wordlist then "Wordlist"
       when :null     then "Null"
@@ -324,8 +355,9 @@ module Gori::Tui
       when :charset then "Charset"
       when :min     then "Min"
       when :max     then "Max"
-      when :path    then "Path"
-      else               ""
+      when :path        then "Path"
+      when :preset_name then "Preset"
+      else                   ""
       end
     end
 
@@ -354,7 +386,11 @@ module Gori::Tui
       render_meta(screen, box)
       render_type_row(screen, box)
       Frame.tee_divider(screen, box, box.y + 2, Theme.bg)
-      @ptype == :list ? render_values(screen, box) : render_fields(screen, box)
+      case @ptype
+      when :list   then render_values(screen, box)
+      when :preset then render_preset(screen, box)
+      else              render_fields(screen, box)
+      end
       render_hint(screen, box)
       render_path_dropdown(screen, box) if @ptype == :wordlist
     end
@@ -400,6 +436,44 @@ module Gori::Tui
       end
     end
 
+    # The built-in-preset selector: a "Preset" row of the available names (the enumeration
+    # requirement), the current one highlighted, followed by its payload count. ←/→ cycle.
+    private def render_preset(screen : Screen, box : Rect) : Nil
+      foc = focused == :preset_name
+      y = box.y + 3
+      screen.fill(Rect.new(box.x + 1, y, box.w - 2, 1), Theme.accent_bg) if foc
+      screen.text(box.x + 2, y, "Preset", foc ? Theme.text_bright : Theme.muted, foc ? Theme.accent_bg : Theme.bg)
+      # Wrap the name segments across the field area so all six stay discoverable even at
+      # the overlay's minimum width.
+      x = box.x + 2 + LABEL_W
+      row = y
+      left = box.x + 2 + LABEL_W
+      Gori::Fuzz::Presets.names.each do |name|
+        sel = name == @preset_name
+        seg = " #{name} "
+        if x + seg.size > box.right - 2
+          row += 1
+          x = left
+          break if row >= box.bottom - 3
+        end
+        bg = sel ? (foc ? Theme.accent : Theme.selection_dim) : Theme.bg
+        fg = sel ? Theme.text_bright : Theme.muted
+        screen.text(x, row, seg, fg, bg)
+        x += seg.size + 1
+      end
+      n = preset_count(@preset_name)
+      meta = n ? "#{n} payloads" : ""
+      screen.text(box.x + 2, box.bottom - 3, meta, Theme.muted, Theme.bg, width: box.w - 4) unless meta.empty?
+    end
+
+    # The selected preset's payload count for the meta line — nil (count hidden) if the
+    # embedded set somehow fails to load, so a render never raises.
+    private def preset_count(name : String) : Int32?
+      Gori::Fuzz::Presets.load(name).size
+    rescue
+      nil
+    end
+
     private def render_values(screen : Screen, box : Rect) : Nil
       top = box.y + 3
       h = {(box.bottom - 2) - top, 1}.max
@@ -418,6 +492,7 @@ module Gori::Tui
         case @ptype
         when :list     then "one value per line · ↵ new value · ⇥ field · esc applies"
         when :wordlist then "filter · ↹/↵ complete · ^D favorite · ⇥ field · esc applies"
+        when :preset   then "←/→ choose preset · ⇥ type · esc applies & closes"
         else                "⇥/↑↓ field · ↵ next · esc applies & closes"
         end
       screen.text(box.x + 2, box.bottom - 2, hint, Theme.muted, Theme.bg, width: box.w - 4)

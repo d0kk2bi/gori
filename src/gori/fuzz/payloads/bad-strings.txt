@@ -1,0 +1,68 @@
+# Bad strings — long inputs, null bytes, unicode edge cases, integer boundaries.
+# A fast-start set, not a wordlist manager; extend with a merge file for depth.
+# Blank lines and lines starting with '#' are comments (skipped at load).
+# Byte-exact payloads (a raw NUL, high bytes) are better sent as list_base64 / a
+# wordlist file; here the control bytes are percent-encoded so they stay legible.
+
+# Long strings
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+# Control bytes (percent-encoded)
+%00
+%00%00%00
+%0a
+%0d
+%0d%0a
+%09
+%1b
+%7f
+%ff
+
+# Integer boundaries
+0
+-0
+-1
+1
+127
+128
+255
+256
+32767
+32768
+-32768
+65535
+65536
+2147483647
+2147483648
+-2147483648
+4294967295
+9223372036854775807
+9223372036854775808
+-9223372036854775808
+18446744073709551615
+
+# Other numeric shapes
+0x00
+0xff
+0xffffffff
+1e309
+NaN
+Infinity
+-Infinity
+
+# Nullish / boolean tokens
+null
+NULL
+nil
+None
+true
+false
+undefined
+
+# Unicode edge cases
+你好世界
+🚀🔥💥
+İıŞşĞğ
+ﬀﬁﬂ
+Ω≈ç√∫

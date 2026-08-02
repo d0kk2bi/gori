@@ -263,6 +263,10 @@ module Gori
         raise FuzzArgError.new(fuzz_plan_error(ex))
       rescue ex : File::Error
         raise FuzzArgError.new("wordlist error: #{ex.message}")
+      rescue ex : Gori::Error
+        # A payload set's own clean error (a bad wordlist/preset path, an unknown preset
+        # reached via size()) — surfaced as a clean arg error, not an internal crash.
+        raise FuzzArgError.new(ex.message || "payload set error")
       end
 
       # MCP's wording for a plan the args can't produce — the builder reports the
@@ -452,6 +456,12 @@ module Gori
           Fuzz::InlineList.new(b64.map { |x| fuzz_payload_bytes(x) })
         elsif wl = obj["wordlist"]?.try(&.as_s?)
           Fuzz::WordlistFile.new(wl)
+        elsif preset = obj["preset"]?.try(&.as_s?)
+          # A built-in preset set (see Fuzz::Presets), optionally merged with a user file
+          # on the server's disk ("file": built-in first, de-duped). Reject a typo up front
+          # with the list, rather than let it surface as an empty run.
+          raise FuzzArgError.new("unknown preset #{preset.inspect} (available: #{Fuzz::Presets.names.join(", ")})") unless Fuzz::Presets.exists?(preset)
+          Fuzz::PresetSource.new(preset, obj["file"]?.try(&.as_s?).presence)
         elsif nums = obj["numbers"]?
           fuzz_numbers(nums)
         elsif (nul = obj["null"]?) && (n = (nul.as_i64? || nul.as_s?.try(&.to_i64?)))
@@ -459,7 +469,7 @@ module Gori
         elsif br = obj["brute"]?
           fuzz_brute(br)
         else
-          raise FuzzArgError.new("unknown payload set #{spec} (use list/list_base64/wordlist/numbers/null/brute)")
+          raise FuzzArgError.new("unknown payload set #{spec} (use list/list_base64/wordlist/preset/numbers/null/brute)")
         end
       end
 

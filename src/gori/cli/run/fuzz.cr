@@ -52,6 +52,7 @@ module Gori
           p.on("--mark=TOKEN", "Mark each literal TOKEN occurrence as a position (repeatable)") { |v| marks << v }
           p.on("--mode=MODE", "sniper (default) | batteringram | pitchfork | clusterbomb") { |v| mode = parse_mode(v) }
           p.on("-wPATH", "--wordlist=PATH", "Payload set: a wordlist file (repeatable; order → positions)") { |v| sources << Fuzz::WordlistFile.new(v) }
+          p.on("--preset=NAME", "Payload set: a built-in preset (#{Fuzz::Presets.names.join("|")}); NAME:FILE merges a user file into it") { |v| sources << parse_preset(v) }
           p.on("--payloads=LIST", "Payload set: inline comma list (a,b,c)") { |v| sources << Fuzz::InlineList.new(v.split(',')) }
           p.on("--numbers=SPEC", "Payload set: FROM-TO[:STEP] (e.g. 1-100 or 0-255:5)") { |v| sources << parse_numbers(v) }
           p.on("--null=N", "Payload set: N empty payloads") { |v| sources << Fuzz::NullPayloads.new(parse_count(v, "--null")) }
@@ -171,7 +172,7 @@ module Gori
         in Fuzz::PlanError::Reason::BadTarget
           "could not determine a target host"
         in Fuzz::PlanError::Reason::NoPayloads
-          "no payloads — add -w/--payloads/--numbers/--null/--brute"
+          "no payloads — add -w/--preset/--payloads/--numbers/--null/--brute"
         in Fuzz::PlanError::Reason::UnresolvedEnv
           env_unresolved_error(ex.detail)
         end
