@@ -129,6 +129,21 @@ module Gori::Decoder
       category: Category::Token, direction: Direction::Decode,
       description: "Decode JWT header+payload (no signature verify)") { |b| Codecs.jwt_decode(b) }
 
+    # Framework signed session cookies — parse into payload / timestamp / signature, no
+    # verify (that + crack/forge live in `gori run cookie` and the MCP cookie_* tools).
+    r.register encode("cookie-decode", "cookie", "session-cookie",
+      category: Category::Token, direction: Direction::Decode,
+      description: "Decode a Flask/Rack/Django signed session cookie (auto-detect)") { |b| Codecs.cookie_decode(b) }
+    r.register encode("flask-decode", "flask", "flask-cookie", "itsdangerous",
+      category: Category::Token, direction: Direction::Decode,
+      description: "Decode a Flask (itsdangerous) session cookie") { |b| Codecs.flask_cookie_decode(b) }
+    r.register encode("rack-decode", "rack", "rack-cookie",
+      category: Category::Token, direction: Direction::Decode,
+      description: "Decode a Rack (Ruby) session cookie") { |b| Codecs.rack_cookie_decode(b) }
+    r.register encode("django-decode", "django", "django-cookie",
+      category: Category::Token, direction: Direction::Decode,
+      description: "Decode a Django (django.core.signing) session cookie") { |b| Codecs.django_cookie_decode(b) }
+
     # ---------------- HASH ----------------
     r.register encode("md5", category: Category::Hash, direction: Direction::Hash, description: "MD5 digest (hex)") { |b| Digest::MD5.hexdigest(b) }
     r.register encode("sha1", category: Category::Hash, direction: Direction::Hash, description: "SHA-1 digest (hex)") { |b| Digest::SHA1.hexdigest(b) }

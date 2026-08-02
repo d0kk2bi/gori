@@ -4,6 +4,7 @@ require "compress/gzip"
 require "compress/zlib"
 require "compress/deflate"
 require "big"
+require "../cookie"
 
 module Gori::Decoder
   # The implementations that have no (or no convenient) stdlib equivalent, plus the
@@ -421,6 +422,27 @@ module Gori::Decoder
       String.from_json(quoted ? t : %("#{t}"))
     rescue ex : JSON::ParseException
       raise DecoderError.new("invalid JSON string: #{ex.message}")
+    end
+
+    # ---- framework signed session cookies — parse only, no signature verify ----
+    # Thin delegators to Gori::Cookie so the Decoder catalog reads the same as jwt_decode.
+    # `cookie_decode` auto-detects Flask / Rack / Django; the pinned variants force one
+    # format so a cookie that another format could also match still decodes as intended.
+    # Cookie::CookieError is a Gori::Error, which the chain surfaces as a step error.
+    def cookie_decode(data : Bytes) : String
+      Gori::Cookie.decode(String.new(data).strip)
+    end
+
+    def flask_cookie_decode(data : Bytes) : String
+      Gori::Cookie::Flask.decode_text(String.new(data).strip)
+    end
+
+    def rack_cookie_decode(data : Bytes) : String
+      Gori::Cookie::Rack.decode_text(String.new(data).strip)
+    end
+
+    def django_cookie_decode(data : Bytes) : String
+      Gori::Cookie::Django.decode_text(String.new(data).strip)
     end
 
     # ---- JWT (header.payload[.signature]) — decode only, no signature verify ----

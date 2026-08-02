@@ -27,6 +27,7 @@ require "./request_builder"
 require "./tools/compare"
 require "./tools/context"
 require "./tools/decode"
+require "./tools/cookie"
 require "./tools/discover"
 require "./tools/env"
 require "./tools/flows"
@@ -296,6 +297,7 @@ module Gori
         "list_projects", "create_project", "switch_project", "delete_project",
         "project_info",
         "decode", "jwt_decode", "jwt_encode", "jwt_attacks",
+        "cookie_decode", "cookie_verify", "cookie_crack", "cookie_forge",
         "sequence_analyze", "ql_reference", "ql_explain",
         "oast_presets", "oast_start", "oast_poll", "oast_payload", "oast_stop",
       }
@@ -792,6 +794,50 @@ module Gori
             "HS256 re-signs, and header-parameter injection (kid path-traversal/SQLi, jku/x5u/jwk). " \
             "Pure transform: no network. Returns an array of {name, category, note, token}." do |s|
             s.field "token", strprop("the JWT to derive testing payloads from"), required: true
+          end
+
+          tool j, "cookie_decode",
+            "Parse a framework signed session cookie — Flask (itsdangerous), Rack (Ruby), or " \
+            "Django (django.core.signing) — into its structured parts (payload, timestamp, " \
+            "signature). Auto-detects the format from the cookie's punctuation. Pure transform: " \
+            "no network, no signature verification. Returns {format, payload, timestamp, signature, …}." do |s|
+            s.field "cookie", strprop("the raw cookie value (URL-decoded)"), required: true
+            s.field "format", strprop("force a format instead of auto-detect: flask | rack | django")
+          end
+
+          tool j, "cookie_verify",
+            "Verify a signed session cookie against a candidate secret — the offline check that " \
+            "confirms a guessed/cracked signing key. Returns {valid, format}." do |s|
+            s.field "cookie", strprop("the raw cookie value"), required: true
+            s.field "secret", strprop("the candidate signing secret"), required: true
+            s.field "format", strprop("force a format: flask | rack | django (default auto-detect)")
+            s.field "salt", strprop("Flask/Django signing salt (Flask default 'cookie-session', Django 'django.core.signing')")
+            s.field "algorithm", strprop("Django HMAC algorithm: sha256 (default) | sha1")
+          end
+
+          tool j, "cookie_crack",
+            "Brute-force a session cookie's signing secret over a wordlist and report the first " \
+            "match — the classic weak-SECRET_KEY move. Supply candidates inline via 'secrets' " \
+            "and/or a 'wordlist' file path. Pure offline compute: no network. Returns {found, secret, format}." do |s|
+            s.field "cookie", strprop("the raw cookie value"), required: true
+            s.field "secrets", strarrprop("inline candidate secrets to try (in order)")
+            s.field "wordlist", strprop("path to a newline-delimited wordlist file")
+            s.field "format", strprop("force a format: flask | rack | django (default auto-detect)")
+            s.field "salt", strprop("Flask/Django signing salt")
+            s.field "algorithm", strprop("Django HMAC algorithm: sha256 (default) | sha1")
+          end
+
+          tool j, "cookie_forge",
+            "Re-sign a (possibly edited) payload with a known/cracked secret and emit a valid " \
+            "session cookie — forge an admin session once the key is known. Flask/Django take a " \
+            "'payload' JSON; Rack takes the opaque base64 'value'. Returns {cookie, format}." do |s|
+            s.field "format", strprop("flask | rack | django"), required: true
+            s.field "secret", strprop("the signing secret"), required: true
+            s.field "payload", strprop("session JSON to sign (Flask/Django)")
+            s.field "value", strprop("the base64 Marshal cookie value (Rack — opaque bytes)")
+            s.field "timestamp", intprop("unix second to stamp (Flask/Django; defaults to now)")
+            s.field "salt", strprop("Flask/Django signing salt")
+            s.field "algorithm", strprop("Django HMAC algorithm: sha256 (default) | sha1")
           end
 
           tool j, "sequence_analyze",
@@ -1787,6 +1833,10 @@ module Gori
         when "jwt_decode"              then jwt_decode_tool(h)
         when "jwt_encode"              then jwt_encode_tool(h)
         when "jwt_attacks"             then jwt_attacks_tool(h)
+        when "cookie_decode"           then cookie_decode_tool(h)
+        when "cookie_verify"           then cookie_verify_tool(h)
+        when "cookie_crack"            then cookie_crack_tool(h)
+        when "cookie_forge"            then cookie_forge_tool(h)
         when "sequence_analyze"        then sequence_analyze(h)
         when "list_rules"              then list_rules
         when "list_extract_rules"      then list_extract_rules
