@@ -21,9 +21,16 @@ end
 private def start_quiet_origin : Int32
   origin = TCPServer.new("127.0.0.1", 0)
   port = origin.local_address.port
+  # Closes each connection immediately — "this port is not TLS" — but accepts REPEATEDLY.
+  # The one-shot version served only the first dial, so an example that dials twice (the
+  # h1-vs-h2 comparison does, once per engine) got the intended verdict on the first connection
+  # and whatever a vanished listener produces on the second. That read as the two engines
+  # disagreeing when it was the harness running out.
   spawn do
-    conn = origin.accept?
-    conn.try(&.close) rescue nil
+    while conn = origin.accept?
+      conn.close rescue nil
+    end
+  rescue
   end
   port
 end
@@ -45,7 +52,11 @@ private def start_tls_origin(advertise_h2 : Bool) : Int32
     while conn = origin.accept?
       spawn do
         ssl = OpenSSL::SSL::Socket::Server.new(conn, ctx, sync_close: true)
-        sleep 2.seconds
+        # Longer than any example's own timeout. At 2s a second connection on a loaded runner
+        # could start its handshake after this fiber had closed, and the example then compared
+        # a verification verdict against a reset — a harness race that read as a real divergence
+        # between the h1 and h2 engines.
+        sleep 30.seconds
         ssl.close
       rescue
         conn.close rescue nil
@@ -1853,39 +1864,33 @@ describe Gori::Repeater::H2Engine do
     # examples on literals would mean an h1-side improvement lands as an h2-side spec failure,
     # which is how the two drifted apart in the first place.
     {
-      # `exact` is false for the plaintext port ALONE, and that is a property of the case, not a
-      # weakened assertion. A port that is not TLS answers the ClientHello when it happens to be
-      # reading and stays silent when it does not, so OpenSSL reports `wrong version number` on
-      # one connection and the handshake times out on the next — and the two sends below are two
-      # connections. Both readings are true, and neither is a certificate claim, which is the
-      # thing this example exists to pin. Demanding one string here would pin the race instead.
-      {"a TCP connect that never came up", -> { s = TCPServer.new("127.0.0.1", 0); p = s.local_address.port; s.close; p }, false, true},
-      {"a certificate the client does not trust", -> { start_tls_origin(advertise_h2: true) }, true, true},
-      {"a plaintext port addressed as https", -> { start_quiet_origin }, false, false},
-    }.each do |(label, open_port, verify, exact)|
+      # Both origins hold every connection open for far longer than these timeouts, on purpose:
+      # each example below dials TWICE (once per engine), and a one-shot or short-lived listener
+      # made the second dial fail differently from the first — which read as the two engines
+      # disagreeing when it was the harness running out.
+      {"a TCP connect that never came up", -> { s = TCPServer.new("127.0.0.1", 0); p = s.local_address.port; s.close; p }, false},
+      {"a certificate the client does not trust", -> { start_tls_origin(advertise_h2: true) }, true},
+      {"a plaintext port addressed as https", -> { start_quiet_origin }, false},
+    }.each do |(label, open_port, verify)|
       it "says exactly what the h1 engine says about #{label}" do
-        port = open_port.call
+        # A FRESH origin per engine. Sharing one made each engine's dial a different connection
+        # to the same listener, and the second connection is not the case under test: it saw a
+        # listener mid-teardown and reported a reset rather than the verdict the first got. Each
+        # engine now gets a first connection, which is what the example is actually about.
         args = {"GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice}
         h2 = Gori::Repeater::H2Engine.send(*args, scheme: "https", host: "127.0.0.1",
-          port: port, verify_upstream: verify, timeout: 3.seconds)
+          port: open_port.call, verify_upstream: verify, timeout: 3.seconds)
         h1 = Gori::Repeater::Engine.send(*args, scheme: "https", host: "127.0.0.1",
-          port: port, verify_upstream: verify, timeout: 3.seconds)
+          port: open_port.call, verify_upstream: verify, timeout: 3.seconds)
 
+        # Compared WITHOUT the trailing `(cause)` and without the port. The cause is the TLS
+        # library's own words about the syscall that observed the failure, and two connections
+        # legitimately differ there ("Unexpected EOF while reading" vs "Connection reset by
+        # peer") for one verdict. What must match is the verdict, the layer and the remedy —
+        # which is the whole of what the h2 engine used to collapse.
+        verdict = ->(s : String?) { s.to_s.sub(/ \([^)]*\)\z/, "").sub(/:\d+ /, " ") }
         error = h2.error.should_not be_nil
-        h1_error = h1.error.should_not be_nil
-        if exact
-          error.should eq(h1_error)
-        else
-          # Same layer, and — the point of the example — neither engine BLAMES a certificate.
-          # Note the timeout sentence mentions one on purpose ("no certificate was exchanged, so
-          # -k and SSL_CERT_FILE cannot help"), which is the opposite of a certificate claim, so
-          # the assertion is on the verdict and its remedy rather than on the word.
-          {error, h1_error}.each do |e|
-            e.should start_with("TLS handshake")
-            e.should_not contain("certificate is not trusted")
-            e.should_not contain("retry with -k")
-          end
-        end
+        verdict.call(error).should eq(verdict.call(h1.error))
         # …and none of the three carries the collapsed sentence's guesses.
         error.should_not contain("no h2 negotiated")
         error.should_not contain("doesn't offer HTTP/2")
