@@ -1475,17 +1475,35 @@ module Gori::Proxy
     end
 
     # The error text for a failed upstream acquire/send. A nil `upstream` is a DIAL failure,
-    # split into unreachable (connect), a TLS/verify rejection — the #323 case, whose fix is
-    # --insecure-upstream, so the recorded flow points there instead of at reachability — and
-    # a refusal by the configured upstream proxy, where the origin was never contacted at all.
+    # split into unreachable (connect), a name that never resolved, a certificate rejection —
+    # the #323 case, whose fix is --insecure-upstream, so the recorded flow points there
+    # instead of at reachability — a handshake the origin refused for some other reason, an
+    # origin that accepted the connection and then went silent, and a refusal by the
+    # configured upstream proxy, where the origin was never contacted at all.
     # A non-nil `upstream` means the socket was live but the mid-request write failed.
+    #
+    # The branches key on `err.kind`, never on `@verify_upstream`: the dialer knows whether
+    # verification is what rejected the origin, and guessing it from the flag is what made a
+    # black hole and a plaintext port both read as an untrusted certificate.
     private def upstream_error_message(host : String, port : Int32, upstream : IO?) : String
       return "upstream write failed: #{host}:#{port}" unless upstream.nil?
       err = @last_dial_error
-      if err && err.tls?
-        return "upstream TLS verification failed: #{host}:#{port} — origin certificate not trusted; " \
-               "retry with --insecure-upstream or set SSL_CERT_FILE" if @verify_upstream
-        return "upstream TLS handshake failed: #{host}:#{port}"
+      if err
+        case err.kind
+        when .tls_verify?
+          return "upstream TLS verification failed: #{host}:#{port} — origin certificate not trusted; " \
+                 "retry with --insecure-upstream or set SSL_CERT_FILE#{err.because}"
+        when .tls?
+          return "upstream TLS handshake failed: #{host}:#{port} — the port may not be TLS, or the " \
+                 "origin refused the protocol/cipher#{err.because}"
+        when .timeout?
+          return "upstream TLS handshake timed out: #{host}:#{port} — the origin accepted the " \
+                 "connection and then sent nothing; no certificate was exchanged, so " \
+                 "--insecure-upstream and SSL_CERT_FILE cannot help#{err.because}"
+        when .dns?
+          return "upstream DNS lookup failed: #{host} — the name did not resolve, so nothing was " \
+                 "dialed#{err.because}"
+        end
       end
       # A detail REPLACES the host-shaped sentence rather than decorating it. Every detail the
       # dialer sets is about a proxy — either one that refused the tunnel or one gori could not
