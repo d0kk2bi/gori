@@ -47,6 +47,17 @@ module Gori
       # Two or three covers every real stack (a SETTINGS ACK plus a WINDOW_UPDATE); eight
       # leaves room for a chatty one without letting a SETTINGS-less peer hold the write.
       AWAIT_SETTINGS_FRAMES = 8
+      # How many idle timeouts the WHOLE exchange may cost when the caller named no timeout
+      # of its own. `SendFlow#patience` bounds one contiguous stall and restarts on progress
+      # (deliberately — an origin that drips window must not be cut short), so on its own it
+      # is not a bound at all: an origin granting one byte of window per second held a
+      # `timeout_ms: 2000` send at 69 of 20 000 bytes after 70 s, extrapolating to ~5.5 hours,
+      # and MAX_FRAMES cannot save it (a drip costs 2 frames per byte). A caller that PASSED a
+      # timeout gets that number as the whole-exchange ceiling — an operator who says 2 s means
+      # 2 s. Only the 30 s default is stretched, because "no number given" is the case that can
+      # afford to let a slow-but-progressing origin finish (a large body arriving in small
+      # windowed pieces, one full stall on the write and another on the read).
+      DEFAULT_BUDGET_FACTOR = 3
 
       private alias Frame = Proxy::H2::Frame
       private alias HPACK = Proxy::H2::HPACK
@@ -86,6 +97,19 @@ module Gori
         # nothing" and "the origin sent everything except window" bound alike — the one
         # number an operator already expects. (`WsEngine::DRAIN_DEADLINE` is the sibling.)
         property patience : Time::Span = Settings.io_timeout
+        # The ceiling for the WHOLE exchange, taken once at `exchange` entry and never
+        # restarted — `patience` above is per-stall and restarts on every DATA frame written,
+        # which is what left a dripping origin unbounded. `budget` is the same span in words,
+        # for the sentence `flow_stalled` writes.
+        property budget : Time::Span? = nil
+        property expires_at : Time::Instant? = nil
+        # The whole-exchange budget — not the per-stall one — is what ended the write.
+        property? budget_expired = false
+        # Flow-control window the origin actually granted while the body was going out. It is
+        # the difference between "never granted window for the rest" (a true statement about a
+        # silent origin) and "granted it in increments too small to finish", which are two
+        # different findings and used to share one sentence.
+        property granted = 0_i64
         # Request-body accounting, so a send gori cut short can never be reported as a clean
         # one. `total_body` is 0 when there was no body to send.
         property sent_body = 0
@@ -115,6 +139,10 @@ module Gori
       # carries the peer's own stated reason (GOAWAY *or* RST_STREAM), which fields arrived in
       # a TRAILING header block, and how the read ended — and every one of those is a distinct
       # sentence the operator needs.
+      # `final_seen` is the one the caller cannot reconstruct: an interim 1xx SETS a status and
+      # then clears the fields it carried, so "the status is zero and there are no headers" —
+      # the old test for "nothing arrived" — is false for an exchange that has no response at
+      # all (RFC 9110 §15.2: a 1xx precedes the final response and is not one).
       private record Reply,
         status : Int32,
         headers : Array({String, String}),
@@ -123,7 +151,8 @@ module Gori
         goaway : String?,
         rst : String?,
         trailers : Array(String)?,
-        timed_out : Bool
+        timed_out : Bool,
+        final_seen : Bool
 
       def self.send(request : Bytes, *, scheme : String, host : String, port : Int32,
                     verify_upstream : Bool, sni : String? = nil,
@@ -186,9 +215,26 @@ module Gori
         # (and an operator) that dialled with a short timeout would still wait out the global
         # default.
         flow.patience = timeout || Settings.io_timeout
+        # …and the ceiling for the whole exchange, which does NOT restart on progress. Taken
+        # here rather than at `send` entry so the dial is not charged against it (the dialer
+        # has its own connect timeout), and stored on the flow because both the write stall
+        # and the response read have to honour it.
+        budget = timeout || Settings.io_timeout * DEFAULT_BUDGET_FACTOR
+        flow.budget = budget
+        flow.expires_at = Time.instant + budget
         write_request(upstream, headers, body, flow)
         reply = read_response(upstream, flow)
-        return failure(no_response(reply, flow, host, port), started) if reply.status == 0 && reply.headers.empty?
+        # "Did a FINAL response arrive", not "is the status zero". An origin that answered
+        # `HEADERS(:status 100)` and then went silent used to come back `ok:true, status:100,
+        # error:null` after a full idle timeout, with the head rendered as `HTTP/2 100` — an
+        # informational response reported as the answer, and the idle timeout gori had computed
+        # thrown away. A 1xx also means the origin already has the whole request (gori writes it
+        # up front), so this failure is DELIVERED: re-sending would double a side effect.
+        unless reply.final_seen
+          return Result.new(Bytes.new(0), nil, nil, elapsed(started),
+            no_response(reply, flow, host, port),
+            delivered: reply.status != 0, timed_out: reply.timed_out)
+        end
         head = synth_head(reply)
         resp = Proxy::Codec::Http1.parse_response_head(head)
         # A stream the peer RESET or a connection it sent GOAWAY on still produced bytes here,
@@ -200,7 +246,7 @@ module Gori
         # the body was still going out is a real response to a request gori did not finish.
         Result.new(head, reply.body, resp, elapsed(started),
           error: send_side_reason(reply, flow, host, port),
-          incomplete: !reply.clean_eos, delivered: true)
+          incomplete: !reply.clean_eos, delivered: true, timed_out: reply.timed_out)
       end
 
       # Everything gori has to say about how an exchange went, or nil when it went cleanly:
@@ -275,7 +321,18 @@ module Gori
         end
         # "sent nothing before the read timed out" is the genuinely retryable outcome and
         # "closed" is not; they had the same wording, so no consumer could tell them apart.
-        base = if reply.timed_out
+        # A third case sits between them: the origin DID answer, with an interim 1xx, and then
+        # never sent the final response — "sent nothing" would be false, and reporting the 1xx
+        # as the answer (what this used to do) is worse. Every branch keeps the "no h2 response"
+        # opening the MCP kind table matches on.
+        base = if interim?(reply.status) && !reply.final_seen
+                 # "ended the exchange" rather than "closed", because a hostile origin can
+                 # also put END_STREAM on the 1xx block itself (§15.2 forbids it, and the
+                 # stream really is over) — and gori must not describe an event it did not see.
+                 tail = reply.timed_out ? "nothing more before the read timed out" : "ended the exchange without one"
+                 "no h2 response from #{host}:#{port} — the origin sent an interim #{reply.status} " \
+                 "and then #{tail} (RFC 9110 §15.2: a 1xx precedes the final response, it is not one)"
+               elsif reply.timed_out
                  "no h2 response from #{host}:#{port} — the origin sent nothing before the read timed out"
                else
                  "no h2 response from #{host}:#{port} — the connection closed before a response frame arrived"
@@ -451,6 +508,9 @@ module Gori
         when 1_u32 then flow.stream += inc
         else            return
         end
+        # Counted for the REPORT, not for the accounting: it is what tells "the origin never
+        # granted window for the rest" apart from "it granted it a byte at a time".
+        flow.granted += inc
         if flow.conn > MAX_WINDOW || flow.stream > MAX_WINDOW
           flow.violation ||= "the origin's WINDOW_UPDATE frames drove a flow-control window past " \
                              "2^31-1, which RFC 9113 §6.9.1 makes a FLOW_CONTROL_ERROR " \
@@ -497,19 +557,34 @@ module Gori
       private def self.write_data(io : IO, body : Bytes, flow : SendFlow) : Nil
         offset = 0
         flow.total_body = body.size
+        # Window granted BEFORE the body started is already folded into the windows above; what
+        # `flow_stalled` needs to know is whether the origin kept granting while the body was
+        # going out. Counting the opening frame of a `WINDOW_UPDATE`-first origin would relabel
+        # its stall "the origin stopped granting" when it never granted for the body at all.
+        flow.granted = 0
         while offset < body.size
           if flow.available <= 0 && !flow.closed?
             # The wall clock, not the frame count. The per-read io_timeout fires only on
             # IDLE, so a keepalive PING every 2 s kept this loop alive under MAX_FRAMES for
             # ~55 hours at 0.1 % CPU — no busy-spin, but no bound an operator can reason
             # about either. The deadline restarts on every DATA frame written below, so an
-            # origin that drips window is never cut short: it bounds only a stall that makes
-            # no progress. One blocking `Frame.read` may already be in flight when it
+            # origin that drips window is never cut short by THIS clock: it bounds only a stall
+            # that makes no progress. One blocking `Frame.read` may already be in flight when it
             # expires, so the true ceiling is `patience` plus that read's own idle bound.
             deadline = Time.instant + flow.patience
+            # …and `flow.expires_at`, which does not restart, is what bounds the drip. It is
+            # checked SECOND on purpose: with an explicit `timeout` the two spans are the same
+            # number and the whole-exchange one is always the earlier instant, so testing it
+            # first would relabel every ordinary no-window stall as a budget expiry. A tie
+            # belongs to the per-stall clock; only a body that kept moving can outlive it.
+            hard = flow.expires_at
             while flow.available <= 0 && !flow.closed?
               io.flush # the peer cannot grant window for frames still sitting in our buffer
               break if Time.instant >= deadline
+              if hard && Time.instant >= hard
+                flow.budget_expired = true
+                break
+              end
               break unless pump_once(io, flow)
             end
           end
@@ -533,16 +608,38 @@ module Gori
       # accounting — rather than blaming the origin for a refusal it never made, and says
       # plainly that the request did NOT go out whole, so no status is read as a verdict on
       # the payload the operator meant to send.
+      #
+      # An origin that granted window and one that granted none are different findings, and a
+      # dripping origin (window in one-byte increments — a throttling gateway, or a DoS-shaped
+      # answer to an upload probe) is neither silent nor closed: "never granted flow-control
+      # window" would simply be false of it, so it gets its own sentence naming the clock that
+      # actually ran out.
       private def self.flow_stalled(flow : SendFlow) : String
         base = "h2 flow control: only #{flow.sent_body} of #{flow.total_body} request body bytes could be sent"
         if flow.eof?
           "#{base} — the origin closed the connection before granting window for the rest " \
           "(RFC 9113 §6.9). The request was NOT fully sent."
-        else
+        elsif flow.granted == 0
           "#{base} — the origin never granted flow-control window for the rest (RFC 9113 §6.9): " \
           "its connection window is #{flow.conn} and its stream window #{flow.stream}. " \
           "The request was NOT fully sent."
+        elsif flow.budget_expired?
+          "#{base} — the origin granted flow-control window in increments too small to finish " \
+          "it, and the #{budget_text(flow)} budget for the whole exchange expired first " \
+          "(RFC 9113 §6.9): its connection window is #{flow.conn} and its stream window " \
+          "#{flow.stream}. The request was NOT fully sent."
+        else
+          "#{base} — the origin stopped granting flow-control window before the rest could go " \
+          "out (RFC 9113 §6.9): its connection window is #{flow.conn} and its stream window " \
+          "#{flow.stream}. The request was NOT fully sent."
         end
+      end
+
+      # The whole-exchange budget as the operator would have typed it. `timeout_ms: 2000` is
+      # the number they are reasoning about, so the sentence quotes it back.
+      private def self.budget_text(flow : SendFlow) : String
+        secs = (flow.budget || Settings.io_timeout).total_seconds
+        secs == secs.round ? "#{secs.to_i}s" : "#{secs.round(1)}s"
       end
 
       # Reads frames until stream 1 closes. `clean_eos` is true only when the stream ended on
@@ -562,7 +659,8 @@ module Gori
         # and drains them below — a response that arrived must never be destroyed by the
         # writer's disposition, which is exactly what the old `raise` did.
         if flow.stall && flow.pending.empty?
-          return Reply.new(0, [] of {String, String}, nil, false, flow.goaway, flow.rst, nil, !flow.eof?)
+          return Reply.new(0, [] of {String, String}, nil, false, flow.goaway, flow.rst, nil,
+            !flow.eof?, false)
         end
         decoder = HPACK::Decoder.new
         header_buf = IO::Memory.new
@@ -580,6 +678,16 @@ module Gori
         pending = flow.pending
         at = 0
         progress = Time.instant # last time stream 1 actually moved
+        # The whole-exchange ceiling — FLOORED at one patience budget from here. The write may
+        # legitimately have spent the entire budget already (an `await_settings` that waited out
+        # a silent origin, or a stall), and the answer that explains the whole exchange is
+        # usually sitting on the socket at exactly that moment: a read handed zero time would
+        # throw away the GOAWAY it was about to read. The floor costs nothing in the case this
+        # bounds — a response that drips forever — because that read never ends on its own.
+        read_hard = flow.expires_at.try do |h|
+          floor = Time.instant + flow.patience
+          floor > h ? floor : h
+        end
 
         until done
           if at < pending.size
@@ -590,8 +698,13 @@ module Gori
             # below is a COUNT, and the per-read io_timeout fires only on IDLE, so an origin
             # trickling PING/SETTINGS/WINDOW_UPDATE under the idle gap without ever advancing
             # stream 1 pinned this read for hours. Reset by every frame that DOES advance
-            # stream 1, so a legitimately slow but progressing response is never cut short.
-            if Time.instant - progress >= flow.patience
+            # stream 1, so a legitimately slow but progressing response is never cut short —
+            # by THIS clock. `flow.expires_at` is the one that does not restart, and it is
+            # what makes the caller's `timeout` a ceiling for the exchange rather than a gap
+            # between frames. Both land on `timed_out`: from the socket's point of view the
+            # origin was still holding it open with nothing more to say.
+            now = Time.instant
+            if now - progress >= flow.patience || (read_hard && now >= read_hard)
               timed_out = true
               break
             end
@@ -687,7 +800,7 @@ module Gori
         end
 
         Reply.new(status, headers, body.size == 0 ? nil : body.to_slice, clean_eos,
-          goaway, rst, trailers, timed_out)
+          goaway, rst, trailers, timed_out, final_seen)
       end
 
       # Names decoded from a header block that arrived AFTER the final response block are

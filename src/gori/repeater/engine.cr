@@ -28,9 +28,16 @@ module Gori
       # effect. Only set on the error paths; a normal Result carries a non-nil `response`, where
       # this is irrelevant.
       getter? delivered : Bool
+      # The read ended on an IDLE TIMEOUT — the origin held the socket open and simply stopped
+      # sending — rather than on a close or a completed body. `incomplete?` says the captured
+      # response is short; this says which of the two events cut it, and without it the
+      # renderers of "incomplete — origin closed before the framed body finished" were blaming
+      # the origin for a connection it never closed. Set by the h2 engine, which computes it
+      # per read; false everywhere else.
+      getter? timed_out : Bool
 
       def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false,
-                     @delivered = false)
+                     @delivered = false, @timed_out = false)
       end
 
       def ok? : Bool

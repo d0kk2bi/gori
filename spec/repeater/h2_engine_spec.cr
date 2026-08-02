@@ -696,6 +696,140 @@ private def start_h2_origin_grpc(trailers_only : Bool) : Int32
   port
 end
 
+# An origin that DRIPS flow-control window: it advertises SETTINGS_INITIAL_WINDOW_SIZE 0 and
+# then grants `per_grant` bytes on the connection AND the stream every `interval`, `grants`
+# times, before closing. A throttling gateway looks like this, and so does a DoS-shaped answer
+# to an upload probe — and it is the shape a per-STALL deadline cannot bound at all, because
+# every grant is progress and restarts the clock. Reports the body bytes it received; answers
+# 200 the moment `total` of them have arrived, so "it finished inside the budget" is testable
+# with the same origin.
+private def start_h2_origin_drip(per_grant : Int32, interval : Time::Span, grants : Int32,
+                                 total : Int32, seen : Channel(Int32)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 30.seconds
+    Frame.read_preface(conn)
+    settings = IO::Memory.new
+    settings.write_bytes(0x4_u16, IO::ByteFormat::BigEndian) # SETTINGS_INITIAL_WINDOW_SIZE
+    settings.write_bytes(0_u32, IO::ByteFormat::BigEndian)   # …of ZERO: nothing may be sent yet
+    send_server_preface(conn, settings.to_slice)
+
+    stop = false
+    spawn do
+      inc = Bytes.new(4)
+      IO::ByteFormat::BigEndian.encode(per_grant.to_u32, inc)
+      grants.times do
+        sleep interval
+        break if stop
+        begin
+          {0_u32, 1_u32}.each do |sid|
+            conn.write(Frame::Header.new(Frame::Type::WindowUpdate.value, 0_u8, sid, inc).to_bytes)
+          end
+          conn.flush
+        rescue
+          break
+        end
+      end
+    end
+
+    got = 0
+    begin
+      loop do
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.frame_type == Frame::Type::Data && f.stream_id == 1
+        got += f.payload.size
+        break if got >= total || f.end_stream?
+      end
+      if got >= total
+        sb = HPACK::Encoder.new.encode([{":status", "200"}])
+        conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
+        conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "ok".to_slice).to_bytes)
+        conn.flush
+        sleep 0.2.seconds
+      end
+    rescue
+    end
+    stop = true
+    seen.send(got)
+    conn.close rescue nil
+  end
+  port
+end
+
+# An origin that answers with an INTERIM 1xx and then either goes SILENT with the socket held
+# OPEN (`final_after` nil) or sends the real final response after that delay. RFC 9110 §15.2:
+# a 1xx precedes the final response and is not one, so the first shape is an exchange with no
+# response — reported for years as `ok:true, status:100, error:null`. The socket is never
+# closed in the silent case: any sentence about the origin "closing" is provably false of it.
+private def start_h2_origin_interim_then(status : Int32, final_after : Time::Span?) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 30.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    sent = false
+    begin
+      loop do
+        f = Frame.read(conn)
+        break if f.nil?
+        next unless f.stream_id == 1 && f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data)
+        unless sent
+          sent = true
+          ib = HPACK::Encoder.new.encode([{":status", status.to_s}])
+          # END_HEADERS but NO END_STREAM: an interim block cannot end the stream.
+          conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, ib).to_bytes)
+          conn.flush
+        end
+        break if f.end_stream?
+      end
+      if d = final_after
+        sleep d
+        sb = HPACK::Encoder.new.encode([{":status", "200"}, {"server", "late"}])
+        conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, sb).to_bytes)
+        conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, "late".to_slice).to_bytes)
+        conn.flush
+        sleep 0.2.seconds
+      else
+        sleep 10.seconds # hold the socket OPEN: "the origin closed" must stay falsifiable
+      end
+    rescue
+    end
+    conn.close rescue nil
+  end
+  port
+end
+
+# HEADERS(:status) + one DATA frame WITHOUT END_STREAM, and then the socket is HELD OPEN — the
+# sibling of `start_h2_origin_truncated`, which closes. Both produce an incomplete response;
+# only one of them involves the origin closing anything.
+private def start_h2_origin_stalled_body(status : Int32, partial : String) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 30.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    loop do
+      f = Frame.read(conn)
+      break if f.nil?
+      break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
+    end
+    block = HPACK::Encoder.new.encode([{":status", status.to_s}])
+    conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, block).to_bytes)
+    conn.write(Frame::Header.new(Frame::Type::Data.value, 0_u8, 1_u32, partial.to_slice).to_bytes)
+    conn.flush
+    sleep 10.seconds # never closes, never finishes the framed body
+    conn.close rescue nil
+  end
+  port
+end
+
 describe Gori::Repeater::H2Engine do
   it "repeaters a GET as real cleartext h2 and reassembles the response" do
     seen = Channel(String).new(1)
@@ -1277,6 +1411,11 @@ describe Gori::Repeater::H2Engine do
           error.should contain("h2 flow control")
           error.should contain("only 4096 of 20000 request body bytes")
           error.should_not contain("GOAWAY")
+          # …and it is "never granted" for BOTH openers. A `WINDOW_UPDATE`-first origin has
+          # credited a byte before the body starts, which is not a grant FOR the body: the
+          # stall accounting counts only what arrived while DATA was going out, or this
+          # would read "the origin stopped granting" for one that never started.
+          error.should contain("never granted flow-control window")
         end
       end
 
@@ -1362,6 +1501,61 @@ describe Gori::Repeater::H2Engine do
         elapsed.should be < 1600.milliseconds
       end
     end
+
+    # R4-F2. The per-stall deadline above restarts on every DATA frame written — deliberately,
+    # so an origin that legitimately drips window is never cut short. That left the send with
+    # NO upper bound at all: an origin granting one byte of window per second held an MCP
+    # `send_request{timeout_ms: 2000}` at 69 of 20 000 bytes after 70 s, i.e. ~5.5 hours for a
+    # call whose stated budget was 2 s, and MAX_FRAMES is a COUNT that a drip costs 2 frames
+    # per byte to reach. The caller's `timeout` is a ceiling to everyone who passes one, so it
+    # is now also a ceiling for the whole exchange.
+    describe "an origin that drips flow-control window" do
+      it "stops at the caller's whole-exchange budget and names the clock that ran out" do
+        seen = Channel(Int32).new(1)
+        # 1 byte every 25 ms for 5 s — progress forever, and never enough.
+        port = start_h2_origin_drip(1, 25.milliseconds, 200, 200, seen)
+        body = ("D" * 200).to_slice
+        started = Time.instant
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/drip"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 700.milliseconds)
+        elapsed = Time.instant - started
+
+        got = receive_within(seen)
+        got.should be > 0   # it DID make progress — that is the whole difficulty
+        got.should be < 200 # …and it never finished
+        elapsed.should be < 2.seconds
+        error = result.error.should_not be_nil
+        error.should contain("h2 flow control")
+        error.should contain("of 200 request body bytes")
+        error.should contain("0.7s budget for the whole exchange")
+        error.should contain("NOT fully sent")
+        # The origin granted window the whole time and never closed anything: neither of the
+        # other two sentences may be reached for it.
+        error.should_not contain("never granted")
+        error.should_not contain("closed the connection")
+      end
+
+      it "does NOT cut short a dripping origin that finishes inside the budget" do
+        # The complement that constrains the fix's shape: the budget is a ceiling on the
+        # exchange, not an excuse to stop writing at a slow origin. 40 bytes every 20 ms
+        # finishes a 200-byte body in ~100 ms, well inside a 2 s budget.
+        seen = Channel(Int32).new(1)
+        port = start_h2_origin_drip(40, 20.milliseconds, 40, 200, seen)
+        body = ("E" * 200).to_slice
+        result = Gori::Repeater::H2Engine.send_fields(
+          [{":method", "POST"}, {":path", "/slow"}, {":scheme", "http"}, {":authority", "h"},
+           {"content-length", body.size.to_s}], body,
+          scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false,
+          timeout: 2.seconds)
+
+        receive_within(seen).should eq(200)
+        result.error.should be_nil
+        result.response.try(&.status).should eq(200)
+      end
+    end
   end
 
   # F3. Seven distinct causes collapsed into one "no h2 response from HOST" sentence. A
@@ -1407,6 +1601,87 @@ describe Gori::Repeater::H2Engine do
         scheme: "http", host: "127.0.0.1", port: start_h2_origin_hangup,
         verify_upstream: false, timeout: 5.seconds)
       hangup.error.not_nil!.should contain("the connection closed before a response frame arrived")
+    end
+  end
+
+  # R4-F3. An origin that answered `HEADERS(:status 100)` and then went silent — socket held
+  # OPEN — came back `ok:true, status:100, error:null` after a full idle timeout, with
+  # `incomplete_reason: "origin closed before the framed body finished"` for a connection it
+  # never closed. Two causes: the failure guard tested `status == 0 && headers.empty?`, and an
+  # interim block sets a status and then clears its headers (RFC 9110 §15.2 — a 1xx precedes
+  # the final response and is not one); and `timed_out`, which the read computes, reached only
+  # `no_response`, i.e. only when nothing at all had arrived.
+  describe "an interim 1xx that is never followed by a final response" do
+    {100, 103}.each do |code|
+      it "reports no response — not a #{code} — when the origin then goes silent" do
+        started = Time.instant
+        result = Gori::Repeater::H2Engine.send(
+          "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+          scheme: "http", host: "127.0.0.1",
+          port: start_h2_origin_interim_then(code, nil),
+          verify_upstream: false, timeout: 600.milliseconds)
+        elapsed = Time.instant - started
+
+        result.ok?.should be_false
+        result.response.should be_nil
+        result.head.size.should eq(0) # never render "HTTP/2 100" as the answer
+        error = result.error.should_not be_nil
+        error.should contain("no h2 response")
+        error.should contain("interim #{code}")
+        error.should contain("nothing more before the read timed out")
+        error.should contain("RFC 9110 §15.2")
+        # The origin held the socket open for the whole exchange.
+        error.should_not contain("closed the connection")
+        # The idle timeout is carried, so a renderer stops attributing this to a close…
+        result.timed_out?.should be_true
+        # …and the request IS with the origin (gori writes it up front), so re-sending a
+        # non-idempotent one would double its side effect.
+        result.delivered?.should be_true
+        elapsed.should be < 3.seconds
+      end
+    end
+
+    it "still succeeds when the final response merely arrives LATE" do
+      # The complement: an interim is not a failure, it is a PRELUDE. The fix must key on
+      # "did a final response arrive", never on "was an interim seen".
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1",
+        port: start_h2_origin_interim_then(100, 400.milliseconds),
+        verify_upstream: false, timeout: 3.seconds)
+
+      result.error.should be_nil
+      result.response.try(&.status).should eq(200)
+      String.new(result.body || Bytes.empty).should eq("late")
+      String.new(result.head).should_not contain("100")
+      result.timed_out?.should be_false
+    end
+  end
+
+  # The other half of the same fact: `incomplete?` conflates an origin that CLOSED early with
+  # one that simply stopped sending, and its two renderers had only the first sentence to
+  # offer. The engine knows which happened; it just was not carrying it.
+  describe "why a delivered response is incomplete" do
+    it "marks an idle timeout on a response the origin never finished framing" do
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: start_h2_origin_stalled_body(200, "partial"),
+        verify_upstream: false, timeout: 600.milliseconds)
+
+      result.response.try(&.status).should eq(200)
+      String.new(result.body || Bytes.empty).should eq("partial")
+      result.incomplete?.should be_true
+      result.timed_out?.should be_true # the socket was open the whole time
+    end
+
+    it "does NOT mark one on an origin that really did close mid-body" do
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1", port: start_h2_origin_truncated(200, "partial"),
+        verify_upstream: false, timeout: 5.seconds)
+
+      result.incomplete?.should be_true
+      result.timed_out?.should be_false
     end
   end
 
