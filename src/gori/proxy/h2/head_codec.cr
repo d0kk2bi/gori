@@ -53,8 +53,16 @@ module Gori::Proxy::H2
     # PUSH_PROMISE is the origin inventing a request, and `Assembler#handle_push_promise`
     # projects it as an ordinary flow, so History / QL / the Sitemap handed an operator reading
     # for evidence a row the origin authored, with nothing saying so.
+    #
+    # `protocol` is the third, and the same discipline again: the loop below skips ALL
+    # pseudo-headers, so an RFC 8441 extended CONNECT's `:protocol` — the one field that says
+    # a WebSocket is running on this stream — reached no stored byte, and the head read as an
+    # ordinary CONNECT tunnel in `gori run show`, HAR and MCP alike. Passed ONLY by the
+    # capture projection; the rewrite path re-synthesizes from the live fields and passes
+    # nothing, so this line can never reach an h2 wire.
     def synth_request(fields : Array({String, String}), authority : String,
-                      trailers : Array(String)? = nil, pushed_by : UInt32? = nil) : Bytes
+                      trailers : Array(String)? = nil, pushed_by : UInt32? = nil,
+                      protocol : String? = nil) : Bytes
       method = pseudo(fields, ":method") || "GET"
       path = pseudo(fields, ":path") || "/"
       String.build do |io|
@@ -65,9 +73,17 @@ module Gori::Proxy::H2
           io << TRAILER_MARKER << ": " << line_safe(trailers.join(", ")) << "\r\n"
         end
         pushed_by.try { |sid| io << PUSHED_MARKER << ": server push promised on stream " << sid << "\r\n" }
+        protocol.try do |p|
+          io << PROTOCOL_MARKER << ": " << line_safe(p) << "\r\n" unless p.empty?
+        end
         io << "\r\n"
       end.to_slice
     end
+
+    # See `synth_request`'s `protocol`: the RFC 8441 `:protocol` pseudo-header, which the
+    # pseudo filter drops and the h1 text form has no other place for. Additive, on the
+    # stored projection only — same discipline as `TRAILER_MARKER` and `PUSHED_MARKER`.
+    PROTOCOL_MARKER = "X-Gori-Protocol"
 
     # See `synth_request`'s `pushed_by`. Same discipline as `TRAILER_MARKER`: additive, on the
     # stored projection only, so nothing that reads a field off the head changes behaviour and

@@ -421,6 +421,7 @@ module Gori::Proxy::H2
     private def emit_request(stream_id : UInt32, stream : Stream) : Nil
       return if stream.flow_id # already emitted
       headers = stream.req.headers.not_nil!
+      note_extended_connect(stream, headers)
       method = pseudo(headers, ":method") || "GET"
       path = pseudo(headers, ":path") || "/"
       scheme = pseudo(headers, ":scheme") || "https"
@@ -429,7 +430,8 @@ module Gori::Proxy::H2
       cap = stream.req.body
       body = cap.total == 0 ? nil : cap.to_slice
 
-      head = synth_request_head(headers, authority, stream.req.trailer_names, stream.pushed_by)
+      head = synth_request_head(headers, authority, stream.req.trailer_names, stream.pushed_by,
+        pseudo(headers, ":protocol"))
       captured = Store::CapturedRequest.new(
         created_at: @created_at, scheme: scheme, host: host, port: port,
         method: method, target: path, http_version: "HTTP/2", head: head, body: body,
@@ -493,9 +495,7 @@ module Gori::Proxy::H2
     end
 
     # RFC 8441 extended CONNECT — `:method CONNECT` plus a `:protocol` pseudo-header, which is
-    # how a WebSocket is opened over HTTP/2. Such a stream ends as an abort ("h2 connection
-    # closed", "stream reset"), and that reason describes the SYMPTOM: what the operator needs
-    # to know is that gori carried the stream but read nothing on it.
+    # how a WebSocket is opened over HTTP/2.
     #
     # Deliberately an advisory and NOT a refusal. gori relays the ORIGIN's SETTINGS frame
     # verbatim (`StreamGate#write` / `Relay#emit` on stream 0), so a client facing an origin
@@ -505,12 +505,48 @@ module Gori::Proxy::H2
     # would break a path that works end to end. What does NOT work is everything gori adds:
     # the WS message transcript, the message gate, intercept and Match&Replace all live on the
     # HTTP/1.1 Upgrade path, so those frames are opaque DATA here. Say that, on the flow.
+    #
+    # ## Written when the stream is RECOGNISED, not when it aborts
+    #
+    # This sentence used to reach the flow only through `extended_connect_note` below, which
+    # `finalize_stream` calls — so it existed only for a stream that ended as an ABORT. The
+    # normal teardown of a conforming client (a WebSocket Close handshake, then END_STREAM)
+    # completes through `emit_ready` → `emit_response` and never goes near `finalize_stream`,
+    # so it landed in History as an ordinary `CONNECT → 200 complete` with `error` NULL and
+    # `advisory` NULL. With `:protocol` also filtered out of the stored head by
+    # `HeadCodec.synth_request`, NOTHING on disk — not History, not the QL, not `run show`,
+    # not HAR, not MCP `get_flow` — could identify the flow as a WebSocket that ran with no
+    # transcript, no message intercept and no Match&Replace. The recognition happens the
+    # moment the request head is decoded, so that is where the advisory is recorded;
+    # `advisory_of` joins the accumulated set onto BOTH halves, so it reaches every one of
+    # those surfaces with no further change.
+    private def note_extended_connect(stream : Stream, headers : Array({String, String})) : Nil
+      protocol = extended_connect_protocol(headers)
+      return unless protocol
+      text = extended_connect_sentence(protocol)
+      stream.advisories << text unless stream.advisories.includes?(text)
+    end
+
+    # The same sentence as an ABORT reason's tail. An aborted 8441 stream's own reason
+    # ("h2 connection closed", "stream reset") describes the SYMPTOM, and `flows.error` is
+    # where an operator reads it — so it keeps carrying the explanation too, rather than
+    # sending them to a second column for it.
     private def extended_connect_note(stream : Stream, reason : String) : String
       headers = stream.req.headers
       return reason unless headers
+      protocol = extended_connect_protocol(headers)
+      return reason unless protocol
+      "#{reason} — #{extended_connect_sentence(protocol)}"
+    end
+
+    # The `:protocol` pseudo-header's value, or nil when this is not an extended CONNECT.
+    private def extended_connect_protocol(headers : Array({String, String})) : String?
       protocol = pseudo(headers, ":protocol")
-      return reason if protocol.nil? || protocol.empty?
-      "#{reason} — this is an RFC 8441 extended CONNECT stream (:protocol #{protocol.inspect}). " \
+      protocol.nil? || protocol.empty? ? nil : protocol
+    end
+
+    private def extended_connect_sentence(protocol : String) : String
+      "this is an RFC 8441 extended CONNECT stream (:protocol #{protocol.inspect}). " \
       "gori relayed it byte-for-byte but did not decode it: WebSocket messages are read on the " \
       "HTTP/1.1 Upgrade path only, so this socket has no message transcript, no message " \
       "intercept and no Match&Replace"
@@ -552,10 +588,16 @@ module Gori::Proxy::H2
     # `finish_header_block` exactly as a response one is, so after the merge `x-req-trailer`
     # read like a header the client sent in its head. `Side#trailer_names` was already being
     # recorded for both sides.
+    #
+    # `protocol` is the third such capture-only extra, and it is here for the reason
+    # `note_extended_connect` states: `regular(fields)` filters every pseudo-header, so an
+    # RFC 8441 extended CONNECT's `:protocol` reached no stored byte at all and the head read
+    # as an ordinary CONNECT tunnel.
     private def synth_request_head(headers : Array({String, String}), authority : String,
                                    trailers : Array(String)? = nil,
-                                   pushed_by : UInt32? = nil) : Bytes
-      HeadCodec.synth_request(headers, authority, trailers, pushed_by)
+                                   pushed_by : UInt32? = nil,
+                                   protocol : String? = nil) : Bytes
+      HeadCodec.synth_request(headers, authority, trailers, pushed_by, protocol)
     end
 
     # `trailers` is the CAPTURE projection's extra: only the stored head names which fields

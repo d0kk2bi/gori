@@ -283,6 +283,21 @@ describe Gori::QL do
     # Mirrors a bad status: — a typo like proto:htttp must not silently match all flows.
     Gori::QL.parse("proto:htttp").sql.should eq("1")
   end
+
+  # The History PROTO column prints WSS/GRPCS/SSES/HTTPS, so those spellings have to be
+  # typeable here — and they have to MEAN the transport they name. An alias that quietly
+  # returned the cleartext rows too would drop exactly the signal the column was changed to
+  # keep, on the query an operator writes BECAUSE they saw it in the column.
+  it "compiles the transport spellings the PROTO column prints as protocol AND scheme" do
+    Gori::QL.parse("proto:wss").sql.should eq("((status = 101) AND scheme = 'https')")
+    Gori::QL.parse("proto:grpcs").sql.should eq(
+      "(((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%')) " \
+      "AND scheme = 'https')")
+    Gori::QL.parse("proto:sses").sql.should eq(
+      "(((content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%')) " \
+      "AND scheme = 'https')")
+    Gori::QL.parse("proto:wss").args.should be_empty
+  end
 end
 
 describe "Gori::Store#search (QL)" do
@@ -359,6 +374,33 @@ describe "Gori::Store#search (QL)" do
       def_ids.call("proto:http").should eq([html, pending].sort)
       # Negation is NULL-safe too: -proto:grpc keeps the pending (NULL content_type) flow.
       def_ids.call("-proto:grpc").includes?(pending).should be_true
+    end
+  end
+
+  # H3-F3's other half, over real rows: the same protocol on the two transports, listed
+  # together the way an operator triages them. `proto:ws` still means "a WebSocket"; the
+  # spelling the PROTO column shows for each row selects that row and only that row.
+  it "separates ws:// from wss:// on proto:, the way the PROTO column now spells them" do
+    tmp_store do |store|
+      cleartext = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "acme.test", port: 80,
+        method: "GET", target: "/chat", http_version: "HTTP/1.1",
+        head: "GET /chat HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice))
+      store.update_response(Gori::Store::CapturedResponse.new(flow_id: cleartext, status: 101,
+        head: "HTTP/1.1 101 Switching Protocols\r\n\r\n".to_slice))
+      tls = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 2_i64, scheme: "https", host: "acme.test", port: 443,
+        method: "GET", target: "/chat", http_version: "HTTP/1.1",
+        head: "GET /chat HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice))
+      store.update_response(Gori::Store::CapturedResponse.new(flow_id: tls, status: 101,
+        head: "HTTP/1.1 101 Switching Protocols\r\n\r\n".to_slice))
+
+      ids = ->(q : String) { store.search(Gori::QL.parse(q), 50).map(&.id).sort }
+      ids.call("proto:ws").should eq([cleartext, tls].sort)
+      ids.call("proto:wss").should eq([tls])
+      # ... and the composed form an operator could always write means the same thing.
+      ids.call("proto:ws scheme:https").should eq([tls])
+      ids.call("proto:ws scheme:http").should eq([cleartext])
     end
   end
 

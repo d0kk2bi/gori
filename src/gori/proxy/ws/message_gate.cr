@@ -112,6 +112,9 @@ module Gori::Proxy::WS
       @dropped = 0
       @stranded = 0
       @lost = 0
+      # The peer on the far side of `@dst` already ended this direction with no CLOSE frame,
+      # so a write here can no longer be CLAIMED as a delivery. See `settle`.
+      @dst_dead = false
     end
 
     # Is anything still parked in this direction's queue? Asked by `Relay.run` at the
@@ -210,7 +213,26 @@ module Gori::Proxy::WS
     # released there is written to a dead socket. A held message therefore had until
     # `Relay::CLOSE_TIMEOUT` and then simply ceased to exist: no bytes on either socket, no
     # `ws_messages` row, and a teardown line calling it "released".
-    def settle(reason : String) : Nil
+    #
+    # ## `destination_dead` — the write still happens, the CLAIM does not
+    #
+    # `write_message` decides whether the peer saw the bytes by whether `@dst.write` RAISED,
+    # and that test is silently wrong on exactly this path: a local write to a socket whose
+    # peer has already sent FIN succeeds into the kernel buffer. So a message the operator
+    # was still holding when the peer vanished was written to a socket nobody was reading,
+    # and gori then recorded a `ws_messages` row identical to the one it writes for a message
+    # that really arrived — the transcript an operator writes a report from claiming the
+    # server received bytes it never received, with `@lost` (the counter that exists for
+    # precisely this) left at 0 so the teardown accounting had nothing to say either.
+    #
+    # `Relay.run` knows which destination is already past that point (`destination_dead?`),
+    # and it is the only thing that does. The bytes are STILL written — a genuine half-close
+    # (`shutdown(SHUT_WR)`) delivers them, and neither gori nor the operator can distinguish
+    # that from a full close — but the row is not written and `@lost` counts it, which is
+    # what `write_message`'s own doc-comment already intends: a `ws_messages` row is gori's
+    # claim that the peer saw these bytes.
+    def settle(reason : String, destination_dead : Bool = false) : Nil
+      @mutex.synchronize { @dst_dead = true } if destination_dead
       BYPASS_SETTLE_TURNS.times do
         drained = @mutex.synchronize { fail_open_locked(reason); @queue.empty? || @closed }
         break if drained
@@ -334,14 +356,22 @@ module Gori::Proxy::WS
       # socket is reported; inventing a failure for a keepalive frame here says nothing new.
     end
 
-    # True iff the bytes reached the socket. A failed write leaves NO capture row on purpose:
-    # a `ws_messages` row is gori's claim that the peer saw these bytes, and inventing one for
-    # a write that raised would be the same class of lie as the teardown line this replaced.
-    # The teardown log counts the loss instead.
+    # True iff the bytes can be CLAIMED to have reached the peer. A failed write leaves NO
+    # capture row on purpose: a `ws_messages` row is gori's claim that the peer saw these
+    # bytes, and inventing one for a write that raised would be the same class of lie as the
+    # teardown line this replaced. The teardown log counts the loss instead.
+    #
+    # A raise was the only failure this tested, and it is not the only one. Once the far end
+    # has ended this direction with no CLOSE frame (`@dst_dead`), the write below SUCCEEDS
+    # into a kernel buffer and says nothing at all about delivery — which is how a message an
+    # operator was still holding when the peer vanished came to be recorded byte-identically
+    # to one that really arrived. So the write is still attempted (a genuine half-close does
+    # deliver) and the claim is withheld. See `settle`.
     private def write_message(opcode : UInt8, payload : Bytes, raw : Bytes?,
                               shape : WS::Shape = WS::Shape::DEFAULT) : Bool
       @dst.write(raw || WS.encode(opcode, payload, mask: @mask, fin: true))
       @dst.flush
+      return false if @dst_dead
       # Record what gori WROTE, not what arrived — the same way step 1's rewrite path keeps
       # P7. The capture has to be the bytes the peer actually sees, framing included.
       @sink.on_ws_message(@flow_id, @direction, opcode.to_i, payload.dup, shape)
@@ -393,13 +423,47 @@ module Gori::Proxy::WS
 
     # --- warnings (once each, per gate) ---------------------------------------
 
+    # A statement about this gate, written where the operator will actually meet it.
+    #
+    # Both accountings below were `::Log.warn` / `::Log.info` only, and under `gori tui` a
+    # `Log` line reaches neither the notification centre nor stderr — so `Relay`'s own
+    # promise ("Nothing else tells the operator that their decision window closed — the queue
+    # row simply vanishes from the TUI") was unmet for every teardown that is not a CLOSE
+    # frame, and the `@dropped` case was equally silent. The row goes on the flow's own
+    # `ws_messages` stream, which is the seam `AssemblingPump#warn_teardown_loss` and the
+    # `Sec-WebSocket-Extensions` advisory already use: it sits exactly where the message the
+    # operator is looking for would have been, and travels to History's WS pane, `gori run
+    # show`, MCP `get_flow` and an export alike, instead of to a `gori.log` only an operator
+    # who knew to tail it ever reads.
+    #
+    # On `Relay::NOTICE_DIRECTION` and behind `NOTICE_PREFIX` for the reasons stated there —
+    # a diagnostic is not traffic, and a repeater seed must refuse to replay it. The row
+    # therefore cannot say which side it is about, so the SENTENCE does. Best-effort: a
+    # capture write that fails must never stop a socket from tearing down.
+    private def note(text : String) : Nil
+      ::Log.warn { "ws #{@direction}: #{text}" }
+      @sink.on_ws_message(@flow_id, Relay::NOTICE_DIRECTION, OP_TEXT.to_i,
+        "#{NOTICE_PREFIX}#{side}: #{text}".to_slice)
+    rescue
+      nil
+    end
+
+    # This direction in words — see `Relay::AssemblingPump#side`, same reason.
+    private def side : String
+      to_server? ? "client→server" : "server→client"
+    end
+
     private def warn_fail_open(reason : String) : Nil
       return if @warned_overflow
       @warned_overflow = true
-      ::Log.warn do
-        "ws #{@direction}: #{reason} — forwarding #{@queue.size} held message(s) unedited, " \
-        "in arrival order. WebSocket has no application-level flow control, so nothing " \
-        "throttles the sender while a hold is out"
+      if @dst_dead
+        note("#{reason}, and the peer had already ended this direction without a CLOSE " \
+             "frame — #{@queue.size} held message(s) are written out anyway, but gori " \
+             "cannot claim they arrived, so no ws_messages row is recorded for them")
+      else
+        note("#{reason} — forwarding #{@queue.size} held message(s) unedited, in arrival " \
+             "order. WebSocket has no application-level flow control, so nothing throttles " \
+             "the sender while a hold is out")
       end
     end
 
@@ -408,15 +472,14 @@ module Gori::Proxy::WS
     # something that was destroyed.
     private def warn_teardown : Nil
       return if @dropped == 0 && @stranded == 0 && @lost == 0
-      ::Log.info do
-        parts = [] of String
-        parts << "#{@dropped} dropped by the operator" if @dropped > 0
-        parts << "#{@lost} forwarded too late to reach the socket" if @lost > 0
-        parts << "#{@stranded} discarded still undecided" if @stranded > 0
-        "ws #{@direction}: held message(s) at teardown — #{parts.join(", ")}. None of these " \
-        "left a ws_messages row and neither endpoint can see the gap: a WebSocket message " \
-        "has no identity for a peer to miss"
-      end
+      parts = [] of String
+      parts << "#{@dropped} dropped by the operator" if @dropped > 0
+      parts << "#{@lost} written after the peer had already ended this direction, so gori " \
+               "cannot claim they arrived" if @lost > 0
+      parts << "#{@stranded} discarded still undecided" if @stranded > 0
+      note("held message(s) at teardown — #{parts.join(", ")}. None of these left a " \
+           "ws_messages row and neither endpoint can see the gap: a WebSocket message has " \
+           "no identity for a peer to miss")
     end
   end
 end

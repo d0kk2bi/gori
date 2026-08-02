@@ -282,9 +282,11 @@ module Gori
       EXCHANGE_BUDGET_PHRASE = "budget for the whole exchange"
 
       # Coarse category for a send's network error, from the engine's error text
-      # (gori's own controlled strings). "connect" (the dialer collapses DNS /
-      # refused / connect-timeout / TLS-verify into one failure — finer split would
-      # need dialer changes), "timeout" (idle read/write), "protocol" (a deterministic
+      # (gori's own controlled strings). "connect" (the TCP layer: refused, unreachable,
+      # a connect timeout, or a name that did not resolve — the dialer now separates a
+      # certificate rejection, a refused handshake and an origin that accepts and then goes
+      # silent into their own sentences, which land on "other"/"timeout" as they should),
+      # "timeout" (idle read/write, and a TLS handshake that never got an answer), "protocol" (a deterministic
       # framing/protocol refusal — see PROTOCOL_ERROR_PHRASES), "no_response", else "other".
       #
       # A pure function of the engine's sentence, so it is `self.` and directly testable: the
@@ -324,10 +326,23 @@ module Gori
       # REQUEST that is partial, and re-sending would put the whole body back on the wire.
       # Everything else keeps the transient NETWORK_ERROR contract callers already apply
       # policy against. `retryable` is the field to branch on; the code names the cause.
-      private def emit_send_error_code(j : JSON::Builder, kind : String?) : Nil
+      #
+      # `delivered` is the SECOND term, and it is the one the error CODE cannot carry. The
+      # code is a pure function of gori's own sentence, and two failures with the same
+      # sentence shape — "the origin said nothing" vs "the origin answered an interim 1xx
+      # and THEN said nothing" — differ in the only fact a retry policy needs. gori writes a
+      # request in full before it reads, so ANY response byte (even a 100/103) proves the
+      # origin has the whole request and has had its chance to act on it. Both engines
+      # compute exactly that (`H2Engine.exchange`'s `delivered: reply.status != 0`,
+      # `Engine.exchange`'s rescue `delivered: !head.nil?`) and it reached NO surface, so MCP
+      # answered `retryable: true` for the very failures round 4 documented as "the origin
+      # already has the whole request … re-sending would double a side effect". Emitted
+      # alongside `retryable` so an agent sees WHY it may not retry, not only that it may not.
+      private def emit_send_error_code(j : JSON::Builder, kind : String?, delivered : Bool) : Nil
         code = Tools.send_error_code(kind)
         j.field "error_code", code
-        j.field "retryable", code == "NETWORK_ERROR"
+        j.field "retryable", Tools.send_retryable?(code, delivered)
+        j.field "delivered", delivered
       end
 
       # Split out and `self.` for the same reason `network_error_kind` is: the retry policy an
@@ -339,6 +354,12 @@ module Gori
         when "truncated_request" then "REQUEST_TRUNCATED"
         else                          "NETWORK_ERROR"
         end
+      end
+
+      # `self.` and separate from `send_error_code` for the same reason: this is the field an
+      # agent branches on, so a spec pins the PAIR rather than the code mapping alone.
+      def self.send_retryable?(code : String, delivered : Bool) : Bool
+        code == "NETWORK_ERROR" && !delivered
       end
 
       private def persist_send_repeater(h, save : Bool, built : RequestBuilder::Built,
@@ -359,10 +380,15 @@ module Gori
         # surface — the CLI refused it with the pseudo-header message and MCP read its method
         # back as `":method:"`. See `replayable_field_head`.
         saved_bytes = replayable_field_head(h2_fields, built, built.bytes)
+        # Masked for the PROBE scan and the reply, NOT for the row. The saved session is a
+        # REPLAY SOURCE (the sentence just above), and storing the masked projection made it
+        # a replay of different bytes: `flow_id` is set here, the TUI reads that as evidence,
+        # and `RepeaterView#evidence?` sends `$NAME` literally — so this row went out one way
+        # from the TUI and another from MCP. Same seam as `Tools#stored_request`.
         masked_req = Env.mask_secrets(String.new(saved_bytes))
         repeater_id = store.insert_repeater(
           target: masked_target,
-          request: masked_req.to_slice,
+          request: saved_bytes,
           http2: http2,
           auto_cl: true,
           flow_id: flow_id,
@@ -531,7 +557,7 @@ module Gori
               # Structured-error contract inside the payload (the payload IS the
               # structuredContent) so a caller can apply policy without string-matching the
               # message — including "do not retry this, report it" (see emit_send_error_code).
-              emit_send_error_code(j, kind)
+              emit_send_error_code(j, kind, result.delivered?)
             end
             if response = result.response
               j.field "status", response.status
@@ -718,7 +744,11 @@ module Gori
               kind = network_error_kind(err)
               j.field "error", Env.mask_secrets(err)
               j.field "error_kind", kind
-              emit_send_error_code(j, kind)
+              # A completed upgrade IS delivery on this surface: the origin answered the
+              # handshake, so it has that request and every frame gori wrote after it. The
+              # WS engine carries no `delivered?` of its own and `upgraded?` is the same
+              # fact — any response byte at all.
+              emit_send_error_code(j, kind, result.upgraded?)
             end
             unless result.handshake_head.empty?
               response = begin

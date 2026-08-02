@@ -510,7 +510,23 @@ module Gori::Fuzz
         break unless loc
         nxt = redirect_request(loc)
         break unless nxt
-        current = @backend.send(nxt)
+        # WHOLE-message verbatim, and not `nil` and not the job's spans. `Sender#send`'s
+        # 1-argument overload means "no exclusions", i.e. substitute every `$NAME` an extract
+        # rule has bound — and `nxt` is assembled below from a `Location` the ORIGIN chose. A
+        # target that reflects a query parameter into `Location` (an ordinary login/redirect
+        # endpoint, and precisely what an open-redirect probe aims at) therefore reproduced the
+        # operator's payload inside this hop, where the exclusion the first hop got no longer
+        # applied: `--payloads '$TOKEN'` put the live session credential in the target's query
+        # string and access log while every surface still showed `$TOKEN` and `0 errors`.
+        #
+        # The job's spans cannot be forwarded — they index the ORIGINAL request's offsets, and
+        # the origin may have re-encoded, moved or duplicated the payload on its way through
+        # `Location`, so locating them again is guesswork with a credential as the stake.
+        # Excluding the whole message needs no guess and gives up nothing: every byte of `nxt`
+        # is either a literal gori wrote (`GET`, `Host:`, `Connection: close`) or the origin's
+        # own `Location`. Neither is a place an operator could have written a `$NAME` for a
+        # binding to resolve, so there is nothing here to substitute in the first place.
+        current = @backend.send(nxt, [{0, nxt.size}])
         retried ||= current.retried?
         total_us += current.duration_us
         hops += 1
@@ -518,8 +534,13 @@ module Gori::Fuzz
       end
       # Report the whole chain's end-to-end time, not just the final hop's — otherwise a
       # slow original request that 3xx's to a fast resource masks a time-based signal.
+      # Named tail, for the reason `Repeater::Result#as_retried` states: `retried` used to sit
+      # in the eighth POSITIONAL slot, which `timed_out` had taken in the same round — so every
+      # keep-alive re-send in a redirect-following sweep lost its row marker and gained a false
+      # `timed_out`. The constructor's tail is keyword-only now, so this cannot recur silently.
       hops > 0 ? Repeater::Result.new(current.head, current.body, current.response, total_us,
-        current.error, current.incomplete?, current.delivered?, retried) : current
+        current.error, current.incomplete?,
+        delivered: current.delivered?, timed_out: current.timed_out?, retried: retried) : current
     end
 
     private def redirect_request(loc : String) : Bytes?

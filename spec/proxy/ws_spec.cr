@@ -1552,6 +1552,112 @@ describe "Gori::Proxy::WS::Relay frame shape capture (V7)" do
   end
 end
 
+# An IO whose READ RAISES where a pipe would report end of stream — a transport reset, the
+# other of the two ways a WebSocket ends without a CLOSE frame. gori distinguishes them
+# (a FIN is `read_fully?` → nil, a reset raises) and used to throw the difference away, so an
+# operator staring at a `101 / complete / empty transcript` flow could not tell "the peer hung
+# up normally" from "something killed this socket".
+private class ResettingIO < IO
+  def initialize(@src : IO, @dst : IO)
+  end
+
+  def read(slice : Bytes) : Int32
+    n = @src.read(slice)
+    raise IO::Error.new("Connection reset by peer") if n == 0
+    n
+  end
+
+  def write(slice : Bytes) : Nil
+    @dst.write(slice)
+  end
+
+  def flush : Nil
+    @dst.flush
+  end
+
+  def close : Nil
+    @src.close rescue nil
+    @dst.close rescue nil
+  end
+end
+
+describe "Gori::Proxy::WS::Relay teardown, FIN vs RST" do
+  # A frame, then the origin's socket RESET. The frame's own row is untouched (it really did
+  # arrive); what is added is the sentence saying HOW the socket ended, on the flow's own
+  # `ws_messages` stream so `gori run show`, the WS pane, MCP `get_flow` and an export all
+  # carry it.
+  it "names a peer that RESET the socket instead of closing it" do
+    ss_r, ss_w = IO.pipe
+    ts_r, ts_w = IO.pipe
+    cs_r, cs_w = IO.pipe
+    tc_r, tc_w = IO.pipe
+    client = IO::Stapled.new(cs_r, tc_w, sync_close: true)
+    upstream = ResettingIO.new(ss_r, ts_w)
+
+    # The CLIENT stays live throughout, so the reset is the FIRST ending `run` observes —
+    # exactly the shape of the case an operator asks about, a socket killed under a peer that
+    # is still there. (`run` closes both legs on an abnormal end, which reaps the other pump.)
+    ss_w.write(Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "from-server".to_slice, mask: false))
+    ss_w.close # ResettingIO turns this end of stream into a raise
+
+    sink = WsSink.new
+    Gori::Proxy::WS::Relay.run(client, upstream, 9_i64, sink, nil, WS_CTX)
+    cs_w.close
+
+    notices = sink.messages.select { |(_, _, t)| t.starts_with?("[gori] ") }
+    notices.size.should eq(1)
+    # A diagnostic is not traffic: NOTICE_DIRECTION, never the direction a repeater seeds from.
+    notices.first[0].should eq("in")
+    notices.first[2].should contain("the server ended this WebSocket with a transport-level RESET")
+    notices.first[2].should contain("leaves no row here")   # so its ABSENCE is readable
+    sink.messages.first.should eq({"in", 1, "from-server"}) # the frame's own row is untouched
+    _ = {ts_r, tc_r}
+  end
+
+  # The complement, and the reason the sentence above says what absence means: the SAME
+  # transcript ended by a plain FIN gets no row. A WebSocket dying on a FIN with no CLOSE is
+  # how one ordinarily dies in the field, and a `[gori]` row on a large fraction of every
+  # capture saying "nothing unusual happened" is how the anomalous row stops being noticed.
+  it "writes no teardown row when the peer merely closed (FIN)" do
+    ss_r, ss_w = IO.pipe
+    ts_r, ts_w = IO.pipe
+    cs_r, cs_w = IO.pipe
+    tc_r, tc_w = IO.pipe
+    client = IO::Stapled.new(cs_r, tc_w, sync_close: true)
+    upstream = IO::Stapled.new(ss_r, ts_w)
+
+    ss_w.write(Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_TEXT, "from-server".to_slice, mask: false))
+    ss_w.close # a plain end of stream: the peer's FIN
+
+    sink = WsSink.new
+    Gori::Proxy::WS::Relay.run(client, upstream, 10_i64, sink, nil, WS_CTX)
+    cs_w.close
+    sink.messages.should eq([{"in", 1, "from-server"}])
+    _ = {ts_r, tc_r}
+  end
+
+  # ... and a proper closing handshake gets none either, even though gori's own teardown then
+  # unblocks the surviving pump's read: only endings observed BEFORE `run` closes the sockets
+  # are the peers', or the diagnostic would report gori's own reap as a peer's reset.
+  it "writes no teardown row when the peer sent a CLOSE frame" do
+    ss_r, ss_w = IO.pipe
+    ts_r, ts_w = IO.pipe
+    cs_r, cs_w = IO.pipe
+    tc_r, tc_w = IO.pipe
+    client = IO::Stapled.new(cs_r, tc_w, sync_close: true)
+    upstream = ResettingIO.new(ss_r, ts_w)
+
+    ss_w.write(Gori::Proxy::WS.encode(Gori::Proxy::WS::OP_CLOSE, Bytes[0x03, 0xE8], mask: false))
+    cs_w.close # both directions end at once; neither ending is a reset
+
+    sink = WsSink.new
+    Gori::Proxy::WS::Relay.run(client, upstream, 11_i64, sink, nil, WS_CTX)
+    sink.messages.count { |(_, _, t)| t.starts_with?("[gori] ") }.should eq(0)
+    ss_w.close
+    _ = {ts_r, tc_r}
+  end
+end
+
 describe "Gori::Proxy::WS.encode frame shapes" do
   # Every one of these was inexpressible: `encode` had no `rsv`, no explicit mask key and no
   # way to decouple the length header from the payload, and nothing above it plumbed `fin`.

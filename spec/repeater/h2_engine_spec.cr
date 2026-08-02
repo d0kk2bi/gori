@@ -21,9 +21,50 @@ end
 private def start_quiet_origin : Int32
   origin = TCPServer.new("127.0.0.1", 0)
   port = origin.local_address.port
+  # Closes each connection immediately — "this port is not TLS" — but accepts REPEATEDLY.
+  # The one-shot version served only the first dial, so an example that dials twice (the
+  # h1-vs-h2 comparison does, once per engine) got the intended verdict on the first connection
+  # and whatever a vanished listener produces on the second. That read as the two engines
+  # disagreeing when it was the harness running out.
   spawn do
-    conn = origin.accept?
-    conn.try(&.close) rescue nil
+    while conn = origin.accept?
+      conn.close rescue nil
+    end
+  rescue
+  end
+  port
+end
+
+# A real TLS listener presenting a leaf minted by a throwaway gori CA — self-signed as far as
+# this process is concerned, so `verify_upstream: true` fails verification against it. It never
+# answers: every example using it is about what happens BEFORE a request goes out.
+#
+# `advertise_h2: false` makes `context_for` offer only `http/1.1` over ALPN, which is the
+# "handshake fine, this origin has no h2" case — a lab or legacy origin, and the one dial
+# failure gori can state without hedging.
+private def start_tls_origin(advertise_h2 : Bool) : Int32
+  dir = File.tempname("gori-h2ca")
+  ca = Gori::Proxy::Tls::CertAuthority.load_or_create(dir)
+  ctx = ca.context_for("127.0.0.1", advertise_h2: advertise_h2)
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    while conn = origin.accept?
+      spawn do
+        ssl = OpenSSL::SSL::Socket::Server.new(conn, ctx, sync_close: true)
+        # Longer than any example's own timeout. At 2s a second connection on a loaded runner
+        # could start its handshake after this fiber had closed, and the example then compared
+        # a verification verdict against a reset — a harness race that read as a real divergence
+        # between the h1 and h2 engines.
+        sleep 30.seconds
+        ssl.close
+      rescue
+        conn.close rescue nil
+      end
+    end
+  rescue
+  ensure
+    FileUtils.rm_rf(dir) if Dir.exists?(dir)
   end
   port
 end
@@ -797,6 +838,63 @@ private def start_h2_origin_interim_then(status : Int32, final_after : Time::Spa
       else
         sleep 10.seconds # hold the socket OPEN: "the origin closed" must stay falsifiable
       end
+    rescue
+    end
+    conn.close rescue nil
+  end
+  port
+end
+
+# An origin that answers with a COMPLETE final response and then sends a header block AFTER it.
+# What that block is decides what gori must do with it:
+#
+#   `late: :interim`    — `HEADERS(:status 103, link)`. An RFC 9110 §15.2 violation: a 1xx
+#                         precedes the final response, it is not one. This is what an h2
+#                         response-splitting / header-injection probe produces and what a
+#                         buggy gateway or an h1→h2 translating proxy emits.
+#   `late: :trailers`   — a real trailers block (no `:status`). Must stay trailers.
+#   `late: :interim_x2` — two late 1xx blocks, so the drop cannot accumulate.
+#
+# `end_stream_on_late` puts END_STREAM on the late block itself instead of on a following DATA
+# frame; before the fix that variant failed DIFFERENTLY (the 1xx's field was MERGED into the
+# final head rather than replacing it), so both shapes are driven.
+private def start_h2_origin_late_block(late : Symbol, end_stream_on_late : Bool = false) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    next unless conn = origin.accept?
+    conn.read_timeout = 30.seconds
+    Frame.read_preface(conn)
+    send_server_preface(conn)
+    begin
+      loop do
+        f = Frame.read(conn)
+        break if f.nil?
+        break if f.frame_type.in?(Frame::Type::Headers, Frame::Type::Data) && f.end_stream?
+      end
+      body = "REALBODY"
+      enc = HPACK::Encoder.new # ONE encoder: the dynamic table spans every block on the stream
+      final = enc.encode([{":status", "200"}, {"content-type", "text/plain"},
+                          {"x-final", "yes"}, {"content-length", body.bytesize.to_s}])
+      conn.write(Frame::Header.new(Frame::Type::Headers.value, Frame::END_HEADERS, 1_u32, final).to_bytes)
+      conn.flush
+      blocks = case late
+               when :trailers then [[{"x-checksum", "deadbeef"}]]
+               when :interim_x2 then [[{":status", "103"}, {"link", "</a.css>; rel=preload"}],
+                                      [{":status", "103"}, {"link", "</b.css>; rel=preload"}]]
+               else [[{":status", "103"}, {"link", "</late.css>; rel=preload"}]]
+               end
+      blocks.each_with_index do |fields, i|
+        last = i == blocks.size - 1
+        flags = Frame::END_HEADERS | ((end_stream_on_late && last) ? Frame::END_STREAM : 0_u8)
+        conn.write(Frame::Header.new(Frame::Type::Headers.value, flags, 1_u32, enc.encode(fields)).to_bytes)
+        conn.flush
+      end
+      unless end_stream_on_late
+        conn.write(Frame::Header.new(Frame::Type::Data.value, Frame::END_STREAM, 1_u32, body.to_slice).to_bytes)
+        conn.flush
+      end
+      sleep 0.3.seconds
     rescue
     end
     conn.close rescue nil
@@ -1642,6 +1740,7 @@ describe Gori::Repeater::H2Engine do
     end
 
     it "still succeeds when the final response merely arrives LATE" do
+      # (see below for the AFTER-the-final-response case — the mirror of this one)
       # The complement: an interim is not a failure, it is a PRELUDE. The fix must key on
       # "did a final response arrive", never on "was an interim seen".
       result = Gori::Repeater::H2Engine.send(
@@ -1655,6 +1754,197 @@ describe Gori::Repeater::H2Engine do
       String.new(result.body || Bytes.empty).should eq("late")
       String.new(result.head).should_not contain("100")
       result.timed_out?.should be_false
+    end
+  end
+
+  # R5-F3. The mirror of the block above, and the case its rework walked straight past. A 1xx
+  # header block arriving AFTER the final response used to overwrite the status, append its
+  # fields, file them as trailers, and then `headers.clear` everything the FINAL block had
+  # contributed — the guard was `interim?(status)` with no `!final_seen` term. A
+  # `200 + content-type + content-length + x-final` followed by `103 link:` and the body was
+  # reported, and STORED, as a clean `status: 103` with NO headers and no error. That is the
+  # output of an h2 response-splitting probe reported as a benign informational response.
+  describe "an interim 1xx that arrives AFTER the final response (RFC 9110 §15.2 violation)" do
+    it "keeps the final response's status, headers and body, and names the late 1xx" do
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1",
+        port: start_h2_origin_late_block(:interim),
+        verify_upstream: false, timeout: 3.seconds)
+
+      # The real answer survives, intact.
+      result.response.try(&.status).should eq(200)
+      head = String.new(result.head)
+      head.should contain("HTTP/2 200")
+      head.should contain("content-type: text/plain")
+      head.should contain("x-final: yes")
+      head.should contain("content-length: 8")
+      String.new(result.body || Bytes.empty).should eq("REALBODY")
+      # The interloper reaches NEITHER the head nor the trailers marker.
+      head.should_not contain("103")
+      head.should_not contain("late.css")
+      head.should_not contain("X-Gori-Trailers")
+      # …and it is not swallowed either: gori exists to reveal exactly this.
+      error = result.error.should_not be_nil
+      error.should contain("interim 103")
+      error.should contain("AFTER its final response")
+      error.should contain("RFC 9110 §15.2")
+      # A response DID arrive, so this is a clause on it, not a failed send.
+      result.delivered?.should be_true
+      result.incomplete?.should be_false
+    end
+
+    it "does the same when END_STREAM rides on the late 1xx itself" do
+      # This variant failed DIFFERENTLY before the fix — `headers.clear` was gated on
+      # `!end_stream_pending`, so the 1xx's `link` was MERGED into the final head instead of
+      # replacing it, and the status was still 103. Both shapes have to end up right.
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1",
+        port: start_h2_origin_late_block(:interim, end_stream_on_late: true),
+        verify_upstream: false, timeout: 3.seconds)
+
+      result.response.try(&.status).should eq(200)
+      head = String.new(result.head)
+      head.should contain("HTTP/2 200")
+      head.should contain("x-final: yes")
+      head.should_not contain("late.css")
+      head.should_not contain("X-Gori-Trailers")
+      result.error.should_not be_nil
+      result.error.not_nil!.should contain("interim 103")
+    end
+
+    it "drops only what EACH late block added, however many arrive" do
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1",
+        port: start_h2_origin_late_block(:interim_x2),
+        verify_upstream: false, timeout: 3.seconds)
+
+      result.response.try(&.status).should eq(200)
+      head = String.new(result.head)
+      head.should contain("x-final: yes")
+      head.should contain("content-length: 8")
+      head.should_not contain("a.css")
+      head.should_not contain("b.css")
+      String.new(result.body || Bytes.empty).should eq("REALBODY")
+    end
+
+    it "still files a REAL trailing block as trailers" do
+      # The complement of the condition the fix keys on. `note_trailers` must keep firing for
+      # a block after the final response that is NOT an interim — a gRPC trailers response, and
+      # whether a gateway promotes a trailer into a header, is a first-class test.
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "http", host: "127.0.0.1",
+        port: start_h2_origin_late_block(:trailers),
+        verify_upstream: false, timeout: 3.seconds)
+
+      result.response.try(&.status).should eq(200)
+      head = String.new(result.head)
+      head.should contain("HTTP/2 200")
+      head.should contain("x-checksum: deadbeef")
+      head.should contain("X-Gori-Trailers: x-checksum")
+      String.new(result.body || Bytes.empty).should eq("REALBODY")
+      result.error.should be_nil # a trailers block is not a violation
+    end
+  end
+
+  # R5 / H3-F1. Four dial failures with four different fixes arrived as ONE sentence — "host
+  # unreachable, the origin doesn't offer HTTP/2 via ALPN, or its TLS certificate failed
+  # verification" — while the SAME operator one `^V` away got the h1 engine's named refusals for
+  # three of them. Two causes: `H2Engine.connect_error` took no `DialError` and built its string
+  # from `scheme`/`verify` alone, and `open` called the nil-returning `Upstream.dial_tls`, which
+  # discards `DialErrorKind` before any caller can ask.
+  describe "why an h2 dial produced no connection" do
+    # The three transport failures are h1's to word — a refused TCP connect and a rejected
+    # certificate fail identically whatever runs on top — so the invariant asserted here is
+    # PARITY, not any particular phrase. `Repeater::Engine.connect_error` is where the wording
+    # (and `DialErrorKind`'s split, and its remedies) is decided and re-decided; keying these
+    # examples on literals would mean an h1-side improvement lands as an h2-side spec failure,
+    # which is how the two drifted apart in the first place.
+    {
+      # Both origins hold every connection open for far longer than these timeouts, on purpose:
+      # each example below dials TWICE (once per engine), and a one-shot or short-lived listener
+      # made the second dial fail differently from the first — which read as the two engines
+      # disagreeing when it was the harness running out.
+      {"a TCP connect that never came up", -> { s = TCPServer.new("127.0.0.1", 0); p = s.local_address.port; s.close; p }, false},
+      {"a certificate the client does not trust", -> { start_tls_origin(advertise_h2: true) }, true},
+      {"a plaintext port addressed as https", -> { start_quiet_origin }, false},
+    }.each do |(label, open_port, verify)|
+      it "says exactly what the h1 engine says about #{label}" do
+        # A FRESH origin per engine. Sharing one made each engine's dial a different connection
+        # to the same listener, and the second connection is not the case under test: it saw a
+        # listener mid-teardown and reported a reset rather than the verdict the first got. Each
+        # engine now gets a first connection, which is what the example is actually about.
+        args = {"GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice}
+        h2 = Gori::Repeater::H2Engine.send(*args, scheme: "https", host: "127.0.0.1",
+          port: open_port.call, verify_upstream: verify, timeout: 3.seconds)
+        h1 = Gori::Repeater::Engine.send(*args, scheme: "https", host: "127.0.0.1",
+          port: open_port.call, verify_upstream: verify, timeout: 3.seconds)
+
+        # Compared WITHOUT the trailing `(cause)` and without the port. The cause is the TLS
+        # library's own words about the syscall that observed the failure, and two connections
+        # legitimately differ there ("Unexpected EOF while reading" vs "Connection reset by
+        # peer") for one verdict. What must match is the verdict, the layer and the remedy —
+        # which is the whole of what the h2 engine used to collapse.
+        verdict = ->(s : String?) { s.to_s.sub(/ \([^)]*\)\z/, "").sub(/:\d+ /, " ") }
+        error = h2.error.should_not be_nil
+        verdict.call(error).should eq(verdict.call(h1.error))
+        # …and none of the three carries the collapsed sentence's guesses.
+        error.should_not contain("no h2 negotiated")
+        error.should_not contain("doesn't offer HTTP/2")
+      end
+    end
+
+    it "names an origin whose ALPN is http/1.1 — the one case gori OBSERVED" do
+      # The handshake COMPLETED and the origin named its protocol, so this is the only one of
+      # the four that needs no hedging. It was buried third in a list of three guesses.
+      port = start_tls_origin(advertise_h2: false)
+
+      result = Gori::Repeater::H2Engine.send(
+        "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "https", host: "127.0.0.1", port: port,
+        verify_upstream: false, timeout: 3.seconds)
+
+      error = result.error.should_not be_nil
+      error.should contain("h2 not negotiated")
+      error.should contain("completed the TLS handshake")
+      # gori offers `h2` alone, so an http/1.1-only origin has nothing to select and the
+      # negotiated protocol is EMPTY. Naming that is the point — the old sentence's "the
+      # origin doesn't offer HTTP/2 via ALPN" was one guess of three, applied to all four.
+      error.should contain("did not accept `h2` over ALPN")
+      error.should contain("HTTP/1.1 instead")
+      # Not blamed on reachability or on the certificate — both are demonstrably fine.
+      error.should_not contain("host unreachable")
+      error.should_not contain("certificate")
+      # This one is h2's ALONE: the h1 engine reaches the same origin without complaint, which
+      # is precisely the advice the sentence gives. It is also why it cannot be delegated.
+      h1 = Gori::Repeater::Engine.send(
+        "GET /x HTTP/1.1\r\nHost: h\r\n\r\n".to_slice,
+        scheme: "https", host: "127.0.0.1", port: port,
+        verify_upstream: false, timeout: 3.seconds)
+      h1.error.should_not eq(error)
+    end
+
+    it "gives the four failures four DIFFERENT sentences" do
+      # The defect was not any one wording, it was that all four were byte-identical.
+      closed = TCPServer.new("127.0.0.1", 0)
+      dead = closed.local_address.port
+      closed.close
+      cases = {
+        {dead, false},
+        {start_tls_origin(advertise_h2: true), true},
+        {start_quiet_origin, false},
+        {start_tls_origin(advertise_h2: false), false},
+      }
+      errors = cases.map do |(port, verify)|
+        Gori::Repeater::H2Engine.send(
+          "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
+          scheme: "https", host: "127.0.0.1", port: port,
+          verify_upstream: verify, timeout: 3.seconds).error.to_s.sub(port.to_s, "PORT")
+      end
+      errors.to_a.uniq.size.should eq(4)
     end
   end
 
@@ -1715,14 +2005,19 @@ describe Gori::Repeater::H2Engine do
   # F5. The guard was `scheme == "https" && verify`, so `-k` / MCP `insecure:true` routed an
   # https target into the h2c branch and reported a cleartext prior-knowledge diagnosis for a
   # failed ALPN negotiation — on the branch operators hit most against a lab origin.
-  it "reports the ALPN diagnosis for an https target even with verification off" do
+  #
+  # R5 / H3-F1 kept both negative assertions and replaced the positive one: this origin is a
+  # PLAINTEXT port, so "the origin doesn't offer HTTP/2 via ALPN" was itself one of the three
+  # guesses the sentence was collapsing. The h2 engine now says which layer broke, in the h1
+  # engine's own words — see "why an h2 dial produced no connection" above.
+  it "does not diagnose h2c, or invent a certificate clause, for an https target with -k" do
     port = start_quiet_origin # accepts TCP, never completes a TLS handshake
     result = Gori::Repeater::H2Engine.send(
       "GET /x HTTP/2\r\nHost: h\r\n\r\n".to_slice,
       scheme: "https", host: "127.0.0.1", port: port, verify_upstream: false,
       timeout: 2.seconds)
     error = result.error.should_not be_nil
-    error.should contain("doesn't offer HTTP/2 via ALPN")
+    error.should contain("TLS handshake failed")
     error.should_not contain("h2c")
     error.should_not contain("certificate") # verification was off — don't invent a clause
   end

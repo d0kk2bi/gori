@@ -123,8 +123,17 @@ module Gori
         # read that times out is the EXPECTED "server went quiet → stop" signal.
         ht = HANDSHAKE_TIMEOUT
         tls = scheme == "https" || scheme == "wss"
-        upstream = tls ? Proxy::Upstream.dial_tls(host, port, verify: verify_upstream, sni: sni, io_timeout: ht, overrides: overrides) : Proxy::Upstream.dial(host, port, io_timeout: ht, overrides: overrides)
-        return err("connect failed: #{host}:#{port}", started) unless upstream
+        # `*_result` rather than the socket-only dial: a WebSocket target fails to come up for
+        # exactly the reasons every other send path fails, and `Engine.connect_error` is where
+        # those sentences live. Dropping the `DialError` here left this one surface saying
+        # "connect failed: host:port" for an untrusted certificate, a plaintext port and an
+        # origin that accepts the connection and then goes silent.
+        upstream, dial_error = if tls
+                                 Proxy::Upstream.dial_tls_result(host, port, verify: verify_upstream, sni: sni, io_timeout: ht, overrides: overrides)
+                               else
+                                 Proxy::Upstream.dial_result(host, port, io_timeout: ht, overrides: overrides)
+                               end
+        return err(Engine.connect_error(scheme, host, port, verify_upstream, dial_error), started) unless upstream
 
         begin
           handshake, keys = build_handshake(upgrade_request, keep_key)

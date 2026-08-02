@@ -45,7 +45,17 @@ module Gori
       # an agent reads this, and both showed a clean single send.
       getter? retried : Bool
 
-      def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false,
+      # The tail is KEYWORD-ONLY (`*`), and that is load-bearing rather than a style choice.
+      # `delivered`, `timed_out` and `retried` are three same-typed Bools that were appended one
+      # per round by three different fixers; twice, a call site written against the previous
+      # arity kept compiling and silently wrote its `true` into the field that had displaced
+      # the one it meant (`as_retried` in round 4, `Fuzz::Engine#follow_redirects` in round 5 —
+      # the latter still reporting `0 errors` while a row lost its re-send marker and gained a
+      # `timed_out` nothing had observed). A grep cannot catch that reliably: the second site
+      # was missed because the call spanned two lines and the sweep counted commas on the
+      # first. A keyword-only tail turns the whole class of mistake into a compile error, and
+      # leaves the sweep to the compiler.
+      def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false, *,
                      @delivered = false, @timed_out = false, @retried = false)
       end
 
@@ -60,9 +70,10 @@ module Gori
         # Named, not positional. Two fixers added a field to this constructor in the same round
         # and the merge reordered the tail — a positional `true` here silently set `timed_out`
         # instead, and the pool's re-send marker vanished with the suite still green but for the
-        # one spec that asserted it.
-        Result.new(@head, @body, @response, @duration_us, @error, @incomplete, @delivered,
-          timed_out: @timed_out, retried: true)
+        # one spec that asserted it. The constructor now REFUSES a positional tail (see there),
+        # so this shape is the only one that compiles.
+        Result.new(@head, @body, @response, @duration_us, @error, @incomplete,
+          delivered: @delivered, timed_out: @timed_out, retried: true)
       end
     end
 
@@ -191,6 +202,9 @@ module Gori
         # would otherwise return the 100/103 as the repeater result. Read on until the final
         # (>=200) status. 101 Switching Protocols is terminal (a protocol upgrade), NOT skipped.
         interim_seen = 0
+        # The LAST interim status read, for the rescue below: a raise AFTER a 1xx is a
+        # different event from a raise before one, and only this loop knows which happened.
+        interim_status = nil.as(Int32?)
         while resp.status >= 100 && resp.status < 200 && resp.status != 101
           # RFC 9112 §6: a 1xx MUST NOT carry content. One that declares a body
           # (Content-Length / Transfer-Encoding) is malformed and a desync vector
@@ -201,6 +215,7 @@ module Gori
           # Cap the run so an origin streaming endless body-less 103s can't hang the
           # repeater/fuzz worker fiber indefinitely (there is no whole-request deadline).
           interim_seen += 1
+          interim_status = resp.status
           return error("too many interim 1xx responses from #{host}:#{port}", started, delivered: true) if interim_seen > MAX_INTERIM
           head = read_response_head(upstream)
           return error("upstream closed after interim 1xx from #{host}:#{port}", started, delivered: true) unless head
@@ -237,7 +252,29 @@ module Gori
         # on a parked socket) — the pre-delivery case the pool may re-send. A raise AFTER a head
         # was read (an interim-1xx read that then reset) means the origin already has the whole
         # request, so mark it delivered and do not re-send a non-idempotent one.
-        error(ex.message || "repeater error", started, delivered: !head.nil?)
+        error(exchange_error(ex, host, port, interim_status), started, delivered: !head.nil?)
+      end
+
+      # The sentence for a raise DURING the exchange.
+      #
+      # A bare `ex.message` — `"Read timed out"` — names neither the origin nor the one fact
+      # that decides what a caller may do next. An origin that answers `100 Continue` and then
+      # goes silent is the h1 twin of the case `H2Engine.no_response` writes a careful sentence
+      # for, and it read identically to a plain silent origin: same message, same `error_kind`,
+      # and (before `delivered?` reached a surface) the same `retryable: true`. The two are
+      # opposite instructions — the interim proves the origin has the whole request, because
+      # gori writes it up front.
+      #
+      # Only the INTERIM case is reworded. With no interim there is nothing gori knows that
+      # `ex.message` does not, and inventing a host-shaped sentence for every socket error
+      # would blur it into the dialer's own vocabulary.
+      private def self.exchange_error(ex : Exception, host : String, port : Int32,
+                                      interim : Int32?) : String
+        base = ex.message.presence || "repeater error"
+        return base unless interim
+        tail = ex.is_a?(IO::TimeoutError) ? "nothing more before the read timed out" : "the connection failed (#{base})"
+        "no response from #{host}:#{port} — the origin sent an interim #{interim} and then " \
+        "#{tail} (RFC 9110 §15.2: a 1xx precedes the final response, it is not one)"
       end
 
       # Read a response head with a TOTAL head-assembly deadline (parity with the proxy's
@@ -270,35 +307,49 @@ module Gori
       #
       # With no detail the KIND still answers which layer broke, and that is the whole reason
       # `DialErrorKind` exists (`upstream.cr`: "a surface can say WHICH LAYER broke instead of
-      # a blanket 'connect failed'"). `dial_tls_result` returns `Tls` only after the TCP
+      # a blanket 'connect failed'"). `dial_tls_result` returns a TLS kind only after the TCP
       # connect SUCCEEDED and the handshake raised, and `Connect` whenever the socket itself
-      # never came up — so the three cases an operator has to tell apart (a firewall/DNS
-      # problem, an untrusted origin cert, and "this port is not TLS") are already separated
-      # by the time this runs. The proxy path has said all three since #323
+      # never came up — so the cases an operator has to tell apart (a firewall problem, a name
+      # that does not resolve, an untrusted origin cert, "this port is not TLS", and an origin
+      # that accepts the connection and then says nothing) are already separated by the time
+      # this runs. The proxy path has said so since #323
       # (`client_conn.cr#upstream_error_message`); every DIRECT sender — repeater, fuzz, mine,
       # sequence, discover, probe active, and `ConnPool` — collapsed them into one sentence
       # that named the first, which sent operators to debug DNS for a self-signed cert.
       #
-      # `scheme` is no longer consulted: only an https dial can produce a `Tls` kind, and a
-      # Connect kind means the TCP layer, whatever the scheme. It stays in the signature
-      # because every send path passes it positionally and it is what the sentence would be
-      # keyed on if a third transport ever appears.
+      # `verify` is no longer consulted either: the dialer reports `TlsVerify` only when
+      # certificate verification is what rejected the origin, so the remedy is offered to the
+      # people it can actually help. Guessing it from the flag is what made a black hole and a
+      # plaintext port both read as an untrusted certificate under verify-on. It stays in the
+      # signature because every send path passes it positionally.
+      #
+      # `scheme` is not consulted: only an https dial can produce a TLS kind, and a Connect
+      # kind means the TCP layer, whatever the scheme. Same reason for keeping it.
       def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool,
                              err : Proxy::Upstream::DialError? = nil) : String
         if detail = err.try(&.detail)
           return "connect failed: #{detail}"
         end
-        if err.try(&.tls?)
-          if verify
+        if err
+          case err.kind
+          when .tls_verify?
             return "TLS verification failed: #{host}:#{port} — the origin's certificate is not " \
                    "trusted (self-signed/expired/wrong name); retry with -k/--insecure-upstream " \
-                   "or set SSL_CERT_FILE"
+                   "or set SSL_CERT_FILE#{err.because}"
+          when .tls?
+            return "TLS handshake failed: #{host}:#{port} — the port may not be TLS, or the origin " \
+                   "refused the protocol/cipher#{err.because}"
+          when .timeout?
+            return "TLS handshake timed out: #{host}:#{port} — the origin accepted the connection " \
+                   "and then sent nothing; no certificate was exchanged, so -k and SSL_CERT_FILE " \
+                   "cannot help#{err.because}"
+          when .dns?
+            return "connect failed: #{host} — the name did not resolve, so nothing was dialed#{err.because}"
           end
-          return "TLS handshake failed: #{host}:#{port} — the port may not be TLS, or the origin " \
-                 "refused the protocol/cipher"
         end
         # Reached only when the TCP layer is what failed, so the TLS clause that used to ride
-        # along here (and made this a catch-all) is gone.
+        # along here (and made this a catch-all) is gone. "DNS" stays in the list because a
+        # dial through an upstream proxy resolves at the PROXY, where gori cannot see it.
         "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout)"
       end
 

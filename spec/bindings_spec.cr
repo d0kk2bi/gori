@@ -187,6 +187,153 @@ describe Gori::Bindings do
       end
     end
 
+    # The refusal above is right and it was SILENT: no header on the wire, no event, no log
+    # line, no advisory, no status. `substitute` had two nil-returns meaning opposite things
+    # and one reporter that only understood the first — `report_unbound` computes
+    # `Env.unbound(replacement)` and returns when it is empty, and a BOUND name is by
+    # definition not unbound. So an origin minting a cookie with a stray CR in it disarmed
+    # every head-scoped injection rule the operator had configured, invisibly, and every
+    # later request went out unauthenticated while gori reported clean sends.
+    describe "the boundary refusal names itself" do
+      # One helper, three byte classes: the guard is CR/LF/NUL and each has to be named on
+      # its own, because "invalid" is not something an operator can act on.
+      {"\\r" => "CR", "\\n" => "LF", "\\u0000" => "NUL"}.each do |escape, byte_class|
+        it "writes a named event when the value carries #{byte_class}" do
+          with_store do |store|
+            b = Gori::Bindings.load(store)
+            b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+            b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"token":"a#{escape}b"})),
+              subject).should eq(["SESSION"])
+            with_layer(b) do
+              rules = Gori::Rules.new(store, store.match_rules)
+              rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-Auth",
+                "$SESSION", Gori::Store::RuleOp::SetHeader, Gori::Store::MatchKind::Literal,
+                "inject", "", "")
+              req = "GET /a HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice
+              rules.rewrite_request(req, "acme.test")
+
+              ev = store.events_after(0, 50).find { |e| e.kind == "boundary_refused" }
+              ev.should_not be_nil
+              ev = ev.not_nil!
+              ev.level.should eq("warn")
+              # It names the RULE, the BINDING and the byte class — and never the value.
+              ev.message.should contain(%("inject"))
+              ev.message.should contain("$SESSION")
+              ev.message.should contain(byte_class)
+              ev.message.should contain("forge a message boundary")
+              # And the VALUE never reaches the feed, not even the byte that triggered it.
+              ev.message.each_byte.none? { |x| x == 0x0d_u8 || x == 0x0a_u8 || x == 0x00_u8 }
+                .should be_true
+              # The rule still did not apply. A named refusal is not a licence to send.
+              String.new(rules.rewrite_request(req, "acme.test")).should_not contain("X-Auth:")
+            end
+          end
+        end
+      end
+
+      # The COMPLEMENT of the guard's own condition. A horizontal tab is a legal header-value
+      # byte and forges nothing, so it must pass byte-exact and say nothing at all — an
+      # over-wide guard here would be the same silent disarming with a different trigger.
+      it "does not fire for a TAB, which the guard deliberately allows" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+          b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"token":"a\\tb"})),
+            subject).should eq(["SESSION"])
+          with_layer(b) do
+            rules = Gori::Rules.new(store, store.match_rules)
+            rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-Auth",
+              "$SESSION", Gori::Store::RuleOp::SetHeader, Gori::Store::MatchKind::Literal,
+              "inject", "", "")
+            out = String.new(rules.rewrite_request("GET /a HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+              "acme.test"))
+            out.should contain("X-Auth: a\tb")
+            store.events_after(0, 50).any? { |e| e.kind == "boundary_refused" }.should be_false
+          end
+        end
+      end
+
+      # The other complement, and the reason the guard is at the injection site rather than at
+      # extraction: the SAME value through a BODY rule forges nothing and is the designed case.
+      it "does not fire for a body-scoped rule carrying the same value" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+          b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"token":"a\\r\\nb"})),
+            subject).should eq(["SESSION"])
+          with_layer(b) do
+            rules = Gori::Rules.new(store, store.match_rules)
+            rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Body, "MARK",
+              "$SESSION", Gori::Store::RuleOp::Replace, Gori::Store::MatchKind::Literal,
+              "inject-body", "", "")
+            String.new(rules.rewrite_request_body("x=MARK".to_slice, "acme.test"))
+              .should eq("x=a\r\nb")
+            store.events_after(0, 50).any? { |e| e.kind == "boundary_refused" }.should be_false
+          end
+        end
+      end
+
+      # The THIRD branch of `head_scoped?`, and the one the finding left uncovered: a WebSocket
+      # frame is all payload, there is no head in it for a CR/LF to forge a line into, and
+      # `Env.expand_bindings(String)` maps `part: Ws` to `guard_boundary: false` for exactly
+      # that reason. So the value must reach the frame intact and say nothing.
+      it "does not fire for a ws-scoped rule carrying the same value" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+          b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"token":"a\\r\\nb"})),
+            subject).should eq(["SESSION"])
+          with_layer(b) do
+            rules = Gori::Rules.new(store, store.match_rules)
+            rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Ws, "MARK",
+              "$SESSION", Gori::Store::RuleOp::Replace, Gori::Store::MatchKind::Literal,
+              "inject-ws", "", "")
+            String.new(rules.rewrite_ws_out("x=MARK".to_slice, "acme.test")).should eq("x=a\r\nb")
+            store.events_after(0, 50).any? { |e| e.kind == "boundary_refused" }.should be_false
+          end
+        end
+      end
+
+      # The refusal the reporter DID understand must keep its exact sentence — it is the one
+      # every surface already reads, and the two now share a reporter.
+      it "leaves the unbound sentence alone" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid").should be_nil
+          with_layer(b) do
+            rules = Gori::Rules.new(store, store.match_rules)
+            rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-Auth",
+              "$SESSION", Gori::Store::RuleOp::SetHeader, Gori::Store::MatchKind::Literal,
+              "inject", "", "")
+            rules.rewrite_request("GET /a HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, "acme.test")
+            events = store.events_after(0, 50)
+            events.any? { |e| e.kind == "boundary_refused" }.should be_false
+            ev = events.find { |e| e.kind == "unbound" }.not_nil!
+            ev.message.should eq(%(rewrite rule "inject" not applied: $SESSION is not bound yet))
+          end
+        end
+      end
+
+      # Same dedupe as the unbound half: one row per (rule, binding revision), or a rule
+      # injecting into every proxied request writes one store row per message.
+      it "says it once per rule per binding revision, not once per message" do
+        with_store do |store|
+          b = Gori::Bindings.load(store)
+          b.add("SESSION", "", Gori::ExtractKind::JsonPath, "$.token").should be_nil
+          b.observe(response_result("HTTP/1.1 200 OK\r\n\r\n", %({"token":"a\\r\\nb"})), subject)
+          with_layer(b) do
+            rules = Gori::Rules.new(store, store.match_rules)
+            rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-Auth",
+              "$SESSION", Gori::Store::RuleOp::SetHeader, Gori::Store::MatchKind::Literal,
+              "inject", "", "")
+            req = "GET /a HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice
+            5.times { rules.rewrite_request(req, "acme.test") }
+            store.events_after(0, 50).count { |e| e.kind == "boundary_refused" }.should eq 1
+          end
+        end
+      end
+    end
+
     # Binding values resolve at SEND time, after every plan builder has already framed the
     # request. Without this the declared length described the UNEXPANDED body: on a pipelined
     # send-group the origin read the declared prefix and the remainder became the front of the
@@ -279,7 +426,7 @@ describe Gori::Bindings do
           wire = "POST /a HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n$T\r\n0\r\n\r\n"
           out = String.new(Gori::Env.expand_bindings(wire.to_slice))
           out.should contain("Content-Length: 2\r\n") # untouched
-          out.should contain("2\r\n0123456789\r\n")    # the body still substituted
+          out.should contain("2\r\n0123456789\r\n")   # the body still substituted
         end
       end
     end

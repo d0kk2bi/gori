@@ -827,7 +827,7 @@ module Gori::Tui
           @host.session.store.update_repeater_response(id, result.head, result.body, result.error, result.duration_us)
           probe_scan_repeater(id, result.head, result.body, result.duration_us, tab.flow_id, view)
         end
-        @host.status(result.ok? ? "sent → #{result.response.try(&.status)} in #{result.duration_us // 1000}ms#{result.incomplete? ? " (incomplete)" : ""}" : "repeater error: #{result.error}")
+        @host.status(result.ok? ? "sent → #{result.response.try(&.status)} in #{result.duration_us // 1000}ms#{result.incomplete? ? " (incomplete)" : ""}#{evidence_literal_note(view)}" : "repeater error: #{result.error}")
         applied = true
       end
       while pair = nonblocking_ws_result
@@ -1450,6 +1450,40 @@ module Gori::Tui
     private def current_repeater_tab : RepeaterTab?
       return nil if @current_repeater_idx < 0 || @current_repeater_idx >= @repeaters.size
       @repeaters[@current_repeater_idx]
+    end
+
+    # " · $CTOK sent literally (evidence tab — not substituted)" when an EVIDENCE tab just
+    # put a declared, BOUND session binding on the wire unresolved, or "" otherwise.
+    #
+    # `Sender#evidence?` suppresses `Env.expand_bindings` on a captured request on purpose —
+    # a capture's `$filter` is a byte the origin saw, not a reference — and its own comment
+    # accepts the cost as "the direction that can only be READ WRONG, never SENT wrong". That
+    # holds for the SUBSTITUTION. It does not hold for the REPORT: `✓ sent → 200` with no
+    # further word is gori claiming a clean send of bytes whose `$CTOK` the tab's OWN binding
+    # hint shows a value for. So the expansion stays suppressed and the fact is stated.
+    private def evidence_literal_note(view : RepeaterView) : String
+      names = RepeaterController.literal_bindings(view.evidence?, view.request_text)
+      return "" if names.empty?
+      " · #{Env.token_list(names)} sent literally (evidence tab — not substituted)"
+    end
+
+    # `self.` and pure so the rule is directly testable, the same reason
+    # `MCP::Tools.send_error_code` is: what an operator is told about their own send hangs
+    # off this predicate, and a Host double is not the thing worth building to pin it.
+    #
+    # Matched on the SPECIFIC declared name (`$CTOK`), not on the `$`+`[A-Za-z_]` shape,
+    # which is why the whole request rather than the head alone is safe to scan — the same
+    # argument `Env.expand_bindings` makes for scanning a body: a chance collision with a
+    # declared name in binary bytes is a 2^-56 event, not the ~3-per-4KB one the head/body
+    # split exists for. And these are exactly the bytes `expand_bindings` would have
+    # rewritten, so the two cannot disagree about what was withheld. An UNBOUND declared
+    # name is deliberately not reported: nothing would have been substituted for it on any
+    # surface, so there is no divergence to name (`Sender#refusal` owns that case).
+    def self.literal_bindings(evidence : Bool, text : String) : Array(String)
+      return [] of String unless evidence
+      prefix = Gori::Settings.env_prefix
+      return [] of String if prefix.empty?
+      Env.binding_values.keys.select { |n| text.includes?("#{prefix}#{n}") }.sort!
     end
 
     # The scope decision Repeater's direct sends (^R, send-group, WS, minimize) dial through.

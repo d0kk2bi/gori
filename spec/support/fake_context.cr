@@ -318,6 +318,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:fuzz_toggle_http2)
   end
 
+  def fuzz_toggle_sni : Nil
+    rec(:fuzz_toggle_sni)
+  end
+
   def repeater_auto_mark : Nil
     rec(:repeater_auto_mark)
   end

@@ -75,6 +75,8 @@ module Gori::Tui
       @target = ""
       @tcx = 0
       @sni = ""
+      @scx = 0             # caret in the SNI row (@tcx is the URL row's)
+      @target_field = :url # which field the TARGET pane edits: :url | :sni
       @http2 = false
       @evidence = false
       @editor = TextArea.new
@@ -217,6 +219,7 @@ module Gori::Tui
       @http2 = built.http2
       @target = built.target
       @tcx = @target.size
+      @target_field = :url
       @editor.set_text(String.new(built.bytes).scrub)
       @evidence = true
       @focus = :template
@@ -229,6 +232,8 @@ module Gori::Tui
       @tcx = target.size
       @http2 = http2
       @sni = sni
+      @scx = @sni.size
+      @target_field = :url
       @editor.set_text(request_text)
       # A Repeater/reconstruction seed and ^N are DRAFTS: the operator authored (or gori
       # rebuilt) those bytes, so a `$KEY` in them is a variable reference they meant.
@@ -252,6 +257,8 @@ module Gori::Tui
       @tcx = rec.target.size
       @http2 = rec.http2?
       @sni = rec.sni || ""
+      @scx = @sni.size
+      @target_field = :url
       @editor.set_text(rec.template)
       # Provenance has to survive a restart, or a reopened capture silently becomes a
       # draft again. `flow_id` is what `insert_fuzz_session` already stored for the ⇧I
@@ -274,6 +281,8 @@ module Gori::Tui
       @tcx = @target.size
       @http2 = rec.http2?
       @sni = rec.sni || ""
+      @scx = @sni.size
+      @target_field = :url
       # set_text zeroes the caret/scroll and clears undo, so it must only run on a REAL text
       # change. The compare is EXACT (`wire_text` is set_text's byte-for-byte inverse), the
       # same test RepeaterView#apply_request_fields makes: the template is persisted in wire
@@ -372,37 +381,45 @@ module Gori::Tui
     end
 
     # --- focus ring ----------------------------------------------------------
+    # Every focus change exits the ^S SNI sub-field — the rule `RepeaterView#set_focus`
+    # states: SNI editing is an explicit per-visit sub-mode, so navigating away while in it
+    # and coming back must not silently route URL keystrokes into @sni.
     def focus_first : Nil
-      @focus = :target
+      set_focus(:target)
     end
 
     def focus_last : Nil
-      @focus = :results
+      set_focus(:results)
     end
 
     def focus_pane(pane : Symbol) : Nil
       return unless PANE_ORDER.includes?(pane)
       commit_chain_pane if @chain_focused
-      @focus = pane
+      set_focus(pane)
     end
 
     def focus_config : Nil
       commit_chain_pane if @chain_focused
-      @focus = :config
+      set_focus(:config)
       @cfg_row = 0 # land on the first payload set / the Add row
     end
 
     def pane_advance(dir : Int32) : Bool
       commit_chain_pane if @chain_focused
       if @focus == :detail
-        @focus = :results
+        set_focus(:results)
         return true
       end
       i = PANE_ORDER.index(@focus) || 0
       ni = i + dir
       return false if ni < 0 || ni >= PANE_ORDER.size
-      @focus = PANE_ORDER[ni]
+      set_focus(PANE_ORDER[ni])
       true
+    end
+
+    private def set_focus(pane : Symbol) : Nil
+      @focus = pane
+      @target_field = :url
     end
 
     def at_top? : Bool
@@ -1376,39 +1393,86 @@ module Gori::Tui
     end
 
     # --- target editing ------------------------------------------------------
+    # The TARGET card holds two single-line fields — the URL and the TLS SNI override —
+    # selected by @target_field (^S toggles), exactly as RepeaterView's does. The mutators
+    # below self-route, so the controller's key handling is the same for both rows.
+    #
+    # The knob was already whole here: `@sni` is persisted with the session, restored,
+    # compared by the reconcile, cloned by Duplicate and handed to `build_engine`. Only the
+    # AFFORDANCE was missing, so a fuzz session seeded from History (⇧I) could never present
+    # anything but the dialed IP — an https vhost sweep is exactly the run that needs one,
+    # and the sole working route was to open the request in the Repeater, set SNI there, and
+    # hand it back with `space ▸ Send to Fuzzer`.
+    def editing_sni? : Bool
+      @target_field == :sni
+    end
+
+    def toggle_sni_field : Nil
+      if @target_field == :sni
+        @target_field = :url
+      else
+        @target_field = :sni
+        @scx = @sni.size
+        @target_mode = InputMode::Insert
+      end
+    end
+
+    # Drop back to URL editing (↵/↑/esc in the SNI field) without changing the value.
+    def exit_sni_field : Nil
+      @target_field = :url
+    end
+
     def target_insert(ch : Char) : Nil
-      @target = "#{@target[0, @tcx]}#{ch}#{@target[@tcx..]}"
-      @tcx += 1
+      if @target_field == :sni
+        @sni = "#{@sni[0, @scx]}#{ch}#{@sni[@scx..]}"
+        @scx += 1
+      else
+        @target = "#{@target[0, @tcx]}#{ch}#{@target[@tcx..]}"
+        @tcx += 1
+      end
       @dirty = true
     end
 
     def target_backspace : Nil
-      return if @tcx == 0
-      @target = "#{@target[0, @tcx - 1]}#{@target[@tcx..]}"
-      @tcx -= 1
+      if @target_field == :sni
+        return if @scx == 0
+        @sni = "#{@sni[0, @scx - 1]}#{@sni[@scx..]}"
+        @scx -= 1
+      else
+        return if @tcx == 0
+        @target = "#{@target[0, @tcx - 1]}#{@target[@tcx..]}"
+        @tcx -= 1
+      end
       @dirty = true
     end
 
     def target_move(d : Int32) : Nil
-      @tcx = (@tcx + d).clamp(0, @target.size)
+      if @target_field == :sni
+        @scx = (@scx + d).clamp(0, @sni.size)
+      else
+        @tcx = (@tcx + d).clamp(0, @target.size)
+      end
     end
 
     def target_home : Nil
-      @tcx = 0
+      @target_field == :sni ? (@scx = 0) : (@tcx = 0)
     end
 
     def target_end : Nil
-      @tcx = @target.size
+      @target_field == :sni ? (@scx = @sni.size) : (@tcx = @target.size)
     end
 
     def target_read_move(dc : Int32, selecting : Bool = false) : Nil
       return if target_insert?
-      cx = @target_read.move_cx(@tcx, dc, @target.size, selecting: selecting)
-      @tcx = cx
+      if @target_field == :sni
+        @scx = @target_read.move_cx(@scx, dc, @sni.size, selecting: selecting)
+      else
+        @tcx = @target_read.move_cx(@tcx, dc, @target.size, selecting: selecting)
+      end
     end
 
     def target_copy_text : String
-      @target_read.copy_text(@target, @tcx)
+      @target_field == :sni ? @target_read.copy_text(@sni, @scx) : @target_read.copy_text(@target, @tcx)
     end
 
     # --- template editing ----------------------------------------------------
@@ -1646,7 +1710,7 @@ module Gori::Tui
         TrafficEmptyState.render(screen, rect, variant: :fuzzer, title: "no request loaded")
         return
       end
-      target_h = {rect.h, 3}.min
+      target_h = {rect.h, target_card_h}.min
       render_target(screen, Rect.new(rect.x, rect.y, rect.w, target_h), focused && @focus == :target)
       rest = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
       return if rest.h <= 0
@@ -1708,6 +1772,26 @@ module Gori::Tui
       insert ? Theme.accent : Theme.focus_gold
     end
 
+    # The TARGET card grows to a second content row (4 high vs 3) whenever an SNI override is
+    # set OR is being edited, so the override is always visible and the input row only
+    # appears once you reach for it (^S). Same rule and same numbers as RepeaterView.
+    private def sni_active? : Bool
+      !@sni.strip.empty? || (editing_sni? && @focus == :target)
+    end
+
+    private def target_card_h : Int32
+      sni_active? ? 4 : 3
+    end
+
+    # The TARGET card row prefixes (marker + the field value 1 col to its right). Constants
+    # so render_target and the click→caret mapping agree on the value base.
+    TARGET_PREFIX = "›"
+    SNI_PREFIX    = "SNI ›"
+
+    private def field_base(rect : Rect, prefix : String) : Int32
+      rect.x + 2 + prefix.size + 1
+    end
+
     private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.h < 2
       ins = focused && target_insert?
@@ -1718,25 +1802,37 @@ module Gori::Tui
         bx = {rect.right - badge.size - 1, rect.x + 9}.max
         screen.text(bx, rect.y, badge, Theme.text_bright, Theme.accent_bg)
       end
-      base = rect.x + 4
-      screen.text(rect.x + 2, rect.y + 1, "›", focused ? Theme.accent : Theme.muted)
-      tw = {rect.right - base - 1, 1}.max
-      if focused && !ins
-        if span = @target_read.selection_span(@tcx)
-          paint_char_span_bg(screen, base, rect.y + 1, @target, span[0], span[1], Theme.accent_bg)
+      draw_target_row(screen, rect, rect.y + 1, TARGET_PREFIX, @target, @tcx,
+        focused && @target_field == :url, ins)
+      if sni_active? && rect.h >= 4
+        draw_target_row(screen, rect, rect.y + 2, SNI_PREFIX, @sni, @scx,
+          focused && @target_field == :sni, ins)
+      end
+    end
+
+    # One single-line field row of the TARGET card: a marker prefix, then the value, with the
+    # block caret + terminal cursor when this row is the active field. Mirrors
+    # RepeaterView#draw_target_row, including the `Screen.draw_width` caret measure that
+    # `target_click_to_cursor`'s `Screen.column_for` inverts and that `paint_char_span_bg`
+    # uses for the selection tint — the three-way agreement `display_width` broke on a value
+    # holding a zero-width char.
+    private def draw_target_row(screen : Screen, rect : Rect, row : Int32, prefix : String, value : String,
+                                cx : Int32, active : Bool, insert : Bool) : Nil
+      screen.text(rect.x + 2, row, prefix, active ? Theme.accent : Theme.muted)
+      base = field_base(rect, prefix)
+      w = {rect.right - base - 1, 1}.max
+      if active && !insert
+        if span = @target_read.selection_span(cx)
+          paint_char_span_bg(screen, base, row, value, span[0], span[1], Theme.accent_bg)
         end
       end
-      Highlight.draw(screen, base, rect.y + 1, Highlight.env_line(@target, Theme.text_bright), width: tw)
-      if focused
-        # column_width — same three-way agreement as RepeaterView#render_target: it matches
-        # paint_char_span_bg (the selection tint, just above) and inverts the
-        # Screen.column_for in target_click_to_cursor. display_width put the caret a column
-        # left of its glyph on a target holding a zero-width char.
-        cx = base + Screen.draw_width(@target[0, @tcx])
-        if cx < rect.right - 1
-          ch = @tcx < @target.size ? @target[@tcx] : ' '
-          screen.cell(cx, rect.y + 1, ch, Theme.bg, ins ? Theme.accent : Theme.accent_bg)
-          screen.cursor(cx, rect.y + 1)
+      Highlight.draw(screen, base, row, Highlight.env_line(value, Theme.text_bright), width: w)
+      if active
+        cursor_x = base + Screen.draw_width(value[0, cx])
+        if cursor_x < rect.right - 1
+          ch = cx < value.size ? value[cx] : ' '
+          screen.cell(cursor_x, row, ch, Theme.bg, insert ? Theme.accent : Theme.accent_bg)
+          screen.cursor(cursor_x, row)
         end
       end
     end
@@ -2501,8 +2597,16 @@ module Gori::Tui
     # base mirrors render_target (the "›" marker at rect.x+2, the value at rect.x+4).
     def target_click_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
       return unless @loaded
-      base = rect.x + 4
-      @tcx = Screen.column_for(@target, mx - base)
+      # Row 2 is the SNI field when it is showing — a click there selects that field, the
+      # same mapping RepeaterView#target_click_to_cursor makes, so the caret cannot land on
+      # the row the click did not point at.
+      if sni_active? && my == rect.y + 2
+        @target_field = :sni
+        @scx = Screen.column_for(@sni, mx - field_base(rect, SNI_PREFIX))
+      else
+        @target_field = :url
+        @tcx = Screen.column_for(@target, mx - field_base(rect, TARGET_PREFIX))
+      end
     end
 
     # Mouse: place the TEMPLATE editor caret at a click. Re-derives the template
@@ -2510,7 +2614,7 @@ module Gori::Tui
     # left half → the card's 1-cell inset), so the caret lands where the click points.
     def template_click_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
       return unless @loaded
-      target_h = {rect.h, 3}.min
+      target_h = {rect.h, target_card_h}.min
       rest = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
       return if rest.h <= 0
       top_h = {rest.h * 45 // 100, 5}.max
@@ -2539,7 +2643,7 @@ module Gori::Tui
     # sidebar). nil when the layout leaves no room. Backs results_row_at hit-testing.
     private def results_rect(rect : Rect) : Rect?
       return nil unless @loaded
-      target_h = {rect.h, 3}.min
+      target_h = {rect.h, target_card_h}.min
       rest = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
       return nil if rest.h <= 0
       top_h = {rest.h * 45 // 100, 5}.max
@@ -2569,7 +2673,7 @@ module Gori::Tui
     # render_template. Miss → nil (caller falls through to caret/focus).
     def template_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
       return nil unless @loaded
-      target_h = {rect.h, 3}.min
+      target_h = {rect.h, target_card_h}.min
       rest = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
       return nil if rest.h <= 0
       top_h = {rest.h * 45 // 100, 5}.max
@@ -2591,14 +2695,14 @@ module Gori::Tui
     # Hit-test the TARGET border NOR/INS chip. Geometry matches render_target.
     def target_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
       return nil unless @loaded
-      target_h = {rect.h, 3}.min
+      target_h = {rect.h, target_card_h}.min
       return nil if target_h < 2 || my != rect.y
       Frame.mode_badge_hit(mx, my, rect.y, rect.right - 1, rect.x + 8, target_insert?) ? :mode : nil
     end
 
     def pane_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
       return nil unless @loaded && rect.contains?(mx, my)
-      target_h = {rect.h, 3}.min
+      target_h = {rect.h, target_card_h}.min
       return :target if my < rect.y + target_h
       rest = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
       return nil if rest.h <= 0

@@ -405,7 +405,7 @@ describe Gori::Proxy::Upstream do
       err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Connect)
     end
 
-    it "classifies an untrusted-cert origin as a Tls failure under verify, and succeeds with verify off" do
+    it "classifies an untrusted-cert origin as a TlsVerify failure under verify, and succeeds with verify off" do
       # A leaf for "localhost" signed by a CA the client does NOT trust: the origin is REACHED
       # (so not a Connect failure) but the chain doesn't verify — exactly the #323 shape.
       ca_cert, ca_key = Gori::Proxy::Tls::CertBuilder.build_root("gori-spec Untrusted CA")
@@ -430,7 +430,12 @@ describe Gori::Proxy::Upstream do
         # Dial 127.0.0.1 explicitly (no localhost→::1 resolution race), verify the "localhost" cert via SNI.
         sock, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: true, sni: "localhost")
         sock.should be_nil
-        err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Tls)
+        err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::TlsVerify)
+        # …and still the TLS leg for anything that only asks which layer broke.
+        err.try(&.tls?).should be_true
+        # OpenSSL's own verdict is kept, not thrown away — it is the ONLY evidence that
+        # separates this from a plaintext port or an origin that never answered.
+        err.try(&.cause).to_s.should contain("certificate verify failed")
 
         # verify OFF: the same origin dials fine — a live socket, no error.
         sock2, err2 = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: false, sni: "localhost")
@@ -440,6 +445,122 @@ describe Gori::Proxy::Upstream do
       ensure
         origin.close rescue nil
       end
+    end
+
+    # Round 5 / Part 2 §2.1. The rescue here used to be bare: it threw the exception away and
+    # called EVERY outcome `Tls`, so a socket that accepts the TCP connection and then never
+    # speaks — a silent firewall drop, a wedged origin, an inline IPS — arrived at the operator
+    # as "origin certificate not trusted; retry with --insecure-upstream or set SSL_CERT_FILE".
+    # No certificate is exchanged in that conversation and both remedies are useless.
+    it "classifies an origin that accepts and then says nothing as Timeout, not a TLS verdict" do
+      origin = TCPServer.new("127.0.0.1", 0)
+      port = origin.local_address.port
+      held = [] of TCPSocket
+      spawn do
+        while sock = origin.accept?
+          held << sock # accepted, and deliberately never written to
+        end
+      end
+
+      begin
+        [true, false].each do |verify| # -k must not change the answer
+          sock, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: verify,
+            io_timeout: 300.milliseconds)
+          sock.should be_nil
+          err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Timeout)
+          # Not the TLS leg at all: nothing came back to judge, so no surface may offer a
+          # certificate remedy — and -k must not change the answer, because verification
+          # never ran either way.
+          err.try(&.tls?).should be_false
+          # The stall was invisible before (a failed dial records no duration), so the wait
+          # itself is the evidence.
+          err.try(&.cause).to_s.should contain("0.3s")
+        end
+      ensure
+        origin.close rescue nil
+        held.each { |s| s.close rescue nil }
+      end
+    end
+
+    it "classifies a plaintext port spoken to as TLS by what OpenSSL said, not as a cert failure" do
+      origin = TCPServer.new("127.0.0.1", 0)
+      port = origin.local_address.port
+      spawn do
+        while sock = origin.accept?
+          # Answers immediately, so OpenSSL parses the reply as a TLS record and refuses —
+          # the complement of the silent case above, which times out instead.
+          sock.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_slice) rescue nil
+          sock.close rescue nil
+        end
+      end
+
+      begin
+        sock, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: true,
+          io_timeout: 3.seconds)
+        sock.should be_nil
+        err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Tls)
+        # Under verify-on this used to be indistinguishable from an untrusted certificate.
+        err.try(&.kind).should_not eq(Gori::Proxy::Upstream::DialErrorKind::TlsVerify)
+        err.try(&.cause).to_s.downcase.should contain("version")
+      ensure
+        origin.close rescue nil
+      end
+    end
+
+    it "keeps a library verdict storable: no heap address, no control bytes" do
+      origin = TCPServer.new("127.0.0.1", 0)
+      port = origin.local_address.port
+      spawn do
+        while sock = origin.accept?
+          sock.linger = 0 # RST rather than FIN, so the failure is an IO error, not a TLS alert
+          sock.close rescue nil
+        end
+      end
+
+      begin
+        _, err = Gori::Proxy::Upstream.dial_tls_result("127.0.0.1", port, verify: true,
+          io_timeout: 3.seconds)
+        cause = err.try(&.cause).to_s
+        # NOT asserted non-empty. Whether the TLS library has words for a connection reset
+        # mid-handshake is platform-dependent — macOS yields an IO error carrying a message,
+        # Linux yields one without. That a cause is PRESENT when the library has a verdict is
+        # pinned by the untrusted-certificate example above, which reports `certificate verify
+        # failed` everywhere. This example is about the SHAPE of whatever comes back, and an
+        # absent cause is trivially storable.
+        # Crystal decorates an IO failure with the object's inspect
+        # ("write (#<TCPSocket:0x104245c80>): Broken pipe"); a heap address in a string the
+        # DB keeps and HAR/MCP export makes two identical failures compare unequal.
+        cause.should_not contain("#<")
+        cause.should_not contain("\r")
+        cause.should_not contain("\n")
+      ensure
+        origin.close rescue nil
+      end
+    end
+
+    it "classifies a name that does not resolve as Dns — nothing was dialed" do
+      _, err = Gori::Proxy::Upstream.dial_result("gori-spec-does-not-exist.invalid", 443,
+        connect_timeout: 3.seconds, io_timeout: 3.seconds)
+      err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Dns)
+      err.try(&.detail).should be_nil # the caller words this one itself
+    end
+
+    it "still reports a refused port as Connect, not as the new DNS kind" do
+      srv = TCPServer.new("127.0.0.1", 0)
+      port = srv.local_address.port
+      srv.close
+      _, err = Gori::Proxy::Upstream.dial_result("127.0.0.1", port)
+      err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Connect)
+    end
+  end
+
+  describe "DialError#because" do
+    it "is empty when there is nothing the library added, and parenthesised when there is" do
+      Gori::Proxy::Upstream::DialError::ORIGIN_UNREACHABLE.because.should eq("")
+      Gori::Proxy::Upstream::DialError.new(Gori::Proxy::Upstream::DialErrorKind::Tls, cause: "")
+        .because.should eq("")
+      Gori::Proxy::Upstream::DialError.new(Gori::Proxy::Upstream::DialErrorKind::Tls,
+        cause: "wrong version number").because.should eq(" (wrong version number)")
     end
   end
 end
