@@ -83,8 +83,8 @@ module Gori::Tui
 
     def render(screen : Screen, rect : Rect, *, input : TextArea, chain : String,
                chain_cx : Int32, chain_pre : String, result : Decoder::ChainResult,
-               pane : Symbol, focused : Bool, popup : ChainComplete, prompt : Symbol?,
-               prompt_buf : String, input_mode : InputMode = InputMode::Read,
+               pane : Symbol, focused : Bool, popup : ChainComplete,
+               input_mode : InputMode = InputMode::Read,
                input_read : TextReadState? = nil) : Nil
       return if rect.empty?
       @last_step_count = result.steps.size
@@ -97,10 +97,10 @@ module Gori::Tui
       render_pipeline(screen, r.pipeline, result) unless r.pipeline.empty?
       render_output_card(screen, r.output, result, focused && pane == :output) unless r.output.empty?
 
-      # The autocomplete popup (anchored under the CHAIN field) + the save/load
-      # prompt float LAST, over the cards below them.
+      # The autocomplete popup (anchored under the CHAIN field) floats LAST, over the cards
+      # below it. The save/load prompt used to float here too — it is a centered modal now
+      # (NamePromptOverlay / LibraryPicker), drawn by the shell over the whole body.
       popup.render(screen, r.chain.inset(1, 1), rect) if pane == :chain && popup.open? && !r.chain.empty?
-      render_prompt(screen, r.output.inset(1, 1), prompt, prompt_buf) if prompt && !r.output.empty?
     end
 
     # INPUT — a framed TextArea; gold border when focused; INS shows the block caret.
@@ -380,14 +380,6 @@ module Gori::Tui
     # invisible, reading as truncated even though it isn't.
     private def sanitize_display(text : String) : String
       String.build { |io| text.each_char { |ch| io << (ch.control? ? '·' : ch) } }
-    end
-
-    private def render_prompt(screen : Screen, rect : Rect, prompt : Symbol, buf : String) : Nil
-      return if rect.h <= 0
-      label = prompt == :save_as ? "save chain as: " : "load chain: "
-      screen.fill(Rect.new(rect.x, rect.y, rect.w, 1), Theme.elevated)
-      x = screen.text(rect.x, rect.y, label, Theme.accent, Theme.elevated, Attribute::Bold)
-      screen.input_line(x, rect.y, buf, buf.size, "", Theme.text_bright, Theme.elevated, width: {rect.right - x, 1}.max)
     end
 
     def cycle_out_mode : Nil

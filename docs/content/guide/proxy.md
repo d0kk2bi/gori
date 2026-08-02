@@ -202,6 +202,15 @@ Manage the list with `a` add, `e`/`Enter` edit, `x` enable/disable, `d` delete, 
 
 Under the list sits an editable **sample** message and, beside it, the same message after the enabled rules run. Paste a real captured request in there to see what your rules do to it before you turn them loose. The sample is saved with the project, like the rules it previews.
 
+### Reusing a rule across projects
+
+A rule you keep rebuilding — strip a CSP header, pin an `X-Forwarded-For`, stub out a licence check — can go in a **library** shared by every project. From the space menu on the rules list:
+
+- **Save rule to library** names the selected rule and writes it to the `rewriter` section of settings (the prompt starts from the rule's own name; saving under a name that already exists updates it).
+- **Load a saved rule** opens a picker over the library, showing each entry's match and replacement next to its name, and **adds** the one you pick to this project. Type to filter; `Ctrl-X` deletes the highlighted entry from the library, which does not touch rules already loaded into a project.
+
+A loaded rule is appended to the end of the apply order and arrives **enabled**, like Add and Duplicate, so it starts rewriting traffic immediately — reorder it with `Shift-J`/`Shift-K` or switch it off with `x`. The library holds one rule per entry and never replaces or merges the list you already have. Only the rule's own fields travel: which rules are live, and in what order, stays with the project.
+
 A **body** rule buffers the message to rewrite it and re-syncs `Content-Length` automatically (a chunked body is de-chunked and re-framed); head rules keep the body streaming untouched. A compressed (`Content-Encoding: gzip`/`br`/…) body isn't decompressed, so a literal pattern won't match it, and streaming responses (SSE, close-delimited, WebSocket upgrades) are left to stream. **A body rule still forces matching hosts to HTTP/1.1.** On HTTP/2 Match & Replace applies to heads; body rewriting there is not implemented and is not planned, because HTTP/2 flow control makes a rewrite that changes a body's length either fail outright or deadlock the stream. So a body rule takes its hosts down to HTTP/1.1, and an h2 client that can't take that downgrade (gRPC) won't connect while one is enabled. `gori.log` records that once per host, naming the host and the reason.
 
 ### Match & Replace on WebSocket {#match-replace-websocket}

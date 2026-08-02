@@ -13,6 +13,7 @@ require "./settings/pet"
 require "./settings/tabs"
 require "./settings/keymap"
 require "./settings/decoder"
+require "./settings/rewriter"
 require "./settings/miner"
 require "./settings/probe"
 require "./settings/discover"
@@ -130,6 +131,9 @@ module Gori
       if cv = root["decoder"]?
         self.decoder_sessions = parse_decoder_sessions(cv["sessions"]?)
         self.decoder_chains = parse_decoder_chains(cv["chains"]?)
+      end
+      if rw = root["rewriter"]?
+        self.rewriter_presets = parse_rewriter_presets(rw["presets"]?)
       end
       parse_mine_prefs(root["mine"]?)
       parse_fuzzer_prefs(root["fuzzer"]?)
@@ -445,6 +449,7 @@ module Gori
           serialize_probe(j)
           serialize_discover(j)
           serialize_decoder(j)
+          serialize_rewriter(j)
         end
       end
     end

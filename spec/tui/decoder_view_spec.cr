@@ -7,7 +7,6 @@ private REG = Gori::Decoder.default_registry
 
 private def render_decoder(*, input : String, chain : String, pane : Symbol = :input,
                            popup : ChainComplete = ChainComplete.new,
-                           prompt : Symbol? = nil, prompt_buf : String = "",
                            w : Int32 = 80, h : Int32 = 30) : MemoryBackend
   view = DecoderView.new
   ta = TextArea.new(input)
@@ -15,7 +14,7 @@ private def render_decoder(*, input : String, chain : String, pane : Symbol = :i
   backend = MemoryBackend.new(w, h)
   view.render(Screen.new(backend), Rect.new(0, 0, w, h),
     input: ta, chain: chain, chain_cx: chain.size, chain_pre: "",
-    result: result, pane: pane, focused: true, popup: popup, prompt: prompt, prompt_buf: prompt_buf)
+    result: result, pane: pane, focused: true, popup: popup)
   backend
 end
 
@@ -56,11 +55,9 @@ describe Gori::Tui::DecoderView do
     b.contains?("base64url-encode").should be_true
   end
 
-  it "renders the save/load mini-prompt over the output region" do
-    b = render_decoder(input: "x", chain: "hex", prompt: :save_as, prompt_buf: "myhash")
-    b.contains?("save chain as:").should be_true
-    b.contains?("myhash").should be_true
-  end
+  # The save/load mini-prompt this view used to draw over the OUTPUT region is gone: naming
+  # and recalling a chain are centered modals now (NamePromptOverlay / LibraryPicker), so
+  # the coverage moved to spec/tui/library_overlays_spec.cr.
 
   it "hscroll_output scrolls a long OUTPUT line sideways into view (shift+←/→)" do
     view = DecoderView.new
@@ -73,7 +70,6 @@ describe Gori::Tui::DecoderView do
     render_args = {
       input: TextArea.new("unrelated"), chain: "", chain_cx: 0, chain_pre: "",
       result: result, pane: :output, focused: true, popup: ChainComplete.new,
-      prompt: nil, prompt_buf: "",
     }
 
     backend = MemoryBackend.new(80, 30)
@@ -98,7 +94,7 @@ describe Gori::Tui::DecoderView do
     result = Gori::Decoder.run(REG, "x".to_slice, "hex")
     view.render(Screen.new(backend), rect,
       input: TextArea.new("x"), chain: "hex", chain_cx: 3, chain_pre: "",
-      result: result, pane: :input, focused: true, popup: ChainComplete.new, prompt: nil, prompt_buf: "")
+      result: result, pane: :input, focused: true, popup: ChainComplete.new)
 
     corners = (0...30).select { |y| backend.grid[y][0] == '╭' }
     corners.size.should eq 4 # one per card: INPUT, CHAIN, PIPELINE, OUTPUT
@@ -115,7 +111,7 @@ describe Gori::Tui::DecoderView do
     result = Gori::Decoder.run(REG, "x".to_slice, "hex")
     view.render(Screen.new(backend), Rect.new(0, 0, 80, 30),
       input: TextArea.new("x"), chain: "hex", chain_cx: 3, chain_pre: "",
-      result: result, pane: :chain, focused: true, popup: ChainComplete.new, prompt: nil, prompt_buf: "")
+      result: result, pane: :chain, focused: true, popup: ChainComplete.new)
     corners = (0...30).select { |y| backend.grid[y][0] == '╭' }
     backend.fg_at(0, corners[0]).should eq(Theme.border)     # INPUT (unfocused) → grey
     backend.fg_at(0, corners[1]).should eq(Theme.focus_gold) # CHAIN (focused) → gold
@@ -127,7 +123,7 @@ describe Gori::Tui::DecoderView do
     result = Gori::Decoder.run(REG, "x".to_slice, "hex")
     view.render(Screen.new(backend), Rect.new(0, 0, 80, 30),
       input: TextArea.new("x"), chain: "hex", chain_cx: 3, chain_pre: "",
-      result: result, pane: :output, focused: true, popup: ChainComplete.new, prompt: nil, prompt_buf: "")
+      result: result, pane: :output, focused: true, popup: ChainComplete.new)
     corners = (0...30).select { |y| backend.grid[y][0] == '╭' }
     backend.fg_at(0, corners[0]).should eq(Theme.border)     # INPUT → grey
     backend.fg_at(0, corners[1]).should eq(Theme.border)     # CHAIN → grey
@@ -193,8 +189,7 @@ describe "DecoderView OUTPUT h-scroll" do
     rect = Rect.new(0, 0, 80, 30)
     render = ->(b : MemoryBackend) do
       view.render(Screen.new(b), rect, input: ta, chain: "unhex", chain_cx: 5, chain_pre: "",
-        result: result, pane: :output, focused: true, popup: ChainComplete.new,
-        prompt: nil, prompt_buf: "")
+        result: result, pane: :output, focused: true, popup: ChainComplete.new)
     end
 
     # Assert on the OUTPUT card ALONE: the PIPELINE card above it echoes the same decoded

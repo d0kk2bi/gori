@@ -160,6 +160,54 @@ module Gori
       refresh
     end
 
+    # --- one-line rule formatting (shared) -----------------------------------
+    # The Rewriter list renders these two as its op and detail columns; the global
+    # rule-preset library (NamePromptOverlay's subject line, LibraryPicker's detail column)
+    # renders `summary`, which is just the pair joined. They live here, on the type that
+    # owns the rule vocabulary, so a saved preset can never describe itself differently
+    # from the list row it was saved from.
+
+    # The short op badge — "re/H", "sub/B", "+hdr", "stub", …
+    def self.op_tag(rule : Store::MatchRule) : String
+      case rule.op
+      when .replace?
+        kind = rule.match_kind.regex? ? "re" : "sub"
+        "#{kind}/#{rule.part.badge}"
+      when .add_header?    then "+hdr"
+      when .set_header?    then "~hdr"
+      when .remove_header? then "-hdr"
+      when .short_circuit? then "stub"
+      else                      "?"
+      end
+    end
+
+    # What the rule does to the bytes, in the op's own shape.
+    def self.describe(rule : Store::MatchRule) : String
+      case rule.op
+      when .add_header?, .set_header? then "#{rule.pattern}: #{rule.replacement}"
+      when .remove_header?            then rule.pattern
+        # `⇥` (not `→`) because a stub does not transform the request into the response — it
+        # answers instead of forwarding, and the row should not read like the other four ops.
+      when .short_circuit? then "#{rule.pattern} ⇥ #{RuleStub.summary(rule.replacement, rule.body_file)}"
+      else                      "#{rule.pattern} → #{rule.replacement}"
+      end
+    end
+
+    # Badge + description + the host glob when the rule is scoped to one. The host is worth
+    # the width HERE and not in the tab's list (which has its own column for it): a preset
+    # scoped to `*.corp.internal` is a different rule from the same pattern unscoped, and
+    # the library card is the only place that distinction is visible before loading.
+    def self.summary(rule : Store::MatchRule) : String
+      s = "#{op_tag(rule)}  #{describe(rule)}"
+      rule.host.empty? ? s : "#{s}  @#{rule.host}"
+    end
+
+    # The same line for a not-yet-loaded library preset. Goes through `to_rule` rather than
+    # re-deriving the format, so the picker row and the list row it becomes are identical.
+    def self.preset_summary(preset : Settings::RulePreset) : String
+      summary(preset.to_rule)
+    end
+
     # --- HeadRewriter (called from proxy fibers) -----------------------------
 
     def rewrite_request(head : Bytes, host : String) : Bytes
