@@ -2167,6 +2167,11 @@ module Gori::Tui
       # TUI used to drop it entirely, so a scope/sandbox refusal read as a bare "ERR".
       if err = r.error
         screen.text(x, y, err, Theme.red, bg, width: {inner.right - x, 1}.max)
+      elsif r.chain_error
+        # The send succeeded, but this row's `¦chain` did not run — its payload went out raw.
+        # Flag it in the list (the detail request pane names the reason) so a swallowed chain
+        # isn't invisible among clean rows. #567/H3 Finding 1.
+        screen.text(x, y, "⚠ ¦chain not applied", Theme.yellow, bg, width: {inner.right - x, 1}.max)
       else
         screen.text(x, y, "#{Fmt.size(r.length).ljust(8)} #{r.words.to_s.ljust(7)} #{Fmt.dur(r.duration_us)}", selected ? Theme.text : Theme.muted, bg, width: {inner.right - x, 1}.max)
       end
@@ -2495,6 +2500,8 @@ module Gori::Tui
         return ResultRequest.new(sent, false)
       end
       tmpl = @run_template || Fuzz::Template.parse(String.new(Env.expand_wire(@editor.wire_text)), @http2)
+      # Values only — the reason a chain didn't run is already carried on the row
+      # (r.chain_error), surfaced by detail_request_lines below.
       payloads = tmpl.apply_chains(r.payloads, Decoder.shared_registry)
       raw = tmpl.render(payloads)
       sync, add, _ = run_policy
@@ -2527,6 +2534,12 @@ module Gori::Tui
       req = result_request(r)
       lines = String.new(req.bytes).scrub.split('\n').map(&.rstrip('\r'))
       lines.unshift(FuzzerView.reconstruction_note(run_policy[2])) if req.reconstructed
+      # This pane already SHOWS the untransformed bytes for a row whose `¦chain` did not run
+      # (result_request re-applies the same chains the engine did). Say WHY, so the operator
+      # doesn't read the raw payload as the request they declared. #567/H3 Finding 1.
+      if ce = r.chain_error
+        lines.unshift("(¦chain not applied: #{ce})")
+      end
       lines
     end
 

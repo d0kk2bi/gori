@@ -169,14 +169,17 @@ module Gori::Fuzz
     # ── helpers ──────────────────────────────────────────────────────────────────
 
     private def emit(idx : Int64, payloads : Array(String), pos : Int32?) : Job
-      raw, spans = @template.render_spans(chained(payloads))
+      values, chain_error = chained_reported(payloads)
+      raw, spans = @template.render_spans(values)
       bytes = raw
       if @config.update_content_length?
         bytes, at, delta = ContentLength.sync_at(raw, @config.add_content_length_when_missing?)
         spans = shift_spans(spans, at, delta) unless delta == 0
       end
-      # keep the ORIGINAL payloads for reporting; only the wire bytes are transformed
-      Job.new(idx, payloads, pos, bytes, spans)
+      # keep the ORIGINAL payloads for reporting; only the wire bytes are transformed.
+      # `chain_error` names any position whose `¦chain` could not run on its payload, so a
+      # request that went out with the transform SKIPPED is not reported as a clean send.
+      Job.new(idx, payloads, pos, bytes, spans, chain_error)
     end
 
     # `spans` moved across the Content-Length rewrite, which is the one pass that runs
@@ -202,10 +205,25 @@ module Gori::Fuzz
 
     # Apply each position's inline Decoder chain to its payload (identity when no
     # registry was supplied). Kept separate so `render` stays a byte-verbatim splice.
+    # Values only — for the baseline/calibration paths, which never surface a per-row chain
+    # error (they seed the matcher, they are not reported requests).
     private def chained(payloads : Array(String)) : Array(String)
       # No registry, or no position has a chain ⇒ apply_chains is a per-element identity, so
       # return payloads verbatim (byte-for-byte the same wire request) and skip its allocation.
       (reg = @registry) && @has_chains ? @template.apply_chains(payloads, reg) : payloads
+    end
+
+    # Like `chained`, but for a REPORTED request: also returns the first position's chain
+    # failure reason (nil when every chain ran), so the emitted `Job` can carry it to the row.
+    # Fast path — no registry / no chains — returns the payloads verbatim with no error and no
+    # extra allocation, so the common `auto_mark` / bare `§v§` sweep is unchanged.
+    private def chained_reported(payloads : Array(String)) : {Array(String), String?}
+      return {payloads, nil} unless (reg = @registry) && @has_chains
+      transformed = @template.apply_chains_reported(payloads, reg)
+      # First failing position wins the row's reason; a request with several failing chains is
+      # still one wrong-on-the-wire request, and the first named cause is enough to act on.
+      err = transformed.each.compact_map(&.[1]).first?
+      {transformed.map(&.[0]), err}
     end
 
     private def set_for(p : Int32) : PayloadSet

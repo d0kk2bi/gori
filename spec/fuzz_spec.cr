@@ -157,6 +157,31 @@ describe F::Template do
     out.should eq("a=aGk=&b=keep&c=plain") # base64(hi)=aGk=; unknown chain passes through; no chain untouched
   end
 
+  # #567/H3 Finding 1: a chain that RESOLVES fine but RAISES on THIS payload's bytes left the
+  # payload untransformed with no way to report the reason — a wrong test on the wire under
+  # `0 errors`. apply_chains_reported carries the named reason alongside the (untransformed)
+  # value so the row can flag it.
+  it "apply_chains_reported names a per-payload chain failure and keeps the payload untransformed" do
+    reg = Gori::Decoder.default_registry
+    t = F::Template.parse("q=§x¦shell-escape§")
+    binary = String.new(Bytes[0xff_u8, 0xfe_u8]) # shell-escape needs valid UTF-8 → raises on this
+    value, err = t.apply_chains_reported([binary], reg).first
+    value.should eq(binary) # untransformed — the payload the operator most needed quoted
+    err.should_not be_nil
+    err.not_nil!.should contain("shell-escape") # names the converter that refused
+    err.not_nil!.should contain("chain")        # operator-facing, not a bare exception
+  end
+
+  # Complement of F1: a chain that SUCCEEDS carries no error; a position with NO chain carries
+  # no error. A false chain_error on a healthy row would be as bad as a swallowed failure.
+  it "apply_chains_reported reports no error when the chain runs or there is no chain" do
+    reg = Gori::Decoder.default_registry
+    t = F::Template.parse("a=§x¦shell-escape§&b=§y§")
+    out = t.apply_chains_reported(["a'b", "plain"], reg)
+    out[0].should eq({"'a'\\''b'", nil}) # shell-escape ran, no error
+    out[1].should eq({"plain", nil})     # no chain, verbatim, no error
+  end
+
   it "marked_spans still counts chained markers 1:1 with positions" do
     t = "a=§1¦base64-encode§&b=§2§"
     F::Template.marked_spans(t).size.should eq(F::Template.parse(t).position_count)
@@ -577,6 +602,40 @@ describe F::Engine do
     matched.first.status.should eq(500)
   end
 
+  # #567/H3 Finding 1, end-to-end: a wordlist carrying a payload its `¦chain` cannot run on
+  # used to go out UNTRANSFORMED under `0 errors` / `error:null`. The row must now carry
+  # chain_error, the send that succeeded but skipped its transform must count in the error
+  # tally, and the untransformed payload must be the one on the wire.
+  it "flags a per-payload chain failure on the row and in the error tally (sends untransformed)" do
+    reg = Gori::Decoder.default_registry
+    tmpl = F::Template.parse("GET /q=§x¦shell-escape§ HTTP/1.1\r\nHost: h\r\n\r\n")
+    binary = String.new(Bytes[0xff_u8, 0xfe_u8])
+    set = F::PayloadSet.new(F::InlineList.new(["a'b", binary, "c;d"]))
+    cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1)
+    gen = F::Generator.new(tmpl, [set], cfg, reg)
+    wire = [] of String
+    backend = FakeBackend.new(F::Origin.new("http", "h", 80)) do |bytes|
+      wire << String.new(bytes).scrub
+      ok_result(200, "ok")
+    end
+    results, done = drain(F::Engine.new(gen, F::Matcher.new, backend, cfg))
+    results.size.should eq(3)
+
+    by_payload = results.index_by { |r| r.payloads.first }
+    by_payload["a'b"].chain_error.should be_nil  # shell-escape ran
+    by_payload["c;d"].chain_error.should be_nil  # shell-escape ran
+    failed = by_payload[binary]
+    failed.chain_error.should_not be_nil         # shell-escape refused this payload
+    failed.chain_error.not_nil!.should contain("shell-escape")
+
+    # The run's tally counts the swallowed chain — it is NOT hidden inside "0 errors".
+    done.as(F::DoneEvent).progress.errors.should eq(1_i64)
+
+    # And the untransformed payload is what actually reached the origin.
+    wire.any? { |w| w.includes?("/q=") && w.includes?(binary.scrub) }.should be_true
+    wire.any? { |w| w.includes?("/q='a'\\''b'") }.should be_true # the ones that ran WERE quoted
+  end
+
   it "retries on a network error up to the configured count" do
     attempts = 0
     set = F::PayloadSet.new(F::InlineList.new(["only"]))
@@ -700,6 +759,44 @@ describe Gori::CLI::Output do
     txt.should contain("#3")
     txt.should contain("admin")
     txt.should contain("403")
+  end
+
+  # #567/H3 Finding 2: a byte-faithful payload (a wordlist may hold invalid UTF-8, e.g. a
+  # raw \xff\xfe bad-strings entry) put raw bytes inside a JSON string, so one payload made
+  # the WHOLE document unparseable (poisoning every row). The MCP twin already scrubs; the CLI
+  # emitter was missed. Both --format json and --format jsonl must stay valid.
+  it "emits valid JSON for a non-UTF-8 payload (row and array)" do
+    binary = String.new(Bytes[0xff_u8, 0xfe_u8])
+    r = F::Result.new(1_i64, [binary], nil, 200, 3_i64, 1, 1, 10_i64, nil, true, false, nil)
+    row = Gori::CLI::Output.fuzz_row_json(r)         # jsonl path
+    arr = Gori::CLI::Output.fuzz_array_json([r])     # json path
+    # `valid_encoding?`, not `JSON.parse`: Crystal's parser tolerates its own invalid-UTF-8
+    # output, but jq / python's json / every other consumer rejects a document with a raw
+    # \xff in a string — which is exactly what the finding reproduced. The emitted bytes must
+    # be valid UTF-8.
+    row.valid_encoding?.should be_true
+    arr.valid_encoding?.should be_true
+    JSON.parse(arr)[0]["payloads"].as_a.size.should eq(1)
+  end
+
+  # Complement of F2: an all-ASCII payload is byte-identical to today (no format churn on the
+  # common path).
+  it "leaves an ASCII payload's JSON unchanged" do
+    r = F::Result.new(0_i64, ["admin"], 0, 200, 1_i64, 1, 1, 1_i64, nil, true, false, nil)
+    JSON.parse(Gori::CLI::Output.fuzz_row_json(r))["payloads"].should eq(["admin"])
+  end
+
+  # The chain_error reason reaches both the JSON row and the text row, and is absent (not a
+  # false null) on a clean row.
+  it "surfaces chain_error on the JSON and text rows, only when set" do
+    r = F::Result.new(2_i64, ["x"], 0, 200, 1_i64, 1, 1, 1_i64, nil, false, false, nil,
+      chain_error: "chain 'shell-escape' step 'shell-escape' failed: needs valid UTF-8 text")
+    j = JSON.parse(Gori::CLI::Output.fuzz_row_json(r))
+    j["chain_error"].as_s.should contain("shell-escape")
+    Gori::CLI::Output.fuzz_row_text(r).should contain("shell-escape")
+
+    clean = F::Result.new(3_i64, ["x"], 0, 200, 1_i64, 1, 1, 1_i64, nil, true, false, nil)
+    Gori::CLI::Output.fuzz_row_json(clean).should_not contain("chain_error")
   end
 end
 

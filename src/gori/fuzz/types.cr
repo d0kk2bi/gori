@@ -53,12 +53,21 @@ module Gori
     # session bindings, so a payload of `$TOKEN` is sent as those six characters instead of
     # as the live session credential. Empty for a `Job` a spec or a non-generator caller
     # built by hand, which means "no exclusions" — the pre-existing behaviour.
+    #
+    # `chain_error` is set when a marked position's inline `¦chain` (a Decoder chain) could
+    # not run on THIS payload's bytes — e.g. `shell-escape` on a non-UTF-8 payload, or a
+    # `*-decode` on non-alphabet text. The chain resolved fine at template time (an
+    # un-resolvable chain is refused up front by `Plan.refuse_unusable_chains`), but raised
+    # on these specific bytes, so `Template#apply_chains` sent the payload UNTRANSFORMED. That
+    # is a different request than the operator declared; the reason rides to the row here so no
+    # surface reports it under `0 errors` / `"error":null`. nil = every chain ran (or none).
     record Job,
       index : Int64,
       payloads : Array(String),
       position : Int32?,
       bytes : Bytes,
-      payload_spans : Array({Int32, Int32}) = [] of {Int32, Int32}
+      payload_spans : Array({Int32, Int32}) = [] of {Int32, Int32},
+      chain_error : String? = nil
 
     # One emitted result row. `length`/`words`/`lines` are computed over the DECODED
     # response body (gzip/deflate/br/zstd inflated). `head`/`body`/`request` are
@@ -86,10 +95,18 @@ module Gori
       getter head : Bytes?
       getter body : Bytes?
       getter request : Bytes?
+      # The declared `¦chain` for one of this request's positions did NOT run on that payload
+      # (it raised on these bytes, or its output exceeded MAX_OUT), so the payload went out
+      # untransformed — a different test than the operator asked for. Carried per row and
+      # counted in the run's error tally so a swallowed chain is never hidden inside `0 errors`.
+      # Distinct from `error` (a network/send failure): a request can succeed on the wire yet
+      # still carry a chain_error. nil when every position's chain ran (or none was declared).
+      getter chain_error : String?
 
       def initialize(@index, @payloads, @position, @status, @length, @words, @lines,
                      @duration_us, @error, @matched, @incomplete, @extracted,
-                     @head = nil, @body = nil, @request = nil, @retried = false)
+                     @head = nil, @body = nil, @request = nil, @retried = false,
+                     @chain_error = nil)
       end
     end
 
