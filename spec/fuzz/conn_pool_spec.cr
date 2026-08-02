@@ -270,7 +270,7 @@ describe F::ConnPool do
       origin.close
     end
 
-    it "re-sends on a fresh connection when the origin had closed the parked one" do
+    it "sends on a fresh connection when the origin had closed the parked one" do
       # The origin serves one request per connection and hangs up WITHOUT saying so, so
       # every checkout after the first finds a dead socket — the classic idle-timeout
       # race. No result may be lost to it.
@@ -287,8 +287,13 @@ describe F::ConnPool do
       results.size.should eq(6)
       results.all? { |r| r.status == 200 && r.error.nil? }.should be_true
       pool = sender.pool.should_not be_nil
-      pool.stale_retries.should be > 0
-      # …and it stops paying for the wasted redial rather than doing it 6 times.
+      # The dead socket IS detected. WHERE it is detected decides what the send costs: the
+      # checkout probe sees the FIN before a byte goes out, so the request is written ONCE, on
+      # a fresh connection. `stale_retries` — a request that went out TWICE — is now the
+      # narrower fallback for a FIN that lands between the probe and the write.
+      (pool.stale_checkouts + pool.stale_retries).should be > 0
+      results.count(&.retried?).should eq(pool.stale_retries)
+      # …and it stops paying for the wasted probe-and-redial rather than doing it 6 times.
       pool.pooling?.should be_false
       origin.close
     end
@@ -333,7 +338,7 @@ describe F::ConnPool do
       # A body longer than its Content-Length: gori reads the framed 4 bytes and the rest sits
       # in the receive buffer. Parking it would hand the NEXT request that leftover response —
       # a 200 attributed to the wrong payload, silently. `reusable_response?` sees only the
-      # head, so the checkout-time `drained?` is what has to catch this.
+      # head, so the checkout-time `checkout_state` is what has to catch this.
       #
       # The poison is the FIRST payload deliberately: this origin is a same-process fiber, and
       # on a REUSED socket the scheduler can interleave its write past gori's checkout so the
@@ -399,7 +404,12 @@ describe F::ConnPool do
       results.none?(&.retried?).should be_true
       pool = sender.pool.should_not be_nil
       pool.stale_retries.should eq(0)
-      pool.unsafe_stale.should eq(2)
+      # R5: ONE, not two. An unsafe stale is a LOST payload, not a wasted redial, so the pool
+      # now stops pooling on the first one instead of waiting for STALE_GIVE_UP. The second
+      # error above is the origin dropping a request on a connection gori dialed fresh —
+      # which `--no-keep-alive` reports identically, and which is the point of the next example.
+      pool.unsafe_stale.should eq(1)
+      pool.pooling?.should be_false
       sender.close
       origin.close
     end
@@ -443,10 +453,10 @@ describe F::ConnPool do
       origin.close
     end
 
-    it "still re-sends a GET after a genuine keep-alive idle close (the pool's whole point)" do
+    it "still delivers a GET after a genuine keep-alive idle close (the pool's whole point)" do
       # The complement of the drop case: the origin ANSWERS and then hangs up, so the next
-      # checkout finds a socket the application never saw a request on. That retry must
-      # survive, or pooling is worse than not pooling.
+      # checkout finds a socket the application never saw a request on. Every payload must
+      # still reach the origin, or pooling is worse than not pooling.
       origin = KeepAliveOrigin.new(close_after: 1)
       tmpl = F::Template.parse("GET /?q=§a§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
       set = F::PayloadSet.new(F::InlineList.new((1..6).map(&.to_s)))
@@ -459,8 +469,9 @@ describe F::ConnPool do
 
       results.size.should eq(6)
       results.all? { |r| r.status == 200 && r.error.nil? }.should be_true
+      origin.requests.should eq(6) # once each — the redial does not duplicate the request
       pool = sender.pool.should_not be_nil
-      pool.stale_retries.should be > 0
+      (pool.stale_checkouts + pool.stale_retries).should be > 0
       pool.unsafe_stale.should eq(0)
       sender.close
       origin.close
@@ -487,6 +498,146 @@ describe F::ConnPool do
         {results.count { |r| r.error }, n}
       end
       counts[0].should eq(counts[1])
+    end
+  end
+
+  # R5-F2. The checkout probe PROVED the parked socket dead — `MSG_PEEK` returned 0 before a
+  # byte of the next request was written — and handed it back as "drained" anyway, on the
+  # (then true) reasoning that the stale-retry path would re-send it. Round 4's idempotency
+  # gate made that reasoning false for POST/PUT/PATCH/DELETE, so the two correct changes
+  # jointly DROPPED the request: gori wrote the POST onto a dead socket, the read failed with
+  # `Connection reset by peer`, and the gate then declined to replay a delivery it could no
+  # longer disprove — one call too late.
+  #
+  # Measured against an out-of-process origin that answers and hangs up: a 4-payload POST
+  # sweep put TWO POSTs at the origin, at a steady 50% loss for the whole run (the interleaved
+  # successes reset `@consecutive_stale`, so STALE_GIVE_UP never tripped), and reported the
+  # missing ones as `read (#<TCPSocket:0x102e5cc80>): Connection reset by peer`.
+  describe "a parked socket the origin closed BEFORE the next request was written" do
+    it "sends the POST once, on a fresh connection, and loses nothing" do
+      origin = KeepAliveOrigin.new(close_after: 1)
+      body = "op=charge&amt=1"
+      tmpl = F::Template.parse("POST /pay HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                               "Content-Length: #{body.bytesize}\r\n\r\nop=charge&amt=§1§")
+      set = F::PayloadSet.new(F::InlineList.new((1..4).map(&.to_s)))
+      cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1)
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+        http2: false, verify: false, keep_alive: true, idle_conns: 1)
+      engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+      results = [] of F::Result
+      engine.run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+
+      results.size.should eq(4)
+      # Every payload reached the origin, exactly once, and every row is a real answer.
+      origin.requests.should eq(4)
+      results.all? { |r| r.status == 200 && r.error.nil? }.should be_true
+      pool = sender.pool.should_not be_nil
+      # A FIRST send on a fresh connection, not a replay: nothing had been written, so no row
+      # may claim its request went out twice and no re-send may be charged.
+      results.none?(&.retried?).should be_true
+      pool.stale_retries.should eq(0)
+      pool.unsafe_stale.should eq(0)
+      pool.stale_checkouts.should be > 0
+      sender.close
+      origin.close
+    end
+
+    it "agrees with --no-keep-alive, which is the whole point" do
+      # The pooled and unpooled runs of the same POST sweep must reach the same verdict. With
+      # the socket handed back dead they did not: pooled lost half the payloads and blamed the
+      # origin for it; unpooled sent all four.
+      counts = [true, false].map do |keep_alive|
+        origin = KeepAliveOrigin.new(close_after: 1)
+        body = "op=charge&amt=1"
+        tmpl = F::Template.parse("POST /pay HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                                 "Content-Length: #{body.bytesize}\r\n\r\nop=charge&amt=§1§")
+        set = F::PayloadSet.new(F::InlineList.new((1..4).map(&.to_s)))
+        cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1, keep_alive: keep_alive)
+        sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+          http2: false, verify: false, keep_alive: cfg.keep_alive?, idle_conns: 1)
+        engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+        results = [] of F::Result
+        engine.run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+        sender.close
+        n = origin.requests
+        origin.close
+        {results.count { |r| r.error }, n}
+      end
+      counts[0].should eq(counts[1])
+      counts[0].should eq({0, 4})
+    end
+
+    # `--concurrency > 1` is deliberately NOT driven here. `KeepAliveOrigin` is an in-process
+    # fiber, and above about six connections it starts leaving requests unread on sockets gori
+    # dialed FRESH — errors with `unsafe_stale == 0`, i.e. nothing to do with the pool. It was
+    # measured out-of-process instead, against an origin that answers and closes immediately:
+    # `--concurrency 4`, 12 POST payloads, 9 of 12 delivered before this fix and 12 of 12
+    # after. Recording it so nobody re-adds a spec that reproduces the harness, not the code.
+    it "retires a socket carrying RESIDUE without charging it as a closed one" do
+      # The complement of the condition the fix keys on. Unread bytes from the PREVIOUS
+      # exchange are a response-desync, not an idle close: the socket is retired either way,
+      # but only a proven FIN licenses treating the redial as a first send, and only a FIN
+      # says "parking this origin's sockets is pointless".
+      origin = PoisonOrigin.new(poison_tail: "EXTRA")
+      pool = F::ConnPool.new("http", "127.0.0.1", origin.port, false, nil, nil, nil, 4)
+      %w[EXTRA B02 B03].each do |p|
+        pool.send(req("GET /f/#{p} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"))
+      end
+      pool.stale_checkouts.should eq(0)
+      pool.stale_retries.should eq(0)
+      pool.pooling?.should be_true # a poisoned socket is not a reason to stop pooling
+      pool.close_all
+      origin.close
+    end
+  end
+
+  # The third harm in R5-F2, and the one that survives the fix: a FIN that lands BETWEEN the
+  # checkout probe and the write is genuinely ambiguous, so the request is NOT replayed — but
+  # the row for it was `Engine.exchange`'s raw exception message. `read (#<TCPSocket:0x…>):
+  # Connection reset by peer` reads as "this payload provoked a reset" (a false positive in a
+  # sweep), blames the ORIGIN for a socket gori wrote onto after the origin had closed it, and
+  # puts a heap pointer in the terminal, in `--format json` and in MCP `fuzz_results`.
+  describe "the row for a non-idempotent request that died on a parked socket" do
+    it "says what gori knows, keeps the transport's words, and leaks no object address" do
+      origin = KeepAliveOrigin.new(drop_every: 2)
+      body = "op=charge&amt=1"
+      tmpl = F::Template.parse("POST /pay HTTP/1.1\r\nHost: 127.0.0.1\r\n" \
+                               "Content-Length: #{body.bytesize}\r\n\r\nop=charge&amt=§1§")
+      set = F::PayloadSet.new(F::InlineList.new((1..4).map(&.to_s)))
+      cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1)
+      sender = F::Sender.new(F::Origin.new("http", "127.0.0.1", origin.port), ungated_outbound,
+        http2: false, verify: false, keep_alive: true, idle_conns: 1)
+      engine = F::Engine.new(F::Generator.new(tmpl, [set], cfg), F::Matcher.new, sender, cfg)
+      results = [] of F::Result
+      engine.run { |ev| results << ev.result if ev.is_a?(F::ResultEvent) }
+
+      pool = sender.pool.should_not be_nil
+      pool.unsafe_stale.should eq(1)
+      pooled = results.compact_map(&.error).select(&.includes?("parked keep-alive"))
+      pooled.size.should eq(1)
+      msg = pooled.first
+      msg.should contain("parked keep-alive connection to 127.0.0.1:#{origin.port}")
+      msg.should contain("POST is not idempotent")
+      msg.should contain("NOT re-send")
+      # gori does not know whether the origin read it, and must not claim either way.
+      msg.should contain("may or may not have reached the origin")
+      # No `#<TCPSocket:0x…>` — the pointer is the tell.
+      msg.should_not match(/0x[0-9a-f]{6,}/)
+      msg.should_not match(/#<\w+:/)
+      sender.close
+      origin.close
+    end
+
+    it "keeps the transport's own words and drops only the object address" do
+      # `transport_detail` is pure, so the shape can be pinned without a socket — the exact
+      # string a real reset produced is the DATA here.
+      raw = "read (#<TCPSocket:0x102e5cc80>): Connection reset by peer"
+      cleaned = F::ConnPool.transport_detail(raw).should_not be_nil
+      cleaned.should eq("read: Connection reset by peer")
+      # Complements: nothing to strip, nothing at all, and a message that is ONLY an address.
+      F::ConnPool.transport_detail("Broken pipe").should eq("Broken pipe")
+      F::ConnPool.transport_detail(nil).should be_nil
+      F::ConnPool.transport_detail(" (#<IO::FileDescriptor:0xdeadbeef>)").should be_nil
     end
   end
 end
