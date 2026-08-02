@@ -12,6 +12,28 @@ module Gori::Proxy::WS
   # overflowing `len.to_i` (Int32) or allocating unbounded memory.
   MAX_FRAME = 16_u64 * 1024 * 1024
 
+  # Prefix on a `ws_messages` row gori wrote ABOUT the socket rather than a frame a peer
+  # sent — the oversized-frame marker, the ping-flood marker, the handshake's
+  # `Sec-WebSocket-Extensions` advisory and the §5.4 parking-ceiling advisory.
+  #
+  # It lives here, beside `Shape`, and not in `Relay` where every writer of one is, because
+  # the READERS need it more than the writers do. A notice row is a diagnostic, and **a
+  # diagnostic is not traffic**: a WebSocket repeater seed takes `ws_messages` rows and puts
+  # them back on the wire opcode-and-bytes straight across, so a seed that cannot recognise
+  # one replays gori's own sentence to the application under test as a message the operator
+  # never authored. `Store::WsMessage#notice?` is that test, and `store/models.cr` cannot
+  # require `relay.cr` (which pulls in the sink, the head rewriter and the Interceptor).
+  NOTICE_PREFIX = "[gori] "
+
+  # Does this payload carry `NOTICE_PREFIX`? On BYTES, and with no decode step: a WebSocket
+  # payload is arbitrary octets (invalid UTF-8 is the §8.1/§5.6 test case, and scrubbing one
+  # to ask this question would be the very substitution the send path spent two rounds
+  # removing), so the test compares the leading octets and nothing else.
+  def self.notice?(payload : Bytes) : Bool
+    prefix = NOTICE_PREFIX.to_slice
+    payload.size >= prefix.size && payload[0, prefix.size] == prefix
+  end
+
   # The RSV1..RSV3 nibble of the first header octet (RFC 6455 §5.2), shifted down so
   # RSV1 = 4, RSV2 = 2, RSV3 = 1. Parsing used to read `b0 & 0x80` and `b0 & 0x0f` and
   # nothing between them, so the three extension bits existed nowhere above the socket:
