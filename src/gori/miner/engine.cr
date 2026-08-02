@@ -209,7 +209,12 @@ module Gori::Miner
       # One {name, canary} pair per candidate — the SAME array feeds the injector and the
       # detector (decide), so no per-bucket name→canary / canary→name hashes are built.
       pairs = task.names.map { |n| {n, Canary.fresh} }
-      raw = send_with_retries(Inject.apply(@base, task.location, pairs, @config.add_content_length_when_missing?))
+      # `apply_with_spans` (not `apply`): the spans mark the INJECTED candidate names/values
+      # so the send seam protects them from session-binding expansion. Without this a `$NAME`
+      # a param wordlist carries — or an injected byte colliding with a bound name — expands
+      # to the live credential and leaves gori for the target, the run reporting `0 errors`.
+      bytes, spans = Inject.apply_with_spans(@base, task.location, pairs, @config.add_content_length_when_missing?)
+      raw = send_with_retries(bytes, spans)
       if err = raw.error
         # A max-requests cap refusal isn't a network error — don't let it inflate @errors.
         unless err == Fuzz::CappedBackend::CAP_ERROR
@@ -269,7 +274,9 @@ module Gori::Miner
       last_canary = canary
       rounds.times do
         c = Canary.fresh
-        raw = send_with_retries(Inject.apply(@base, location, [{name, c}], @config.add_content_length_when_missing?))
+        # Same span-protection as the main loop — the confirm re-send injects the same name.
+        bytes, spans = Inject.apply_with_spans(@base, location, [{name, c}], @config.add_content_length_when_missing?)
+        raw = send_with_retries(bytes, spans)
         next if raw.error
         probe = Fingerprint.probe(raw)
         decision = Miner.decide(r, probe, [{name, c}], location)
@@ -422,10 +429,10 @@ module Gori::Miner
 
     # ── sending / pacing ────────────────────────────────────────────────────────────
 
-    private def send_with_retries(bytes : Bytes) : Repeater::Result
+    private def send_with_retries(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
       attempts = 0
       loop do
-        raw = @backend.send(bytes)
+        raw = @backend.send(bytes, verbatim)
         if raw.error.nil?
           @successful_sends += 1
           return raw

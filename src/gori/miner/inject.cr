@@ -30,15 +30,47 @@ module Gori::Miner
     def self.apply(request : Bytes, location : Location,
                    params : Array({String, String}),
                    add_cl_when_missing : Bool = false) : Bytes
-      return request if params.empty?
+      apply_with_spans(request, location, params, add_cl_when_missing)[0]
+    end
+
+    # `apply`, PLUS the byte spans in the RETURNED bytes that hold the injected candidate
+    # names and values (final, post Content-Length sync offsets). A send seam marks those
+    # `verbatim` so a `$NAME` an operator's wordlist carries — or any injected byte that
+    # collides with a live session binding — is NOT expanded to the real credential on the
+    # way to the target and reported back as a clean `0 errors` run. This is the same role
+    # `Fuzz::Job#payload_spans` plays for the Fuzzer (the round-5 fix); the miner reaches the
+    # send seam through here rather than through the fuzz Generator, so it needs its own spans.
+    #
+    # Only the INJECTED regions are protected: the seed's OWN `$BINDING` placeholders (the
+    # operator's captured request) lie outside every span and still resolve at send. The
+    # spans come out sorted and disjoint — what `Env.expand_bindings`' single-cursor walk
+    # requires — and a location that injects nothing returns an empty list.
+    def self.apply_with_spans(request : Bytes, location : Location,
+                              params : Array({String, String}),
+                              add_cl_when_missing : Bool = false) : {Bytes, Array({Int32, Int32})}
+      return {request, [] of {Int32, Int32}} if params.empty?
       case location
       in Location::Query     then inject_query(request, params)
-      in Location::Form      then Fuzz::ContentLength.sync(inject_form(request, params), add_cl_when_missing)
-      in Location::Multipart then Fuzz::ContentLength.sync(inject_multipart(request, params), add_cl_when_missing)
-      in Location::Json      then Fuzz::ContentLength.sync(inject_json(request, params), add_cl_when_missing)
+      in Location::Form      then sync_spans(inject_form(request, params), add_cl_when_missing)
+      in Location::Multipart then sync_spans(inject_multipart(request, params), add_cl_when_missing)
+      in Location::Json      then sync_spans(inject_json(request, params), add_cl_when_missing)
       in Location::Headers   then inject_headers(request, params)
       in Location::Cookies   then inject_cookies(request, params)
       end
+    end
+
+    # Content-Length sync over a freshly injected BODY, carrying the injected spans across
+    # the rewrite. The head's CL line can change length, moving every body offset by `delta`
+    # from `at` on — the exact shift `Fuzz::Generator#shift_spans` applies, for the exact
+    # reason: this rewrite happens between the splice and the socket, so a caller holding
+    # pre-sync offsets cannot re-derive them. A span at or past `at` moves; one before it
+    # (there is none here — every injected span lives in the body, well past the head) stays.
+    private def self.sync_spans(pair : {Bytes, Array({Int32, Int32})},
+                                add_when_missing : Bool) : {Bytes, Array({Int32, Int32})}
+      bytes, spans = pair
+      synced, at, delta = Fuzz::ContentLength.sync_at(bytes, add_when_missing)
+      spans = spans.map { |(a, b)| a >= at ? {a + delta, b + delta} : {a, b} } unless delta == 0
+      {synced, spans}
     end
 
     # ── head/body split (own copy of Fuzz::ContentLength's left-to-right scan) ────────
@@ -93,39 +125,40 @@ module Gori::Miner
       {nil, 0, "\r\n"}
     end
 
-    private def self.rebuild(head_lines : Array(String), eol : String, body : Bytes) : Bytes
-      io = IO::Memory.new
-      io << head_lines.join(eol) << eol << eol
-      io.write(body) unless body.empty?
-      io.to_slice
-    end
-
     # ── query ───────────────────────────────────────────────────────────────────────
 
-    private def self.inject_query(request : Bytes, params : Array({String, String})) : Bytes
+    private def self.inject_query(request : Bytes, params : Array({String, String})) : {Bytes, Array({Int32, Int32})}
       nl = request.index(0x0a_u8)
-      return request unless nl
+      return {request, [] of {Int32, Int32}} unless nl
       first = String.new(request[0, nl]).rstrip('\r')
       parts = first.split(' ')
-      return request unless parts.size == 3
+      return {request, [] of {Int32, Int32}} unless parts.size == 3
       extra = encode_pairs(params)
-      target = append_query(parts[1], extra)
-      new_first = "#{parts[0]} #{target} #{parts[2]}"
+      target = parts[1]
+      sep = query_separator(target)
       eol = (nl > 0 && request[nl - 1] == 0x0d_u8) ? "\r\n" : "\n"
       io = IO::Memory.new(request.size + extra.bytesize + 8)
-      io << new_first << eol
+      io << parts[0] << ' ' << target << sep
+      start = io.pos.to_i32
+      io << extra
+      span = {start, io.pos.to_i32}
+      io << ' ' << parts[2] << eol
       rest_at = nl + 1
       io.write(request[rest_at, request.size - rest_at])
-      io.to_slice
+      {io.to_slice, [span]}
     end
 
-    private def self.append_query(target : String, extra : String) : String
+    # The join byte that appends `extra` to the request target: `?` when there is no query
+    # yet, nothing when the target already ends in `?`/`&`, `&` otherwise. Split out from the
+    # old `append_query` so the injected span starts exactly AFTER this separator (the
+    # separator is framing gori wrote, not an injected candidate byte).
+    private def self.query_separator(target : String) : String
       if !target.includes?('?')
-        "#{target}?#{extra}"
+        "?"
       elsif target.ends_with?('?') || target.ends_with?('&')
-        "#{target}#{extra}"
+        ""
       else
-        "#{target}&#{extra}"
+        "&"
       end
     end
 
@@ -137,11 +170,11 @@ module Gori::Miner
     # body shape to preserve, so injecting here would fabricate a framing-broken request:
     # a body with no Content-Length and no Content-Type header at all. Bail out unmodified
     # instead, same as inject_multipart/inject_json do when their location doesn't apply.
-    private def self.inject_form(request : Bytes, params : Array({String, String})) : Bytes
+    private def self.inject_form(request : Bytes, params : Array({String, String})) : {Bytes, Array({Int32, Int32})}
       head, body, eol = split(request)
-      return request if body.empty?
+      return {request, [] of {Int32, Int32}} if body.empty?
       ct = (header_value(request, "content-type") || "").downcase
-      return request unless ct.includes?("x-www-form-urlencoded")
+      return {request, [] of {Int32, Int32}} unless ct.includes?("x-www-form-urlencoded")
       extra = encode_pairs(params)
       # The body is spliced through as bytes. It used to be copied into a String, then again by
       # the interpolation that joined it to `extra`, then a third time into the IO — and the
@@ -153,8 +186,9 @@ module Gori::Miner
         io.write(body)
         io << '&' unless body[body.size - 1] == 0x26_u8 # '&'
       end
+      start = io.pos.to_i32
       io << extra
-      io.to_slice
+      {io.to_slice, [{start, io.pos.to_i32}]}
     end
 
     # Encoded straight into one builder. The map/join form allocated two encoded Strings plus an
@@ -178,27 +212,34 @@ module Gori::Miner
     # `--boundary--` close delimiter (not MIME::Multipart::Builder, which would mint a fresh
     # boundary and force a Content-Type rewrite + re-serialization that mangles binary parts).
     # Multipart is ALWAYS CRLF internally (RFC 7578), regardless of the head's EOL.
-    private def self.inject_multipart(request : Bytes, params : Array({String, String})) : Bytes
+    private def self.inject_multipart(request : Bytes, params : Array({String, String})) : {Bytes, Array({Int32, Int32})}
       raw_ct = header_value(request, "content-type") # ORIGINAL case — the boundary is case-sensitive
-      return request unless raw_ct
+      return {request, [] of {Int32, Int32}} unless raw_ct
       boundary = MIME::Multipart.parse_boundary(raw_ct)
-      return request if boundary.nil? || boundary.empty?
+      return {request, [] of {Int32, Int32}} if boundary.nil? || boundary.empty?
 
       additions = build_multipart_parts(boundary, params)
-      return request if additions.empty?
+      return {request, [] of {Int32, Int32}} if additions.empty?
 
       head, body, eol = split(request)
       io = IO::Memory.new(head.size + body.size + additions.bytesize + eol.bytesize * 2 + 16)
       io.write(head)
       io << eol << eol
 
+      # The whole injected `additions` block is candidate content (Content-Disposition
+      # framing gori wrote plus the injected names/values) — mark it all verbatim: no injected
+      # byte is ever scanned for a `$NAME`, and the framing carries none.
+      start = 0
+      stop = 0
       close = "--#{boundary}--".to_slice
       if ci = last_index_of(body, close)
         io.write(body[0, ci])
         # A boundary delimiter must be preceded by CRLF; a well-formed body already ends the
         # prior part with it (so this no-ops), but a synthesised/edited body might not.
         io << "\r\n" unless ci >= 2 && body[ci - 2] == 0x0d_u8 && body[ci - 1] == 0x0a_u8
-        io << additions                    # each appended part already ends with CRLF
+        start = io.pos.to_i32
+        io << additions # each appended part already ends with CRLF
+        stop = io.pos.to_i32
         io.write(body[ci, body.size - ci]) # the close delimiter + any epilogue, verbatim
       else
         # Malformed (no close delimiter) or empty body: synthesise a well-formed tail so the
@@ -207,10 +248,12 @@ module Gori::Miner
           io.write(body)
           io << "\r\n" unless ends_with_crlf?(body)
         end
+        start = io.pos.to_i32
         io << additions
+        stop = io.pos.to_i32
         io << "--" << boundary << "--\r\n"
       end
-      io.to_slice
+      {io.to_slice, [{start, stop}]}
     end
 
     private def self.build_multipart_parts(boundary : String, params : Array({String, String})) : String
@@ -242,16 +285,72 @@ module Gori::Miner
       body.size >= 2 && body[body.size - 2] == 0x0d_u8 && body[body.size - 1] == 0x0a_u8
     end
 
+    # First occurrence of `needle` at or after `from`, byte-wise (String#index would corrupt a
+    # non-UTF-8 body). Used to locate an injected JSON fragment whose final offset only exists
+    # after `any.to_json` has reserialized the whole body.
+    private def self.forward_index_of(haystack : Bytes, needle : Bytes, from : Int32) : Int32?
+      return nil if needle.empty? || needle.size > haystack.size
+      i = from < 0 ? 0 : from
+      last = haystack.size - needle.size
+      while i <= last
+        return i if haystack[i, needle.size] == needle
+        i += 1
+      end
+      nil
+    end
+
+    # Sort spans by start and fold any that touch or overlap into one. `Env.expand_bindings`
+    # walks the verbatim list with a single forward cursor, so it requires sorted + disjoint
+    # ranges; only the JSON path can emit incidentally overlapping fragments, but every caller
+    # runs this so the invariant holds uniformly.
+    private def self.merge_spans(spans : Array({Int32, Int32})) : Array({Int32, Int32})
+      return spans if spans.size <= 1
+      sorted = spans.sort_by! { |(a, _)| a }
+      out = [] of {Int32, Int32}
+      cs, ce = sorted[0]
+      sorted.each_with_index do |(a, b), i|
+        next if i == 0
+        if a <= ce
+          ce = b if b > ce
+        else
+          out << {cs, ce}
+          cs, ce = a, b
+        end
+      end
+      out << {cs, ce}
+      out
+    end
+
     # ── json (object + nested objects + array roots) ─────────────────────────────────
 
-    private def self.inject_json(request : Bytes, params : Array({String, String})) : Bytes
+    private def self.inject_json(request : Bytes, params : Array({String, String})) : {Bytes, Array({Int32, Int32})}
       head, body, eol = split(request)
       new_body = inject_json_text(String.new(body).scrub, params)
-      return request unless new_body
+      return {request, [] of {Int32, Int32}} unless new_body
       io = IO::Memory.new(head.size + new_body.bytesize + eol.bytesize * 2)
       io.write(head)
       io << eol << eol << new_body
-      io.to_slice
+      out = io.to_slice
+
+      # A JSON candidate is reserialized (`any.to_json`) or textually spliced, so its final
+      # position is only known after the fact: locate every injected `"name":"value"` fragment
+      # in the new body (the SAME spelling both paths emit — `n.to_json`/`v.to_json`, no space,
+      # Crystal-compact). A name is injected into every object node, so a fragment can recur;
+      # each occurrence is a span. Values are canaries here (unique), so a fragment cannot
+      # collide with pre-existing body content, and merge_spans folds any incidental overlap so
+      # the list stays sorted+disjoint for `Env.expand_bindings`' cursor.
+      body_off = head.size + eol.bytesize * 2
+      nb = new_body.to_slice
+      spans = [] of {Int32, Int32}
+      params.each do |(n, v)|
+        frag = "#{n.to_json}:#{v.to_json}".to_slice
+        from = 0
+        while idx = forward_index_of(nb, frag, from)
+          spans << {body_off + idx, body_off + idx + frag.size}
+          from = idx + frag.size
+        end
+      end
+      {out, merge_spans(spans)}
     end
 
     # Inject candidate keys into EVERY object node of the JSON body — the root object, objects
@@ -309,32 +408,64 @@ module Gori::Miner
     # head bytes are copied through verbatim. The old path took String.new(head) (a full copy),
     # split it into a String per line, then rebuild joined them back into another full copy
     # before writing — three passes over the head to append to it.
-    private def self.inject_headers(request : Bytes, params : Array({String, String})) : Bytes
+    private def self.inject_headers(request : Bytes, params : Array({String, String})) : {Bytes, Array({Int32, Int32})}
       head, body, eol = split(request)
       io = IO::Memory.new(head.size + params.size * 48 + body.size + eol.bytesize * 2)
       io.write(head)
+      spans = [] of {Int32, Int32}
       params.each do |(n, v)|
-        io << eol << n << ": " << sanitize_value(v) if valid_header_name?(n)
+        next unless valid_header_name?(n)
+        io << eol
+        start = io.pos.to_i32
+        io << n << ": " << sanitize_value(v)
+        spans << {start, io.pos.to_i32}
       end
       io << eol << eol
       io.write(body) unless body.empty?
-      io.to_slice
+      {io.to_slice, spans}
     end
 
     # ── cookies ──────────────────────────────────────────────────────────────────────
 
-    private def self.inject_cookies(request : Bytes, params : Array({String, String})) : Bytes
+    private def self.inject_cookies(request : Bytes, params : Array({String, String})) : {Bytes, Array({Int32, Int32})}
       head, body, eol = split(request)
       lines = String.new(head).split(eol)
       additions = params.compact_map { |(n, v)| valid_cookie_name?(n) ? "#{n}=#{sanitize_value(v)}" : nil }
-      return request if additions.empty?
+      return {request, [] of {Int32, Int32}} if additions.empty?
+      joined = additions.join("; ")
       idx = lines.index { |l| (c = l.index(':')) && c > 0 && l[0...c].strip.downcase == "cookie" }
+
+      # Byte-identical to the old split/mutate/rebuild, but built through an IO so the injected
+      # `joined` span (the added `name=value; …`) is recorded in final offsets. Appended to an
+      # existing Cookie line, or added as a fresh one when there is none.
+      io = IO::Memory.new(head.size + joined.bytesize + body.size + eol.bytesize * 4 + 16)
+      start = 0
+      stop = 0
       if idx
-        lines[idx] = "#{lines[idx].rstrip}; #{additions.join("; ")}"
+        lines.each_with_index do |line, i|
+          io << eol if i > 0
+          if i == idx
+            io << line.rstrip << "; "
+            start = io.pos.to_i32
+            io << joined
+            stop = io.pos.to_i32
+          else
+            io << line
+          end
+        end
       else
-        lines << "Cookie: #{additions.join("; ")}"
+        lines.each_with_index do |line, i|
+          io << eol if i > 0
+          io << line
+        end
+        io << eol << "Cookie: "
+        start = io.pos.to_i32
+        io << joined
+        stop = io.pos.to_i32
       end
-      rebuild(lines, eol, body)
+      io << eol << eol
+      io.write(body) unless body.empty?
+      {io.to_slice, [{start, stop}]}
     end
 
     # ── name/value validity ──────────────────────────────────────────────────────────
