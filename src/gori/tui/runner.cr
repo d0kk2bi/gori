@@ -4396,14 +4396,23 @@ module Gori::Tui
     # Host: open the Project SCOPE rule popup (nil edit_id = add a new rule). The apply is
     # injected as the overlay's commit closure (Overlay seam): it persists via the Project
     # controller and returns whether to close (false = invalid pattern → keep the form up).
-    def open_scope_rule_editor(edit_id : Int64?, kind : String, match_type : String, pattern : String) : Nil
+    #
+    # `on_applied` runs only on a SUCCESSFUL write, for a caller that opened this form from
+    # somewhere the new rule is immediately visible (the Sitemap's `a`, whose tree carries
+    # scope markers and — with the lens on — is filtered by the rule just added).
+    def open_scope_rule_editor(edit_id : Int64?, kind : String, match_type : String, pattern : String,
+                               on_applied : Proc(Nil)? = nil) : Nil
       ov =
         if id = edit_id
           ScopeRuleOverlay.editing(id, kind, match_type, pattern)
         else
           ScopeRuleOverlay.new(kind: kind, match_type: match_type, pattern: pattern)
         end
-      ov.on_commit = -> { project_controller.apply_scope_rule(ov.edit_id, ov.kind, ov.match_type, ov.pattern) }
+      ov.on_commit = -> {
+        ok = project_controller.apply_scope_rule(ov.edit_id, ov.kind, ov.match_type, ov.pattern)
+        on_applied.try(&.call) if ok
+        ok
+      }
       open_overlay(ov)
     end
 
@@ -4672,9 +4681,10 @@ module Gori::Tui
     # Sitemap verbs that stay SINGLE-target even with marks set, and say so in their menu
     # hint. Discover is single by design (one config popup scans one start target under one
     # host — see the multi-host refusal in runner/discover.cr), the Sequencer collects one
-    # endpoint's token, and a detail overlay shows one flow; the rest (query / fold /
-    # scope-lens) are selection-independent, so a cursor note there would be noise.
-    SITEMAP_CURSOR_ONLY = {"sitemap.discover", "sitemap.sequence", "sitemap.open-flow"}
+    # endpoint's token, a detail overlay shows one flow, and the scope form edits one
+    # pattern; the rest (query / fold / scope-lens) are selection-independent, so a cursor
+    # note there would be noise.
+    SITEMAP_CURSOR_ONLY = {"sitemap.discover", "sitemap.sequence", "sitemap.open-flow", "sitemap.scope-add"}
 
     # Retitle the Sitemap's menu entries while marks are set, so the menu says what will
     # actually happen — "Tag 3 paths". MUST return nil when nothing is marked, so every

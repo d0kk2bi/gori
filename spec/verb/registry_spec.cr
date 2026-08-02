@@ -472,6 +472,10 @@ private class FakeContext < ExecContext
     @calls << :sitemap_open_flow
   end
 
+  def sitemap_scope_add : Nil
+    @calls << :sitemap_scope_add
+  end
+
   def sitemap_mark_toggle : Nil
     @calls << :sitemap_mark_toggle
   end

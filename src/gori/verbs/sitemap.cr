@@ -88,6 +88,14 @@ module Gori
         "sitemap.scope-toggle", "Toggle scope lens", "Filter the tree to in-scope endpoints on/off",
         Verb::Scope::Sitemap, [Verb::Chord.new("s", shift: true)], mnemonic: 's') { |ctx| ctx.scope_toggle_lens; nil }
 
+      # `a` — add the cursor row to the project scope, pre-filling the SAME popup the Project
+      # tab's `a` opens (hence the same chord): a host row seeds a `host` rule, a path row a
+      # "host/path" `string` rule. The tree is where you SEE what is worth scoping, so the
+      # rule is authored there instead of retyping the host in the Project tab.
+      r.register Verb::Definition.new(
+        "sitemap.scope-add", "Add to scope", "Add the selected host — or host + path — to the scope rules",
+        Verb::Scope::Sitemap, [Verb::Chord.new("a")], mnemonic: 'a') { |ctx| ctx.sitemap_scope_add; nil }
+
       # `d` — spider + brute-force the selected host/path (opens the Discover config popup).
       r.register Verb::Definition.new(
         "sitemap.discover", "Discover here", "Spider + brute-force the selected host or path subtree",

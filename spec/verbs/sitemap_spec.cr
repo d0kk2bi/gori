@@ -30,7 +30,22 @@ describe "Gori::Verbs.register_sitemap" do
      "sitemap.discover"        => :sitemap_discover,
      "sitemap.repeater"        => :sitemap_repeater,
      "sitemap.open-flow"       => :sitemap_open_flow,
+     "sitemap.scope-add"       => :sitemap_scope_add,
     }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
+  end
+
+  # The tree is where you SEE what is worth scoping, but the rule editor lived only in the
+  # Project tab — so scoping a host you just found meant retyping it there.
+  it "adds the cursor row to the scope on `a`, the same chord the Project scope pane uses" do
+    verb = r["sitemap.scope-add"]
+    verb.chords.should eq([Gori::Verb::Chord.new("a")])
+    verb.hidden?.should be_false # else it reaches neither the space menu nor Help
+    verb.menu_key.should eq('a')
+    # Same gesture as the popup's other door, so `a` means "add a scope rule" in both places.
+    r["scope.add-rule"].chords.should eq([Gori::Verb::Chord.new("a")])
+    # 's' still belongs to the LENS toggle here — adding a rule and filtering by it are
+    # distinct actions, and the toast after a save points at 's'.
+    r["sitemap.scope-toggle"].menu_key.should eq('s')
   end
 
   # #539: the action existed nowhere — no chord, no registry entry — so the space menu could
