@@ -256,6 +256,33 @@ describe Gori::Decoder do
     it "punycode-decode rejects a malformed xn-- label instead of emitting garbage" do
       expect_raises(Gori::Decoder::DecoderError, /invalid punycode/) { conv("punycode-decode", "xn--a-!!") }
     end
+
+    # punycode-encode (alias idn-encode) is IDN encode, not raw bootstring: a label with an
+    # uppercase or otherwise un-mapped code point must be case-folded + NFC-normalised (RFC 3490
+    # ToASCII step 2) BEFORE the bootstring, so the output is the ACE label a resolver produces.
+    # Golden column is Python stdlib `s.encode('idna')`.
+    it "punycode-encode applies ToASCII case-folding so an upper/mixed-case IDN encodes to the resolver's label" do
+      conv("punycode-encode", "MÜNCHEN.de").should eq "xn--mnchen-3ya.de"
+      conv("punycode-encode", "München.de").should eq "xn--mnchen-3ya.de"
+      conv("punycode-encode", "BÜCHER.example").should eq "xn--bcher-kva.example"
+      # Cyrillic: not merely a case change in the OUTPUT — the bootstring DIGITS differ, because
+      # the lowercase Cyrillic code points are distinct characters (raw bootstring gave xn--c0adxhks).
+      conv("punycode-encode", "МОСКВА.РФ").should eq "xn--80adxhks.xn--p1ai"
+      # NFC normalisation: this label is DECOMPOSED ('u' + U+0308 combining diaeresis); the fix
+      # NFC-composes it before the bootstring so it folds to the same ACE as the precomposed form.
+      conv("punycode-encode", "münchen.de").should eq "xn--mnchen-3ya.de"
+      # Round-trips: the ACE our encoder now emits decodes back to the folded Unicode name.
+      conv("punycode-decode", conv("punycode-encode", "MÜNCHEN.de")).should eq "münchen.de"
+    end
+
+    # Complements of the branch the fix keys on: an already-lowercase IDN label is unchanged
+    # (no regression on the working path), and a pure-ASCII label passes through with its case
+    # intact (matching Python idna, which nameprep-maps only non-ASCII labels).
+    it "punycode-encode leaves an all-lowercase IDN and a pure-ASCII label exactly as before" do
+      conv("punycode-encode", "münchen.de").should eq "xn--mnchen-3ya.de" # all-lowercase: same as today
+      conv("punycode-encode", "PAYPAL.com").should eq "PAYPAL.com"         # pure ASCII: case preserved
+      conv("punycode-encode", "Example.COM").should eq "Example.COM"       # pure ASCII, mixed: untouched
+    end
   end
 
   describe "compression" do

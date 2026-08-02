@@ -454,7 +454,11 @@ module Gori::Fuzz
         result = run_one(job)
         @sent += 1
         @matched += 1 if result.matched?
-        @errors += 1 if result.error
+        # A swallowed `¦chain` (the transform did not run, the payload went out raw) is an
+        # error too — otherwise a sweep reports `0 errors` while sending the untransformed
+        # payload. `||` not `+2`: one request is one error even if it both failed on the wire
+        # AND carried a chain that could not run.
+        @errors += 1 if result.error || result.chain_error
         @events.send(ResultEvent.new(result)) # blocking — never drop a row
         emit_progress
       end

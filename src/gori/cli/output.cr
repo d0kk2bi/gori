@@ -166,7 +166,13 @@ module Gori
       def self.fuzz_row_fields(j : JSON::Builder, r : Fuzz::Result) : Nil
         j.object do
           j.field "index", r.index
-          j.field("payloads") { j.array { r.payloads.each { |p| j.string(p) } } }
+          # `.scrub`: a `Fuzz::Payload` is byte-faithful, so a wordlist entry may be invalid
+          # UTF-8 (a raw `\xff\xfe` bad-strings payload). `JSON::Builder#string` escapes JSON
+          # metacharacters but passes raw bytes straight through, so one such payload used to
+          # produce a document no JSON parser would accept — poisoning EVERY row, not just its
+          # own. Scrubbing to U+FFFD matches the MCP emitter (`Serialize.text`) and keeps the
+          # report parseable; the exact bytes that went out are recoverable from `request`.
+          j.field("payloads") { j.array { r.payloads.each { |p| j.string(p.scrub) } } }
           j.field "position", r.position
           j.field "status", r.status
           j.field "length", r.length
@@ -175,6 +181,14 @@ module Gori
           j.field "duration_us", r.duration_us
           j.field "matched", r.matched?
           j.field "error", r.error
+          # A declared `¦chain` that could not run on this payload — the payload went out
+          # UNTRANSFORMED. Emitted (and only when set) so a script never reads `"error":null`
+          # for a request that sent a different test than the operator asked for. `.scrub` for
+          # the same reason `payloads` is scrubbed: a codec's refusal can quote a byte from the
+          # payload, and one invalid byte would poison the whole document.
+          if ce = r.chain_error
+            j.field "chain_error", ce.scrub
+          end
           j.field "extracted", r.extracted
           # Only when true. This is an exception rather than a per-row property, and a `false`
           # on every row of every clean run would bury the one row that matters.
@@ -365,6 +379,8 @@ module Gori
           # request went out twice (see `Fuzz::Result#retried?`).
           io << "  re-sent" if r.retried?
           io << "  " << r.error if r.error
+          # The transform declared for this payload did not run; the payload went out raw.
+          io << "  ⚠ " << r.chain_error if r.chain_error
         end
       end
 

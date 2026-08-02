@@ -190,10 +190,16 @@ module Gori
 
     # Replace a repeater session's outbound WebSocket messages.
     #
-    # `Env.mask_secrets` is byte-level (it scans `to_slice`, never `String#chars`), so the
-    # String round-trip through it is lossless for a payload that is not valid UTF-8 — which
-    # is the whole reason this can take raw bytes at all. `String#scrub` was the lossy step,
-    # and it lived in the callers, not here.
+    # The author's payload is persisted VERBATIM — a store row is a claim that those exact
+    # bytes are the author's, so a value that happens to match a session binding must NOT be
+    # masked to `$KEY` here. `Env.mask_secrets` is a draft-/display-time transform; running
+    # it on this WRITE path rewrote a live value the author typed (or, when seeded from a
+    # `--flow`, a capture's own bytes) into `$CTOK`, which every later send (the TUI evidence
+    # path, `gori run`, MCP) then put on the wire instead of what the author wrote. Binding
+    # substitution belongs at the SEND seam (`Repeater::Sender#expand_messages` /
+    # `RepeaterView#ws_out_messages`), which expands `$KEY` unless the frame is evidence.
+    # This mirrors `insert_repeater` (request bytes stored verbatim) and `insert_ws_one`
+    # (a captured frame stored verbatim).
     #
     # The V7 shape columns ride along, through the same `bind_ws_shape` the capture writer
     # uses. A session is the only place a `declared_len` can live at all — a length header
@@ -206,7 +212,7 @@ module Gori
           ts = now_us
           # See insert_ws_one: an empty payload binds SQL NULL and violates the NOT NULL
           # column (an empty repeater message text hits this), so store X'' for it.
-          slice = Env.mask_secrets(String.new(msg.payload)).to_slice
+          slice = msg.payload
           empty = slice.empty?
           args = [0_i64, id, ts, "out", msg.opcode] of DB::Any
           args << slice unless empty

@@ -11,6 +11,12 @@ module Gori::CLI::Run
   def self.cookie_input_for_spec(positional : Array(String)) : String
     cookie_input(positional)
   end
+
+  # `--timestamp` parsing seam. The option callback wraps this and turns the raised
+  # ArgumentError into an `abort` (which exits, so it can't run in-process).
+  def self.parse_forge_timestamp_for_spec(v : String) : Int64
+    parse_forge_timestamp(v)
+  end
 end
 
 describe "gori run cookie" do
@@ -18,6 +24,36 @@ describe "gori run cookie" do
     # A cookie pasted from a terminal or piped through a shell routinely arrives with
     # surrounding whitespace/newline.
     Gori::CLI::Run.cookie_input_for_spec(["  #{RACK}\n"]).should eq(RACK)
+  end
+
+  describe "--forge --timestamp" do
+    it "parses a valid unix second" do
+      Gori::CLI::Run.parse_forge_timestamp_for_spec("1750000000").should eq(1750000000_i64)
+    end
+
+    it "accepts 0 as the epoch" do
+      Gori::CLI::Run.parse_forge_timestamp_for_spec("0").should eq(0_i64)
+    end
+
+    it "refuses an unparseable value by name (not silently 'now')" do
+      # Without the fix `to_i64?` returned nil and the `|| now` fallback stamped the
+      # current time, reporting a forged cookie as success.
+      expect_raises(ArgumentError, /invalid --timestamp "notanumber"/) do
+        Gori::CLI::Run.parse_forge_timestamp_for_spec("notanumber")
+      end
+    end
+
+    it "refuses an out-of-Int64-range value by name" do
+      expect_raises(ArgumentError, /invalid --timestamp/) do
+        Gori::CLI::Run.parse_forge_timestamp_for_spec("1180591620717411303424")
+      end
+    end
+
+    it "refuses a negative value by name" do
+      expect_raises(ArgumentError, /invalid --timestamp "-5" \(must not be negative\)/) do
+        Gori::CLI::Run.parse_forge_timestamp_for_spec("-5")
+      end
+    end
   end
 
   it "the CLI and MCP share the decode_json shape (no divergence)" do

@@ -164,7 +164,8 @@ module Gori::Fuzz
         duration_us: raw.duration_us, error: raw.error, matched: matched,
         incomplete: raw.incomplete?, extracted: extracted,
         head: keep ? present(raw.head) : nil, body: keep ? raw.body : nil,
-        request: keep ? present(job.bytes) : nil, retried: raw.retried?)
+        request: keep ? present(job.bytes) : nil, retried: raw.retried?,
+        chain_error: job.chain_error)
     end
 
     private def decide(raw : Repeater::Result, status : Int32?, length : Int64,
