@@ -54,8 +54,7 @@ module Gori::Proxy
       # hostname override only changes where we dial (see connect_target).
       route = Settings.upstream_route(host)
       if route.direct?
-        sock = direct_dial(target, target_port, connect_timeout, io_timeout)
-        sock ? {sock, nil} : {nil, DialError::ORIGIN_UNREACHABLE}
+        direct_dial_result(target, target_port, connect_timeout, io_timeout)
       elsif route.socks5?
         dial_via_socks5(route, target, target_port, connect_timeout, io_timeout)
       else
@@ -227,9 +226,24 @@ module Gori::Proxy
       h.starts_with?('[') && h.ends_with?(']') ? h[1...-1] : h
     end
 
+    # The socket alone, for the callers that already have their own account of a failure
+    # (the upstream-proxy dials below: a proxy that does not resolve and a proxy that refuses
+    # the port are one problem — "the proxy is unreachable" — and they say so themselves).
     private def self.direct_dial(host : String, port : Int32,
                                  connect_timeout : Time::Span = Settings.connect_timeout,
                                  io_timeout : Time::Span = Settings.io_timeout) : TCPSocket?
+      direct_dial_result(host, port, connect_timeout, io_timeout)[0]
+    end
+
+    # Same dial, paired with WHY there is no socket. A name that does not resolve and a port
+    # that refuses are both "no socket", but not the same problem: the first is a name /
+    # resolver / scope mistake and nothing was dialed at all, the second is a service that is
+    # not there. `Socket::Addrinfo::Error` is raised before the connect is attempted, which is
+    # exactly that line, so it earns its own kind instead of being folded into a reachability
+    # sentence that lists three causes and commits to none.
+    private def self.direct_dial_result(host : String, port : Int32,
+                                        connect_timeout : Time::Span = Settings.connect_timeout,
+                                        io_timeout : Time::Span = Settings.io_timeout) : {TCPSocket?, DialError?}
       sock = TCPSocket.new(bare_host(host), port, connect_timeout: connect_timeout)
       begin
         sock.sync = true # flush writes immediately (P6)
@@ -243,11 +257,13 @@ module Gori::Proxy
         # A peer RST between connect and option-setup would otherwise leak the open fd
         # (the outer rescue returns nil without closing it) — close it first.
         sock.close rescue nil
-        return nil
+        return {nil, DialError::ORIGIN_UNREACHABLE}
       end
-      sock
+      {sock, nil}
+    rescue ex : Socket::Addrinfo::Error
+      {nil, DialError.new(DialErrorKind::Dns, cause: exception_cause(ex))}
     rescue
-      nil
+      {nil, DialError::ORIGIN_UNREACHABLE}
     end
 
     # Connect to the upstream HTTP proxy and CONNECT-tunnel to the origin. Used for
@@ -747,26 +763,40 @@ module Gori::Proxy
     end
 
     # Why an upstream dial failed. Every send path records this so a failed flow says WHAT
-    # broke instead of a blanket "connect failed": a Connect failure is a reachability problem,
-    # a Tls failure under verify-on is almost always an untrusted / self-signed / expired
-    # origin cert (the #323 shape) whose fix is --insecure-upstream (or SSL_CERT_FILE), and a
-    # Proxy failure is neither — the origin was never contacted at all, and the fix is a
-    # credential or a proxy ACL. A "connect failed" message actively hides all three.
+    # broke instead of a blanket "connect failed", and each member is a member because its FIX
+    # is different: Connect is a reachability problem, Dns is a name/resolver/scope one and
+    # nothing was dialed, TlsVerify is the #323 shape whose fix is --insecure-upstream (or
+    # SSL_CERT_FILE), Tls is "this port is not TLS" / a protocol-or-cipher refusal where a CA
+    # file is the WRONG advice, Timeout is a silent drop where neither TLS remedy can help, and
+    # Proxy is none of them — the origin was never contacted, and the fix is a credential or a
+    # proxy ACL. A "connect failed" message actively hides all six.
+    #
+    # A member is only ever reported when the dialer has EVIDENCE for it (see tls_dial_error):
+    # inferring one from the caller's verify flag is what made a black hole and a plaintext
+    # port both read as an untrusted certificate.
     enum DialErrorKind
-      Connect # TCP connect (to the origin, or to the upstream proxy itself) failed
-      Proxy   # the upstream proxy answered and REFUSED the tunnel (407/403/502, SOCKS5 REP≠0)
-      Tls     # origin reached, but the TLS handshake / certificate verification failed
+      Connect   # TCP connect (to the origin, or to the upstream proxy itself) failed
+      Proxy     # the upstream proxy answered and REFUSED the tunnel (407/403/502, SOCKS5 REP≠0)
+      Tls       # origin reached, the TLS handshake failed for a reason that is NOT verification
+      TlsVerify # origin reached, the handshake got to certificate verification and it rejected the chain
+      Timeout   # origin ACCEPTED the connection and then said nothing before the io timeout
+      Dns       # the name never resolved, so nothing was dialed at all
     end
 
     # The kind plus the sentence a surface should show. `detail` is nil only for the plain
     # Connect/Tls cases every caller already words for itself; when it is set it names the
     # thing that refused and what it said, which is the whole point of #F3 — a nil socket
     # cannot say "the proxy you configured wants credentials".
+    #
+    # `cause` is the opposite half: the underlying library's OWN words (OpenSSL's error
+    # string, the resolver's). Unlike `detail` it NEVER replaces the caller's sentence — it is
+    # appended as evidence, so "the port may not be TLS" can be checked instead of believed.
     struct DialError
       getter kind : DialErrorKind
       getter detail : String?
+      getter cause : String?
 
-      def initialize(@kind : DialErrorKind, @detail : String? = nil)
+      def initialize(@kind : DialErrorKind, @detail : String? = nil, @cause : String? = nil)
       end
 
       # A direct dial that did not connect. Deliberately carries NO detail: the caller already
@@ -775,8 +805,18 @@ module Gori::Proxy
       # the cases a caller CANNOT word for itself, which is every one involving a proxy.
       ORIGIN_UNREACHABLE = new(DialErrorKind::Connect)
 
+      # The TLS leg, whichever way it broke. Kept broad on purpose: a caller that only needs
+      # "was this the TLS handshake?" keeps working now that verification has its own kind.
       def tls? : Bool
-        @kind.tls?
+        @kind.tls? || @kind.tls_verify?
+      end
+
+      # `cause` parenthesised for interpolation at the end of a sentence that has already
+      # named the layer; empty when there is nothing to add, so a caller can splice it
+      # unconditionally.
+      def because : String
+        c = @cause
+        c && !c.empty? ? " (#{c})" : ""
       end
     end
 
@@ -816,7 +856,7 @@ module Gori::Proxy
         sync_close: true, hostname: sni || host)
       ssl.sync = true
       {ssl, nil}
-    rescue
+    rescue ex
       # A handshake failure inside Socket::Client.new (cert mismatch under verify,
       # expired/self-signed cert, plaintext-on-443, peer reset mid-handshake) does
       # NOT close the underlying socket — sync_close only transfers ownership once
@@ -824,7 +864,48 @@ module Gori::Proxy
       # per failed origin → fd exhaustion). `tcp` is non-nil here: `dial` never raises
       # (it returns nil), so the only raising step runs after the nil-guard above.
       tcp.try(&.close) rescue nil
-      {nil, DialError.new(DialErrorKind::Tls)}
+      {nil, tls_dial_error(ex, io_timeout)}
+    end
+
+    # What actually broke inside the TLS attempt. This used to be a bare `rescue` that threw
+    # the exception away and called every outcome `Tls`, which manufactured a verdict the code
+    # had not earned: a socket that accepts the TCP connection and then never speaks (a silent
+    # firewall drop, a wedged origin, an inline IPS) was reported as "origin certificate not
+    # trusted; retry with --insecure-upstream or set SSL_CERT_FILE" when no certificate had
+    # been exchanged at all — a wrong diagnosis with two useless remedies. OpenSSL already
+    # separates the cases; this only stops discarding the answer.
+    private def self.tls_dial_error(ex : Exception, io_timeout : Time::Span) : DialError
+      # A read timeout is not a TLS verdict — nothing came back to judge. Naming the layer
+      # TLS here is precisely what produced the certificate advice for a black hole, so it
+      # gets its own kind and carries how long gori actually waited (the stall was otherwise
+      # invisible: a failed dial records no duration).
+      if ex.is_a?(IO::TimeoutError)
+        return DialError.new(DialErrorKind::Timeout,
+          cause: "no TLS response within #{io_timeout.total_seconds.round(1)}s")
+      end
+      cause = exception_cause(ex)
+      # OpenSSL says "certificate verify failed" for an untrusted chain, an expired leaf AND a
+      # hostname mismatch — one kind, and the remedy (a CA file, or -k) is the same for all
+      # three. Everything else it raises is a protocol-level refusal, where offering a CA file
+      # is the wrong advice.
+      return DialError.new(DialErrorKind::TlsVerify, cause: cause) if cause.includes?("certificate verify failed")
+      DialError.new(DialErrorKind::Tls, cause: cause)
+    end
+
+    # Longest library verdict worth carrying into a stored flow error. OpenSSL's are ~60 bytes.
+    CAUSE_MAX = 200
+
+    # An exception's own words, never empty (a nil/blank message would render as a bare "()")
+    # and safe to store: Crystal decorates an IO failure with the object's inspect
+    # ("write (#<TCPSocket:0x104245c80>): Broken pipe"), which pins a heap address into a
+    # string the operator reads, the DB keeps and HAR/MCP export — and makes two identical
+    # failures compare unequal. Control bytes go the same way: a diagnostic is not traffic and
+    # must never carry a framing character into whatever renders it.
+    private def self.exception_cause(ex : Exception) : String
+      raw = ex.message.try(&.scrub) || ""
+      raw = raw.gsub(/\s*\(#<[^>]*>\)/, "").gsub(/[\x00-\x1f\x7f]+/, " ").strip
+      raw = raw[0, CAUSE_MAX] if raw.size > CAUSE_MAX
+      raw.empty? ? ex.class.name : raw
     end
 
     # A bare (unbracketed) IPv6 literal. The charset guard scrubs and rejects anything

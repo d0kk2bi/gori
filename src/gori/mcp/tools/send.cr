@@ -282,9 +282,11 @@ module Gori
       EXCHANGE_BUDGET_PHRASE = "budget for the whole exchange"
 
       # Coarse category for a send's network error, from the engine's error text
-      # (gori's own controlled strings). "connect" (the dialer collapses DNS /
-      # refused / connect-timeout / TLS-verify into one failure — finer split would
-      # need dialer changes), "timeout" (idle read/write), "protocol" (a deterministic
+      # (gori's own controlled strings). "connect" (the TCP layer: refused, unreachable,
+      # a connect timeout, or a name that did not resolve — the dialer now separates a
+      # certificate rejection, a refused handshake and an origin that accepts and then goes
+      # silent into their own sentences, which land on "other"/"timeout" as they should),
+      # "timeout" (idle read/write, and a TLS handshake that never got an answer), "protocol" (a deterministic
       # framing/protocol refusal — see PROTOCOL_ERROR_PHRASES), "no_response", else "other".
       #
       # A pure function of the engine's sentence, so it is `self.` and directly testable: the

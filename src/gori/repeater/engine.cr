@@ -270,35 +270,49 @@ module Gori
       #
       # With no detail the KIND still answers which layer broke, and that is the whole reason
       # `DialErrorKind` exists (`upstream.cr`: "a surface can say WHICH LAYER broke instead of
-      # a blanket 'connect failed'"). `dial_tls_result` returns `Tls` only after the TCP
+      # a blanket 'connect failed'"). `dial_tls_result` returns a TLS kind only after the TCP
       # connect SUCCEEDED and the handshake raised, and `Connect` whenever the socket itself
-      # never came up — so the three cases an operator has to tell apart (a firewall/DNS
-      # problem, an untrusted origin cert, and "this port is not TLS") are already separated
-      # by the time this runs. The proxy path has said all three since #323
+      # never came up — so the cases an operator has to tell apart (a firewall problem, a name
+      # that does not resolve, an untrusted origin cert, "this port is not TLS", and an origin
+      # that accepts the connection and then says nothing) are already separated by the time
+      # this runs. The proxy path has said so since #323
       # (`client_conn.cr#upstream_error_message`); every DIRECT sender — repeater, fuzz, mine,
       # sequence, discover, probe active, and `ConnPool` — collapsed them into one sentence
       # that named the first, which sent operators to debug DNS for a self-signed cert.
       #
-      # `scheme` is no longer consulted: only an https dial can produce a `Tls` kind, and a
-      # Connect kind means the TCP layer, whatever the scheme. It stays in the signature
-      # because every send path passes it positionally and it is what the sentence would be
-      # keyed on if a third transport ever appears.
+      # `verify` is no longer consulted either: the dialer reports `TlsVerify` only when
+      # certificate verification is what rejected the origin, so the remedy is offered to the
+      # people it can actually help. Guessing it from the flag is what made a black hole and a
+      # plaintext port both read as an untrusted certificate under verify-on. It stays in the
+      # signature because every send path passes it positionally.
+      #
+      # `scheme` is not consulted: only an https dial can produce a TLS kind, and a Connect
+      # kind means the TCP layer, whatever the scheme. Same reason for keeping it.
       def self.connect_error(scheme : String, host : String, port : Int32, verify : Bool,
                              err : Proxy::Upstream::DialError? = nil) : String
         if detail = err.try(&.detail)
           return "connect failed: #{detail}"
         end
-        if err.try(&.tls?)
-          if verify
+        if err
+          case err.kind
+          when .tls_verify?
             return "TLS verification failed: #{host}:#{port} — the origin's certificate is not " \
                    "trusted (self-signed/expired/wrong name); retry with -k/--insecure-upstream " \
-                   "or set SSL_CERT_FILE"
+                   "or set SSL_CERT_FILE#{err.because}"
+          when .tls?
+            return "TLS handshake failed: #{host}:#{port} — the port may not be TLS, or the origin " \
+                   "refused the protocol/cipher#{err.because}"
+          when .timeout?
+            return "TLS handshake timed out: #{host}:#{port} — the origin accepted the connection " \
+                   "and then sent nothing; no certificate was exchanged, so -k and SSL_CERT_FILE " \
+                   "cannot help#{err.because}"
+          when .dns?
+            return "connect failed: #{host} — the name did not resolve, so nothing was dialed#{err.because}"
           end
-          return "TLS handshake failed: #{host}:#{port} — the port may not be TLS, or the origin " \
-                 "refused the protocol/cipher"
         end
         # Reached only when the TCP layer is what failed, so the TLS clause that used to ride
-        # along here (and made this a catch-all) is gone.
+        # along here (and made this a catch-all) is gone. "DNS" stays in the list because a
+        # dial through an upstream proxy resolves at the PROXY, where gori cannot see it.
         "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout)"
       end
 
