@@ -722,9 +722,21 @@ module Gori::Decoder
     # Domain-aware, because that is the only form an operator ever holds: each dot-separated
     # label carrying non-ASCII becomes "xn--" + its bootstring encoding, and a pure-ASCII
     # label passes through untouched (so a plain hostname is its own encoding).
+    #
+    # A non-ASCII label is first run through the RFC 3490 ToASCII step-2 map — case-fold +
+    # NFC — BEFORE the RFC 3492 bootstring, so the result is the ACE label a resolver actually
+    # produces (MÜNCHEN -> xn--mnchen-3ya, not the raw-bootstring xn--MNCHEN-psa; the Cyrillic
+    # МОСКВА even differs in the bootstring DIGITS, not just case, because its lowercase code
+    # points are distinct characters). Without this map the advertised homoglyph -> punycode
+    # homograph workflow would emit hostnames that resolve to nothing. A pure-ASCII label is
+    # already its own ACE form and passes through with its case intact, matching Python's idna
+    # ToASCII, which nameprep-maps only labels that carry non-ASCII.
     def punycode_encode(s : String) : String
       raise DecoderError.new("input too large for punycode (max #{PUNY_MAX_IN} chars)") if s.size > PUNY_MAX_IN
-      s.split('.').map { |label| label.ascii_only? ? label : "xn--" + puny_encode_label(label) }.join('.')
+      s.split('.').map do |label|
+        next label if label.ascii_only?
+        "xn--" + puny_encode_label(label.downcase.unicode_normalize(:nfc))
+      end.join('.')
     end
 
     def punycode_decode(s : String) : String
