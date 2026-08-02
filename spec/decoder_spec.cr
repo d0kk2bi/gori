@@ -480,6 +480,123 @@ describe Gori::Decoder do
       end
     end
 
+    # ── ordering independence ─────────────────────────────────────────────────────
+    #
+    # `register_all` used to flatten and register in ONE loop, so `flatten`'s `r[tok]?` probe
+    # read a registry the loop was mutating: by entry i, entries 0..i-1 answered it and every
+    # BACKWARD reference stayed a run-time nested call instead of being spliced. Only forward
+    # references were spliced, so only forward references were counted against MAX_TOKENS —
+    # and the ordinary authoring order (save the helper, THEN save the chain that calls it) is
+    # entirely backward references, which left the guard dead on the path it exists for.
+    #
+    # Every example below states the same library TWICE, helper-first and helper-last, because
+    # the defect was invisible in one ordering and only in one.
+    it "refuses an over-MAX_TOKENS library in EITHER definition order" do
+      # Depth 9 of `x(n) = x(n-1) > x(n-1)` is 512 flattened steps — past MAX_TOKENS (256).
+      # Written helper-LAST this was already refused; written helper-FIRST it registered fine
+      # and one `run` burned 2^9 applications, growing to 73 seconds of CPU at depth 25.
+      deep = [{"z0", "upper"}]
+      (1..9).each { |i| deep << {"z#{i}", "z#{i - 1} > z#{i - 1}"} }
+
+      with_library(deep) do |reg| # helper FIRST (what ^S produces)
+        res = Gori::Decoder.run(reg, "hi".to_slice, "z9")
+        res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+        res.steps[0].error.not_nil!.should contain "expands past 256 steps"
+      end
+      with_library(deep.reverse) do |reg| # helper LAST
+        res = Gori::Decoder.run(reg, "hi".to_slice, "z9")
+        res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+        res.steps[0].error.not_nil!.should contain "expands past 256 steps"
+      end
+    end
+
+    it "keeps an UNDER-MAX_TOKENS library usable in either order (the complement)" do
+      # The same shape one level shallower — 256 steps, at the ceiling and not past it. If the
+      # fix refused this it would have turned a working library into a broken one.
+      ok = [{"z0", "upper"}]
+      (1..8).each { |i| ok << {"z#{i}", "z#{i - 1} > z#{i - 1}"} }
+      [ok, ok.reverse].each do |entries|
+        with_library(entries) do |reg|
+          String.new(Gori::Decoder.run(reg, "hi".to_slice, "z8").output.not_nil!).should eq "HI"
+        end
+      end
+    end
+
+    it "reports the SAME failing built-in at the same depth in either order" do
+      # The ordering also decided the error TEXT from a two-entry library: helper-first left
+      # `inner` as a run-time call and reported "outer: step 1 'inner': inner: step 1
+      # 'base64-decode': …", helper-last spliced it and reported "outer: step 1
+      # 'base64-decode': …". One library, one meaning.
+      pair = [{"inner", "base64-decode"}, {"outer", "inner > upper"}]
+      msgs = [pair, pair.reverse].map do |entries|
+        with_library(entries) do |reg|
+          Gori::Decoder.run(reg, "!!!!".to_slice, "outer").steps[0].error.not_nil!
+        end
+      end
+      msgs[0].should eq msgs[1]
+      msgs[0].should contain "base64-decode"
+    end
+
+    it "detects a cycle in either order, and does not memoize a false one" do
+      cyc = [{"cyc-a", "cyc-b"}, {"cyc-b", "cyc-a"}]
+      [cyc, cyc.reverse].each do |entries|
+        with_library(entries) do |reg|
+          ["cyc-a", "cyc-b"].each do |name|
+            res = Gori::Decoder.run(reg, "x".to_slice, name)
+            res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+            res.steps[0].error.not_nil!.should contain "recursive"
+          end
+        end
+      end
+      # Self-reference, both orders (there is only one entry, but the DIAMOND below is the
+      # case a naive "don't memoize failures" fix regresses).
+      with_library([{"selfref", "selfref > upper"}]) do |reg|
+        Gori::Decoder.run(reg, "x".to_slice, "selfref").steps[0].error.not_nil!
+          .should contain "recursive"
+      end
+      # A DIAMOND is not a cycle: `top` reaches `leaf` by two routes. Flattening must succeed
+      # in either order — the memo has to be reused, not mistaken for a stack hit.
+      dia = [{"leaf", "upper"}, {"l", "leaf"}, {"r", "leaf"}, {"top", "l > r"}]
+      [dia, dia.reverse].each do |entries|
+        with_library(entries) do |reg|
+          String.new(Gori::Decoder.run(reg, "hi".to_slice, "top").output.not_nil!).should eq "HI"
+        end
+      end
+    end
+
+    it "leaves a dangling reference dangling in either order" do
+      dang = [{"outer", "nosuch > upper"}]
+      [dang, dang.reverse].each do |entries|
+        with_library(entries) do |reg|
+          res = Gori::Decoder.run(reg, "x".to_slice, "outer")
+          res.steps[0].state.should eq Gori::Decoder::StepState::Failed
+          res.steps[0].error.not_nil!.should contain "nosuch"
+        end
+      end
+    end
+
+    it "still lets a built-in win over a saved name that shadows it, in either order" do
+      # The two-pass split changes WHAT `r` holds while flattening, so the "a built-in wins"
+      # filter is worth re-stating on both sides of it.
+      shadow = [{"hexer", "hex-encode"}, {"hex", "upper"}]
+      [shadow, shadow.reverse].each do |entries|
+        with_library(entries) do |reg|
+          String.new(Gori::Decoder.run(reg, "a".to_slice, "hex").output.not_nil!).should eq "61"
+          String.new(Gori::Decoder.run(reg, "a".to_slice, "hexer").output.not_nil!).should eq "61"
+        end
+      end
+    end
+
+    # ── the flag a caller reads instead of running the converter ──────────────────
+    it "marks an unusable saved chain `unusable` and a working one nil" do
+      with_library([{"good", "upper"}, {"selfref", "selfref > upper"}]) do |reg|
+        reg["good"].unusable.should be_nil
+        reg["selfref"].unusable.not_nil!.should contain "recursive"
+        # A built-in is never unusable.
+        reg["upper"].unusable.should be_nil
+      end
+    end
+
     it "publishes through the Settings setter, so every surface sees the same library" do
       before = Gori::Settings.decoder_chains
       begin

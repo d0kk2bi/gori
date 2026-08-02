@@ -33,11 +33,30 @@ module Gori::Decoder
 
       flat = {} of String => Array(String)?
       why = {} of String => String
+      # TWO passes, and the split is the whole point. `flatten` asks `r[tok]?` to decide
+      # "built-in, leave it alone" from "saved name, splice it" — so flattening and registering
+      # in ONE loop mutated the registry it was probing: by the time entry i was flattened,
+      # entries 0..i-1 answered `r[tok]?` and every BACKWARD reference stayed a run-time nested
+      # `Decoder.run` instead of being spliced. Only forward references were spliced, so only
+      # forward references were counted against MAX_TOKENS — and the ordinary authoring order
+      # (save the helper, THEN save the chain that calls it) is entirely backward references,
+      # which left the guard dead on the path it exists for. Measured: a 25-deep library written
+      # helper-last is refused at MAX_TOKENS; the same library written helper-first ran 73
+      # seconds of CPU for one `run decoder`, and 2.8 s for three fuzz requests at depth 18.
+      # It also made one library mean two different things — the two orderings reported
+      # different failing tokens at different prefix depths for the same broken entry.
+      #
+      # With `r` held pristine (built-ins only) for the whole flatten phase, both orderings
+      # produce the same `flat`/`why`, so the library's meaning no longer depends on the order
+      # its entries happen to sit in settings.json.
+      order.each { |nk| flatten(nk, specs, r, flat, why, [] of String) }
       order.each do |nk|
         name, spec = specs[nk]
-        tokens = flatten(nk, specs, r, flat, why, [] of String)
         begin
-          r.register build(name, spec, tokens, why[nk]?, r)
+          # `flat` is total over `order` after the first pass: `flatten` writes `flat[nk]` on
+          # every path that reaches its tail, and the one path that returns WITHOUT memoizing
+          # (the `stack.includes?` cycle frame) cannot fire at depth 0, where the stack is empty.
+          r.register build(name, spec, flat[nk]?, why[nk]?, r)
         rescue
           # Registry#register raises on a duplicate key, and the two filters above already
           # exclude every way one can arise. This bounds the blast radius if that ever drifts:
@@ -54,6 +73,10 @@ module Gori::Decoder
     #
     # A token that is neither a built-in nor a saved name is left ALONE: `run` then reports it
     # as an unknown converter, which is the same answer typing it directly would give.
+    #
+    # `r` MUST be the pristine built-in registry here — see `register_all`'s two passes. If a
+    # saved entry has already been registered into it, `r[tok]?` answers true for that name and
+    # the reference below is left as a run-time call rather than spliced.
     private def self.flatten(nk : String, specs, r : Registry,
                              flat : Hash(String, Array(String)?), why : Hash(String, String),
                              stack : Array(String)) : Array(String)?
@@ -68,6 +91,9 @@ module Gori::Decoder
       failed = false
       Decoder.parse_spec(specs[nk][1]).each do |tok|
         tk = Registry.normalize(tok)
+        # A built-in wins (register_all never lets a saved name shadow one), and an unknown
+        # token stays as typed. Everything else is a saved name and gets spliced — in EITHER
+        # direction, because `r` holds no saved entry at this point.
         if r[tok]? || !specs.has_key?(tk)
           out << tok
         else
@@ -94,20 +120,25 @@ module Gori::Decoder
 
     private def self.build(name : String, spec : String, tokens : Array(String)?,
                            reason : String?, r : Registry) : Converter
+      msg = tokens.nil? ? "#{name}: #{reason || "unusable saved chain"}" : nil
       fn =
-        if tokens.nil?
-          msg = "#{name}: #{reason || "unusable saved chain"}"
+        if m = msg
           # The `: Bytes` return annotation is what lets an unconditionally-raising body sit in
           # a Proc(Bytes, Bytes) without a dead trailing expression to type it.
-          ->(_input : Bytes) : Bytes { raise DecoderError.new(msg) }
+          ->(_input : Bytes) : Bytes { raise DecoderError.new(m) }
         else
-          flat = tokens.join(" > ")
+          flat = tokens.not_nil!.join(" > ")
           ->(input : Bytes) { apply(name, r, flat, input) }
         end
       # `Array(String).new` and not `[] of String`: a positional `[] of T` followed by more
       # positional args makes the parser read the rest as a PROC TYPE ("expecting '->'").
+      #
+      # `unusable: msg` carries the SAME sentence the proc raises, askable without calling it —
+      # this entry is registered only so its name resolves and the reason is visible, and a
+      # caller that has to refuse a plan before the first dial has to be able to see that
+      # without running the converter over the operator's payload.
       Converter.new(name, Array(String).new, Category::Saved, Direction::Transform,
-        "saved chain: #{spec.strip.empty? ? "(empty)" : spec.strip}", fn)
+        "saved chain: #{spec.strip.empty? ? "(empty)" : spec.strip}", fn, unusable: msg)
     end
 
     # Run the flattened spec as this one step. A failure INSIDE the recipe is re-raised with
