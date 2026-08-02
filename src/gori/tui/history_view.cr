@@ -1525,9 +1525,10 @@ module Gori::Tui
         end
         screen.text(time_x, y, fmt_time(row.created_at), Theme.muted, bg)
         screen.text(method_x, y, row.method, Theme.method_color(row.method), bg)
-        # PROTO: surface WS/GRPC/SSE (accented so they pop out of the HTTP stream);
-        # plain HTTP flows keep showing the scheme (HTTP/HTTPS) — the plaintext-vs-TLS
-        # signal — since there is nothing else worth flagging on them.
+        # PROTO: surface WS/GRPC/SSE (accented so they pop out of the HTTP stream), each
+        # carrying the plaintext-vs-TLS signal the HTTP/HTTPS pair has always carried —
+        # `Proto::Kind#label` owns that spelling, because a bare WS tag REPLACED the scheme
+        # and made a `ws://` row and a `wss://` row byte-identical here.
         kind = Proto.classify(row.status, row.content_type)
         # A short-circuited flow says so IN the PROTO column, replacing HTTP/HTTPS (#511).
         # That column already answers "what kind of exchange was this", and for a stub the
@@ -1538,7 +1539,7 @@ module Gori::Tui
         # scheme is still on the row's URL and in the detail pane. Yellow, like #507's
         # `bypass:N` chip — "you are not seeing what you think", not a blocked/failed state.
         stub = row.short_circuited?
-        proto_label = stub ? "STUB" : (kind.http? ? row.scheme.upcase : kind.label)
+        proto_label = stub ? "STUB" : kind.label(row.scheme)
         proto_color = stub ? Theme.yellow : (kind.http? ? Theme.muted : Theme.accent)
         screen.text(proto_x, y, proto_label, proto_color, bg)
         screen.text(host_x, y, row.host, fg, bg, width: host_w) if host_w > 0

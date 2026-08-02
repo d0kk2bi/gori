@@ -45,6 +45,32 @@ module Gori::Proxy::WS
   # it applies to: when an intercept hold actually PARKS the message, where a control frame
   # cannot wait for a human (see `MessageGate`'s header).
   module Relay
+    # How one direction's pump stopped reading. `pump`/`AssemblingPump#run` used to answer
+    # this as a Bool ("did it relay a CLOSE frame?"), which collapsed the two ways a socket
+    # can end WITHOUT one — and gori knows which it was, because they arrive differently:
+    # a FIN is a clean end of stream (`read_fully?` → nil) and a reset RAISES on gori's own
+    # read. Neither reached the operator, so a `101 / complete / empty transcript` flow could
+    # not answer "did the peer hang up normally, or did something kill this socket" — which
+    # is the question that flow is opened to ask. It is also what `Relay.run` needs to know
+    # whether a gate's DESTINATION is still worth claiming a delivery to (see `MessageGate`).
+    enum Ending
+      # This direction relayed a CLOSE frame — the clean half of the RFC 6455 §7.1.1
+      # closing handshake. The peer is closing on purpose and is still reading.
+      Close
+      # End of stream with no CLOSE frame: the peer's FIN, or a frame truncated by it.
+      Eof
+      # The read raised: a transport reset, a broken pipe, an unreadable socket.
+      Reset
+    end
+
+    # One direction's outcome, tagged with WHICH direction it was — `run` needs the pairing
+    # to decide which gate's destination socket the ending is about.
+    record DirectionEnd, direction : String, ending : Ending do
+      def clean? : Bool
+        ending.close?
+      end
+    end
+
     # Cap on a reassembled (possibly fragmented) message we buffer for capture.
     # The raw forward is always byte-exact (P7); only the captured projection is
     # bounded, so a giant streamed message can't exhaust memory.
@@ -152,11 +178,11 @@ module Gori::Proxy::WS
       out_pump = assembling_pump(client, upstream, "out", flow_id, sink, out_rw, ctx, out_gate, mask: true)
       in_pump = assembling_pump(upstream, client, "in", flow_id, sink, in_rw, ctx, in_gate, mask: false)
 
-      done = Channel(Bool).new(2) # each pump's payload: did it end by relaying a CLOSE frame?
+      done = Channel(DirectionEnd).new(2) # each pump's payload: HOW that direction ended
       # client→server: RFC 6455 §5.3 requires every such frame to be masked, so a re-emitted
       # one carries a fresh key of gori's.
-      spawn { done.send(run_direction(client, upstream, "out", flow_id, sink, out_pump, out_gate)) }
-      spawn { done.send(run_direction(upstream, client, "in", flow_id, sink, in_pump, in_gate)) }
+      spawn { done.send(DirectionEnd.new("out", run_direction(client, upstream, "out", flow_id, sink, out_pump, out_gate))) }
+      spawn { done.send(DirectionEnd.new("in", run_direction(upstream, client, "in", flow_id, sink, in_pump, in_gate))) }
 
       # The first direction to end tells us how to tear down:
       #   - abnormal end (EOF / reset / truncated frame): the peer is gone — close both
@@ -169,12 +195,17 @@ module Gori::Proxy::WS
       #     used to drop it (the local "forward, then break" is near-instant; the peer's
       #     reply needs a real round trip). Give the other pump a bounded window
       #     (CLOSE_TIMEOUT) to relay that reply before tearing down.
-      first_clean = done.receive
+      first = done.receive
+      # Only the endings observed BEFORE the two `close` calls below are the PEERS'. The one
+      # reaped afterwards is gori's own teardown unblocking a parked read, and attributing
+      # that to a peer would be the diagnostic inventing traffic facts.
+      observed = [first]
       second_pending = true
-      if first_clean
+      if first.clean?
         select
-        when done.receive
+        when second = done.receive
           second_pending = false # other side finished within the window (reply relayed, or its own end)
+          observed << second
         when timeout(CLOSE_TIMEOUT)
           # peer never replied — give up waiting; the pump below is reaped after closing.
           warn_close_deadline(out_gate, in_gate)
@@ -184,14 +215,18 @@ module Gori::Proxy::WS
       # pump's `ensure`, which is only reached because the two lines below unblocked its
       # read — so a message released there is written to a socket that is already gone. This
       # is the one moment at which a held message can still reach its peer.
-      out_gate.try(&.settle("the socket is closing"))
-      in_gate.try(&.settle("the socket is closing"))
+      #
+      # ... and `destination_dead` is the moment at which it CANNOT, which is a different
+      # thing from failing to write. See the parameter's own doc on `MessageGate#settle`.
+      out_gate.try(&.settle("the socket is closing", destination_dead: destination_dead?(observed, "out")))
+      in_gate.try(&.settle("the socket is closing", destination_dead: destination_dead?(observed, "in")))
       # ... and the same moment, for the same reason, is the last one at which a HALF-assembled
       # message and the control frames parked between its fragments can still reach the peer.
       # The gates above resolve what a HUMAN still owns; this resolves what the pump itself is
       # withholding, and it goes second because those bytes arrived after everything queued.
       out_pump.try(&.flush_at_teardown)
       in_pump.try(&.flush_at_teardown)
+      record_teardown(sink, flow_id, observed)
       client.close rescue nil
       upstream.close rescue nil
       # Every path above consumes exactly one of the two `done` sends before this point
@@ -211,6 +246,58 @@ module Gori::Proxy::WS
       sink.on_ws_message(flow_id, NOTICE_DIRECTION, OP_TEXT.to_i, "#{NOTICE_PREFIX}#{n}".to_slice)
     rescue
       nil
+    end
+
+    # Is the socket a gate WRITES to already past the point where a delivery can be claimed?
+    #
+    # A gate's destination is the OTHER direction's source: `out`'s destination is the
+    # upstream leg, which the `in` pump reads, and `in`'s is the client, which `out` reads.
+    # So a direction's destination is known unreachable exactly when the OPPOSITE direction
+    # ended without a CLOSE frame — a peer that sent one is closing on purpose and is still
+    # reading, which is why the CLOSE path (`Relay::CLOSE_TIMEOUT`'s decision window) keeps
+    # forwarding and keeps writing its `ws_messages` row.
+    private def self.destination_dead?(observed : Array(DirectionEnd), direction : String) : Bool
+      other = direction == "out" ? "in" : "out"
+      observed.any? { |e| e.direction == other && !e.clean? }
+    end
+
+    # A peer that RESET the socket, said on the flow's own `ws_messages` stream — the seam
+    # `AssemblingPump#warn_teardown_loss` and the `Sec-WebSocket-Extensions` advisory already
+    # use, so it travels to History's WS pane, `gori run show`, MCP `get_flow` and an export
+    # rather than to a `gori.log` only an operator who knew to tail it ever reads.
+    #
+    # gori HAS the FIN-vs-RST bit and was throwing it away: a peer's reset RAISES on gori's
+    # own read while a FIN is a clean end of stream, and neither reached the flow. An operator
+    # looking at a `101 / complete / empty transcript` flow is asking exactly whether the peer
+    # hung up normally or something killed the socket, and nothing on disk could answer.
+    #
+    # Only the RESET earns a row, and the sentence says so, so its ABSENCE is readable rather
+    # than ambiguous. A WebSocket that ends on a FIN with no CLOSE frame is the ordinary way
+    # one dies in the field — a closed tab, a dropped network, a restarted origin — and
+    # annotating those would put a `[gori]` row on a large fraction of every capture to say
+    # "nothing unusual happened", which is exactly how the anomalous row stops being noticed.
+    # Only endings observed BEFORE `run` closes the sockets are considered, so gori's own
+    # teardown is never reported as a peer's. Best-effort, and on `NOTICE_DIRECTION` for the
+    # reason stated there.
+    private def self.record_teardown(sink : FlowSink, flow_id : Int64,
+                                     observed : Array(DirectionEnd)) : Nil
+      reset = observed.find(&.ending.reset?) || return
+      note = teardown_sentence(reset)
+      ::Log.info { "ws #{reset.direction}: #{note}" }
+      sink.on_ws_message(flow_id, NOTICE_DIRECTION, OP_TEXT.to_i,
+        "#{NOTICE_PREFIX}#{note}".to_slice)
+    rescue
+      nil
+    end
+
+    # The SENTENCE has to name the side, because the row is written on `NOTICE_DIRECTION`.
+    # `out` reads the client and `in` reads the server, so the peer named here is the one
+    # whose bytes stopped arriving.
+    private def self.teardown_sentence(e : DirectionEnd) : String
+      peer = e.direction == "out" ? "the client" : "the server"
+      "#{peer} ended this WebSocket with a transport-level RESET and no CLOSE frame — " \
+      "something killed the socket rather than closing it (RFC 6455 §7.1.1). A peer that " \
+      "closes normally, with or without the closing handshake, leaves no row here"
     end
 
     # CLOSE_TIMEOUT just expired with a message still held. Nothing else tells the operator
@@ -258,7 +345,7 @@ module Gori::Proxy::WS
     # One direction's loop, on whichever pump `assembling_pump` chose.
     private def self.run_direction(src : IO, dst : IO, direction : String, flow_id : Int64,
                                    sink : FlowSink, assembling : AssemblingPump?,
-                                   gate : MessageGate?) : Bool
+                                   gate : MessageGate?) : Ending
       return pump(src, dst, direction, flow_id, sink) unless assembling
       begin
         assembling.run
@@ -280,16 +367,16 @@ module Gori::Proxy::WS
     # through (byte-exact, P7) rather than aborting the whole tunnel; its payload is
     # too large to buffer, so capture records a marker for that frame instead.
     #
-    # Returns whether this direction ended by successfully relaying a CLOSE frame (the
-    # "clean" end of the RFC 6455 closing handshake) — as opposed to an abnormal end (EOF,
-    # reset, or a truncated frame, all `false`) — so `run` can tell the two cases apart and
-    # give the peer's replying CLOSE a bounded window instead of tearing the tunnel down
-    # the instant either direction stops.
-    private def self.pump(src : IO, dst : IO, direction : String, flow_id : Int64, sink : FlowSink) : Bool
+    # Returns HOW this direction ended (see `Ending`): a relayed CLOSE frame is the "clean"
+    # end of the RFC 6455 closing handshake, and `run` gives the peer's replying CLOSE a
+    # bounded window on it instead of tearing the tunnel down the instant either direction
+    # stops. The two abnormal ends are kept apart rather than collapsed, because gori reads
+    # them differently and the operator needs the difference.
+    private def self.pump(src : IO, dst : IO, direction : String, flow_id : Int64, sink : FlowSink) : Ending
       assembling = IO::Memory.new
       message_opcode = OP_TEXT
       scratch = Bytes.new(STREAM_CHUNK)
-      clean_close = false
+      ending = Ending::Eof
       shape = MessageShape.new
       controls = 0
       loop do
@@ -313,7 +400,7 @@ module Gori::Proxy::WS
           assembling = emit_pending(assembling, direction, flow_id, sink, message_opcode, shape) if h.data?
           break unless forward_oversized_frame(src, dst, h, direction, flow_id, sink, message_opcode, scratch)
           if h.close? # an oversized CLOSE still terminates the tunnel, like a normal one
-            clean_close = true
+            ending = Ending::Close
             break
           end
           next
@@ -326,13 +413,13 @@ module Gori::Proxy::WS
         shape.note(frame) if frame.data?
         assembling = capture_frame(frame, assembling, direction, flow_id, sink, message_opcode, shape)
         if frame.close?
-          clean_close = true
+          ending = Ending::Close
           break
         end
       end
-      clean_close
+      ending
     rescue
-      false # peer closed / reset: this direction ends
+      Ending::Reset # the read RAISED: a transport reset, not the peer's FIN
     ensure
       # An unterminated fragment when the direction ends. gori already put those bytes on the
       # wire frame by frame, so dropping them here made History disagree with what gori itself
@@ -457,15 +544,15 @@ module Gori::Proxy::WS
         @scratch = Bytes.new(STREAM_CHUNK)
       end
 
-      # Same contract as `Relay.pump`: true iff this direction ended by relaying a CLOSE.
-      def run : Bool
-        clean_close = false
+      # Same contract as `Relay.pump`: HOW this direction ended (see `Ending`).
+      def run : Ending
+        ending = Ending::Eof
         loop do
           h = WS.read_header(@src) || break
           unless h.data?
             break unless forward_control(h)
             if h.close?
-              clean_close = true
+              ending = Ending::Close
               break
             end
             next
@@ -478,9 +565,9 @@ module Gori::Proxy::WS
           frame = WS.read_body(@src, h) || break
           handle_data(frame)
         end
-        clean_close
+        ending
       rescue
-        false # peer closed / reset: this direction ends
+        Ending::Reset # the read RAISED: a transport reset, not the peer's FIN
       ensure
         # The abnormal exits (EOF, a truncated frame, a reset) are withholding the same bytes
         # a CLOSE would have been, and the byte-exact pump would already have forwarded them —

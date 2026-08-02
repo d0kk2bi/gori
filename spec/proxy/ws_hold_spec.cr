@@ -92,6 +92,18 @@ private def masked(opcode : UInt8, payload : Bytes, fin : Bool = true) : Bytes
 end
 
 # Read one whole frame off `io` as {opcode, payload}.
+# A gate's own `[gori] …` rows, and everything that is not one. Both accountings the gate
+# keeps — a held message forwarded involuntarily, dropped, stranded, or written to a peer that
+# had already gone — now reach the flow's `ws_messages` stream rather than only `gori.log`,
+# which under `gori tui` reaches neither the notification centre nor stderr.
+private def notice_rows(sink) : Array({String, Int32, String})
+  sink.messages.select { |(_, _, text)| text.starts_with?("[gori] ") }
+end
+
+private def data_rows(sink) : Array({String, Int32, String})
+  sink.messages.reject { |(_, _, text)| text.starts_with?("[gori] ") }
+end
+
 private def read_message(io : IO) : {UInt8, String}
   h = WS.read_header(io).not_nil!
   f = WS.read_body(io, h).not_nil!
@@ -482,7 +494,14 @@ describe Gori::Proxy::WS::MessageGate do
       r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
       got = r.ts_r.gets_to_end.to_slice
       got.should eq(masked(WS::OP_TEXT, "HELD".to_slice) + tail + ping)
-      sink.messages.should eq([{"out", 9, "zz"}, {"out", 1, "HELD"}, {"out", 1, "TAIL"}])
+      data_rows(sink).should eq([{"out", 9, "zz"}, {"out", 1, "HELD"}, {"out", 1, "TAIL"}])
+      # The upstream leg is still live here (only the CLIENT went), so the release is a real
+      # delivery and the row is a true claim — but the operator's decision window closed
+      # involuntarily, and that is now said where they will meet it.
+      notice_rows(sink).map(&.[](2)).should eq(
+        ["[gori] client→server: the socket is closing — forwarding 1 held message(s) " \
+         "unedited, in arrival order. WebSocket has no application-level flow control, so " \
+         "nothing throttles the sender while a hold is out"])
     end
     r.shutdown
   end
@@ -613,12 +632,16 @@ describe Gori::Proxy::WS::MessageGate do
 
       r.ts_r.as(IO::FileDescriptor).read_timeout = 3.seconds
       r.ts_r.gets_to_end.to_slice.should eq(masked(WS::OP_TEXT, "HELD".to_slice) + lead + ping)
-      sink.messages.should eq([{"out", 9, "zz"}, {"out", 1, "HELD"}])
+      data_rows(sink).should eq([{"out", 9, "zz"}, {"out", 1, "HELD"}])
+      notice_rows(sink).map(&.[](2)).should eq(
+        ["[gori] client→server: the socket is closing — forwarding 1 held message(s) " \
+         "unedited, in arrival order. WebSocket has no application-level flow control, so " \
+         "nothing throttles the sender while a hold is out"])
     end
     r.shutdown
   end
 
-  it "forwards a still-held message at teardown instead of destroying it" do
+  it "forwards a still-held message at teardown without CLAIMING the dead peer received it" do
     # The socket ends while the operator still owns the message. `MessageGate#close` runs
     # from the pump's `ensure`, which is only reached AFTER `Relay.run` has closed both
     # sockets to unblock the pump's read — so releasing there writes to a dead socket. It
@@ -627,6 +650,14 @@ describe Gori::Proxy::WS::MessageGate do
     # `ws_messages` row, under a log line calling them "released". `Relay.run` settles both
     # gates while the sockets are still open; fail-open is the disposition every other
     # involuntary release in this class already takes.
+    #
+    # And the DESTINATION here is already gone: the `in` pump EOF'd, which is the upstream
+    # leg this gate writes to. `write_message` decided "did the peer see it?" by whether the
+    # write RAISED, and a write to a socket whose peer has sent FIN succeeds into the kernel
+    # buffer — so this used to record a `ws_messages` row byte-identical to the one a message
+    # that really arrived gets, while `@lost` stayed 0 and the teardown accounting had nothing
+    # to say. The bytes are still written (a genuine half-close delivers them, and gori cannot
+    # tell that from a full close); the CLAIM is what is withdrawn.
     r = rig
     sink = HoldSink.new
     with_interceptor("proto:ws") do |ic|
@@ -638,7 +669,64 @@ describe Gori::Proxy::WS::MessageGate do
       r.ss_w.close # the origin goes away with the decision still outstanding
       read_message(r.ts_r).should eq({WS::OP_TEXT, "CLIENT-HELD"})
       wait_until("the queue row to be given back") { ic.pending_count == 0 }
-      sink.messages.should eq([{"out", 1, "CLIENT-HELD"}])
+      # Was: `[{"out", 1, "CLIENT-HELD"}]` — indistinguishable, in `run show` and in the
+      # table, from the delivered case asserted by the complement below.
+      data_rows(sink).should eq([] of {String, Int32, String})
+      wait_until("the teardown accounting") { notice_rows(sink).size == 2 }
+      texts = notice_rows(sink).map(&.[](2))
+      texts[0].should contain("the peer had already ended this direction without a CLOSE frame")
+      texts[0].should contain("no ws_messages row is recorded for them")
+      texts[1].should contain("1 written after the peer had already ended this direction")
+      # A diagnostic is not traffic: never on the direction a WebSocket repeater seeds from.
+      notice_rows(sink).map(&.[](0)).uniq.should eq(["in"])
+    end
+    r.shutdown
+  end
+
+  # The complement that decides whether the row above means anything: the SAME hold, the same
+  # involuntary teardown release, on a socket whose destination is still alive. Here the write
+  # is a real delivery, so the `ws_messages` row is a true claim and must still be written —
+  # the operator is only told that their decision window closed.
+  it "still records a held message released at teardown when the destination is alive" do
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::RequestOnly)
+      spawn { WS::Relay.run(r.client, r.upstream, 37_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(masked(WS::OP_TEXT, "CLIENT-HELD".to_slice))
+      wait_until("the hold") { ic.pending_count == 1 }
+
+      r.cs_w.close # only the CLIENT goes; the upstream leg this gate writes to is untouched
+      read_message(r.ts_r).should eq({WS::OP_TEXT, "CLIENT-HELD"})
+      wait_until("the queue row to be given back") { ic.pending_count == 0 }
+      data_rows(sink).should eq([{"out", 1, "CLIENT-HELD"}])
+      notice_rows(sink).map(&.[](2)).should eq(
+        ["[gori] client→server: the socket is closing — forwarding 1 held message(s) " \
+         "unedited, in arrival order. WebSocket has no application-level flow control, so " \
+         "nothing throttles the sender while a hold is out"])
+    end
+    r.shutdown
+  end
+
+  # The DOCUMENTED decision window, which must not regress: a peer that sends a CLOSE frame is
+  # closing on purpose and is still reading, so `Relay::CLOSE_TIMEOUT` expires, the held
+  # message is forwarded unedited, it DOES arrive — and the row is therefore correct.
+  it "keeps the capture row when the peer ends with a CLOSE frame instead of vanishing" do
+    r = rig
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::RequestOnly)
+      spawn { WS::Relay.run(r.client, r.upstream, 38_i64, sink, nil, HOLD_CTX, ic) }
+      r.cs_w.write(masked(WS::OP_TEXT, "CLIENT-HELD".to_slice))
+      wait_until("the hold") { ic.pending_count == 1 }
+
+      # The origin closes the RFC 6455 way. `in` ends CLEAN, so the upstream leg is not dead.
+      r.ss_w.write(WS.encode(WS::OP_CLOSE, Bytes[0x03, 0xe8], mask: false))
+      read_message(r.ts_r).should eq({WS::OP_TEXT, "CLIENT-HELD"})
+      wait_until("the row") { data_rows(sink).any? { |(_, _, t)| t == "CLIENT-HELD" } }
+      data_rows(sink).should contain({"out", 1, "CLIENT-HELD"})
+      # ... and no reset notice: the peer closed on purpose.
+      notice_rows(sink).each { |(_, _, t)| t.should_not contain("RESET") }
     end
     r.shutdown
   end
@@ -657,8 +745,38 @@ describe Gori::Proxy::WS::MessageGate do
       gate.close
       dst.size.should_not eq(0) # was: zero bytes, and no capture row either
       read_message(IO::Memory.new(dst.to_slice)).should eq({WS::OP_TEXT, "held"})
-      sink.messages.should eq([{"out", 1, "held"}])
+      data_rows(sink).should eq([{"out", 1, "held"}])
+      # `close` never saw a `settle`, so nothing knows the destination is dead — the release
+      # is claimed, and the involuntary release is still named.
+      notice_rows(sink).map(&.[](2)).should eq(
+        ["[gori] client→server: the socket closed with the message still held — forwarding " \
+         "1 held message(s) unedited, in arrival order. WebSocket has no application-level " \
+         "flow control, so nothing throttles the sender while a hold is out"])
       ic.pending_count.should eq(0)
+    end
+  end
+
+  # The `@dropped` half of the same accounting, which was equally silent: an operator who
+  # dropped a message watched the queue row leave and nothing downstream — History, the WS
+  # pane, an export — had any record of the attempt.
+  it "says on the flow that a dropped message left no trace, rather than only in gori.log" do
+    dst = IO::Memory.new
+    sink = HoldSink.new
+    with_interceptor("proto:ws") do |ic|
+      gate = WS::MessageGate.new("out", dst, 39_i64, sink, ic, HOLD_CTX, mask: true)
+      gate.submit(WS::OP_TEXT, "secret".to_slice, nil)
+      wait_until("the hold") { ic.pending_count == 1 }
+      ic.drop(ic.pending.first.id)
+      # The gate's own queue, not the interceptor's: `drop` only puts the decision on the
+      # channel, and a `close` that overtakes the wait fiber counts the slot as STRANDED.
+      wait_until("the drop to reach the gate") { !gate.pending? }
+      gate.close
+      dst.size.should eq(0) # nothing on the wire, which is the whole point of a drop
+      data_rows(sink).should eq([] of {String, Int32, String})
+      notice_rows(sink).map(&.[](2)).should eq(
+        ["[gori] client→server: held message(s) at teardown — 1 dropped by the operator. " \
+         "None of these left a ws_messages row and neither endpoint can see the gap: a " \
+         "WebSocket message has no identity for a peer to miss"])
     end
   end
 

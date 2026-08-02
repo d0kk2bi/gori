@@ -145,6 +145,22 @@ describe Gori::Proxy::H2::HeadCodec do
       head.should contain("host: other.example.com")
     end
 
+    # The `:protocol` pseudo-header (RFC 8441) is what says a WebSocket is running on a
+    # CONNECT stream, and the pseudo filter above dropped it — so the stored head read as an
+    # ordinary tunnel. Additive and CAPTURE-ONLY, exactly like `X-Gori-Pushed`: passed by the
+    # projection alone, so the line can never reach an h2 wire through the rewrite path.
+    it "names the RFC 8441 :protocol only when the capture projection passes it" do
+      fields = [f(":method", "CONNECT"), f(":protocol", "websocket"),
+                f(":scheme", "https"), f(":path", "/chat"), f(":authority", "ws.test")]
+      bare = String.new(HeadCodec.synth_request(tuples(fields), "ws.test"))
+      bare.should_not contain("X-Gori-Protocol") # the rewrite path passes nothing
+      named = String.new(HeadCodec.synth_request(tuples(fields), "ws.test", protocol: "websocket"))
+      named.should contain("X-Gori-Protocol: websocket")
+      # It is the LAST line, like the other markers: nothing that reads a field off the head
+      # by position changes behaviour.
+      named.should end_with("X-Gori-Protocol: websocket\r\n\r\n")
+    end
+
     it "renders a response status line with no reason phrase (h2 has none)" do
       head = String.new(HeadCodec.synth_response(tuples([f(":status", "200"), f("content-type", "text/html")])))
       head.should eq("HTTP/2 200\r\ncontent-type: text/html\r\n\r\n")
