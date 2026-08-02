@@ -57,9 +57,26 @@ module Gori::Tui
     # separately from restore() — like @name, the reconcile clobber never touches it.
     property tags : Array(String) = [] of String
 
+    # PROVENANCE: this tab's request came from a CAPTURED flow (^R off History, the Sitemap,
+    # an Issue, a reopened flow-seeded session), not from `^N` or a hand-typed draft. Feeds
+    # `Repeater::PlanOptions#evidence?` and gates the editor's own `$KEY` expansion — see
+    # `expanded_text_to_bytes`.
+    #
+    # The Fuzzer/Miner/Sequencer tabs got this in round 4's first half and the Repeater, the
+    # tab a capture lands in FIRST, did not: `repeater_plan` passed `expand_request: false`
+    # while the view had already run `Env.expand_wire` over the same bytes, so a project that
+    # happens to define `filter`/`top` sent `GET /api?PWNED=name&99=10` from a pane still
+    # reading `GET /api?$filter=name&$top=10`, for a flow `gori run repeater 1` replayed
+    # byte-exact in the same project. An operator edit does NOT clear it, the same call
+    # `FuzzerView#evidence_template` documents: provenance is about where the bytes came
+    # from, and dropping it on the first keystroke puts the substitution straight back on
+    # the commonest workflow there is.
+    getter? evidence : Bool
+
     def initialize
       @name = nil
       @tags = [] of String
+      @evidence = false
       @flow = nil.as(Store::FlowDetail?)
       @target = ""
       @tcx = 0             # target (URL) cursor
@@ -455,6 +472,7 @@ module Gori::Tui
 
     def load(detail : Store::FlowDetail) : Nil
       @flow = detail
+      @evidence = true # a CAPTURED request — see `evidence?`
       @http2 = detail.http_version == "HTTP/2"
       @target = build_target(detail.row.scheme, detail.row.host, detail.row.port)
       @tcx = @target.size
@@ -488,6 +506,7 @@ module Gori::Tui
     # seed, so an unedited replay still sends it (see `@ws_out_seed`).
     def load_ws(detail : Store::FlowDetail, out_messages : Array(Store::WsOutMessage)) : Nil
       @flow = detail
+      @evidence = true # the handshake AND the seeded frames are the capture's
       @ws_mode = true
       @ws_keep_key = false # a fresh capture: the regenerated key is the default (see the ivar)
       @http2 = false       # WebSocket is HTTP/1.1
@@ -525,13 +544,21 @@ module Gori::Tui
     # and the database can never disagree about which frames this tab holds. They did: this
     # method used to fall back to its own LF-split of the pane the moment the pane was edited,
     # while the badge on the pane's border kept naming the frames that fallback had dropped.
+    #
+    # A tab seeded from a CAPTURED 101 flow is EVIDENCE and is not expanded at all — the
+    # same rule `gori run repeater send` and MCP `send_websocket` now apply to a flow-seeded
+    # session's stored rows. A captured `{"$where":"this.a==1"}` is a MongoDB injection test,
+    # not a reference to a project variable; with the draft policy on it was unsendable
+    # (`ws_unresolved_env` named `$where`) and setting the variable to get past that sent
+    # `{"WHEREVAL":"this.a==1"}`.
     def ws_out_messages : Array(Repeater::WsEngine::OutMsg)
       ws_out_messages_raw.map do |m|
         # `Env.expand` scans BYTES and copies every unmatched span through untouched, so a
         # TEXT frame carrying invalid UTF-8 survives it; a BINARY frame is not expanded at
         # all, the same rule `gori run repeater send` and MCP `send_websocket` apply.
+        expand = m.text? && !@evidence
         Repeater::WsEngine::OutMsg.new(m.opcode,
-          m.text? ? Env.expand(String.new(m.payload)).to_slice : m.payload, m.shape)
+          expand ? Env.expand(String.new(m.payload)).to_slice : m.payload, m.shape, @evidence)
       end
     end
 
@@ -640,7 +667,11 @@ module Gori::Tui
     # be displaying, not text an operator typed — and `$` followed by `[A-Za-z_]` turns up in
     # such bytes roughly once per 1.2KB by chance (#519). Without this the pane refused a
     # real captured binary frame, naming the `$A` inside a JPEG.
+    #
+    # Empty for an EVIDENCE tab, because nothing on that path expands: a check that refuses
+    # a send the expansion would not have touched is not a check, it is a second policy.
     def ws_unresolved_env : Array(String)
+      return [] of String if @evidence
       # The list that is actually going out (`ws_out_messages_raw`), for the same reason
       # `ws_out_messages` reads it: a check run against a different list than the send is not
       # a check. Pre-splice this branched on `ws_out_seeded?` and read the pane's raw lines.
@@ -784,6 +815,7 @@ module Gori::Tui
     # deframed gRPC transcript + grpc-status.
     def load_grpc(detail : Store::FlowDetail) : Nil
       @flow = detail
+      @evidence = true
       @grpc_mode = true
       @ws_mode = false
       @http2 = true # gRPC is HTTP/2
@@ -861,6 +893,7 @@ module Gori::Tui
     # payload re-sends byte-for-byte). Session-only (db_id nil) — see the controller.
     private def seed_decode(detail : Store::FlowDetail, kind : Symbol, payload : String) : Nil
       @flow = detail
+      @evidence = true
       @decode_kind = kind
       @ws_mode = false
       @grpc_mode = false
@@ -1226,8 +1259,14 @@ module Gori::Tui
                 response_error : String? = nil, response_duration_us : Int64? = nil,
                 sni : String = "",
                 ws_messages : Array(Store::WsOutMessage)? = nil,
-                ws_keep_key : Bool = false) : Nil
+                ws_keep_key : Bool = false,
+                evidence : Bool = false) : Nil
       @flow = nil
+      # `@flow` is deliberately cleared on a restore (the FlowDetail is not persisted), so
+      # provenance has to arrive from the caller: the store row's `flow_id`, which is the
+      # same carrier `FuzzerView`/`MinerView` restore from. Without it a reopened capture
+      # silently reverted to a draft on the next gori start.
+      @evidence = evidence
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
 
       @original_lines = [] of String
@@ -1258,7 +1297,9 @@ module Gori::Tui
     def apply_peer_request(target : String, request : String, http2 : Bool, auto_cl : Bool,
                            sni : String = "",
                            ws_messages : Array(Store::WsOutMessage)? = nil,
-                           ws_keep_key : Bool = false) : Nil
+                           ws_keep_key : Bool = false,
+                           evidence : Bool = false) : Nil
+      @evidence = evidence
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key)
       @req_hex_edit = nil
       # Leave @result / @prev_result / @focus / @scroll / @resp_mode / @original_lines alone.
@@ -1340,6 +1381,7 @@ module Gori::Tui
     # scaffold URL is a placeholder you almost always change first.
     def load_blank : Nil
       @flow = nil
+      @evidence = false # ^N: a draft the operator is about to type
       @http2 = false
       @target = BLANK_TARGET
       @link_host_to_target = true # first target edit mirrors into the Host header (see the field)
@@ -1368,6 +1410,7 @@ module Gori::Tui
     # chip name (+ " copy"). Drops source flow linkage, inflight state, and scroll/cursor.
     def duplicate_from(src : RepeaterView) : Nil
       @flow = nil
+      @evidence = src.evidence? # the same bytes carry the same provenance
       @http2 = src.@http2
       @target = src.@target
       @tcx = @target.size
@@ -1508,8 +1551,20 @@ module Gori::Tui
     # origin with the CRLF delimiters RFC 2046 requires. See
     # `FlowRequest.normalize_multipart_body` for why that step is opt-in here and not
     # inside `expand_wire`.
+    #
+    # For an EVIDENCE tab the `$KEY` half is off and only the CRLF half runs. `expand_wire`
+    # is two passes welded together — substitute, then promote the head's bare LFs — and only
+    # the second is something this editor owes the wire. The first is a draft-time policy:
+    # a capture's `$filter`/`$top`/`$where`/`$IFS`/`$user.name` are bytes the origin sent,
+    # and substituting a project value into one sends a request nobody captured, which is
+    # precisely what `Repeater::PlanOptions#evidence?` and `FuzzerView#evidence_template`
+    # already say for the same bytes on every other surface. The CRLF promotion is kept and
+    # done explicitly because `TextArea#insert_newline` gives a typed line a bare LF and
+    # names `expand_wire` as what promotes it — shipping one inside a head is itself a
+    # front-end/back-end desync primitive, i.e. a different test than the one on screen.
     private def expanded_text_to_bytes(text : String) : Bytes
-      Repeater::FlowRequest.normalize_multipart_body(Env.expand_wire(text))
+      wire = @evidence ? Env.normalize_wire(text) : Env.expand_wire(text)
+      Repeater::FlowRequest.normalize_multipart_body(wire)
     end
 
     # §…§ marker send: parse the CRLF wire form as a Fuzz template and render each marked

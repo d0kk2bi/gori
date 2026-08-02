@@ -65,8 +65,21 @@ module Gori
       # RSV=0, masked with a fresh key. That is one frame shape out of the dozen a WebSocket
       # test needs, so a captured session of twelve distinct shapes replayed as seven
       # identical ones and the difference was never reported.
+      #
+      # `evidence` is PROVENANCE, the same axis `Repeater::PlanOptions#evidence?` carries for
+      # the HTTP half: true when these bytes were CAPTURED (a session seeded from a flow),
+      # false when the operator typed them here and now (`--message`, MCP `messages`, a line
+      # added to the pane). It is per-message and not per-send because the two populations mix
+      # in one list — `--message` overrides a seed, and the TUI pane is a splice over one.
+      #
+      # A captured frame is replayed as recorded or not at all. `{"$where":"this.a==1"}` is a
+      # MongoDB injection test, `{"$ref":…}` is a JSON-Schema document and `$filter` is OData;
+      # with the draft policy on, the capture was unreplayable without project env vars, and
+      # taking the refusal's own advice sent `{"WHEREVAL":"this.a==1"}` — a JSON object with a
+      # key nobody wrote, in place of the payload the whole test was about.
       record OutMsg, opcode : Int32, payload : Bytes,
-        shape : Proxy::WS::Shape = Proxy::WS::Shape::DEFAULT
+        shape : Proxy::WS::Shape = Proxy::WS::Shape::DEFAULT,
+        evidence : Bool = false
 
       # One message in the replayed transcript. `direction` is "out" (we sent) or
       # "in" (server sent); `opcode` is the RFC 6455 opcode, no longer folded to 1 or 2.

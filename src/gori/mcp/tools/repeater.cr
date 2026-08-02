@@ -40,6 +40,7 @@ module Gori
         keep_request_line = bool_arg(h, "keep_request_line", false)
         ws_messages_override = nil.as(Array(Store::WsOutMessage)?)
         rewrote_request_line = false
+        notice_rows_dropped = 0
 
         if flow_id
           flow = store.get_flow(flow_id)
@@ -85,7 +86,12 @@ module Gori
             # BINARY out-frame with no warning at all (the CLI at least printed one), and the
             # `.scrub` rewrote an invalid-UTF-8 TEXT payload to U+FFFD before it was stored —
             # so a §8.1/§5.6 test case could not be seeded into a repeater from MCP.
-            ws_messages_override = store.ws_messages(flow_id).select { |m| m.direction == "out" }
+            # A `[gori]` advisory row is a diagnostic about the socket, not traffic it
+            # carried; seeding one would replay gori's own sentence as a client frame. The
+            # count rides back to the agent — a seed quietly holding fewer frames than the
+            # capture is as wrong as one holding an extra. See `CLI::Run.ws_seed_rows`.
+            rows, notice_rows_dropped = CLI::Run.ws_seed_rows(store.ws_messages(flow_id))
+            ws_messages_override = rows
               .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, CLI::Run.seed_shape(m.shape)) }
           end
         end
@@ -171,6 +177,12 @@ module Gori
             # How many frames were actually stored, so an agent authoring a multi-frame
             # sequence can assert on it rather than take the count on trust.
             j.field "ws_out_message_count", ws_count if ws_count
+            # Only when it FIRED. The seed holds fewer frames than the capture, and a count
+            # an agent asserts on has to come with the reason it is short.
+            if notice_rows_dropped > 0
+              j.field "ws_notice_rows_dropped", notice_rows_dropped
+              j.field "note", CLI::Run.ws_notice_dropped_note(notice_rows_dropped)
+            end
           end
         })
       rescue ex : Gori::Error
