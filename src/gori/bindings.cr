@@ -113,6 +113,31 @@ module Gori
       false
     end
 
+    # Which boundary-forging byte classes `value` carries, named the way an operator reads
+    # them ("CR", "LF", "NUL"), in that order. Empty exactly when `boundary_forging?` is false.
+    #
+    # A SECOND pass and not a widening of the predicate above: that one answers a yes/no per
+    # resolved key on the proxy request path and must not allocate, while this one runs only
+    # once a refusal has already fired and is going to write an `events` row. A refusal that
+    # does not name what it found is barely better than silence — #491's lesson — and "a stray
+    # CR" is the difference between an operator editing their extract rule and an operator
+    # concluding gori is broken.
+    def self.boundary_bytes(value : String) : Array(String)
+      cr = lf = nul = false
+      value.each_byte do |b|
+        case b
+        when 0x0d_u8 then cr = true
+        when 0x0a_u8 then lf = true
+        when 0x00_u8 then nul = true
+        end
+      end
+      found = [] of String
+      found << "CR" if cr
+      found << "LF" if lf
+      found << "NUL" if nul
+      found
+    end
+
     @rules : Array(Store::ExtractRule)
     @compiled : Array(Compiled)
     @values : Hash(String, Bound)
@@ -133,6 +158,9 @@ module Gori
       # Rule ids already reported as needing an entity that was not buffered, at that rule
       # revision — see `miss_no_entity`.
       @no_entity_reported = Set(Int64).new
+      # Rule ids already reported as having read a body that is not valid UTF-8, at that rule
+      # revision — see `report_scrubbed`.
+      @scrub_reported = Set(Int64).new
       # Rule ids that already reported a plain miss at binding revision `@miss_reported_rev`
       # — see `report_miss?`.
       @miss_reported = Set(Int64).new
@@ -197,7 +225,15 @@ module Gori
     # Every value held, enabled or not — the MASKING half of the split above. A token whose
     # rule the operator switched off stops resolving, but it was still observed from a real
     # response and is still in memory, so `Env.mask_secrets` must keep redacting it out of
-    # exports, notes and the detail view. See `Env.masking_vars`.
+    # everything the operator AUTHORS. See `Env.masking_vars`.
+    #
+    # Which is: an issue's title / host / notes (`mcp/tools/issues.cr`, `cli/run/issues.cr`), a
+    # Repeater tab's target / request / name / tags (`mcp/tools/repeater.cr`,
+    # `cli/run/repeater.cr`) and a WS message an operator composed (`store/repeater_sessions.cr`).
+    # NOT an export and NOT the flow detail view, and that is deliberate rather than a gap: both
+    # render CAPTURED bytes, which is the exception the class doc above states — masking a
+    # capture would be a P7 violation, not a fix. (This comment used to name exports and the
+    # detail view; it named two surfaces that must never call this, and no surface that does.)
     def held_values : Hash(String, String)
       @mutex.synchronize do
         h = {} of String => String
@@ -485,6 +521,9 @@ module Gori
       return [] of String if picked.empty?
       bound = [] of String
       now = Time.utc
+      # Decided at most ONCE per response and only if a `text_only?` descriptor actually binds
+      # off it — the check decodes the entity, so a project of cookie rules never pays for it.
+      lossy = nil.as(Bool?)
       picked.each do |c|
         # A body-scoped descriptor on a response gori never buffered cannot possibly match, and
         # saying "found nothing" would blame the selector for gori's own decision. Say which it
@@ -502,6 +541,17 @@ module Gori
         if reason = unusable(value)
           record_miss(c.rule, reason, flow_id, throttle)
           next
+        end
+        # A `regex` / `jsonpath` descriptor can only read the body as text, and Crystal's
+        # readers need a valid subject — so on a body that is not valid UTF-8 the descriptor
+        # ran over a repaired copy and the value bound is not the bytes the origin sent, while
+        # a `cookie`, `header` or `position` descriptor on the SAME response returns them
+        # exactly. Bind anyway: a page in a legacy encoding with a CSRF token in it is an
+        # ordinary target and refusing would break a case that works today. But say it, because
+        # this is the one place a binding's value can differ from its response.
+        if c.rule.kind.text_only?
+          lossy = Gori::TokenExtract.text_lossy?(raw) if lossy.nil?
+          report_scrubbed(c.rule, flow_id) if lossy
         end
         @mutex.synchronize { @values[c.rule.name] = Bound.new(value, c.rule.id, now) }
         bound << c.rule.name
@@ -554,6 +604,21 @@ module Gori
         "$#{rule.name}: #{rule.token_loc.label} found nothing (#{reason})", flow_id: flow_id)
     end
 
+    # A bind that HAPPENED but not over the origin's bytes. Once per rule per rule revision,
+    # the same key and the same reason as `miss_no_entity`: this is a structural fact about
+    # the target's body, so it is news when the operator edits the rule and noise on every
+    # subsequent response. Warn and not info — the operator's next request carries a value
+    # gori repaired, and that is the kind of thing a 401 is later blamed on.
+    private def report_scrubbed(rule : Store::ExtractRule, flow_id : Int64?) : Nil
+      return unless @mutex.synchronize { @scrub_reported.add?(rule.id) }
+      @store.insert_event("bindings", "extract_scrubbed", "warn",
+        "$#{rule.name}: #{rule.token_loc.label} read a response body that is not valid UTF-8 — a " \
+        "regex/jsonpath descriptor has no byte-level reading, so every invalid byte was replaced " \
+        "with U+FFFD before it ran and the bound value may not be the bytes the origin sent " \
+        "(a cookie, header or position descriptor reads the same response byte-exact)",
+        flow_id: flow_id)
+    end
+
     private def miss_no_entity(rule : Store::ExtractRule, flow_id : Int64?) : Nil
       return unless @mutex.synchronize { @no_entity_reported.add?(rule.id) }
       @store.insert_event("bindings", "extract_no_body", "warn",
@@ -598,6 +663,7 @@ module Gori
         @rev &+= 1
         # An edit is the operator looking at this rule, so let it say the no-body thing again.
         @no_entity_reported.clear
+        @scrub_reported.clear
       end
       @enabled_count.set(fresh.count(&.enabled?))
       @body_count.set(fresh.count { |r| r.enabled? && r.body_scoped? })

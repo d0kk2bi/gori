@@ -37,6 +37,16 @@ module Gori
       when "jsonpath", "json", "j" then JsonPath
       end
     end
+
+    # Kinds that can only read the body AS TEXT. Crystal's `Regex` raises `ArgumentError` on
+    # a subject that is not valid UTF-8 and `JSON.parse` wants one too, so both run over a
+    # `#scrub`bed copy of the body — see `TokenExtract.text_lossy?` for what that costs and
+    # `Bindings#run` for who has to say so. The other three read BYTES: `Cookie` and `Header`
+    # off the parsed head, and `Position` off the decoded entity, whose whole meaning is a
+    # byte range.
+    def text_only? : Bool
+      regex? || json_path?
+    end
   end
 
   # Where the token lives in a response. One `selector` string is reused per kind
@@ -126,12 +136,26 @@ module Gori
     end
 
     # A fixed half-open byte range of the decoded body, clamped to its bounds.
+    #
+    # Over the decoded BYTES, not over `decoded_text`. `Position` has no text reading at all —
+    # `body[100...140]` over a gzip stream is forty bytes of DEFLATE, and `bindings.cr` says so
+    # verbatim — so running the range over a `#scrub`bed String made every offset past an
+    # invalid byte slide by two, U+FFFD being three bytes where the invalid one was one. One
+    # origin response then gave a cookie descriptor the origin's `41 42 FF 43 44` and this one
+    # five DIFFERENT bytes for the same value, which is exactly the disagreement
+    # `bindings.cr` rules out: "the same `TokenLoc` on the same response has to mean one
+    # thing whether a Repeater send or the proxy saw it".
+    #
+    # The slice is handed to `String.new` unscrubbed. A `String` holding invalid UTF-8 survives
+    # every consumer of a bound value, and each of them says so where it is written:
+    # `Env.mask_secrets`, `Rules#substitute` and `Bindings.boundary_forging?` are all
+    # byte-level, and the store never sees a value at all.
     def self.position(raw : Repeater::Result, a : Int32, b : Int32) : String?
-      text = decoded_text(raw)
-      lo = a.clamp(0, text.bytesize)
-      hi = b.clamp(0, text.bytesize)
+      body = decoded_bytes(raw)
+      lo = a.clamp(0, body.size)
+      hi = b.clamp(0, body.size)
       return nil if hi <= lo
-      String.new(text.to_slice[lo...hi]).scrub
+      String.new(body[lo...hi])
     end
 
     # A leaf value at a dotted/bracketed path into a JSON body. Supports `$`, `.key`,
@@ -240,9 +264,30 @@ module Gori
       acc
     end
 
-    private def self.decoded_text(raw : Repeater::Result) : String
+    # The decoded entity, byte-exact (gzip/br/zstd handled through the same seam
+    # `Fuzz::Matcher` uses, so the two cannot disagree). What every BYTE-scoped reading gets.
+    private def self.decoded_bytes(raw : Repeater::Result) : Bytes
       decoded, _ = Proxy::Codec::ContentDecode.decode(raw.head, raw.body)
-      String.new(decoded || raw.body || Bytes.empty).scrub
+      decoded || raw.body || Bytes.empty
+    end
+
+    # The decoded entity read as TEXT, repaired so `Regex` and `JSON.parse` can run over it.
+    # Only `text_only?` kinds come through here; `text_lossy?` is how a caller learns that the
+    # repair happened and that the value it just got is not the origin's bytes.
+    private def self.decoded_text(raw : Repeater::Result) : String
+      String.new(decoded_bytes(raw)).scrub
+    end
+
+    # Whether reading this response's body as TEXT changes its bytes — i.e. the decoded entity
+    # is not valid UTF-8, so a `text_only?` descriptor necessarily ran over a `#scrub`bed copy
+    # in which every invalid byte became U+FFFD. The value such a descriptor returns is then
+    # NOT what the origin sent, and a caller that BINDS it has to say so rather than bind
+    # different bytes silently.
+    #
+    # `valid_encoding?` and not a scrub-and-compare: 9 µs against 130 µs on a valid 40 KB body,
+    # and this is asked once per response a rule has already claimed.
+    def self.text_lossy?(raw : Repeater::Result) : Bool
+      !String.new(decoded_bytes(raw)).valid_encoding?
     end
   end
 end
