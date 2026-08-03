@@ -113,6 +113,25 @@ module Gori::Fuzz
     def extra_requests : Int64
       0_i64
     end
+
+    # Send a GROUP of requests as ONE same-connection sequence, capturing each response in
+    # order — the primitive the active request-smuggling / desync rule needs (see
+    # `Repeater::Engine.send_pipeline`): a desync induced by member N surfaces only in the
+    # response to member N+1 on the SAME socket, which fresh-connection-per-send `send` can
+    # never reveal. `timeout` bounds the group's per-operation reads (nil = the backend's own).
+    #
+    # A CONCRETE DEFAULT, not a second abstract, and it deliberately delegates to per-member
+    # `send`: every wrapper backend (`GatedBackend`/`CappedBackend`) then inherits its gating /
+    # capping through the `send` overrides it already has, and every spec double stays a
+    # three-line class with no group logic to write. Only `Sender` — the production transport —
+    # overrides this to reach a REAL dedicated socket (the default's per-member sends are each a
+    # fresh connection, so it does not prove a same-socket desync; a caller that needs the true
+    # single socket is on `Sender`, and a spec that only asserts routing/gating does not need it).
+    # Whole-buffer `verbatim` per member, matching how the probe path marks every send: a crafted
+    # smuggling probe carries no operator `$NAME` to expand.
+    def send_pipeline(requests : Array(Bytes), timeout : Time::Span? = nil) : Array(Repeater::Result)
+      requests.map { |b| send(b, Backend.all_verbatim(b)) }
+    end
   end
 
   # Production backend over the Repeater engines (fresh connection per send — there is
@@ -250,6 +269,40 @@ module Gori::Fuzz
 
     def extra_requests : Int64
       @pool.try(&.stale_retries) || 0_i64
+    end
+
+    # Same-connection group send for the active smuggling/desync probe. Unlike `send`, the whole
+    # group MUST ride ONE dedicated socket (a desync induced by member N shows up only in member
+    # N+1's response), so this routes to `Repeater::Engine.send_pipeline`, which dials one socket
+    # and retires it on the first error/incomplete exchange. That deliberately BYPASSES the
+    # keep-alive `ConnPool` (`reusable_request?` refuses CL+TE / obfuscated payloads by design —
+    # exactly the bytes this carries) and never touches `Fuzz::ContentLength.sync`: the caller owns
+    # the framing (a deliberately wrong Content-Length is the whole point), so nothing rewrites it.
+    def send_pipeline(requests : Array(Bytes), timeout : Time::Span? = nil) : Array(Repeater::Result)
+      return [] of Repeater::Result if requests.empty?
+      # send_pipeline frames HTTP/1.1 only (`Repeater::Engine.send_pipeline` is h1). h2 multiplexes
+      # its own connection per send with separate stream-state rules, so a "same socket" group is
+      # meaningless there — DEGRADE to the per-member default (each on its own h2 connection via
+      # `send`, still gated, still one Result per request in order). The rule pre-filters to
+      # HTTP/1.1 anyway, so this is a belt-and-braces guard, not a hot path.
+      return super if @http2
+      # GROUP-GATE up front, sweep-side, mirroring `Repeater::Sender#group_refusal`: one blocked
+      # member refuses the WHOLE batch and returns all-error Results — a group is one connection
+      # carrying a deliberate sequence, so a partial send would be a misleading half-probe. The
+      # target is read off each member AFTER the same binding expansion `send` applies, so the
+      # scope decision is identical to the lone-send path (BEFORE the socket, per `ClientConn`).
+      requests.each do |req|
+        target = Gori::Outbound.request_target(@evidence ? req : Gori::Env.expand_bindings(req))
+        if err = @outbound.sweep_block(@origin.scheme, @origin.host, target)
+          @blocked += requests.size
+          @blocked_reason ||= err
+          return requests.map { Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err) }
+        end
+      end
+      reqs = @evidence ? requests : requests.map { |b| Gori::Env.expand_bindings(b) }
+      Repeater::Engine.send_pipeline(reqs, scheme: @origin.scheme, host: @origin.host,
+        port: @origin.port, verify_upstream: @verify, sni: @sni,
+        timeout: timeout || @timeout, overrides: @overrides)
     end
   end
 
@@ -401,6 +454,16 @@ module Gori::Fuzz
     @sent : Int64
     @matched : Int64
     @errors : Int64
+    # PAYLOAD-unit refusals, counted on the ENGINE rather than read off `@backend.blocked`. The
+    # backend increments on EVERY refused `send` call, so a gate-refused payload that `--retries`
+    # re-sent — and a redirect hop the gate refused — each bumped it, and `all_blocked`
+    # (`sent>0 && blocked>=sent`, mcp/tools/fuzz.cr) then read true on a run where a payload came
+    # back 200. Here it is exactly one increment per refused PAYLOAD (see `run_one`), the unit
+    # that compares to `@sent`. The backend keeps its own per-call counter — the Miner
+    # (miner/engine.cr) and the injected-backend Probe path read it and are out of this scope —
+    # but the fuzz `snapshot` now publishes THIS one.
+    @blocked : Int64
+    @blocked_reason : String?
     @dispatched : Int64
     @last_dispatch : Time::Instant
     @total : Int64?
@@ -422,6 +485,8 @@ module Gori::Fuzz
       @sent = 0_i64
       @matched = 0_i64
       @errors = 0_i64
+      @blocked = 0_i64
+      @blocked_reason = nil.as(String?)
       @dispatched = 0_i64
       @last_dispatch = Time.instant
       @total = nil.as(Int64?)
@@ -542,6 +607,13 @@ module Gori::Fuzz
         # payload. `||` not `+2`: one request is one error even if it both failed on the wire
         # AND carried a chain that could not run.
         @errors += 1 if result.error || result.chain_error
+        # Every SUPERSEDED attempt was a failed send too: `run_one` only re-sends after a
+        # network error, so `resent_count` is exactly the count of earlier attempts that failed
+        # and were replaced. The line above counts the FINAL result; without this one a POST
+        # that failed twice and then succeeded on try 3 reported `0 errors` for two real network
+        # failures. `resent_count` is 0 on the common path, so a clean run is byte-unchanged; and
+        # it never double-counts the final attempt, which is the one the `||` above already saw.
+        @errors += result.resent_count
         @events.send(ResultEvent.new(result)) # blocking — never drop a row
         emit_progress
       end
@@ -563,20 +635,48 @@ module Gori::Fuzz
 
     private def run_one(job : Job) : Result
       attempts = 0
+      resent_count = 0
       loop do
         # The payload spans ride with the bytes: `Sender` needs them to tell the operator's
         # test case from the template it was spliced into (see `Backend#send`).
         raw = @backend.send(job.bytes, job.payload_spans)
+        # A scope-gate refusal (Sandbox / an explicit exclude rule) is a PAYLOAD-unit block:
+        # count it once HERE and return, never retry it. Two things depended on this together:
+        #   * the OLD loop DID retry it — a gate error is not `CAP_ERROR` — so with `--retries N`
+        #     the same refused payload re-ran N times, and each re-run bumped `@backend.blocked`
+        #     again; `blocked` then climbed past `sent` and `all_blocked` read true on a run that
+        #     never was fully blocked. Retrying is also pointless: the decision is stable within
+        #     `Outbound::RELOAD_INTERVAL`, so a re-send only burns `retry_pause` and one request.
+        #   * counting on the engine (not the backend) is what keeps a refused redirect HOP —
+        #     which still bumps `@backend.blocked` — out of this tally, since only the PRIMARY
+        #     send reaches this line. See the `@blocked` field comment.
+        # Detected by the two exact strings `Outbound#sweep_block` returns and nothing else does,
+        # so it is precise and race-free across worker fibers (no shared-counter delta to read).
+        if gate_refused?(raw.error)
+          @blocked += 1
+          @blocked_reason ||= raw.error
+          return @matcher.build(job, raw, resent_count: resent_count)
+        end
         # Don't burn retries/sleep on a permanent max-requests stop — further send()s
-        # are also refused. Real network errors still retry as configured.
+        # are also refused. Real network errors still retry as configured; each retry means the
+        # previous attempt was a failed send, tallied via `resent_count` (see `worker_loop`).
         if raw.error && raw.error != CappedBackend::CAP_ERROR && attempts < @config.retries
           attempts += 1
+          resent_count += 1
           sleep @config.retry_pause
           next
         end
         raw = follow_redirects(raw) if @config.follow_redirects? && raw.error.nil?
-        return @matcher.build(job, raw)
+        return @matcher.build(job, raw, resent_count: resent_count)
       end
+    end
+
+    # A send the SCOPE GATE refused before the socket, told apart from a network error by the
+    # two exact strings `Outbound#sweep_block` returns (via `Sender#send`/`GatedBackend#send`).
+    # Kept a string compare rather than a new `Repeater::Result` flag: that struct is shared with
+    # every other engine and must not grow a fuzz-only field — the constants ARE the contract.
+    private def gate_refused?(err : String?) : Bool
+      err == Gori::Outbound::SANDBOX_SWEEP_ERROR || err == Gori::Outbound::EXCLUDE_SWEEP_ERROR
     end
 
     # Follow up to max_redirects SAME-ORIGIN redirects (relative, or absolute to the
@@ -589,6 +689,15 @@ module Gori::Fuzz
       # below keeps the last hop's fields, so without this an original request that was
       # re-sent and then redirected would report as a single clean send.
       retried = raw.retried?
+      # A hop that FAILED — the gate refused its off-scope `Location`, or the target was dead —
+      # must NOT overwrite the payload's real answer. The payload's answer is the 3xx we already
+      # hold in `current`, and that 302 is exactly what an open-redirect probe is hunting; the
+      # old collapse replaced it with the hop's "never dialed" error and destroyed the finding.
+      # When a hop errors we keep the last good response and carry the hop's failure as a NOTE on
+      # the collapsed error — status and body stay the payload's, since an error and a response
+      # are not exclusive (see `cli/run/repeater.cr`). A refused hop is also NOT a payload-block,
+      # so it never touches `@blocked`; only `run_one`'s PRIMARY refusal does.
+      hop_error : String? = nil
       hops = 0
       while hops < @config.max_redirects
         resp = current.response
@@ -613,11 +722,18 @@ module Gori::Fuzz
         # is either a literal gori wrote (`GET`, `Host:`, `Connection: close`) or the origin's
         # own `Location`. Neither is a place an operator could have written a `$NAME` for a
         # binding to resolve, so there is nothing here to substitute in the first place.
-        current = @backend.send(nxt, Backend.all_verbatim(nxt))
-        retried ||= current.retried?
-        total_us += current.duration_us
+        hop = @backend.send(nxt, Backend.all_verbatim(nxt))
+        retried ||= hop.retried?
+        total_us += hop.duration_us
         hops += 1
-        break unless current.error.nil?
+        # Keep `current` (the last good response, e.g. the 302) when the hop failed; attach the
+        # reason rather than replacing the response with it. Prefixed so no surface reads it as
+        # the PAYLOAD's own failure — it is a note about a hop gori chose to follow.
+        if err = hop.error
+          hop_error = "redirect hop refused: #{err}"
+          break
+        end
+        current = hop
       end
       # Report the whole chain's end-to-end time, not just the final hop's — otherwise a
       # slow original request that 3xx's to a fast resource masks a time-based signal.
@@ -626,7 +742,7 @@ module Gori::Fuzz
       # keep-alive re-send in a redirect-following sweep lost its row marker and gained a false
       # `timed_out`. The constructor's tail is keyword-only now, so this cannot recur silently.
       hops > 0 ? Repeater::Result.new(current.head, current.body, current.response, total_us,
-        current.error, current.incomplete?,
+        hop_error || current.error, current.incomplete?,
         delivered: current.delivered?, timed_out: current.timed_out?, retried: retried) : current
     end
 
@@ -720,7 +836,10 @@ module Gori::Fuzz
       # The gRPC framing tally rides along from the Matcher, which is the one object that
       # sees every RENDERED request (see `Matcher#grpc_template?`). All zeroes / nil unless
       # the template was a cleanly-framed gRPC request, so no surface changes for anything else.
-      Progress.new(@sent, total, @matched, @errors, @backend.blocked, @backend.blocked_reason,
+      # `@blocked`/`@blocked_reason` are the ENGINE's payload-unit tally (see the field comment),
+      # NOT `@backend.blocked` — the backend counts every refused call, which double-counts a
+      # gate-refused payload's retries and its redirect hops and poisons `all_blocked`.
+      Progress.new(@sent, total, @matched, @errors, @blocked, @blocked_reason,
         @backend.sent + @backend.extra_requests,
         @matcher.grpc_stale, @matcher.grpc_requests, @matcher.grpc_stale_reason)
     end
