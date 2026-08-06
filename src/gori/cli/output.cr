@@ -47,7 +47,7 @@ module Gori
           # a rule that structurally could not run on it, a request the ORIGIN invented in a
           # PUSH_PROMISE. Emitted only when there is one, so a script keying off field
           # presence is not broken by a field it never asked for — the same discipline
-          # `emit_ws_shape_json` uses.
+          # `Store::WsMessage#emit_shape_json` uses.
           advisories = row.advisories
           unless advisories.empty?
             j.field("advisory") { j.array { advisories.each { |l| j.string(term_safe(l)) } } }
@@ -108,19 +108,6 @@ module Gori
         return "(no payload)" if m.payload.empty?
         body = String.new(m.payload)
         body.valid_encoding? ? term_safe(body) : "0x#{m.payload.hexstring}"
-      end
-
-      # The shape fields, for a JSON reader. Only what departs from the default is emitted,
-      # so an ordinary message's object is exactly the shape it was before V7 — a script
-      # keying off field presence is not broken by a feature it did not ask for.
-      def self.emit_ws_shape_json(j : JSON::Builder, m : Store::WsMessage) : Nil
-        s = m.shape
-        j.field "fin", false unless s.fin
-        j.field "rsv", s.rsv if s.rsv != 0
-        s.masked.try { |mk| j.field "masked", mk unless mk }
-        j.field "frames", s.frames if s.frames > 1
-        m.close_code.try { |c| j.field "close_code", c }
-        m.close_reason.try { |r| j.field "close_reason", String.new(r).scrub }
       end
 
       # "#42  GET   https  example.com:443/users  200  1.2kB  3ms  [Complete]"

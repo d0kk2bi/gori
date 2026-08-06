@@ -531,7 +531,7 @@ module Gori
                           j.object do
                             j.field "direction", m.direction
                             j.field "opcode", m.opcode
-                            Output.emit_ws_shape_json(j, m)
+                            m.emit_shape_json(j)
                             if m.text?
                               j.field "text", String.new(m.payload).scrub
                               # See emit_ws_result: JSON cannot carry a byte that is not valid

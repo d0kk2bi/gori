@@ -481,8 +481,10 @@ module Gori
                     # existed; MCP did not, so the agent surface was the one place a captured
                     # RSV1 frame, an unmasked client frame, or a close code was invisible —
                     # and a close code is the most diagnostic thing a failed WebSocket test
-                    # produces. Shared emitter, so the two projections cannot drift.
-                    CLI::Output.emit_ws_shape_json(j, m)
+                    # produces. The MODEL's own emitter, so the two projections cannot drift —
+                    # and, unlike the `CLI::Output` call this replaced, without MCP depending on
+                    # the CLI surface (see `WsMessage#emit_shape_json`).
+                    m.emit_shape_json(j)
                     if m.text?
                       raw = String.new(m.payload)
                       s = raw.scrub
