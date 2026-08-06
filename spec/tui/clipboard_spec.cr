@@ -42,11 +42,39 @@ describe Gori::Tui::Clipboard do
 
   it "clips to MAX_CLIP BYTES, not chars, for multi-byte payloads" do
     # 30k chars × 3 bytes = 90k bytes: over the 64KB byte cap but under it by char
-    # count, so a char-based clip would overshoot the cap. The return must be the cap.
+    # count, so a char-based clip would overshoot the cap.
     big = "한" * 30_000
     big.size.should be < Gori::Tui::Clipboard::MAX_CLIP     # under cap by chars
     big.bytesize.should be > Gori::Tui::Clipboard::MAX_CLIP # over cap by bytes
-    Gori::Tui::Clipboard.copy(big, IO::Memory.new).should eq(Gori::Tui::Clipboard::MAX_CLIP)
+    Gori::Tui::Clipboard.copy(big, IO::Memory.new).should be <= Gori::Tui::Clipboard::MAX_CLIP
+  end
+
+  # The cap used to `byte_slice(0, MAX_CLIP)` flat, and 65536 is not a multiple of 3, so a
+  # 3-byte-per-char payload was cut mid-character. Terminals base64-DECODE the payload and
+  # then require valid UTF-8 (wezterm `String::from_utf8(bytes)?`, alacritty
+  # `if let Ok(text) = …`), and both drop the whole write silently when it fails — so every
+  # copy over 64KB containing non-ASCII text reached no clipboard while the toast claimed
+  # success. Land on a codepoint boundary instead.
+  it "clips on a CODEPOINT boundary so the capped payload is still valid UTF-8" do
+    big = "한" * 30_000
+    io = IO::Memory.new
+    written = Gori::Tui::Clipboard.copy(big, io)
+    written.should eq(65_535) # the largest multiple of 3 that fits under the cap
+
+    payload = io.to_s.lchop("\e]52;c;").rchop("\a")
+    String.new(Base64.decode(payload)).valid_encoding?.should be_true
+  end
+
+  # Same silent drop from the other direction: a raw request/response dump is
+  # `String.new(bytes)` over whatever was on the wire, so a binary body is not UTF-8.
+  it "scrubs a source that is not valid UTF-8, so the terminal accepts the write" do
+    raw = String.new(Bytes[0x50, 0x4F, 0x53, 0x54, 0x0D, 0x0A, 0xFF, 0xFE, 0x41])
+    raw.valid_encoding?.should be_false
+
+    io = IO::Memory.new
+    Gori::Tui::Clipboard.copy(raw, io)
+    payload = io.to_s.lchop("\e]52;c;").rchop("\a")
+    String.new(Base64.decode(payload)).valid_encoding?.should be_true
   end
 
   describe ".note" do
@@ -54,21 +82,34 @@ describe Gori::Tui::Clipboard do
     # at six call sites and missing at five more, so `y` on a large selection reported the
     # TRUNCATED count as the copy size. One formula, asserted once.
     it "is silent when the whole source was copied" do
-      Gori::Tui::Clipboard.note(120, 120).should eq("")
+      Gori::Tui::Clipboard.note(120, "x" * 120).should eq("")
     end
 
     it "names the cap when the copy was clipped" do
-      Gori::Tui::Clipboard.note(65_536, 200_000).should eq(" — clipped from 200000b (64KB cap)")
+      Gori::Tui::Clipboard.note(65_536, "x" * 200_000).should eq(" — clipped from 200000b (64KB cap)")
     end
 
     it "names the SETTING when the clipboard is off, not an empty copy" do
       # copy() returns 0 without touching the tty when clipboard_osc52? is false; "copied
       # 0b" alone reads as an empty selection, which is a different problem entirely.
-      Gori::Tui::Clipboard.note(0, 4_096).should eq(" — clipboard is off (Settings → General)")
+      Gori::Tui::Clipboard.note(0, "x" * 4_096).should eq(" — clipboard is off (Settings → General)")
     end
 
     it "says nothing for an empty source (0 of 0 is not a failure)" do
-      Gori::Tui::Clipboard.note(0, 0).should eq("")
+      Gori::Tui::Clipboard.note(0, "").should eq("")
+    end
+
+    # The scrub keeps the copy alive but the clipboard is no longer the bytes gori
+    # captured, and on this project a malformed byte is routinely the finding itself.
+    it "says the copy is not byte-exact when the source was not valid UTF-8" do
+      raw = String.new(Bytes[0x41, 0xFF, 0x42])
+      Gori::Tui::Clipboard.note(5, raw).should eq(" — not byte-exact (invalid UTF-8 replaced)")
+    end
+
+    it "reports BOTH caveats when a clipped copy was also scrubbed" do
+      raw = String.new(Bytes[0xFF]) + ("x" * 200_000)
+      Gori::Tui::Clipboard.note(65_535, raw)
+        .should eq(" — clipped from 200001b (64KB cap) · not byte-exact (invalid UTF-8 replaced)")
     end
   end
 end

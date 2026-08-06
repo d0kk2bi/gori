@@ -1,5 +1,6 @@
 require "base64"
 require "../settings"
+require "./tty_out"
 
 module Gori::Tui
   # System-clipboard access via the OSC 52 terminal escape. Unlike shelling out
@@ -42,38 +43,80 @@ module Gori::Tui
       core + "\eP" + "tmux;" + core.gsub('\e', "\e\e") + "\e\\"
     end
 
-    # Emits the sequence to the terminal. In TUI mode STDOUT is the controlling
-    # tty (same device termisu draws to); OSC 52 is state-neutral, so it does not
-    # disturb the cell grid — the next diff render repaints normally.
+    # Emits the sequence to the tty the TUI draws on (see `TtyOut` for why that is not
+    # STDOUT). OSC 52 is state-neutral, so it does not disturb the cell grid — the next
+    # diff render repaints normally.
     #
     # Returns the number of bytes actually placed on the clipboard (≤ MAX_CLIP), so
     # callers can compare against the source size and report when the copy was clipped.
-    def self.copy(data : String, io : IO = STDOUT) : Int32
+    def self.copy(data : String, io : IO = TtyOut.io) : Int32
       # Clipboard disabled by the user: write nothing to the tty, report 0 copied.
       return 0 unless Settings.clipboard_osc52?
-      # Clip by BYTES (not chars): MAX_CLIP bounds the OSC 52 tty write, and the
-      # returned count is a byte count the caller compares to the source byte size.
-      # `byte_slice` may sever a trailing multi-byte codepoint, but the sequence is
-      # base64-encoded from the raw bytes, so that's harmless for a clipboard cap.
-      data = data.byte_slice(0, MAX_CLIP) if data.bytesize > MAX_CLIP
+      data = wire_safe(data)
       io.print(osc52(data, tmux: !ENV["TMUX"]?.nil?))
       io.flush
       data.bytesize
     end
 
+    # What may actually go on the wire, and the reason a copy could report success and
+    # deliver nothing even when the sequence DID reach the terminal.
+    #
+    # A terminal does not treat the OSC 52 payload as opaque bytes. It base64-decodes it
+    # and then demands valid UTF-8 — wezterm `String::from_utf8(bytes)?` (the `Err` is
+    # swallowed into an `Unspecified` command with a trace log), alacritty
+    # `if let Ok(text) = String::from_utf8(bytes)`. Neither tells the user. So invalid
+    # UTF-8 is not "harmless for a clipboard cap", it is a silently dropped copy, and
+    # gori hits it two ways:
+    #
+    # - the source itself: a raw request/response dump is `String.new(bytes)` over
+    #   whatever was on the wire, and a binary body is not UTF-8
+    # - the cap: the old `byte_slice(0, MAX_CLIP)` severed a trailing codepoint, so
+    #   ANY copy over 64KB containing non-ASCII text was dropped (measured: 30k Hangul
+    #   characters clipped to 65536 bytes → invalid, clipboard untouched, toast claimed
+    #   "copied 65536b — clipped from 90000b")
+    #
+    # Scrub first (the caller is told via `note`, since replacement bytes mean the
+    # clipboard is no longer byte-exact evidence), then cap on a codepoint boundary so
+    # the scrub cannot be undone by the clip.
+    private def self.wire_safe(data : String) : String
+      data = data.scrub unless data.valid_encoding?
+      return data if data.bytesize <= MAX_CLIP
+      bytes = data.to_slice
+      cut = MAX_CLIP
+      # Byte `cut` is the first one dropped. While it is a UTF-8 continuation byte
+      # (0b10xxxxxx) the cut sits inside a character, so walk back onto its lead byte.
+      # `data` is valid here, so this backs up at most 3 bytes.
+      while cut > 0 && (bytes[cut] & 0xC0) == 0x80
+        cut -= 1
+      end
+      data.byte_slice(0, cut)
+    end
+
     # The status suffix for a copy, derived from what `copy` actually wrote versus the
-    # source size. Callers append this instead of re-deriving the comparison themselves:
-    # the `— clipped from Nb` half used to be hand-written at six call sites and simply
-    # absent at five more, so `y` on a large selection reported the TRUNCATED count as
-    # the copy size. One formula, one home — the omission can't recur per-caller.
+    # SOURCE ITSELF. Callers append this instead of re-deriving the comparison
+    # themselves: the `— clipped from Nb` half used to be hand-written at six call sites
+    # and simply absent at five more, so `y` on a large selection reported the TRUNCATED
+    # count as the copy size. One formula, one home — the omission can't recur
+    # per-caller.
+    #
+    # Takes the source string rather than its byte count so the second caveat lives here
+    # too. `wire_safe` scrubs invalid UTF-8 because the terminal would otherwise drop the
+    # whole write, but that makes the clipboard a REPLACED copy of bytes gori captured
+    # verbatim, and on this project malformed bytes are routinely the finding itself. A
+    # copy that is not byte-exact has to say so; deriving it from `source` keeps every
+    # caller out of the decision.
     #
     # A disabled clipboard is its own answer: `copy` returns 0 without touching the tty,
     # and "copied 0b" alone reads as an empty selection rather than a switched-off
     # setting. Empty source is not an error — it returns "".
-    def self.note(written : Int32, source_bytes : Int32) : String
+    def self.note(written : Int32, source : String) : String
+      source_bytes = source.bytesize
       return "" if source_bytes.zero?
       return " — clipboard is off (Settings → General)" if written.zero?
-      written < source_bytes ? " — clipped from #{source_bytes}b (64KB cap)" : ""
+      notes = [] of String
+      notes << "clipped from #{source_bytes}b (64KB cap)" if written < source_bytes
+      notes << "not byte-exact (invalid UTF-8 replaced)" unless source.valid_encoding?
+      notes.empty? ? "" : " — #{notes.join(" · ")}"
     end
   end
 end

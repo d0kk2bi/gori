@@ -222,7 +222,7 @@ module Gori::Tui
       text = sel ? view.copy_text : view.copy_all
       return if text.empty?
       written = Clipboard.copy(text)
-      note = Clipboard.note(written, text.bytesize)
+      note = Clipboard.note(written, text)
       @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
     end
 

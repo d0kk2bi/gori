@@ -413,7 +413,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
     end
 
     # The description selection (or current line) text without copying — "Send selection to".
@@ -428,7 +428,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied description to clipboard (#{written}b)#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied description to clipboard (#{written}b)#{Clipboard.note(written, text)}")
     end
 
     # --- SCOPE pane: browse the rule list; a/e open the Miner-style popup overlay ---

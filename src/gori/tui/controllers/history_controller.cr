@@ -510,8 +510,11 @@ module Gori::Tui
       io = IO::Memory.new
       io.write(detail.request_head)
       io.write(detail.request_body.not_nil!) if detail.request_body
-      written = Clipboard.copy(String.new(io.to_slice))
-      @host.status("copied #{detail.row.method} #{Url.origin_path(detail.row.target)} to clipboard (#{written}b)#{Clipboard.note(written, io.size)}")
+      # Held as a local: `note` compares against the SOURCE, and a raw wire dump is the
+      # one copy on this path that can carry non-UTF-8 bytes for it to flag.
+      raw = String.new(io.to_slice)
+      written = Clipboard.copy(raw)
+      @host.status("copied #{detail.row.method} #{Url.origin_path(detail.row.target)} to clipboard (#{written}b)#{Clipboard.note(written, raw)}")
     end
 
     # Multi-mark copy (#442): concatenating N raw request dumps is not what anyone marking
@@ -525,7 +528,7 @@ module Gori::Tui
       written = Clipboard.copy(text)
       # A thousand marked URLs overrun the 64KB clipboard cap, and a severed list that CLAIMS a
       # thousand is worse than a short one that admits it (Clipboard.note owns that formula).
-      msg = "copied #{urls.size} URL#{urls.size == 1 ? "" : "s"} to clipboard (#{written}b)#{Clipboard.note(written, text.bytesize)}"
+      msg = "copied #{urls.size} URL#{urls.size == 1 ? "" : "s"} to clipboard (#{written}b)#{Clipboard.note(written, text)}"
       msg += " — #{ids.size - urls.size} no longer available" if urls.size < ids.size
       @host.status(msg)
     end
@@ -603,7 +606,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
     end
 
     # The detail pane's selection (or current line) text without copying — "Send selection to".

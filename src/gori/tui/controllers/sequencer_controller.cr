@@ -309,7 +309,7 @@ module Gori::Tui
              end
       return if text.empty?
       written = Clipboard.copy(text)
-      note = Clipboard.note(written, text.bytesize)
+      note = Clipboard.note(written, text)
       @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
     end
 
