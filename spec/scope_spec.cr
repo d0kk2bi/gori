@@ -197,6 +197,38 @@ describe Gori::Scope do
     end
   end
 
+  # `validation_error`'s `case match_type` had no `else`, so an unrecognised type returned nil
+  # and `valid?` said yes — `Scope#add` stored it and `Rule#matches?` (whose own case DOES end
+  # in `else false`) then never matched it. The dangerous direction is EXCLUDE: a typo'd
+  # `exclude strng logout` sat in the operator's listed scope and excluded nothing, which is
+  # fail-OPEN, and is exactly the "silent dead rule" the host:port check above exists to stop.
+  # Every write path validates membership itself today, so this is the guarantee
+  # `validation_error`'s own doc already claimed rather than a live hole being closed.
+  it "refuses a match_type outside TYPES instead of storing a rule that can never match" do
+    Gori::Scope.valid?("strng", "logout").should be_false
+    Gori::Scope.validation_error("strng", "logout").not_nil!
+      .should contain("unknown match type")
+    # …and it names what IS accepted, so the message is actionable.
+    Gori::Scope::TYPES.each do |t|
+      Gori::Scope.validation_error("strng", "x").not_nil!.should contain(t)
+    end
+    # All three real types still pass through untouched.
+    Gori::Scope.valid?("host", "acme.test").should be_true
+    Gori::Scope.valid?("string", "logout").should be_true
+    Gori::Scope.valid?("regex", "^/api/").should be_true
+  end
+
+  it "keeps a dead-on-arrival exclude rule out of the store" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("exclude", "strng", "logout").should be_false
+      scope.rules.should be_empty
+      # The correctly-spelled rule is unaffected.
+      scope.add("exclude", "string", "logout").should be_true
+      scope.rules.map(&.match_type).should eq(["string"])
+    end
+  end
+
   it "normalizes IPv6 brackets so [::1] and ::1 match a host rule interchangeably" do
     # The CONNECT/tunnel path (the dominant HTTPS-MITM case) stores the flow host bare,
     # so a bracketed rule (the form the old suggestion recommended) must still match it —

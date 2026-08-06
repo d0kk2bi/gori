@@ -107,7 +107,16 @@ module Gori::Fuzz
     property? http2 : Bool
     # Payload sources, in position order. `Plan.build` pairs each with `processors`.
     property sources : Array(PayloadSource)
-    # The processing pipeline applied to EVERY set (all three surfaces share one list).
+    # The processing pipeline applied to EVERY set — one list, shared by every set rather than
+    # declared per set.
+    #
+    # Set by `gori run fuzz` (`--prefix/--suffix/--encode/--case/--hash/--regex-replace`) and by
+    # MCP `fuzz_start{processors}`. NOT by the TUI: `FuzzerView#build_engine` passes none and the
+    # Fuzzer tab has never had a processor UI (`Fuzz::Processor` appears nowhere under
+    # `src/gori/tui/`). This comment used to claim "all three surfaces share one list", which was
+    # false in the commit that wrote it — the same #366 change added the CLI/MCP wiring and
+    # touched `tui/fuzzer_view.cr` without wiring it. Recorded rather than quietly widened, per
+    # DESIGN.md's preamble; closing it is a TUI feature, not a rewording.
     property processors : Array(Processor)
     # Mode / concurrency / rps / throttle / retries / timeout / follow_redirects /
     # auto_calibrate / keep_bodies (the evidence policy) / max_requests.
