@@ -50,7 +50,12 @@ module Gori
     # writer transaction so a mid-batch failure rolls back the whole import.
     struct InsertImportBatch < WriteOp
       getter pairs : Array({CapturedRequest, CapturedResponse?})
-      getter reply : Channel(Int32)
+      # The new row IDS, in the order the pairs were given — not a count. A caller that has to
+      # link each source record to the flow it became (Discover: a finding row → the request/
+      # response it can then open) has no other way to learn them: the ids are assigned inside
+      # the writer transaction, and looking them back up by created_at would race any other
+      # import writing the same microsecond. `insert_import_batch` still answers a count.
+      getter reply : Channel(Array(Int64))
 
       def initialize(@pairs, @reply)
       end
@@ -302,11 +307,17 @@ module Gori
     # Insert many flows atomically (one writer transaction). Returns the committed
     # count, or 0 when the store is closing or the batch was rolled back.
     def insert_import_batch(pairs : Array({CapturedRequest, CapturedResponse?})) : Int32
-      reply = Channel(Int32).new(1)
+      insert_import_batch_ids(pairs).size
+    end
+
+    # Same write, answering with the new flow ids in pair order (empty when the store is
+    # closing or the batch rolled back). Blocks until committed.
+    def insert_import_batch_ids(pairs : Array({CapturedRequest, CapturedResponse?})) : Array(Int64)
+      reply = Channel(Array(Int64)).new(1)
       @writes.send(InsertImportBatch.new(pairs, reply))
       reply.receive
     rescue Channel::ClosedError
-      0_i32
+      [] of Int64
     end
 
     # Fills in the response side of an existing flow. Blocks until committed.
@@ -472,7 +483,7 @@ module Gori
                     inserted << {id, has_resp}
                   end
                   deferred << -> {
-                    batch_reply.send(inserted.size.to_i32)
+                    batch_reply.send(inserted.map { |(id, _)| id })
                     inserted.each do |(id, has_resp)|
                       publish(FlowEvent.new(id, :inserted))
                       publish(FlowEvent.new(id, :updated)) if has_resp
@@ -622,7 +633,7 @@ module Gori
     private def fail_reply(op : WriteOp) : Nil
       case op
       when InsertFlow        then op.reply.send(0_i64)
-      when InsertImportBatch then op.reply.send(0_i32)
+      when InsertImportBatch then op.reply.send([] of Int64)
       when UpdateResp        then op.reply.send(nil)
       when InsertWs          then op.reply.send(nil)
       when ExecTask          then op.reply.send(0_i64)

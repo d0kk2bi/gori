@@ -26,6 +26,9 @@ module Gori::Tui
       @view = DiscoverView.new
       @discover_events = Channel({DiscoverRun, Discover::Event}).new(256)
       @persist_buf = [] of {Store::CapturedRequest, Store::CapturedResponse?}
+      # Which findings row each buffered pair came from, same order as @persist_buf, so the
+      # ids the batch returns can be handed back to the rows that will open them.
+      @persist_owners = [] of {DiscoverRun, Int32}
       @persist_base = Time.utc.to_unix * 1_000_000
       @persist_seq = 0_i64
       @run_seq = 0
@@ -50,9 +53,9 @@ module Gori::Tui
     def body_hint(focus : Symbol) : String
       return "start from Sitemap/History (space → \"Discover here\")" if @view.empty?
       if @view.focus == :runs
-        "↑/↓ runs · tab findings · ^R run · ^X stop · p pause · d dismiss · space cmds · esc tabs"
+        "↑/↓ runs · ↵/tab findings · ^R run · ^X stop · p pause · d dismiss · space cmds · esc tabs"
       else
-        "↑/↓ nav · tab runs · [ / ] runs · ^R run · ^X stop · p pause · d dismiss · esc tabs"
+        "↑/↓ nav · ↵/o request+response · tab runs · [ / ] runs · ^R run · ^X stop · p pause · esc tabs"
       end
     end
 
@@ -109,11 +112,16 @@ module Gori::Tui
 
     # RUNS list: ↑/↓ walk the runs (which is what ^R/^X/p then act on), stepping off the
     # bottom into the findings table and off the top to the Sitemap|Discover strip.
+    #
+    # ↵ drills into the findings table — the master/detail step, and the reason the
+    # `discover.open-flow` verb's `enter` chord never fires from this pane: a run row has no
+    # request of its own to open, so ↵ here means "into the list that does".
     private def handle_runs_key(ev : Termisu::Event::Key) : Bool
       key = ev.key
       case
       when key.up?, key.lower_k?   then @view.runs_at_top? ? @host.request_focus(:subtabs) : @view.move_run(-1)
       when key.down?, key.lower_j? then @view.runs_at_bottom? ? @view.focus_pane(:findings) : @view.move_run(1)
+      when key.enter?              then @view.focus_pane(:findings)
       else                              return false
       end
       true
@@ -216,6 +224,31 @@ module Gori::Tui
         run.request_stop
         @host.jobs.finish(run.job_id, :stopped, "project closed") if run.job_id != 0
       end
+    end
+
+    # The flow behind the findings cursor — what `o` opens. Answers for the CURSOR ROW whatever
+    # pane has focus, because that row is drawn selected either way (the RUNS pane merely dims
+    # it); `↵` from the RUNS list is the one that drills in first, and it never reaches here
+    # (handle_runs_key consumes it). Returns nil having already said why there is nothing.
+    #
+    # The Runner does the opening: a captured flow's request/response belongs to History's
+    # detail overlay, and reaching it is a CROSS-TAB hop this controller must not make (see
+    # Runner#discover_open_flow, which is `sitemap_open_flow`'s hop from the same parent tab).
+    def open_flow_target : Int64?
+      if @view.empty?
+        @host.status("no runs yet — start from Sitemap/History (space → \"Discover here\")")
+        return nil
+      end
+      unless @view.selected_finding
+        @host.status("no finding to open — this run found nothing")
+        return nil
+      end
+      id = @view.selected_flow_id
+      # A finding is persisted in the same drain tick that adds its row, so this is not a
+      # "wait a moment" — it means the store write for this row did not land, and saying so
+      # beats a detail overlay that silently opens some other flow.
+      @host.status("no stored request/response for this finding — the project write did not land") unless id
+      id
     end
 
     def discover_toggle_pause : Nil
@@ -355,9 +388,9 @@ module Gori::Tui
     private def apply_event(run : DiscoverRun, ev : Discover::Event) : Nil
       case ev
       when Discover::FindingEvent
-        run.findings << ev.finding
+        idx = run.add_finding(ev.finding)
         run.found = run.findings.size
-        queue_persist(ev.finding)
+        queue_persist(run, idx, ev.finding, ev.exchange)
       when Discover::ProgressEvent
         p = ev.progress
         run.sent = p.sent
@@ -422,19 +455,36 @@ module Gori::Tui
         goto_tab: "target", goto_session_id: run.id.to_i64)
     end
 
-    # --- persistence: discovered endpoints → Store → Sitemap ---
-    private def queue_persist(f : Discover::Finding) : Nil
+    # --- persistence: discovered endpoints → Store → Sitemap / History ---
+    #
+    # The run itself keeps no bytes: the exchange goes straight into the batch and is dropped,
+    # and the row keeps only the flow id it became (`discover_open_flow` opens it from the
+    # store). That is what lets a long crawl retain nothing per finding but its row.
+    private def queue_persist(run : DiscoverRun, idx : Int32, f : Discover::Finding,
+                              exchange : Discover::Exchange?) : Nil
       @persist_seq += 1
-      pair = Discover::Persist.flow_pair(f, @persist_base + @persist_seq)
+      pair = Discover::Persist.flow_pair(f, @persist_base + @persist_seq, exchange)
       @persist_buf << {pair.request, pair.response}
+      @persist_owners << {run, idx}
     end
 
     private def flush_persist : Nil
       return if @persist_buf.empty?
-      @host.session.store.insert_import_batch(@persist_buf)
-      @persist_buf.clear
+      ids = @host.session.store.insert_import_batch_ids(@persist_buf)
+      # Pair by POSITION, and only when the writer answered for the whole batch — a rolled-back
+      # batch replies with an empty array, and a short reply would slide every id onto the wrong
+      # row. No id simply means the row cannot be opened yet, which the verb reports.
+      if ids.size == @persist_owners.size
+        @persist_owners.each_with_index { |(run, idx), i| run.set_flow_id(idx, ids[i]) }
+      end
+      clear_persist
     rescue
-      @persist_buf.clear # a store write failure must not wedge the drain
+      clear_persist # a store write failure must not wedge the drain
+    end
+
+    private def clear_persist : Nil
+      @persist_buf.clear
+      @persist_owners.clear
     end
   end
 end

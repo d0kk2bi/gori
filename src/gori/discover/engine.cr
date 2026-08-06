@@ -41,6 +41,33 @@ module Gori::Discover
   abstract class Backend
     abstract def fetch(scheme : String, host : String, port : Int32, target : String) : Repeater::Result
 
+    # The bytes `fetch` puts on the wire for this target — the REQUEST half of the exchange a
+    # finding is kept with. A hook rather than a second return value from `fetch` for the
+    # reason `Sender#binding_headers` spells out: this backend BUILDS its request from
+    # (scheme, host, port, target) instead of being handed one, so the request is a pure
+    # function of those four plus the run's fixed header block, and `Sender` overrides this
+    # with the very call `fetch` makes. The default below is the minimal GET the contract
+    # implies, which is exactly what a backend that frames nothing (a spec double) stands for.
+    #
+    # One caveat, since this is called just after the send rather than during it: a `$NAME`
+    # header REBOUND between the two resolves to its new value here. `Env.binding_rev` only
+    # moves when the operator edits a binding, and the window is the length of one `fetch`, so
+    # the stored request can differ from the sent one by a header value in exactly that case.
+    def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
+      default = scheme == "https" ? 443 : 80
+      hostline = port == default ? host : "#{host}:#{port}"
+      "GET #{target} HTTP/1.1\r\nHost: #{hostline}\r\n\r\n".to_slice
+    end
+
+    # The name this backend presents in the ClientHello, or nil for the dialed host's own name.
+    # It belongs on the send seam for the reason `Sender#sni` gives (the backend owns the wire
+    # decision), and it has to reach the STORE: `Repeater::FlowRequest.build` seeds a re-send
+    # from `FlowDetail#sni`, so a flow persisted without it re-sends to a name-based vhost
+    # under the wrong name — which is precisely the sweep `--sni` exists to express.
+    def sni : String?
+      nil
+    end
+
     # Release any transport the backend is holding open (the keep-alive pools' parked
     # sockets). Called once when a run ends — including a stopped or failed one, or the
     # sockets sit open until GC. A no-op by default so the spec doubles stay three-line
@@ -161,7 +188,7 @@ module Gori::Discover
       unless Proxy::Codec::Http1.request_token_safe?(target) && Proxy::Codec::Http1.request_token_safe?(host)
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, UNSAFE_URL)
       end
-      req = build_get(scheme, host, port, target, binding_headers)
+      req = request_head(scheme, host, port, target)
       if @http2
         Repeater::H2Engine.send(req, scheme: scheme, host: host, port: port,
           verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
@@ -171,6 +198,12 @@ module Gori::Discover
         Repeater::Engine.send(req, scheme: scheme, host: host, port: port,
           verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
       end
+    end
+
+    # The real thing, not an approximation of it: `fetch` sends exactly these bytes (it calls
+    # this method), so the request a finding is stored with is the request that was made.
+    def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
+      build_get(scheme, host, port, target, binding_headers)
     end
 
     def close : Nil
@@ -277,6 +310,14 @@ module Gori::Discover
       @inner.fetch(scheme, host, port, target)
     end
 
+    def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
+      @inner.request_head(scheme, host, port, target)
+    end
+
+    def sni : String?
+      @inner.sni
+    end
+
     def close : Nil
       @inner.close
     end
@@ -305,13 +346,16 @@ module Gori::Discover
   private record RawLink, href : String, source : Source
 
   # Worker → orchestrator. One per received Task, so the orchestrator's @pending balances.
+  # `exchange` is the wire bytes kept for an outcome that can still become a finding; the
+  # orchestrator drops it with the Outcome when the outcome is suppressed instead.
   private record Outcome,
     task : Task,
     fetched : Calibrate::Fetched?,
     links : Array(RawLink),
     baseline : Calibrate::DirBaseline?,
     hit : Bool,
-    confidence : Float64
+    confidence : Float64,
+    exchange : Exchange? = nil
 
   # The spider + brute-force engine. Single-threaded fiber scheduler (no -Dpreview_mt), so
   # the ORCHESTRATOR fiber owns all bookkeeping state (frontier/seen/templates/dirs/clusters)
@@ -399,7 +443,7 @@ module Gori::Discover
     @phase : Phase
     @seed_calibration_dir : String?
     @seed_baseline : Calibrate::DirBaseline?
-    @pending_seed_fetches : Array({Task, Calibrate::Fetched})
+    @pending_seed_fetches : Array({Task, Calibrate::Fetched, Exchange?})
 
     def initialize(seed_url : String, @words : Array(String), backend : Backend,
                    @config : Config, @scope : ScopePolicy = OpenScope.new)
@@ -462,7 +506,7 @@ module Gori::Discover
       @phase = Phase::Seeding
       @seed_calibration_dir = nil
       @seed_baseline = nil
-      @pending_seed_fetches = [] of {Task, Calibrate::Fetched}
+      @pending_seed_fetches = [] of {Task, Calibrate::Fetched, Exchange?}
     end
 
     def start : Nil
@@ -718,9 +762,9 @@ module Gori::Discover
         return
       end
       if @seed_calibration_dir && (task.source.robots? || task.source.sitemap?)
-        resolve_seed_finding(task, fetched)
+        resolve_seed_finding(task, fetched, oc.exchange)
       else
-        record_page(task, fetched)
+        record_page(task, fetched, oc.exchange)
       end
       expand_links(oc, task, fetched)
     end
@@ -773,7 +817,7 @@ module Gori::Discover
       end
       if oc.hit && oc.confidence >= @config.confidence_floor
         record_finding(Finding.new(oc.task.url, "GET", fetched.status, fetched.length,
-          fetched.content_type, Source::Bruteforced, oc.task.depth, oc.confidence, nil))
+          fetched.content_type, Source::Bruteforced, oc.task.depth, oc.confidence, nil), oc.exchange)
         s = fetched.status
         if s && s >= 200 && s < 300 && oc.task.depth < @config.max_depth
           enqueue_dir_from_url(oc.task.url, oc.task.depth + 1) # a hit that's a container → recurse
@@ -797,12 +841,12 @@ module Gori::Discover
       err == CappedBackend::CAP_ERROR || err == SCOPE_REFUSED
     end
 
-    private def record_page(task : Task, fetched : Calibrate::Fetched) : Nil
+    private def record_page(task : Task, fetched : Calibrate::Fetched, ex : Exchange?) : Nil
       s = fetched.status
       return unless s && (s < 400 || s == 401 || s == 403)
       conf = crawl_confidence(task.source, s)
       record_finding(Finding.new(task.url, "GET", s, fetched.length, fetched.content_type,
-        task.source, task.depth, conf, nil))
+        task.source, task.depth, conf, nil), ex)
     end
 
     private def crawl_confidence(source : Source, status : Int32) : Float64
@@ -822,37 +866,38 @@ module Gori::Discover
     # ready yet — its Calibrate task races this Fetch task — so an early arrival buffers here
     # until handle_calibrate delivers @seed_baseline; if the run stops before that ever
     # happens, the buffered entry is simply never counted (fail safe: no baseline, no claim).
-    private def resolve_seed_finding(task : Task, fetched : Calibrate::Fetched) : Nil
+    private def resolve_seed_finding(task : Task, fetched : Calibrate::Fetched, ex : Exchange?) : Nil
       if bl = @seed_baseline
-        record_seed_hit(task, fetched, bl)
+        record_seed_hit(task, fetched, bl, ex)
       else
-        @pending_seed_fetches << {task, fetched}
+        @pending_seed_fetches << {task, fetched, ex}
       end
     end
 
     private def flush_pending_seed_fetches : Nil
       return if @pending_seed_fetches.empty?
       return unless bl = @seed_baseline
-      @pending_seed_fetches.each { |task, fetched| record_seed_hit(task, fetched, bl) }
+      @pending_seed_fetches.each { |task, fetched, ex| record_seed_hit(task, fetched, bl, ex) }
       @pending_seed_fetches.clear
     end
 
     # Same hit/confidence gate handle_probe applies to a brute-forced wordlist entry.
-    private def record_seed_hit(task : Task, fetched : Calibrate::Fetched, bl : Calibrate::DirBaseline) : Nil
+    private def record_seed_hit(task : Task, fetched : Calibrate::Fetched, bl : Calibrate::DirBaseline,
+                                ex : Exchange?) : Nil
       hit, conf = Calibrate.hit?(bl, fetched)
       if hit && conf >= @config.confidence_floor
         record_finding(Finding.new(task.url, "GET", fetched.status, fetched.length, fetched.content_type,
-          task.source, task.depth, conf, nil))
+          task.source, task.depth, conf, nil), ex)
       else
         @calibrated_out += 1
       end
     end
 
-    private def record_finding(f : Finding) : Nil
+    private def record_finding(f : Finding, ex : Exchange? = nil) : Nil
       return unless @found_urls.add?(f.url)
       @found += 1
       bump_conf_hist(f.confidence)
-      @events.send(FindingEvent.new(f))
+      @events.send(FindingEvent.new(f, ex))
     end
 
     private def bump_conf_hist(c : Float64) : Nil
@@ -1075,7 +1120,7 @@ module Gori::Discover
       body = decode_body(raw)
       fetched = distill(raw, body)
       links = raw.error.nil? ? extract_links(task, fetched, body) : EMPTY_LINKS
-      Outcome.new(task, fetched, links, nil, false, 0.0)
+      Outcome.new(task, fetched, links, nil, false, 0.0, capture_exchange(task.url, raw))
     end
 
     # Pick the link extractor from the RESPONSE, not from how the URL was found. Only the
@@ -1113,14 +1158,41 @@ module Gori::Discover
     end
 
     private def process_probe(task : Task) : Outcome
-      fetched = distill_only(task.url)
+      raw = send_with_retries(task.url)
+      fetched = distill(raw, decode_body(raw))
       bl = task.baseline
       if bl
         hit, conf = Calibrate.hit?(bl, fetched)
-        Outcome.new(task, fetched, EMPTY_LINKS, nil, hit, conf)
+        # Only a HIT can become a finding, and `hit?` is decided right here in the worker — so
+        # a wordlist sweep keeps the bytes of the handful it found and forgets the thousands of
+        # soft-404s it did not, instead of shipping every miss's body through the channel for
+        # the orchestrator to drop.
+        Outcome.new(task, fetched, EMPTY_LINKS, nil, hit, conf, hit ? capture_exchange(task.url, raw) : nil)
       else
         Outcome.new(task, fetched, EMPTY_LINKS, nil, false, 0.0)
       end
+    end
+
+    # The exchange to keep for an outcome that may be recorded, or nil when there is nothing
+    # to keep (no response — an error, a refusal, or the request cap).
+    #
+    # The body is capped at `Settings.capture_max` HERE and not only at the store boundary,
+    # because between the two it travels through a channel: without the cap an 8 MiB response
+    # (`Body::CAPTURE_READ_MAX`) per queued finding is live at once, and the truncation would
+    # then be indistinguishable from a short response. `body_size` carries what the origin
+    # actually delivered so the store records it as truncated.
+    private def capture_exchange(url : String, raw : Repeater::Result) : Exchange?
+      resp = raw.response
+      return nil unless resp
+      p = Url.parse(url)
+      return nil unless p
+      target = p.query ? "#{p.path}?#{p.query}" : p.path
+      body = raw.body
+      size = body.try(&.size.to_i64)
+      max = Settings.capture_max
+      body = body[0, max].dup if body && body.size > max
+      Exchange.new(@capped.request_head(p.scheme, p.host, p.port, target),
+        resp, body, size, raw.incomplete?, raw.duration_us, @capped.sni)
     end
 
     private def send_with_retries(url : String) : Repeater::Result

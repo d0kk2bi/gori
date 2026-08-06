@@ -77,6 +77,25 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     discover_controller.discover_dismiss
   end
 
+  # Open the bytes behind the selected finding. CROSS-TAB mediator, and deliberately the SAME
+  # hop `sitemap_open_flow` makes from the neighbouring sub-tab: the run recorded the request
+  # it framed and the response the origin sent, the controller persisted them as an ordinary
+  # flow, and this drives the History controller + detail overlay to show it. The detail
+  # overlay's own navigation is gated on `@active_tab == :history`, so the tab switch is part
+  # of opening it, not a flourish — `esc` comes back out to History's list.
+  def discover_open_flow : Nil
+    return unless id = discover_controller.open_flow_target
+    if history_controller.view.open_detail_id(id, @session.store)
+      @active_tab = :history
+      @focus = :body
+      @overlay = OverlayKind::Detail
+    else
+      # The row carries an id the persist batch committed, so only a prune (or a retention
+      # sweep) between then and now lands here. Say that, rather than "nothing captured".
+      @toast = "that request was pruned since the run recorded it"
+    end
+  end
+
   def goto_discover : Nil
     focus_tab(:target)
     target_controller.select_discover

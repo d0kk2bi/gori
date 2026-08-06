@@ -181,7 +181,7 @@ module Gori
       # and marks the job but never unwinds out of engine.run.
       private def drain_discover_event(djob : DiscoverJob, ev : Discover::Event, base_ts : Int64) : Nil
         case ev
-        when Discover::FindingEvent then store_discover_finding(djob, ev.finding, base_ts)
+        when Discover::FindingEvent then store_discover_finding(djob, ev.finding, base_ts, ev.exchange)
         when Discover::ProgressEvent
           p = ev.progress
           djob.sent = p.sent; djob.found = p.found; djob.errors = p.errors; djob.queued = p.queued
@@ -217,13 +217,14 @@ module Gori
 
       # Buffer the finding for discover_results AND write it into the project so list_sitemap /
       # get_flow reflect it. A store write failure (lock/disk) must not kill the running scan.
-      private def store_discover_finding(djob : DiscoverJob, f : Discover::Finding, base_ts : Int64) : Nil
+      private def store_discover_finding(djob : DiscoverJob, f : Discover::Finding, base_ts : Int64,
+                                         exchange : Discover::Exchange? = nil) : Nil
         if djob.results.size < DISCOVER_MAX_STORED
           djob.results << f
         else
           djob.truncated = true
         end
-        pair = Discover::Persist.flow_pair(f, base_ts + djob.results.size)
+        pair = Discover::Persist.flow_pair(f, base_ts + djob.results.size, exchange)
         store.insert_import_batch([{pair.request, pair.response}])
       rescue
       end

@@ -7,5 +7,6 @@ abstract class Gori::Verb::ExecContext
   abstract def discover_stop : Nil         # stop the running Discover run
   abstract def discover_toggle_pause : Nil # pause / resume the running Discover run
   abstract def discover_dismiss : Nil      # drop the selected FINISHED run's row from the list
+  abstract def discover_open_flow : Nil    # open the selected finding's captured request/response
   abstract def goto_discover : Nil         # focus the Target tab's Discover sub-tab
 end
