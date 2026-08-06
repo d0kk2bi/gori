@@ -4,6 +4,7 @@ require "./screen"
 require "./theme"
 require "./frame"
 require "./layout"
+require "./mascot"
 require "./tutorial"
 require "../settings"
 
@@ -14,23 +15,30 @@ module Gori::Tui
   # `gori wizard`. A config-only tool — no Session/proxy/CA — so it just edits the
   # global Settings + live Theme, mirroring ProjectPicker's run-loop/render shape.
   #
-  # Steps: NETWORK (bind ip/port) → THEME (list + live preview) → REVIEW (recap + finish).
+  # Steps: NETWORK (bind ip/port) → THEME (list + live preview) → PET (Miss Ring) →
+  # REVIEW (recap + finish).
   #
   # Edits are STAGED in wizard-local fields and committed to Settings only on
   # finish, so "skip" (Esc) is coherent: it reverts the live theme preview to the
   # baseline, leaves Settings untouched, and persists once (materializing
   # settings.json so the wizard never auto-launches again).
   class SetupWizard
-    LABEL_W      =  9 # widest bind label ("Bind Port")
-    PREVIEW_W    = 30 # theme-preview panel width (two-column theme step)
-    PREVIEW_GAP  =  2
-    LIST_MIN     = 24 # minimum theme-list width before the preview is dropped
-    THEME_VP_MAX = 10 # most theme rows shown at once
+    # Miss Ring's stand in the PET step's card: the sprite plus a column of plate either
+    # side, held off the card's right border.
+    PET_PREVIEW_W   = Mascot::W + 2
+    PET_PREVIEW_GAP =  2 # min columns between the text column and her plate
+    LABEL_W         =  9 # widest bind label ("Bind Port")
+    PREVIEW_W       = 30 # theme-preview panel width (two-column theme step)
+    PREVIEW_GAP     =  2
+    LIST_MIN        = 24 # minimum theme-list width before the preview is dropped
+    THEME_VP_MAX    = 10 # most theme rows shown at once
 
     enum Step
       Bind       # bind ip/port
       Appearance # theme (named Appearance to avoid clashing with the Theme module)
-      Review     # recap + finish
+      Pet        # Miss Ring: on/off + motion (enum members are scoped to Step, so this
+      #            does NOT shadow Gori::Tui::Pet — which the wizard never touches anyway)
+      Review # recap + finish
     end
 
     def initialize(@term : Termisu)
@@ -51,6 +59,19 @@ module Gori::Tui
       @theme_scroll = 0
       @resized = false # forces a full repaint (resize OR a live theme swap)
       @running = false
+      # Pet step — STAGED, like every other choice here, and unlike the theme.
+      #
+      # The theme previews by mutating the LIVE Theme module and reverting on skip;
+      # Settings.theme is untouched until finish. There is no such separation for Miss
+      # Ring: `Settings.pet?` IS both the gate Pet#tick reads and the value that gets
+      # persisted, and `skip` calls Settings.save (to materialize settings.json) — so
+      # previewing her by flipping Settings.pet would persist whatever was live when the
+      # user pressed Esc. Hence a STATIC preview drawn straight from the pure Mascot art
+      # (render_pet below): no Pet instance, no tick, no gate to bypass, nothing to revert.
+      # The wizard doesn't need her to blink; it needs the user to see what they're
+      # turning on.
+      @pet_enabled = Settings.pet?
+      @pet_motion = Settings.pet_motion
       # Review step — offer a guided TUI tour after setup. `@launch_tutorial` is set
       # on finish and read by `run` (below) to launch the tour in this same terminal.
       @offer = :tour # :tour | :skip
@@ -100,6 +121,7 @@ module Gori::Tui
       case @step
       when Step::Bind       then handle_bind_key(ev)
       when Step::Appearance then handle_theme_key(ev)
+      when Step::Pet        then handle_pet_key(ev)
       when Step::Review     then handle_review_key(ev)
       end
     end
@@ -138,13 +160,34 @@ module Gori::Tui
     private def handle_theme_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
       if key.enter? || key.tab?
-        @step = Step::Review
+        @step = Step::Pet
       elsif key.back_tab?
         back_to_bind
       elsif key.up? || key.left?
         cycle_theme(-1)
       elsif key.down? || key.right?
         cycle_theme(1)
+      end
+    end
+
+    # Pet step: ↑/↓ pick the on/off ring; ←/→ flip her motion; ↵/⇥ next; ⇧⇥ back.
+    # Same split Review uses (ring on ↑/↓, the secondary choice on ←/→), so this step
+    # needs no focus ring either.
+    private def handle_pet_key(ev : Termisu::Event::Key) : Nil
+      key = ev.key
+      if key.enter? || key.tab?
+        @step = Step::Review
+      elsif key.back_tab?
+        @step = Step::Appearance
+      elsif key.up? || key.down?
+        @pet_enabled = !@pet_enabled
+      elsif (key.left? || key.right?) && @pet_enabled
+        # Motion is hers; with "No mascot" selected there is nothing to set a motion FOR,
+        # and the row is hidden in that state. Accepting the key anyway let a user who
+        # declined her still stage a non-default motion, which #finish would then persist —
+        # materializing a "pet" section in settings.json for someone who said no. Settings
+        # only omits that section while EVERY field is factory-default.
+        @pet_motion = @pet_motion == "calm" ? "lively" : "calm"
       end
     end
 
@@ -159,7 +202,7 @@ module Gori::Tui
       elsif key.left? || key.right?
         @modifier = @modifier == "alt" ? "ctrl" : "alt"
       elsif key.back_tab?
-        @step = Step::Appearance
+        @step = Step::Pet
       end
     end
 
@@ -250,6 +293,13 @@ module Gori::Tui
       Settings.bind_port = @port.strip.to_i? || Settings.bind_port
       Settings.theme = @theme_name
       Settings.command_modifier = Settings.normalize_command_modifier(@modifier)
+      # Miss Ring — the ONE place the wizard writes her, so Esc can never persist a preview.
+      # Motion is written only when she is ON: a user who declined her must not leave a
+      # non-default motion behind, which is what keeps a default install's settings.json
+      # free of a "pet" section entirely (Settings omits it only while every field is
+      # factory-default).
+      Settings.pet = @pet_enabled
+      Settings.pet_motion = Settings.normalize_pet_motion(@pet_motion) if @pet_enabled
       Settings.save
       @launch_tutorial = @offer == :tour # `run` launches the tour after the loop
       @running = false
@@ -310,6 +360,9 @@ module Gori::Tui
     # chrome, clamped to the space between the header and the hint. The ONE source of this
     # geometry — render and the mouse hit-tests share it.
     private def step_card(w : Int32, h : Int32) : Rect
+      # Only BIND uses the narrow card. Appearance needs room for the preview panel beside
+      # the list, Review's Shortcuts row spells out a chord family, and Pet holds her
+      # sprite's band back out of the same interior its copy runs across.
       cols = @step.bind? ? 64 : 84
       inner = {w - 4, cols}.min
       cw = {inner, 34}.max
@@ -326,7 +379,8 @@ module Gori::Tui
     private def content_rows : Int32
       case @step
       when Step::Bind   then 8 # heading, gap, ip, port, gap, 2 info lines, status
-      when Step::Review then 9 # title, gap, 3 recap rows, gap, offer prompt, 2 offer rows
+      when Step::Pet    then 7 # heading, gap, 2 offer rows, gap, motion row, info line
+      when Step::Review then 9 # title, gap, 4 recap rows, gap, 2 offer rows
       # ≥7 so the preview panel (header + 3 status rows) is never clipped, capped so a
       # long theme list scrolls (the list viewport derives from the card height) instead
       # of demanding the whole screen.
@@ -365,6 +419,7 @@ module Gori::Tui
       case @step
       when Step::Bind       then render_bind(screen, box)
       when Step::Appearance then render_theme(screen, box)
+      when Step::Pet        then render_pet(screen, box)
       when Step::Review     then render_review(screen, box)
       end
       render_footer(screen, w, h)
@@ -393,8 +448,9 @@ module Gori::Tui
 
     private def progress_label : String
       case @step
-      when Step::Bind       then "step 1 of 2"
-      when Step::Appearance then "step 2 of 2"
+      when Step::Bind       then "step 1 of 3"
+      when Step::Appearance then "step 2 of 3"
+      when Step::Pet        then "step 3 of 3"
       else                       "review"
       end
     end
@@ -403,6 +459,7 @@ module Gori::Tui
       case @step
       when Step::Bind       then "NETWORK · global default"
       when Step::Appearance then "THEME · appearance"
+      when Step::Pet        then "PET · Miss Ring"
       else                       "REVIEW"
       end
     end
@@ -411,9 +468,20 @@ module Gori::Tui
       hint = case @step
              when Step::Bind       then "↵ next · ↑/↓ field · esc skip"
              when Step::Appearance then "↑/↓ pick theme · ↵ next · ⇧⇥ back · esc skip"
+             when Step::Pet        then pet_footer_hint
              else                       "↑/↓ choose · ←/→ shortcuts · ↵ confirm · ⇧⇥ back · esc skip"
              end
       screen.text({(w - hint.size) // 2, 0}.max, h - 1, hint, Theme.muted, Theme.bg)
+    end
+
+    # ←/→ is only offered while she is on — it does nothing under "No mascot", and the
+    # motion row it drives is hidden there too.
+    private def pet_footer_hint : String
+      if @pet_enabled
+        "↑/↓ choose · ←/→ motion · ↵ next · ⇧⇥ back · esc skip"
+      else
+        "↑/↓ choose · ↵ next · ⇧⇥ back · esc skip"
+      end
     end
 
     private def render_bind(screen : Screen, box : Rect) : Nil
@@ -539,20 +607,77 @@ module Gori::Tui
       end
     end
 
+    # Miss Ring: an on/off ring, her motion, and a STATIC sprite of what "on" looks like.
+    #
+    # The sprite is drawn from Mascot directly — pure art, no Pet, no tick, no
+    # Settings.pet? gate (see @pet_enabled). It is the resting :idle frame with no badge
+    # and no glint: one honest still of her, rather than an animation the wizard would
+    # have to own a clock for.
+    private def render_pet(screen : Screen, box : Rect) : Nil
+      ix = box.x + 3
+      # Hold the sprite's column band back before laying out the text, so a line can never
+      # run under her — the same order Tutorial.step_card reserves her band in.
+      px = box.right - 2 - PET_PREVIEW_W
+      iw = {px - PET_PREVIEW_GAP - ix, 1}.max
+      screen.text(ix, box.y + 2, "A mascot in the corner, off unless you want her.",
+        Theme.text, Theme.panel, width: iw)
+      ry = box.y + 4
+      band = px - PET_PREVIEW_GAP # the accent band stops short of her plate
+      render_offer_row(screen, box, ry, "Show Miss Ring", @pet_enabled, band)
+      render_offer_row(screen, box, ry + 1, "No mascot", !@pet_enabled, band)
+      # Only while she is on — a motion row under "No mascot" offers a setting for
+      # something that isn't there, and its ←/→ hint would advertise a key that (rightly)
+      # does nothing in that state.
+      screen.text(ix, ry + 3, "Motion   #{pet_motion_recap}", Theme.muted, Theme.panel, width: iw) if @pet_enabled
+      # Say the cost out loud: she is the one piece of chrome that repaints while you are
+      # at the keyboard, which is why she is opt-in at all.
+      screen.text(ix, ry + 4, "She reacts to results, then dozes off after 90s idle.",
+        Theme.muted, Theme.panel, width: iw)
+      draw_pet_preview(screen, px, ry) if @pet_enabled
+    end
+
+    # Her plate is the card's own panel colour, so she sits ON the card rather than in a
+    # box of her own — which is how she is actually drawn everywhere else.
+    private def draw_pet_preview(screen : Screen, px : Int32, py : Int32) : Nil
+      pal = Mascot.palette(:info, Theme.panel)
+      frame = Mascot::Frame.new(pose: :idle)
+      Mascot::H.times do |i|
+        screen.cell(px, py + i, ' ', pal.plate, pal.plate)
+        screen.cell(px + 1 + Mascot::W, py + i, ' ', pal.plate, pal.plate)
+      end
+      Mascot.draw(screen, px + 1, py, frame, pal)
+    end
+
+    # Kept short enough to survive the 80-column case: the card is {w - 4, 84}.min, so an
+    # 80-column terminal leaves ~59 columns of interior once her band is held back.
+    private def pet_motion_recap : String
+      if @pet_motion == "calm"
+        "calm    (←/→ lively · adds winks and a glint)"
+      else
+        "lively  (←/→ calm · half the blinks, for SSH)"
+      end
+    end
+
     private def render_review(screen : Screen, box : Rect) : Nil
       ix = box.x + 3
       y = box.y + 2
       screen.text(ix, y, "You're all set!", Theme.text_bright, Theme.panel, width: {box.w - 6, 1}.max)
       y += 2
-      recap_labels = ["Proxy (global)", "Theme", "Shortcuts"]
+      recap_labels = ["Proxy (global)", "Theme", "Miss Ring", "Shortcuts"]
       vx = ix + recap_labels.max_of(&.size) + 2 # +2 = min visible gap before the value column
       recap(screen, box, ix, vx, y, "Proxy (global)", "#{effective_ip}:#{@port.strip}"); y += 1
       recap(screen, box, ix, vx, y, "Theme", @theme_name); y += 1
+      recap(screen, box, ix, vx, y, "Miss Ring", @pet_enabled ? "on · #{@pet_motion}" : "off"); y += 1
       # The only EDITABLE recap row (←/→). Spell out both the chords it moves and the
       # macOS caveat — a user who picks ⌥ without Option-as-Meta would see nothing happen.
       recap(screen, box, ix, vx, y, "Shortcuts", modifier_recap); y += 2
-      screen.text(ix, y, "New to gori? Take a quick tour of the TUI:", Theme.muted, Theme.panel, width: {box.w - 6, 1}.max)
-      y += 1
+      # No prompt line above the offer: the two rows below say "Take the guided tour" /
+      # "Skip — finish setup" in full, so "New to gori? Take a quick tour of the TUI:" was
+      # restating them. Dropping it is what keeps the Miss Ring recap row free — adding a
+      # fourth recap row otherwise pushed content_rows from 9 to 10, which moved the whole
+      # step's minimum height from 15 rows to 16. That is the worst row to lose: REVIEW is
+      # where `finish` lives, so a 15-row terminal could no longer commit the wizard at
+      # all (Esc skips without committing). Net rows are unchanged and the floor holds.
       render_offer_row(screen, box, y, "Take the guided tour", @offer == :tour); y += 1
       render_offer_row(screen, box, y, "Skip — finish setup", @offer == :skip)
     end
@@ -572,12 +697,19 @@ module Gori::Tui
     end
 
     # A selectable offer row (radio-style), mirroring the theme list's accent band.
-    private def render_offer_row(screen : Screen, box : Rect, ry : Int32, label : String, selected : Bool) : Nil
+    #
+    # `band_right` is where the accent band STOPS, defaulting to the card's inner edge.
+    # The Pet step passes her sprite's left edge: her plate is the card's panel colour, so
+    # a full-width band would run under her and she would read as a panel-coloured hole
+    # punched in the selected row rather than as a mascot standing beside it.
+    private def render_offer_row(screen : Screen, box : Rect, ry : Int32, label : String,
+                                 selected : Bool, band_right : Int32? = nil) : Nil
       bg = selected ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, ry, box.w - 2, 1), bg)
+      right = band_right || (box.right - 1)
+      screen.fill(Rect.new(box.x + 1, ry, {right - (box.x + 1), 1}.max, 1), bg)
       screen.cell(box.x + 1, ry, selected ? '▎' : ' ', Theme.accent, bg)
       screen.cell(box.x + 3, ry, selected ? '◉' : '◯', selected ? Theme.accent : Theme.muted, bg)
-      screen.text(box.x + 5, ry, label, selected ? Theme.text_bright : Theme.text, bg, width: {box.right - (box.x + 5) - 1, 1}.max)
+      screen.text(box.x + 5, ry, label, selected ? Theme.text_bright : Theme.text, bg, width: {right - (box.x + 5), 1}.max)
     end
   end
 end

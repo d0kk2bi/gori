@@ -738,7 +738,7 @@ This is deliberately **orthogonal to `GORI_HOME`**: it changes only which settin
 gori wizard
 ```
 
-Runs the interactive setup (global proxy bind default, then theme). Also runs automatically on first launch. The bind step writes the shared `settings.json` defaults. Projects can still pin their own address in the Project tab; `--listen` / `--port` override for one run only.
+Runs the interactive setup (global proxy bind default, then theme, then the Miss Ring mascot). Also runs automatically on first launch. The bind step writes the shared `settings.json` defaults. Projects can still pin their own address in the Project tab; `--listen` / `--port` override for one run only.
 
 ## gori tutorial
 

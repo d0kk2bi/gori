@@ -718,7 +718,7 @@ gori --config ~/profiles/corp.json          # 다른 설정으로 TUI 실행
 gori wizard
 ```
 
-대화형 설정(전역 프록시 바인드 기본값, 그다음 테마)을 실행합니다. 최초 실행 시에도 자동으로 실행됩니다. 바인드 단계는 공유 `settings.json` 기본값을 기록합니다. 프로젝트는 Project 탭에서 자체 주소를 고정할 수 있으며, `--listen` / `--port`는 이번 실행에 한해서만 오버라이드합니다.
+대화형 설정(전역 프록시 바인드 기본값, 테마, 그다음 Miss Ring 마스코트)을 실행합니다. 최초 실행 시에도 자동으로 실행됩니다. 바인드 단계는 공유 `settings.json` 기본값을 기록합니다. 프로젝트는 Project 탭에서 자체 주소를 고정할 수 있으며, `--listen` / `--port`는 이번 실행에 한해서만 오버라이드합니다.
 
 ## gori tutorial {#gori-tutorial}
 
