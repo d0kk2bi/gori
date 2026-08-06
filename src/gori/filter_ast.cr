@@ -363,6 +363,36 @@ module Gori
           i += run + 1
           next
         end
+        # `NOT (tag:x)` — same desugar, but the NOT sits before a GROUP. An LParen lexeme
+        # has `term == nil`, so the branch above never fired and the inner `tag:x` was
+        # taken UNNEGATED while `NOT ( )` fell into residual and folded away — Sitemap
+        # `NOT (tag:done)` then showed ONLY the tagged nodes, silently inverted, with no
+        # "invalid filter" note. Walk the group, apply the run's polarity to every taken
+        # term inside (XOR with a dash already on the leaf), and leave non-matching
+        # structure in the residual. Empty residual groups fold the same way as before.
+        if run > 0 && nxt && nxt.tok.l_paren?
+          j = i + run
+          depth = 0
+          while j < lexemes.size
+            lx = lexemes[j]
+            if lx.tok.l_paren?
+              depth += 1
+              kept << query[lx.start, lx.size]
+            elsif lx.tok.r_paren?
+              depth -= 1
+              kept << query[lx.start, lx.size]
+              j += 1
+              break if depth == 0
+            elsif (t = lx.term) && yield t
+              taken << (run.odd? ? t.negated : t)
+            else
+              kept << query[lx.start, lx.size]
+            end
+            j += 1
+          end
+          i = j
+          next
+        end
         lx = lexemes[i]
         t = lx.term
         if t && yield t

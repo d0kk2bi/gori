@@ -344,6 +344,19 @@ module Gori::Proxy
         end
       end
 
+      # The target every SCOPE/INTERCEPT gate below reads, from the ACTUALLY-SENT head (post
+      # Match&Replace). `Codec::Http1.gate_target` is `sent_req.target` on the common path and
+      # only recovers when the strict `split(' ')` could not frame the request line — a doubled
+      # space, a tab, or a leading blank line otherwise hands the gate `""` (or `"HTTP/1.1"`)
+      # while an origin that collapses whitespace still reads the real path, which is a Sandbox
+      # bypass. Read that method's comment; the wire bytes are untouched (P7).
+      #
+      # The RECORDED projection (`sent_req.target`, below) deliberately stays on the strict
+      # parse — `request_head` is byte-exact and `target` is a derived column — so for a
+      # malformed request line the History row's `target` does NOT reproduce this gate's input.
+      # That is the one case where the live gate and the Scope SQL filter over History disagree.
+      gate_target = Codec::Http1.gate_target(sent_req)
+
       # Sandbox: the hard scope gate. When enabled, ONLY requests the scope ALLOWS reach
       # upstream — everything else, including ALL traffic when no include rule is set, is
       # blocked HERE, before we touch (or even dial) the origin. Keyed on the ACTUALLY-SENT
@@ -351,7 +364,7 @@ module Gori::Proxy
       # We record the attempt as an aborted flow (visible in History) and answer the client
       # a distinct 403 so a sandbox block never reads like an upstream failure. The scope
       # URL is built lazily inside the interceptor, only while the sandbox is on.
-      if (ic = @interceptor) && ic.sandbox_blocks?(scheme, host, sent_req.target)
+      if (ic = @interceptor) && ic.sandbox_blocks?(scheme, host, gate_target)
         record_blocked_request(sent_req, scheme, host, port, created_at)
         write_sandbox_block
         return false
@@ -397,11 +410,12 @@ module Gori::Proxy
       # Intercept (request): hold only when enabled AND in scope. Holding buffers
       # the full body (vs streaming) so the human can see/edit it; the non-hold
       # path keeps zero-buffer streaming (P6). The gate builds the scope URL lazily
-      # (scheme || '://' || host || <stored target>, matching the Scope SQL filter over
-      # the SAME captured target) only when intercept + Scope are both on, so the common
+      # (scheme || '://' || host || <gate target>, which for a well-formed request line IS
+      # the captured target the Scope SQL filter sees — see `gate_target` above for the one
+      # case they part company) only when intercept + Scope are both on, so the common
       # capture-only path spends nothing here.
       if (ic = @interceptor) && ic.intercepts_request?(
-           method: sent_req.method, host: host, target: sent_req.target, scheme: scheme)
+           method: sent_req.method, host: host, target: gate_target, scheme: scheme)
         return handle_held_request(ic, req, sent_req, sent_head, host, port, scheme,
           created_at, started, req_framing, req_len)
       end
@@ -747,7 +761,8 @@ module Gori::Proxy
       # request that was captured + scope-gated), not the original `req`, so a `method:`/`path:`
       # rule that holds the request also holds its response when M&R changed the request line.
       if (ic = @interceptor) && ic.intercepts_response?(
-           method: sent_req.method, host: host, target: sent_req.target, scheme: scheme, status: resp.status) &&
+           method: sent_req.method, host: host, target: Codec::Http1.gate_target(sent_req),
+           scheme: scheme, status: resp.status) &&
          !resp_framing.close_delimited? && !sse?(resp) && resp.status != 101
         return handle_held_response(ic, upstream, req, sent_req, flow_id, host, port, scheme,
           resp, sent_resp_head, resp_framing, resp_len, ttfb, started)
@@ -803,8 +818,12 @@ module Gori::Proxy
           # scope on — a WebSocket message has no authority, scheme or path of its own. The
           # relay asks each lens ONCE, here, whether it can reach this host; a socket that
           # answers "no" to both keeps the byte-exact pump (P6/P7).
+          # `target` here is what `Interceptor#intercepts_ws?` scopes every message on, so it
+          # takes the same gate-side recovery as the two HTTP gates (see `gate_target`) —
+          # otherwise a handshake with a malformed request line hands the WS message gate an
+          # empty path and every frame on that socket escapes a path-scoped rule.
           ws_ctx = WS::Context.new(host: host, port: port, scheme: scheme,
-            method: sent_req.method, target: sent_req.target)
+            method: sent_req.method, target: Codec::Http1.gate_target(sent_req))
           # frames until close
           WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor, notice: ws_notice)
         else
@@ -871,8 +890,16 @@ module Gori::Proxy
         # RFC 9110 §15.2 / RFC 7231: a proxy MUST NOT forward a 1xx to an HTTP/1.0
         # client (it can't parse it). Read past it for everyone; forward only to 1.1.
         if req.version == "HTTP/1.1"
-          @io.write(resp_head) # forward byte-exact (P6/P7); no rewrite on interim
-          @io.flush
+          begin
+            @io.write(resp_head) # forward byte-exact (P6/P7); no rewrite on interim
+            @io.flush
+          rescue
+            # Client gone mid-1xx (Stop / max-time / RST). Every other exit from this
+            # method records on_response; an unguarded raise left the flow Pending forever.
+            @sink.on_response(FlowMapper.error_response(flow_id, "connection closed while forwarding interim 1xx response"))
+            release_upstream
+            return nil
+          end
         end
         resp_head = safe_read_head(upstream)
         if resp_head.nil?
@@ -1130,28 +1157,41 @@ module Gori::Proxy
       # forwarded unedited (whose Content-Length describes the entity, not the bytes).
       out_head, out_body = split_message(decision.bytes)
       sent_resp = Codec::Http1.parse_response_head(out_head)
-      @io.write(out_head)
-      @io.write(out_body) if out_body
-      @io.flush
-      # The operator's bytes are what the client got, so they are what a binding must agree
-      # with (P4) — and a DROPPED response never reaches here at all, because the client never
-      # received it. `decision.bytes` is a complete message, so its body half is already the
-      # entity (the editor synced Content-Length); an empty one is a body we have, not a body
-      # gori withheld, hence `Bytes.empty` rather than nil.
-      observe_delivered(extract_ref_for(sent_req, host, scheme, sent_resp.status, flow_id),
-        out_head, out_body || Bytes.empty)
+      delivered = true
+      begin
+        @io.write(out_head)
+        @io.write(out_body) if out_body
+        @io.flush
+      rescue
+        # Client gone while we held the response (navigated away / Stop). The non-held
+        # stream path already rescues this as Aborted; without the rescue the raise
+        # unwound to run's blanket rescue and left the flow Pending forever — the
+        # invariant this file states four times ("record + close, never unwind").
+        delivered = false
+      end
       stored, trunc, size = capped(out_body)
-      @sink.on_response(FlowMapper.response(sent_resp,
-        flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-        body_truncated: trunc, body_size: size))
+      if delivered
+        # The operator's bytes are what the client got, so they are what a binding must agree
+        # with (P4) — and a DROPPED response never reaches here at all, because the client never
+        # received it. `decision.bytes` is a complete message, so its body half is already the
+        # entity (the editor synced Content-Length); an empty one is a body we have, not a body
+        # gori withheld, hence `Bytes.empty` rather than nil.
+        observe_delivered(extract_ref_for(sent_req, host, scheme, sent_resp.status, flow_id),
+          out_head, out_body || Bytes.empty)
+        @sink.on_response(FlowMapper.response(sent_resp,
+          flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
+          body_truncated: trunc, body_size: size))
+      else
+        @sink.on_response(FlowMapper.response(sent_resp,
+          flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
+          body_truncated: trunc, body_size: size,
+          state: Store::FlowState::Aborted, error: "connection closed while forwarding held response"))
+      end
       # Reuse the upstream iff we read the WHOLE body cleanly AND the origin kept its
       # side alive. Origin side keys on sent_req (what the origin received); the CLIENT
       # keep-alive (return value) uses the edited resp.
       update_upstream_reuse(resp_complete && origin_keep_alive?(sent_req, resp, resp_framing))
-      # A truncated upstream body was forwarded short — close the client connection so it
-      # sees end-of-response instead of blocking for the missing bytes while we read its
-      # next keep-alive request (mirrors the non-held path's resp_complete guard).
-      return false unless resp_complete
+      return false unless delivered && resp_complete
       # The human may have edited the held response into conflicting framing (CL+TE); the
       # response was already forwarded + recorded above, so recompute the client-side framing
       # defensively — a raw response_framing raise here would unwind to run's blanket rescue

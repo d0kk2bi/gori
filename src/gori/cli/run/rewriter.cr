@@ -64,15 +64,18 @@ module Gori
         db_path : String? = nil
         project_name : String? = nil
         format = :text
+        leftover = [] of String
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run rewriter extract [list] [options]"
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.unknown_args { |rest, _| leftover = rest }
           p.invalid_option { |f| abort "gori run rewriter extract: unknown option: #{f}\n#{p}" }
         end
         parser.parse(args)
+        refuse_list_leftovers(leftover, "rewriter extract", "add, rm/delete, enable, disable")
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin
@@ -293,6 +296,7 @@ module Gori
         db_path : String? = nil
         project_name : String? = nil
         format = :text
+        leftover = [] of String
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run rewriter [options]\n\n" \
@@ -304,10 +308,12 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.unknown_args { |rest, _| leftover = rest }
           p.invalid_option { |f| abort "gori run rewriter: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run rewriter: missing value for #{f}" }
         end
         parser.parse(args)
+        refuse_list_leftovers(leftover, "rewriter", "add, rm/delete, enable, disable, preview, extract, bindings")
 
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)

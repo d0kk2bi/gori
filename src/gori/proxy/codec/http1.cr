@@ -168,6 +168,47 @@ module Gori::Proxy::Codec::Http1
     {parts[0]? || "", parts[1]? || "", parts.size != 3 || start == H2_PREFACE_LINE}
   end
 
+  # The request-target the SCOPE GATE reads — NOT what goes on the wire.
+  #
+  # `parse_request_head`'s strict `split(' ')` is right for the forwarding path and must stay:
+  # it feeds `resolve_forward`/`rewrite_request_line`, whose `version` is `parts[2]`, so making
+  # the parse lenient would rebuild a doubled-space `GET  http://x/y HTTP/1.1` as
+  # `GET /y http://x/y` — gori corrupting the operator's bytes (P7). But the same strictness
+  # hands the GATE a target of `""` (doubled space / leading blank line) or of `"HTTP/1.1"`
+  # (a tab between method and target), and an origin that collapses whitespace still reads the
+  # real path. That gap is a Sandbox/scope BYPASS: with `include host:acme.test` +
+  # `exclude string:/admin` and Sandbox on, `GET  /admin HTTP/1.1` evaluated as
+  # `http://acme.test` misses the exclude and reaches the origin, while `GET /admin HTTP/1.1`
+  # is 403'd. Verified end-to-end against 0.2.0.
+  #
+  # `Outbound` fixed exactly this on the gori-originated side (#491); this is the same
+  # predicate's ONE home, which `Outbound.request_target` now delegates to rather than
+  # re-deriving next to its own caller (the shape AGENTS.md flags as thrice-recurring).
+  # The bytes still reach the wire byte-exact — only what the gate READS changes.
+  #
+  # Recovery is skipped on the common path: a well-formed line's `target` is returned as-is,
+  # so the gate stays allocation-free (P6).
+  def self.gate_target(req : RawRequest) : String
+    return req.target unless req.malformed? || req.target.empty?
+    request_target_line(String.new(req.raw_head))
+  end
+
+  # Read the request-TARGET off the request line — but from the first NON-BLANK line, not
+  # blindly the first line. A raw request may arrive with LEADING BLANK LINE(S) (an operator's
+  # authored bytes, or a peer that emits an empty line before the request-line, which RFC 9112
+  # §2.2 tells a recipient to ignore); reading the first line blindly then gates the innocuous
+  # "/" while the REAL target sits on a later line and goes on the wire.
+  #
+  # The no-arg `split` collapses whitespace RUNS and drops empty parts, so a doubled space or a
+  # tab recovers the real target; a line with no target (or an all-blank input) degrades to "/".
+  def self.request_target_line(text : String) : String
+    text.each_line do |line|
+      next if line.strip.empty? # skip a leading blank / whitespace-only line (incl. a bare "\r")
+      return line.split[1]? || "/"
+    end
+    "/"
+  end
+
   def self.parse_response_head(raw : Bytes) : RawResponse
     first_crlf = index_crlf(raw, 0)
     start = String.new(raw[0, first_crlf || raw.size])

@@ -180,6 +180,68 @@ describe F::ConnPool do
         req("POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")).should be_false
     end
 
+    it "refuses a chunked body whose DATA forges the zero-chunk suffix" do
+      # The whole reason `reusable_request?` walks the chunk framing instead of comparing a
+      # 5-byte suffix. Chunk size 5, data `AB0\r\n`: the wire ends with `0\r\n\r\n` and carries
+      # NO terminating zero-chunk, so the origin sits waiting for the next chunk-size line and
+      # reads whatever gori pipelines next as this body's continuation — gori smuggling a
+      # request into its own target, out of its own pool.
+      F::ConnPool.reusable_request?(
+        req("POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nAB0\r\n\r\n")).should be_false
+      # Same forgery one chunk further in, after an honest chunk has been walked.
+      F::ConnPool.reusable_request?(
+        req("POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n" \
+            "2\r\nhi\r\n5\r\nAB0\r\n\r\n")).should be_false
+    end
+
+    it "refuses a chunked body with bytes AFTER its terminator" do
+      # Trailing octets are the mirror smuggle: the origin stops at the zero-chunk and the
+      # remainder becomes the head of the next request on the socket.
+      F::ConnPool.reusable_request?(
+        req("POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /x HTTP/1.1\r\n\r\n")).should be_false
+    end
+
+    it "refuses a chunk-size line the origin would read differently" do
+      # `parse_chunk_size`'s rules, reached through the walker: a signed size, a non-hex size,
+      # a size larger than the body actually carries, and one that does not even fit Int32 —
+      # `parse_chunk_size` accepts any non-negative Int64 hex, so the walker has to reject an
+      # over-long size rather than walk its cursor past the buffer.
+      {
+        "+5\r\nhello\r\n0\r\n\r\n",
+        "z\r\nhello\r\n0\r\n\r\n",
+        "99\r\nhello\r\n0\r\n\r\n",
+        "7FFFFFFFFF\r\nhello\r\n0\r\n\r\n",
+        "7FFFFFFFFFFFFFFF\r\nhello\r\n0\r\n\r\n",
+      }.each do |body|
+        F::ConnPool.reusable_request?(
+          req("POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n#{body}")).should be_false
+      end
+    end
+
+    it "answers an over-long chunk size without raising out of the codec" do
+      # `reusable_request?` has a blanket rescue, so an escaping OverflowError would still read as
+      # "not reusable" there — but `Codec::Body.chunked_complete?` is public on the codec now and
+      # a caller without that rescue must not inherit a crash.
+      Gori::Proxy::Codec::Body.chunked_complete?(
+        "7FFFFFFFFFFFFFFF\r\nhello\r\n0\r\n\r\n".to_slice).should be_false
+      Gori::Proxy::Codec::Body.chunked_complete?("5\r\nhello\r\n0\r\n\r\n".to_slice).should be_true
+    end
+
+    it "still accepts the legitimate chunked shapes the walker has to keep passing" do
+      # Regression guard on the tightening: chunk extensions, a trailer field, multiple chunks
+      # and a bare-LF chunk terminator are all things `copy_chunked` frames successfully, so
+      # refusing them would have quietly dropped the pool back to one connection per request.
+      {
+        "5;name=v\r\nhello\r\n0\r\n\r\n",
+        "5\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n",
+        "2\r\nhi\r\n3\r\nthe\r\n0\r\n\r\n",
+        "5\nhello\n0\n\n",
+      }.each do |body|
+        F::ConnPool.reusable_request?(
+          req("POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n#{body}")).should be_true
+      end
+    end
+
     it "refuses bytes with no complete head" do
       F::ConnPool.reusable_request?(req("GET /a HTTP/1.1\r\nHost: h\r\n")).should be_false
     end

@@ -15,7 +15,10 @@ module Gori::Settings
   class_property? discover_prefs_saved : Bool = false
 
   private def self.parse_discover_prefs(node : JSON::Any?) : Nil
-    obj = node.try(&.as_h?)
+    # ABSENT (nil) leaves the live prefs alone — same import_document hole as mine
+    # (see parse_mine_prefs). Present-but-not-an-object still clears.
+    return if node.nil?
+    obj = node.as_h?
     unless obj
       self.discover_prefs_saved = false
       return

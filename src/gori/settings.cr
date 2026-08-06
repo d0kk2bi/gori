@@ -119,8 +119,28 @@ module Gori
       nil
     end
 
+    # The section node at `key`, but ONLY when it is a JSON OBJECT — nil for a scalar, an array
+    # or null. `JSON::Any#[]?(String)` RAISES on a non-object ("Expected Hash for
+    # #[]?(key : String), not String"), and a raise inside `apply_sections` abandons every
+    # section BELOW it: `Settings.load`'s blanket rescue then returns with `env` (vars AND their
+    # token VALUES), `hostname_overrides`, `scan_rules`, `oast_providers`, `hotkeys`, `listeners`,
+    # `retention` and the rest at factory defaults, and the first later `save` writes those
+    # defaults OVER the operator's file. That is the shipped failure #594 fixed, reached through a
+    # different coercion: one `"editor": "nvim"` — or a `gori settings import` of a profile with
+    # one, since `CLI` validates only that the TOP level is an object — was enough.
+    #
+    # Returns `JSON::Any` rather than the unwrapped Hash so the section bodies and their
+    # `load_bool` / `parse_tls_passthrough` helpers keep their existing signatures. The sections
+    # whose parse helper already begins `node.try(&.as_h?)` were never exposed; these four
+    # dereferenced the node directly.
+    private def self.object_section(root : JSON::Any, key : String) : JSON::Any?
+      node = root[key]?
+      node && node.as_h? ? node : nil
+    end
+
     protected def self.apply_sections(root : JSON::Any) : Nil
-      if net = root["network"]?
+      # All four of these dereference their node directly — see `object_section`.
+      if net = object_section(root, "network")
         self.bind_host = net["bind_host"]?.try(&.as_s?) || bind_host
         self.bind_port = int_field(net, "bind_port") || bind_port
         self.upstream_proxy = net["upstream_proxy"]?.try(&.as_s?) || upstream_proxy
@@ -135,7 +155,7 @@ module Gori
       self.theme = root["theme"]?.try(&.as_s?) || theme # validated against the known themes by Theme.apply
       self.mouse = load_bool(root, "mouse", mouse)
       self.pretty_bodies_default = load_bool(root, "pretty_bodies", pretty_bodies_default)
-      if ed = root["editor"]?
+      if ed = object_section(root, "editor")
         self.editor = ed["command"]?.try(&.as_s?) || editor
         self.editor_markdown = load_bool(ed, "markdown", editor_markdown)
       end
@@ -149,11 +169,11 @@ module Gori
       self.scan_rules = parse_scan_rules(root["scan_rules"]?)
       self.oast_providers = parse_oast_providers(root["oast_providers"]?)
       parse_hotkeys(root["hotkeys"]?)
-      if cv = root["decoder"]?
+      if cv = object_section(root, "decoder")
         self.decoder_sessions = parse_decoder_sessions(cv["sessions"]?)
         self.decoder_chains = parse_decoder_chains(cv["chains"]?)
       end
-      if rw = root["rewriter"]?
+      if rw = object_section(root, "rewriter")
         self.rewriter_presets = parse_rewriter_presets(rw["presets"]?)
       end
       parse_mine_prefs(root["mine"]?)

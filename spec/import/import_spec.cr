@@ -993,6 +993,21 @@ describe Gori::Import::Builder do
       head.should contain("Transfer-Encoding: chunked\r\n")
     end
 
+    it "does not invent a Content-Length on a response that stated no framing" do
+      empty = Gori::Import::Builder::Headers.new
+      # Close-delimited / bodyless 304 / HTTP/2 DATA-framed: no CL on the wire.
+      head = String.new(Gori::Import::Builder.response_head("HTTP/1.1", 304, "Not Modified",
+        empty, nil))
+      head.should_not contain("Content-Length")
+      head = String.new(Gori::Import::Builder.response_head("HTTP/1.1", 200, "OK", empty,
+        "<html>".to_slice))
+      head.should_not contain("Content-Length")
+      head = String.new(Gori::Import::Builder.response_head("HTTP/2", 200, "", empty,
+        %({"a":1}).to_slice))
+      head.should_not contain("Content-Length")
+      head.should eq("HTTP/2 200\r\n\r\n") # no trailing space on empty reason
+    end
+
     # The complements: each framing ALONE keeps the behaviour the surrounding comments
     # describe, so "keep both" cannot be read as "keep whatever the source said".
     it "still drops a Content-Length that stands alone and re-states the real one" do
@@ -1105,7 +1120,8 @@ describe Gori::Import::Builder do
     it "does NOT rescue a body that was never chunk framing to begin with" do
       # The complement, and the reason the relaxation is bounded: a DECODED body a
       # third-party HAR shipped under a Transfer-Encoding header still loses the header,
-      # truncation flag or no truncation flag.
+      # truncation flag or no truncation flag. No CL is invented either — fabricating one
+      # would change a close-delimited (or unframed) entity into length-framed (P7).
       headers = Gori::Import::Builder::Headers.new
       headers << {"Transfer-Encoding", "chunked"}
       empty = Gori::Import::Builder::Headers.new
@@ -1114,7 +1130,7 @@ describe Gori::Import::Builder do
         headers, "hello world".to_slice, "text/plain", nil, nil, 5_000_i64)
       head = String.new(pair.response.not_nil!.head)
       head.should_not contain("Transfer-Encoding")
-      head.should contain("Content-Length: 11\r\n")
+      head.should_not contain("Content-Length")
     end
 
     it "does NOT relax the walk for an UNtruncated body" do

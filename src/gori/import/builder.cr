@@ -362,8 +362,14 @@ module Gori
         reject_inject!(reason, "reason phrase")
         reject_header_injection!(headers)
         String.build do |b|
-          b << http_version << ' ' << status << ' ' << reason << "\r\n"
-          has_cl = false
+          # HTTP/2 status lines carry no reason phrase on the wire; inventing "OK" (or a
+          # trailing space after an empty reason) broke the export→import fixed point for
+          # every h2 flow. Omit the phrase when empty rather than force a space.
+          if reason.empty?
+            b << http_version << ' ' << status << "\r\n"
+          else
+            b << http_version << ' ' << status << ' ' << reason << "\r\n"
+          end
           wire_chunked = wire_chunked?(headers, body, truncated)
           # A response stating both framings keeps both, for the reason `both_framings?`
           # gives: the pair is the operator's evidence, and a response desync is the same
@@ -371,11 +377,13 @@ module Gori
           both = both_framings?(headers)
           headers.each do |k, v|
             next if !both && !wire_chunked && transfer_encoding?(k)
-            has_cl = true if !has_cl && k.compare("content-length", case_insensitive: true) == 0
             b << k << ": " << v << "\r\n"
           end
-          # See `wire_chunked?`: a length only where the body is not chunk-framed as stored.
-          b << "Content-Length: " << (body.try(&.size) || 0) << "\r\n" unless has_cl || wire_chunked
+          # Do NOT invent a Content-Length the source never stated. Close-delimited replies,
+          # bodyless 304/204, and every HTTP/2 head (DATA-framed, no CL) had one fabricated
+          # here, so re-import silently changed framing (P7) and broke export→import. An
+          # incoming CL is kept by the headers loop above; chunked bodies keep TE via
+          # wire_chunked; truncation is already carried by body_size on the DTO.
           b << "\r\n"
         end.to_slice
       end

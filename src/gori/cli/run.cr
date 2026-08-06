@@ -394,6 +394,16 @@ module Gori
       # would ship a token minutes-to-days stale into the run and produce the page of 401s the
       # feature exists to remove.
 
+      # The {scheme, host, target} `guard_outbound` judges a `--bind-from` seed by. Named rather
+      # than inlined so the decision is spec-able without a live send, the way
+      # `repeater_out_of_scope?` is for `gori run repeater`. The target comes from
+      # `Outbound.request_target` — the one home for reading a request-target off raw bytes,
+      # which recovers it from an irregular request line instead of gating an empty path.
+      private def self.bind_from_scope_triple(built : Repeater::FlowRequest::Built) : {String, String, String}
+        scheme, host, _port = Repeater::FlowRequest.parse_target(built.target)
+        {scheme, host, Gori::Outbound.request_target(built.bytes)}
+      end
+
       # Replay flow `flow_id` through `Repeater::Sender` — the one extraction source — so its
       # response can fill the binding table before the sweep starts. Aborts on anything that
       # leaves the table unfilled: a seed that silently did nothing would hand the operator
@@ -419,6 +429,17 @@ module Gori
         if err = bind_from_blocker(bindings)
           abort "#{cmd}: #{err}"
         end
+        # Layer 1, on the SEED's own host — which is not the sweep's. Each command guards its
+        # `--target` with `guard_outbound` before it gets here, but `--bind-from FLOW-ID` names
+        # a second, unrelated destination: whatever host that capture was taken from. Without
+        # this the seed replayed a full captured request — cookies and all — to an out-of-scope
+        # host that the very same invocation would have refused as a `--target`, and only
+        # Sandbox/excludes (Layer 2, inside `Repeater::Sender`) could stop it. `Outbound` exists
+        # so no active request leaves gori without a scope decision; a replay is an active
+        # request. `--allow-unscoped` still waives it, exactly as it does for the sweep.
+        # Same gap, same shape, and the same fix as #406 gave `gori run repeater`.
+        gs, gh, gt = bind_from_scope_triple(built)
+        guard_outbound(outbound, gs, gh, gt, "#{cmd}: --bind-from")
         # `evidence: true` is not conditional here and cannot be: `built` is
         # `Repeater::FlowRequest.build(detail)`, which reads `request_head`/`request_body` and
         # nothing else, and the operator supplied one integer. There is no draft on this path
@@ -535,6 +556,33 @@ module Gori
         {hits, rest}
       end
 
+      # The QL `gori run history`/`ls` actually runs, plus the positional terms an explicit
+      # `--query` swallowed (nil when none were).
+      #
+      # `--query` wins over a POSITIONAL query — but NOT over a negation term, and the difference
+      # is provenance. A positional is a second spelling of the same argument, so letting the
+      # explicit flag win is a choice. A `-path:/b` is not: OptionParser would have aborted it as
+      # an unknown option, so `split_ql_negations` reclassified it out of argv on the operator's
+      # behalf — and the old `query ||= (positional + neg_terms).join` then threw it away
+      # whenever `--query` was also given. Measured with 3 flows: `history 'host:x' '-path:/b'`
+      # returned the two that match, `history --query='host:x' '-path:/b'` returned all three.
+      # A silently BROADER result set is the one outcome `warn_query_terms` exists to shout
+      # about, and the dropped term never reached it either. Spaces are QL's AND, which the
+      # positional join already assumed.
+      #
+      # Returned rather than aborted so the caller owns the message, and named rather than
+      # inlined so the precedence is spec-able without a store or a tty.
+      def self.compose_history_query(query : String?, positional : Array(String),
+                                     neg_terms : Array(String)) : {String?, String?}
+        if q = query
+          combined = neg_terms.empty? ? q : ([q] + neg_terms).join(' ')
+          {combined, positional.empty? ? nil : positional.join(' ')}
+        else
+          pq = (positional + neg_terms).join(' ')
+          {pq.empty? ? nil : pq, nil}
+        end
+      end
+
       # QL negation terms ("-field:value" / "-field~rx") begin with '-', so OptionParser
       # aborts them as unknown options before the positional-query join ever runs. Pull
       # them out first so they join the query like any other positional term. A single-
@@ -571,6 +619,31 @@ module Gori
           end
         end
         out
+      end
+
+      # Refuse the positionals a LIST command was handed. A `list` takes none, but every
+      # `rewriter`/`probe rules` dispatcher routes a first token starting with '-' straight to
+      # its list command on the assumption that the rest are list options — so a global flag
+      # written BEFORE the verb (`rewriter --project=t1 rm 1`, the ordering every other
+      # `gori run` command accepts) discarded the verb AND its id, listed the rules, and exited
+      # 0. A destructive mutation that silently no-ops with a SUCCESS status is the failure this
+      # file's own header (see the `verb_token?` guards) calls the worst one a scripted surface
+      # can have, so it becomes a usage error that names the ordering.
+      private def self.refuse_list_leftovers(leftover : Array(String), sub : String,
+                                             verbs : String) : Nil
+        (msg = list_leftover_error(leftover, sub, verbs)) && abort(msg)
+      end
+
+      # The sentence `refuse_list_leftovers` aborts with, or nil to proceed. Split out so the
+      # decision AND the message are spec-able — `abort` is not, and this is the one fix of the
+      # three whose blast radius is several call sites (`cmd_rewriter_list`, `cmd_extract_list`,
+      # `cmd_probe_rules_list`) plus one DELIBERATE exclusion: `cmd_probe_scan` takes a positional
+      # QL query (`gori run probe [QL query]`), so a leftover there is the operator's filter, not
+      # a discarded verb. Do not add this to it.
+      def self.list_leftover_error(leftover : Array(String), sub : String, verbs : String) : String?
+        return nil if leftover.empty?
+        "gori run #{sub}: unknown subcommand '#{leftover[0]}' — global flags go AFTER " \
+        "the subcommand (`gori run #{sub} #{leftover[0]} … --project=NAME`). Verbs: #{verbs}"
       end
 
       private def self.take_flow_id(rest : Array(String), sub : String) : Int64

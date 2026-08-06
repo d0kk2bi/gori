@@ -164,3 +164,30 @@ describe Gori::Tui::Tutorial do
     end
   end
 end
+
+# The tour's fake palette is filterable, so its row list can be EMPTY — and the ↑ arm took its
+# modulo before checking, so `gori tutorial` → palette step → `^P` → type a non-matching
+# character → ↑ died with an unhandled DivisionByZeroError. Both arrows now go through one
+# helper; these are the cases that used to differ between them.
+describe "Gori::Tui::Tutorial.wrap_sel" do
+  it "returns 0 for an empty list instead of dividing by zero" do
+    Gori::Tui::Tutorial.wrap_sel(0, -1, 0).should eq(0)  # the crash
+    Gori::Tui::Tutorial.wrap_sel(0, +1, 0).should eq(0)  # the arm that was already guarded
+    Gori::Tui::Tutorial.wrap_sel(7, -1, 0).should eq(0)  # a stale selection, list filtered away
+    Gori::Tui::Tutorial.wrap_sel(3, +1, -1).should eq(0) # defensive: n can never be < 0, but 0 is the answer
+  end
+
+  it "wraps both directions over a non-empty list" do
+    Gori::Tui::Tutorial.wrap_sel(0, -1, 4).should eq(3) # floored %, so ↑ from the top goes to the end
+    Gori::Tui::Tutorial.wrap_sel(3, +1, 4).should eq(0)
+    Gori::Tui::Tutorial.wrap_sel(1, -1, 4).should eq(0)
+    Gori::Tui::Tutorial.wrap_sel(1, +1, 4).should eq(2)
+  end
+
+  it "lands in range even when the selection is already past the end" do
+    # `render_fake_palette` clamps for drawing, but the state itself must not stay out of range.
+    Gori::Tui::Tutorial.wrap_sel(9, +1, 3).should be < 3
+    Gori::Tui::Tutorial.wrap_sel(9, -1, 3).should be < 3
+    Gori::Tui::Tutorial.wrap_sel(1, +1, 1).should eq(0)
+  end
+end

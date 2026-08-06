@@ -467,9 +467,13 @@ module Gori::Repeater
         # mid-message, so whatever runs next on this connection is misframed.
         body.to_i64 == len
       in Proxy::Codec::BodyFraming::Chunked
-        # A chunked body is reusable only if it actually terminates here. Cheap exact test:
-        # the wire form must end with the zero-chunk + (empty) trailer section.
-        ends_with?(bytes, "0\r\n\r\n".to_slice)
+        # A chunked body is reusable only if it actually terminates here — WALKED, not
+        # suffix-matched. `ends_with?(bytes, "0\r\n\r\n")` looks like an exact test and is a
+        # forgery: a chunk whose own DATA ends `0\r\n` (e.g. `5\r\nAB0\r\n\r\n`) produces that
+        # suffix with no zero-chunk anywhere, so the origin stayed mid-body and the next
+        # request off this pooled socket became its continuation chunks. See
+        # `Codec::Body.chunked_complete?`, which frames by the same rules `copy_chunked` uses.
+        Proxy::Codec::Body.chunked_complete?(bytes[head_len, body])
       in Proxy::Codec::BodyFraming::CloseDelimited
         false # responses only, but the enum is exhaustive
       end
@@ -540,11 +544,6 @@ module Gori::Repeater
         i += 1
       end
       nil
-    end
-
-    private def self.ends_with?(bytes : Bytes, suffix : Bytes) : Bool
-      return false if bytes.size < suffix.size
-      bytes[(bytes.size - suffix.size), suffix.size] == suffix
     end
   end
 end

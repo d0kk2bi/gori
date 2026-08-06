@@ -280,8 +280,8 @@ describe Gori::Decoder do
     # intact (matching Python idna, which nameprep-maps only non-ASCII labels).
     it "punycode-encode leaves an all-lowercase IDN and a pure-ASCII label exactly as before" do
       conv("punycode-encode", "münchen.de").should eq "xn--mnchen-3ya.de" # all-lowercase: same as today
-      conv("punycode-encode", "PAYPAL.com").should eq "PAYPAL.com"         # pure ASCII: case preserved
-      conv("punycode-encode", "Example.COM").should eq "Example.COM"       # pure ASCII, mixed: untouched
+      conv("punycode-encode", "PAYPAL.com").should eq "PAYPAL.com"        # pure ASCII: case preserved
+      conv("punycode-encode", "Example.COM").should eq "Example.COM"      # pure ASCII, mixed: untouched
     end
   end
 
@@ -797,6 +797,15 @@ describe Gori::Decoder do
         reg["selfref"].unusable.not_nil!.should contain "recursive"
         # A built-in is never unusable.
         reg["upper"].unusable.should be_nil
+      end
+    end
+
+    it "marks a saved chain with an unknown converter token unusable" do
+      # Left as typed, this registered with unusable:nil so Fuzz::Plan's pre-dial
+      # refusal never fired and apply_chains sent the payload untransformed.
+      with_library([{"myenc", "url-encode > nosuchthing"}]) do |reg|
+        reg["myenc"].unusable.not_nil!.should contain "unknown converter"
+        reg["myenc"].unusable.not_nil!.should contain "nosuchthing"
       end
     end
 

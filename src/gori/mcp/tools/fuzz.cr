@@ -49,6 +49,10 @@ module Gori
       # never leave the job wedged at :running, which would hang a polling client
       # forever and keep jobs_running? true (blocking switch_project/delete_project).
       private def run_fuzz_job(fjob : FuzzJob, engine : Fuzz::Engine) : Nil
+        # CLI (`--ac`) and the TUI both call calibrate_baseline before the sweep.
+        # fuzz_config already set Config/Matcher.auto_calibrate from the arg, but nothing
+        # here ever sampled — so auto_calibrate:true was a documented silent no-op.
+        engine.calibrate_baseline if engine.auto_calibrate?
         engine.run { |ev| drain_fuzz_event(fjob, ev) }
       rescue ex
         Log.error(exception: ex) { "fuzz job #{fjob.id} crashed" }

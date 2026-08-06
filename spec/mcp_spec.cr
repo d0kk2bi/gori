@@ -1524,6 +1524,27 @@ describe Gori::MCP::Server do
       end
     end
 
+    it "save_as_repeater keeps the source SNI and does not force auto_content_length on" do
+      with_store do |store|
+        port = start_mcp_http_origin("ok")
+        # Seed a repeater with an SNI and auto_cl OFF (byte-exact / CL-desync probe).
+        rid = store.insert_repeater(
+          target: "http://127.0.0.1:#{port}",
+          request: "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice,
+          http2: false, auto_cl: false, flow_id: nil, position: 0,
+          sni: "backend.internal.example.com")
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"repeater_id":#{rid},"save_as_repeater":true,"allow_unscoped":true}}})
+        resp = drive(store, call, verify_upstream: false)[0]
+        resp["result"]["isError"].as_bool.should be_false
+        # New row is the last repeater; source row kept.
+        saved = store.repeaters_meta.last
+        saved.id.should_not eq(rid)
+        rec = store.get_repeater(saved.id).not_nil!
+        rec.sni.should eq("backend.internal.example.com")
+        rec.auto_content_length?.should be_false
+      end
+    end
+
     it "includes effective_request on a url send (no ignored fields)" do
       with_store do |store|
         port = start_mcp_http_origin("ok")

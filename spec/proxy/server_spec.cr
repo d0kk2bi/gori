@@ -1090,6 +1090,105 @@ describe Gori::Proxy::Server do
     sink.responses.first.error.should eq("blocked by sandbox (out of scope)")
   end
 
+  it "sandbox blocks a request whose doubled-space request line hid the excluded path" do
+    # The scope gate used to read `parse_request_head`'s strict `split(' ')` target, which for
+    # `GET  /admin HTTP/1.1` is the EMPTY string — so the gate evaluated `http://127.0.0.1:p`,
+    # missed `exclude string:/admin`, and forwarded. An origin that collapses the whitespace
+    # reads `/admin` all the same, so this was a Sandbox bypass, not a cosmetic parse gap.
+    # `Codec::Http1.gate_target` closes it; the bytes still reach the origin byte-exact (P7).
+    seen = Channel(String).new(2)
+    done = Channel(Nil).new(2)
+    origin_port = start_origin("ok", seen)
+
+    store_path = File.tempname("gori-sbx-ws", ".db")
+    store = Gori::Store.open(store_path)
+    scope = Gori::Scope.load(store)
+    scope.add("include", "host", "127.0.0.1")
+    scope.add("exclude", "string", "/admin")
+    scope.enable_sandbox
+    interceptor = Gori::Interceptor.new(scope)
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, interceptor: interceptor)
+    proxy.start
+
+    # Control: the well-formed request line is blocked by the exclude rule.
+    plain = TCPSocket.new("127.0.0.1", proxy.port)
+    plain << "GET /admin HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    plain.flush
+    plain_resp = plain.gets_to_end
+    plain.close
+    done.receive
+
+    # The bypass shape: same path, one extra space.
+    doubled = TCPSocket.new("127.0.0.1", proxy.port)
+    doubled << "GET  /admin HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    doubled.flush
+    doubled_resp = doubled.gets_to_end
+    doubled.close
+    done.receive
+
+    # And the tab shape, which handed the gate the VERSION as the target.
+    tabbed = TCPSocket.new("127.0.0.1", proxy.port)
+    tabbed << "GET\t/admin HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    tabbed.flush
+    tabbed_resp = tabbed.gets_to_end
+    tabbed.close
+    done.receive
+
+    proxy.stop
+    store.close
+    File.delete?(store_path)
+    File.delete?("#{store_path}-wal")
+    File.delete?("#{store_path}-shm")
+
+    plain_resp.should contain("403 Forbidden")
+    doubled_resp.should contain("403 Forbidden")
+    tabbed_resp.should contain("403 Forbidden")
+    # Nothing was dialled: every attempt is an Aborted flow, and the origin's 200 never arrives
+    # (a forwarded request would have made these responses Ok with a body instead).
+    sink.responses.size.should eq(3)
+    sink.responses.each do |r|
+      r.state.should eq(Gori::Store::FlowState::Aborted)
+      r.error.should eq("blocked by sandbox (out of scope)")
+    end
+  end
+
+  it "still forwards a doubled-space request line byte-exact when the scope allows it" do
+    # The gate got stricter; the WIRE did not. gori is a proxy for malformed bytes (P7), so the
+    # origin must receive the operator's octets unchanged — doubled space included.
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_origin("ok", seen)
+
+    store_path = File.tempname("gori-sbx-wsok", ".db")
+    store = Gori::Store.open(store_path)
+    scope = Gori::Scope.load(store)
+    scope.add("include", "host", "127.0.0.1")
+    scope.enable_sandbox
+    interceptor = Gori::Interceptor.new(scope)
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, interceptor: interceptor)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET  /hello HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    body = client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+    store.close
+    File.delete?(store_path)
+    File.delete?("#{store_path}-wal")
+    File.delete?("#{store_path}-shm")
+
+    seen.receive.should eq("GET  /hello HTTP/1.1") # both spaces survived the proxy
+    body.should contain("200 OK")
+  end
+
   it "answers 400 (not a silent empty close) when it refuses a request's framing" do
     # gori is right to refuse CL+TE on the live MITM path (DESIGN P7) — but it used to do it
     # by closing with ZERO bytes, which on the wire is indistinguishable from the ORIGIN

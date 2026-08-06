@@ -371,6 +371,7 @@ module Gori
         project_name : String? = nil
         kind : String? = nil
         format = :text
+        leftover = [] of String
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run probe rules [list] [options]\n\n" \
@@ -382,10 +383,12 @@ module Gori
           p.on("--kind=KIND", "Only list rules of this kind (passive|active|custom)") { |v| kind = parse_rule_kind(v) }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.unknown_args { |rest, _| leftover = rest }
           p.invalid_option { |f| abort "gori run probe rules: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe rules: missing value for #{f}" }
         end
         parser.parse(args)
+        refuse_list_leftovers(leftover, "probe rules", "add, enable, disable, delete/rm")
 
         store = open_store(resolve_read_project(project_name, db_path))
         entries, mode = begin

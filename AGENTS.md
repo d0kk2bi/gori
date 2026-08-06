@@ -61,9 +61,10 @@ parity with it, and every parity gap found so far has been in a surface, not an 
     src/gori/{store,probe,fuzz,miner,discover,sequencer,oast}.cr
   ```
 
-  Today that returns four hits, all of them comments: `src/gori/store/models.cr` (×2),
+  Today that returns eight hits, all of them comments: `src/gori/store/models.cr` (×6),
   `src/gori/probe/group.cr`, `src/gori/fuzz/types.cr`. A comment may point at a caller; code
-  may not — so the check is "every hit is a comment", not a hit count.
+  may not — so the check is "every hit is a comment", not a hit count. (The count drifts as
+  those comments are edited; that is fine, and is why it is not the check.)
 - Every gori-originated request goes through the `Gori::Outbound` chokepoint
   (`src/gori/outbound.cr`). It is a required constructor argument on `Fuzz::Sender` and
   `Repeater::Sender`, so an ungated sender is a compile error. Layer 1 (`check`) is the only

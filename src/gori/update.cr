@@ -717,7 +717,18 @@ module Gori
 
     private def self.http_client(host : String, port : Int32, tls : Bool,
                                  timeout : Time::Span = HTTP_TIMEOUT) : HTTP::Client
-      client = HTTP::Client.new(host, port, tls)
+      # When tls is a bare `true`, HTTP::Client builds OpenSSL::SSL::Context::Client.new
+      # with only the compiled-in OPENSSLDIR store. A static-musl release binary's store
+      # is often empty (#323/#333) — exactly the environment `gori update` exists to
+      # serve (Channel::Binary). Apply the same system-trust repair the proxy uses so
+      # GitHub HTTPS verification works out of the box; additive and rescue-guarded.
+      client = if tls
+                 ctx = OpenSSL::SSL::Context::Client.new
+                 Proxy::Upstream.apply_system_trust(ctx)
+                 HTTP::Client.new(host, port, ctx)
+               else
+                 HTTP::Client.new(host, port, false)
+               end
       client.connect_timeout = timeout
       client.read_timeout = timeout
       client

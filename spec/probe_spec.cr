@@ -1719,6 +1719,21 @@ describe "Gori::Probe::Active::ForbiddenBypass" do
     end
   end
 
+  it "dedup_key distinguishes ACTIVE from AGGRESSIVE so the wider header set is not suppressed" do
+    with_store do |store|
+      forbidden = capture_flow(store, "HTTP/1.1 403 Forbidden\r\n\r\n", target: "/admin", status: 403, content_type: nil)
+      base_key = probe.dedup_key(forbidden, Gori::Probe::Active::Options::DEFAULT).not_nil!
+      aggr_opts = Gori::Probe::Active::Options.new(allow_unsafe: true, aggressive: true)
+      aggr_key = probe.dedup_key(forbidden, aggr_opts).not_nil!
+      base_key.should_not eq(aggr_key)
+      base_key.should contain("|base")
+      aggr_key.should contain("|aggr")
+      # plan and dedup_key stay identical for each mode.
+      probe.plan(forbidden).not_nil!.dedup_key.should eq(base_key)
+      probe.plan(forbidden, aggr_opts).not_nil!.dedup_key.should eq(aggr_key)
+    end
+  end
+
   it "flags a possible bypass (Medium) only when the probe flips to 2xx and the control still denies" do
     with_store do |store|
       forbidden = capture_flow(store, "HTTP/1.1 403 Forbidden\r\n\r\n", target: "/admin", status: 403, content_type: nil)

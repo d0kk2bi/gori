@@ -60,7 +60,8 @@ module Gori
         Log.info { "send_request #{built.scheme}://#{built.host}:#{built.port} http2=#{http2} scope=#{sc.decision} flow_id=#{recorded_flow_id || "none"} -> #{result.ok? ? "ok" : result.error}" }
 
         repeater_id = persist_send_repeater(h, save, built, http2, result,
-          issue_id, recorded_flow_id, plan.h2_fields)
+          issue_id, recorded_flow_id, plan.h2_fields,
+          sni: plan.sni, auto_cl: send_persist_auto_cl(h))
 
         body_cap, body_omit = body_return_opts(h)
         Result.new(send_result_json(result, recorded_flow_id, repeater_id,
@@ -381,10 +382,25 @@ module Gori
         code == "NETWORK_ERROR" && !delivered
       end
 
+      # The auto-Content-Length flag to persist on a save_as_repeater row. Hard-coded true
+      # re-framed every later replay of a CL-desync evidence capture. Prefer the source
+      # session's setting when replaying a repeater; otherwise default OFF (byte-exact),
+      # overridable by an explicit auto_content_length arg.
+      private def send_persist_auto_cl(h) : Bool
+        if present?(h, "auto_content_length")
+          return bool_arg(h, "auto_content_length", false)
+        end
+        if present?(h, "repeater_id") && (id = int(h, "repeater_id")) && (rec = store.get_repeater(id))
+          return rec.auto_content_length?
+        end
+        false
+      end
+
       private def persist_send_repeater(h, save : Bool, built : RequestBuilder::Built,
                                         http2 : Bool, result : Repeater::Result,
                                         issue_id : Int64?, recorded_flow_id : Int64?,
-                                        h2_fields : Array({String, String})? = nil) : Int64?
+                                        h2_fields : Array({String, String})? = nil,
+                                        *, sni : String? = nil, auto_cl : Bool = false) : Int64?
         return nil unless save
         port_suffix = ((built.scheme == "https" && built.port == 443) ||
                        (built.scheme == "http" && built.port == 80)) ? "" : ":#{built.port}"
@@ -429,20 +445,21 @@ module Gori
         # and `RepeaterView#evidence?` sends `$NAME` literally — so this row went out one way
         # from the TUI and another from MCP. Same seam as `Tools#stored_request`.
         masked_req = Env.mask_secrets(String.new(saved_bytes))
+        # Prefer the Plan's expanded SNI (what the send actually used); fall back through
+        # send_sni so an explicit arg still wins. Bare `send_sni(h)` dropped the stored SNI
+        # because it passed no `stored` argument.
+        effective_sni = sni.presence || send_sni(h)
         repeater_id = store.insert_repeater(
           target: target_url,
           request: saved_bytes,
           http2: http2,
-          auto_cl: true,
+          auto_cl: auto_cl,
           flow_id: flow_id,
           position: store.repeaters_meta.size.to_i32,
           # The SNI the send actually used, so re-sending the saved row reproduces the same
-          # ClientHello. Hard-coded `nil` until `send_request` gained the argument — harmless
-          # while there was nothing to lose, a silent fidelity hole the moment there was: the
-          # row would dial the vhost by `target`'s own name while the send that produced the
-          # evidence presented a different one. Through `send_sni`, so the row stores exactly
-          # what `send_plan_options` handed the sender.
-          sni: send_sni(h)
+          # ClientHello. Through the effective value above, not a hard-coded nil / arg-only
+          # read that silently dropped the source's SNI.
+          sni: effective_sni
         )
         return nil unless repeater_id > 0
 

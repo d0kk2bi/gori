@@ -195,11 +195,17 @@ module Gori::Proxy::Codec
       # explicitly sanctions refusing a message here rather than guessing.
       raise Gori::Error.new("ambiguous framing headers (a lenient recipient would frame this response differently)") if Http1.framing_ambiguous?(resp.raw_head, resp.headers)
       # Allocation-free case-insensitive match (per response); `.upcase` allocated a String.
-      if request_method.compare("HEAD", case_insensitive: true) == 0 ||
-         request_method.compare("CONNECT", case_insensitive: true) == 0
+      if request_method.compare("HEAD", case_insensitive: true) == 0
         return {BodyFraming::None, 0_i64}
       end
       s = resp.status
+      # RFC 7230 §3.3.3 / RFC 9112 §6.3: a response to CONNECT is bodyless only for 2xx
+      # (the tunnel is open). Non-2xx (407 Proxy Auth Required, 502, …) may carry an
+      # entity the client must read; treating EVERY CONNECT reply as bodyless left that
+      # entity on the wire to misframe the next message on a reused upstream.
+      if request_method.compare("CONNECT", case_insensitive: true) == 0 && (200..299).includes?(s)
+        return {BodyFraming::None, 0_i64}
+      end
       return {BodyFraming::None, 0_i64} if (s >= 100 && s < 200) || s == 204 || s == 304
 
       te = resp.headers.has?("Transfer-Encoding") ? resp.headers.get_all("Transfer-Encoding") : EMPTY_TE
@@ -437,7 +443,7 @@ module Gori::Proxy::Codec
           end
           return true # terminating chunk reached
         end
-        return false unless copy_n(src, dst, tee, size, cbuf)             # truncated mid-chunk
+        return false unless copy_n(src, dst, tee, size, cbuf)              # truncated mid-chunk
         return false unless copy_chunk_terminator(src, dst, tee, line_buf) # bad/absent chunk-data terminator → desync
       end
     end
@@ -511,6 +517,82 @@ module Gori::Proxy::Codec
     # request. Check content (terminator octets only), not length.
     private def self.blank_line?(line : Bytes) : Bool
       line.all? { |b| b == 0x0d_u8 || b == 0x0a_u8 }
+    end
+
+    # Does this IN-MEMORY chunked body contain one COMPLETE chunked message and nothing
+    # after it? For a buffer gori is about to write onto a socket it intends to REUSE — the
+    # Repeater/Fuzz connection pool's `reusable_request?`.
+    #
+    # It exists because the cheap test that shape invites — "the bytes end with 0\r\n\r\n" —
+    # is FORGEABLE by the chunk data itself. A single chunk `5\r\nAB0\r\n\r\n` (size 5, data
+    # `AB0\r\n`) ends with those five octets while carrying no terminating zero-chunk at all,
+    # so the origin is left mid-body waiting for the next chunk-size line: the NEXT request
+    # gori pipelines onto that socket is read as this one's continuation. That is a request
+    # smuggle gori would be committing against its own target, from its own pool.
+    #
+    # Framing rules mirror `copy_chunked` exactly — `parse_chunk_size` (pure hex, chunk-ext
+    # after ';', no sign), and a chunk-data terminator of "\r\n" or a bare "\n" — with one
+    # DELIBERATE tightening: `copy_chunked` tolerates a clean EOF standing in for the trailer
+    # section, because there it means the peer hung up and the connection dies anyway. Here
+    # the whole question is whether the connection SURVIVES, and a missing final CRLF is
+    # precisely the state that leaves the origin's parser open. So the trailer section must be
+    # present and the buffer must end exactly on it; anything else is unprovable, hence false.
+    #
+    # It lives HERE, beside `copy_chunked`, despite having one caller (P0 would otherwise put it
+    # in `ConnPool`): it must answer "is this chunked message complete" the same way the streaming
+    # reader frames one, and a copy in the pool is a copy that drifts. `ConnPool`'s job is the
+    # reuse POLICY; the framing rule is the codec's.
+    def self.chunked_complete?(body : Bytes) : Bool
+      pos = 0
+      while pos < body.size
+        eol = line_end(body, pos)
+        return false unless eol # no LF: an unterminated size line, not a framing gori can trust
+        size = parse_chunk_size(body[pos, eol - pos])
+        return false if size.nil?
+        pos = eol
+        return trailer_ends_body?(body, pos) if size == 0
+        # Bounds-check BEFORE advancing, so `pos` (Int32) can never be walked past the buffer by
+        # an Int64 chunk-size a hostile/garbled line declared — `parse_chunk_size` accepts any
+        # non-negative hex that fits Int64, so `7FFFFFFFFF` is a "valid" size. A size larger than
+        # what is actually here is unprovable anyway, so it returns false rather than overflowing.
+        remaining = (body.size - pos).to_i64
+        return false if size > remaining # chunk declares more data than is here
+        pos += size.to_i32
+        # …then the chunk-data terminator, and JUST it (see copy_chunk_terminator).
+        tend = line_end(body, pos)
+        return false unless tend
+        term = body[pos, tend - pos]
+        return false unless term.size <= 2 && (term.size == 1 || term[0] == 0x0d_u8)
+        pos = tend
+      end
+      false # a chunked body that never reached its zero-chunk
+    end
+
+    # After a zero-chunk: does the trailer section close, with the body ending exactly on its
+    # blank line? Trailing octets past that line are the mirror smuggle of a missing terminator
+    # — the origin stops reading at the zero-chunk, so the remainder becomes the head of the
+    # next request on the socket.
+    private def self.trailer_ends_body?(body : Bytes, pos : Int32) : Bool
+      while pos < body.size
+        tend = line_end(body, pos)
+        return false unless tend
+        line = body[pos, tend - pos]
+        pos = tend
+        return pos == body.size if blank_line?(line)
+      end
+      false # ran out of bytes before the blank line closed the trailer section
+    end
+
+    # Index just PAST the next LF at or after `from`, or nil when there is none. The scanning
+    # counterpart of `read_crlf_line`: an "up to and including the LF" line, so a bare-LF
+    # terminator reads the same here as it does on the streaming path.
+    private def self.line_end(body : Bytes, from : Int32) : Int32?
+      i = from
+      while i < body.size
+        return i + 1 if body.unsafe_fetch(i) == 0x0a_u8
+        i += 1
+      end
+      nil
     end
   end
 end

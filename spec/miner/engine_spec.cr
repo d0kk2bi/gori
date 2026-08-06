@@ -242,6 +242,27 @@ describe Gori::Miner::Engine do
       engine.first_error.should be_nil
       engine.successful_sends.should be > 0
     end
+
+    it "does not retry an exclude-rule refusal (Layer 2 is permanent)" do
+      # permanent_refusal? used to list only CAP and SANDBOX — exclude burned retries and
+      # the request cap for a refusal that cannot change between attempts.
+      reason = Gori::Outbound::EXCLUDE_SWEEP_ERROR
+      backend = BlockedBackend.new(F::Origin.new("http", "h", 80), reason)
+      c = cfg
+      c.retries = 5
+      c.retry_pause = 0.milliseconds
+      c.concurrency = 1
+      c.stability_rounds = 1
+      c.confirm_rounds = 1
+      base = "GET /api?a=1 HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
+      engine = M::Engine.new(base, http2: false, names: ["alpha"], backend: backend, config: c)
+      engine.run { }
+      # One send per planned attempt — never (1 + retries) per attempt.
+      backend.sent.should be <= 4 # baseline + a few buckets, all single-shot
+      # If exclude were retried, retries=5 would multiply every send by 6.
+      backend.sent.should be < 12
+      engine.first_error.should eq(reason)
+    end
   end
 
   # Names the wordlist supplied that a location cannot carry. Dropping them is CORRECT — a
