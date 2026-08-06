@@ -4,12 +4,13 @@ require "../../src/gori/tui/comparer_view"
 
 include Gori::Tui
 
-private def flow(method, target, host = "h.test", body = "body")
+private def flow(method, target, host = "h.test", body = "body",
+                 status = 200, size = 50_i64, dur = 1_i64)
   row = Gori::Store::FlowRow.new(
     1_i64, 1_i64, "https", method, host, 443, target,
-    200, 100_i64, Gori::Store::FlowState::Complete, 50_i64, 1_i64, "text/plain")
+    status, 100_i64, Gori::Store::FlowState::Complete, size, dur, "text/plain")
   head = "#{method} #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice
-  resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n".to_slice
+  resp = "HTTP/1.1 #{status} OK\r\nContent-Type: text/plain\r\n\r\n".to_slice
   Gori::Store::FlowDetail.new(row, "HTTP/1.1", head, nil, resp, body.to_slice)
 end
 
@@ -41,8 +42,8 @@ describe ComparerView do
     v.add_flow(flow("GET", "/ring")) # ring now points at B
     v.set_pair(flow("GET", "/older"), flow("POST", "/newer"))
     v.both_set?.should be_true
-    v.@slot_a.not_nil!.row.target.should eq("/older")
-    v.@slot_b.not_nil!.row.target.should eq("/newer")
+    v.slot(:a).not_nil!.path.should eq("/older")
+    v.slot(:b).not_nil!.path.should eq("/newer")
     # Re-armed at A: the next single add replaces the baseline, not the comparison side.
     v.add_flow(flow("GET", "/next")).should eq(:a)
   end
@@ -273,6 +274,23 @@ describe "ComparerView row cursor" do
     v.rowsel.cursor.cy.should eq(0)
   end
 
+  it "carries the intra-line diff to a CHANGED row: shared runs dim, the differing run lit" do
+    v = ComparerView.new
+    v.set_pair(flow("GET", "/a", body: %({"role":"user"})),
+      flow("GET", "/a", body: %({"role":"admin"})))
+    b = MemoryBackend.new(100, 20)
+    v.render(Screen.new(b), Rect.new(0, 0, 100, 20), true)
+    y = (0...20).find { |i| b.row(i).includes?("\"role\":\"user\"") }.not_nil!
+    row = b.row(y)
+    shared = row.index("\"role\"").not_nil! # the run both sides hold
+    diff = row.index("user").not_nil!       # the run only A holds
+    b.fg_grid[y][shared].should eq(Theme.muted)
+    b.fg_grid[y][diff].should eq(Theme.red)
+    # …and the B column's own changed run is the green one.
+    gi = row.index("admin").not_nil!
+    b.fg_grid[y][gi].should eq(Theme.green)
+  end
+
   it "tints the whole cursor row, both columns and the marker band" do
     v = diff_view
     rect = Rect.new(0, 0, 100, 20)
@@ -283,5 +301,108 @@ describe "ComparerView row cursor" do
     b.bg_grid[body.y][2].should eq(Theme.accent_bg)
     b.bg_grid[body.y][body.right - 3].should eq(Theme.accent_bg)
     b.bg_grid[body.y + 1][2].should_not eq(Theme.accent_bg) # and only that row
+  end
+end
+
+# A long response whose diff is one line put that line hundreds of ↓ presses from the top,
+# with nothing that could ask for it directly. `n`/`⇧N` cross the distance; `f` removes it.
+describe "ComparerView change navigation and folding" do
+  # 60 identical lines with a single edit in the middle — the shape both features exist for.
+  private_long = ->(marker : String) {
+    (1..60).map { |i| i == 30 ? marker : "line#{i}" }.join("\n")
+  }
+
+  long_pair = -> {
+    v = ComparerView.new
+    v.set_pair(flow("GET", "/a", body: private_long.call("BEFORE")),
+      flow("GET", "/a", body: private_long.call("AFTER")))
+    v.render(Screen.new(MemoryBackend.new(100, 20)), Rect.new(0, 0, 100, 20), true)
+    v
+  }
+
+  it "jumps the cursor onto the changed row and wraps back to it" do
+    v = long_pair.call
+    v.rowsel.cursor.cy.should eq(0)
+    v.jump_change(1).should be_true
+    at = v.rowsel.cursor.cy
+    at.should be > 20 # past the first screenful — unreachable without this verb
+    v.copy_text.should start_with("~")
+    # One change only, so the next/previous jump both wrap back onto it.
+    v.jump_change(1).should be_true
+    v.rowsel.cursor.cy.should eq(at)
+    v.jump_change(-1).should be_true
+    v.rowsel.cursor.cy.should eq(at)
+  end
+
+  it "reports no change to jump to when the two are identical" do
+    v = ComparerView.new
+    v.set_pair(flow("GET", "/a", body: "same"), flow("GET", "/a", body: "same"))
+    v.render(Screen.new(MemoryBackend.new(100, 20)), Rect.new(0, 0, 100, 20), true)
+    v.jump_change(1).should be_false
+  end
+
+  it "folds the unchanged runs to a marker that keeps context around the change" do
+    v = long_pair.call
+    v.fold?.should be_false
+    v.toggle_fold.should be_true
+    b = MemoryBackend.new(100, 20)
+    v.render(Screen.new(b), Rect.new(0, 0, 100, 20), true)
+    screen = (0...20).map { |y| b.row(y) }
+    # The whole diff now fits: the change AND its context AND the collapse markers.
+    screen.any?(&.includes?("BEFORE")).should be_true
+    screen.any?(&.includes?("AFTER")).should be_true
+    screen.any?(&.includes?("unchanged line")).should be_true
+    screen.count(&.includes?("line29")).should eq(1)  # context kept
+    screen.any?(&.includes?("line5")).should be_false # …and the rest collapsed
+    v.toggle_fold.should be_false
+  end
+
+  # Folding renumbers every row after the first collapsed run, so a cursor carried across by
+  # INDEX would silently land somewhere else in the message.
+  it "keeps the cursor on the same diff row across a fold toggle" do
+    v = long_pair.call
+    v.jump_change(1)
+    before = v.copy_text
+    v.toggle_fold
+    v.copy_text.should eq(before)
+    v.toggle_fold
+    v.copy_text.should eq(before)
+  end
+
+  it "projects a fold marker into the copy text rather than dropping the rows silently" do
+    v = long_pair.call
+    v.toggle_fold
+    v.copy_all.should contain("unchanged lines @@")
+  end
+end
+
+describe "ComparerView meta readout" do
+  it "prints each side's status/size/time and the A→B delta" do
+    v = ComparerView.new
+    v.set_pair(flow("GET", "/admin", status: 403, size: 1234_i64, dur: 31_000_i64),
+      flow("GET", "/admin", status: 200, size: 1250_i64, dur: 402_000_i64))
+    b = MemoryBackend.new(120, 20)
+    v.render(Screen.new(b), Rect.new(0, 0, 120, 20), true)
+    header = b.row(0)
+    header.should contain("403")
+    header.should contain("200")
+    header.should contain("1.2 KB")
+    header.should contain("31 ms")
+    # The pair-level delta rides the divider row, left of the REQ/RES chips.
+    divider = b.row(1)
+    divider.should contain("403 → 200")
+    divider.should contain("+16 B")
+    divider.should contain("+371 ms")
+    divider.should contain("REQ") # …without displacing the pane selector
+  end
+
+  it "drops the readout instead of half-printing it in a narrow column" do
+    v = ComparerView.new
+    v.set_pair(flow("GET", "/a", status: 403, size: 1234_i64, dur: 31_000_i64),
+      flow("GET", "/a", status: 200, size: 1250_i64, dur: 402_000_i64))
+    b = MemoryBackend.new(34, 12) # ~15 cols per column: no room for label + meta
+    v.render(Screen.new(b), Rect.new(0, 0, 34, 12), true)
+    b.row(0).should contain("A:")
+    b.row(0).should_not contain("31 ms")
   end
 end

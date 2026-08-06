@@ -986,6 +986,26 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:comparer_add_selected)
   end
 
+  def comparer_add_repeater : Nil
+    rec(:comparer_add_repeater)
+  end
+
+  def comparer_add_sitemap : Nil
+    rec(:comparer_add_sitemap)
+  end
+
+  def comparer_add_fuzz : Nil
+    rec(:comparer_add_fuzz)
+  end
+
+  def comparer_jump_change(dir : Int32) : Nil
+    rec(:comparer_jump_change, dir)
+  end
+
+  def comparer_toggle_fold : Nil
+    rec(:comparer_toggle_fold)
+  end
+
   def comparer_new : Nil
     rec(:comparer_new)
   end

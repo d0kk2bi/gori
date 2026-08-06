@@ -965,6 +965,26 @@ private class FakeContext < ExecContext
     @calls << :comparer_toggle_pane
   end
 
+  def comparer_add_repeater : Nil
+    @calls << :comparer_add_repeater
+  end
+
+  def comparer_add_sitemap : Nil
+    @calls << :comparer_add_sitemap
+  end
+
+  def comparer_add_fuzz : Nil
+    @calls << :comparer_add_fuzz
+  end
+
+  def comparer_jump_change(dir : Int32) : Nil
+    @calls << :comparer_jump_change
+  end
+
+  def comparer_toggle_fold : Nil
+    @calls << :comparer_toggle_fold
+  end
+
   def comparer_add_selected : Nil
     @calls << :comparer_add_selected
   end

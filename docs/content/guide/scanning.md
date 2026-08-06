@@ -124,7 +124,25 @@ Marks survive a filter change, a re-sort (including the one your own severity ed
 Two more tools round out analysis:
 
 - **Notes**: free-form, per-project Markdown documents (multiple notes per project). Create, edit, and close notes from the Notes tab; list or dump them headless with `gori run notes` / `gori run notes --all`. Agents can manage notes over MCP (`list_notes`, `get_note`, `create_note`, …).
-- **Comparer**: load two flows into slots A and B for a line-by-line diff, useful for spotting how a response changed between requests. Send a flow from History with `Space` → Comparer, or swap slots on the Comparer tab.
+- **Comparer**: load two messages into slots A and B for a side-by-side diff, useful for spotting how a response changed between requests.
+
+  A slot is filled from anywhere that holds a request and a response: `Space` → **Send to Comparer** from History, the Sitemap, a Repeater tab (its last send) or a Fuzzer result row, or `a` / `b` on the Comparer tab itself to pick a captured flow. A Repeater send and a fuzz row leave no capture behind, so this is the only route those two have into a diff.
+
+  Each column header carries that side's `status · size · time`, and the divider between them states the A→B delta — a `403 → 200` is usually the whole answer, before a body line is read.
+
+  Inside the diff:
+
+  | Key | Action |
+  |-----|--------|
+  | `←` / `→` | Diff the requests or the responses |
+  | `n` / `⇧N` | Jump to the next / previous **changed** row (wraps; the footer shows `3/8`) |
+  | `f` | Fold the unchanged runs to `⋯ N unchanged lines ⋯`, keeping 3 lines of context |
+  | `↑` / `↓`, `⇧↑` / `⇧↓` | Move the row cursor · grow a whole-row selection |
+  | `y` | Copy the selection — or the whole diff — as unified text |
+  | `⇧←` / `⇧→` | Scroll both columns sideways together |
+  | `s` | Swap A ⇄ B |
+
+  On a changed row only the parts that actually differ are lit red/green; what both sides share is dimmed, so a re-signed token or one flipped JSON value is visible without reading the line.
 
 Issues, notes, repeaters, and fuzz/miner sessions can be linked so you jump from an issue straight back to the evidence flow or the session that produced it. `Space` → **Link…** from History, the Repeater, the Fuzzer, or the Miner opens one card holding every issue *and* every note, with `+ New issue…` / `+ New note…` pinned above them — so filing a brand-new issue for what you are looking at, already linked, is the same keystroke as attaching it to an existing one. Type to filter by title, host, status, or the words `issue` / `note`; whatever you typed becomes the new issue's title if you land on the create row.
 

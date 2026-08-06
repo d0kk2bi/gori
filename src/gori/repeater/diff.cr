@@ -20,6 +20,44 @@ module Gori
     module Diff
       MAX_LINES = 1500
 
+      # Unchanged lines kept either side of a change when a diff is FOLDED — the unified-diff
+      # default, and the number the Comparer tab, `gori run compare --context` and MCP
+      # `compare_flows` all mean by "context". One constant because a fold that keeps three
+      # lines in one surface and five in another is two different diffs of the same pair.
+      FOLD_CONTEXT = 3
+
+      # A folded diff row: a real line, or the count of unchanged lines collapsed in its place.
+      record Folded, line : DiffLine?, hidden : Int32
+
+      # Collapse the runs of unchanged lines that are more than `context` away from any
+      # change. A run of ONE is left alone: the marker that replaces it is a row too, so
+      # collapsing it saves nothing and only costs the reader the line's content.
+      def self.fold(diff : Array(DiffLine), context : Int32 = FOLD_CONTEXT) : Array(Folded)
+        keep = Array(Bool).new(diff.size, false)
+        diff.each_index do |i|
+          next if diff[i].kind == DiffKind::Same
+          lo = {i - context, 0}.max
+          hi = {i + context, diff.size - 1}.min
+          (lo..hi).each { |k| keep[k] = true }
+        end
+        acc = [] of Folded
+        i = 0
+        while i < diff.size
+          if keep[i]
+            acc << Folded.new(diff[i], 0)
+            i += 1
+            next
+          end
+          start = i
+          while i < diff.size && !keep[i]
+            i += 1
+          end
+          run = i - start
+          acc << (run > 1 ? Folded.new(nil, run) : Folded.new(diff[start], 0))
+        end
+        acc
+      end
+
       def self.lines(a : Array(String), b : Array(String)) : Array(DiffLine)
         a = a.first(MAX_LINES)
         b = b.first(MAX_LINES)

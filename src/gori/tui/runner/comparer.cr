@@ -34,6 +34,26 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     @toast = "comparer: comparing #{view.pane}s"
   end
 
+  # `n` / `N`: walk the diff by CHANGE rather than by row. A 900-line response whose diff is
+  # one line put that line 400 ↓ presses from the top, with nothing to ask for it directly.
+  def comparer_jump_change(dir : Int32) : Nil
+    view = comparer_controller.view
+    return (@toast = "pick flow A and flow B first") unless view.both_set?
+    unless view.jump_change(dir)
+      @toast = "no differences — the two are identical"
+      return
+    end
+    @toast = nil # the footer's "n/total" readout is the answer; a toast would just cover it
+  end
+
+  # `f`: collapse the unchanged runs to a marker, keeping FOLD_CONTEXT rows of context
+  # around every change — the diff of a long response, on one screen.
+  def comparer_toggle_fold : Nil
+    view = comparer_controller.view
+    return (@toast = "pick flow A and flow B first") unless view.both_set?
+    @toast = view.toggle_fold ? "comparer: unchanged runs folded" : "comparer: showing every line"
+  end
+
   def comparer_new : Nil
     comparer_controller.comparer_new
   end
@@ -77,6 +97,43 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     return (@toast = "flow no longer available") unless a && b
     comparer_controller.view.set_pair(a, b)
     @toast = "comparer: A ##{older} · B ##{newer} — open Comparer (^P) to view the diff"
+  end
+
+  # CROSS-TAB: the active Repeater tab's last send → the next Comparer slot. The Repeater
+  # is where a request gets changed one header at a time, so "what did that change do to the
+  # response" is the question this tab exists for — and it could not be asked, because a
+  # Repeater send leaves no flow row for the picker to find.
+  def comparer_add_repeater : Nil
+    slot = repeater_controller.current_view.try(&.comparer_slot)
+    return (@toast = "send the request first (^R) — there is no response to compare") unless slot
+    which = comparer_controller.view.add_slot(slot)
+    @toast = "comparer: set #{which.to_s.upcase} ← repeater — open Comparer (^P) to view the diff"
+  end
+
+  # CROSS-TAB: the Sitemap cursor's endpoint → the next Comparer slot, resolved through the
+  # same representative-flow lookup `sitemap_repeater` / `sitemap_open_flow` use, so all three
+  # agree about which capture a tree row stands for.
+  def comparer_add_sitemap : Nil
+    ep = sitemap_controller.view.selected_endpoint
+    return (@toast = "select an endpoint to send") unless ep
+    id = @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target])
+    return (@toast = "no captured request for this path — capture it, or use Discover") unless id
+    detail = @session.store.get_flow(id)
+    return (@toast = "that request was pruned since the tree was built") unless detail
+    which = comparer_controller.view.add_flow(detail)
+    @toast = "comparer: set #{which.to_s.upcase} — open Comparer (^P) to view the diff"
+  end
+
+  # CROSS-TAB: the selected fuzz result → the next Comparer slot. The request is the one the
+  # run sent (reconstructed when the run kept no bodies — the same seed `fuzz.repeater` uses),
+  # and the response is whatever the row retained. A run without `keep bodies` still yields a
+  # usable slot: `length`/`status`/`duration` were measured either way, so the meta readout and
+  # the request diff both work, and only the response half comes up empty.
+  def comparer_add_fuzz : Nil
+    slot = fuzzer_controller.comparer_slot
+    return (@toast = "select a result first") unless slot
+    which = comparer_controller.view.add_slot(slot)
+    @toast = "comparer: set #{which.to_s.upcase} ← fuzz — open Comparer (^P) to view the diff"
   end
 
   # Both flows are set — the gate for the diff's row select / copy verbs.

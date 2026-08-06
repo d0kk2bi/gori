@@ -142,7 +142,12 @@ gori run compare 41 42 --pane response --changes-only
 |--------|-------------|
 | `--pane=PANE` | 비교 대상: `request` 또는 `response` (기본값) |
 | `--changes-only` | 변경되지 않은 문맥은 빼고 추가 / 삭제된 줄만 출력 |
+| `--context=N` | 변경 지점 주변 N줄만 남기고 나머지 동일 구간은 `@@ N unchanged lines @@` 마커로 접기 (`--changes-only`와 함께 쓸 수 없음) |
 | `--format=FMT` | `text` (기본값) 또는 `json` |
+
+diff 위에 양쪽의 `status · size · time`과 A→B 델타가 출력됩니다. 상태 코드가 뒤집혔는지, 크기가 얼마나 달라졌는지를 첫 줄을 읽기 전에 알 수 있습니다. `--format=json`에도 같은 값이 `meta`로 들어가고, 접힌 구간은 빈칸이 아니라 `{"kind":"fold","hidden":N}` 행이 됩니다.
+
+`--changes-only`는 *무엇이* 바뀌었는지는 알려주지만 *어디서* 바뀌었는지는 지웁니다. 400줄 본문에서 한 줄만 다르면 위치 없는 두 줄만 남습니다. `--context`는 변경 지점을 제자리에 두고, 건너뛴 양을 함께 적습니다.
 
 ### run intercept {#run-intercept}
 

@@ -94,7 +94,7 @@ If a client starts MCP outside your repository directory, the server starts unbo
 | `list_probe_rules` | Every scan rule (passive, active, custom), which are enabled, and the project's scan mode |
 | `list_scope` | Current scope include/exclude rules |
 | `list_links` | Evidence pointers from an issue or note to a flow, Repeater session, or job |
-| `compare_flows` | Line diff of two flows' request or response |
+| `compare_flows` | Line diff of two flows' request or response — with each side's status/size/time and the A→B delta; `context:N` folds the unchanged runs into `{kind:fold,hidden}` markers |
 | `intercept_list` / `intercept_get` | Inspect the live intercept queue and one held item in full |
 | `list_projects` | Every gori project on this host |
 | `list_notes` / `get_note` | Read project notes |

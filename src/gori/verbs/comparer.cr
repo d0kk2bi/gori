@@ -25,6 +25,30 @@ module Gori
         "Toggle the diff between the two requests and the two responses",
         Verb::Scope::Comparer, available: in_comparer, mnemonic: 't') { |ctx| ctx.comparer_toggle_pane; nil }
 
+      # Navigating BY CHANGE and hiding what didn't change. Both gate on a shown diff —
+      # there is nothing to jump between, or fold around, on a half-filled comparison.
+      # `⇧N`, spelled Chord.new("n", shift: true): Chord.new("N") never fires.
+      in_diff = ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.comparer_diff_shown? }
+
+      # Explicit menu mnemonics: the derived ones would be 'n' / 'p' / 'f', and 'n' is
+      # comparer.new's — the KEYS here are n / ⇧N / f, so the menu letters carry no meaning
+      # worth defending and just have to be free.
+      r.register Verb::Definition.new(
+        "comparer.next-change", "Next change", "Jump the row cursor to the next changed row",
+        Verb::Scope::Comparer, [Verb::Chord.new("n")],
+        available: in_diff, mnemonic: 'g') { |ctx| ctx.comparer_jump_change(1); nil }
+
+      r.register Verb::Definition.new(
+        "comparer.prev-change", "Previous change", "Jump the row cursor to the previous changed row",
+        Verb::Scope::Comparer, [Verb::Chord.new("n", shift: true)],
+        available: in_diff, mnemonic: 'G') { |ctx| ctx.comparer_jump_change(-1); nil }
+
+      r.register Verb::Definition.new(
+        "comparer.toggle-fold", "Fold unchanged",
+        "Collapse the runs of identical lines, keeping context around each change",
+        Verb::Scope::Comparer, [Verb::Chord.new("f")],
+        available: in_diff, mnemonic: 'z') { |ctx| ctx.comparer_toggle_fold; nil }
+
       # Sub-tab strip / space menu (session multi-pair workspace).
       r.register Verb::Definition.new(
         "comparer.new", "New comparison", "Open a fresh blank comparison sub-tab",
@@ -59,6 +83,35 @@ module Gori
         Verb::Scope::Comparer,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_search_count >= 2 },
         mnemonic: '/', section: :tab) { |ctx| ctx.subtab_filter_open; nil }
+
+      register_send_to_comparer(r)
+    end
+
+    # The verbs that FILL a slot, registered here rather than in the tab each fires from:
+    # they are one feature with one rule (fill the next slot in the A → B → A ring), and
+    # splitting them across four files is how History's stayed the only one for so long.
+    #
+    # History's own `history.compare` / `detail.compare` stay where they are — they carry the
+    # "exactly 2 marked" pairing rule, which is a History concept, not a Comparer one.
+    def self.register_send_to_comparer(r : Verb::Registry) : Nil
+      r.register Verb::Definition.new(
+        "repeater.compare", "Send to Comparer",
+        "Send this tab's last send (request + response) to the Comparer's next slot",
+        Verb::Scope::Repeater,
+        available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :repeater },
+        mnemonic: 'C', group: :send) { |ctx| ctx.comparer_add_repeater; nil }
+
+      r.register Verb::Definition.new(
+        "sitemap.compare", "Send to Comparer",
+        "Send the selected endpoint's captured flow to the Comparer's next slot",
+        Verb::Scope::Sitemap, mnemonic: 'c', group: :send) { |ctx| ctx.comparer_add_sitemap; nil }
+
+      r.register Verb::Definition.new(
+        "fuzz.compare", "Send to Comparer",
+        "Send the selected result (request + response) to the Comparer's next slot",
+        Verb::Scope::Fuzzer,
+        available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :fuzzer && ctx.fuzzer_result_selected? },
+        mnemonic: 'C') { |ctx| ctx.comparer_add_fuzz; nil }
     end
   end
 end

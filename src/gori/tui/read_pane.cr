@@ -163,6 +163,17 @@ module Gori::Tui
       ensure_visible
     end
 
+    # Park the caret on line `i` (clamped) and drag the viewport to it. For a pane whose rows
+    # are reachable by something other than a keystroke — the Comparer's jump to the next
+    # changed row — where `move`'s relative step would have to be computed by the caller from
+    # a `scroll` it does not own. Drops any selection: the caret did not walk there.
+    def goto_line(i : Int32) : Nil
+      return if empty?
+      @cursor.clear_selection
+      @cursor.move_to(i.clamp(0, @size - 1), 0)
+      ensure_visible
+    end
+
     # Home / End / PageUp / PageDown, with ⇧ extending. Returns false when `ev` is none of
     # them, so a caller can fall through to its own keymap.
     #

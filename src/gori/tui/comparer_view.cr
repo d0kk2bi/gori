@@ -4,12 +4,13 @@ require "./frame"
 require "./read_pane"
 require "./highlight"
 require "./url"
-require "./flow_status"
 require "./subtab_clone"
+require "./comparer_slot"
 require "../store"
 require "../repeater/diff"
 require "../repeater/side_by_side"
 require "../repeater/message_lines"
+require "../repeater/word_diff"
 require "../repeater/subtab_filter"
 
 module Gori::Tui
@@ -26,10 +27,40 @@ module Gori::Tui
 
     SEP_W = 3 # the centre marker band between the A and B columns
 
+    # Unchanged rows kept either side of a change when `fold` is on. Shared with
+    # `gori run compare --context` and MCP `compare_flows` (see `Repeater::Diff::FOLD_CONTEXT`)
+    # so the three surfaces mean the same thing by a folded diff. The rule is applied here
+    # rather than through `Diff.fold` because these rows are two-column and carry the
+    # per-row bookkeeping (`a_index`, `src`) that the unified projection has no place for.
+    FOLD_CONTEXT = Repeater::Diff::FOLD_CONTEXT
+
+    # Ceiling on the intra-line highlight memo, mirroring `ReadPane::WRAP_CACHE_CAP` for the
+    # same reason: a viewport is tens of rows, so this covers it many times over, while a
+    # diff scrolled end-to-end can never accumulate an entry per changed row.
+    WORD_CACHE_CAP = 512
+
+    # One DRAWN row: a diff row, or the marker standing in for a run of unchanged rows that
+    # `fold` collapsed. Everything downstream — the row cursor, the copy projection, the
+    # syntax overlay, the click hit-test — addresses THIS list, so the fold is one
+    # transformation in one place rather than an offset every consumer has to apply.
+    #
+    # `a_index` is the row's line in slot A (−1 for an add-only row, which has none), so the
+    # syntax overlay maps by index instead of replaying SideBySide's advance rule. `src` is
+    # the row's index in the un-folded rows, which is how the cursor survives a fold toggle.
+    record DisplayRow, row : Repeater::SideBySide::Row?, a_index : Int32, src : Int32, hidden : Int32 do
+      def fold? : Bool
+        @row.nil?
+      end
+
+      def changed? : Bool
+        (r = @row) ? !r.kind.same? : false
+      end
+    end
+
     def initialize
       @name = nil
-      @slot_a = nil.as(Store::FlowDetail?)
-      @slot_b = nil.as(Store::FlowDetail?)
+      @slot_a = nil.as(ComparerSlot?)
+      @slot_b = nil.as(ComparerSlot?)
       @pane = :response
       # Row cursor + selection + vertical scroll for the diff. `line_select_only`: a screen row
       # here is TWO columns of the same diff, so a char rectangle would address cells that are
@@ -44,17 +75,25 @@ module Gori::Tui
       @xscroll = 0
       @fill_next = :a # the slot the next "Send to Comparer" fills (rings A → B → A …)
       @rows_cache = nil.as(Array(Repeater::SideBySide::Row)?)
-      # Styled overlay for the UNCHANGED (same) rows only — parallel to @rows_cache, nil
-      # per changed/del/add row (those keep their diff colours). Rebuilt with the rows and
-      # on a theme switch. See build_rows / draw_diff_row.
+      # The drawn projection of @rows_cache under the current fold setting. Separate from it
+      # so toggling the fold re-lays the rows without re-running the diff.
+      @display_cache = nil.as(Array(DisplayRow)?)
+      # Collapse long runs of unchanged rows to a single marker (`f`). Off, which is what
+      # this tab has always shown; on, a 900-line response whose diff is three lines fits on
+      # one screen instead of being somewhere inside 900 rows of identical text.
+      @fold = false
+      # Styled overlay for the UNCHANGED (same) rows only — parallel to @display_cache, nil
+      # per changed/del/add/fold row (those get their own colours). Rebuilt with the rows and
+      # on a theme switch. See build_display / draw_diff_row.
       @styled_same = nil.as(Array(Highlight::Line?)?)
       @styled_same_rev = 0_u32
+      # Intra-line highlight of CHANGED rows, built lazily per drawn row and memoized: the
+      # word diff is cheap per row but this runs on every row of every frame. Keyed by
+      # display index, dropped with the rows and on a theme switch.
+      @word_cache = {} of Int32 => {Highlight::Line, Highlight::Line}
+      @word_rev = 0_u32
       @truncated = false
       @change_count = 0 # cached with @rows_cache so the footer doesn't recount each frame
-      # Decoded display lines per slot, cached so a rebuild (build_rows + styled_same)
-      # and a theme reshade don't re-decode/-scrub/-split the same body more than once.
-      @lines_a = nil.as(Array(String)?)
-      @lines_b = nil.as(Array(String)?)
     end
 
     # Chip label (custom name, or a compact A ⇄ B summary). Capped like Repeater/Decoder.
@@ -72,9 +111,9 @@ module Gori::Tui
     # `method:` narrow either side. See ComparerController#filter_subjects.
     def filter_subject : Repeater::SubtabFilter::Subject
       slots = [@slot_a, @slot_b].compact
-      summ = slots.map { |d| summary(d) }.join(" · ")
-      targets = slots.map(&.row.url).join(' ') # full URL → host: substring-matches the authority
-      methods = slots.map(&.row.method).join(' ')
+      summ = slots.map(&.summary).join(" · ")
+      targets = slots.map(&.target).join(' ') # full URL → host: substring-matches the authority
+      methods = slots.map(&.method).join(' ')
       Repeater::SubtabFilter::Subject.new(@name, summ, targets, methods, [] of String)
     end
 
@@ -97,6 +136,7 @@ module Gori::Tui
       @slot_a = other.@slot_a
       @slot_b = other.@slot_b
       @pane = other.@pane
+      @fold = other.@fold
       @fill_next = other.@fill_next
       @xscroll = 0
       invalidate # resets the row cursor too
@@ -108,6 +148,7 @@ module Gori::Tui
       @slot_a = nil
       @slot_b = nil
       @pane = :response
+      @fold = false
       @rowsel = ReadPane.new(line_select_only: true) # see initialize
       @xscroll = 0
       @fill_next = :a
@@ -120,49 +161,66 @@ module Gori::Tui
       case {a, b}
       when {nil, nil}
         "empty"
-      when {Store::FlowDetail, nil}
+      when {ComparerSlot, nil}
         slot_short(a.not_nil!)
-      when {nil, Store::FlowDetail}
+      when {nil, ComparerSlot}
         slot_short(b.not_nil!)
       else
         "#{slot_short(a.not_nil!)} ⇄ #{slot_short(b.not_nil!)}"
       end
     end
 
-    private def slot_short(d : Store::FlowDetail) : String
-      row = d.row
-      path = Url.origin_path(row.target)
+    private def slot_short(s : ComparerSlot) : String
+      path = s.path
       # Truncate by DISPLAY WIDTH, not char count: a CJK/emoji path is up to 2 cols per
       # char, so `path.size > 12` / `path[0, 11]` let it overflow the slot budget. Use the
       # grapheme-aware width + column helpers (identical to the old behavior for ASCII).
       if Screen.display_width(path) > 12
         path = path[0, Screen.column_for(path, 11)] + "…"
       end
-      "#{row.method} #{path}"
+      s.method.empty? ? path : "#{s.method} #{path}"
     end
 
     # --- slot management (controller + cross-tab handoff) -------------------
 
-    def set_slot(slot : Symbol, detail : Store::FlowDetail?) : Nil
-      slot == :a ? (@slot_a = detail) : (@slot_b = detail)
+    def set_slot(slot : Symbol, s : ComparerSlot?) : Nil
+      slot == :a ? (@slot_a = s) : (@slot_b = s)
       invalidate
     end
 
+    # A captured flow still names a slot directly — the flow picker and History's handoff
+    # both hand one over, and every other source arrives as a built `ComparerSlot`.
+    def set_slot(slot : Symbol, detail : Store::FlowDetail?) : Nil
+      set_slot(slot, detail ? ComparerSlot.from_flow(detail) : nil)
+    end
+
     # Fill the next slot in the A → B → A ring; returns the slot that was set.
-    def add_flow(detail : Store::FlowDetail) : Symbol
+    def add_slot(s : ComparerSlot) : Symbol
       slot = @fill_next
-      set_slot(slot, detail)
+      set_slot(slot, s)
       @fill_next = slot == :a ? :b : :a
       slot
+    end
+
+    def add_flow(detail : Store::FlowDetail) : Symbol
+      add_slot(ComparerSlot.from_flow(detail))
     end
 
     # Fill BOTH slots in one go — History's "exactly 2 marked → compare these" (#442).
     # Skips the next-slot ring entirely (and re-arms it at A), so the caller decides which
     # flow is the baseline instead of inheriting whatever the ring's phase happened to be.
-    def set_pair(a : Store::FlowDetail, b : Store::FlowDetail) : Nil
+    def set_pair(a : ComparerSlot, b : ComparerSlot) : Nil
       set_slot(:a, a)
       set_slot(:b, b)
       @fill_next = :a
+    end
+
+    def set_pair(a : Store::FlowDetail, b : Store::FlowDetail) : Nil
+      set_pair(ComparerSlot.from_flow(a), ComparerSlot.from_flow(b))
+    end
+
+    def slot(which : Symbol) : ComparerSlot?
+      which == :a ? @slot_a : @slot_b
     end
 
     def swap : Nil
@@ -174,6 +232,61 @@ module Gori::Tui
       @pane = @pane == :response ? :request : :response
       @xscroll = 0 # request/response differ in width, so start from the left edge too
       invalidate   # …and in length, so the row cursor starts from the top
+    end
+
+    def fold? : Bool
+      @fold
+    end
+
+    # Collapse / expand the unchanged runs. The cursor is carried across on the row it was
+    # ON, not on its index: folding renumbers every row after the first collapsed run, so
+    # keeping the index would silently move the cursor somewhere else in the message.
+    def toggle_fold : Bool
+      keep = display[@rowsel.cursor.cy]?.try(&.src)
+      @fold = !@fold
+      @display_cache = nil
+      @styled_same = nil
+      @word_cache.clear
+      sync_rowsel
+      if keep
+        idx = display.index { |d| d.src >= keep } || 0
+        @rowsel.goto_line(idx)
+      end
+      @fold
+    end
+
+    # Move the row cursor to the next (`dir` 1) or previous (−1) CHANGED row, wrapping at
+    # the ends. Returns false when the diff has no changed row at all, which is the one case
+    # where the caller has something different to say ("identical").
+    #
+    # A diff's whole point is its changed rows, and reaching them was ↓ held down: a 900-line
+    # response whose diff is one line put that line 400 rows from the top with no way to ask
+    # for it. Folding hides the distance; this crosses it.
+    def jump_change(dir : Int32) : Bool
+      rs = display
+      return false if rs.empty?
+      changed = rs.each_index.select { |i| rs[i].changed? }.to_a
+      return false if changed.empty?
+      sync_rowsel
+      cy = @rowsel.cursor.cy
+      target = if dir >= 0
+                 changed.find { |i| i > cy } || changed.first
+               else
+                 changed.reverse_each.find { |i| i < cy } || changed.last
+               end
+      @rowsel.goto_line(target)
+      true
+    end
+
+    # 1-based position of the cursor among the changed rows, for the footer readout — nil
+    # when the cursor is not sitting on one.
+    def change_position : Int32?
+      rs = display
+      cy = @rowsel.cursor.cy
+      return nil unless (r = rs[cy]?) && r.changed?
+      n = 0
+      (0..cy).each { |i| n += 1 if rs[i].changed? }
+      n
     end
 
     # Jump straight to a half (mouse chip); no-op when already there.
@@ -293,9 +406,9 @@ module Gori::Tui
 
     private def invalidate : Nil
       @rows_cache = nil
+      @display_cache = nil
       @styled_same = nil
-      @lines_a = nil
-      @lines_b = nil
+      @word_cache.clear
       @rowsel.reset # a new pair (or the other half of it) renumbers every row
     end
 
@@ -303,7 +416,7 @@ module Gori::Tui
     # this only re-hands the same two values — so every gesture and every verb can call it and
     # none of them can act on a stale row count.
     private def sync_rowsel : Nil
-      rs = rows
+      rs = display
       @rowsel.source(rs.size, ->(i : Int32) { unified_line(rs[i]) })
     end
 
@@ -313,7 +426,9 @@ module Gori::Tui
     #
     # `~` (changed) carries BOTH sides, because that is the row's information; a `- `/`+ ` pair
     # would double the line count and break that 1:1.
-    private def unified_line(r : Repeater::SideBySide::Row) : String
+    private def unified_line(d : DisplayRow) : String
+      r = d.row
+      return "@@ #{d.hidden} unchanged line#{d.hidden == 1 ? "" : "s"} @@" unless r
       case r.kind
       when .same?     then "  #{r.left}"
       when .del_only? then "- #{r.left}"
@@ -336,27 +451,80 @@ module Gori::Tui
       result
     end
 
-    # Syntax-highlighted lines for the UNCHANGED rows, parallel to `rows` (nil per
-    # changed/del/add row). The A message is styled as a whole via `Highlight.from_lines`
-    # (so header vs body + content-type styling is correct), then mapped to rows by
-    # replaying SideBySide's advance rule: a Same/Changed/DelOnly row consumes one A line.
-    # Cached with the rows and rebuilt on a theme switch. The input is capped to
-    # `Diff::MAX_LINES` — the diff (and thus every row index) is already truncated there,
-    # so styling past it would colour lines that can never be displayed.
+    # The rows as drawn — see `DisplayRow`. Memoized separately from `rows` so a fold toggle
+    # re-lays them without re-running the diff.
+    private def display : Array(DisplayRow)
+      @display_cache ||= build_display
+    end
+
+    private def build_display : Array(DisplayRow)
+      rs = rows
+      # `acc`, not `out` — `out` is a Crystal keyword and `return out` does not parse.
+      acc = Array(DisplayRow).new(rs.size)
+      ai = 0
+      a_of = Array(Int32).new(rs.size)
+      rs.each do |r|
+        if r.kind.add_only?
+          a_of << -1
+        else
+          a_of << ai
+          ai += 1
+        end
+      end
+      unless @fold
+        rs.each_index { |i| acc << DisplayRow.new(rs[i], a_of[i], i, 0) }
+        return acc
+      end
+
+      # A row is KEPT when it is a change or within FOLD_CONTEXT of one. Everything else
+      # falls into a run, and a run is only worth collapsing when the marker replaces more
+      # rows than it costs — a 1-row "1 unchanged line" marker is noise, not a saving.
+      keep = Array(Bool).new(rs.size, false)
+      rs.each_index do |i|
+        next if rs[i].kind.same?
+        lo = {i - FOLD_CONTEXT, 0}.max
+        hi = {i + FOLD_CONTEXT, rs.size - 1}.min
+        (lo..hi).each { |k| keep[k] = true }
+      end
+      i = 0
+      while i < rs.size
+        if keep[i]
+          acc << DisplayRow.new(rs[i], a_of[i], i, 0)
+          i += 1
+          next
+        end
+        start = i
+        while i < rs.size && !keep[i]
+          i += 1
+        end
+        run = i - start
+        if run > 1
+          acc << DisplayRow.new(nil, -1, start, run)
+        else
+          acc << DisplayRow.new(rs[start], a_of[start], start, 0)
+        end
+      end
+      acc
+    end
+
+    # Syntax-highlighted lines for the UNCHANGED rows, parallel to `display` (nil per
+    # changed/del/add/fold row). The A message is styled as a whole via `Highlight.from_lines`
+    # (so header vs body + content-type styling is correct), then mapped to rows by each
+    # row's own `a_index`. Cached with the rows and rebuilt on a theme switch. The input is
+    # capped to `Diff::MAX_LINES` — the diff (and thus every row index) is already truncated
+    # there, so styling past it would colour lines that can never be displayed.
     private def styled_same : Array(Highlight::Line?)
       cached = @styled_same
       return cached if cached && @styled_same_rev == Theme.revision
-      rs = rows
+      rs = display
       out = Array(Highlight::Line?).new(rs.size, nil)
       if @slot_a
         al = lines_a
         al = al.first(Repeater::Diff::MAX_LINES) if al.size > Repeater::Diff::MAX_LINES
         al_styled = Highlight.from_lines(al, request: @pane == :request)
-        ai = 0
-        rs.each_with_index do |r, idx|
-          out[idx] = al_styled[ai]? if r.kind.same?
-          # DelOnly/Changed/Same all consume one A (left) line; AddOnly consumes none.
-          ai += 1 unless r.kind.add_only?
+        rs.each_with_index do |d, idx|
+          next unless (r = d.row) && r.kind.same?
+          out[idx] = al_styled[d.a_index]?
         end
       end
       @styled_same = out
@@ -364,24 +532,36 @@ module Gori::Tui
       out
     end
 
+    # The two styled halves of a CHANGED row: the parts that actually differ are lit in the
+    # diff colour, the parts both sides share are dimmed. Built on demand for the rows being
+    # drawn and memoized (see WORD_CACHE_CAP).
+    private def word_lines(idx : Int32, r : Repeater::SideBySide::Row) : {Highlight::Line, Highlight::Line}
+      if @word_rev != Theme.revision
+        @word_cache.clear
+        @word_rev = Theme.revision
+      end
+      if hit = @word_cache[idx]?
+        return hit
+      end
+      la, lb = Repeater::WordDiff.pieces(r.left || "", r.right || "")
+      pair = {word_spans(la, Theme.red), word_spans(lb, Theme.green)}
+      @word_cache.clear if @word_cache.size >= WORD_CACHE_CAP
+      @word_cache[idx] = pair
+      pair
+    end
+
+    private def word_spans(pieces : Array(Repeater::WordDiff::Piece), accent : Color) : Highlight::Line
+      pieces.map do |p|
+        p.changed ? Highlight::Span.new(p.text, accent, Attribute::Bold) : Highlight::Span.new(p.text, Theme.muted)
+      end
+    end
+
     private def lines_a : Array(String)
-      a = @slot_a
-      return [] of String unless a
-      @lines_a ||= lines_for(a)
+      (a = @slot_a) ? a.lines(@pane) : [] of String
     end
 
     private def lines_b : Array(String)
-      b = @slot_b
-      return [] of String unless b
-      @lines_b ||= lines_for(b)
-    end
-
-    private def lines_for(d : Store::FlowDetail) : Array(String)
-      if @pane == :request
-        Repeater::MessageLines.of(d.request_head, d.request_body, decode: false)
-      else
-        Repeater::MessageLines.of(d.response_head, d.response_body, decode: true, error: d.error)
-      end
+      (b = @slot_b) ? b.lines(@pane) : [] of String
     end
 
     # --- rendering ---------------------------------------------------------
@@ -397,6 +577,7 @@ module Gori::Tui
       if rect.h > 2
         Frame.inner_divider(screen, rect, rect.y + 1, border: Frame.pane_border(focused))
         render_pane_selector(screen, rect)
+        draw_delta(screen, rect)
       end
 
       body = body_rect(rect)
@@ -413,7 +594,7 @@ module Gori::Tui
         return
       end
 
-      data = rows
+      data = display
       sr = styled_same
       sync_rowsel
       top = @rowsel.viewport_top(body_h) # the state half of ReadPane#render — this view draws its own rows
@@ -425,7 +606,7 @@ module Gori::Tui
         di = top + i
         break if di >= data.size
         marked = focused && @rowsel.row_marked?(di)
-        draw_diff_row(screen, rect.x, body_top + i, left_w, sep_x, right_x, right_w, data[di], sr[di]?, marked)
+        draw_diff_row(screen, rect.x, body_top + i, left_w, sep_x, right_x, right_w, data[di], di, sr[di]?, marked)
       end
       Frame.scroll_gauge(screen, Rect.new(rect.x, body_top, rect.w, body_h), data.size, top, focused)
       draw_footer(screen, rect, footer_y)
@@ -433,8 +614,44 @@ module Gori::Tui
 
     private def draw_header(screen : Screen, rect : Rect, y : Int32, left_w : Int32,
                             right_x : Int32, right_w : Int32) : Nil
-      screen.text(rect.x, y, header_label("A", @slot_a), Theme.accent, attr: Attribute::Bold, width: left_w) if left_w > 0
-      screen.text(right_x, y, header_label("B", @slot_b), Theme.accent, attr: Attribute::Bold, width: right_w) if right_w > 0
+      draw_slot_header(screen, rect.x, y, left_w, "A", @slot_a) if left_w > 0
+      draw_slot_header(screen, right_x, y, right_w, "B", @slot_b) if right_w > 0
+    end
+
+    # One column's header: the slot summary on the left, its status · size · time readout
+    # right-aligned on the same row. The meta is the first thing an operator wants from a
+    # comparison — a 403 against a 200, a response that grew by 16 bytes — and reading it
+    # used to mean going back to History for each side. It is DROPPED, not truncated, when
+    # the column can't hold both: a half-printed "12" is worse than no readout.
+    private def draw_slot_header(screen : Screen, x : Int32, y : Int32, w : Int32,
+                                 tag : String, s : ComparerSlot?) : Nil
+      unless s
+        screen.text(x, y, "#{tag}: — empty (press #{tag.downcase} to pick) —", Theme.muted, width: w)
+        return
+      end
+      meta = s.meta.line
+      mw = Screen.display_width(meta)
+      label_w = w
+      if mw > 0 && w >= mw + 12
+        screen.text(x + w - mw, y, meta, s.status_color, width: mw)
+        label_w = w - mw - 1
+      end
+      screen.text(x, y, "#{tag}: #{s.summary}", Theme.accent, attr: Attribute::Bold, width: label_w)
+    end
+
+    # The A→B delta, on the LEFT of the divider row the REQ/RES chips already ride. It is a
+    # per-PAIR fact, so it belongs between the two column headers and the diff rather than in
+    # either column — and it costs no body row there.
+    private def draw_delta(screen : Screen, rect : Rect) : Nil
+      a = @slot_a
+      b = @slot_b
+      return unless a && b
+      text = ComparerSlot.delta(a, b)
+      return unless text
+      # Stop short of the pane selector (or the frame's right edge when it doesn't fit).
+      limit = (pane_selector_geom(rect).try(&.[0]) || rect.right) - (rect.x + 2)
+      return if limit < 8
+      screen.text(rect.x + 2, rect.y + 1, text, Theme.muted, Theme.bg, width: limit)
     end
 
     # The REQ ⇄ RES pane selector, right-aligned on the divider row: ←/→ switches which
@@ -462,21 +679,12 @@ module Gori::Tui
       {sx, sx + hint_w}
     end
 
-    private def header_label(tag : String, d : Store::FlowDetail?) : String
-      d ? "#{tag}: #{summary(d)}" : "#{tag}: — empty (press #{tag.downcase} to pick) —"
-    end
-
-    private def summary(d : Store::FlowDetail) : String
-      row = d.row
-      "#{row.method} #{row.host}#{Url.origin_path(row.target)} · #{FlowStatus.cell(row)[0]}"
-    end
-
     # `marked` = this row is under the row cursor, or inside a selection. It tints the WHOLE row
     # (both columns and the marker band) rather than a character span, because that is the only
     # honest highlight for a two-column diff — see the `line_select_only` note on `@rowsel`.
     private def draw_diff_row(screen : Screen, x : Int32, y : Int32, left_w : Int32,
                               sep_x : Int32, right_x : Int32, right_w : Int32,
-                              r : Repeater::SideBySide::Row, styled : Highlight::Line?,
+                              d : DisplayRow, idx : Int32, styled : Highlight::Line?,
                               marked : Bool = false) : Nil
       bg = marked ? Theme.accent_bg : Theme.bg
       if marked
@@ -484,14 +692,23 @@ module Gori::Tui
         # selected unit instead of a ragged highlight the width of its text.
         screen.text(x, y, " " * {left_w + SEP_W + right_w, 0}.max, Theme.text, bg)
       end
+      unless r = d.row
+        # A fold marker spans BOTH columns: it stands for rows that were identical on each
+        # side, so splitting it down the middle would suggest a per-column fact it isn't.
+        screen.text(x, y, "⋯ #{d.hidden} unchanged line#{d.hidden == 1 ? "" : "s"} ⋯",
+          Theme.border, bg, width: {left_w + SEP_W + right_w, 0}.max)
+        return
+      end
       lcolor, rcolor, glyph, gcolor = case r.kind
                                       when .same?     then {Theme.text, Theme.text, '│', Theme.border}
                                       when .changed?  then {Theme.red, Theme.green, '~', Theme.yellow}
                                       when .del_only? then {Theme.red, Theme.muted, '-', Theme.red}
                                       else                 {Theme.muted, Theme.green, '+', Theme.green} # add_only
                                       end
-      # Unchanged rows get syntax highlighting (both columns hold identical text); changed/
-      # added/deleted rows keep the red/green diff colours so the diff signal stays legible.
+      # Unchanged rows get syntax highlighting (both columns hold identical text); a CHANGED
+      # row gets the intra-line diff (the differing runs lit red/green, the shared ones
+      # dimmed) so the eye lands on the actual change instead of the whole line; add/delete
+      # rows keep the flat diff colour, which is already the whole story for them.
       # The centre marker band rides the frame, not the text: it stays put while the two
       # columns scroll under it, so the ~/-/+ signal survives any h-offset.
       if styled && r.kind.same?
@@ -499,6 +716,13 @@ module Gori::Tui
         Highlight.draw(screen, x, y, shown, bg: bg, width: left_w) if left_w > 0
         screen.cell(sep_x + 1, y, glyph, gcolor, bg)
         Highlight.draw(screen, right_x, y, shown, bg: bg, width: right_w) if right_w > 0
+      elsif r.kind.changed?
+        wl, wr = word_lines(idx, r)
+        wl = Highlight.slice_left(wl, @xscroll) if @xscroll > 0
+        wr = Highlight.slice_left(wr, @xscroll) if @xscroll > 0
+        Highlight.draw(screen, x, y, wl, bg: bg, width: left_w) if left_w > 0
+        screen.cell(sep_x + 1, y, glyph, gcolor, bg)
+        Highlight.draw(screen, right_x, y, wr, bg: bg, width: right_w) if right_w > 0
       else
         screen.text(x, y, sliced(r.left), lcolor, bg, width: left_w) if left_w > 0
         screen.cell(sep_x + 1, y, glyph, gcolor, bg)
@@ -515,6 +739,12 @@ module Gori::Tui
       return if y <= rect.y + 1 # no room: header + divider already fill the frame
       changed = @change_count
       note = changed == 0 ? "identical" : "#{changed} changed line#{changed == 1 ? "" : "s"}"
+      # Which change the cursor is on, so n/N reads as progress through the diff rather than
+      # as an unanchored jump.
+      if changed > 0 && (pos = change_position)
+        note += " · #{pos}/#{changed}"
+      end
+      note += " · folded" if @fold
       note += " · truncated to #{Repeater::Diff::MAX_LINES}/side" if @truncated
       note += " · col #{@xscroll}" if @xscroll > 0                              # only when scrolled: otherwise it's noise
       screen.text(rect.x + 1, y, note, Theme.muted, width: {rect.w - 2, 1}.max) # pane + ←/→ moved to the divider selector
@@ -523,7 +753,7 @@ module Gori::Tui
     # Pin the h-offset to the widest row CURRENTLY ON SCREEN, across both columns — the
     # same rule the Repeater response uses. Measured with draw_width_upto so a minified
     # multi-MB body line is never fully walked once per frame.
-    private def clamp_hscroll(data : Array(Repeater::SideBySide::Row), body_h : Int32, cw : Int32) : Nil
+    private def clamp_hscroll(data : Array(DisplayRow), body_h : Int32, cw : Int32) : Nil
       if cw <= 0
         @xscroll = 0
         return
@@ -531,8 +761,10 @@ module Gori::Tui
       limit = @xscroll + cw + 1
       widest = 0
       (0...body_h).each do |i|
-        r = data[@rowsel.scroll + i]?
-        break unless r
+        d = data[@rowsel.scroll + i]?
+        break unless d
+        r = d.row
+        next unless r
         {r.left, r.right}.each do |t|
           next unless t
           w = Screen.draw_width_upto(t, limit)

@@ -2,6 +2,7 @@ require "json"
 require "../../store"
 require "../../repeater/message_lines"
 require "../../repeater/diff"
+require "../../repeater/exchange_meta"
 require "../serialize"
 
 module Gori
@@ -28,13 +29,29 @@ module Gori
         pane = pane_s == "request" ? :request : :response
         changes_only = bool_arg(h, "changes_only", false)
         include_sensitive = bool_arg(h, "include_sensitive", false)
+        context = int(h, "context")
+        if context && context < 0
+          return err("invalid 'context' (expected >= 0)", "INVALID_ARGUMENT", field: "context")
+        end
+        if context && changes_only
+          return err("'changes_only' and 'context' are mutually exclusive", "INVALID_ARGUMENT", field: "context")
+        end
 
         lines_a = compare_lines(detail_a, pane, include_sensitive)
         lines_b = compare_lines(detail_b, pane, include_sensitive)
         truncated = lines_a.size > Repeater::Diff::MAX_LINES || lines_b.size > Repeater::Diff::MAX_LINES
         full_diff = Repeater::Diff.lines(lines_a, lines_b)
         change_count = Repeater::Diff.change_count(full_diff)
-        diff = changes_only ? full_diff.reject { |dl| dl.kind == Repeater::DiffKind::Same } : full_diff
+        # `context` folds the unchanged runs to counted markers; `changes_only` drops them
+        # outright. Folding is the one an agent wants for a long response: it keeps the
+        # changes readable in place without claiming the message had nothing else in it.
+        diff = if context
+                 Repeater::Diff.fold(full_diff, context.to_i)
+               elsif changes_only
+                 full_diff.reject { |dl| dl.kind == Repeater::DiffKind::Same }.map { |dl| Repeater::Diff::Folded.new(dl, 0) }
+               else
+                 full_diff.map { |dl| Repeater::Diff::Folded.new(dl, 0) }
+               end
         # Bound the emitted diff by BYTES, not just MAX_LINES (a line count). A decoded
         # response body can be one enormous line (minified JS/JSON, a base64 data URI up
         # to the 32 MiB decode ceiling), so a 1500-line diff could still be tens of MiB in
@@ -50,12 +67,34 @@ module Gori
             j.field "changed_lines", change_count
             j.field "identical", change_count == 0
             j.field "truncated", truncated
+            j.field "meta" do
+              j.object do
+                meta_a = Repeater::ExchangeMeta.of(detail_a.row)
+                meta_b = Repeater::ExchangeMeta.of(detail_b.row)
+                {"a" => meta_a, "b" => meta_b}.each do |name, m|
+                  j.field name do
+                    j.object do
+                      j.field "status", m.status
+                      j.field "size", m.size
+                      j.field "duration_us", m.duration_us
+                    end
+                  end
+                end
+                j.field "delta", Repeater::ExchangeMeta.delta(meta_a, meta_b)
+              end
+            end
             j.field "diff" do
               j.array do
-                capped.each do |(kind, text)|
+                capped.each do |(kind, text, hidden)|
                   j.object do
                     j.field "kind", kind
-                    j.field "text", text
+                    if kind == "fold"
+                      # A folded run is a ROW in the diff, not a gap in it: an agent has to be
+                      # able to tell "3 identical lines here" from "nothing here".
+                      j.field "hidden", hidden
+                    else
+                      j.field "text", text
+                    end
                   end
                 end
               end
@@ -74,14 +113,19 @@ module Gori
       # cut through a multi-byte UTF-8 sequence can't emit invalid UTF-8 onto the stdio
       # stream), stop once the total budget is spent. Returns the kept {kind, text} pairs
       # and whether anything was trimmed.
-      private def cap_diff_bytes(diff : Array(Repeater::DiffLine)) : {Array({String, String}), Bool}
+      private def cap_diff_bytes(diff : Array(Repeater::Diff::Folded)) : {Array({String, String, Int32}), Bool}
         budget = COMPARE_MAX_DIFF_BYTES
-        kept = [] of {String, String}
+        kept = [] of {String, String, Int32}
         trimmed = false
-        diff.each do |dl|
+        diff.each do |f|
           if budget <= 0
             trimmed = true
             break
+          end
+          unless dl = f.line
+            # A fold marker costs no text budget — it carries a count, not bytes.
+            kept << {"fold", "", f.hidden}
+            next
           end
           text = dl.text
           if text.bytesize > COMPARE_MAX_LINE_BYTES
@@ -93,7 +137,7 @@ module Gori
             trimmed = true
           end
           budget -= text.bytesize
-          kept << {dl.kind.to_s.downcase, text}
+          kept << {dl.kind.to_s.downcase, text, 0}
         end
         {kept, trimmed}
       end
