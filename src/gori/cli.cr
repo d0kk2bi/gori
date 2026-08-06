@@ -163,7 +163,7 @@ module Gori
       puts "  settings  Show the settings.json path (or --edit to open it)"
       puts "  ca        Print the root CA path, or regenerate it (see gori ca --help)"
       puts "  run       Non-interactive CLI: capture, history, show, repeater, issues, project"
-      puts "  wizard    Interactive setup wizard (bind, theme) — also runs on first launch"
+      puts "  wizard    Interactive setup wizard (bind, theme, pet) — also runs on first launch"
       puts "  tutorial  Guided TUI tour with try-it steps (nav, palette, menu, edit)"
       puts "  mcp       Start an MCP server over stdio (AI/tool integration)"
       puts "  update    Update gori (channel-aware: binary download or package manager)"
@@ -592,7 +592,7 @@ module Gori
     private def self.run_wizard(args : Array(String)) : Nil
       if args.any? { |a| ["-h", "--help"].includes?(a) }
         puts "Usage: gori wizard"
-        puts "  Interactive setup wizard: global proxy bind (default for projects), TUI theme."
+        puts "  Interactive setup wizard: global proxy bind (default for projects), TUI theme, Miss Ring."
         puts "  Runs automatically on first launch; use this to re-run it anytime."
         puts "  Bind is the shared default — pin a different address per project in the Project tab;"
         puts "  --listen/--port override settings for one run only (not written to disk)."

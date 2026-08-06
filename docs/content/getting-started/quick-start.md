@@ -18,7 +18,7 @@ With no subcommand, gori starts the proxy and opens the interface:
 gori
 ```
 
-The first launch runs a short [setup wizard](#first-run-wizard) (global bind and theme), then offers a [guided UI tour](#guided-ui-tour). You can take the tour now or skip it and come back; this page covers the same ground against live traffic.
+The first launch runs a short [setup wizard](#first-run-wizard) (global bind, theme, and the Miss Ring mascot), then offers a [guided UI tour](#guided-ui-tour). You can take the tour now or skip it and come back; this page covers the same ground against live traffic.
 
 By default the proxy listens on `127.0.0.1:8070`. Override it for a single run (a project's own bind still wins when set):
 
@@ -202,7 +202,7 @@ Keep this table nearby until the chords stick:
 
 ## First-run wizard
 
-Re-run the guided setup (global proxy bind default, then theme) at any time:
+Re-run the guided setup (global proxy bind default, then theme, then Miss Ring) at any time:
 
 ```bash
 gori wizard

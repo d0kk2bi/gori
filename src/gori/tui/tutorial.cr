@@ -4,6 +4,10 @@ require "./screen"
 require "./theme"
 require "./frame"
 require "./layout"
+require "./mascot"
+require "./notifications"
+require "./pet"
+require "../settings"
 
 module Gori::Tui
   # A guided, standalone tour of gori's TUI, shown right after the setup wizard
@@ -43,6 +47,23 @@ module Gori::Tui
     CARD_W       = 78
     HEADER_ROWS  =  2 # brand + progress rail
     FOOTER_ROWS  =  2 # hint + Prev/Next buttons
+
+    # Columns Miss Ring's stand claims at the right edge, when she is on: the sprite, the
+    # GUTTER Pet.place already keeps clear of it, and ONE more for the plate strip
+    # Pet.draw paints at `rect.x - 1`.
+    #
+    # The card is NARROWED by this rather than the sprite being dropped when it doesn't
+    # fit beside a full-width card — which is what the project picker does, and copying
+    # that rule here would have been wrong. The picker's card is 50 columns, so 80 seats
+    # her beside it; the tour's is up to 78, so the same rule would not seat her until
+    # ~102 columns — absent on exactly the 80-column terminals the new users this tour
+    # exists for are most likely to be running. CARD_W is a CAP, not a requirement
+    # (step_card already floors the card at 40), so reserving her band before centring
+    # costs a few columns of mock and seats her from 80.
+    #
+    # Only when she is ON. A default install (Pet off) must render the tour exactly as it
+    # did before she existed — see #pet_band.
+    PET_BAND = Pet::GUTTER + Mascot::W + 1
 
     # Fake palette rows used by the palette lesson + practice overlay.
     PALETTE_ROWS = [
@@ -116,6 +137,19 @@ module Gori::Tui
       @request_rect = Rect.new(0, 0, 0, 0)
       @palette_rect = Rect.new(0, 0, 0, 0)
       @space_rect = Rect.new(0, 0, 0, 0)
+
+      # Miss Ring (settings:pet), the same widget the session and the picker run — off by
+      # default, and the same zero-cost no-op while off. Like the picker she has no
+      # notification ring here (the tour opens no project), so everything she says beyond
+      # her hello is handed to her directly via Pet#say.
+      #
+      # SHE REACTS; THE CARD TEACHES. Every lesson's explanation stays in the card where
+      # it already is, and she only ever confirms a move the user just made. That is what
+      # keeps her honest against Pet#say's `pet_notices?` gate: a reader who turned her
+      # speech off gets a tour missing some encouragement, never a tour missing the
+      # lesson. Teaching content may not live in a bubble.
+      @pet = Pet.new(Notifications.new)
+      @pet_said = Set(Symbol).new # goals she has already reacted to (rising edge, once each)
     end
 
     # Run the tour to completion (Done + Next/Finish) or until the user leaves
@@ -123,17 +157,98 @@ module Gori::Tui
     def run : Nil
       @running = true
       loop do
+        tick_pet
         render
         # Own event loop — fold ⌥P onto ^P so the "try the palette" goal below can be
         # completed with whichever modifier the user configured.
         case ev = Keybind.dealias_event(@term.poll_event(50))
         when Termisu::Event::Resize then (@backend.resize(ev.width, ev.height); @resized = true)
-        when Termisu::Event::Key    then handle_key(ev)
-        when Termisu::Event::Mouse  then handle_mouse(ev)
+        when Termisu::Event::Key    then (@pet.wake_on_input; handle_key(ev))
+        when Termisu::Event::Mouse  then (@pet.wake_on_input; handle_mouse(ev))
         end
         @tick &+= 1
         break unless @running
       end
+    end
+
+    # --- Miss Ring -----------------------------------------------------------
+
+    # No dirty-tracking around the tick (unlike the Runner's): this loop already repaints
+    # every poll, so her `changed` verdict has nothing here to gate — the same bargain
+    # ProjectPicker#tick_pet makes.
+    private def tick_pet : Nil
+      pet_watch_goals
+      @pet.tick(Time.instant)
+    end
+
+    # What she says, per goal. Retagged (^P → ⌥P) at the say site so she names the chord
+    # the user actually configured, exactly as the card titles do.
+    PET_LINES = [
+      {:nav, "that's it — tab bar up top, body below"},
+      {:palette, "^P from anywhere, any tab"},
+      {:space, "space acts on whatever's selected"},
+      {:edit, "INS to type, esc back to READ"},
+      {:practice, "all four! you're ready"},
+      {:done, "that's the tour — go break something"},
+    ]
+
+    # Rising-edge watch over the tour's OWN goal flags, run once per frame.
+    #
+    # The flags are set at a dozen scattered sites (lesson try-its, practice, the mock's
+    # mouse handlers), and threading a reaction through each of them would put her in the
+    # middle of code that has nothing to do with her. Watching the flags instead keeps
+    # every line she says in one table, and means a goal reached by a route nobody thought
+    # about still gets its reaction.
+    #
+    # ONE AT A TIME, AND ONLY WHILE SHE IS SILENT. Several goals can be reached before she
+    # has said anything — a user who jumps straight to Practice via the rail, or a single
+    # keystroke on the REQUEST pane that sets @p_edit and completes the practice set at
+    # once — and firing them together would let the last line stomp the rest.
+    #
+    # "One per frame" is NOT enough to pace that, which is what this originally did: the
+    # run loop polls on a 50ms timeout, so the next frame is ~50ms away while a :success
+    # bubble lives for 3500ms. The queued line would replace the previous one before it
+    # could be read. Waiting for the bubble to clear is the only pacing that matches how
+    # long she actually speaks for, so the backlog drains one readable line at a time.
+    private def pet_watch_goals : Nil
+      return unless Settings.pet?
+      return if pet_speaking?
+      PET_LINES.each do |(goal, line)|
+        next unless pet_goal_reached?(goal)
+        return if pet_react(goal, Hotkeys.retag(line))
+      end
+    end
+
+    # Whether a bubble is still on screen. Not the text — nothing here paints her line, she
+    # says it in her own bubble — only whether the next reaction has to wait its turn.
+    private def pet_speaking? : Bool
+      !@pet.frame.try(&.bubble).nil?
+    end
+
+    private def pet_goal_reached?(goal : Symbol) : Bool
+      case goal
+      when :nav      then @tried_nav
+      when :palette  then @tried_palette
+      when :space    then @tried_space
+      when :edit     then @tried_edit
+      when :practice then practice_done?
+      when :done     then @step.done?
+      else                false
+      end
+    end
+
+    # React to a goal the user just completed, ONCE per tour; true when she actually spoke.
+    # `goal` is the latch, not the step: the lessons set @tried_* and Practice sets @p_*,
+    # and a user who does the same move in both should not be congratulated for it twice.
+    #
+    # Set#add? IS the latch — the caller must not pre-check membership, or the same fact
+    # ends up spelled two ways and a later edit has to prove they agree. Loop-internal:
+    # pet_watch_goals owns the Settings.pet? gate. Pet#say is gated on `pet_notices?` for
+    # the rest, which is deliberate (see the note on @pet above).
+    private def pet_react(goal : Symbol, line : String, level : Symbol = :success) : Bool
+      return false unless @pet_said.add?(goal)
+      @pet.say(line, Time.instant, level)
+      true
     end
 
     # --- input ---------------------------------------------------------------
@@ -695,7 +810,12 @@ module Gori::Tui
       @palette_rect = Rect.new(0, 0, 0, 0)
       @space_rect = Rect.new(0, 0, 0, 0)
 
-      unless Layout.usable?(w, h) && step_card(w, h).h >= MIN_CARD_H
+      # Derived ONCE and reused below. step_card now runs the whole placement decision
+      # (pet_band → pet_place → Pet.place, plus a nested step_card), and this loop repaints
+      # on every 50ms poll — calling it for the guard and again for the card doubled that
+      # work ~20x/second to answer a question whose inputs had not changed.
+      box = step_card(w, h)
+      unless Layout.usable?(w, h) && box.h >= MIN_CARD_H
         screen.text(0, 0, "terminal too small for tutorial — min 80x16, resize & retry (esc to leave)", Theme.red)
         @term.hide_cursor
         flush
@@ -704,7 +824,6 @@ module Gori::Tui
 
       render_header(screen, w)
       render_progress_rail(screen, w)
-      box = step_card(w, h)
       Frame.card(screen, box, Hotkeys.retag(card_title), border: Theme.border_focus)
       case @step
       when Step::Welcome   then render_welcome(screen, box)
@@ -716,9 +835,25 @@ module Gori::Tui
       when Step::Done      then render_done(screen, box)
       end
       render_footer(screen, w, h)
+      render_pet(screen, w, h)
 
       @term.hide_cursor
       flush
+    end
+
+    # She paints LAST, over the card — anything she is allowed to occupy she occupies
+    # opaquely, so drawing her earlier would let a mock's pane border cut through her.
+    # step_card has already held her band back, so the sprite lands on bare background;
+    # only the BUBBLE floats over the card, for the few seconds she is talking, exactly as
+    # it does over the picker's card and a tab body in the session.
+    private def render_pet(screen : Screen, w : Int32, h : Int32) : Nil
+      return unless Settings.pet?
+      # pet_draw_stage, NOT pet_stage: the bare stage seats her at every size Pet.place
+      # accepts, which includes the 40..51-column band pet_place stands her down in. That
+      # bug painted her over the mock tab bar at exactly those sizes.
+      return unless stage = Tutorial.pet_draw_stage(w, h)
+      return unless frame = @pet.frame
+      Pet.draw(screen, stage, frame)
     end
 
     private def flush : Nil
@@ -726,14 +861,72 @@ module Gori::Tui
       @resized = false
     end
 
-    # Card sits between the 2-row header and the 2-row footer.
+    # Card sits between the 2-row header and the 2-row footer, centred in whatever width
+    # Miss Ring's stand leaves it (PET_BAND, or the full width while she is off).
     private def step_card(w : Int32, h : Int32) : Rect
-      cw = { {w - 4, CARD_W}.min, 40 }.max
+      Tutorial.step_card(w, h, pet_band(w, h))
+    end
+
+    # The placement rules themselves, free of Settings and of any Tutorial instance so a
+    # spec can sweep them over terminal sizes — the one thing about her here that geometry
+    # can get wrong. `band` is threaded through rather than read from Settings for the same
+    # reason: the card's width and her stand are two halves of one decision, and a spec has
+    # to be able to check they agree.
+    def self.step_card(w : Int32, h : Int32, band : Int32 = 0) : Rect
+      avail_w = {w - band, 40}.max
+      cw = { {avail_w - 4, CARD_W}.min, 40 }.max
       avail = {h - HEADER_ROWS - FOOTER_ROWS, 3}.max
       ch = {CONTENT_ROWS + 3, avail}.min
-      cx = {(w - cw) // 2, 0}.max
+      cx = {(avail_w - cw) // 2, 0}.max
       cy = HEADER_ROWS + {(avail - ch) // 2, 0}.max
       Rect.new(cx, cy, cw, ch)
+    end
+
+    # Her stage is the canvas down to the row above the footer, so Pet.place's own
+    # BOTTOM_MARGIN keeps her plate clear of both footer rows with a row to spare.
+    def self.pet_stage(w : Int32, h : Int32) : Rect
+      Rect.new(0, 0, w, h - FOOTER_ROWS)
+    end
+
+    # Her stand, or nil when the terminal cannot seat her CLEAR OF THE CARD.
+    #
+    # Reserving her band is not enough on its own: step_card floors the card at 40 columns
+    # (a narrower one can't hold a legible mock), so below ~52 columns the floor wins and
+    # the card grows back over her stand. Layout.usable? admits terminals from 40 columns,
+    # so that range is reachable — and the failure would be a mascot painted on top of the
+    # tab-bar mock, not a missing one. She stands down instead, and #pet_band then returns
+    # 0 so the card takes the full width it would have had if she were off.
+    def self.pet_place(w : Int32, h : Int32) : Rect?
+      return nil unless rect = Pet.place(pet_stage(w, h))
+      # Her plate claims a column left of the sprite (Pet.draw), so that — not rect.x — is
+      # the edge the card has to clear. PET_BAND, not #pet_band: the card measured here is
+      # the one she would get if she stands, which is exactly what this decides.
+      return nil if rect.x - 1 < step_card(w, h, PET_BAND).right
+      rect
+    end
+
+    # Columns to hold back from the card. Not circular with step_card: pet_place measures
+    # against a card sized by the CONSTANT band, never by this.
+    def self.pet_band(w : Int32, h : Int32) : Int32
+      pet_place(w, h) ? PET_BAND : 0
+    end
+
+    # The stage to hand Pet.draw, or nil when she must not be drawn at all.
+    #
+    # ONE function, so the render path cannot drift from the placement rule. Pet.draw
+    # re-derives Pet.place from whatever rect it is handed and knows nothing about the
+    # card, so handing it the bare stage seats her at every size Pet.place accepts —
+    # including the 40..51-column band pet_place deliberately rejects. Routing the render
+    # through this makes "may she be drawn" and "where does she stand" the same answer,
+    # and gives the spec something it can assert without a Screen.
+    def self.pet_draw_stage(w : Int32, h : Int32) : Rect?
+      return nil unless pet_place(w, h)
+      pet_stage(w, h)
+    end
+
+    # …and the live gate. Off by default, so a default install gets the full-width card.
+    private def pet_band(w : Int32, h : Int32) : Int32
+      Settings.pet? ? Tutorial.pet_band(w, h) : 0
     end
 
     private def render_header(screen : Screen, w : Int32) : Nil
@@ -1117,12 +1310,21 @@ module Gori::Tui
       return if rect.h < 5
       @shell_rect = rect
       screen.fill(rect, Theme.bg)
-      render_tab_bar(screen, rect.x, rect.y, rect.w, active, !in_body)
-
+      # The focus badge is painted AFTER the tab bar and would overwrite whatever chip
+      # happens to reach its columns, so reserve them first — otherwise the last tab that
+      # still fits gets sheared mid-word and reads as "Fuzzer" rendering as "F TABS".
+      # Only visible once the shell is narrow enough for the chips to reach that far,
+      # which is why Miss Ring's band (which narrows the card) is what surfaced it.
       scol = in_body ? Theme.focus_gold : Theme.accent
       slabel = " #{in_body ? "BODY" : "TABS"} "
       sx = rect.right - slabel.size
-      screen.text(sx, rect.y, slabel, Theme.ink_on(scol), scol, attr: Attribute::Bold) if sx > rect.x
+      # ONE condition for both the reservation and the paint. Reserving columns the badge
+      # then declines to use (sx <= rect.x, on a shell too narrow to hold it) would spend
+      # the whole row on a chip that never appears.
+      badge = sx > rect.x
+      bar_w = badge ? {rect.w - slabel.size - 1, 1}.max : rect.w
+      render_tab_bar(screen, rect.x, rect.y, bar_w, active, !in_body)
+      screen.text(sx, rect.y, slabel, Theme.ink_on(scol), scol, attr: Attribute::Bold) if badge
 
       py = rect.y + 2
       ph = {rect.bottom - py, 3}.max
