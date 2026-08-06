@@ -907,6 +907,13 @@ module Gori::Tui
       # markers (and Sandbox enforcement, which reads the SAME live object) from going stale
       # after an external `gori run project scope add/rm` against this project's db.
       @session.scope.reload
+      # Same discipline for the per-project /etc/hosts: the proxy's dial path and the Project
+      # tab's HOST OVERRIDES pane read this ONE live object, so an external
+      # `gori run project host-override add` / MCP `add_host_override` against this db has to
+      # land here or the session dials the old address for the rest of its life. The pane's
+      # own inline add/edit row is a separate buffer and is untouched by this (only the
+      # underlying list changes), so there is nothing to clobber — same as Scope above.
+      @session.host_overrides.reload
       # Reload a store-backed view only when it's the ACTIVE tab (others reload on
       # tab entry via on_enter_tab) — avoids re-querying History's page ~1.3×/sec
       # while the user is elsewhere. Own-session captures also arrive via flow_events.

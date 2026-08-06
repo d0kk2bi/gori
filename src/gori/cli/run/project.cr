@@ -487,7 +487,8 @@ module Gori
           scope = Scope.load(store)
           unless scope.add(kind, match_type, pat)
             store.close
-            abort "gori run project scope add: failed to add rule (duplicate, empty, or invalid)"
+            abort "gori run project scope add: rule NOT added (duplicate, empty, invalid, " \
+                  "or the store was busy/unwritable); the scope is unchanged"
           end
           puts "Scope rule added successfully."
         ensure
@@ -954,7 +955,8 @@ module Gori
           ov = HostOverrides.load(store)
           unless ov.add(h, i)
             store.close
-            abort "gori run project host-override add: failed to add override (duplicate host, empty, or invalid)"
+            abort "gori run project host-override add: override NOT added (duplicate host, empty, " \
+                  "invalid, or the store was busy/unwritable); nothing was created"
           end
           entry = ov.entries.find { |e| e.host == h.strip.downcase }
           if e = entry

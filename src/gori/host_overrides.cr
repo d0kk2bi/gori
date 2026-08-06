@@ -66,7 +66,16 @@ module Gori
     end
 
     # Add an override (validates, lowercases the host, dedupes on host). Returns false
-    # (no-op) on an empty/invalid pair or a host that's already mapped (edit it instead).
+    # (no-op) on an empty/invalid pair, a host that's already mapped (edit it instead) — or a
+    # store write that did not commit.
+    #
+    # That last case used to return TRUE: unlike update/remove (exec_task_ok) the INSERT goes
+    # through exec_task, which reports nothing, so a busy/locked/closing store rolled the batch
+    # back and `add` still said yes — the caller then reported an override the proxy would
+    # never dial. The `INSERT OR IGNORE` behind it can also drop the row when a PEER process
+    # created the same host since this object last loaded, which the in-memory dedupe above
+    # cannot see. The reload right below already fetches the truth: present with THIS address
+    # ⇒ stored. (Address, not just host — a peer's colliding row must not be read as our write.)
     def add(host : String, ip : String) : Bool
       host = host.strip.downcase
       ip = ip.strip
@@ -75,8 +84,8 @@ module Gori
         return false if @entries.any? { |e| e.host == host }
         @store.add_host_override(host, ip)
         reload_entries_unlocked
+        @entries.any? { |e| e.host == host && e.ip == ip }
       end
-      true
     end
 
     # Edit an override in place (by id). Dedupes the host against OTHER entries so a
@@ -131,6 +140,24 @@ module Gori
       host = parts[1].strip
       return nil unless valid?(host, ip)
       {host.downcase, ip}
+    end
+
+    # Re-read the entries from the store after an EXTERNAL change — another process
+    # (`gori run project host-override add/rm`, an MCP `add_host_override`) or another
+    # instance's TUI writing to the SAME db. Mirrors Scope#reload / Rules#reload, and for
+    # the same reason: every consumer already holds a reference to THIS object (the proxy's
+    # `Upstream.connect_target` via each listener, the Project tab's HOST OVERRIDES pane),
+    # so refreshing it in place is enough — no re-wiring needed.
+    #
+    # Without it a running gori kept dialing the OLD address for the rest of the session
+    # while the writing surface reported success, and the TUI pane deduped its own adds
+    # against a stale list — `INSERT OR IGNORE` then dropped the write (host is UNIQUE) and
+    # the reload surfaced the OTHER process's value under an "override added" toast.
+    #
+    # Pulled by the same two call sites Scope#reload has: the TUI's data_version poll
+    # (Runner#apply_external_change) and headless capture's reload fiber (App#spawn_reload_loop).
+    def reload : Nil
+      @mutex.synchronize { reload_entries_unlocked }
     end
 
     private def reload_entries_unlocked : Nil
