@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Comparer: read the diff instead of scanning it. A changed row now lights only the runs that actually differ (a re-signed token, one flipped JSON value) and dims what both sides share; `n` / `⇧N` jump between changed rows and the footer says which one you are on; `f` folds the identical runs to `⋯ N unchanged lines ⋯`, so a 900-line response whose diff is three lines fits on one screen
+- Comparer: each column header carries that side's `status · size · time`, and the divider between them states the A→B delta — a `403 → 200`, `+16 B`, `+371 ms` — which is the whole answer to most comparisons, before a body line is read
+- Comparer: fill a slot from anywhere that holds a request and a response, not just a captured flow — `Space` → **Send to Comparer** now exists on the Repeater (its last send), the Sitemap, and Fuzzer result rows. A Repeater send and a fuzz row leave no capture behind, so this is the only route those two ever had into a diff
+- CLI/MCP parity: `gori run compare --context=N` and `compare_flows context:N` fold the unchanged runs the same way the tab does (`@@ N unchanged lines @@` / `{kind:fold,hidden}`), and both surfaces now report each side's status/size/duration plus the delta. `--changes-only` says *what* changed but erases *where*; `--context` keeps the change in place
+
 ## v0.2.0
 
 - Proxy: upstream connection rules with per-host routing, SOCKS5 and proxy auth; a TLS pass-through list that is never MITM'd; per-destination outbound TLS (client certificates, protocol floor, ciphers); a setting to force HTTP/1.1; transparent listeners and additional listeners alongside the primary bind (#434, #435, #436, #437, #438)

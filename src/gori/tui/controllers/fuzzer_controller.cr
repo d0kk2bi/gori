@@ -1128,6 +1128,37 @@ module Gori::Tui
       FuzzerController.repeater_seed_for(v, r)
     end
 
+    # The selected result as ONE side of a Comparer diff; nil when nothing is selected.
+    #
+    # A fuzz row is exactly the comparison the Comparer is for — "this payload got a 500,
+    # the baseline got a 200, what is different about the body" — and it had no way there:
+    # a fuzz send is not a captured flow. `head`/`body` are nil on a run without `keep
+    # bodies`, so the response half comes up empty there while the request half (the same
+    # reconstruction `fuzz.repeater` seeds with) and the measured meta still work.
+    def comparer_slot : ComparerSlot?
+      return nil unless v = current_view
+      return nil unless r = v.selected_result
+      FuzzerController.comparer_slot_for(v, r)
+    end
+
+    # The slot for one {session, result} pair. A class method for the same reason
+    # `repeater_seed_for` is one: `comparer_slot` above only picks the pair, so a spec can
+    # drive the real byte handling without standing up a Host.
+    def self.comparer_slot_for(v : FuzzerView, r : Fuzz::Result) : ComparerSlot
+      payload = r.payloads.join(", ")
+      payload = "#{payload[0, 23]}…" if payload.size > 24
+      req = v.result_request(r).bytes
+      ComparerSlot.from_exchange(
+        # The source chip says "rebuilt" when the row kept no request bytes and this is a
+        # reconstruction — the same caveat `fuzz.repeater` carries in its label, and it has
+        # to survive into the Comparer header where the two sides are read against each other.
+        v.result_request_note(r) ? "fuzz·rebuilt" : "fuzz",
+        ComparerSlot.method_of(req), v.target_origin,
+        req, nil, r.head, r.body,
+        status: r.status, duration_us: r.duration_us, error: r.error, size: r.length,
+        label: "##{r.index} #{payload}".rstrip)
+    end
+
     # The seed for one {session, result} pair. A class method because it reads no shell
     # state: `selected_repeater_seed` above only picks the pair, so a spec can drive the
     # REAL byte handling below without standing up a Host.

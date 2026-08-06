@@ -6,10 +6,19 @@ abstract class Gori::Verb::ExecContext
   abstract def comparer_swap : Nil                # swap the A and B flows
   abstract def comparer_toggle_pane : Nil         # toggle the diff between the requests and the responses
   abstract def comparer_add_selected : Nil        # send History's selected flow to the next Comparer slot
-  abstract def comparer_new : Nil                 # open a fresh blank comparison sub-tab
-  abstract def comparer_close_subtab : Nil        # close the active comparison (keeps ≥1)
-  abstract def comparer_rename_subtab : Nil       # rename the active comparison chip
-  abstract def comparer_duplicate_subtab : Nil    # clone the active A/B pair
+  # The other three sources a slot can come from — none of them a captured flow. See
+  # `Gori::Tui::ComparerSlot` for why the slot is bytes + labelling rather than a FlowDetail.
+  abstract def comparer_add_repeater : Nil     # the active Repeater tab's last send
+  abstract def comparer_add_sitemap : Nil      # the Sitemap cursor's representative capture
+  abstract def comparer_add_fuzz : Nil         # the selected fuzz result
+  abstract def comparer_new : Nil              # open a fresh blank comparison sub-tab
+  abstract def comparer_close_subtab : Nil     # close the active comparison (keeps ≥1)
+  abstract def comparer_rename_subtab : Nil    # rename the active comparison chip
+  abstract def comparer_duplicate_subtab : Nil # clone the active A/B pair
+  # Move the row cursor to the next (1) / previous (-1) CHANGED row, wrapping at the ends.
+  abstract def comparer_jump_change(dir : Int32) : Nil
+  # Collapse / expand the runs of unchanged rows around each change.
+  abstract def comparer_toggle_fold : Nil
   # Both flows are set, so there are diff rows with a cursor on them — the gate for the row
   # select / copy verbs. A blank comparison has nothing to select.
   abstract def comparer_diff_shown? : Bool

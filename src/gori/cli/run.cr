@@ -865,13 +865,27 @@ module Gori
       end
 
       private def self.print_diff(diff : Array(Repeater::DiffLine)) : Nil
-        diff.each do |dl|
-          prefix = case dl.kind
-                   in Repeater::DiffKind::Same then " "
-                   in Repeater::DiffKind::Add  then "+"
-                   in Repeater::DiffKind::Del  then "-"
-                   end
-          puts "#{prefix}#{dl.text}"
+        diff.each { |dl| puts "#{diff_prefix(dl)}#{dl.text}" }
+      end
+
+      # A FOLDED diff (`--context`): the collapsed runs print as their own `@@ … @@` row, in
+      # place, so the marker sits where the hidden lines were rather than being appended as a
+      # summary the reader has to re-position by hand.
+      private def self.print_folded_diff(diff : Array(Repeater::Diff::Folded)) : Nil
+        diff.each do |f|
+          if line = f.line
+            puts "#{diff_prefix(line)}#{line.text}"
+          else
+            puts "@@ #{f.hidden} unchanged lines @@"
+          end
+        end
+      end
+
+      private def self.diff_prefix(dl : Repeater::DiffLine) : String
+        case dl.kind
+        in Repeater::DiffKind::Same then " "
+        in Repeater::DiffKind::Add  then "+"
+        in Repeater::DiffKind::Del  then "-"
         end
       end
     end

@@ -66,3 +66,69 @@ describe "gori run compare" do
     Gori::Repeater::Diff.change_count(Gori::Repeater::Diff.lines(a, a)).should eq(0)
   end
 end
+
+# `--context` (CLI), `context` (MCP) and `f` (the Comparer tab) are ONE rule, so the fold
+# lives with the differ and every surface asks it the same question.
+describe Gori::Repeater::Diff do
+  private_lines = ->(mid : String) { (1..40).map { |i| i == 20 ? mid : "l#{i}" } }
+
+  it "keeps `context` lines around each change and collapses the rest into counted markers" do
+    diff = Gori::Repeater::Diff.lines(private_lines.call("BEFORE"), private_lines.call("AFTER"))
+    folded = Gori::Repeater::Diff.fold(diff, 3)
+    kept = folded.compact_map(&.line).map(&.text)
+    kept.should contain("BEFORE")
+    kept.should contain("AFTER")
+    kept.should contain("l17") # 3 lines of context before the change
+    kept.should_not contain("l16")
+    kept.should contain("l23") # …and 3 after
+    kept.should_not contain("l24")
+    # Nothing is lost: every collapsed line is accounted for by a marker's count.
+    hidden = folded.select { |f| f.line.nil? }.sum(&.hidden)
+    (kept.size + hidden).should eq(diff.size)
+  end
+
+  it "leaves a one-line run alone — the marker replacing it is a row too" do
+    # `x` `SAME` `y` on one side vs `X` `SAME` `Y`: the single unchanged line between two
+    # changes must survive rather than becoming "1 unchanged line".
+    diff = Gori::Repeater::Diff.lines(%w(a SAME b), %w(A SAME B))
+    Gori::Repeater::Diff.fold(diff, 0).any? { |f| f.line.try(&.text) == "SAME" }.should be_true
+  end
+
+  it "collapses an identical pair to one marker and nothing else" do
+    diff = Gori::Repeater::Diff.lines((1..20).map(&.to_s), (1..20).map(&.to_s))
+    folded = Gori::Repeater::Diff.fold(diff, 3)
+    folded.size.should eq(1)
+    folded[0].line.should be_nil
+    folded[0].hidden.should eq(20)
+  end
+end
+
+describe Gori::Repeater::ExchangeMeta do
+  it "states the pair's status flip, size and timing shift" do
+    a = Gori::Repeater::ExchangeMeta.new(403, "403", 1234_i64, 31_000_i64)
+    b = Gori::Repeater::ExchangeMeta.new(200, "200", 1250_i64, 402_000_i64)
+    a.line.should eq("403 · 1.2 KB · 31 ms")
+    d = Gori::Repeater::ExchangeMeta.delta(a, b).not_nil!
+    d.should contain("status 403 → 200")
+    d.should contain("size +16 B")
+    d.should contain("time +371 ms")
+  end
+
+  # An unmeasured field is DROPPED, never zeroed: "0 B" would be a claim about the origin
+  # that nothing observed, and an agent reading the JSON would have no way to tell.
+  it "drops the fields a source cannot name instead of printing zeros" do
+    m = Gori::Repeater::ExchangeMeta.of(nil, nil, nil, nil)
+    m.line.should eq("—")
+    m.size.should be_nil
+    Gori::Repeater::ExchangeMeta.delta(m, m).should be_nil
+  end
+
+  it "labels an errored flow ERR rather than printing its status 0" do
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "https", method: "GET", host: "a.test", port: 443,
+      target: "/", status: 0, size: 0_i64, state: Gori::Store::FlowState::Error)
+    m = Gori::Repeater::ExchangeMeta.of(row)
+    m.status_text.should eq("ERR")
+    m.errored?.should be_true
+  end
+end

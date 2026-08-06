@@ -1511,3 +1511,38 @@ describe "Gori::Tui::FuzzerView ⇧I capture seeding" do
     end
   end
 end
+
+# A fuzz row is exactly the comparison the Comparer tab is for — "this payload got a 500,
+# the baseline got a 200, what is different about the body" — and it had no way there: a
+# fuzz send is not a captured flow, so neither the flow picker nor History's handoff could
+# reach it. See `Gori::Tui::ComparerSlot`.
+describe "Gori::Tui::FuzzerController fuzz → Comparer slot" do
+  it "carries the sent request, the retained response and the measured meta" do
+    view = loaded_fuzzer
+    r = Gori::Fuzz::Result.new(4_i64, ["' OR 1=1"], nil, 500, 91_i64, 9, 5, 12_000_i64,
+      nil, true, false, nil,
+      "HTTP/1.1 500 Internal Server Error\r\n\r\n".to_slice, "stack trace".to_slice,
+      "GET /?x=' OR 1=1 HTTP/1.1\r\nHost: h\r\n\r\n".to_slice)
+    slot = Gori::Tui::FuzzerController.comparer_slot_for(view, r)
+    slot.label.should eq("#4 ' OR 1=1")
+    slot.method.should eq("GET")
+    slot.meta.status.should eq(500)
+    slot.meta.duration_us.should eq(12_000)
+    slot.meta.size.should eq(91) # the run's measured length, not the held body's
+    slot.lines(:response).should contain("stack trace")
+    slot.lines(:request).first.should contain("' OR 1=1")
+  end
+
+  # `keep_bodies` off is the TUI default, so the common case has no response bytes at all.
+  # The slot must still be usable — the request half is reconstructed and the meta was
+  # measured either way — and it must SAY that the request is a reconstruction.
+  it "still yields a slot for a row the run kept no bodies for, and flags the rebuild" do
+    view = loaded_fuzzer
+    slot = Gori::Tui::FuzzerController.comparer_slot_for(view, unretained_result(1, ["x"]))
+    slot.source.should eq("fuzz·rebuilt")
+    slot.summary.should contain("[fuzz·rebuilt]")
+    slot.lines(:request).should_not be_empty
+    slot.lines(:response).should be_empty
+    slot.meta.status.should eq(404) # …and the row's own numbers survive
+  end
+end

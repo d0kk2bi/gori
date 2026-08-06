@@ -612,13 +612,18 @@ module Gori
             "Line-diff two flows' request or response — the MCP equivalent of the TUI's Comparer " \
             "tab. Response bodies are decoded (de-chunked/decompressed) before diffing; request " \
             "bodies are compared byte-faithful. Returns {changed_lines, identical, truncated, " \
-            "diff:[{kind: same|add|del, text}]} (add = only in flow B, del = only in flow A). " \
+            "meta:{a,b:{status,size,duration_us}, delta}, " \
+            "diff:[{kind: same|add|del, text} | {kind: fold, hidden}]} (add = only in flow B, " \
+            "del = only in flow A; fold = a run of `hidden` identical lines collapsed by `context`). " \
+            "`meta.delta` answers the usual question — a status flip, a size or timing shift — " \
+            "before any diff line is read. " \
             "Authorization/Cookie/Set-Cookie/API-key header values are [REDACTED] in the diff " \
             "text unless include_sensitive=true. Pure read: no network, nothing written." do |s|
             s.field "flow_id_a", intprop("first flow id (the 'original' side)"), required: true
             s.field "flow_id_b", intprop("second flow id (the 'new' side)"), required: true
             s.field "pane", strprop("request | response (default response)")
             s.field "changes_only", boolprop("omit unchanged (same) lines from the diff (default false)")
+            s.field "context", intprop("collapse unchanged runs to {kind:fold,hidden} markers, keeping N lines around each change — the readable form for a long response (mutually exclusive with changes_only)")
             s.field "include_sensitive", boolprop("return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED] (default false)")
           end
 

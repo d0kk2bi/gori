@@ -142,7 +142,12 @@ gori run compare 41 42 --pane response --changes-only
 |--------|-------------|
 | `--pane=PANE` | What to diff: `request` or `response` (default) |
 | `--changes-only` | Print only added / removed lines, omitting unchanged context |
+| `--context=N` | Collapse unchanged runs to `@@ N unchanged lines @@` markers, keeping N lines around each change (mutually exclusive with `--changes-only`) |
 | `--format=FMT` | `text` (default) or `json` |
+
+Both sides' `status · size · time` and the A→B delta print above the diff, so a status flip or a size shift is visible before the first line is read. `--format=json` carries the same under `meta`, and a collapsed run becomes `{"kind":"fold","hidden":N}` rather than a gap.
+
+`--changes-only` says *what* changed but erases *where*: a 400-line body with one edit comes back as two lines with no position. `--context` keeps the change in place and states how much it skipped.
 
 ### run intercept
 

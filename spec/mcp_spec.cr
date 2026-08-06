@@ -1912,6 +1912,52 @@ describe Gori::MCP::Server do
       end
     end
 
+    # `changes_only` answers "what changed" but erases WHERE: a body of 40 identical lines
+    # with one edit comes back as two lines with no position. `context` keeps the change in
+    # place and states how much it skipped, so an agent can quote a real region.
+    it "context folds unchanged runs into counted markers instead of dropping them" do
+      with_store do |store|
+        body = ->(mid : String) { (1..40).map { |i| i == 20 ? mid : "line#{i}" }.join("\n") }
+        a = seed_flow(store, "a.test", "GET", "/x", 200, resp_body: body.call("BEFORE").to_slice)
+        b = seed_flow(store, "a.test", "GET", "/x", 200, resp_body: body.call("AFTER").to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"compare_flows","arguments":{"flow_id_a":#{a},"flow_id_b":#{b},"context":3}}})
+        payload = tool_payload(drive(store, call)[0])
+        rows = payload["diff"].as_a
+        folds = rows.select { |r| r["kind"].as_s == "fold" }
+        folds.size.should be > 0
+        folds.each { |f| f["hidden"].as_i.should be > 1 }
+        texts = rows.compact_map { |r| r["text"]?.try(&.as_s) }
+        texts.any?(&.includes?("BEFORE")).should be_true
+        texts.any?(&.includes?("line19")).should be_true # context kept
+        texts.any?(&.includes?("line5")).should be_false # …and the distance folded away
+        rows.size.should be < 40
+      end
+    end
+
+    it "refuses context together with changes_only rather than silently picking one" do
+      with_store do |store|
+        a = seed_flow(store, "a.test", "GET", "/x", 200)
+        b = seed_flow(store, "a.test", "GET", "/y", 200)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"compare_flows","arguments":{"flow_id_a":#{a},"flow_id_b":#{b},"context":3,"changes_only":true}}})
+        resp = drive(store, call)[0]["result"]
+        resp["isError"].as_bool.should be_true
+        resp["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+      end
+    end
+
+    # The first answer to most comparisons is not in the body: a status flip, a size shift.
+    it "reports each side's status/size/time and the A→B delta" do
+      with_store do |store|
+        a = seed_flow(store, "a.test", "GET", "/admin", 403, resp_body: "no".to_slice)
+        b = seed_flow(store, "a.test", "GET", "/admin", 200, resp_body: "yes ok".to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"compare_flows","arguments":{"flow_id_a":#{a},"flow_id_b":#{b}}}})
+        payload = tool_payload(drive(store, call)[0])
+        payload["meta"]["a"]["status"].as_i.should eq(403)
+        payload["meta"]["b"]["status"].as_i.should eq(200)
+        payload["meta"]["delta"].as_s.should contain("403 → 200")
+      end
+    end
+
     it "returns NOT_FOUND for a missing flow id" do
       with_store do |store|
         a = seed_flow(store, "a.test", "GET", "/x", 200)

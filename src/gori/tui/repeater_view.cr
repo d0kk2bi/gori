@@ -22,6 +22,7 @@ require "../repeater/diff"
 require "../repeater/flow_request"
 require "../repeater/minimize" # PIPELINE_SEP aliases Minimize::GROUP_SEP
 require "../repeater/subtab_filter"
+require "./comparer_slot" # a send can be handed to the Comparer as one side of a diff
 require "../fuzz"
 require "../decoder"
 require "./chain_pane"
@@ -1937,6 +1938,32 @@ module Gori::Tui
       return nil unless res
       return nil if res.head.empty?
       {res.head, res.body}
+    end
+
+    # This tab's last send as ONE side of a Comparer diff — the request that went out, the
+    # response that came back, and the status/time the sender measured.
+    #
+    # It has to be built here rather than resolved from a flow, because a Repeater send does
+    # not become one: WS, gRPC and split-decode tabs are session-only (`db_id` nil) and even
+    # an ordinary send leaves no capture row. Comparing "the captured request" against "the
+    # same request with one header changed" was the obvious use for this tab and the one
+    # thing it could not reach.
+    #
+    # nil until a send lands. `request_bytes` can refuse (a group-framing send), which is a
+    # statement about SENDING, not about reading: fall back to the response half alone rather
+    # than withholding the whole slot.
+    def comparer_slot : ComparerSlot?
+      res = @result
+      return nil unless res
+      req = begin
+        request_bytes
+      rescue
+        nil
+      end
+      ComparerSlot.from_exchange(
+        "repeater", ComparerSlot.method_of(req), @target,
+        req, nil, res.head.empty? ? nil : res.head, res.body,
+        status: res.response.try(&.status), duration_us: res.duration_us, error: res.error)
     end
 
     def request_bytes : Bytes
