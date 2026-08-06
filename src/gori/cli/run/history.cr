@@ -33,8 +33,14 @@ module Gori
         end
         parser.parse(args)
 
-        id_s = positional.first? || abort("gori run history delete: <id> is required")
-        id = id_s.to_i64? || abort("gori run history delete: invalid flow id #{id_s.inspect}")
+        # `take_flow_id`, not a hand-rolled `first?`: it supplies the too-many-arguments abort
+        # this one path was missing, so `history delete 1 2 3` no longer deletes ONLY flow #1
+        # and exits 0 with nothing said about #2 and #3. The TUI has multi-select delete and the
+        # store exposes `delete_flows`, so trying the list form is natural — and an operator who
+        # believes three captures are gone when two are still on disk has been told a lie by a
+        # destructive command. Every sibling id-taking delete (project, scope, env,
+        # host-override, `history show`) already goes through this helper.
+        id = take_flow_id(positional, "history delete")
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin
@@ -110,9 +116,12 @@ module Gori
         parser.parse(opt_args)
         # Accept a positional QL too ("gori run history status:404" / "-status:404"),
         # mirroring the TUI's `/` bar — otherwise a positional query was silently dropped
-        # and EVERY flow dumped. An explicit --query wins. Terms join with spaces (QL ANDs).
-        positional_query = (positional + neg_terms).join(' ')
-        query ||= positional_query unless positional_query.empty?
+        # and EVERY flow dumped.
+        query, dropped = Run.compose_history_query(query, positional, neg_terms)
+        if dropped
+          STDERR.puts "gori run history: --query given, so the positional query term(s) " \
+                      "#{dropped.inspect} were ignored"
+        end
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin

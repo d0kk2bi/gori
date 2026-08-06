@@ -961,3 +961,76 @@ describe "gori run --bind-from — Layer-1 scope gate on the SEED's host" do
     end
   end
 end
+
+# `split_ql_negations` pulls `-field:value` out of argv before OptionParser can abort it as an
+# unknown option — so a negation term is a filter the CLI reclassified on the operator's behalf,
+# not a positional they chose. `query ||= (positional + neg_terms).join` threw those terms away
+# whenever `--query` was also given, silently BROADENING the result set (measured: with 3 flows,
+# `history 'host:x' '-path:/b'` returned 2 and `history --query='host:x' '-path:/b'` returned 3)
+# and skipping `warn_query_terms`, the apparatus built to shout about exactly that.
+describe "CLI::Run.compose_history_query" do
+  it "ANDs negation terms into an explicit --query instead of dropping them" do
+    q, dropped = Gori::CLI::Run.compose_history_query("host:x", [] of String, ["-path:/b"])
+    q.should eq("host:x -path:/b")
+    dropped.should be_nil
+  end
+
+  it "reports nothing swallowed when --query stands alone" do
+    # The warning must fire ONLY when something was actually dropped: `gori run history
+    # --format=har --query=… > out.har` is piped, so a line on STDERR every time would be new
+    # noise in an existing workflow.
+    Gori::CLI::Run.compose_history_query("host:x", [] of String, [] of String)
+      .should eq({"host:x", nil})
+  end
+
+  it "keeps --query winning over a plain positional, but reports what it swallowed" do
+    q, dropped = Gori::CLI::Run.compose_history_query("host:x", ["status:404"], [] of String)
+    q.should eq("host:x")
+    dropped.should eq("status:404") # the caller warns; silence is what made this a bug
+  end
+
+  it "ANDs negations AND reports the swallowed positional when both are present" do
+    q, dropped = Gori::CLI::Run.compose_history_query("host:x", ["status:404"], ["-path:/b", "-method~PO"])
+    q.should eq("host:x -path:/b -method~PO")
+    dropped.should eq("status:404")
+  end
+
+  it "joins positionals and negations when there is no --query (unchanged)" do
+    q, dropped = Gori::CLI::Run.compose_history_query(nil, ["host:x"], ["-path:/b"])
+    q.should eq("host:x -path:/b")
+    dropped.should be_nil
+  end
+
+  it "is nil — match everything — only when the operator asked for nothing" do
+    Gori::CLI::Run.compose_history_query(nil, [] of String, [] of String).should eq({nil, nil})
+    # A negation ALONE is still a query: `history -status:404` must not dump every flow.
+    Gori::CLI::Run.compose_history_query(nil, [] of String, ["-status:404"]).should eq({"-status:404", nil})
+  end
+end
+
+# `gori run rewriter --project=t1 rm 1` — a global flag BEFORE the verb, the ordering every other
+# `gori run` command accepts. The dispatcher sees a first token starting with '-', assumes the rest
+# are list options, and routes to the list command, whose OptionParser had no `unknown_args`
+# handler: the verb and its id were dropped, the rules printed, exit 0. A destructive mutation that
+# silently no-ops with a SUCCESS status. Verified against the built binary for all three list
+# commands; this pins the shared decision and message, which `abort` cannot be spec'd for.
+describe "CLI::Run.list_leftover_error" do
+  it "is nil when a list command got no positionals (the ordinary list)" do
+    Gori::CLI::Run.list_leftover_error([] of String, "rewriter", "add, rm").should be_nil
+  end
+
+  it "names the discarded verb, the ordering, and the real verbs" do
+    msg = Gori::CLI::Run.list_leftover_error(["rm", "1"], "rewriter", "add, rm/delete, enable")
+    msg.should_not be_nil
+    m = msg.not_nil!
+    m.should contain("unknown subcommand 'rm'") # the token that was about to be swallowed
+    m.should contain("global flags go AFTER")   # the fix the operator has to apply
+    m.should contain("gori run rewriter rm")    # the corrected invocation, spelled out
+    m.should contain("add, rm/delete, enable")  # what they could have meant
+  end
+
+  it "names only the FIRST leftover — the verb, not its arguments" do
+    Gori::CLI::Run.list_leftover_error(["disable", "custom_p_1"], "probe rules", "add, enable")
+      .not_nil!.should contain("unknown subcommand 'disable'")
+  end
+end

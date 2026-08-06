@@ -556,6 +556,33 @@ module Gori
         {hits, rest}
       end
 
+      # The QL `gori run history`/`ls` actually runs, plus the positional terms an explicit
+      # `--query` swallowed (nil when none were).
+      #
+      # `--query` wins over a POSITIONAL query — but NOT over a negation term, and the difference
+      # is provenance. A positional is a second spelling of the same argument, so letting the
+      # explicit flag win is a choice. A `-path:/b` is not: OptionParser would have aborted it as
+      # an unknown option, so `split_ql_negations` reclassified it out of argv on the operator's
+      # behalf — and the old `query ||= (positional + neg_terms).join` then threw it away
+      # whenever `--query` was also given. Measured with 3 flows: `history 'host:x' '-path:/b'`
+      # returned the two that match, `history --query='host:x' '-path:/b'` returned all three.
+      # A silently BROADER result set is the one outcome `warn_query_terms` exists to shout
+      # about, and the dropped term never reached it either. Spaces are QL's AND, which the
+      # positional join already assumed.
+      #
+      # Returned rather than aborted so the caller owns the message, and named rather than
+      # inlined so the precedence is spec-able without a store or a tty.
+      def self.compose_history_query(query : String?, positional : Array(String),
+                                     neg_terms : Array(String)) : {String?, String?}
+        if q = query
+          combined = neg_terms.empty? ? q : ([q] + neg_terms).join(' ')
+          {combined, positional.empty? ? nil : positional.join(' ')}
+        else
+          pq = (positional + neg_terms).join(' ')
+          {pq.empty? ? nil : pq, nil}
+        end
+      end
+
       # QL negation terms ("-field:value" / "-field~rx") begin with '-', so OptionParser
       # aborts them as unknown options before the positional-query join ever runs. Pull
       # them out first so they join the query like any other positional term. A single-
@@ -592,6 +619,31 @@ module Gori
           end
         end
         out
+      end
+
+      # Refuse the positionals a LIST command was handed. A `list` takes none, but every
+      # `rewriter`/`probe rules` dispatcher routes a first token starting with '-' straight to
+      # its list command on the assumption that the rest are list options — so a global flag
+      # written BEFORE the verb (`rewriter --project=t1 rm 1`, the ordering every other
+      # `gori run` command accepts) discarded the verb AND its id, listed the rules, and exited
+      # 0. A destructive mutation that silently no-ops with a SUCCESS status is the failure this
+      # file's own header (see the `verb_token?` guards) calls the worst one a scripted surface
+      # can have, so it becomes a usage error that names the ordering.
+      private def self.refuse_list_leftovers(leftover : Array(String), sub : String,
+                                             verbs : String) : Nil
+        (msg = list_leftover_error(leftover, sub, verbs)) && abort(msg)
+      end
+
+      # The sentence `refuse_list_leftovers` aborts with, or nil to proceed. Split out so the
+      # decision AND the message are spec-able — `abort` is not, and this is the one fix of the
+      # three whose blast radius is several call sites (`cmd_rewriter_list`, `cmd_extract_list`,
+      # `cmd_probe_rules_list`) plus one DELIBERATE exclusion: `cmd_probe_scan` takes a positional
+      # QL query (`gori run probe [QL query]`), so a leftover there is the operator's filter, not
+      # a discarded verb. Do not add this to it.
+      def self.list_leftover_error(leftover : Array(String), sub : String, verbs : String) : String?
+        return nil if leftover.empty?
+        "gori run #{sub}: unknown subcommand '#{leftover[0]}' — global flags go AFTER " \
+        "the subcommand (`gori run #{sub} #{leftover[0]} … --project=NAME`). Verbs: #{verbs}"
       end
 
       private def self.take_flow_id(rest : Array(String), sub : String) : Int64

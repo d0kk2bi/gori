@@ -170,7 +170,63 @@ module Gori::Proxy
 
     private def self.normalize_host(h : String) : String
       h = h[1...-1] if h.starts_with?('[') && h.ends_with?(']') # strip IPv6 brackets
+      # Unwrap a v4-mapped literal, the same rule (and reason) as `OrigDst.dial_host`. Under a
+      # dual-stack `::` bind the kernel reports an accepted IPv4 connection's local address as
+      # `::ffff:192.168.1.5` while the client's `Host` says `192.168.1.5`, so the `local_host`
+      # comparisons in `loops_to_self?`/`addresses_self?` — the whole reason that parameter
+      # exists ("a Host that matches the LAN/interface IP the client connected through") — could
+      # never match, and a LAN device got neither the CA-download page nor the self-loop refusal.
+      h = h.lchop("::ffff:") if h.starts_with?("::ffff:") && h.count('.') == 3
       h.downcase
+    end
+
+    # `h` with one trailing root dot removed: `localhost.` is the same name as `localhost` to
+    # every resolver (verified: it dials a 127.0.0.1 listener), but to a string compare it is not.
+    private def self.strip_root_dot(h : String) : String
+      h.size > 1 && h.ends_with?('.') ? h.rchop('.') : h
+    end
+
+    # `h` read as `inet_aton` reads it, folded to a u32 — or nil when it is not that grammar.
+    #
+    # `parse_ip` is `inet_pton`, which accepts only the full dotted-quad. The RESOLVER every
+    # dial goes through is `inet_aton`-flavoured and accepts far more, all of which reach a
+    # 127.0.0.1 listener (measured on this platform): a bare 32-bit decimal (`2130706433`), a
+    # hex or octal form (`0x7f000001`, `017700000001`), and the short dotted forms where the last
+    # part fills the remaining low bytes (`127.1`, `0.0`, `0`). So `unspecified?` returned false
+    # for `0` and `0.0` — both all-zero spellings its own comment claims to cover — and
+    # `loopback?`'s string fallback knew only the literal `127.` prefix. A client naming gori's
+    # own port as `Host: 0:8080` therefore walked past `loops_to_self?` and gori forwarded to
+    # itself, accepted that as a fresh client, re-derived the same target, and dialled again:
+    # verbatim the accept-loop wedge `reaches_self?` exists to stop.
+    #
+    # String-local on purpose — no DNS on this path (see `parse_ip`) — and STRICT, because a
+    # false positive here 502s legitimate traffic: every part must be numeric and in range, so a
+    # hostname (`example.com`, `12345.com`) yields nil rather than an address.
+    private def self.inet_aton_u32?(h : String) : UInt32?
+      return nil if h.empty?
+      parts = h.split('.')
+      return nil if parts.size > 4
+      vals = [] of UInt32
+      parts.each do |p|
+        return nil if p.empty?
+        v = if p.starts_with?("0x") || p.starts_with?("0X")
+              p[2..]?.presence.try(&.to_u32?(16))
+            elsif p.size > 1 && p.starts_with?('0')
+              p[1..].to_u32?(8)
+            else
+              p.to_u32?(10)
+            end
+        return nil unless v
+        vals << v
+      end
+      last = vals[-1]
+      lead = vals[0...(vals.size - 1)]
+      return nil if lead.any? { |v| v > 0xff }
+      # inet_aton: with n parts, the last one fills the low `4 - (n - 1)` bytes.
+      return nil if last.to_u64 > (1_u64 << (8 * (4 - lead.size))) - 1
+      acc = 0_u32
+      lead.each_with_index { |v, i| acc |= v << (8 * (3 - i)) }
+      acc | last
     end
 
     # `h` parsed as an IP literal, or nil when it is a hostname ("localhost",
@@ -193,10 +249,15 @@ module Gori::Proxy
     # literal), so dropping the prefix test would regress the exact case it guards.
     # Parsing additionally buys the v4-mapped forms (::ffff:127.0.0.1) for free.
     private def self.loopback?(h : String) : Bool
+      h = strip_root_dot(h)
       if ip = parse_ip(h)
         return ip.loopback?
       end
-      h == "localhost" || h.starts_with?("127.")
+      return true if h == "localhost"
+      if v = inet_aton_u32?(h)
+        return (v >> 24) == 127 # the whole 127/8 block, however it was spelled
+      end
+      h.starts_with?("127.")
     end
 
     # The all-zero address in ANY spelling (0.0.0.0, ::, ::0, 0:0:0:0:0:0:0:0, 0000:…).
@@ -205,7 +266,9 @@ module Gori::Proxy
     # bind the loopback/wildcard conjunct collapsed to false for every loopback target
     # and BOTH the self-page (CA download) and the self-loop refusal disappeared.
     private def self.unspecified?(h : String) : Bool
-      !!parse_ip(h).try(&.unspecified?)
+      h = strip_root_dot(h)
+      return true if parse_ip(h).try(&.unspecified?)
+      inet_aton_u32?(h) == 0_u32 # `0`, `0.0`, `0.0.0`, `0x0` — all-zero, none of them inet_pton
     end
 
     # A BIND that answers on every interface: the all-zero address, plus the empty string

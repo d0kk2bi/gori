@@ -272,6 +272,54 @@ describe Gori::Proxy::Upstream do
       Gori::Proxy::Upstream.addresses_self?("127.0.0.1", 8080, {"127.0.0.1", 8080}).should be_true
     end
 
+    # The resolver's grammar is `inet_aton`'s, not `inet_pton`'s: every spelling below was
+    # MEASURED reaching a real 127.0.0.1 TCPServer on this platform, while
+    # `Socket::IPAddress.new(h, 0)` raises for all of them. So the classifiers were blind to
+    # them and gori forwarded a request aimed at its own listener to itself, accepted it as a
+    # fresh client, and dialled again — the accept-loop wedge `reaches_self?` exists to stop.
+    it "recognises numeric and rooted loopback spellings inet_pton rejects" do
+      {"2130706433", "0x7f000001", "017700000001", "127.1", "127.0.1", "localhost."}.each do |h|
+        Gori::Proxy::Upstream.addresses_self?(h, 8080, {"127.0.0.1", 8080})
+          .should be_true, file: __FILE__, line: __LINE__
+      end
+    end
+
+    # `unspecified?`'s own comment claims "the all-zero address in ANY spelling"; these three
+    # are all-zero, all reach loopback, and none of them parse as a literal.
+    it "recognises short all-zero spellings as the unspecified address" do
+      {"0", "0.0", "0.0.0"}.each do |h|
+        Gori::Proxy::Upstream.addresses_self?(h, 8080, {"127.0.0.1", 8080})
+          .should be_true, file: __FILE__, line: __LINE__
+      end
+    end
+
+    # The false-positive boundary: a 502 for legitimate traffic is worse than the loop, so the
+    # numeric reader must refuse anything that is not exactly inet_aton's grammar, and must not
+    # claim a non-127 address.
+    it "does not mistake a hostname or a non-loopback numeric host for self" do
+      {"example.com", "12345.com", "0x", "1.2.3.4.5", "256.1",
+       "16777217", "8.8.8.8", "notlocalhost"}.each do |h|
+        Gori::Proxy::Upstream.addresses_self?(h, 8080, {"127.0.0.1", 8080})
+          .should be_false, file: __FILE__, line: __LINE__
+      end
+      # `127.0.0.256` is out-of-range for inet_aton too, so the numeric reader also refuses it —
+      # but the PRE-EXISTING `starts_with?("127.")` fallback still claims it, and deliberately
+      # (see `loopback?`: dropping the prefix test would regress `127.1`). Pinned as unchanged
+      # rather than omitted: refusing an unroutable `127.` host as self is the safe side.
+      Gori::Proxy::Upstream.addresses_self?("127.0.0.256", 8080, {"127.0.0.1", 8080}).should be_true
+    end
+
+    # A dual-stack `::` bind reports an accepted IPv4 connection's local address v4-mapped, so
+    # `local_host` never matched the dotted `Host` the client actually sent — the one input the
+    # parameter was added for.
+    it "matches a v4-mapped local_host against the dotted Host the client sent" do
+      Gori::Proxy::Upstream.addresses_self?(
+        "192.168.1.5", 8080, {"::", 8080}, local_host: "::ffff:192.168.1.5").should be_true
+      # …and the mirror spelling, a client that writes the mapped form itself.
+      Gori::Proxy::Upstream.addresses_self?(
+        "[::ffff:192.168.1.5]", 8080, {"::", 8080}, local_host: "192.168.1.5").should be_true
+    end
+
     # Gap 1: the OS routes a connect() to the all-zero address onto loopback, so a
     # wildcard TARGET reaches us wherever a loopback target would.
     it "treats a 0.0.0.0 target as self against a loopback bind" do

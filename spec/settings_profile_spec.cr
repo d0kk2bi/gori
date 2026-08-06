@@ -276,3 +276,41 @@ describe "settings profiles" do
     end
   end
 end
+
+# #594 fixed a settings loader that overwrote the operator's own file: one `as_i?` OverflowError
+# aborted `apply_sections` partway, every section BELOW it kept its factory default, and the next
+# `save` wrote those defaults to disk. The same failure was still reachable through a different
+# coercion — `JSON::Any#[]?(String)` RAISES on a non-object ("Expected Hash for #[]?(key : String),
+# not String"), and four sections dereferenced their node with no `as_h?` guard. `"editor": "nvim"`
+# is enough, and `gori settings import` accepts such a profile after validating only the TOP level.
+#
+# `mine` is the probe: `parse_mine_prefs(root["mine"]?)` is declared AFTER all four guarded
+# sections, so it is applied only if none of them aborted the pass.
+describe "Settings.apply_sections — a non-object section must not abandon the rest" do
+  {"editor", "network", "decoder", "rewriter"}.each do |section|
+    {"\"not-an-object\"", "null", "42", "[1,2]"}.each do |bad|
+      it "survives #{section} = #{bad} and still applies the sections after it" do
+        with_config_home do
+          prev = Gori::Settings.mine_concurrency
+          begin
+            Gori::Settings.mine_concurrency = 3
+            Gori::Settings.import_document(%({"#{section}": #{bad}, "mine": {"concurrency": 7}}))
+            Gori::Settings.mine_concurrency.should eq(7)
+          ensure
+            Gori::Settings.mine_concurrency = prev
+          end
+        end
+      end
+    end
+  end
+
+  it "still reads a well-formed editor and network section (regression guard)" do
+    with_config_home do
+      Gori::Settings.import_document(
+        %({"editor": {"command": "nvim"}, "network": {"bind_port": 9123}, "theme": "goriday"}))
+      Gori::Settings.editor.should eq("nvim")
+      Gori::Settings.bind_port.should eq(9123)
+      Gori::Settings.theme.should eq("goriday")
+    end
+  end
+end

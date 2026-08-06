@@ -541,12 +541,19 @@ module Gori::Tui
 
       case @overlay
       when :palette
+        # ONE `rows.size` for both arrows. The ↑ arm used to take the modulo BEFORE its
+        # empty-list guard — `(@pal_sel - 1) % 0` — so typing a character that matches no
+        # PALETTE_ROWS label and then pressing ↑ killed the tour with an unhandled
+        # DivisionByZeroError, while the ↓ arm three lines below had always computed `n`
+        # first. `render_fake_palette` already paints "(no matches)" and `footer_hint`
+        # advertises ↑/↓ in exactly that state, so the empty list was expected everywhere
+        # except on that one line. Hoisted rather than re-guarded so the two cannot drift
+        # apart again. (Crystal's `%` is floored, so -1 wraps to the last row.)
+        n = filtered_palette.size
         if key.up? || ev.char == 'k'
-          @pal_sel = (@pal_sel - 1) % filtered_palette.size
-          @pal_sel = 0 if filtered_palette.empty?
+          @pal_sel = Tutorial.wrap_sel(@pal_sel, -1, n)
         elsif key.down? || ev.char == 'j'
-          n = filtered_palette.size
-          @pal_sel = n == 0 ? 0 : (@pal_sel + 1) % n
+          @pal_sel = Tutorial.wrap_sel(@pal_sel, +1, n)
         elsif key.backspace?
           @pal_query = @pal_query[0...-1] unless @pal_query.empty?
           @pal_sel = 0
@@ -896,6 +903,22 @@ module Gori::Tui
     # so that range is reachable — and the failure would be a mascot painted on top of the
     # tab-bar mock, not a missing one. She stands down instead, and #pet_band then returns
     # 0 so the card takes the full width it would have had if she were off.
+    # Move a wrapping selection by `delta` over `n` rows, and 0 when there are none.
+    #
+    # A class method rather than two inline expressions because the two arrows had already
+    # drifted: ↑ took `(@pal_sel - 1) % filtered_palette.size` BEFORE its empty-list guard, so
+    # filtering the tour's fake palette down to no matches and pressing ↑ (or `k`) killed the
+    # process with an unhandled DivisionByZeroError — on the first-run path that is after
+    # `SetupWizard#finish` has written settings.json, so the tour never auto-launched again.
+    # ↓ three lines below had always computed the size first. `render_fake_palette` clamps for
+    # an empty list and paints "(no matches)", and `footer_hint` advertises ↑/↓ in exactly that
+    # state, so the empty list was expected everywhere but that one line. One home, spec-able
+    # without a tty. (Crystal's `%` is floored, so -1 wraps to the last row.)
+    def self.wrap_sel(sel : Int32, delta : Int32, n : Int32) : Int32
+      return 0 if n <= 0
+      (sel + delta) % n
+    end
+
     def self.pet_place(w : Int32, h : Int32) : Rect?
       return nil unless rect = Pet.place(pet_stage(w, h))
       # Her plate claims a column left of the sprite (Pet.draw), so that — not rect.x — is
