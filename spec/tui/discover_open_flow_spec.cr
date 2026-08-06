@@ -1,4 +1,5 @@
 require "../spec_helper"
+require "../support/memory_backend"
 
 # `↵` on a Discover findings row opens the request/response that row was found with, in the
 # same History detail the Sitemap's `o` opens. The run holds no bytes — the exchange went
@@ -10,6 +11,10 @@ include Gori::Tui
 private def finding(url : String) : Gori::Discover::Finding
   Gori::Discover::Finding.new(url, "GET", 200, 4_i64, "text/html",
     Gori::Discover::Source::Crawled, 1, 0.95, nil)
+end
+
+private def render(view : DiscoverView, w = 120, h = 30) : Nil
+  view.render(Screen.new(MemoryBackend.new(w, h)), Rect.new(0, 0, w, h), true)
 end
 
 private def run_with(urls : Array(String)) : DiscoverRun
@@ -70,6 +75,26 @@ describe "Discover finding → flow" do
     view.focus_pane(:findings)
     view.selected_finding.should be_nil
     view.selected_flow_id.should be_nil
+  end
+
+  it "pulls the cursor back inside a re-run that found fewer endpoints" do
+    # ^R empties `findings` on the run while `@fsel` lives on the view, so a cursor parked on
+    # row 9 of a 10-finding run outlived a re-run that found 3: the band was drawn on nothing
+    # and `selected_finding` was nil with rows plainly on screen.
+    view = DiscoverView.new
+    run = run_with((1..10).map { |i| "http://t/#{i}" })
+    view.add(run)
+    view.focus_pane(:findings)
+    9.times { view.move(1) }
+    view.selected_finding.not_nil!.url.should eq("http://t/10")
+
+    run.begin_run
+    3.times { |i| run.add_finding(finding("http://t/re#{i}")) }
+    run.set_flow_id(2, 99_i64)
+    render(view)
+
+    view.selected_finding.not_nil!.url.should eq("http://t/re2")
+    view.selected_flow_id.should eq(99_i64)
   end
 
   it "answers for the cursor row from either pane — `o` opens what is drawn selected" do

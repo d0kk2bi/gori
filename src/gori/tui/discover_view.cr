@@ -262,6 +262,19 @@ module Gori::Tui
       r.flow_id_at(@fsel)
     end
 
+    # Pull the findings cursor back inside the selected run's list.
+    #
+    # `move` clamps as it steps, but a RE-RUN (`^R`) empties `findings` on the run object while
+    # `@fsel` lives here, so a cursor parked on row 9 of a 10-finding run survives into a re-run
+    # that finds 3. That left the selection band drawn on nothing and `selected_finding` nil
+    # with rows plainly on screen — which `open_flow_target` would then report as "this run
+    # found nothing". Called from render, alongside the scroll anchor it already fixes up.
+    private def clamp_findings(r : DiscoverRun) : Nil
+      return if r.findings.empty? # nothing to clamp to; the empty-state message is correct
+      @fsel = r.findings.size - 1 if @fsel >= r.findings.size
+      @fsel = 0 if @fsel < 0
+    end
+
     def findings_at_top? : Bool
       @fsel == 0
     end
@@ -470,6 +483,7 @@ module Gori::Tui
       end
       header_row(screen, inner)
       cap = inner.h - 1
+      clamp_findings(r) # before ensure_visible: the scroll anchor is derived from @fsel
       ensure_visible(cap, r)
       cap.times do |i|
         idx = @scroll + i

@@ -48,10 +48,24 @@ module Gori::Discover
     # function of those four plus the run's fixed header block, and `Sender` overrides this
     # with the very call `fetch` makes. The default below is the minimal GET the contract
     # implies, which is exactly what a backend that frames nothing (a spec double) stands for.
+    #
+    # One caveat, since this is called just after the send rather than during it: a `$NAME`
+    # header REBOUND between the two resolves to its new value here. `Env.binding_rev` only
+    # moves when the operator edits a binding, and the window is the length of one `fetch`, so
+    # the stored request can differ from the sent one by a header value in exactly that case.
     def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
       default = scheme == "https" ? 443 : 80
       hostline = port == default ? host : "#{host}:#{port}"
       "GET #{target} HTTP/1.1\r\nHost: #{hostline}\r\n\r\n".to_slice
+    end
+
+    # The name this backend presents in the ClientHello, or nil for the dialed host's own name.
+    # It belongs on the send seam for the reason `Sender#sni` gives (the backend owns the wire
+    # decision), and it has to reach the STORE: `Repeater::FlowRequest.build` seeds a re-send
+    # from `FlowDetail#sni`, so a flow persisted without it re-sends to a name-based vhost
+    # under the wrong name — which is precisely the sweep `--sni` exists to express.
+    def sni : String?
+      nil
     end
 
     # Release any transport the backend is holding open (the keep-alive pools' parked
@@ -298,6 +312,10 @@ module Gori::Discover
 
     def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
       @inner.request_head(scheme, host, port, target)
+    end
+
+    def sni : String?
+      @inner.sni
     end
 
     def close : Nil
@@ -1174,7 +1192,7 @@ module Gori::Discover
       max = Settings.capture_max
       body = body[0, max].dup if body && body.size > max
       Exchange.new(@capped.request_head(p.scheme, p.host, p.port, target),
-        resp, body, size, raw.incomplete?, raw.duration_us)
+        resp, body, size, raw.incomplete?, raw.duration_us, @capped.sni)
     end
 
     private def send_with_retries(url : String) : Repeater::Result

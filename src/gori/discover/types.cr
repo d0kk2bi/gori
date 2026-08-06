@@ -103,13 +103,19 @@ module Gori
     # `Settings.capture_max` like live capture. `body_size` is what the origin actually
     # delivered, so a capped body is stored as truncated rather than as a complete short one.
     # `incomplete` is `Repeater::Result#incomplete?` — the origin cut the response short.
+    #
+    # `sni` is the ClientHello name the run dialed under (`--sni` / `discover_start{sni}`),
+    # carried because the stored flow is re-sendable: `Repeater::FlowRequest.build` seeds a
+    # repeater from `FlowDetail#sni`, so dropping it here would make an IP-direct sweep of a
+    # name-based vhost find an endpoint that its own re-send cannot reach.
     record Exchange,
       request_head : Bytes,
       response : Proxy::Codec::RawResponse,
       body : Bytes?,
       body_size : Int64?,
       incomplete : Bool,
-      duration_us : Int64
+      duration_us : Int64,
+      sni : String? = nil
 
     # Live counters. `est_total` is a MOVING estimate that RISES as discovery proceeds
     # (a live crawl has no stable denominator), nil early — frontends render

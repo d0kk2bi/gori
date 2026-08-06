@@ -93,6 +93,34 @@ describe "Gori::Discover finding exchanges" do
     events.first.exchange.not_nil!.body.not_nil!.should eq("admin panel".to_slice)
   end
 
+  it "carries the run's SNI onto the stored flow, so its re-send reaches the same vhost" do
+    # `--sni` / `discover_start{sni}` express an IP-direct sweep of a name-based vhost. The
+    # stored flow is re-sendable (`Repeater::FlowRequest.build` seeds from `FlowDetail#sni`),
+    # so a finding persisted without the name would re-send under the dialed IP and miss the
+    # vhost it was found on.
+    ex = D::Exchange.new(
+      request_head: "GET / HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n".to_slice,
+      response: Gori::Proxy::Codec::Http1.parse_response_head(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_slice),
+      body: "ok".to_slice, body_size: 2_i64, incomplete: false, duration_us: 1_i64,
+      sni: "vhost.example")
+    f = D::Finding.new("https://10.0.0.5/", "GET", 200, 2_i64, nil, D::Source::Seed, 0, 0.95, nil)
+
+    with_store do |store|
+      pair = D::Persist.flow_pair(f, 4_i64, ex)
+      id = store.insert_import_batch_ids([{pair.request, pair.response}]).first
+      store.get_flow(id).not_nil!.sni.should eq("vhost.example")
+    end
+  end
+
+  it "reads the SNI off the send seam, not off a copy the engine keeps" do
+    # The backend owns the wire decision; the default Backend presents no override.
+    HeaderBackend.new(->(_t : String) { notfound }).sni.should be_nil
+    Gori::Discover::Sender.new(verify: true, sni: "vhost.example").sni.should eq("vhost.example")
+    Gori::Discover::CappedBackend.new(
+      Gori::Discover::Sender.new(verify: true, sni: "vhost.example"), nil).sni.should eq("vhost.example")
+  end
+
   it "persists the wire bytes as an openable flow" do
     ex = D::Exchange.new(
       request_head: "GET /a HTTP/1.1\r\nHost: t\r\nAccept: */*\r\n\r\n".to_slice,

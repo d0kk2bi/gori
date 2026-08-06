@@ -131,7 +131,7 @@ module Gori::Discover
       scheme, host, port, _ = Import::Builder.endpoint(f.url)
       req = Proxy::Codec::Http1.parse_request_head(ex.request_head)
       request = FlowMapper.request(req, scheme: scheme, host: host, port: port,
-        created_at: created_at)
+        created_at: created_at, sni: ex.sni)
       stored, trunc, size = Import::Builder.capped(ex.body, ex.body_size)
       # `incomplete` is the OTHER way a stored body is short of what the origin framed (it cut
       # the response off); `capped` only knows about the ceiling gori applied. Either one means
