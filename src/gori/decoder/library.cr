@@ -71,8 +71,12 @@ module Gori::Decoder
     # visible stack rather than a hang in a fuzz worker. Returns nil when the entry is
     # unusable (cycle, or past MAX_TOKENS), with the reason in `why`.
     #
-    # A token that is neither a built-in nor a saved name is left ALONE: `run` then reports it
-    # as an unknown converter, which is the same answer typing it directly would give.
+    # A token that is neither a built-in nor a saved name makes the chain unusable: leaving
+    # it "as typed" registered the entry with `unusable: nil`, so `Fuzz::Plan`'s up-front
+    # `refuse_unusable_chains` never fired and `Template#apply_chains` sent the payload
+    # untransformed (a typo'd `url-encode > nosuchthing` put a raw space on the wire).
+    # Marking it here surfaces the same "unknown converter" answer the plan gate already
+    # knows how to report — before the first dial.
     #
     # `r` MUST be the pristine built-in registry here — see `register_all`'s two passes. If a
     # saved entry has already been registered into it, `r[tok]?` answers true for that name and
@@ -91,11 +95,16 @@ module Gori::Decoder
       failed = false
       Decoder.parse_spec(specs[nk][1]).each do |tok|
         tk = Registry.normalize(tok)
-        # A built-in wins (register_all never lets a saved name shadow one), and an unknown
-        # token stays as typed. Everything else is a saved name and gets spliced — in EITHER
-        # direction, because `r` holds no saved entry at this point.
-        if r[tok]? || !specs.has_key?(tk)
+        # A built-in wins (register_all never lets a saved name shadow one). An unknown
+        # token fails the chain as unusable (see comment above). Everything else is a
+        # saved name and gets spliced — in EITHER direction, because `r` holds no saved
+        # entry at this point.
+        if r[tok]?
           out << tok
+        elsif !specs.has_key?(tk)
+          failed = true
+          why[nk] = "unknown converter \"#{tok}\""
+          break
         else
           inner = flatten(tk, specs, r, flat, why, stack)
           if inner.nil?

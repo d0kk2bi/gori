@@ -218,10 +218,36 @@ describe Gori::QL do
   end
 
   it "compiles header: as a case-insensitive substring over the head bytes" do
+    # Long needles use a case-insensitive literal REGEXP (SafeRegexp is NUL-transparent);
+    # CAST+LIKE truncated at the first NUL and missed headers stored after an embedded 0x00.
     f = Gori::QL.parse("header:Set-Cookie")
-    f.sql.should eq("((lower(CAST(request_head AS TEXT)) LIKE ? ESCAPE '\\' OR " \
-                    "(response_head IS NOT NULL AND lower(CAST(response_head AS TEXT)) LIKE ? ESCAPE '\\')))")
-    f.args.should eq(["%set-cookie%", "%set-cookie%"]) # lowercased, substring
+    f.sql.should eq("((CAST(request_head AS TEXT) REGEXP ? OR " \
+                    "(response_head IS NOT NULL AND CAST(response_head AS TEXT) REGEXP ?)))")
+    f.args.should eq(["(?i)Set\\-Cookie", "(?i)Set\\-Cookie"])
+  end
+
+  it "compiles a short header: needle via byte-wise instr (NUL-transparent)" do
+    f = Gori::QL.parse("header:ab")
+    # case permutations of "ab" → ab/aB/Ab/AB, each against request + response head
+    f.sql.includes?("instr(request_head").should be_true
+    f.sql.includes?("instr(response_head").should be_true
+    f.args.size.should eq(8)
+  end
+
+  it "matches header: past an embedded NUL in the stored head bytes" do
+    # CAST AS TEXT LIKE stopped at the first NUL; the REGEXP/instr path must not.
+    tmp_store do |store|
+      head = "HTTP/1.1 200 OK\r\nX-Trace: a\u0000b\r\nSet-Cookie: sid=1\r\n\r\n".to_slice
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "acme.test", port: 80,
+        method: "GET", target: "/", http_version: "HTTP/1.1",
+        head: "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, body: nil))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: head))
+      store.flush
+      store.search(Gori::QL.parse("header:Set-Cookie"), 50).map(&.id).should eq([id])
+      store.search(Gori::QL.parse("header:set-cookie"), 50).map(&.id).should eq([id]) # case-insensitive
+    end
   end
 
   it "compiles the ~ operator to a REGEXP over text fields" do

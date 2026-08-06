@@ -164,7 +164,11 @@ module Gori
               detections.concat(Passive.analyze(detail, ws, disabled: cfg.disabled, custom: cfg.custom))
               # `!cfg.degraded`: the disabled-rule set could not be read, so gori does not
               # know which ACTIVE rules the operator switched off — see `RuleConfig`.
-              if active && !cfg.degraded && outbound.allows?(detail.row.url, detail.row.host) && budget.take?
+              # Gate on the port-less scope URL Layer 2 / History / SQL already share —
+              # `FlowRow#url` embeds a non-default port, so a string/regex include of
+              # `https://acme.test/` would miss `https://acme.test:8443/…` and silently
+              # skip every active probe on that origin while the lens still shows it in-scope.
+              if active && !cfg.degraded && allows_row?(outbound, detail.row) && budget.take?
                 detections.concat(Active.analyze(detail, verify_upstream, outbound: outbound, opts: opts,
                   disabled: cfg.disabled, on_error: on_error))
               end
@@ -204,7 +208,7 @@ module Gori
             Passive.analyze(detail, ws, disabled: cfg.disabled, custom: cfg.custom).each do |d|
               detections << Probe.with_source(d, flow_id: rec.flow_id, repeater_id: rec.id)
             end
-            if active && !cfg.degraded && outbound.allows?(detail.row.url, detail.row.host) && budget.take?
+            if active && !cfg.degraded && allows_row?(outbound, detail.row) && budget.take?
               Active.analyze(detail, verify_upstream, outbound: outbound, opts: opts,
                 disabled: cfg.disabled, on_error: on_error).each do |d|
                 detections << Probe.with_source(d, flow_id: rec.flow_id, repeater_id: rec.id)
@@ -225,6 +229,12 @@ module Gori
       # against, so it probes nothing unless allow_unscoped — same as before, but explicit.
       private def outbound_for(scope : Scope?, allow_unscoped : Bool) : Outbound
         allow_unscoped ? Outbound.waived(scope, Outbound::Reason::Operator) : Outbound.allowlist(scope)
+      end
+
+      # Layer 1 on the same URL shape every other gate builds (port omitted). ONE home so
+      # scan_flows / scan_repeaters cannot drift apart again.
+      private def allows_row?(outbound : Outbound, row : Store::FlowRow) : Bool
+        !outbound.check_request(row.scheme, row.host, row.target).blocked?
       end
     end
   end

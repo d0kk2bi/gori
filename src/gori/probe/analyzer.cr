@@ -387,12 +387,13 @@ module Gori
         # is the refusal that matters and would reject this job anyway (#511).
         return if detail.row.short_circuited?
         row = detail.row
-        url = row.url
         # Active probes only on hosts/paths covered by Project scope INCLUDE rules
         # (the Outbound ALLOWLIST gate — lens-independent; requires ≥1 include so
         # excludes-only never means "probe everything"). in_scope_url? is wrong here: it is
         # permissive when the ⇧S display lens is off. AGGRESSIVE never widens this.
-        return unless @outbound.allows?(url, row.host)
+        # Gate on the port-less scope URL (check_request), not FlowRow#url — a non-default
+        # port in the latter made string/regex includes miss every active probe on that origin.
+        return if @outbound.check_request(row.scheme, row.host, row.target).blocked?
         opts = active_opts
         Active::RULES.each { |rule| enqueue_probe(rule, detail, opts) unless Probe.rule_disabled?(rule.info.id, @disabled) }
       rescue Channel::ClosedError

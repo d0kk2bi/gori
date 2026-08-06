@@ -49,8 +49,22 @@ module Gori::Oast
     private def to_interaction(it : JSON::Any) : Interaction?
       return nil unless it.as_h?
       uid = field(it, "uuid") || Crypto.random_id(16)
-      raw = field(it, "content") || it.to_json
-      Interaction.new(uid, "http", field(it, "method"), field(it, "ip"), uid, raw, nil,
+      # The hit URL carries the per-payload nonce `generate_payload` minted
+      # (`…/{uuid}/{nonce}`). `full_id` is "the destination sub-id shown in the table",
+      # so prefer the URL over the request uuid. An empty-body GET — the canonical blind
+      # SSRF callback — arrives with `content: ""`; `field` returns that empty string
+      # (only JSON null is skipped), so `|| it.to_json` never fired and both raw_request
+      # and full_id lost the nonce. Fall back to the URL (then the item JSON) when the
+      # body is absent or blank so attribution survives.
+      hit_url = field(it, "url")
+      content = field(it, "content")
+      raw = if content.nil? || content.empty?
+              hit_url.presence || it.to_json
+            else
+              content
+            end
+      full_id = hit_url.presence || uid
+      Interaction.new(uid, "http", field(it, "method"), field(it, "ip"), full_id, raw, nil,
         parse_time(it["created_at"]?))
     end
   end

@@ -183,6 +183,28 @@ describe Gori::FilterAst do
       taken.map(&.negate?).should eq([false])
       residual.should eq("NOT host:a")
     end
+
+    it "carries a NOT before a parenthesised group onto every taken term inside" do
+      # LParen has term==nil, so the bare-term NOT branch used to miss and take tag:a
+      # unnegated while residual `NOT ( )` folded away — Sitemap `NOT (tag:done)` then
+      # showed ONLY the tagged nodes. Polarity must ride into the group.
+      taken, residual = Gori::FilterAst.partition("NOT (tag:a) b") { |t| t.text.starts_with?("tag:") }
+      taken.map { |t| {t.text, t.negate?} }.should eq([{"tag:a", true}])
+      # Group shells and non-matching words stay; empty-group residue is fine (QL folds it).
+      residual.should contain("(")
+      residual.should contain(")")
+      residual.should contain("b")
+      residual.includes?("tag:a").should be_false
+
+      both, _ = Gori::FilterAst.partition("NOT (tag:a OR tag:b)") { |t| t.text.starts_with?("tag:") }
+      both.map { |t| {t.text, t.negate?} }.should eq([{"tag:a", true}, {"tag:b", true}])
+
+      # Even run cancels; dash inside XORs with the outer run.
+      even, _ = Gori::FilterAst.partition("NOT NOT (tag:x)") { |t| t.text.starts_with?("tag:") }
+      even.map(&.negate?).should eq([false])
+      dash, _ = Gori::FilterAst.partition("NOT (-tag:x)") { |t| t.text.starts_with?("tag:") }
+      dash.map(&.negate?).should eq([false])
+    end
   end
 
   describe ".spans" do

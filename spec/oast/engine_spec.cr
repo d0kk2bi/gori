@@ -322,4 +322,35 @@ describe Gori::Oast do
       O::ProviderKind.parse?("custom http").should be_nil
     end
   end
+
+  describe O::WebhookSite do
+    it "keeps the payload nonce on an empty-body callback" do
+      # generate_payload mints …/{uuid}/{nonce}; a GET with content:"" used to set
+      # raw_request="" and full_id=request-uuid, so the nonce vanished from every surface.
+      token = "tok-uuid-aaaa"
+      nonce = "n0nc3payld"
+      hit = "https://webhook.site/#{token}/#{nonce}"
+      body = {
+        "data" => [{
+          "uuid"       => "req-bbbb",
+          "method"     => "GET",
+          "ip"         => "203.0.113.5",
+          "content"    => "",
+          "url"        => hit,
+          "created_at" => "2024-01-01T00:00:00Z",
+        }],
+      }.to_json
+      provider = O::WebhookSite.new("https://webhook.site")
+      session = O::Session.new(0_i64, O::ProviderKind::WebhookSite,
+        "https://webhook.site", token, "", registered: true)
+      results = provider.poll(FakeHttp.new("/token/", body), session)
+      results.size.should eq(1)
+      i = results[0]
+      i.unique_id.should eq("req-bbbb")
+      i.full_id.should eq(hit)
+      i.raw_request.should eq(hit)
+      i.raw_request.should contain(nonce)
+      i.method.should eq("GET")
+    end
+  end
 end

@@ -120,6 +120,38 @@ describe Gori::Outbound do
       Gori::Outbound.allowlist(nil).allows?(URL, "acme.test").should be_false
     end
 
+    it "check_request uses the port-less scope URL, so a non-default port stays allowlisted" do
+      # FlowRow#url embeds :8443; string/regex includes are written against the port-less
+      # form Scope.request_url / QL::URL_EXPR use. Probe Layer 1 must call check_request
+      # (or scope_url), not allows?(row.url, …), or every active probe on a non-default
+      # port is silently skipped while History still shows the flow in-scope.
+      with_scope do |scope, _store|
+        scope.add("include", "string", "https://acme.test/")
+        ob = Gori::Outbound.allowlist(scope)
+        portful = "https://acme.test:8443/admin"
+        # Documents the wrong form: a port-bearing URL misses the string include.
+        ob.allows?(portful, "acme.test").should be_false
+        # The form every other gate builds — and check_request.
+        ob.allows?(Gori::Outbound.scope_url("https", "acme.test", "/admin"), "acme.test").should be_true
+        ob.check_request("https", "acme.test", "/admin").blocked?.should be_false
+        # host rules never cared about port; pin that still holds.
+        scope2_path = File.tempname("gori-outbound-host", ".db")
+        store2 = Gori::Store.open(scope2_path)
+        begin
+          s2 = Gori::Scope.load(store2)
+          s2.add("include", "host", "acme.test")
+          o2 = Gori::Outbound.allowlist(s2)
+          o2.check_request("https", "acme.test", "/admin").blocked?.should be_false
+          o2.allows?(portful, "acme.test").should be_true # host match ignores URL port
+        ensure
+          store2.close
+          File.delete?(scope2_path)
+          File.delete?("#{scope2_path}-wal")
+          File.delete?("#{scope2_path}-shm")
+        end
+      end
+    end
+
     # Regression: Unscoped(NoProject) waives BOTH layers, so it is only ever correct when
     # there genuinely is no project. `gori run repeater send <id>` reads its session out of
     # the most-recently-active project even with no --project flag, and briefly built its
@@ -397,7 +429,7 @@ describe Gori::Outbound do
       Gori::Outbound.request_target("\r\nGET /admin/x HTTP/1.1\r\nHost: h\r\n\r\n").should eq("/admin/x")
       Gori::Outbound.request_target("\nGET /admin/x HTTP/1.1\r\n".to_slice).should eq("/admin/x")
       Gori::Outbound.request_target("\r\n\r\nGET /admin/x HTTP/1.1\r\n").should eq("/admin/x") # doubled leading blank
-      Gori::Outbound.request_target("\r\nPOST  /a/b\tHTTP/1.1\r\n").should eq("/a/b")           # blank line + irregular ws
+      Gori::Outbound.request_target("\r\nPOST  /a/b\tHTTP/1.1\r\n").should eq("/a/b")          # blank line + irregular ws
     end
 
     it "keeps the scope gate honest against a doubled-space request line" do

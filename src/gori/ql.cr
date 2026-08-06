@@ -468,11 +468,30 @@ module Gori
     # the whole head, so it also sees the request/status line (rare false hit; fine).
     # request_head is NOT NULL; response_head is guarded so a response-less flow
     # contributes no match (and `-header:x` correctly keeps it).
-    private def self.header_cond(value : String) : {String, Array(DB::Any)}
-      p = like(value)
-      {"(lower(CAST(request_head AS TEXT)) LIKE ? ESCAPE '\\' OR " \
-       "(response_head IS NOT NULL AND lower(CAST(response_head AS TEXT)) LIKE ? ESCAPE '\\'))",
-       [p, p] of DB::Any}
+    #
+    # BYTE-wise, not `CAST(... AS TEXT) LIKE`: SQLite truncates a BLOB→TEXT cast at the
+    # first NUL, so a head that stored an embedded NUL (header-injection / smuggling
+    # cases — the codec keeps the octets, P7) made every header after the NUL invisible
+    # to `header:` while `header~` (SafeRegexp over the full blob) still found it. Same
+    # trap `body_cond` already routed around. `instr` is case-SENSITIVE, so OR every case
+    # permutation of a short needle; longer needles go through a case-insensitive literal
+    # REGEXP, which SafeRegexp already makes NUL-transparent.
+    private def self.header_cond(value : String) : {String, Array(DB::Any)}?
+      value = value.chars.reject(&.control?).join
+      return nil if value.empty?
+      if value.size < 3
+        conds = [] of String
+        params = [] of DB::Any
+        case_permutations(value).each do |v|
+          conds << "COALESCE(instr(request_head, CAST(? AS BLOB)), 0) > 0"
+          conds << "COALESCE(instr(response_head, CAST(? AS BLOB)), 0) > 0"
+          params << v << v
+        end
+        return {"(#{conds.join(" OR ")})", params}
+      end
+      pat = "(?i)#{Regex.escape(value)}"
+      return {"0", [] of DB::Any} unless valid_regex?(pat)
+      header_regex_cond(pat)
     end
 
     # The `~` operator: case-sensitive regex (SQLite REGEXP, the same shard-provided
