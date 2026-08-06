@@ -1521,6 +1521,20 @@ describe "Gori::Proxy::WS::Relay frame shape capture (V7)" do
     rows[0][3].fin.should be_true  # ... and the last of them did FIN
   end
 
+  it "records the re-framed shape (1 frame) when a rewrite collapses fragmentation" do
+    # Re-framing replaces multi-fragment wire bytes with ONE frame; capture must not keep
+    # the arrived frames=2 / RSV / mask key. emit_message used to pass `arrived` into the
+    # gate branch (and `emitted` was a dead store); the direct path already used emitted.
+    wire = client_frame(Gori::Proxy::WS::OP_TEXT, "hi ".to_slice, fin: false) +
+           client_frame(Gori::Proxy::WS::OP_CONT, "there".to_slice)
+    rows = shape_capture(wire, WsRewriter.new(to_server: {"hi there", "bye"}))
+    rows.size.should eq(1)
+    rows[0][2].should eq("bye")
+    rows[0][3].frames.should eq(1) # gori's one frame, not the peer's two
+    rows[0][3].fin.should be_true
+    rows[0][3].rsv.should eq(0)
+  end
+
   it "marks a message that ended with no FIN at all" do
     rows = shape_capture(client_frame(Gori::Proxy::WS::OP_TEXT, "never-ends".to_slice, fin: false))
     rows.size.should eq(1)

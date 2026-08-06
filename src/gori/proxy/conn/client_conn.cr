@@ -890,8 +890,16 @@ module Gori::Proxy
         # RFC 9110 §15.2 / RFC 7231: a proxy MUST NOT forward a 1xx to an HTTP/1.0
         # client (it can't parse it). Read past it for everyone; forward only to 1.1.
         if req.version == "HTTP/1.1"
-          @io.write(resp_head) # forward byte-exact (P6/P7); no rewrite on interim
-          @io.flush
+          begin
+            @io.write(resp_head) # forward byte-exact (P6/P7); no rewrite on interim
+            @io.flush
+          rescue
+            # Client gone mid-1xx (Stop / max-time / RST). Every other exit from this
+            # method records on_response; an unguarded raise left the flow Pending forever.
+            @sink.on_response(FlowMapper.error_response(flow_id, "connection closed while forwarding interim 1xx response"))
+            release_upstream
+            return nil
+          end
         end
         resp_head = safe_read_head(upstream)
         if resp_head.nil?
@@ -1149,28 +1157,41 @@ module Gori::Proxy
       # forwarded unedited (whose Content-Length describes the entity, not the bytes).
       out_head, out_body = split_message(decision.bytes)
       sent_resp = Codec::Http1.parse_response_head(out_head)
-      @io.write(out_head)
-      @io.write(out_body) if out_body
-      @io.flush
-      # The operator's bytes are what the client got, so they are what a binding must agree
-      # with (P4) — and a DROPPED response never reaches here at all, because the client never
-      # received it. `decision.bytes` is a complete message, so its body half is already the
-      # entity (the editor synced Content-Length); an empty one is a body we have, not a body
-      # gori withheld, hence `Bytes.empty` rather than nil.
-      observe_delivered(extract_ref_for(sent_req, host, scheme, sent_resp.status, flow_id),
-        out_head, out_body || Bytes.empty)
+      delivered = true
+      begin
+        @io.write(out_head)
+        @io.write(out_body) if out_body
+        @io.flush
+      rescue
+        # Client gone while we held the response (navigated away / Stop). The non-held
+        # stream path already rescues this as Aborted; without the rescue the raise
+        # unwound to run's blanket rescue and left the flow Pending forever — the
+        # invariant this file states four times ("record + close, never unwind").
+        delivered = false
+      end
       stored, trunc, size = capped(out_body)
-      @sink.on_response(FlowMapper.response(sent_resp,
-        flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-        body_truncated: trunc, body_size: size))
+      if delivered
+        # The operator's bytes are what the client got, so they are what a binding must agree
+        # with (P4) — and a DROPPED response never reaches here at all, because the client never
+        # received it. `decision.bytes` is a complete message, so its body half is already the
+        # entity (the editor synced Content-Length); an empty one is a body we have, not a body
+        # gori withheld, hence `Bytes.empty` rather than nil.
+        observe_delivered(extract_ref_for(sent_req, host, scheme, sent_resp.status, flow_id),
+          out_head, out_body || Bytes.empty)
+        @sink.on_response(FlowMapper.response(sent_resp,
+          flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
+          body_truncated: trunc, body_size: size))
+      else
+        @sink.on_response(FlowMapper.response(sent_resp,
+          flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
+          body_truncated: trunc, body_size: size,
+          state: Store::FlowState::Aborted, error: "connection closed while forwarding held response"))
+      end
       # Reuse the upstream iff we read the WHOLE body cleanly AND the origin kept its
       # side alive. Origin side keys on sent_req (what the origin received); the CLIENT
       # keep-alive (return value) uses the edited resp.
       update_upstream_reuse(resp_complete && origin_keep_alive?(sent_req, resp, resp_framing))
-      # A truncated upstream body was forwarded short — close the client connection so it
-      # sees end-of-response instead of blocking for the missing bytes while we read its
-      # next keep-alive request (mirrors the non-held path's resp_complete guard).
-      return false unless resp_complete
+      return false unless delivered && resp_complete
       # The human may have edited the held response into conflicting framing (CL+TE); the
       # response was already forwarded + recorded above, so recompute the client-side framing
       # defensively — a raw response_framing raise here would unwind to run's blanket rescue

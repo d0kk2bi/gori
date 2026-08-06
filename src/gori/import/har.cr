@@ -69,7 +69,18 @@ module Gori
         end
 
         status = resp["status"]?.try(&.as_i).try(&.to_i32) || 0
-        reason = resp["statusText"]?.to_s.presence || status_reason(status)
+        # Prefer the HAR's own statusText. Only invent a phrase for HTTP/1.x when the
+        # field is absent — HTTP/2 has no reason phrase on the wire, and inventing "OK"
+        # (or a trailing space on an empty phrase) broke the export→import fixed point.
+        resp_version = normalize_http_version(resp["httpVersion"]?.to_s.presence || http_version)
+        raw_reason = resp["statusText"]?.to_s
+        reason = if raw_reason.presence
+                   raw_reason
+                 elsif resp_version.starts_with?("HTTP/2")
+                   ""
+                 else
+                   status_reason(status)
+                 end
         resp_headers = headers_list(resp["headers"]?)
         resp_body, mime_type, resp_declared = response_body(resp)
         # Prefer the ACTUAL Content-Type response HEADER over HAR content.mimeType, matching how

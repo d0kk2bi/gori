@@ -943,10 +943,14 @@ module Gori::Proxy::WS
           # It gets the message's frames in both forms because only IT knows which applies:
           # written through, the peer's own interleave goes back on the wire; parked on a
           # hold, the control frames are split back out and sent now (see `WS::RawFrames`).
+          # Pass `emitted`, not `arrived`: when re-framing, MessageGate records the shape
+          # on write, and the arrived multi-fragment RSV/mask is a lie about what goes out
+          # (one frame, gori's key). `emitted` was already computed above and was a dead
+          # store on this branch.
           gate.submit(@opcode, rewritten,
             reusable ? WS::RawFrames.new(interleaved: interleaved_raw.dup,
               data_only: @raw.to_slice.dup, controls: parked_bytes) : nil,
-            arrived)
+            emitted)
         else
           write_direct(reusable ? interleaved_raw : WS.encode(@opcode, rewritten, mask: @mask, fin: true))
           # Record what gori WROTE rather than what arrived, the way #513 keeps P7 on h2: the
