@@ -512,6 +512,10 @@ private class FakeContext < ExecContext
     @calls << :discover_dismiss
   end
 
+  def discover_open_flow : Nil
+    @calls << :discover_open_flow
+  end
+
   def oast_listen : Nil
     @calls << :oast_listen
   end

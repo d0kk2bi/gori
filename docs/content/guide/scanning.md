@@ -65,6 +65,8 @@ Where the Miner finds hidden inputs, **Discover** finds hidden endpoints. It spi
 
 Start a run from where you already are: on a **Sitemap** node or a **History** flow, press `Space` and pick **Discover here**. A small popup lets you choose the exploration style (spider, brute-force, or both, the default), a max depth, the crawl scope, and concurrency. The run happens in the background: watch the bottom bar, pause or stop it from the Discover sub-tab (`^X` stop, `p` pause), and jump to the results from the completion notification.
 
+A finished run is not just a list of URLs. Every finding is stored with the request Discover framed and the response the origin sent back, so in the FINDINGS table `Enter` (or `o`) opens that exchange in the same detail view History uses: headers, body, pretty-printed JSON, and from there `^R` to the Repeater. Headless runs and MCP runs store the same bytes, so a finding is openable with `gori run show` or `get_flow` too.
+
 Discover is built for tight false-positive and false-negative rates on real sites:
 
 - **Soft-404 calibration.** Before brute-forcing a directory it sends a few known-bad paths to learn how that server answers a miss. It handles a server that returns `200` for everything and one that redirects every unknown path to `/login`, so a wordlist hit only counts when it genuinely diverges from that baseline.

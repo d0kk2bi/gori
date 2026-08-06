@@ -555,6 +555,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:discover_dismiss)
   end
 
+  def discover_open_flow : Nil
+    rec(:discover_open_flow)
+  end
+
   def goto_discover : Nil
     rec(:goto_discover)
   end

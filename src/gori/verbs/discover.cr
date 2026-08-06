@@ -19,6 +19,15 @@ module Gori
         "discover.pause", "Pause / resume", "Pause or resume the running discovery",
         Verb::Scope::Discover, [] of Verb::Chord, mnemonic: 'p') { |ctx| ctx.discover_toggle_pause; nil }
 
+      # `o`/`↵` on a findings row opens the bytes that row was found with, in the same History
+      # detail the Sitemap's `o` opens (the run persisted the exchange when it recorded the
+      # finding). The `enter` chord only ever arrives from the FINDINGS pane — in the RUNS list
+      # ↵ is the drill-in step and the controller consumes it (handle_runs_key).
+      r.register Verb::Definition.new(
+        "discover.open-flow", "Open flow", "Open the selected finding's captured request/response in History",
+        Verb::Scope::Discover, [Verb::Chord.new("o"), Verb::Chord.new("enter")],
+        mnemonic: 'o', group: :view) { |ctx| ctx.discover_open_flow; nil }
+
       # `d` clears a finished row from the RUNS list, which is append-only for the session.
       # Never a running one — the controller refuses and says to stop it first.
       r.register Verb::Definition.new(

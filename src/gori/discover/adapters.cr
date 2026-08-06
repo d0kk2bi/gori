@@ -3,6 +3,8 @@ require "./engine"
 require "../outbound"
 require "../scope"
 require "../import/builder"
+require "../flow_mapper"
+require "../proxy/codec/http1"
 
 # Surface-side adapters that bridge the pure Discover engine to the project's Scope and
 # Store. Kept OUT of the discover.cr umbrella so the engine itself stays Store-free; the
@@ -91,11 +93,22 @@ module Gori::Discover
   end
 
   # Persist a discovered endpoint as a normal flow row so it surfaces in the Sitemap (which
-  # groups by host/method/target). No response body is stored — the Sitemap needs only
-  # method/target/status; re-send via Repeater for the live body. A finding with no status
-  # (rare) becomes a Pending flow.
+  # groups by host/method/target) and can be OPENED — request and response, the bytes the run
+  # actually exchanged — everywhere a captured flow can be. A finding with no status (rare)
+  # becomes a Pending flow.
+  #
+  # Given the run's `Exchange` this stores the WIRE TRUTH (P7): the request head the Sender
+  # framed and the response head + raw body the origin answered with, mapped through the same
+  # `FlowMapper` live capture and the Burp raw-item import use. Without one — a status-less
+  # finding, or a backend that frames no bytes — it falls back to the synthesized stub below,
+  # which describes the finding rather than reproducing it. The two are deliberately NOT
+  # blended: a synthesized head must never be presented as bytes someone sent, so the stub
+  # keeps its `X-Gori-Discover` provenance marker and the captured pair carries no header
+  # gori invented.
   module Persist
-    def self.flow_pair(f : Finding, created_at : Int64) : Import::Builder::FlowPair
+    def self.flow_pair(f : Finding, created_at : Int64,
+                       exchange : Exchange? = nil) : Import::Builder::FlowPair
+      return captured_pair(f, created_at, exchange) if exchange
       if status = f.status
         resp_headers = Import::Builder::Headers.new
         resp_headers << {"Content-Type", f.content_type.not_nil!} if f.content_type
@@ -108,6 +121,25 @@ module Gori::Discover
       else
         Import::Builder.pending_request(created_at, f.url, f.method)
       end
+    end
+
+    # The captured half: raw head bytes in, storage projections out. `Import::Builder` is a
+    # SERIALIZER and would re-emit the head from parsed parts (see `Import::Raw`'s note on why
+    # that destroys wire truth), so only its URL split and its body cap are reused here.
+    private def self.captured_pair(f : Finding, created_at : Int64,
+                                   ex : Exchange) : Import::Builder::FlowPair
+      scheme, host, port, _ = Import::Builder.endpoint(f.url)
+      req = Proxy::Codec::Http1.parse_request_head(ex.request_head)
+      request = FlowMapper.request(req, scheme: scheme, host: host, port: port,
+        created_at: created_at)
+      stored, trunc, size = Import::Builder.capped(ex.body, ex.body_size)
+      # `incomplete` is the OTHER way a stored body is short of what the origin framed (it cut
+      # the response off); `capped` only knows about the ceiling gori applied. Either one means
+      # a reader must not treat these bytes as the whole response.
+      response = FlowMapper.response(ex.response, flow_id: 0, body: stored,
+        duration_us: ex.duration_us,
+        body_truncated: trunc || ex.incomplete, body_size: size)
+      Import::Builder::FlowPair.new(request, response)
     end
 
     private def self.reason_for(status : Int32) : String

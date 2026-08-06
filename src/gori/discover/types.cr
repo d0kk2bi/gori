@@ -1,3 +1,5 @@
+require "../proxy/codec/message"
+
 module Gori
   # The Discover engine: spiders a target (follows links a user never clicked) AND
   # brute-forces unlinked directories/paths, feeding every found endpoint back into the
@@ -86,6 +88,29 @@ module Gori
       confidence : Float64,
       note : String?
 
+    # The wire truth behind ONE finding: the request gori framed and the response the origin
+    # answered with. Carried on the FindingEvent rather than on `Finding` because it is BULK —
+    # a consumer that only wants the row (`discover_results`, the CLI's `--format json`) must
+    # not be made to hold response bodies, while the one that persists the finding gets the
+    # bytes to persist instead of a synthesized stub.
+    #
+    # Only emitted for a fetch that produced a response, and only for outcomes that can BECOME
+    # a finding (a brute probe that missed its baseline never builds one) — every other send is
+    # forgotten as soon as it is distilled, which is what keeps a 250k-candidate sweep bounded.
+    #
+    # `body` is the RAW body exactly as it arrived (still gzip/br-encoded when the origin said
+    # so — `response.headers` carries the Content-Encoding that decodes it), capped at
+    # `Settings.capture_max` like live capture. `body_size` is what the origin actually
+    # delivered, so a capped body is stored as truncated rather than as a complete short one.
+    # `incomplete` is `Repeater::Result#incomplete?` — the origin cut the response short.
+    record Exchange,
+      request_head : Bytes,
+      response : Proxy::Codec::RawResponse,
+      body : Bytes?,
+      body_size : Int64?,
+      incomplete : Bool,
+      duration_us : Int64
+
     # Live counters. `est_total` is a MOVING estimate that RISES as discovery proceeds
     # (a live crawl has no stable denominator), nil early — frontends render
     # "N found · M sent · K queued", not a hard percent. `sent` is the real network count.
@@ -119,7 +144,10 @@ module Gori
     # dropped. `kind` on BaselineEvent is the DirBaseline kind label (a String to keep
     # this file free of a require cycle with calibrate.cr).
     record BaselineEvent, dir : String, kind : String, note : String?
-    record FindingEvent, finding : Finding
+    # `exchange` is nil when there was nothing to keep: a finding recorded with no response
+    # (a status-less row), or a spec/CLI backend that frames no bytes. A consumer must render
+    # what it has rather than claim the request was never sent.
+    record FindingEvent, finding : Finding, exchange : Exchange? = nil
     record ProgressEvent, progress : Progress
     # `budget_exhausted` — the run STOPPED SHORT because `max_requests` ran out, as opposed to
     # having simply reached its cap on the last thing it had to do. Fuzz and mine let a

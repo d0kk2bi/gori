@@ -20,6 +20,11 @@ module Gori::Tui
     # never sent.
     property status : Symbol = :idle
     getter findings = [] of Discover::Finding
+    # The flow each finding was persisted as, INDEX-ALIGNED with `findings` — nil until the
+    # controller's persist batch commits (or forever, if that write failed). It is what turns
+    # a findings row into something openable: the run is in-memory and holds no bytes, the
+    # STORE holds the request/response, and this is the only link between the two.
+    getter flow_ids = [] of Int64?
     property stats : Discover::RunStats? = nil
     property sent = 0_i64
     property found = 0
@@ -51,10 +56,28 @@ module Gori::Tui
       object_id == other.object_id
     end
 
+    # Record a finding and the slot its flow id will land in. One method, so the two arrays
+    # cannot drift: an unaligned `flow_ids` would open the request/response of the WRONG
+    # endpoint, which is worse than opening none.
+    def add_finding(f : Discover::Finding) : Int32
+      @findings << f
+      @flow_ids << nil
+      @findings.size - 1
+    end
+
+    def set_flow_id(idx : Int32, id : Int64) : Nil
+      @flow_ids[idx] = id if 0 <= idx < @flow_ids.size
+    end
+
+    def flow_id_at(idx : Int32) : Int64?
+      @flow_ids[idx]?
+    end
+
     def begin_run : Nil
       @status = :running
       @stop_requested = false
       @findings.clear
+      @flow_ids.clear
       @stats = nil
       @sent = 0_i64
       @found = 0
@@ -228,6 +251,15 @@ module Gori::Tui
 
     def selected_finding : Discover::Finding?
       current.try(&.findings[@fsel]?)
+    end
+
+    # The stored flow behind the cursor row, or nil when the row has none yet (the persist
+    # batch has not committed) or never will (the store write failed). Only meaningful with a
+    # finding under the cursor — `selected_finding` is what says whether there is one.
+    def selected_flow_id : Int64?
+      return nil unless r = current
+      return nil unless r.findings[@fsel]?
+      r.flow_id_at(@fsel)
     end
 
     def findings_at_top? : Bool
