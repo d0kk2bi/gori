@@ -30,8 +30,7 @@ module Gori::Tui
     ComparerPick
     RepeaterSubtab
     Links
-    IssuePick
-    NotePick
+    LinkPick
     Preferences
     Settings
     Tabs

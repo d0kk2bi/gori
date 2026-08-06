@@ -170,7 +170,7 @@ So `/ status:5xx` → `Shift-T` → `Space` → `X` deletes every error in one c
 | Copy | `y` | The URL list (one per line) |
 | Copy as… | `Space` `Y` | urls / host list / cURL / raw requests / raw responses / req+res pairs |
 | Delete | `Space` `X` | One confirm for the whole set |
-| Link to issue / note | `Space` `k` / `u` | Pick the owner once, attach every flow |
+| Link… | `Space` `k` | One card lists every issue and note (plus `+ New issue…` / `+ New note…`); pick or create once, attach every flow |
 | Add issue | `Shift-F` | One issue with every flow as evidence |
 | Repeater / Fuzzer | `Ctrl-R` / `Shift-I` | One sub-tab per flow (max 20) |
 | Mine parameters | `Space` `m` | One config popup, one session per flow (max 20) |

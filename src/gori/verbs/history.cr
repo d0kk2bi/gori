@@ -608,18 +608,17 @@ module Gori
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :miner && ctx.subtab_search_count >= 2 },
         mnemonic: '/', section: :tab) { |ctx| ctx.subtab_filter_open; nil }
 
-      # Repeater's/Fuzzer's "Link to issue/note" (Round 5 — relocated OUT of
-      # register_links, which registers before register_fuzz/register_miner in
-      # Verbs.registry: leaving them there put Link-issue/Link-note AHEAD of
-      # Fuzz/Mine in the Repeater/Fuzzer COMMON group, when the curated order wants
-      # them LAST (COMMON = most-used-first: Send/Copy/New/Fuzz/Mine/Link-issue/
-      # Link-note for Repeater; Run/Stop/New/Copy/Link-issue/Link-note for Fuzzer).
-      # Registering them here — after repeater.mine above, and after register_fuzz
+      # Repeater's/Fuzzer's "Link…" (Round 5 — relocated OUT of register_links, which
+      # registers before register_fuzz/register_miner in Verbs.registry: leaving it
+      # there put Link AHEAD of Fuzz/Mine in the Repeater/Fuzzer COMMON group, when
+      # the curated order wants it LAST (COMMON = most-used-first: Send/Copy/New/
+      # Fuzz/Mine/Link for Repeater; Run/Stop/New/Copy/Link for Fuzzer).
+      # Registering it here — after repeater.mine above, and after register_fuzz
       # already ran — achieves that order for free (menu order == registration
-      # order, per Registry#for_scope with an empty query). Same ids/titles/
-      # handlers as before; only the registration SITE moved. History's own
+      # order, per Registry#for_scope with an empty query). History's own
       # link.history.*/link.history-detail.* and Miner's link.miner.* stay in
-      # register_links (their relative order wasn't in scope for this round).
+      # register_links (their relative order wasn't in scope for this round), and
+      # the same one-verb-per-scope shape applies to all five — see the comment there.
       repeater_linkable = ->(ctx : Verb::ExecContext) {
         ctx.current_tab == :repeater && !ctx.link_repeater_id.nil?
       }
@@ -627,17 +626,11 @@ module Gori
         ctx.current_tab == :fuzzer && !ctx.link_fuzz_id.nil?
       }
       r.register Verb::Definition.new(
-        "link.repeater.to-issue", "Link to issue", "Attach this repeater session to an issue",
-        Verb::Scope::Repeater, available: repeater_linkable, mnemonic: 'k') { |ctx| ctx.link_to_issue; nil }
+        "link.repeater.attach", "Link…", "Attach this repeater session to an issue or note — or create one",
+        Verb::Scope::Repeater, available: repeater_linkable, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
       r.register Verb::Definition.new(
-        "link.repeater.to-note", "Link to note", "Attach this repeater session to a note",
-        Verb::Scope::Repeater, available: repeater_linkable, mnemonic: 'u') { |ctx| ctx.link_to_note; nil }
-      r.register Verb::Definition.new(
-        "link.fuzzer.to-issue", "Link to issue", "Attach this fuzz session to an issue",
-        Verb::Scope::Fuzzer, available: fuzz_linkable, mnemonic: 'k') { |ctx| ctx.link_to_issue; nil }
-      r.register Verb::Definition.new(
-        "link.fuzzer.to-note", "Link to note", "Attach this fuzz session to a note",
-        Verb::Scope::Fuzzer, available: fuzz_linkable, mnemonic: 'u') { |ctx| ctx.link_to_note; nil }
+        "link.fuzzer.attach", "Link…", "Attach this fuzz session to an issue or note — or create one",
+        Verb::Scope::Fuzzer, available: fuzz_linkable, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
     end
 
     # Builds a registry with every built-in verb registered.

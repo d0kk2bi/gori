@@ -2,11 +2,17 @@ require "../verb"
 
 module Gori
   module Verbs
-    # Repeater's/Fuzzer's own "Link to issue/note" (link.repeater.*/link.fuzzer.*) are
-    # registered in register_miner (history.cr) instead of here — Round 5 moved them
-    # there so their Repeater/Fuzzer COMMON menu position lands AFTER Fuzz/Mine (see
-    # the comment at their new registration site for why). History's/HistoryDetail's/
-    # Miner's own link verbs are unaffected and stay below.
+    # ONE "Link…" verb per scope, not the `to-issue` / `to-note` pair it replaces: the
+    # owner kind is now a row in the picker (LinkPicker), so choosing it is no longer a
+    # choice of VERB made before you can see what exists — and each list's "+ New …" row
+    # stopped being hidden behind that guess. `k` carries over from the old to-issue half
+    # (the more-used of the two); `u` is freed.
+    #
+    # Repeater's/Fuzzer's own link verb (link.repeater.*/link.fuzzer.*) is registered in
+    # register_miner (history.cr) instead of here — Round 5 moved the pair there so its
+    # Repeater/Fuzzer COMMON menu position lands AFTER Fuzz/Mine (see the comment at that
+    # registration site for why). History's/HistoryDetail's/Miner's own link verbs are
+    # unaffected and stay below.
     def self.register_links(r : Verb::Registry) : Nil
       flow_available = ->(ctx : Verb::ExecContext) {
         ctx.current_tab == :history && !ctx.link_flow_id.nil?
@@ -28,28 +34,16 @@ module Gori
       }
 
       r.register Verb::Definition.new(
-        "link.history.to-issue", "Link to issue", "Attach the selected/marked flows to an issue",
-        Verb::Scope::Body, available: flow_targets, mnemonic: 'k') { |ctx| ctx.link_to_issue; nil }
+        "link.history.attach", "Link…", "Attach the selected/marked flows to an issue or note — or create one",
+        Verb::Scope::Body, available: flow_targets, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
 
       r.register Verb::Definition.new(
-        "link.history.to-note", "Link to note", "Attach the selected/marked flows to a note",
-        Verb::Scope::Body, available: flow_targets, mnemonic: 'u') { |ctx| ctx.link_to_note; nil }
+        "link.history-detail.attach", "Link…", "Attach this flow to an issue or note — or create one",
+        Verb::Scope::HistoryDetail, available: flow_available, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
 
       r.register Verb::Definition.new(
-        "link.history-detail.to-issue", "Link to issue", "Attach this flow to an issue",
-        Verb::Scope::HistoryDetail, available: flow_available, mnemonic: 'k') { |ctx| ctx.link_to_issue; nil }
-
-      r.register Verb::Definition.new(
-        "link.history-detail.to-note", "Link to note", "Attach this flow to a note",
-        Verb::Scope::HistoryDetail, available: flow_available, mnemonic: 'u') { |ctx| ctx.link_to_note; nil }
-
-      r.register Verb::Definition.new(
-        "link.miner.to-issue", "Link to issue", "Attach this miner session to an issue",
-        Verb::Scope::Miner, available: miner_linkable, mnemonic: 'k') { |ctx| ctx.link_to_issue; nil }
-
-      r.register Verb::Definition.new(
-        "link.miner.to-note", "Link to note", "Attach this miner session to a note",
-        Verb::Scope::Miner, available: miner_linkable, mnemonic: 'u') { |ctx| ctx.link_to_note; nil }
+        "link.miner.attach", "Link…", "Attach this miner session to an issue or note — or create one",
+        Verb::Scope::Miner, available: miner_linkable, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
     end
   end
 end

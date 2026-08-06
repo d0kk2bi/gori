@@ -765,12 +765,8 @@ private class FakeContext < ExecContext
     @calls << :issues_copy_all
   end
 
-  def link_to_issue : Nil
-    @calls << :link_to_issue
-  end
-
-  def link_to_note : Nil
-    @calls << :link_to_note
+  def link_attach : Nil
+    @calls << :link_attach
   end
 
   def link_flow_id : Int64?

@@ -170,7 +170,7 @@ gori run history -q 'status:5xx host:api.example.com'
 | 복사 | `y` | URL 목록(한 줄에 하나) |
 | 형식 지정 복사 | `Space` `Y` | urls / host 목록 / cURL / 원본 요청 / 원본 응답 / 요청+응답 쌍 |
 | 삭제 | `Space` `X` | 전체를 확인 한 번으로 |
-| 이슈/노트에 연결 | `Space` `k` / `u` | 대상은 한 번만 선택, 전체를 첨부 |
+| 연결(Link…) | `Space` `k` | 한 카드에 모든 이슈와 노트(그리고 `+ New issue…` / `+ New note…`)가 함께 뜹니다. 대상은 한 번만 고르거나 새로 만들고, 전체를 첨부 |
 | 이슈 추가 | `Shift-F` | 표시된 전체를 근거로 가진 이슈 하나 |
 | Repeater / Fuzzer | `Ctrl-R` / `Shift-I` | 플로우마다 서브탭 하나(최대 20) |
 | 파라미터 마이닝 | `Space` `m` | 설정 팝업 한 번, 플로우마다 세션 하나(최대 20) |

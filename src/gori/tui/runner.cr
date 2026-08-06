@@ -51,8 +51,7 @@ require "./subtab_picker"
 require "./library_picker"
 require "./name_prompt_overlay"
 require "./links_overlay"
-require "./issue_picker"
-require "./note_picker"
+require "./link_picker"
 require "../links"
 require "../notes"
 require "./settings_view"
@@ -2269,58 +2268,65 @@ module Gori::Tui
       end
     end
 
-    # ↵ on the issue picker: "+ New issue…" hands off to the NEW ISSUE form, any other
-    # row takes the link. The create row arms on_close rather than opening the form here,
-    # because the form claims @overlay and the shell's close would tear it straight back
-    # down; on_close runs after the drop, so the form is the last write (see Overlay).
-    private def link_picked_issue(ip : IssuePicker, refs : Array({Store::LinkRefKind, Int64})) : Bool
-      if ip.selected_create?
-        ip.on_close = -> { open_issue_form_for_link(refs) }
+    # ↵ on the link picker. The two create rows hand off — "+ New issue…" to the NEW ISSUE
+    # form, "+ New note…" to a blank note — and every other row takes the link directly.
+    # A create row arms on_close rather than opening the next modal here, because that
+    # modal claims @overlay and the shell's close would tear it straight back down;
+    # on_close runs after the drop, so the hand-off is the last write (see Overlay).
+    private def link_picked(lp : LinkPicker, refs : Array({Store::LinkRefKind, Int64})) : Bool
+      if kind = lp.selected_create
+        # The filter doubles as the new issue's title: type it, ↵, and the form is filled.
+        typed = lp.query.strip
+        lp.on_close = kind.issue? ? -> { open_issue_form_for_link(refs, typed) } : -> { create_note_and_link(refs) }
         return true
       end
-      if f = ip.selected_issue
-        commit_links_to_owner(Store::LinkOwnerKind::Issue, f.id, refs)
+      if row = lp.selected_row
+        if commit_links_to_owner(row.kind, row.id, refs) && refs.size == 1
+          # commit_links_to_owner already reported the counts for a batch; the single case
+          # names WHICH owner took the link. One list now holds both kinds, so a bare
+          # "linked" no longer says what was picked. Built from the owner's IDENTITY, not
+          # from the row's display label — `3:` there is a sub-tab position, not an id.
+          owner = case row.kind
+                  in .issue? then "issue ##{row.id}: #{link_title_snip(row.name)}"
+                  in .note?  then "note #{link_title_snip(row.name)}"
+                  end
+          @toast = "linked to #{owner}"
+        end
       end
       true
     end
 
-    # Transition from the issue picker into the NEW ISSUE form. Ownership of the ref moves
+    # Transition from the link picker into the NEW ISSUE form. Ownership of the ref moves
     # INTO the form (C3's `link_ref:`), so dropping the form — esc, click-away — drops the
-    # pending link with it; nothing is parked on the Runner.
-    private def open_issue_form_for_link(refs : Array({Store::LinkRefKind, Int64})) : Nil
+    # pending link with it; nothing is parked on the Runner. `typed` is whatever was in the
+    # filter box, and it WINS over the flow-derived title: the operator naming the issue is
+    # more specific than "GET /path".
+    private def open_issue_form_for_link(refs : Array({Store::LinkRefKind, Int64}), typed : String = "") : Nil
       ref = refs.first
       # The form's own fields describe ONE flow (title/host/evidence); the rest of a marked
       # set rides along as extra_flow_ids and is linked after the insert (#442).
       extra = refs[1..].select { |kind, _| kind.flow? }.map { |_, id| id }
       if ref[0].flow?
         if row = @session.store.flow_row(ref[1])
-          open_issue_form(IssueForm.new("#{row.method} #{row.target}", row.host, ref[1],
+          title = typed.empty? ? "#{row.method} #{row.target}" : typed
+          open_issue_form(IssueForm.new(title, row.host, ref[1],
             link_ref: ref, extra_flow_ids: extra))
           return
         end
       end
-      open_issue_form(IssueForm.new(link_ref: ref, extra_flow_ids: extra))
+      open_issue_form(IssueForm.new(typed, link_ref: ref, extra_flow_ids: extra))
     end
 
-    # ↵ on the note picker: "+ New note…" creates a blank note and links to it, any
-    # other row links to the note picked. Same on_close hand-off as the issue picker —
+    # Blank note + link the workbench ref(s), then ask open vs stay. Reached from the link
+    # picker's "+ New note…" row, on the same on_close hand-off as the issue form —
     # create_note_and_link ends on the open-vs-stay confirm, which claims @overlay.
-    private def link_picked_note(np : NotePicker, refs : Array({Store::LinkRefKind, Int64})) : Bool
-      if np.selected_create?
-        np.on_close = -> { create_note_and_link(refs) }
-        return true
-      end
-      if row = np.selected_row
-        commit_links_to_owner(Store::LinkOwnerKind::Note, row.id, refs)
-      end
-      true
-    end
-
-    # Blank note + link the workbench ref(s), then ask open vs stay.
     private def create_note_and_link(refs : Array({Store::LinkRefKind, Int64})) : Nil
       note_id = notes_controller.create_blank_note_id
       commit_links_to_owner(Store::LinkOwnerKind::Note, note_id, refs)
-      @toast = refs.size == 1 ? "note created and linked" : "note created · linked #{refs.size} flows"
+      # commit_links_to_owner set an ACCURATE batch summary — a mark whose flow is gone was
+      # dropped, not attached. Prefix it rather than overwriting it: a flat "linked N flows"
+      # here claimed the whole marked set even when two of them no longer resolved.
+      @toast = refs.size == 1 ? "note created and linked" : "note created · #{@toast}"
       offer_open_created(:note, note_id)
     end
 
@@ -2328,6 +2334,13 @@ module Gori::Tui
     # owner, or stay on the caller tab. Default selection is stay (cancel) so a
     # reflexive ↵ doesn't yank focus away mid-recon.
     private def offer_open_created(kind : Symbol, id : Int64) : Nil
+      # Drop whatever raised this BEFORE the confirm goes up. The issue path arrives from
+      # inside the NEW ISSUE form's own on_commit, so `confirm` would otherwise capture
+      # that form as its `parent` and restore it on close — landing "stay" back on a
+      # filled-in create form for the issue that was just created, where a reflexive ↵
+      # files a duplicate. The note path already gets here with nothing held (it runs from
+      # the picker's on_close), so this is a no-op there.
+      leave_overlay
       case kind
       when :issue
         confirm("ISSUE CREATED",
@@ -2453,12 +2466,29 @@ module Gori::Tui
       links.size > 1 ? "#{line} (+#{links.size - 1})" : line
     end
 
-    private def note_picker_rows : Array(NotePicker::Row)
-      doc = Notes.load(@session.store)
-      doc.notes.map_with_index do |entry, i|
-        label = Notes.title(entry.text) || "note #{i + 1}"
-        NotePicker::Row.new(entry.id, "#{i + 1}:#{label}", entry.text.lines.first?.try(&.strip) || "")
+    # Every attachable owner on one list: issues first (the usual destination for evidence),
+    # then the open notes. `detail` is scan context AND filter fodder — an issue's host and
+    # status, a note's first line — so `issue pending h.test` narrows without leaving the card.
+    private def link_picker_rows : Array(LinkPicker::Row)
+      rows = @session.store.issues.map do |f|
+        # Joined from the parts that are actually there: an issue filed from a Repeater/Fuzz
+        # session carries no host, and "#{nil} · open" renders as a dangling "· open".
+        detail = [f.host, f.status.label].compact.reject(&.empty?).join(" · ")
+        LinkPicker::Row.new(Store::LinkOwnerKind::Issue, f.id,
+          "##{f.id} [#{f.severity.label}] #{f.title}", f.title, detail)
       end
+      doc = Notes.load(@session.store)
+      doc.notes.each_with_index do |entry, i|
+        # "untitled", not "note N": `name` is what the toast says after the kind word, and
+        # that fallback rendered as "linked to note note 1".
+        name = Notes.title(entry.text) || "untitled"
+        # The BODY's first line, not the note's — line one is the title, and echoing it in
+        # the detail column just prints every note's name twice.
+        body = entry.text.lines.map(&.strip).reject(&.empty?)
+        rows << LinkPicker::Row.new(Store::LinkOwnerKind::Note, entry.id, "#{i + 1}:#{name}",
+          name, body.size > 1 ? body[1] : "")
+      end
+      rows
     end
 
     # Commit the tab-bar working copy: persist once, force a full repaint (the tab set/
@@ -4485,36 +4515,34 @@ module Gori::Tui
       miner_controller.current_session_db_id if @active_tab == :miner
     end
 
+    # THE link entry point — one verb per scope ("Link…"), one card, both owner kinds and
+    # both create paths inside it. It used to be two verbs (`k` to-issue / `u` to-note),
+    # which made the operator pick the owner KIND before seeing what existed and hid each
+    # list's "+ New …" row behind that guess.
+    #
     # Batch-capable from the History list (#442): the picker is shown ONCE and every marked
     # flow is attached to whatever it lands on. refs is 1-element everywhere else.
-    def link_to_issue : Nil
+    def link_attach : Nil
       refs = current_link_refs
       return (@toast = "nothing to link") if refs.empty?
-      if f = issues_controller.view.detail_issue
-        # An open issue detail is the implicit target — name it so it's clear which
-        # issue got the link (the picker path below is explicit, so it stays "linked").
-        if commit_links_to_owner(Store::LinkOwnerKind::Issue, f.id, refs)
-          # commit_links_to_owner already reported the counts for a batch; only the single
-          # case gets the "which issue" flavour it would otherwise lose.
-          @toast = "linked to issue ##{f.id}: #{link_title_snip(f.title)}" if refs.size == 1
-        end
-        return
-      end
-      ip = IssuePicker.new(@session.store.issues)
-      ip.on_commit = -> { link_picked_issue(ip, refs) }
-      open_overlay(ip)
-    end
-
-    def link_to_note : Nil
-      refs = current_link_refs
-      return (@toast = "nothing to link") if refs.empty?
+      # Persist the notes buffer before listing it: the rows are read off the store, so an
+      # unsaved in-progress note would otherwise be missing or stale in the card.
       notes_controller.save_notes
-      np = NotePicker.new(note_picker_rows)
-      np.on_commit = -> { link_picked_note(np, refs) }
-      open_overlay(np)
+      lp = LinkPicker.new(link_picker_rows)
+      # Put the History drill-in back on the way out. `open_overlay` overwrites @overlay and
+      # closing clears it to None, which would tear down the flow detail the operator is
+      # linking FROM — the same restore `confirm(return_to: :detail)` performs for the delete
+      # dialog. A create row REPLACES this closure (see link_picked): from there the form and
+      # its confirm own the overlay, and re-opening the detail underneath them would be undone
+      # by the next modal anyway.
+      if @overlay.detail?
+        lp.on_close = -> { @overlay = OverlayKind::Detail }
+      end
+      lp.on_commit = -> { link_picked(lp, refs) }
+      open_overlay(lp)
     end
 
-    # Trim an issue title for a one-line toast (avoid a wall of text on wide titles).
+    # Trim a picked owner's label for a one-line toast (avoid a wall of text on wide titles).
     private def link_title_snip(title : String) : String
       t = title.strip
       t.size > 48 ? "#{t[0, 47]}…" : t
@@ -5089,17 +5117,16 @@ module Gori::Tui
     # the same list the availability gate (history_targets) and the per-verb handlers implement.
     # "%s" takes the flow-count phrase ("3 flows").
     HISTORY_BATCH_TITLES = {
-      "history.copy-as"       => "Copy %s as…",
-      "history.delete"        => "Delete %s",
-      "history.repeater"      => "Repeater %s",
-      "history.fuzz"          => "Send %s to Fuzzer",
-      "history.mine"          => "Mine %s",
-      "history.probe-active"  => "Run active scan on %s",
-      "history.discover"      => "Discover from %s",
-      "scope.add-host"        => "Add %s' hosts to scope",
-      "issue.create"          => "Add issue with %s",
-      "link.history.to-issue" => "Link %s to issue",
-      "link.history.to-note"  => "Link %s to note",
+      "history.copy-as"      => "Copy %s as…",
+      "history.delete"       => "Delete %s",
+      "history.repeater"     => "Repeater %s",
+      "history.fuzz"         => "Send %s to Fuzzer",
+      "history.mine"         => "Mine %s",
+      "history.probe-active" => "Run active scan on %s",
+      "history.discover"     => "Discover from %s",
+      "scope.add-host"       => "Add %s' hosts to scope",
+      "issue.create"         => "Add issue with %s",
+      "link.history.attach"  => "Link %s…",
     }
 
     # Verbs that stay SINGLE-target even with marks set, and say so in their menu hint (AC: a
