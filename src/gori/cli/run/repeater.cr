@@ -747,7 +747,7 @@ module Gori
               j.field "upgraded", result.upgraded?
               j.field "duration_us", result.duration_us
               j.field "close_code", result.close_code
-              j.field "error", result.error
+              CLI::Output.json_captured(j, "error", result.error)
               j.field "note", result.note
               # The inbound transcript stopped SHORT of the server at a cap. A synthetic row
               # already sits in `messages` below; this is the summary half so a script reading
@@ -1308,7 +1308,9 @@ module Gori
             j.field "ok", result.ok?
             j.field "status", result.response.try(&.status)
             j.field "duration_us", result.duration_us
-            j.field "error", result.error
+            # A send failure quotes origin bytes — see `Output.json_captured`. The WS sibling
+            # above takes the same treatment.
+            CLI::Output.json_captured(j, "error", result.error)
             # …and WHY it is incomplete. `incomplete` alone conflates an origin that closed
             # early with gori's own capture ceiling; a reader that assumed the first blamed
             # the target for something gori did.

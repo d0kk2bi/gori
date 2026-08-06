@@ -597,7 +597,11 @@ module Gori
             j.field "saved_repeater_id", repeater_id if repeater_id && repeater_id > 0
             unless result.ok?
               kind = network_error_kind(result.error)
-              j.field "error", result.error
+              # `Serialize.text`: a send failure quotes bytes the ORIGIN chose (a malformed
+              # status line, a header the codec refused), so it is captured data — which is why
+              # `Serialize.fuzz_result` and `Serialize.flow_detail` both already wrap their own
+              # `error`. Raw here would put invalid UTF-8 on a stdio JSON-RPC line.
+              j.field "error", Serialize.text(result.error)
               j.field "error_kind", kind
               # Structured-error contract inside the payload (the payload IS the
               # structuredContent) so a caller can apply policy without string-matching the

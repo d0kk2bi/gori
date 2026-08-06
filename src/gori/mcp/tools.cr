@@ -2074,7 +2074,16 @@ module Gori
       private def emit_audit(j : JSON::Builder, a : JobAudit, ended_at_ms : Int64?) : Nil
         j.field "audit" do
           j.object do
-            j.field "target", a.target
+            # `Serialize.text`, matching what all four `list_jobs` rows already do with this
+            # exact value (`tools/jobs.cr`) — it was raw only here. For fuzz/mine/sequence the
+            # target is `"#{scheme}://#{host}:#{port}"` built from the plan's origin, and a
+            # flow-seeded job takes that host off a capture: `flows.host` round-trips a byte
+            # above 0x7F (nothing rejects it — `Import::Builder::HOST_INVALID` covers only
+            # `[\x00-\x20\x7f]`) and `FlowRequest.parse_target` passes it through, so
+            # `fuzz_status` could put invalid UTF-8 on the wire while `list_jobs` for the same
+            # job stayed clean. This surface is stdio JSON-RPC, where that is a transport-level
+            # protocol violation rather than a display glitch (see `Serialize.issue`).
+            j.field "target", Serialize.text(a.target)
             j.field "rate", a.rate
             j.field "concurrency", a.concurrency
             j.field "max_requests", a.max_requests
