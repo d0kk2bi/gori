@@ -216,3 +216,96 @@ describe "held-item edit refusal on the read surfaces" do
     obj.has_key?("head_only_note").should be_false
   end
 end
+
+# `head_and_body` backs BOTH read surfaces — MCP `intercept_list`/`intercept_get` and
+# `gori run intercept list`/`show` — and it used to scan for `\r\n\r\n` alone and slice the
+# body at a hard-coded `sep + 4`. A bare-LF header terminator is *the* CL/TE desync primitive
+# (P7 keeps it byte-exact), so the one message class an operator holds precisely BECAUSE of its
+# framing was the one whose framing these projections got wrong: the body was reported inside
+# `head` with `body_size: 0`, while the EDIT path on the same bytes split it correctly through
+# `Env.head_body_boundary`. `body_size` is the only body signal `intercept_get` gives without
+# `include_sensitive`, and `intercept show` gates its raw-bytes hint on `body.empty?`.
+private def desync_held(raw : String) : Gori::Store::HeldRow
+  Gori::Store::HeldRow.new(
+    session_token: "t", item_id: 3_i64, kind: "request", method: "POST", host: "h",
+    port: 80, scheme: "http", target: "/x", raw: raw.to_slice, held_at_ms: 0_i64)
+end
+
+describe "Gori::MCP::Serialize.head_and_body" do
+  it "splits a bare-LF-terminated head (LFLF) and keeps the body byte-exact" do
+    head, body = Gori::MCP::Serialize.head_and_body(
+      "POST /x HTTP/1.1\nHost: h\nContent-Length: 8\n\nSMUGGLED".to_slice)
+    head.should eq("POST /x HTTP/1.1\nHost: h\nContent-Length: 8")
+    String.new(body).should eq("SMUGGLED")
+  end
+
+  it "splits the mixed `\\n\\r\\n` spelling too" do
+    head, body = Gori::MCP::Serialize.head_and_body("POST /x HTTP/1.1\nHost: h\n\r\nBODY".to_slice)
+    head.should eq("POST /x HTTP/1.1\nHost: h")
+    String.new(body).should eq("BODY")
+  end
+
+  it "is unchanged on a conformant CRLF message" do
+    head, body = Gori::MCP::Serialize.head_and_body("POST /x HTTP/1.1\r\nHost: h\r\n\r\nBODY".to_slice)
+    head.should eq("POST /x HTTP/1.1\r\nHost: h")
+    String.new(body).should eq("BODY")
+  end
+
+  # The leftmost terminator wins, so a CRLFCRLF sitting INSIDE a smuggled body cannot pull the
+  # split past the real one — the failure mode `Env.head_body_separator` is ordered to avoid.
+  it "takes the earliest terminator when the body itself contains a CRLFCRLF" do
+    head, body = Gori::MCP::Serialize.head_and_body(
+      "POST /x HTTP/1.1\nCL: 1\n\nGET /smuggled HTTP/1.1\r\nHost: h\r\n\r\n".to_slice)
+    head.should eq("POST /x HTTP/1.1\nCL: 1")
+    String.new(body).should eq("GET /smuggled HTTP/1.1\r\nHost: h\r\n\r\n")
+  end
+
+  it "treats a message with no terminator as all head" do
+    head, body = Gori::MCP::Serialize.head_and_body("GET / HTTP/1.1".to_slice)
+    head.should eq("GET / HTTP/1.1")
+    body.size.should eq(0)
+  end
+
+  it "reports the body on the intercept detail projection, not a phantom empty one" do
+    row = desync_held("POST /x HTTP/1.1\nHost: h\nContent-Length: 8\n\nSMUGGLED")
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_detail(j, row, false, 0_i64) })
+    obj["body_size"].as_i.should eq(8)
+    obj["raw_size"].as_i.should eq(52)
+    obj["head"].as_s.should_not contain("SMUGGLED")
+  end
+
+  it "keeps the head preview on the list projection free of body bytes" do
+    row = desync_held("POST /x HTTP/1.1\nHost: h\nContent-Length: 8\n\nSMUGGLED")
+    obj = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.intercept_item_row(j, row, false, 0_i64) })
+    obj["head_preview"]?.try(&.as_s).try(&.should_not(contain("SMUGGLED")))
+  end
+end
+
+# The scanner both shapes come from. `head_body_boundary` (body start) and
+# `head_body_separator` ({offset, width}) must never disagree, because a caller that renders
+# the head as TEXT needs the offset and cannot derive it by subtracting a fixed 4.
+describe "Gori::Env.head_body_separator" do
+  it "agrees with head_body_boundary on every terminator spelling" do
+    {
+      "GET / HTTP/1.1\nHost: h\n\nbody",
+      "GET / HTTP/1.1\r\nHost: h\r\n\r\nbody",
+      "GET / HTTP/1.1\nHost: h\n\r\nbody",
+    }.each do |wire|
+      bytes = wire.to_slice
+      offset, width = Gori::Env.head_body_separator(bytes).not_nil!
+      (offset + width).should eq(Gori::Env.head_body_boundary(bytes))
+    end
+  end
+
+  it "reports the width of each spelling" do
+    Gori::Env.head_body_separator("a\n\nb".to_slice).should eq({1, 2})
+    Gori::Env.head_body_separator("a\n\r\nb".to_slice).should eq({1, 3})
+    Gori::Env.head_body_separator("a\r\n\r\nb".to_slice).should eq({1, 4})
+  end
+
+  it "is nil — and head_body_boundary is the full size — when there is no terminator" do
+    bytes = "GET / HTTP/1.1\r\nHost: h\r\n".to_slice
+    Gori::Env.head_body_separator(bytes).should be_nil
+    Gori::Env.head_body_boundary(bytes).should eq(bytes.size)
+  end
+end

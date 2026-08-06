@@ -1,5 +1,6 @@
 require "json"
 require "base64"
+require "../env"
 require "../store"
 require "../issues_export"
 require "../repeater/engine"
@@ -126,21 +127,30 @@ module Gori
 
       # --- #123 held intercept item projections --------------------------------
 
-      # Offset of the CRLFCRLF head/body separator in a raw HTTP message, or nil.
-      def self.head_body_split(raw : Bytes) : Int32?
-        i = 0
-        while i + 3 < raw.size
-          return i if raw[i] == 13 && raw[i + 1] == 10 && raw[i + 2] == 13 && raw[i + 3] == 10
-          i += 1
-        end
-        nil
-      end
-
       # {scrubbed head text, body bytes} for a held raw message; whole message as head
       # (empty body) when there is no separator.
+      #
+      # `Env.head_body_separator`, not a local scan: this used to roll its own CRLFCRLF-only
+      # loop and slice the body at a hard-coded `sep + 4`, which made it the one splitter in
+      # the tree that neither handled a bare-LF-terminated head nor refused it. `Env`'s
+      # accepts `\n\n` / `\n\r\n` / `\r\n\r\n` (leftmost wins) and `Fuzz::ContentLength` scans
+      # the same three; `Repeater::FlowRequest.resync_content_length` stays CRLF-only but
+      # deliberately NO-OPS rather than mis-framing. This one reported a wrong split instead:
+      # a held CL/TE desync probe (`…Content-Length: 8\n\nSMUGGLED`) came back with its body
+      # inside `head` and `body_size: 0`, so `intercept_get`'s only body signal said there was
+      # none, and `gori run intercept show` — which gates its "[N bytes of body — use
+      # --format json --include-sensitive …]" hint on `body.empty?` — never told the operator
+      # the body existed or how to fetch its bytes. The intercept EDIT path on the same bytes
+      # already split at the right offset (`Env.head_body_boundary`), so one held message had
+      # two framings inside one feature.
+      #
+      # The width matters and is why `Env` exposes the separator rather than only the
+      # boundary: the head is rendered as TEXT here, so it must exclude the terminator, and
+      # `boundary - 4` is only correct for the CRLF spelling.
       def self.head_and_body(raw : Bytes) : {String, Bytes}
-        if sep = head_body_split(raw)
-          {String.new(raw[0, sep]).scrub, raw[(sep + 4)..]}
+        if sep = Env.head_body_separator(raw)
+          offset, width = sep
+          {String.new(raw[0, offset]).scrub, raw[(offset + width)..]}
         else
           {String.new(raw).scrub, Bytes.empty}
         end

@@ -3520,8 +3520,11 @@ describe "MCP intercept_forward_edit" do
       end
 
       queued = queued_intercept_bytes(store)
-      sep = Gori::MCP::Serialize.head_body_split(queued).not_nil!
-      queued[(sep + 4)..].should eq body # untouched, 0x0A and 0xFF included
+      # `Env.head_body_separator` — the one scanner. The `+ 4` this used to hard-code beside
+      # a CRLFCRLF-only scan is the bug `head_and_body` carried; take the width from the
+      # scanner so the assertion holds whichever spelling terminates the head.
+      offset, width = Gori::Env.head_body_separator(queued).not_nil!
+      queued[(offset + width)..].should eq body # untouched, 0x0A and 0xFF included
     end
   end
 
