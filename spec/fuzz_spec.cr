@@ -622,10 +622,10 @@ describe F::Engine do
     results.size.should eq(3)
 
     by_payload = results.index_by { |r| r.payloads.first }
-    by_payload["a'b"].chain_error.should be_nil  # shell-escape ran
-    by_payload["c;d"].chain_error.should be_nil  # shell-escape ran
+    by_payload["a'b"].chain_error.should be_nil # shell-escape ran
+    by_payload["c;d"].chain_error.should be_nil # shell-escape ran
     failed = by_payload[binary]
-    failed.chain_error.should_not be_nil         # shell-escape refused this payload
+    failed.chain_error.should_not be_nil # shell-escape refused this payload
     failed.chain_error.not_nil!.should contain("shell-escape")
 
     # The run's tally counts the swallowed chain — it is NOT hidden inside "0 errors".
@@ -658,6 +658,24 @@ describe F::Engine do
     backend = FakeBackend.new(F::Origin.new("http", "h", 80)) { |_b| ok_result(200, "x") }
     results, _ = drain(F::Engine.new(gen, F::Matcher.new, backend, cfg))
     results.size.should eq(3) # all sent — a 0 cap must not break at @dispatched >= 0
+  end
+
+  it "skips calibration at max_requests=1 so the sweep still gets a send" do
+    # Math.max(cap-1, 1) used to want 1 calibration sample at cap=1, leaving zero for the
+    # sweep despite the comment promising the opposite.
+    set = F::PayloadSet.new(F::InlineList.new(["only"]))
+    cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1, max_requests: 1_i64,
+      auto_calibrate: true)
+    gen = F::Generator.new(base, [set], cfg)
+    backend = FakeBackend.new(F::Origin.new("http", "h", 80)) { |_b| ok_result(200, "x") }
+    matcher = F::Matcher.new(auto_calibrate: true)
+    engine = F::Engine.new(gen, matcher, backend, cfg)
+    engine.auto_calibrate?.should be_true
+    engine.calibrate_baseline # must send nothing under cap=1
+    backend.sent.should eq(0)
+    results, _ = drain(engine)
+    results.size.should eq(1)
+    backend.sent.should eq(1)
   end
 
   it "enforces max_requests as a hard cap on real sends (retries count)" do
@@ -768,8 +786,8 @@ describe Gori::CLI::Output do
   it "emits valid JSON for a non-UTF-8 payload (row and array)" do
     binary = String.new(Bytes[0xff_u8, 0xfe_u8])
     r = F::Result.new(1_i64, [binary], nil, 200, 3_i64, 1, 1, 10_i64, nil, true, false, nil)
-    row = Gori::CLI::Output.fuzz_row_json(r)         # jsonl path
-    arr = Gori::CLI::Output.fuzz_array_json([r])     # json path
+    row = Gori::CLI::Output.fuzz_row_json(r)     # jsonl path
+    arr = Gori::CLI::Output.fuzz_array_json([r]) # json path
     # `valid_encoding?`, not `JSON.parse`: Crystal's parser tolerates its own invalid-UTF-8
     # output, but jq / python's json / every other consumer rejects a document with a raw
     # \xff in a string — which is exactly what the finding reproduced. The emitted bytes must

@@ -118,7 +118,15 @@ module Gori
         value = l[(colon + 1)..].strip
         case name
         when "authorization"
-          tok = value.lchop?("Bearer ") || value.lchop?("bearer ") || value
+          # RFC 7235: the auth scheme is case-insensitive. Only "Bearer "/"bearer " were
+          # stripped, so `BEARER` / mixed-case schemes left the whole value in place and
+          # jwt? rejected it — tokens present on the wire were silently dropped from the
+          # scan. A 7-char case-insensitive prefix match covers every spelling.
+          tok = if value.size >= 7 && value[0, 7].compare("Bearer ", case_insensitive: true) == 0
+                  value[7..]
+                else
+                  value
+                end
           yield "#{pfx}Authorization", tok.strip
         when "cookie", "set-cookie"
           label = name == "cookie" ? "Cookie" : "Set-Cookie"

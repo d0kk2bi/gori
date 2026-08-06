@@ -92,7 +92,7 @@ module Gori
           return nil if malformed
           return nil unless method_allowed?(method.upcase, opts)
           return nil unless denied_status?(detail.row.status)
-          key_string(detail, method.upcase, target)
+          key_string(detail, method.upcase, target, opts.aggressive)
         end
 
         # probe (spoofed headers) + control (the request UNCHANGED).
@@ -111,7 +111,7 @@ module Gori
           # two legs differ in exactly one thing: whether our forged values are present.
           control = rebuild_with_bypass_headers(detail.request_head, detail.request_body,
             opts.aggressive, insert: false)
-          Plan.new(request, [] of Param, key_string(detail, req.method.upcase, req.target), [control])
+          Plan.new(request, [] of Param, key_string(detail, req.method.upcase, req.target, opts.aggressive), [control])
         end
 
         # results = [probe, control]. Flag only when the spoofed request succeeded AND the control
@@ -155,9 +155,14 @@ module Gori
 
         # The single key expression both `plan` and `dedup_key` use, so they can't drift. Query is
         # stripped (a client-IP gate is per-endpoint, not per-query-value) → one probe per
-        # (host, method, path); host:PORT so the same host on another service is a distinct surface.
-        private def key_string(detail : Store::FlowDetail, method_upcase : String, target : String) : String
-          "forbidden_bypass|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path_key(target)}"
+        # (host, method, path, header-set); host:PORT so the same host on another service is a
+        # distinct surface. The aggressive tag is load-bearing: without it, a surface already
+        # probed in ACTIVE mode never received the wider AGGRESSIVE IP-header set, because
+        # both modes shared one key and the first win suppressed the second forever.
+        private def key_string(detail : Store::FlowDetail, method_upcase : String, target : String,
+                               aggressive : Bool) : String
+          tag = aggressive ? "aggr" : "base"
+          "forbidden_bypass|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path_key(target)}|#{tag}"
         end
 
         private def path_key(target : String) : String

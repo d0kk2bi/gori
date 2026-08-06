@@ -503,6 +503,13 @@ module Gori::Fuzz
       @total
     end
 
+    # Whether Config asked for auto-calibration. Surfaces that own their start path
+    # (CLI, TUI) call `calibrate_baseline` themselves; MCP's job fiber asks this so the
+    # documented `auto_calibrate` flag is not a silent no-op.
+    def auto_calibrate? : Bool
+      @config.auto_calibrate?
+    end
+
     # Seed the matcher's calibration set from CALIBRATION_SAMPLES synthetic,
     # randomly-payloaded requests (see Generator#calibration_requests and
     # Matcher.reflects_length?) — replaces the old single-snapshot baseline, which a
@@ -510,12 +517,17 @@ module Gori::Fuzz
     # reflected parameter) trivially defeated. Optional; call before `start`. Every
     # send routes through @backend like any other, so calibration sends still count
     # against a configured max_requests cap; under a tight cap, sample count is
-    # trimmed so at least one send is left for the sweep itself. A failed/empty
-    # calibration is non-fatal — auto_calibrate then simply suppresses nothing.
+    # trimmed so at least one send is left for the sweep itself (at max_requests=1
+    # calibration is skipped entirely — the old `Math.max(cap - 1, 1)` still wanted 1
+    # sample and left zero for the sweep, despite the comment promising the opposite).
+    # A failed/empty calibration is non-fatal — auto_calibrate then simply suppresses
+    # nothing.
     def calibrate_baseline : Nil
       wanted = CALIBRATION_SAMPLES
-      if (cap = @config.max_requests) && cap > 0 && cap - 1 < wanted
-        wanted = Math.max(cap - 1, 1_i64).to_i32
+      if (cap = @config.max_requests) && cap > 0
+        room = cap - 1
+        return if room <= 0
+        wanted = Math.min(wanted.to_i64, room).to_i32
       end
       samples = [] of BaselineSample
       @generator.calibration_requests(wanted).each do |bytes, payload_len|

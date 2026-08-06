@@ -163,6 +163,20 @@ describe Gori::Proxy::Codec::Body do
       Body.response_framing(ok, "HEAD").should eq({BodyFraming::None, 0_i64})
     end
 
+    it "treats a 2xx CONNECT response as bodyless but frames a non-2xx CONNECT entity" do
+      # RFC 7230 §3.3.3 / RFC 9112 §6.3: only a successful CONNECT is bodyless.
+      ok = Http1.parse_response_head("HTTP/1.1 200 Connection Established\r\n\r\n".to_slice)
+      Body.response_framing(ok, "CONNECT").should eq({BodyFraming::None, 0_i64})
+
+      auth = Http1.parse_response_head(
+        "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 12\r\n\r\n".to_slice)
+      Body.response_framing(auth, "CONNECT").should eq({BodyFraming::Length, 12_i64})
+
+      err = Http1.parse_response_head(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\n".to_slice)
+      Body.response_framing(err, "CONNECT").should eq({BodyFraming::CloseDelimited, 0_i64})
+    end
+
     it "falls back to close-delimited when a response has neither CL nor chunked" do
       resp = Http1.parse_response_head("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n".to_slice)
       Body.response_framing(resp, "GET").should eq({BodyFraming::CloseDelimited, 0_i64})

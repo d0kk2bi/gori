@@ -314,3 +314,29 @@ describe "Settings.apply_sections — a non-object section must not abandon the 
     end
   end
 end
+
+describe "Settings.import_document — absent mine/discover leave overlay prefs alone" do
+  it "does not clear mine_prefs_saved when the profile omits mine" do
+    with_config_home do
+      Gori::Settings.save_mine_prefs(["query", "headers"], 12, "always")
+      Gori::Settings.mine_prefs_saved?.should be_true
+      Gori::Settings.mine_concurrency.should eq(12)
+      # network-only import used to call parse_mine_prefs(nil) and wipe the saved flag.
+      Gori::Settings.import_document(%({"network":{"bind_port":9199}}), ["network"])
+      Gori::Settings.mine_prefs_saved?.should be_true
+      Gori::Settings.mine_concurrency.should eq(12)
+      Gori::Settings.mine_locations.should eq(["query", "headers"])
+    end
+  end
+
+  it "does not clear discover_prefs_saved when the profile omits discover" do
+    with_config_home do
+      Gori::Settings.save_discover_prefs("strict", 3, 8, true, false, true, true)
+      Gori::Settings.discover_prefs_saved?.should be_true
+      Gori::Settings.import_document(%({"theme":"goriday"}), ["theme"])
+      Gori::Settings.discover_prefs_saved?.should be_true
+      Gori::Settings.discover_max_depth.should eq(3)
+      Gori::Settings.discover_concurrency.should eq(8)
+    end
+  end
+end

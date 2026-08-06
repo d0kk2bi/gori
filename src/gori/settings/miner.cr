@@ -12,7 +12,12 @@ module Gori::Settings
   class_property? mine_prefs_saved : Bool = false
 
   private def self.parse_mine_prefs(node : JSON::Any?) : Nil
-    obj = node.try(&.as_h?)
+    # ABSENT (nil) leaves the live prefs alone — import_document filters to selected
+    # sections then reuses apply_sections, so a profile without `mine` used to clear
+    # mine_prefs_saved and the next save erased the operator's Mine overlay choices.
+    # Present-but-not-an-object still clears (malformed section, not "untouched").
+    return if node.nil?
+    obj = node.as_h?
     unless obj
       self.mine_prefs_saved = false
       return

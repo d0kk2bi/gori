@@ -142,6 +142,15 @@ describe Gori::Jwt do
       found[0].brief.not_nil!.should contain("exp ")
     end
 
+    it "strips a case-insensitive Bearer scheme (RFC 7235)" do
+      # Only "Bearer "/"bearer " were stripped; BEARER left the whole value and jwt? dropped it.
+      {"Bearer", "bearer", "BEARER", "BeArEr"}.each do |scheme|
+        found = Gori::Jwt.from_flow("/", head("GET / HTTP/1.1", "Authorization: #{scheme} #{token}"), nil, nil, nil)
+        found.size.should eq(1), "scheme #{scheme.inspect}"
+        found[0].token.should eq(token)
+      end
+    end
+
     it "finds a token embedded in a JSON response body" do
       found = Gori::Jwt.from_flow("/", head("GET / HTTP/1.1"), nil,
         head("HTTP/1.1 200 OK"), %({"access_token":"#{token}"}).to_slice)
