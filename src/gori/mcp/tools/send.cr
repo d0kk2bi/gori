@@ -204,6 +204,25 @@ module Gori
         sc
       end
 
+      # The TLS SNI for one send: an explicit `sni` argument OVERRIDES whatever the stored source
+      # carries (`stored` is `flow.sni` / `rec.sni`, or nil on the direct-dial branch). That is
+      # the rule `gori run repeater <flow-id> --sni` already applies
+      # (`sni_override.presence || built.sni`).
+      #
+      # Until this argument existed, `send_request` was the one send surface in gori with no
+      # route to an SNI at all — every sibling takes it and their schemas name it "the
+      # vhost-confusion / domain-fronting test" (`create_repeater`, `update_repeater`,
+      # `fuzz_start`, `mine_start`, `sequence_start`, `discover_start`, `gori run
+      # repeater/fuzz/mine/sequence/discover --sni`, four TUI tabs). So replaying a flow dialled
+      # with a ClientHello the CLI could change and an agent could not: same stored bytes, two
+      # different handshakes depending on the surface.
+      #
+      # `.presence` so an empty string means "no override" rather than an empty ServerName. One
+      # function rather than the expression inlined per branch, so the precedence is stated once.
+      private def send_sni(h, stored : String? = nil) : String?
+        str(h, "sni").presence || stored
+      end
+
       # Per-operation (connect + idle read/write) timeout for a one-shot send, from
       # timeout_ms; nil = the engine defaults. Mirrors fuzz_timeout's bounds.
       private def send_timeout(h) : Time::Span?
@@ -375,8 +394,8 @@ module Gori
         flow_id = int(h, "flow_id") || recorded_flow_id
         # Masked for the PROBE SCAN only, exactly like `masked_req` below — never for the row.
         # `target` is a WIRE field: it is the dial tuple, and it supplies the TLS ClientHello
-        # ServerName whenever `sni` is absent (which it always is on this save-from-send path,
-        # `sni: nil`). See `stored_request` for the seam; the two extra facts that make masking
+        # ServerName whenever `sni` is absent. See `stored_request` for the seam; the two extra
+        # facts that make masking
         # it destructive rather than merely cosmetic:
         #
         #   * The two ends do not share a vocabulary. `mask_secrets` resolves against
@@ -417,7 +436,13 @@ module Gori
           auto_cl: true,
           flow_id: flow_id,
           position: store.repeaters_meta.size.to_i32,
-          sni: nil
+          # The SNI the send actually used, so re-sending the saved row reproduces the same
+          # ClientHello. Hard-coded `nil` until `send_request` gained the argument — harmless
+          # while there was nothing to lose, a silent fidelity hole the moment there was: the
+          # row would dial the vhost by `target`'s own name while the send that produced the
+          # evidence presented a different one. Through `send_sni`, so the row stores exactly
+          # what `send_plan_options` handed the sender.
+          sni: send_sni(h)
         )
         return nil unless repeater_id > 0
 
@@ -994,7 +1019,7 @@ module Gori
           # Respect the repeater's auto-Content-Length setting (the TUI Repeater does):
           # only recompute CL when it's on, so a deliberately hand-set CL is preserved.
           return {Repeater::PlanOptions.new([rec.request], default_target: rec.target,
-            http2: bool_arg(h, "http2", rec.http2?), sni: rec.sni,
+            http2: bool_arg(h, "http2", rec.http2?), sni: send_sni(h, rec.sni),
             auto_content_length: rec.auto_content_length?, verify: verify,
             timeout: timeout, overrides: overrides), false}
         end
@@ -1050,7 +1075,7 @@ module Gori
           {Repeater::PlanOptions.new([flow.bytes], default_target: flow.target,
             expand_request: false, evidence: true,
             auto_content_length: false,
-            http2: bool_arg(h, "http2", flow.http2), sni: flow.sni, verify: verify,
+            http2: bool_arg(h, "http2", flow.http2), sni: send_sni(h, flow.sni), verify: verify,
             timeout: timeout, overrides: overrides), flow.rewrote_request_line}
         else
           # `RequestBuilder` already expanded, framed and range-checked this one, with
@@ -1070,6 +1095,11 @@ module Gori
             # copy-paste artifact to repair. See `PlanOptions#preserve_field_case?`.
             preserve_field_case: verbatim,
             origin: Repeater::Origin.new(built.scheme, built.host, built.port),
+            # The direct-dial branch carried no SNI at all, so the domain-fronting test this
+            # argument exists for — an IP or a fronting host in `url`, a different name in the
+            # ClientHello — was unreachable even with the argument present. `Repeater::Plan`
+            # owns the `Env.expand` over it (`PlanOptions#sni`), so it goes in raw.
+            sni: send_sni(h),
             http2: bool_arg(h, "http2", false), verify: verify,
             timeout: timeout, overrides: overrides), false}
         end

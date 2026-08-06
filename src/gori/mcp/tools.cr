@@ -1190,6 +1190,7 @@ module Gori
               s.field "h2_fields", h2fieldsprop
               s.field "http2", boolprop("use real HTTP/2; defaults to the flow's version when flow_id is set)")
               s.field "timeout_ms", intprop("per-operation connect + idle (read/write) timeout in milliseconds; a timeout surfaces as a network-error result with error_kind (1-600000)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni). OVERRIDES the SNI a flow_id/repeater_id source carries, the way `gori run repeater <flow-id> --sni` does; omit to keep the stored one.")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
               s.field "apply_rules", boolprop("apply the project's enabled Match & Replace rules (REQUEST side only) to the outgoing request before sending, matching the live proxy; default false — direct sends are byte-exact")
               s.field "record_history", boolprop("record the outbound request and response in History for audit/evidence (default true)")

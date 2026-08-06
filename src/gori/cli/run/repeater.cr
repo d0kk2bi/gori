@@ -44,6 +44,7 @@ module Gori
         insecure = false
         allow_unscoped = false
         format = :text
+        timeout : Time::Span? = nil
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run repeater h2 --target URL --fields FILE [options]\n\n" \
@@ -54,6 +55,7 @@ module Gori
           p.on("-tURL", "--target=URL", "Dial origin (scheme://host[:port]); :authority/:scheme in the fields may differ") { |v| target = v }
           p.on("--fields=FILE", "JSON file with the ordered HPACK field list (and optional body)") { |v| fields_file = v }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
+          p.on("--timeout=SEC", "Per-operation connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -81,7 +83,7 @@ module Gori
         plan = begin
           Repeater::Plan.build(Repeater::PlanOptions.new(
             h2_fields: fields, h2_body: body, target: tgt,
-            http2: true, verify: !insecure, overrides: overrides), outbound)
+            http2: true, verify: !insecure, timeout: timeout, overrides: overrides), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater h2", ex)
         end
@@ -399,9 +401,11 @@ module Gori
       # Content-Length on every replay, and no `Plan`-level spec would notice.
       private def self.session_plan_options(rec : Store::RepeaterRecord, insecure : Bool,
                                             overrides : Gori::HostOverrides?,
-                                            verbatim : Bool = false) : Repeater::PlanOptions
+                                            verbatim : Bool = false,
+                                            timeout : Time::Span? = nil) : Repeater::PlanOptions
         Repeater::PlanOptions.new([rec.request],
           default_target: rec.target, http2: rec.http2?, sni: rec.sni,
+          timeout: timeout,
           expand_request: !verbatim,
           # …and on an h2 session it used to change NOTHING the encoder does: the flag
           # promised "the stored bytes EXACTLY" while `H2Engine` still lowercased every field
@@ -460,6 +464,7 @@ module Gori
         insecure = false
         do_diff = false
         format = :text
+        timeout : Time::Span? = nil
         # `--message` and `--message-frame` share ONE list so their relative ORDER is the send
         # order. A WebSocket exchange is a sequence, and two lists merged afterwards would
         # silently reorder a fragment ahead of the CONT that finishes it.
@@ -481,6 +486,7 @@ module Gori
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
+          p.on("--timeout=SEC", "Per-operation connect + idle timeout (seconds). Ignored on the WebSocket path, which paces itself with --idle-ms") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("--diff", "Diff the new response against the session's last stored response") { do_diff = true }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--verbatim", "Send the stored bytes EXACTLY: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync, no HTTP/2→1.1 version fix, and on h2 no field-name lowercasing") { verbatim = true }
@@ -515,7 +521,7 @@ module Gori
         outbound = project_outbound(project_name, db_path, allow_unscoped)
 
         plan = begin
-          Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim), outbound)
+          Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim, timeout), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater send", ex, "session ##{id}")
         end
@@ -1139,6 +1145,7 @@ module Gori
         body_override : String? = nil
         allow_unscoped = false
         keep_request_line = false
+        timeout : Time::Span? = nil
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -1156,6 +1163,7 @@ module Gori
           p.on("--http1", "Force HTTP/1.1 — downgrades an h2-captured flow (default follows how the flow was captured)") { http2_override = false }
           p.on("--no-http2", "Alias for --http1") { http2_override = false }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni_override = v }
+          p.on("--timeout=SEC", "Per-operation connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
           p.on("--diff", "Diff the new response against the captured one") { do_diff = true }
           p.on("-HHEADER", "--header=HEADER", "Custom header to overwrite/add. Repeat the SAME name to send duplicate header lines. An explicit Content-Length is honored verbatim (no auto-resync) for CL-mismatch testing") { |v| headers << v }
@@ -1277,7 +1285,7 @@ module Gori
             # operator's OWN `-H`/`-b`/`--target` above, so nothing downstream needs to (and
             # nothing downstream can still tell the operator's bytes from the capture's).
             evidence: true,
-            verify: !insecure, overrides: host_overrides), outbound)
+            verify: !insecure, timeout: timeout, overrides: host_overrides), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater", ex)
         end
