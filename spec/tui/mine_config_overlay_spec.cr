@@ -32,7 +32,7 @@ describe Gori::Tui::MineConfigOverlay do
 
   it "cycles max-requests, concurrency and notification on their rows and reports the Start row" do
     ov = MineConfigOverlay.new(seed([Gori::Miner::Location::Query], [Gori::Miner::Location::Query]))
-    # rows: [0]=query, [1]=max requests, [2]=concurrency, [3]=notification, [4]=start
+    # rows: [0]=query, [1]=max requests, [2]=concurrency, [3]=notification, [4]=keep-alive, [5]=start
     ov.build_config.max_requests.should be_nil # uncapped is the first choice, and the default
     ov.move(1)                                 # max requests row
     ov.adjust(1)
@@ -43,8 +43,21 @@ describe Gori::Tui::MineConfigOverlay do
     ov.move(1)                                # notification row
     ov.adjust(1)
     ov.build_config.notify.should eq(Gori::Miner::NotifyMode::Off)
+    ov.move(1) # keep-alive row
+    ov.on_start_row?.should be_false
     ov.move(1) # start row
     ov.on_start_row?.should be_true
+  end
+
+  it "reuses connections by default and turns pooling off from its own row" do
+    ov = MineConfigOverlay.new(seed([Gori::Miner::Location::Query], [Gori::Miner::Location::Query]))
+    ov.build_config.keep_alive?.should be_true
+    ov.set_selected(4) # the keep-alive row for a one-location seed
+    ov.toggle
+    ov.build_config.keep_alive?.should be_false
+    # ←/→ flips it too, so the row behaves like the cyclers it sits under.
+    ov.adjust(1)
+    ov.build_config.keep_alive?.should be_true
   end
 
   it "defaults notification to when-found" do
@@ -56,6 +69,7 @@ describe Gori::Tui::MineConfigOverlay do
     Gori::Settings.mine_locations = ["query", "json"]
     Gori::Settings.mine_concurrency = 20
     Gori::Settings.mine_notify = "always"
+    Gori::Settings.mine_keep_alive = false
     Gori::Settings.mine_prefs_saved = true
     ov = MineConfigOverlay.new(seed(
       [Gori::Miner::Location::Query, Gori::Miner::Location::Json, Gori::Miner::Location::Headers],
@@ -64,10 +78,12 @@ describe Gori::Tui::MineConfigOverlay do
     cfg.locations.should eq([Gori::Miner::Location::Query, Gori::Miner::Location::Json])
     cfg.concurrency.should eq(20)
     cfg.notify.should eq(Gori::Miner::NotifyMode::Always)
+    cfg.keep_alive?.should be_false
   ensure
     Gori::Settings.mine_locations = [] of String
     Gori::Settings.mine_concurrency = 10
     Gori::Settings.mine_notify = "when-found"
+    Gori::Settings.mine_keep_alive = true
     Gori::Settings.mine_prefs_saved = false
   end
 

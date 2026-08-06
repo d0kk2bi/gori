@@ -49,6 +49,7 @@ module Gori::Tui
       @conc_idx = CONC_CHOICES.index(10) || 1
       @notify_idx = NOTIFY_CHOICES.index(Miner::NotifyMode::WhenFound) || 0
       @maxreq_idx = 0
+      @keep_alive = true
       @selected = 0
       restore_saved_prefs
     end
@@ -57,7 +58,7 @@ module Gori::Tui
     def save_prefs : Nil
       locs = @seed.applicable.select { |l| @checked[l]? }.map(&.label)
       notify = NOTIFY_CHOICES[@notify_idx].token
-      Settings.save_mine_prefs(locs, CONC_CHOICES[@conc_idx], notify)
+      Settings.save_mine_prefs(locs, CONC_CHOICES[@conc_idx], notify, @keep_alive)
     end
 
     private def restore_saved_prefs : Nil
@@ -72,12 +73,13 @@ module Gori::Tui
       if mode = Miner::NotifyMode.parse?(Settings.mine_notify)
         @notify_idx = NOTIFY_CHOICES.index(mode) || @notify_idx
       end
+      @keep_alive = Settings.mine_keep_alive?
     end
 
     # Rows: one per applicable location, then max-requests + concurrency + notification
-    # cyclers, then Start.
+    # cyclers, then the keep-alive checkbox, then Start.
     private def row_count : Int32
-      @seed.applicable.size + 4
+      @seed.applicable.size + 5
     end
 
     private def maxreq_row : Int32
@@ -92,8 +94,14 @@ module Gori::Tui
       @seed.applicable.size + 2
     end
 
-    private def start_row : Int32
+    # Reuse one connection across the run's probes — a checkbox rather than a cycler
+    # because it is a plain on/off, matching the Discover overlay's own keep-alive row.
+    private def keepalive_row : Int32
       @seed.applicable.size + 3
+    end
+
+    private def start_row : Int32
+      @seed.applicable.size + 4
     end
 
     def on_start_row? : Bool
@@ -157,9 +165,10 @@ module Gori::Tui
 
     def adjust(d : Int32) : Nil
       case @selected
-      when maxreq_row then @maxreq_idx = (@maxreq_idx + d) % MAX_REQ_CHOICES.size
-      when conc_row   then @conc_idx = (@conc_idx + d) % CONC_CHOICES.size
-      when notify_row then @notify_idx = (@notify_idx + d) % NOTIFY_CHOICES.size
+      when maxreq_row    then @maxreq_idx = (@maxreq_idx + d) % MAX_REQ_CHOICES.size
+      when conc_row      then @conc_idx = (@conc_idx + d) % CONC_CHOICES.size
+      when notify_row    then @notify_idx = (@notify_idx + d) % NOTIFY_CHOICES.size
+      when keepalive_row then @keep_alive = !@keep_alive
       end
     end
 
@@ -168,6 +177,8 @@ module Gori::Tui
       if @selected < @seed.applicable.size
         loc = @seed.applicable[@selected]
         @checked[loc] = !(@checked[loc]? || false)
+      elsif @selected == keepalive_row
+        @keep_alive = !@keep_alive
       elsif @selected == maxreq_row || @selected == conc_row || @selected == notify_row
         adjust(1)
       end
@@ -179,6 +190,7 @@ module Gori::Tui
       c.concurrency = CONC_CHOICES[@conc_idx]
       c.notify = NOTIFY_CHOICES[@notify_idx]
       c.max_requests = MAX_REQ_CHOICES[@maxreq_idx].try(&.to_i64)
+      c.keep_alive = @keep_alive
       c
     end
 
@@ -235,15 +247,23 @@ module Gori::Tui
       x = box.x + 3
       if i < @seed.applicable.size
         loc = @seed.applicable[i]
-        on = @checked[loc]? || false
-        screen.text(x, py, on ? "[x]" : "[ ]", on ? Theme.green : Theme.muted, bg)
-        screen.text(x + 4, py, "#{loc.label} mining", sel ? Theme.text_bright : Theme.text, bg)
+        draw_check(screen, x, py, bg, sel, @checked[loc]? || false, "#{loc.label} mining")
+      elsif i == keepalive_row
+        draw_check(screen, x, py, bg, sel, @keep_alive, "reuse connections (keep-alive)")
       elsif i == start_row
         label = any_checked? ? "[ Start mining ]" : "[ select a location ]"
         screen.text(x, py, label, any_checked? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
       else
         draw_cycler(screen, x, py, bg, sel, i)
       end
+    end
+
+    # One ␣-toggled checkbox row — the location rows and the keep-alive row are the same
+    # widget, so they draw through the same three lines rather than two copies of them.
+    private def draw_check(screen : Screen, x : Int32, py : Int32, bg : Color,
+                           sel : Bool, on : Bool, label : String) : Nil
+      screen.text(x, py, on ? "[x]" : "[ ]", on ? Theme.green : Theme.muted, bg)
+      screen.text(x + 4, py, label, sel ? Theme.text_bright : Theme.text, bg)
     end
 
     # The three ←/›-cycled rows, split out of draw_row so adding a knob does not keep

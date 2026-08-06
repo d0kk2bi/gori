@@ -193,6 +193,7 @@ module Gori
         config.max_requests = cap ? {cap, MINE_MAX_REQUESTS}.min : MINE_MAX_REQUESTS
         config.user_wordlist = str(h, "wordlist").presence
         int(h, "throttle_ms").try { |v| config.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
+        config.keep_alive = bool_arg(h, "keep_alive", true)
         options = Miner::PlanOptions.new(text,
           # A `flow_id` template is CAPTURED evidence; a `template` string is the caller's
           # draft. See `Miner::PlanOptions#evidence?`.

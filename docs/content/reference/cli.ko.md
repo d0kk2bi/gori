@@ -232,7 +232,10 @@ gori run mine <flow-id> --locations query,headers --wordlist params.txt
 | `--locations=LIST` | `query`, `form`, `json`, `headers`, `cookies` |
 | `--wordlist`, `--bucket=N` | 후보 이름과 버킷 크기 |
 | `--concurrency` (10), `--rate`, `--throttle`, `--timeout`, `--retries` (1), `--max-requests=N` | 속도 제어 |
+| `--no-keep-alive` | 연결 재사용 대신 프로브마다 새로 연결 |
 | `--format` | `text`, `json`, 또는 `jsonl` |
+
+기본적으로 연결을 재사용합니다. 마이닝 한 번이 프로브마다가 아니라 워커마다 TCP(https라면 TLS) 핸드셰이크를 한 번씩만 치릅니다. 실행이 끝날 때 나오는 `connections · N dialed · M reused` 줄에서 대상이 이를 지켰는지 확인할 수 있습니다. 대상이 연결 단위로 동작한다면 `--no-keep-alive`로 끕니다.
 
 ### run sequence {#run-sequence}
 

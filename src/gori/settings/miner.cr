@@ -9,6 +9,10 @@ module Gori::Settings
   class_property mine_locations : Array(String) = [] of String
   class_property mine_concurrency : Int32 = 10
   class_property mine_notify : String = "when-found"
+  # Reuse one connection across the mine's probes. Mirrors `Settings.discover_keep_alive?`,
+  # including the `!= false` read below: a settings file written before this key existed must
+  # come back as the default ON, not as an opt-out the operator never chose.
+  class_property? mine_keep_alive : Bool = true
   class_property? mine_prefs_saved : Bool = false
 
   private def self.parse_mine_prefs(node : JSON::Any?) : Nil
@@ -28,13 +32,16 @@ module Gori::Settings
     end
     int_field(obj, "concurrency").try { |n| self.mine_concurrency = n }
     obj["notify"]?.try(&.as_s?).try { |s| self.mine_notify = s }
+    self.mine_keep_alive = obj["keep_alive"]?.try(&.as_bool?) != false
   end
 
   # Persist the overlay's last confirmed choices (called when mining starts).
-  def self.save_mine_prefs(locations : Array(String), concurrency : Int32, notify : String) : Nil
+  def self.save_mine_prefs(locations : Array(String), concurrency : Int32, notify : String,
+                           keep_alive : Bool = true) : Nil
     self.mine_locations = locations.map(&.downcase.strip).reject(&.empty?)
     self.mine_concurrency = concurrency
     self.mine_notify = notify
+    self.mine_keep_alive = keep_alive
     self.mine_prefs_saved = true
     save
   end
@@ -48,6 +55,7 @@ module Gori::Settings
           end
           j.field "concurrency", mine_concurrency
           j.field "notify", mine_notify
+          j.field "keep_alive", mine_keep_alive?
         end
       end
     end

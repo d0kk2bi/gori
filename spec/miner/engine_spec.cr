@@ -80,6 +80,57 @@ private class BlockedBackend < F::Backend
   end
 end
 
+# Reacts to a magic name at the QUERY *and* at the HEADER location, and yields inside every
+# send so the scheduler can interleave — which is what makes the in-flight measurements below
+# real rather than always 1.
+#
+#   max_in_flight     — the most sends outstanding at one moment.
+#   mixed_in_flight   — a QUERY bucket and a HEADER bucket were outstanding TOGETHER, which
+#                       a per-location schedule can never produce.
+#   closed            — the end-of-run release of the send backend (the pool's sockets).
+private class MultiLocationBackend < F::Backend
+  getter origin : F::Origin
+  getter sent : Int32 = 0
+  getter closed : Bool = false
+  getter max_in_flight : Int32 = 0
+  getter mixed_in_flight : Bool = false
+
+  def initialize(@origin : F::Origin, @magic : String)
+    @in_flight = 0
+    @query_in_flight = 0
+    @header_in_flight = 0
+  end
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    text = String.new(bytes)
+    line = text.lines.first? || ""
+    # A canary is "gq" + 8 hex, injected as `name=gqXXXXXXXX` in the query and as
+    # `name: gqXXXXXXXX` in a header — so the request itself says which bucket this is.
+    query = line.includes?("=gq")
+    header = text.includes?(": gq")
+    @sent += 1
+    @in_flight += 1
+    @query_in_flight += 1 if query
+    @header_in_flight += 1 if header
+    @max_in_flight = @in_flight if @in_flight > @max_in_flight
+    @mixed_in_flight = true if @query_in_flight > 0 && @header_in_flight > 0
+    Fiber.yield
+    @in_flight -= 1
+    @query_in_flight -= 1 if query
+    @header_in_flight -= 1 if header
+    hit = line.includes?("#{@magic}=gq") || text.includes?("\r\n#{@magic}: gq")
+    body = "BASELINE BODY CONTENT"
+    body += " XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" if hit
+    head = "HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\n\r\n".to_slice
+    resp = Gori::Proxy::Codec::Http1.parse_response_head(head)
+    Gori::Repeater::Result.new(head, body.to_slice, resp, 1000_i64)
+  end
+
+  def close : Nil
+    @closed = true
+  end
+end
+
 private def mine(backend : F::Backend, names : Array(String), config : M::Config) : Array(M::Finding)
   base = "GET /api HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
   engine = M::Engine.new(base, http2: false, names: names, backend: backend, config: config)
@@ -165,6 +216,49 @@ describe Gori::Miner::Engine do
     end
     saw_baseline.should be_true
     saw_done.should be_true
+  end
+
+  it "mines every configured location in ONE pass, not one location after another" do
+    # The scheduler runs all locations through a single work queue, so the mine is not
+    # serialised per location and the tail of one bisection no longer idles the pool while
+    # another location's untouched buckets wait behind a barrier. What must NOT change is
+    # the verdict: the same name is still isolated at each location it applies to.
+    backend = MultiLocationBackend.new(F::Origin.new("http", "h", 80), "secret")
+    c = cfg
+    c.locations = [M::Location::Query, M::Location::Headers]
+    c.concurrency = 8
+    names = ["alpha", "beta", "gamma", "secret", "delta", "epsilon", "zeta", "eta"]
+    findings = mine(backend, names, c)
+    findings.map(&.name).uniq.should eq(["secret"])
+    findings.map(&.location).sort_by(&.value).should eq([M::Location::Query, M::Location::Headers])
+    # Buckets from BOTH locations were in flight together — under the old per-location
+    # loop the second location could not start until the first had finished entirely.
+    backend.mixed_in_flight.should be_true
+  end
+
+  it "releases the send backend (the keep-alive pool's sockets) when the run ends" do
+    backend = MultiLocationBackend.new(F::Origin.new("http", "h", 80), "secret")
+    mine(backend, ["alpha", "secret"], cfg)
+    backend.closed.should be_true
+  end
+
+  it "calibrates the baseline concurrently, and one at a time when the run is paced" do
+    # Calibration is `stability_rounds + locations` round trips of dead air at the head of
+    # every mine, and the probes do not depend on each other.
+    c = cfg
+    c.stability_rounds = 4
+    c.concurrency = 4
+    base = "GET /api HTTP/1.1\r\nHost: h\r\n\r\n".to_slice
+    backend = MultiLocationBackend.new(F::Origin.new("http", "h", 80), "secret")
+    M::Baseline.new(backend, base, c).calibrate([M::Location::Query])
+    backend.max_in_flight.should be > 1
+
+    # …but a paced run asked for one request per interval, and the FIRST thing the target
+    # sees from a mine must not be a burst of them.
+    c.throttle_ms = 50
+    paced = MultiLocationBackend.new(F::Origin.new("http", "h", 80), "secret")
+    M::Baseline.new(paced, base, c).calibrate([M::Location::Query])
+    paced.max_in_flight.should eq(1)
   end
 
   it "enforces max_requests as a hard cap that counts baseline calibration too" do

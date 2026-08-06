@@ -194,6 +194,30 @@ describe Gori::Miner::Plan do
     File.delete?(path) if path
   end
 
+  describe "transport" do
+    it "gives the run a keep-alive pool, sized to its concurrency" do
+      cfg = config(concurrency: 7)
+      plan = M::Plan.build(M::PlanOptions.new(CRLF_RAW, target: "http://t.test", config: cfg), ungated)
+      # One parked socket per worker fiber is the most that can ever be checked out at once.
+      plan.pool.should_not be_nil
+      plan.sender.pool.should be(plan.pool)
+    end
+
+    it "runs connection-per-send when keep-alive is off" do
+      cfg = config
+      cfg.keep_alive = false
+      plan = M::Plan.build(M::PlanOptions.new(CRLF_RAW, target: "http://t.test", config: cfg), ungated)
+      plan.pool.should be_nil
+    end
+
+    it "runs connection-per-send on h2, whatever the knob says" do
+      # H2Engine frames its own connection per send — `Fuzz::Sender` excludes h2 from pooling.
+      plan = M::Plan.build(M::PlanOptions.new(CRLF_RAW, target: "https://t.test",
+        http2: true, config: config), ungated)
+      plan.pool.should be_nil
+    end
+  end
+
   describe "locations" do
     it "detects the applicable defaults when the surface named none" do
       # A GET with no body: Form/Json cannot apply, so the default is query only.

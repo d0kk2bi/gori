@@ -233,8 +233,11 @@ gori run mine <flow-id> --locations query,headers --wordlist params.txt
 | `--locations=LIST` | `query`, `form`, `multipart`, `json`, `headers`, `cookies` (multipart off by default, pass it explicitly) |
 | `--wordlist`, `--bucket=N` | Candidate names and bucket size |
 | `--concurrency` (10), `--rate`, `--throttle`, `--timeout`, `--retries` (1), `--max-requests=N` | Rate control |
+| `--no-keep-alive` | Dial a fresh connection per probe instead of reusing one |
 | `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
 | `--format` | `text`, `json`, or `jsonl` |
+
+Connections are reused by default, so a mine pays one TCP (and on https one TLS) handshake per worker rather than one per probe — the `connections · N dialed · M reused` line at the end of a run is where you see whether the target honoured it. Turn it off with `--no-keep-alive` when the target behaves per-connection.
 
 ### run sequence
 
