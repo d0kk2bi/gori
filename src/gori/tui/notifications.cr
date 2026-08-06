@@ -46,10 +46,13 @@ module Gori::Tui
         @notes.shift
       end
       # Terminal bell on non-info notes when enabled — a state-neutral `\a` tty write,
-      # like the clipboard's OSC52. This is the app's only bell emit point.
+      # like the clipboard's OSC52, and to the same tty for the same reason (`TtyOut`:
+      # STDOUT is not necessarily the device termisu draws on). This is the app's only
+      # bell emit point.
       if Settings.notify_bell? && level != :info
-        STDOUT.print("\a")
-        STDOUT.flush
+        io = TtyOut.io
+        io.print("\a")
+        io.flush
       end
       n
     end

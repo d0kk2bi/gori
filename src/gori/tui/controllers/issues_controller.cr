@@ -442,7 +442,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
     end
 
     # The notes selection (or current line) text without copying — "Send selection to".
@@ -457,7 +457,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied notes to clipboard (#{written}b)#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied notes to clipboard (#{written}b)#{Clipboard.note(written, text)}")
     end
 
     # Write the issue report to `path` (the destination came from ExportOverlay — this used

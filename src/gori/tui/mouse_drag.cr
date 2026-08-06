@@ -1,3 +1,5 @@
+require "./tty_out"
+
 module Gori::Tui
   # xterm mode 1002 — BUTTON-EVENT tracking, the one that reports pointer MOTION while a
   # button is held. Without it a terminal sends press and release only, so a drag is
@@ -7,8 +9,12 @@ module Gori::Tui
   # It lives here rather than in termisu because termisu's `enable_mouse` writes 1000 (normal
   # tracking) + 1006 (SGR coordinates) and nothing else, and this repo vendors that shard —
   # a patch there is undone by the next `shards install`. Writing the one extra mode
-  # ourselves, at the same tty termisu draws to, is the same shape `Clipboard` already uses
-  # for OSC 52.
+  # ourselves is the same shape `Clipboard` already uses for OSC 52.
+  #
+  # That shape used to mean STDOUT, which this comment described as "the same tty termisu
+  # draws to". It is not — see `TtyOut`. When stdout was not the terminal, 1002 never
+  # arrived while termisu's 1000/1006 did, so press and release kept working and only the
+  # DRAG went missing, which reads as a selection bug rather than a redirected escape.
   #
   # ORDER MATTERS on the way in: 1002 must be set AFTER 1000, because a terminal that
   # implements both treats the later request as the active tracking level. On the way out
@@ -23,14 +29,14 @@ module Gori::Tui
     # Runner reconciles this from a setting on every settings save.
     @@on = false
 
-    def self.enable(io : IO = STDOUT) : Nil
+    def self.enable(io : IO = TtyOut.io) : Nil
       return if @@on
       io.print(ENABLE)
       io.flush
       @@on = true
     end
 
-    def self.disable(io : IO = STDOUT) : Nil
+    def self.disable(io : IO = TtyOut.io) : Nil
       return unless @@on
       io.print(DISABLE)
       io.flush

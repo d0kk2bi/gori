@@ -367,7 +367,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
     end
 
     # The selection (or current line) text without the clipboard write — for the
@@ -384,7 +384,7 @@ module Gori::Tui
         return
       end
       written = Clipboard.copy(text)
-      @host.status("copied note to clipboard (#{written}b)#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied note to clipboard (#{written}b)#{Clipboard.note(written, text)}")
     end
 
     # Wipe the current note's text (the sub-tab stays open). Confirm-gated like every

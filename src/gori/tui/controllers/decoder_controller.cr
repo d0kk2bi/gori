@@ -538,7 +538,7 @@ module Gori::Tui
         @host.status("nothing to copy")
       else
         written = Clipboard.copy(text)
-        @host.status("output copied to clipboard#{Clipboard.note(written, text.bytesize)}")
+        @host.status("output copied to clipboard#{Clipboard.note(written, text)}")
       end
     end
 
@@ -553,7 +553,7 @@ module Gori::Tui
         @host.status("nothing to copy")
       else
         written = Clipboard.copy(text)
-        @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text.bytesize)}")
+        @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
       end
     end
 
@@ -572,7 +572,7 @@ module Gori::Tui
         @host.status("nothing to copy")
       else
         written = Clipboard.copy(text)
-        @host.status("copied all (#{written}b)#{Clipboard.note(written, text.bytesize)}")
+        @host.status("copied all (#{written}b)#{Clipboard.note(written, text)}")
       end
     end
 

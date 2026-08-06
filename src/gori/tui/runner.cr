@@ -2021,7 +2021,7 @@ module Gori::Tui
       cp.on_commit = -> {
         if opt = cp.selected_option
           written = Clipboard.copy(opt.text)
-          @toast = "copied #{opt.label.downcase} (#{written}b)#{Clipboard.note(written, opt.text.bytesize)}"
+          @toast = "copied #{opt.label.downcase} (#{written}b)#{Clipboard.note(written, opt.text)}"
         end
         true
       }
@@ -5757,9 +5757,10 @@ module Gori::Tui
     # leaves the tty as it found it rather than mute to the mouse for the rest of the session.
     # `term` is deliberately unrestricted: the Runner needs a live tty and cannot be
     # instantiated in a spec, so this is the seam a recorder double drives to pin the ordering.
-    # `io` is where the mode-1002 sequences go — STDOUT in the app, an IO::Memory in the spec
-    # that pins this ordering (a spec must not write escape codes to the test runner's tty).
-    def self.suspend_without_mouse(term, *, mouse : Bool, io : IO = STDOUT, &)
+    # `io` is where the mode-1002 sequences go — the TUI's tty in the app (`TtyOut`, NOT
+    # STDOUT), an IO::Memory in the spec that pins this ordering (a spec must not write
+    # escape codes to the test runner's tty).
+    def self.suspend_without_mouse(term, *, mouse : Bool, io : IO = TtyOut.io, &)
       MouseDrag.disable(io) # our mode 1002 rides along: the child would get motion reports too
       term.disable_mouse
       begin

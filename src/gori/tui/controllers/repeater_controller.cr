@@ -749,7 +749,7 @@ module Gori::Tui
       text = v.pane_copy_text
       return if text.empty?
       written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
     end
 
     # The focused pane's selection (or current line) text without copying — for the
@@ -764,7 +764,7 @@ module Gori::Tui
       text = v.pane_copy_all_text
       return if text.empty?
       written = Clipboard.copy(text)
-      @host.status("copied all (#{written}b)#{Clipboard.note(written, text.bytesize)}")
+      @host.status("copied all (#{written}b)#{Clipboard.note(written, text)}")
     end
 
     def repeater_read_mode? : Bool
