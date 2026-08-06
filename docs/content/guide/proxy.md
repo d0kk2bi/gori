@@ -198,18 +198,32 @@ A **Replace** rule targets the request or response, and the **head** (request/st
 
 Scope any rule to a **host** glob so it only fires for matching traffic: a plain string matches as a substring (`example.com` matches `api.example.com`), and `*` is a wildcard (`*.example.com`). Leave it empty to apply to every host.
 
-Manage the list with `a` add, `e`/`Enter` edit, `x` enable/disable, `d` delete, `Shift-J`/`Shift-K` reorder (rules apply top to bottom), and `space` for the full menu. The editor shows a live preview of how many recent flows a rule would affect. Rules are per-project and take effect as soon as you save, with no restart.
+Manage the list with `a` add, `e`/`Enter` edit, `x` enable/disable, `d` delete, `s` global/project, `Shift-J`/`Shift-K` reorder (rules apply top to bottom), and `space` for the full menu. The editor shows a live preview of how many recent flows a rule would affect. Rules take effect as soon as you save, with no restart.
 
 Under the list sits an editable **sample** message and, beside it, the same message after the enabled rules run. Paste a real captured request in there to see what your rules do to it before you turn them loose. The sample is saved with the project, like the rules it previews.
 
-### Reusing a rule across projects
+### Global and project rules
 
-A rule you keep rebuilding — strip a CSP header, pin an `X-Forwarded-For`, stub out a licence check — can go in a **library** shared by every project. From the space menu on the rules list:
+Every rule lives in one of two places, shown in the `G`/`P` column of the list:
 
-- **Save rule to library** names the selected rule and writes it to the `rewriter` section of settings (the prompt starts from the rule's own name; saving under a name that already exists updates it).
-- **Load a saved rule** opens a picker over the library, showing each entry's match and replacement next to its name, and **adds** the one you pick to this project. Type to filter; `Ctrl-X` deletes the highlighted entry from the library, which does not touch rules already loaded into a project.
+- **Project** rules are stored in the project database. They are what this engagement needs and nothing else sees them.
+- **Global** rules are stored in the `rewriter` section of `settings.json` and apply in **every** project — a standing policy like "strip CSP on `*.corp.internal`" that you do not want to rebuild per engagement.
 
-A loaded rule is appended to the end of the apply order and arrives **enabled**, like Add and Duplicate, so it starts rewriting traffic immediately — reorder it with `Shift-J`/`Shift-K` or switch it off with `x`. The library holds one rule per entry and never replaces or merges the list you already have. Only the rule's own fields travel: which rules are live, and in what order, stays with the project.
+Set the scope in the editor's `scope:` row when you create a rule, or press `s` on the list to move an existing one between the two. The rule keeps its fields and its state where you are standing; what changes is who else sees it.
+
+Global rules apply **first**, in their own order, then the project's own — the standing layer, then the local one. `Shift-J`/`Shift-K` reorder within a scope and never across it, because the boundary is not a position.
+
+A global rule carries a **default** on/off state, and a project may disagree with it:
+
+- `x` toggles the rule **in this project**. For a global rule that writes an override, and the row is marked `G*`.
+- `Shift-X` (space menu: **Enable/disable everywhere**) flips the global default itself, which every project that has not overridden it follows.
+- Toggling back to the default **removes** the override, so the project follows the library again — including later changes to it.
+
+Deleting a global rule removes it from every project. A running gori in another window picks up global changes when its rules reload (reopen the Rewriter tab), and a second gori **process** only on restart.
+
+Headless, `--scope=global` addresses the library on every subcommand: `gori run rewriter add --scope=global …`, `gori run rewriter disable 3 --scope=global` (this project's override) and `--everywhere` on top of that for the default. The MCP rule tools take the same `scope` argument.
+
+> Upgrading from the old saved-rule **library** (`s`/`o`): its entries are adopted as global rules, **disabled**, the first time gori reads the file. A preset did nothing until you loaded it, so none of them start rewriting traffic on their own; arm the ones you want with `x`.
 
 A **body** rule buffers the message to rewrite it and re-syncs `Content-Length` automatically (a chunked body is de-chunked and re-framed); head rules keep the body streaming untouched. A compressed (`Content-Encoding: gzip`/`br`/…) body isn't decompressed, so a literal pattern won't match it, and streaming responses (SSE, close-delimited, WebSocket upgrades) are left to stream. **A body rule still forces matching hosts to HTTP/1.1.** On HTTP/2 Match & Replace applies to heads; body rewriting there is not implemented and is not planned, because HTTP/2 flow control makes a rewrite that changes a body's length either fail outright or deadlock the stream. So a body rule takes its hosts down to HTTP/1.1, and an h2 client that can't take that downgrade (gRPC) won't connect while one is enabled. `gori.log` records that once per host, naming the host and the reason.
 
@@ -275,7 +289,7 @@ Head rules apply to HTTP/2 without downgrading the connection, so gRPC keeps wor
 
 Head rules take effect on connections opened after you save. A rule enabled while a long-lived HTTP/2 connection is already open applies from that connection's next request head.
 
-The same rules are scriptable headless: `gori run rewriter` (list / add / rm / enable / disable / preview) and the MCP `create_rule` / `update_rule` / `list_rules` / `preview_rule` tools.
+The same rules are scriptable headless: `gori run rewriter` (list / add / rm / enable / disable / preview) and the MCP `create_rule` / `update_rule` / `list_rules` / `preview_rule` tools. Both carry the `scope` argument, so a global rule can be created and toggled without opening the TUI.
 
 ## Session bindings
 

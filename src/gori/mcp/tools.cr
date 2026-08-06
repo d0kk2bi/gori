@@ -857,8 +857,14 @@ module Gori
           end
 
           tool j, "list_rules",
-            "List the project's Match & Replace rules (the Rewriter tab — literal/regex replace or " \
-            "add/set/remove header, applied to in-flight request/response HEAD or BODY), in apply order." { }
+            "List the Match & Replace rules applied to this project (the Rewriter tab — literal/regex " \
+            "replace or add/set/remove header, applied to in-flight request/response HEAD or BODY), in " \
+            "apply order: GLOBAL rules (settings.json, shared by every project) first, then the " \
+            "project's own. `id` is unique only within a scope, so pass both to the mutation tools. " \
+            "For a global rule, `enabled` is the state in THIS project and `default_enabled` the " \
+            "library's own; `overridden` says the two were made to differ here." do |s|
+            s.field "scope", strprop("show only project | global rules (default: both)")
+          end
 
           tool j, "list_extract_rules",
             "List the project's EXTRACT rules — the read half of a session binding. Each one " \
@@ -1042,9 +1048,11 @@ module Gori
 
             tool j, "create_rule",
               "Add a Match & Replace rule (the Rewriter tab) applied to in-flight traffic. " \
-              "Persisted to the project. Note: a gori TUI already running applies it only after its " \
+              "Persisted to the project, or to the global library shared by every project when " \
+              "scope=global. Note: a gori TUI already running applies it only after its " \
               "rules reload (reopen the Rewriter tab or restart); `gori run` and newly opened TUIs " \
               "pick it up immediately." do |s|
+              s.field "scope", strprop("project (default) | global — a global rule lives in settings.json and applies in EVERY project")
               s.field "pattern", strprop("for replace: the substring/regex to match; for a header op: the HEADER NAME; for short_circuit: the substring/regex matched against the REQUEST head"), required: true
               s.field "replacement", strprop("for replace: the replacement (empty = delete; supports $1 capture refs when match=regex); for add/set header: the header VALUE (default empty); for short_circuit: the canned RESPONSE — a status line such as '200 OK', then header lines, then a blank line and the body")
               s.field "target", strprop("request|response (default request; short_circuit is always request)")
@@ -1058,8 +1066,11 @@ module Gori
             end
 
             tool j, "update_rule",
-              "Update an existing Match & Replace rule by id. Omitted fields are left unchanged." do |s|
+              "Update an existing Match & Replace rule by id. Omitted fields are left unchanged. " \
+              "For a global rule, `enabled` changes the state in THIS project (an override), not " \
+              "the library's default — use set_rule_enabled with everywhere=true for that." do |s|
               s.field "id", intprop("rule id from list_rules"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
               s.field "pattern", strprop("new match substring/regex, or header name")
               s.field "replacement", strprop("new replacement / header value / canned response")
               s.field "target", strprop("request|response")
@@ -1085,13 +1096,21 @@ module Gori
               s.field "host", strprop("host glob ('' = all hosts)")
             end
 
-            tool j, "set_rule_enabled", "Enable or disable a Match & Replace rule by id." do |s|
+            tool j, "set_rule_enabled",
+              "Enable or disable a Match & Replace rule by id. For a GLOBAL rule this writes THIS " \
+              "project's override by default; everywhere=true changes the rule's own default, which " \
+              "every project that has not overridden it follows." do |s|
               s.field "id", intprop("rule id from list_rules"), required: true
               s.field "enabled", boolprop("true to enable, false to disable"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
+              s.field "everywhere", boolprop("global rules only: change the default for every project instead of this one")
             end
 
-            tool j, "delete_rule", "Delete a Match & Replace rule by id." do |s|
+            tool j, "delete_rule",
+              "Delete a Match & Replace rule by id. Deleting a GLOBAL rule removes it from every " \
+              "project." do |s|
               s.field "id", intprop("rule id from list_rules"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
             end
 
             tool j, "create_extract_rule",
@@ -1848,7 +1867,7 @@ module Gori
         when "cookie_crack"            then cookie_crack_tool(h)
         when "cookie_forge"            then cookie_forge_tool(h)
         when "sequence_analyze"        then sequence_analyze(h)
-        when "list_rules"              then list_rules
+        when "list_rules"              then list_rules(h)
         when "list_extract_rules"      then list_extract_rules
         when "list_projects"           then list_projects
         when "ql_explain"              then ql_explain(h)

@@ -154,23 +154,20 @@ module Gori::Tui
       ]},
       {"REWRITER", [
         Item.new("a · ↵/e", "add a Match & Replace rule · edit the selected one"),
-        Item.new("x · d", "enable/disable · delete the selected rule"),
-        Item.new("⇧J / ⇧K", "reorder — rules apply top to bottom"),
+        Item.new("x · d", "enable/disable in this project · delete the selected rule"),
+        Item.new("s · ⇧X", "move the rule global ⇄ project · flip a global rule's default everywhere"),
+        Item.new("G / P column", "global (every project) or project · G* = this project overrides its default"),
+        Item.new("⇧J / ⇧K", "reorder within a scope — globals apply first, then project rules"),
         Item.new("[ / ]", "switch sub-tab: rules · extract · bindings"),
         Item.new("↓ past the list", "the editable preview sample, and the same message after the rules run"),
-        # No verb_id: these are space-menu MNEMONICS, not chords. binding_label would swap
-        # the literal for a chord the moment either verb gained one, and the row names two
-        # verbs at once — one chord could not stand for both.
-        Item.new("space → s · o", "save the selected rule to the library · add one from it"),
-        Item.new("rule library", "shared by every project · picker: type to filter · ^X deletes an entry"),
       ]},
       {"OVERLAYS", [
         Item.new("palette / settings", "↑/↓ · ↵ · esc"),
         Item.new("confirm", "←/→ choose · y / n · ↵"),
         Item.new("Settings: Editor", "toggle mouse support (Mouse field)"),
-        # No row for the save/load library modals here: the DECODER and REWRITER sections
-        # each already state it, and the key column truncates at ~20 cols anyway ("save /
-        # load a libra…"), so a third copy would be both redundant and unreadable.
+        # No row for the save/load library modal here: the DECODER section already states it,
+        # and the key column truncates at ~20 cols anyway ("save / load a libra…"), so a
+        # second copy would be both redundant and unreadable.
       ]},
     ]
 

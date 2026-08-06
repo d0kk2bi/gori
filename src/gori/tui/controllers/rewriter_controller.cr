@@ -313,6 +313,8 @@ module Gori::Tui
       when c == 'a'             then rewriter_add
       when c == 'd'             then rewriter_delete
       when c == 'x'             then rewriter_toggle
+      when c == 'X'             then rewriter_toggle_default
+      when c == 's'             then rewriter_scope_toggle
       when c == 'J'             then rewriter_move(1)
       when c == 'K'             then rewriter_move(-1)
       else                           return false
@@ -562,37 +564,76 @@ module Gori::Tui
     def rewriter_delete : Nil
       rule = selected_rule || return @host.status("no rule selected")
       label = rule.name.empty? ? rule.pattern : rule.name
-      @host.confirm("Delete rule", "Delete “#{label}”? This can't be undone.",
+      # A global rule is deleted out of EVERY project, and the prompt has to say so — the row
+      # looks the same as a project rule's apart from one badge, and the confirm is the last
+      # place to notice which of the two is about to go.
+      note = rule.global? ? " It is a GLOBAL rule — this removes it from every project." : ""
+      @host.confirm("Delete rule", "Delete “#{label}”?#{note} This can't be undone.",
         confirm_label: "Delete", danger: true) do
         # The store's answer, not an assumption: a rolled-back write left the rule rewriting
         # live traffic while this toasted "rule deleted". Both headless surfaces already
         # refuse to say that (`mcp/tools/rules.cr`, `cli/run/rewriter.cr`).
-        ok = rules_engine.remove(rule.id)
+        ok = rules_engine.remove(rule.id, rule.scope)
         @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
         @host.status(ok ? "rule deleted" : "rule NOT deleted (project busy) — it is still rewriting traffic")
       end
     end
 
+    # `x` toggles the rule HERE. For a project rule that is the row itself; for a global one it
+    # is this project's override of the library's default, which is why the toast says where
+    # the change lands — the same keypress means "off in this engagement", not "off everywhere"
+    # (that is ⇧X / `rewriter_toggle_default`).
     def rewriter_toggle : Nil
       rule = selected_rule || return @host.status("no rule selected")
-      unless rules_engine.toggle(rule.id)
+      unless rules_engine.toggle(rule.id, rule.scope)
         return @host.status("enable/disable NOT applied (project busy) — the rule is unchanged")
       end
-      @host.status(rule.enabled? ? "rule disabled" : "rule enabled")
+      state = rule.enabled? ? "disabled" : "enabled"
+      @host.status(rule.global? ? "global rule #{state} in this project" : "rule #{state}")
+    end
+
+    # ⇧X: the global DEFAULT — what every project that has not overridden this rule follows.
+    def rewriter_toggle_default : Nil
+      rule = selected_rule || return @host.status("no rule selected")
+      return @host.status("only a global rule has a default — this one is project-scoped") unless rule.global?
+      unless rules_engine.toggle_default(rule.id)
+        return @host.status("default NOT changed (settings not writable) — the rule is unchanged")
+      end
+      after = rule_list.find { |r| r.global? && r.id == rule.id }
+      note = after.try(&.overridden?) ? " (this project still overrides it)" : ""
+      @host.status("global rule default flipped for every project#{note}")
     end
 
     def rewriter_move(dir : Int32) : Nil
       rule = selected_rule || return @host.status("no rule selected")
-      rules_engine.move(rule.id, dir)
-      move_sel(dir)
+      # Only follow the rule when it actually moved: ⇧J on the last GLOBAL rule cannot push it
+      # into the project block (that is a scope change, `s`), and walking the cursor there
+      # anyway would read as a swap that never happened.
+      move_sel(dir) if rules_engine.move(rule.id, dir, rule.scope)
     end
 
     def rewriter_duplicate : Nil
       rule = selected_rule || return @host.status("no rule selected")
       name = rule.name.empty? ? "" : "#{rule.name} copy"
       rules_engine.add(rule.target, rule.part, rule.pattern, rule.replacement,
-        rule.op, rule.match_kind, name, rule.host)
-      @host.status("rule duplicated")
+        rule.op, rule.match_kind, name, rule.host, rule.body_file, scope: rule.scope)
+      @host.status(rule.global? ? "global rule duplicated" : "rule duplicated")
+    end
+
+    # `s`: move the selected rule between the global library and this project. The rule keeps
+    # its fields and the state it has HERE; what changes is who else sees it.
+    def rewriter_scope_toggle : Nil
+      rule = selected_rule || return @host.status("no rule selected")
+      to = rule.global? ? Store::RuleScope::Project : Store::RuleScope::Global
+      unless rules_engine.set_scope(rule, to)
+        return @host.status("scope NOT changed (project busy or settings not writable) — the rule is unchanged")
+      end
+      # The rule moved between the two blocks, so its row moved too — follow it rather than
+      # leaving the highlight on whatever slid into its old index. It lands at the END of the
+      # destination block (both stores append), which is an exact answer where matching on the
+      # fields would pick the wrong twin among duplicates.
+      @sel = last_index_of_scope(to)
+      @host.status(to.global? ? "rule is now GLOBAL — it applies in every project" : "rule is now project-scoped")
     end
 
     def rewriter_reload : Nil
@@ -600,60 +641,34 @@ module Gori::Tui
       @host.status("rules reloaded")
     end
 
-    # --- the global rule-preset library (settings.json `rewriter.presets`) ---------------
-    # The shell owns the two modals (Runner#open_rule_preset_save / #open_rule_preset_load);
-    # these are the halves that touch the rule set.
-
-    # Copy the rule's FIELDS into the library under `name`. A preset is a recipe, so what
-    # does NOT travel is as deliberate as what does: no id (it names a row in THIS project's
-    # DB), no position (apply order is a property of a list, not of one rule) and no enabled
-    # state (see load_rule_preset).
-    def save_rule_preset(rule : Store::MatchRule, name : String) : Nil
-      if name.empty?
-        @host.status("rule name required")
-        return
-      end
-      ok, existing = Settings.save_rewriter_preset(name, rule.target.label, rule.part.label,
-        rule.pattern, rule.replacement, rule.op.label, rule.match_kind.label,
-        rule.host, rule.body_file)
-      unless ok
-        @host.status("could not save rule to the library")
-        return
-      end
-      @host.status(existing ? "updated saved rule \"#{name}\"" : "saved rule \"#{name}\" to the library")
-    end
-
-    # APPEND the preset as a new rule in this project — never a merge, never a replacement
-    # of the current list. One preset is one rule precisely so loading needs no policy: it
-    # lands at the end of the apply order, where `u`/`n` can move it, and the rules already
-    # there are untouched.
-    #
-    # It arrives ENABLED, like Duplicate and like the editor's Add, so "load" means the same
-    # thing every other way of putting a rule in this list means. That does start rewriting
-    # live traffic, which is why the toast names the rule instead of just saying "loaded".
-    def load_rule_preset(preset : Settings::RulePreset) : Nil
-      r = preset.to_rule
-      rules_engine.add(r.target, r.part, r.pattern, r.replacement,
-        r.op, r.match_kind, r.name, r.host, r.body_file)
-      # `add` refuses an empty pattern silently; the parse layer drops those, so a preset can
-      # never carry one — but select the row by COUNT rather than assuming, so a future
-      # refusal can't leave the cursor pointing past the end.
-      @sel = {rule_list.size - 1, 0}.max
-      @host.status("added rule \"#{preset.name}\" from the library")
-    end
-
     # Commit the editor overlay: add a new rule or update the edited one, then re-select it.
+    # The form's `scope:` row is part of the edit — changing it on an existing rule MOVES the
+    # rule between the two stores (fields first, then the re-home, so a refused move leaves
+    # the edit applied rather than silently dropping both halves).
     def apply_rewriter_rule(ov : RewriterRuleOverlay) : Bool
       return false unless ov.valid?
       if id = ov.edit_id
+        from = ov.edit_scope || Store::RuleScope::Project
         rules_engine.update(id, ov.target, ov.part, ov.pattern, ov.replacement,
-          ov.op, ov.match_kind, ov.name, ov.host, ov.body_file)
+          ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: from)
+        if from != ov.scope
+          moved = rule_list.find { |r| r.scope == from && r.id == id }
+          if moved && !rules_engine.set_scope(moved, ov.scope)
+            @host.status("rule saved, but the scope change did not commit — it is still #{from.label}")
+          end
+        end
       else
         rules_engine.add(ov.target, ov.part, ov.pattern, ov.replacement,
-          ov.op, ov.match_kind, ov.name, ov.host, ov.body_file)
-        @sel = {rule_list.size - 1, 0}.max
+          ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: ov.scope)
+        # A global rule lands at the end of the GLOBAL block, which is not the end of the list.
+        @sel = last_index_of_scope(ov.scope)
       end
       true
+    end
+
+    private def last_index_of_scope(scope : Store::RuleScope) : Int32
+      idx = rule_list.rindex { |r| r.scope == scope }
+      idx || {rule_list.size - 1, 0}.max
     end
 
     # --- extract sub-tab actions (#501) ---
@@ -741,7 +756,7 @@ module Gori::Tui
       when :preview_out
         "↑/↓ move · ⇧arrows select · y copy · x line · space cmds · ← input · esc input"
       else
-        "[/] sub-tab · ↑/↓ select · ↓ preview · a add · ↵/e edit · x on/off · d delete · ⇧J/⇧K reorder · esc tabs"
+        "[/] sub-tab · ↑/↓ select · a add · ↵/e edit · x on/off · s global/project · d delete · ⇧J/⇧K reorder · esc tabs"
       end
     end
   end

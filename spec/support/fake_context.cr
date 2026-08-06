@@ -1079,7 +1079,8 @@ class FakeExecContext < Gori::Verb::ExecContext
   end
 
   property rewriter_rule_selected : Bool = false # settable so the has-rule gate can be exercised
-  property rewriter_rules_sub : Bool = true      # settable so the RULES-sub-tab gate (load-preset) can be exercised
+  property rewriter_rules_sub : Bool = true      # settable so the RULES-sub-tab gate can be exercised
+  property rewriter_global_rule : Bool = false   # settable so the global-rule gate (toggle-default) can be exercised
   property rewriter_preview_out : Bool = false   # settable so the PREVIEW OUTPUT read-pane gate can be exercised
   property comparer_diff : Bool = false          # settable so the Comparer row-cursor gate can be exercised
   property intercept_preview : Bool = false      # settable so the Intercept preview read-pane gate can be exercised
@@ -1152,12 +1153,16 @@ class FakeExecContext < Gori::Verb::ExecContext
     @miner_detail_read
   end
 
-  def rewriter_save_preset : Nil
-    rec(:rewriter_save_preset)
+  def rewriter_scope_toggle : Nil
+    rec(:rewriter_scope_toggle)
   end
 
-  def rewriter_load_preset : Nil
-    rec(:rewriter_load_preset)
+  def rewriter_toggle_default : Nil
+    rec(:rewriter_toggle_default)
+  end
+
+  def rewriter_global_rule_selected? : Bool
+    @rewriter_global_rule
   end
 
   def notes_new : Nil

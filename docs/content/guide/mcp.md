@@ -98,7 +98,7 @@ If a client starts MCP outside your repository directory, the server starts unbo
 | `intercept_list` / `intercept_get` | Inspect the live intercept queue and one held item in full |
 | `list_projects` | Every gori project on this host |
 | `list_notes` / `get_note` | Read project notes |
-| `list_rules` | List the project's Match & Replace rules in apply order |
+| `list_rules` | List the Match & Replace rules applied to the project in apply order — global rules first, then the project's own (`scope` filters to one) |
 | `list_env` | Project env tokens available to `$KEY` substitution (values redacted) |
 | `list_host_overrides` | The host to IP dial map in force for this project |
 | `list_oast_providers` | Configured OAST providers and which one is active |
@@ -124,7 +124,7 @@ If a client starts MCP outside your repository directory, the server starts unbo
 | `create_issue` / `update_issue` / `delete_issue` | Record, update, and remove issues |
 | `add_link` / `remove_link` | Attach or detach an issue's / note's evidence pointer |
 | `create_note` / `update_note` / `delete_note` | Manage project notes |
-| `create_rule` / `update_rule` / `set_rule_enabled` / `delete_rule` | Create, edit, toggle, and delete Match & Replace rules (rewrites on in-flight request/response head or body) |
+| `create_rule` / `update_rule` / `set_rule_enabled` / `delete_rule` | Create, edit, toggle, and delete Match & Replace rules (rewrites on in-flight request/response head or body). Each takes `scope` — `project` (default) or `global`, which applies in every project |
 | `preview_rule` | Estimate how many stored flows a rule would change, before creating it |
 | `import_flows` | Bulk-import a HAR / URL list / OpenAPI / Postman / Insomnia / Burp file into History |
 | `delete_flow` / `clear_history` | Remove one flow, or wipe captured History |

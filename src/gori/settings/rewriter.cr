@@ -1,26 +1,27 @@
 require "json"
 require "../store/models"
 
-# REWRITER section: the Rewriter tab's named rule presets. See settings.cr for the
+# REWRITER section: the GLOBAL half of the Match & Replace rule set. See settings.cr for the
 # module-level overview and the load/save/serialize orchestration.
 module Gori::Settings
-  # A Match & Replace rule saved under a name, reusable in every project (settings.json
-  # `rewriter.presets`). Same RECIPE-vs-MATERIAL split the Decoder's named chains rest on
-  # (see settings/decoder.cr): "strip the CSP header on *.corp.internal" is tool config an
-  # operator re-uses on every engagement, while WHICH rules are live — and the traffic they
-  # rewrote — is project data and stays in the project DB (`match_rules`).
+  # A Match & Replace rule that lives in settings.json (`rewriter.rules`) instead of a project
+  # DB, and therefore applies in EVERY project. The counterpart to a `match_rules` row; both
+  # fold into the runtime `Store::MatchRule` list through `Rules.merged`, exactly the way
+  # `Settings::ScanRule` and `probe_custom_rules` fold into `Probe.custom_rules`.
   #
-  # Deliberately a copy of the rule's FIELDS, not a reference to a row: a preset must
-  # survive the project it was lifted from being deleted, so it carries no id and no
-  # `position` (apply order is a property of a project's list, not of one saved rule) and
-  # no `enabled` (loading appends a live rule, exactly like Duplicate does).
+  # This REPLACES the old preset library (`rewriter.presets`, an inert recipe you had to load
+  # into a project before it did anything). The axis that library got wrong is that a rewrite
+  # rule is not a recipe: "strip CSP on *.corp.internal" is a standing policy an operator wants
+  # ON, everywhere, without re-loading it per project. What stays per-project is which of them
+  # this engagement disagrees with — an OVERRIDE, not a copy (see `Store#rewriter_overrides`).
   #
   # The enum fields are stored as their `label` strings — the same vocabulary `gori run
-  # rewriter` and the MCP rule tools already speak — so a hand-edited settings.json reads
-  # the way the CLI prints.
-  record RulePreset,
-    id : String,     # random hex token assigned on creation (stable across renames)
-    name : String,   # the operator-facing label; unique by convention (save overwrites)
+  # rewriter` and the MCP rule tools already speak — so a hand-edited settings.json reads the
+  # way the CLI prints.
+  record RewriterRule,
+    id : Int64,      # monotonic, from `rewriter_next_rule_id`; never reused (see below)
+    enabled : Bool,  # the DEFAULT across projects; a project may override it
+    name : String,   # the operator-facing label ("" = unnamed, like a project rule)
     target : String, # Store::RuleTarget label — "request" | "response"
     part : String,   # Store::RulePart label — "head" | "body" | "ws"
     pattern : String,
@@ -29,105 +30,219 @@ module Gori::Settings
     match_kind : String,  # Store::MatchKind label — "literal" | "regex"
     host : String,        # host glob ("" = every host)
     body_file : String do # ShortCircuit stub path ("" = inline body in `replacement`)
-    # The preset as the rule it would become — `id: 0` and `enabled: true` because neither
-    # is the preset's to know: an id belongs to the project row this is not yet, and a rule
-    # added from the library goes live exactly like Duplicate's does.
+    # The rule as the proxy sees it in one project: `enabled` is the EFFECTIVE state there
+    # (this rule's default unless the project overrode it) and `overridden` says which of the
+    # two it is, so the list row can mark it.
     #
-    # `from_label` RAISES on an unknown label and that is safe here: a preset only reaches
-    # memory through `parse_rewriter_presets`, which clamps all four fields to their allowed
-    # sets, or through `save_rewriter_preset`, which is handed a live rule's own `.label`.
-    # The clamp at the parse boundary is what makes this total.
-    def to_rule : Store::MatchRule
-      Store::MatchRule.new(0_i64, true,
+    # `from_label` RAISES on an unknown label and that is safe here: a rule only reaches memory
+    # through `parse_rewriter_rules`, which clamps all four enum fields to their allowed sets,
+    # or through the CRUD below, which is handed a live rule's own `.label`. The clamp at the
+    # parse boundary is what makes this total.
+    def to_rule(enabled : Bool = @enabled, overridden : Bool = false) : Store::MatchRule
+      Store::MatchRule.new(id, enabled,
         Store::RuleTarget.from_label(target), Store::RulePart.from_label(part),
         pattern, replacement,
         Store::RuleOp.from_label(op), Store::MatchKind.from_label(match_kind),
-        name, host, body_file)
+        name, host, body_file,
+        scope: Store::RuleScope::Global, overridden: overridden)
     end
   end
 
-  class_property rewriter_presets : Array(RulePreset) = [] of RulePreset
+  class_property rewriter_rules : Array(RewriterRule) = [] of RewriterRule
 
-  RULE_PRESET_TARGETS = %w[request response]
-  RULE_PRESET_PARTS   = %w[head body ws]
-  RULE_PRESET_OPS     = %w[replace add_header set_header remove_header short_circuit]
-  RULE_PRESET_KINDS   = %w[literal regex]
+  # The next global rule id, monotonic and NEVER reused. `max(id) + 1` would hand a deleted
+  # rule's number to the next one created, and a project that had overridden the deleted rule
+  # would then be silently overriding the new one — the override outlives the rule it names,
+  # because it lives in a different file this process may never open again.
+  #
+  # Counts from ONE, so that 0 is free to mean "the write did not commit" in
+  # `add_rewriter_rule`'s answer — the same contract `Store#insert_rule` has.
+  class_property rewriter_next_rule_id : Int64 = 1_i64
 
-  # Tolerant preset parse: a non-array (or absent) node keeps the current value; entries
-  # missing id/name/pattern are dropped (a rule with no pattern can never match, and
-  # `Rules#add` refuses it anyway); the four enum fields are clamped to their allowed sets.
+  RULE_TARGETS = %w[request response]
+  RULE_PARTS   = %w[head body ws]
+  RULE_OPS     = %w[replace add_header set_header remove_header short_circuit]
+  RULE_KINDS   = %w[literal regex]
+
+  # Parse the `rewriter` section: `rules` when present, else the pre-upgrade `presets` block.
+  private def self.parse_rewriter(node : JSON::Any) : Nil
+    if node["rules"]?
+      self.rewriter_rules = parse_rewriter_rules(node["rules"]?)
+    else
+      self.rewriter_rules = parse_legacy_presets(node["presets"]?)
+    end
+    stored = node["next_rule_id"]?.try(&.as_i64?) || 0_i64
+    # Never go BACKWARDS from the ids actually present, whatever the file says: a hand-edited
+    # (or truncated) counter must not be able to mint a duplicate id.
+    self.rewriter_next_rule_id = {stored, (rewriter_rules.max_of?(&.id) || 0_i64) + 1, 1_i64}.max
+  end
+
+  # Tolerant global-rule parse: a non-array (or absent) node keeps the current value; entries
+  # missing a pattern are dropped (a rule with no pattern can never match, and `Rules#add`
+  # refuses it anyway); the four enum fields are clamped to their allowed sets.
   #
   # Clamping rather than `from_label` is the point: those raise on an unknown label, and a
-  # single typo in a hand-edited settings.json would take the whole file down through
-  # `load`'s blanket rescue — resetting theme, hotkeys and every other section to factory
-  # defaults. Mirrors parse_scan_rules.
-  private def self.parse_rewriter_presets(node : JSON::Any?) : Array(RulePreset)
+  # single typo in a hand-edited settings.json would take the whole file down through `load`'s
+  # blanket rescue — resetting theme, hotkeys and every other section to factory defaults.
+  # Mirrors parse_scan_rules.
+  #
+  # A missing `enabled` reads as FALSE. These rules rewrite live traffic in every project, so
+  # the one direction a malformed or hand-written entry may not default to is "on".
+  private def self.parse_rewriter_rules(node : JSON::Any?) : Array(RewriterRule)
     arr = node.try(&.as_a?)
-    return rewriter_presets unless arr
-    presets = [] of RulePreset
+    return rewriter_rules unless arr
+    list = [] of RewriterRule
+    seen = Set(Int64).new
     arr.each do |e|
       next unless o = e.as_h?
-      id = o["id"]?.try(&.as_s?)
-      name = o["name"]?.try(&.as_s?)
       pattern = o["pattern"]?.try(&.as_s?)
-      next if id.nil? || id.empty? || name.nil? || name.empty? || pattern.nil? || pattern.empty?
-      presets << RulePreset.new(
-        id, name,
-        clamp_field(o["target"]?.try(&.as_s?), RULE_PRESET_TARGETS, "request"),
-        clamp_field(o["part"]?.try(&.as_s?), RULE_PRESET_PARTS, "head"),
+      next if pattern.nil? || pattern.empty?
+      list << RewriterRule.new(
+        claim_id(o["id"]?.try(&.as_i64?), seen),
+        o["enabled"]?.try(&.as_bool?) || false,
+        o["name"]?.try(&.as_s?) || "",
+        clamp_field(o["target"]?.try(&.as_s?), RULE_TARGETS, "request"),
+        clamp_field(o["part"]?.try(&.as_s?), RULE_PARTS, "head"),
         pattern,
         o["replacement"]?.try(&.as_s?) || "",
-        clamp_field(o["op"]?.try(&.as_s?), RULE_PRESET_OPS, "replace"),
-        clamp_field(o["match_kind"]?.try(&.as_s?), RULE_PRESET_KINDS, "literal"),
+        clamp_field(o["op"]?.try(&.as_s?), RULE_OPS, "replace"),
+        clamp_field(o["match_kind"]?.try(&.as_s?), RULE_KINDS, "literal"),
         o["host"]?.try(&.as_s?) || "",
         o["body_file"]?.try(&.as_s?) || "")
     end
-    presets
+    list
   end
 
-  # --- global rule-preset library CRUD -------------------------------------------------
-  # Save under `name`, REPLACING any preset already holding it (the TUI prompts with the
-  # rule's own name, so re-saving an edited rule must update rather than fork a duplicate
-  # the picker then shows twice). Returns whether the write reached disk AND whether the
-  # name already existed, so the caller can toast "saved" vs "updated" honestly.
-  def self.save_rewriter_preset(name : String, target : String, part : String, pattern : String,
+  # The id this parsed entry gets to keep, recording it in `seen`. A missing, non-positive or
+  # already-taken id is replaced with one past everything seen so far: two rules sharing an id
+  # would make every by-id mutation ambiguous, and dropping the entry would silently lose a
+  # rule the operator wrote. (Zero is not a valid id — see `rewriter_next_rule_id`.)
+  private def self.claim_id(id : Int64?, seen : Set(Int64)) : Int64
+    return id if id && id > 0 && seen.add?(id)
+    fresh = (seen.max? || 0_i64) + 1
+    seen << fresh
+    fresh
+  end
+
+  # Adopt a pre-upgrade `rewriter.presets` block as global rules, DISABLED. A preset was inert
+  # by construction — it did nothing until you loaded it into a project — so adopting one as a
+  # live rule would start rewriting traffic in every project on the strength of an upgrade.
+  # They arrive as rows in the Rewriter list, off, where `x` arms them.
+  #
+  # No eraser is needed for the legacy key (contrast `drop_legacy_decoder_sessions`): the
+  # migration is in-memory and idempotent — `rules` wins the moment it exists, so a stale
+  # `presets` block is never read again — and the first save that touches the section replaces
+  # it with `rules` outright, because the merge sees the section change.
+  private def self.parse_legacy_presets(node : JSON::Any?) : Array(RewriterRule)
+    arr = node.try(&.as_a?)
+    return rewriter_rules unless arr
+    list = [] of RewriterRule
+    arr.each do |e|
+      next unless o = e.as_h?
+      name = o["name"]?.try(&.as_s?)
+      pattern = o["pattern"]?.try(&.as_s?)
+      next if name.nil? || name.empty? || pattern.nil? || pattern.empty?
+      list << RewriterRule.new(
+        (list.size + 1).to_i64, false, name,
+        clamp_field(o["target"]?.try(&.as_s?), RULE_TARGETS, "request"),
+        clamp_field(o["part"]?.try(&.as_s?), RULE_PARTS, "head"),
+        pattern,
+        o["replacement"]?.try(&.as_s?) || "",
+        clamp_field(o["op"]?.try(&.as_s?), RULE_OPS, "replace"),
+        clamp_field(o["match_kind"]?.try(&.as_s?), RULE_KINDS, "literal"),
+        o["host"]?.try(&.as_s?) || "",
+        o["body_file"]?.try(&.as_s?) || "")
+    end
+    list
+  end
+
+  # --- global rule CRUD -----------------------------------------------------------------
+  # Each mutation rewrites the array and persists via `save` (atomic + 3-way merge). The array
+  # ORDER is the apply order among global rules, which is why add appends and move swaps.
+
+  # Returns the new rule's id, or 0 when the write did not reach disk — the same "did it
+  # commit" answer `Store#insert_rule` gives, so `Rules#add` can report the two scopes alike.
+  def self.add_rewriter_rule(target : String, part : String, pattern : String, replacement : String,
+                             op : String, match_kind : String, name : String, host : String,
+                             body_file : String, enabled : Bool = true) : Int64
+    id = rewriter_next_rule_id
+    self.rewriter_next_rule_id = id + 1
+    self.rewriter_rules = rewriter_rules + [RewriterRule.new(id, enabled, name, target, part,
+      pattern, replacement, op, match_kind, host, body_file)]
+    save ? id : 0_i64
+  end
+
+  # Field update only — `enabled` is untouched, because it is the rule's default across
+  # projects and an edit made in one of them is not a statement about the others.
+  def self.update_rewriter_rule(id : Int64, target : String, part : String, pattern : String,
                                 replacement : String, op : String, match_kind : String,
-                                host : String, body_file : String) : {Bool, Bool}
-    prior = rewriter_presets.find { |p| p.name == name }
-    # Keep the id across an overwrite: it is the preset's identity, and a caller holding
-    # one (a future delete/reorder) must not have it change under an in-place update.
-    id = prior.try(&.id) || Random::Secure.hex(4)
-    kept = rewriter_presets.reject { |p| p.name == name }
-    self.rewriter_presets = kept + [RulePreset.new(id, name, target, part, pattern,
-      replacement, op, match_kind, host, body_file)]
-    {save, !prior.nil?}
+                                name : String, host : String, body_file : String) : Bool
+    found = false
+    self.rewriter_rules = rewriter_rules.map do |r|
+      next r unless r.id == id
+      found = true
+      RewriterRule.new(id, r.enabled, name, target, part, pattern, replacement,
+        op, match_kind, host, body_file)
+    end
+    found && save
   end
 
-  def self.delete_rewriter_preset(id : String) : Bool
-    self.rewriter_presets = rewriter_presets.reject { |p| p.id == id }
+  # The rule's DEFAULT state, which every project without an override follows.
+  def self.set_rewriter_rule_enabled(id : Int64, enabled : Bool) : Bool
+    found = false
+    self.rewriter_rules = rewriter_rules.map do |r|
+      next r unless r.id == id
+      found = true
+      r.copy_with(enabled: enabled)
+    end
+    found && save
+  end
+
+  def self.delete_rewriter_rule(id : Int64) : Bool
+    kept = rewriter_rules.reject { |r| r.id == id }
+    return false if kept.size == rewriter_rules.size
+    self.rewriter_rules = kept
     save
   end
 
-  # Omit the whole block when there are no presets, so an untouched OR cleared Rewriter
-  # library never writes a "rewriter" section.
+  # Swap the rule one slot earlier (dir < 0) / later (dir > 0) among the GLOBAL rules. Never
+  # across the scope boundary: the two blocks are stored in different files and ordered by
+  # different mechanisms, so "past the last global rule" is not a position — it is a scope
+  # change, which is its own action.
+  def self.move_rewriter_rule(id : Int64, dir : Int32) : Bool
+    list = rewriter_rules.dup
+    i = list.index { |r| r.id == id }
+    return false unless i
+    j = i + (dir < 0 ? -1 : 1)
+    return false if j < 0 || j >= list.size
+    list[i], list[j] = list[j], list[i]
+    self.rewriter_rules = list
+    save
+  end
+
+  # Omit the whole block when there is nothing to say, so an untouched install never writes a
+  # "rewriter" section. The counter is written even with an empty list — it is what keeps a
+  # deleted rule's id from being handed out again after the last rule is removed.
   private def self.serialize_rewriter(j : JSON::Builder) : Nil
-    return if rewriter_presets.empty?
+    return if rewriter_rules.empty? && rewriter_next_rule_id <= 1
     j.field "rewriter" do
       j.object do
-        j.field "presets" do
+        j.field "next_rule_id", rewriter_next_rule_id
+        j.field "rules" do
           j.array do
-            rewriter_presets.each do |p|
+            rewriter_rules.each do |r|
               j.object do
-                j.field "id", p.id
-                j.field "name", p.name
-                j.field "target", p.target
-                j.field "part", p.part
-                j.field "pattern", p.pattern
-                j.field "replacement", p.replacement
-                j.field "op", p.op
-                j.field "match_kind", p.match_kind
-                j.field "host", p.host
-                j.field "body_file", p.body_file
+                j.field "id", r.id
+                j.field "enabled", r.enabled
+                j.field "name", r.name
+                j.field "target", r.target
+                j.field "part", r.part
+                j.field "pattern", r.pattern
+                j.field "replacement", r.replacement
+                j.field "op", r.op
+                j.field "match_kind", r.match_kind
+                j.field "host", r.host
+                j.field "body_file", r.body_file
               end
             end
           end

@@ -447,8 +447,12 @@ gori run rewriter add --op set_header --target request \
   --find X-Forwarded-For --value 127.0.0.1 --host '*.example.com'
 gori run rewriter add --op replace --target response --part body \
   --match regex --find 'secret=(\w+)' --value 'secret=[redacted]'
+gori run rewriter add --op remove_header --target response \
+  --find Content-Security-Policy --scope global          # 모든 프로젝트에 적용
 gori run rewriter preview --op replace --part body --find password --value hunter2
 gori run rewriter disable 3
+gori run rewriter disable 2 --scope global               # 이 프로젝트에서만 끄기
+gori run rewriter disable 2 --scope global --everywhere  # 기본값을 꺼서 모든 곳에 적용
 gori run rewriter rm 3
 ```
 
@@ -463,8 +467,10 @@ gori run rewriter rm 3
 | `--host=GLOB` | 매칭되는 호스트로 규칙을 한정(부분 문자열, `*` 와일드카드). 생략하면 전체 적용 |
 | `--name=NAME` | 규칙 목록에 표시할 라벨 |
 | `--disabled` | 규칙을 만들되 활성화하지 않음 |
+| `--scope=SCOPE` | `project`(기본값) 또는 `global`. 전역 규칙은 `settings.json` 에 저장되어 모든 프로젝트에 적용됨 |
+| `--everywhere` | 전역 규칙의 `enable`/`disable` 에서, 이 프로젝트의 오버라이드 대신 규칙 자체의 기본값을 변경 |
 
-`preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id를 받습니다.
+`preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id와 함께 `--scope`도 받습니다. 두 저장소가 규칙 번호를 각자 매기므로 id 하나가 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 범위를 `G`/`P` 접두어로 출력하고(`G*` 는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻), 프록시가 적용하는 순서 그대로 전역 규칙을 먼저 보여 줍니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#reusing-a-rule-across-projects)을 참고하세요.
 
 본문 규칙은 필요에 따라 `Content-Length`를 다시 맞추고 청크를 해제하며, 활성화된 규칙은 매칭되는 호스트에서 HTTP/1.1을 강제합니다. 대화형 편집기는 [Proxy & History](/guide/proxy/)를 참고하세요.
 

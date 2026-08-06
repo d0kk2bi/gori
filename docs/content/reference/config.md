@@ -641,7 +641,7 @@ Omitted until you apply or star a wordlist.
 | `env` | Env-token prefix and global values. See [env](#env) above |
 | `hotkeys` | Keybinding overrides (`os` layer + `command_modifier` + `bindings`). See the [Hotkeys guide](/guide/hotkeys/) |
 | `decoder` | Named Decoder chain specs, shared by every project and callable as a chain step by name (open sub-tabs live in the project database) |
-| `rewriter` | Saved Match & Replace rules, shared by every project. See [Reusing a rule across projects](/guide/proxy/#reusing-a-rule-across-projects) |
+| `rewriter` | GLOBAL Match & Replace rules — applied in every project, each with a default on/off state a project can override. See [Global and project rules](/guide/proxy/#global-and-project-rules) |
 | `mine` | Saved Param Miner defaults. See [mine](#mine) above |
 | `layout` | History / Probe / Issues previews + Sitemap expand depth. See [layout](#layout) above |
 | `statusline` | Bottom status row that runs a command on an interval. See [statusline](#statusline) above |

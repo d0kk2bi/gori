@@ -25,7 +25,7 @@ module Gori
         "rewriter.edit", "Edit rule", "Edit the selected rule in the popup editor",
         Verb::Scope::Rewriter, available: has_rule, mnemonic: 'e', section: :rules) { |ctx| ctx.rewriter_edit; nil }
       r.register Verb::Definition.new(
-        "rewriter.toggle", "Enable/disable", "Toggle the selected rule on or off",
+        "rewriter.toggle", "Enable/disable", "Toggle the selected rule on or off in THIS project",
         Verb::Scope::Rewriter, available: has_rule, mnemonic: 'x', section: :rules) { |ctx| ctx.rewriter_toggle; nil }
       r.register Verb::Definition.new(
         "rewriter.delete", "Delete rule", "Delete the selected rule (confirms first)",
@@ -43,23 +43,23 @@ module Gori
         "rewriter.reload", "Reload rules", "Re-read rules from the project DB (pick up external edits)",
         Verb::Scope::Rewriter, available: in_rw, mnemonic: 'r', section: :rules) { |ctx| ctx.rewriter_reload; nil }
 
-      # The global rule-preset library (settings.json `rewriter.presets`) — the Decoder's
-      # named chains, one table over. A Match & Replace rule is a RECIPE ("strip CSP on
-      # *.corp.internal"): reusable on the next engagement, while which rules are live in
-      # THIS project stays in the project DB. Same 's'/'o' mnemonics the Decoder uses for
-      # the same pair, so the gesture is one thing to learn.
+      # The scope half. A Match & Replace rule lives EITHER in this project or in the global
+      # library that every project reads (`Store::RuleScope`) — this replaces the old s/o
+      # preset library, whose recipes did nothing until you loaded a copy into each project.
+      # `s` keeps the mnemonic the save half had, now meaning "which scope".
       #
-      # Save gates on has_rule (there must be a rule to save), load only on the RULES
-      # sub-tab: loading appends to the Match&Replace list, so offering it while the
-      # `extract`/`bindings` sub-tab is on screen would write to a table the operator is
-      # not looking at — the leak `rewriter_rule_selected?` documents, one verb over.
-      in_rules = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter && ctx.rewriter_rules_sub? }
+      # The default-flip is offered only for a global rule, because a project rule has no
+      # default to flip: `x` IS its state. Both gate on a selected rule for the reason
+      # `rewriter_rule_selected?` documents — the menu must not act on a row the operator
+      # cannot see from the `extract` / `bindings` sub-tabs.
+      global_rule = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter && ctx.rewriter_global_rule_selected? }
       r.register Verb::Definition.new(
-        "rewriter.save-preset", "Save rule to library", "Save the selected rule under a name, shared by every project",
-        Verb::Scope::Rewriter, available: has_rule, mnemonic: 's', section: :rules) { |ctx| ctx.rewriter_save_preset; nil }
+        "rewriter.scope", "Global/project", "Move the selected rule between this project and the global library",
+        Verb::Scope::Rewriter, available: has_rule, mnemonic: 's', section: :rules) { |ctx| ctx.rewriter_scope_toggle; nil }
       r.register Verb::Definition.new(
-        "rewriter.load-preset", "Load a saved rule", "Add a rule from the global library to this project (^X deletes one)",
-        Verb::Scope::Rewriter, available: in_rules, mnemonic: 'o', section: :rules) { |ctx| ctx.rewriter_load_preset; nil }
+        "rewriter.toggle-default", "Enable/disable everywhere",
+        "Flip a global rule's default — what every project that hasn't overridden it follows",
+        Verb::Scope::Rewriter, available: global_rule, mnemonic: 'g', section: :rules) { |ctx| ctx.rewriter_toggle_default; nil }
     end
   end
 end

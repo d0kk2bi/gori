@@ -940,6 +940,64 @@ describe Gori::MCP::Server do
       end
     end
 
+    # The scope half: a global rule lives in settings.json and applies in EVERY project, so
+    # every by-id tool takes a `scope` alongside the id — the two stores number independently.
+    it "creates a GLOBAL rule, overrides it per project, and refuses an unknown scope" do
+      before = Gori::Settings.rewriter_rules
+      counter = Gori::Settings.rewriter_next_rule_id
+      begin
+        Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+        Gori::Settings.rewriter_next_rule_id = 1_i64
+        with_store do |store|
+          create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"pattern":"Server: nginx","replacement":"Server: gori","target":"response","scope":"global"}}})
+          payload = tool_payload(drive(store, create)[0])
+          payload["scope"].as_s.should eq("global")
+          id = payload["id"].as_i64
+          store.match_rules.should be_empty # not a project row
+          Gori::Settings.rewriter_rules.size.should eq(1)
+
+          listed = tool_payload(drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_rules"}}))[0])
+          rule = listed["rules"][0]
+          rule["scope"].as_s.should eq("global")
+          rule["enabled"].as_bool.should be_true
+          rule["overridden"].as_bool.should be_false
+          rule["default_enabled"].as_bool.should be_true
+
+          # Disabling WITHOUT `everywhere` is this project's override — the library still says on.
+          off = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"set_rule_enabled","arguments":{"id":#{id},"scope":"global","enabled":false}}})
+          tool_payload(drive(store, off)[0])["enabled"].as_bool.should be_false
+          Gori::Settings.rewriter_rules.first.enabled.should be_true
+          store.rewriter_overrides[id].should be_false
+          again = tool_payload(drive(store, %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_rules"}}))[0])
+          again["rules"][0]["overridden"].as_bool.should be_true
+          again["rules"][0]["default_enabled"].as_bool.should be_true
+
+          # …and with it, the default itself.
+          everywhere = %({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"set_rule_enabled","arguments":{"id":#{id},"scope":"global","enabled":false,"everywhere":true}}})
+          tool_payload(drive(store, everywhere)[0])["everywhere"].as_bool.should be_true
+          Gori::Settings.rewriter_rules.first.enabled.should be_false
+
+          # An id that exists in the OTHER scope is not this rule.
+          missing = %({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_rule","arguments":{"id":#{id}}}})
+          drive(store, missing)[0]["result"]["isError"].as_bool.should be_true
+          Gori::Settings.rewriter_rules.size.should eq(1)
+
+          # A typo'd scope is REFUSED, never clamped to project — clamping would report
+          # success for an edit the caller meant to make everywhere.
+          bad = %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"delete_rule","arguments":{"id":#{id},"scope":"globl"}}})
+          drive(store, bad)[0]["result"]["isError"].as_bool.should be_true
+
+          del = %({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"delete_rule","arguments":{"id":#{id},"scope":"global"}}})
+          tool_payload(drive(store, del)[0])["deleted"].as_bool.should be_true
+          Gori::Settings.rewriter_rules.should be_empty
+          store.rewriter_overrides.should be_empty # the disagreement dies with the rule
+        end
+      ensure
+        Gori::Settings.rewriter_rules = before
+        Gori::Settings.rewriter_next_rule_id = counter
+      end
+    end
+
     it "rejects an invalid target on create (persists nothing)" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"pattern":"x","target":"sideways"}}})

@@ -466,8 +466,12 @@ gori run rewriter add --op set_header --target request \
   --find X-Forwarded-For --value 127.0.0.1 --host '*.example.com'
 gori run rewriter add --op replace --target response --part body \
   --match regex --find 'secret=(\w+)' --value 'secret=[redacted]'
+gori run rewriter add --op remove_header --target response \
+  --find Content-Security-Policy --scope global          # applies in EVERY project
 gori run rewriter preview --op replace --part body --find password --value hunter2
 gori run rewriter disable 3
+gori run rewriter disable 2 --scope global               # off in THIS project only
+gori run rewriter disable 2 --scope global --everywhere  # off by default, everywhere
 gori run rewriter rm 3
 ```
 
@@ -482,8 +486,10 @@ gori run rewriter rm 3
 | `--host=GLOB` | Limit the rule to matching hosts (substring, `*` wildcard). Omit to apply everywhere |
 | `--name=NAME` | Label shown in the rule list |
 | `--disabled` | Create the rule without arming it |
+| `--scope=SCOPE` | `project` (default) or `global`. A global rule lives in `settings.json` and applies in every project |
+| `--everywhere` | On `enable`/`disable` of a global rule: change the rule's own default instead of this project's override |
 
-`preview` takes the same rule flags and reports how many stored flows the rule would have changed, without writing it. `rm` (`delete`), `enable` and `disable` take a rule id from the list.
+`preview` takes the same rule flags and reports how many stored flows the rule would have changed, without writing it. `rm` (`delete`), `enable` and `disable` take a rule id from the list — and `--scope`, because the two stores number their rules independently, so an id alone names two different rules. The list prints the scope as a `G`/`P` prefix (`G*` = this project overrides that global rule's default) and shows global rules first, the order the proxy applies them in. See [Global and project rules](/guide/proxy/#global-and-project-rules).
 
 Body rules re-sync `Content-Length` and de-chunk as needed, and an enabled rule forces HTTP/1.1 on hosts it matches. See [Proxy & History](/guide/proxy/) for the interactive editor.
 

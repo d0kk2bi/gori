@@ -13,6 +13,21 @@ private def with_store(&)
   end
 end
 
+# The global rule library is process-wide state (Settings), so every example that writes it
+# restores what it found — `Rules.load` merges it into EVERY project's rule list.
+private def with_globals(&)
+  before = Gori::Settings.rewriter_rules
+  counter = Gori::Settings.rewriter_next_rule_id
+  begin
+    Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+    Gori::Settings.rewriter_next_rule_id = 1_i64
+    yield
+  ensure
+    Gori::Settings.rewriter_rules = before
+    Gori::Settings.rewriter_next_rule_id = counter
+  end
+end
+
 describe Gori::Rules do
   # This gate backs EVERY rule op — body, ws, short_circuit, head, header — and the extract
   # rules that mint session bindings, so an over-match is how a `SetHeader $SESSION` rule
@@ -386,6 +401,130 @@ describe Gori::Rules do
         miss = Gori::Store::MatchRule.new(0_i64, true, Gori::Store::RuleTarget::Response,
           Gori::Store::RulePart::Ws, "ping", "pong")
         rules.preview(miss).matched.should eq(0)
+      end
+    end
+  end
+
+  # --- scope: the global library + this project's overrides ------------------------------
+  # A global rule lives in settings.json and applies in EVERY project; a project rule is a
+  # `match_rules` row. `Rules.merged` is what folds them into the one list the proxy reads.
+  describe "rule scope" do
+    it "applies global rules before project rules, and rewrites with both" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "X-One: a", "X-One: b", scope: Gori::Store::RuleScope::Global)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "X-One: b", "X-One: c")
+
+          rules.rules.map(&.scope).should eq([Gori::Store::RuleScope::Global,
+                                             Gori::Store::RuleScope::Project])
+          # b→c only fires because a→b ran first: the order is the whole claim.
+          head = "GET / HTTP/1.1\r\nHost: acme.test\r\nX-One: a\r\n\r\n".to_slice
+          String.new(rules.rewrite_request(head, "acme.test")).should contain("X-One: c")
+        end
+      end
+    end
+
+    it "toggles a global rule per project without touching its default" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "A", "B", scope: Gori::Store::RuleScope::Global)
+          id = rules.rules.first.id
+
+          rules.toggle(id, Gori::Store::RuleScope::Global).should be_true
+          rules.rules.first.enabled?.should be_false
+          rules.rules.first.overridden?.should be_true
+          # the LIBRARY still says on — only this project disagrees
+          Gori::Settings.rewriter_rules.first.enabled.should be_true
+          store.rewriter_overrides[id].should be_false
+
+          # Toggling back AGREES with the default, so the override is dropped rather than
+          # pinned — this project follows a later change to the default again.
+          rules.toggle(id, Gori::Store::RuleScope::Global).should be_true
+          rules.rules.first.enabled?.should be_true
+          rules.rules.first.overridden?.should be_false
+          store.rewriter_overrides.should be_empty
+        end
+      end
+    end
+
+    it "flips the global default for projects that have not overridden it" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "A", "B", scope: Gori::Store::RuleScope::Global)
+          id = rules.rules.first.id
+          rules.toggle_default(id).should be_true
+          rules.rules.first.enabled?.should be_false
+          rules.rules.first.overridden?.should be_false
+          rules.active?.should be_false
+        end
+      end
+    end
+
+    it "moves a rule between scopes, keeping its fields and its state here" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Response, Gori::Store::RulePart::Head,
+            "Server: nginx", "Server: gori", name: "mask")
+          rule = rules.rules.first
+          rules.set_scope(rule, Gori::Store::RuleScope::Global).should be_true
+
+          rules.rules.size.should eq(1)
+          moved = rules.rules.first
+          moved.global?.should be_true
+          moved.name.should eq("mask")
+          moved.replacement.should eq("Server: gori")
+          store.match_rules.should be_empty # gone from the project table, not copied
+
+          # …and back, which also takes it out of every other project
+          rules.set_scope(moved, Gori::Store::RuleScope::Project).should be_true
+          rules.rules.first.scope.project?.should be_true
+          Gori::Settings.rewriter_rules.should be_empty
+        end
+      end
+    end
+
+    it "reorders within a scope only" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "A", "1", scope: Gori::Store::RuleScope::Global)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "B", "2", scope: Gori::Store::RuleScope::Global)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "C", "3")
+
+          last_global = rules.rules[1]
+          # down from the last global rule would cross into the project block — refused, and
+          # the caller is told so rather than the cursor walking across a swap that never was
+          rules.move(last_global.id, 1, Gori::Store::RuleScope::Global).should be_false
+          rules.move(last_global.id, -1, Gori::Store::RuleScope::Global).should be_true
+          rules.rules.map(&.pattern).should eq(["B", "A", "C"])
+        end
+      end
+    end
+
+    it "drops this project's override when the global rule is deleted" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "A", "B", scope: Gori::Store::RuleScope::Global)
+          id = rules.rules.first.id
+          rules.toggle(id, Gori::Store::RuleScope::Global)
+          store.rewriter_overrides.should_not be_empty
+
+          rules.remove(id, Gori::Store::RuleScope::Global).should be_true
+          rules.rules.should be_empty
+          store.rewriter_overrides.should be_empty
+        end
       end
     end
   end
