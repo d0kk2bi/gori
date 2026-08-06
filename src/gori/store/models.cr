@@ -811,6 +811,10 @@ module Gori
     # interactsh RSA private key (nil for other providers).
     struct OastSessionRecord
       getter id : Int64
+      # Microseconds, the column the table has always written and nothing ever read back.
+      # The resume picker is the first reader: "which listener is this" is answered by WHEN
+      # it was started far better than by its correlation id.
+      getter created_at : Int64
       getter provider_id : Int64?
       getter kind : String
       getter server_url : String
@@ -820,8 +824,8 @@ module Gori
       getter token : String?
       getter last_poll_at : Int64?
 
-      def initialize(@id, @provider_id, @kind, @server_url, @correlation_id, @secret,
-                     @private_key_pem, @token, @last_poll_at)
+      def initialize(@id, @created_at, @provider_id, @kind, @server_url, @correlation_id,
+                     @secret, @private_key_pem, @token, @last_poll_at)
       end
     end
 

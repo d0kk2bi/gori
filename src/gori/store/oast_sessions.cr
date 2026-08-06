@@ -51,14 +51,14 @@ module Gori
 
     def oast_sessions : Array(OastSessionRecord)
       list = [] of OastSessionRecord
-      @db.query("SELECT id, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at FROM oast_sessions ORDER BY id") do |rs|
+      @db.query("SELECT id, created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at FROM oast_sessions ORDER BY id") do |rs|
         rs.each { list << read_oast_session(rs) }
       end
       list
     end
 
     def get_oast_session(id : Int64) : OastSessionRecord?
-      @db.query("SELECT id, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at FROM oast_sessions WHERE id = ?", id) do |rs|
+      @db.query("SELECT id, created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at FROM oast_sessions WHERE id = ?", id) do |rs|
         return read_oast_session(rs) if rs.move_next
       end
       nil
@@ -133,8 +133,8 @@ module Gori
 
     private def read_oast_session(rs : DB::ResultSet) : OastSessionRecord
       OastSessionRecord.new(
-        rs.read(Int64), rs.read(Int64?), rs.read(String), rs.read(String), rs.read(String),
-        rs.read(String), rs.read(String?), rs.read(String?), rs.read(Int64?))
+        rs.read(Int64), rs.read(Int64), rs.read(Int64?), rs.read(String), rs.read(String),
+        rs.read(String), rs.read(String), rs.read(String?), rs.read(String?), rs.read(Int64?))
     end
   end
 end

@@ -17,17 +17,31 @@ module Gori::Oast
       rsa = RsaKeyPair.generate_2048
       corr = Crypto.random_id(20)
       secret = Crypto.random_id(13)
-      body = {
-        "public-key"     => Base64.strict_encode(rsa.public_spki_pem),
-        "secret-key"     => secret,
-        "correlation-id" => corr,
-      }.to_json
-      resp = http.request("POST", "#{base_url}/register", json_headers, body)
+      resp = http.request("POST", "#{base_url}/register", json_headers,
+        register_body(rsa, corr, secret))
       unless register_ok?(resp)
         raise Gori::Error.new("interactsh register failed: HTTP #{resp.status} #{snippet(resp.body)}")
       end
       Session.new(0_i64, ProviderKind::Interactsh, base_url, corr, secret,
         private_key_pem: rsa.private_pem, token: @token, registered: true, rsa: rsa)
+    end
+
+    # Re-POST /register with the SAME correlation id, secret and public key. The server
+    # either still holds the session (409 / "correlation-id … exists", which `register_ok?`
+    # already accepts) or rebuilds it from what we send — so a payload minted days ago
+    # resolves again and its buffered interactions come back on the next poll.
+    #
+    # `session.server_url` rather than `base_url`: the session records the host it was
+    # registered against, and that is the only host holding its state. A provider whose host
+    # was edited since must not silently re-register this correlation id somewhere else.
+    def resume(http : Http, session : Session) : Nil
+      rsa = session.rsa
+      raise Gori::Error.new("interactsh resume: session has no private key") unless rsa
+      resp = http.request("POST", "#{session.server_url}/register", json_headers,
+        register_body(rsa, session.correlation_id, session.secret))
+      unless register_ok?(resp)
+        raise Gori::Error.new("interactsh resume failed: HTTP #{resp.status} #{snippet(resp.body)}")
+      end
     end
 
     # LOCAL: 20-char correlation id + a fresh 13-char nonce + "." + server host (33-char
@@ -71,6 +85,16 @@ module Gori::Oast
     end
 
     # ---- internals ----
+
+    # The /register payload. ONE builder for both callers: register mints the triple, resume
+    # replays the persisted one, and the server cannot tell (nor should it) which is which.
+    private def register_body(rsa : RsaKeyPair, corr : String, secret : String) : String
+      {
+        "public-key"     => Base64.strict_encode(rsa.public_spki_pem),
+        "secret-key"     => secret,
+        "correlation-id" => corr,
+      }.to_json
+    end
 
     # 200/201/204 succeed; a "correlation-id … exists" 400 or a 409 means an already-known
     # id (resume) — also fine.

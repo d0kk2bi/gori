@@ -4,8 +4,9 @@ require "./http"
 require "./session"
 
 module Gori::Oast
-  # An OAST backend, bound to one configured endpoint (host + optional token). Four calls:
+  # An OAST backend, bound to one configured endpoint (host + optional token). Five calls:
   #   register        — mint server-side state, return a fresh Session (once, at "listen").
+  #   resume          — revive the server state of a Session restored from the store.
   #   generate_payload — LOCAL, no network: a fresh unique payload URL from a Session.
   #   poll            — fetch + normalize new interactions.
   #   deregister      — best-effort release of server state (never raises).
@@ -23,6 +24,21 @@ module Gori::Oast
     abstract def register(http : Http) : Session
     abstract def generate_payload(session : Session) : String
     abstract def poll(http : Http, session : Session) : Array(Interaction)
+
+    # Re-arm a Session rebuilt from the store so its ALREADY-PLANTED payloads keep resolving.
+    # This is what makes a delayed callback — the stored payload that only fires on a nightly
+    # job, the back-office browser that opens the mail tomorrow — reachable at all: without it
+    # a restart could only `register` a NEW correlation id, and every payload minted before it
+    # was dead the moment the process exited.
+    #
+    # Default no-op, which is the honest answer for four of the five backends: webhook.site,
+    # postbin, BOAST and custom-http keep (or never had) their state independently of us, so
+    # polling the persisted correlation id is the whole of resuming. interactsh overrides —
+    # ITS server drops a session on deregister or restart. Unlike `deregister`, this one MAY
+    # raise: the operator asked for the session back, and a resume that quietly failed would
+    # leave a listener that polls a correlation id the server has never heard of.
+    def resume(http : Http, session : Session) : Nil
+    end
 
     # Best-effort teardown. Default no-op; override where the server supports it. MUST NOT
     # raise (callers deregister during cleanup where an error is noise).

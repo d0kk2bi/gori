@@ -33,6 +33,25 @@ module Gori
         "oast.filter", "Filter callbacks", "Filter the callbacks list by protocol/method/source/destination/provider",
         Verb::Scope::OastCallbacks, [Verb::Chord.new("/")], mnemonic: 'f') { |ctx| ctx.oast_filter; nil }
 
+      # Resume a persisted session. A plain `r`, not a ^-chord: ^R/^X already carry the pair
+      # you drum on, and this is the one you reach for ONCE, at the start of a sitting.
+      # OastController#handle_callbacks_key deliberately does not claim the letter — the
+      # action opens an overlay, which a controller cannot do — so it falls through to here.
+      r.register Verb::Definition.new(
+        "oast.sessions", "Resume listener…", "Resume polling a saved session — its planted payloads still resolve",
+        Verb::Scope::OastCallbacks, [Verb::Chord.new("r")], mnemonic: 'r') { |ctx| ctx.oast_sessions; nil }
+
+      # Promote a callback to an Issue. ⇧F is History's `issue.create` chord deliberately —
+      # "file what I'm looking at" is one gesture across the app, and Keymap#lookup is
+      # per-scope so the two never resolve together. The chord is Chord.new("f", shift: true),
+      # NOT Chord.new("F"): Keybind.from_event normalises a typed capital to shift+lowercase,
+      # so an "F" chord would never fire; menu_key skips shift chords, hence the mnemonic.
+      r.register Verb::Definition.new(
+        "oast.issue", "Add issue", "File the selected callback as an Issue, with its raw interaction as evidence",
+        Verb::Scope::OastCallbacks, [Verb::Chord.new("f", shift: true)],
+        available: ->(ctx : Verb::ExecContext) { ctx.oast_callback_selected? },
+        mnemonic: 'a', group: :triage) { |ctx| ctx.oast_issue_create; nil }
+
       r.register Verb::Definition.new(
         "oast.callbacks-to-menu", "Back to menu", "Move focus up to the tab menu",
         Verb::Scope::OastCallbacks, [Verb::Chord.new("escape")], hidden: true) { |ctx| ctx.focus_pane(:menu); nil }

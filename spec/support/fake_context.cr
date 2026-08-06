@@ -583,6 +583,17 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:oast_filter)
   end
 
+  def oast_sessions : Nil
+    rec(:oast_sessions)
+  end
+
+  # Settable so the selection-gated "promote this callback to an Issue" verb can be exercised.
+  property? oast_callback_selected : Bool = false
+
+  def oast_issue_create : Nil
+    rec(:oast_issue_create)
+  end
+
   def oast_add_provider : Nil
     rec(:oast_add_provider)
   end

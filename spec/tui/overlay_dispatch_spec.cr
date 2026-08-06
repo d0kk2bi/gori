@@ -30,7 +30,7 @@ private EXPECTED_OVERLAY_SYMS = {
   :none, :detail, :palette, :issue_new, :confirm, :browser, :choice, :tabs_more,
   :comparer_pick, :repeater_subtab, :links, :link_pick, :preferences,
   :settings, :tabs, :hosts, :env, :hotkeys, :notifications, :passthrough, :listeners, :probe_active,
-  :discover_config, :discover_headers, :fuzz_set, :fuzz_advanced, :oast_provider,
+  :discover_config, :discover_headers, :fuzz_set, :fuzz_advanced, :oast_provider, :oast_session,
   :probe_rule, :rewriter_rule, :extract_rule, :rewriter_stub, :ca_import, :import, :export, :scope_rule, :sequence_config,
   :mine_config, :name_prompt, :library_pick, :copy_as, :send_to,
 }
@@ -91,6 +91,9 @@ private MIGRATED_KINDS = [
   # likewise never in MODAL_OVERLAYS.
   OverlayKind::NamePrompt,
   OverlayKind::LibraryPick,
+  # OastSession — the RESUME LISTENER picker, born on the seam (the OAST tab's `r`), so
+  # likewise never in MODAL_OVERLAYS.
+  OverlayKind::OastSession,
 ]
 
 # Never in MODAL_OVERLAYS by design, migrated or not. `None` is "no modal at all" and

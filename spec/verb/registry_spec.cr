@@ -536,6 +536,18 @@ private class FakeContext < ExecContext
     @calls << :oast_filter
   end
 
+  def oast_sessions : Nil
+    @calls << :oast_sessions
+  end
+
+  def oast_callback_selected? : Bool
+    false
+  end
+
+  def oast_issue_create : Nil
+    @calls << :oast_issue_create
+  end
+
   def oast_add_provider : Nil
     @calls << :oast_add_provider
   end
