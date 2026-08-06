@@ -1008,83 +1008,147 @@ describe Gori::Settings do
     end
   end
 
-  # The Rewriter's global rule-preset library — the Decoder's named chains, one table over.
-  it "round-trips the Rewriter rule presets" do
+  # The Rewriter's GLOBAL rules (settings.json `rewriter.rules`) — the half of the Match &
+  # Replace list that every project reads, and the store `Rules.merged` folds in first.
+  it "round-trips the Rewriter global rules" do
     dir = File.tempname("gori-settings-rewriter")
     Dir.mkdir_p(dir)
     prev = ENV["GORI_HOME"]?
     begin
       ENV["GORI_HOME"] = dir
-      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
-      ok, existed = Gori::Settings.save_rewriter_preset("strip csp", "response", "head",
-        "Content-Security-Policy", "", "remove_header", "literal", "*.corp.internal", "")
-      ok.should be_true
-      existed.should be_false
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      Gori::Settings.rewriter_next_rule_id = 1_i64
+      id = Gori::Settings.add_rewriter_rule("response", "head", "Content-Security-Policy", "",
+        "remove_header", "literal", "strip csp", "*.corp.internal", "")
+      # Ids count from 1 so that 0 stays free to mean "the write did not commit".
+      id.should eq(1_i64)
 
-      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
       Gori::Settings.load
-      Gori::Settings.rewriter_presets.size.should eq(1)
-      p = Gori::Settings.rewriter_presets.first
-      p.name.should eq("strip csp")
-      p.op.should eq("remove_header")
-      p.host.should eq("*.corp.internal")
+      Gori::Settings.rewriter_rules.size.should eq(1)
+      r = Gori::Settings.rewriter_rules.first
+      r.name.should eq("strip csp")
+      r.op.should eq("remove_header")
+      r.host.should eq("*.corp.internal")
+      r.enabled.should be_true
+      r.to_rule.scope.global?.should be_true
 
-      # Saving the same NAME updates in place (and keeps the id) rather than forking a
-      # duplicate the picker would then show twice.
-      id = p.id
-      _, existed2 = Gori::Settings.save_rewriter_preset("strip csp", "request", "head",
-        "X-Debug", "1", "set_header", "literal", "", "")
-      existed2.should be_true
-      Gori::Settings.rewriter_presets.size.should eq(1)
-      Gori::Settings.rewriter_presets.first.id.should eq(id)
-      Gori::Settings.rewriter_presets.first.op.should eq("set_header")
+      # The default is the rule's own; a project's disagreement lives in the project DB, so
+      # nothing here is per-project.
+      Gori::Settings.set_rewriter_rule_enabled(id, false).should be_true
+      Gori::Settings.load
+      Gori::Settings.rewriter_rules.first.enabled.should be_false
+
+      # Ids are monotonic and never reused: a project that overrode #0 must not find its
+      # override silently reattached to a rule created after #0 was deleted.
+      second = Gori::Settings.add_rewriter_rule("request", "head", "X-Debug", "1",
+        "set_header", "literal", "", "", "")
+      second.should eq(2_i64)
+      Gori::Settings.delete_rewriter_rule(second).should be_true
+      Gori::Settings.add_rewriter_rule("request", "head", "X-Trace", "on",
+        "set_header", "literal", "", "", "").should eq(3_i64)
+      Gori::Settings.load
+      Gori::Settings.rewriter_next_rule_id.should eq(4_i64)
+
+      # apply order is the array order, and move swaps within it
+      Gori::Settings.move_rewriter_rule(3_i64, -1).should be_true
+      Gori::Settings.rewriter_rules.map(&.id).should eq([3_i64, 1_i64])
+      Gori::Settings.move_rewriter_rule(3_i64, -1).should be_false # already first
 
       # a file with no "rewriter" key keeps the current in-memory value
       File.write(Gori::Settings.path, %({"theme":"goridark"}))
       Gori::Settings.load
-      Gori::Settings.rewriter_presets.size.should eq(1)
+      Gori::Settings.rewriter_rules.size.should eq(2)
 
-      # Malformed presets tolerated: entries missing id/name/pattern are dropped, and an
-      # unknown enum label is CLAMPED rather than raised. `from_label` would raise, and
-      # load's blanket rescue would turn one typo into a full factory reset of every
-      # section — so the clamp is what makes RulePreset#to_rule total.
-      File.write(Gori::Settings.path, %({"rewriter":{"presets":[\
-{"id":"a1","name":"ok","pattern":"foo","op":"nonsense","part":"nope","target":"sideways","match_kind":"fuzzy"},\
-{"id":"","name":"noid","pattern":"x"},\
-{"id":"b2","name":"","pattern":"x"},\
-{"id":"c3","name":"nopattern"}]}}))
+      # Malformed rules tolerated: an entry with no pattern is dropped, an unknown enum label
+      # is CLAMPED rather than raised (`from_label` would raise, and load's blanket rescue
+      # would turn one typo into a factory reset of every section), a missing `enabled` reads
+      # as OFF, and a duplicated id is renumbered so every by-id mutation stays unambiguous.
+      File.write(Gori::Settings.path, %({"rewriter":{"rules":[\
+{"id":7,"enabled":true,"name":"ok","pattern":"foo","op":"nonsense","part":"nope","target":"sideways","match_kind":"fuzzy"},\
+{"id":7,"name":"dup","pattern":"bar"},\
+{"id":9,"name":"nopattern"}]}}))
       Gori::Settings.load
-      Gori::Settings.rewriter_presets.size.should eq(1)
-      kept = Gori::Settings.rewriter_presets.first
+      Gori::Settings.rewriter_rules.size.should eq(2)
+      kept = Gori::Settings.rewriter_rules.first
       kept.name.should eq("ok")
       kept.op.should eq("replace")
       kept.part.should eq("head")
       kept.target.should eq("request")
       kept.match_kind.should eq("literal")
       kept.to_rule.op.replace?.should be_true # the clamped labels really rebuild a rule
+      dup = Gori::Settings.rewriter_rules[1]
+      dup.id.should_not eq(7_i64)
+      dup.enabled.should be_false # no "enabled" key => OFF, never armed by a hand edit
+      Gori::Settings.rewriter_next_rule_id.should be >= 9_i64
 
-      Gori::Settings.delete_rewriter_preset("a1").should be_true
-      Gori::Settings.rewriter_presets.should be_empty
+      Gori::Settings.delete_rewriter_rule(7_i64).should be_true
+      Gori::Settings.rewriter_rules.size.should eq(1)
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
-      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      Gori::Settings.rewriter_next_rule_id = 1_i64
     end
   end
 
-  it "omits the rewriter key entirely when the preset library is empty" do
+  # The pre-upgrade preset library. A preset was INERT — it did nothing until loaded into a
+  # project — so it must not come back as a live rule in every project.
+  it "adopts legacy rewriter presets as DISABLED global rules" do
+    dir = File.tempname("gori-settings-rwlegacy")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      Gori::Settings.rewriter_next_rule_id = 1_i64
+      File.write(Gori::Settings.path, %({"rewriter":{"presets":[\
+{"id":"a1","name":"strip csp","pattern":"Content-Security-Policy","op":"remove_header","target":"response"},\
+{"id":"b2","name":"","pattern":"x"}]}}))
+      Gori::Settings.load
+      # The unnamed entry is dropped (a preset was addressed by name); the named one arrives OFF.
+      Gori::Settings.rewriter_rules.size.should eq(1)
+      adopted = Gori::Settings.rewriter_rules.first
+      adopted.name.should eq("strip csp")
+      adopted.enabled.should be_false
+      adopted.op.should eq("remove_header")
+
+      # In-memory and idempotent: a second load of the same file adopts the same one rule
+      # rather than appending a copy per launch.
+      Gori::Settings.load
+      Gori::Settings.rewriter_rules.size.should eq(1)
+
+      # The first save that touches the section replaces `presets` with `rules` outright —
+      # the 3-way merge sees the section change, so this process wins it.
+      Gori::Settings.set_rewriter_rule_enabled(adopted.id, true).should be_true
+      raw = File.read(Gori::Settings.path)
+      raw.includes?("presets").should be_false
+      raw.includes?("\"rules\"").should be_true
+      Gori::Settings.load
+      Gori::Settings.rewriter_rules.first.enabled.should be_true
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      Gori::Settings.rewriter_next_rule_id = 1_i64
+    end
+  end
+
+  it "omits the rewriter key entirely when there are no global rules" do
     dir = File.tempname("gori-settings-norewriter")
     Dir.mkdir_p(dir)
     prev = ENV["GORI_HOME"]?
     begin
       ENV["GORI_HOME"] = dir
-      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      Gori::Settings.rewriter_next_rule_id = 1_i64
       Gori::Settings.save.should be_true
       File.read(Gori::Settings.path).includes?("rewriter").should be_false
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
-      Gori::Settings.rewriter_presets = [] of Gori::Settings::RulePreset
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      Gori::Settings.rewriter_next_rule_id = 1_i64
     end
   end
 

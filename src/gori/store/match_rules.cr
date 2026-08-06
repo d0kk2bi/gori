@@ -1,4 +1,5 @@
 require "db"
+require "json"
 
 module Gori
   class Store
@@ -75,6 +76,55 @@ module Gori
     # Returns whether the write committed (false = store busy/locked/closing).
     def delete_rule(id : Int64) : Bool
       exec_task_ok ->(c : DB::Connection) { c.exec("DELETE FROM match_rules WHERE id = ?", id); nil }
+    end
+
+    # --- this project's answer to a GLOBAL rule ------------------------------------------
+    # A global rule (settings.json `rewriter.rules`) carries a default enabled state that every
+    # project follows until that project disagrees. The disagreement is stored HERE, as one
+    # JSON object under a single settings key — global id → the state this project wants —
+    # rather than as a copy of the rule, so editing the rule still reaches every project and
+    # nothing has to be re-synced.
+    #
+    # An entry exists ONLY while it differs from the default: `Rules` deletes it the moment the
+    # two agree again, so a project that was merely toggled back and forth follows the library
+    # afterwards instead of pinning a state that happens to match today.
+    REWRITER_OVERRIDES_KEY = "rewriter_global_overrides"
+
+    # Tolerant read: an unreadable or corrupt value degrades to "no overrides", i.e. every
+    # global rule follows its default. Fail-open is right here and not a safety hole — the
+    # DEFAULT is the operator's own global choice, not an escalation, and the alternative
+    # (raising) would take down the Rewriter tab and the proxy's rule load with it.
+    def rewriter_overrides : Hash(Int64, Bool)
+      map = {} of Int64 => Bool
+      raw = setting(REWRITER_OVERRIDES_KEY)
+      return map if raw.nil? || raw.strip.empty?
+      JSON.parse(raw).as_h?.try &.each do |k, v|
+        id = k.to_i64?
+        b = v.as_bool?
+        map[id] = b if id && !b.nil?
+      end
+      map
+    rescue
+      {} of Int64 => Bool
+    end
+
+    # Returns whether the write committed (false = store busy/locked/closing → the caller must
+    # not report the toggle as applied; the rule keeps rewriting whatever it was rewriting).
+    def set_rewriter_override(id : Int64, enabled : Bool) : Bool
+      write_rewriter_overrides(rewriter_overrides.merge({id => enabled}))
+    end
+
+    # Drop this project's disagreement, so the rule follows the global default again.
+    def clear_rewriter_override(id : Int64) : Bool
+      map = rewriter_overrides
+      return true unless map.has_key?(id)
+      map.delete(id)
+      write_rewriter_overrides(map)
+    end
+
+    private def write_rewriter_overrides(map : Hash(Int64, Bool)) : Bool
+      return delete_setting(REWRITER_OVERRIDES_KEY) if map.empty?
+      set_setting(REWRITER_OVERRIDES_KEY, map.to_h { |id, on| {id.to_s, on} }.to_json)
     end
   end
 end

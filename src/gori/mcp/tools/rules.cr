@@ -4,8 +4,18 @@ require "../../store"
 module Gori
   module MCP
     class Tools
-      private def list_rules : Result
-        rules = store.match_rules
+      # Every rule that applies to this project, in apply order: the GLOBAL library first, then
+      # the project's own rows. `id` is unique only WITHIN a scope, so every row carries its
+      # `scope` and the mutation tools take one alongside the id.
+      private def list_rules(h) : Result
+        want = nil.as(Store::RuleScope?)
+        if present?(h, "scope")
+          sc = rule_scope(h)
+          return sc if sc.is_a?(Result)
+          want = sc
+        end
+        rules = Gori::Rules.merged(store)
+        rules = rules.select { |r| r.scope == want } if want
         Result.new(JSON.build do |j|
           j.object do
             j.field "count", rules.size
@@ -14,7 +24,15 @@ module Gori
                 rules.each do |r|
                   j.object do
                     j.field "id", r.id
+                    j.field "scope", r.scope.label
+                    # The EFFECTIVE state here. For a global rule the library's own default may
+                    # differ — this project overrode it — and both are reported so an agent can
+                    # tell "off everywhere" from "off in this engagement".
                     j.field "enabled", r.enabled?
+                    if r.global?
+                      j.field "overridden", r.overridden?
+                      j.field "default_enabled", Settings.rewriter_rules.find { |g| g.id == r.id }.try(&.enabled)
+                    end
                     j.field "name", r.name
                     j.field "target", r.target.label
                     j.field "part", r.part.label
@@ -30,6 +48,20 @@ module Gori
             end
           end
         end)
+      end
+
+      # The `scope` argument, defaulting to this project — the safe direction: a caller that
+      # omits it edits the engagement in front of it, never every future one. An unrecognised
+      # value is REFUSED rather than clamped, because clamping "globl" to project would report
+      # success for an edit the caller meant to make everywhere.
+      private def rule_scope(h) : Store::RuleScope | Result
+        s = str(h, "scope")
+        return Store::RuleScope::Project if s.nil? || s.empty?
+        case s.downcase
+        when "project" then Store::RuleScope::Project
+        when "global"  then Store::RuleScope::Global
+        else                err("invalid 'scope' (expected project|global)", "INVALID_ARGUMENT", field: "scope")
+        end
       end
 
       # Whether a rule's pattern is acceptable: only a Replace+Regex rule must compile; a
@@ -62,6 +94,8 @@ module Gori
       private def create_rule(h) : Result
         pattern = str(h, "pattern")
         return err("missing required 'pattern'", "INVALID_ARGUMENT", field: "pattern") if pattern.nil? || pattern.empty?
+        scope = rule_scope(h)
+        return scope if scope.is_a?(Result)
         tp = rule_target_part(h, Store::RuleTarget::Request, Store::RulePart::Head)
         return tp if tp.is_a?(Result)
         target, part = tp
@@ -87,11 +121,20 @@ module Gori
         # Atomic disabled creation: insert already-disabled so there is no window
         # where a just-created rule is live before a follow-up disable call.
         enabled = bool_arg(h, "enabled", true)
-        id = store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled, body_file: body_file)
-        return busy("failed to persist rule (store busy or unwritable)") if id == 0
+        id =
+          if scope.global?
+            Settings.add_rewriter_rule(target.label, part.label, pattern, replacement, op.label,
+              match_kind.label, name, host, body_file, enabled)
+          else
+            store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled, body_file: body_file)
+          end
+        if id == 0
+          return busy(scope.global? ? "failed to persist global rule (settings not writable)" : "failed to persist rule (store busy or unwritable)")
+        end
         Result.new(JSON.build do |j|
           j.object do
             j.field "id", id
+            j.field "scope", scope.label
             j.field "target", target.label
             j.field "part", part.label
             j.field "op", op.label
@@ -106,8 +149,10 @@ module Gori
       private def update_rule(h) : Result
         id = int(h, "id")
         return err(id_error(h, "id"), "INVALID_ARGUMENT", field: "id") unless id
-        existing = store.match_rules.find { |r| r.id == id }
-        return not_found("no rule with id #{id}") unless existing
+        scope = rule_scope(h)
+        return scope if scope.is_a?(Result)
+        existing = Gori::Rules.merged(store).find { |r| r.id == id && r.scope == scope }
+        return not_found("no #{scope.label} rule with id #{id}") unless existing
         tp = rule_target_part(h, existing.target, existing.part)
         return tp if tp.is_a?(Result)
         target, part = tp
@@ -130,14 +175,25 @@ module Gori
         if bad = short_circuit_error(op, replacement, body_file)
           return bad
         end
-        return busy("rule not updated (store busy or unwritable); the rule is unchanged") unless store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
+        updated =
+          if scope.global?
+            Settings.update_rewriter_rule(id, target.label, part.label, pattern, replacement,
+              op.label, match_kind.label, name, host, body_file)
+          else
+            store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
+          end
+        return busy("rule not updated (store busy or unwritable); the rule is unchanged") unless updated
         if present?(h, "enabled")
           en = bool_arg(h, "enabled", existing.enabled?)
-          return busy("rule fields were updated but the enable/disable did not persist (store busy or unwritable); retry") unless store.set_rule_enabled(id, en)
+          # For a global rule this is THIS project's answer, exactly as `set_rule_enabled`
+          # means it — changing the library's default is `set_rule_enabled` + everywhere.
+          ok = scope.global? ? set_global_rule_enabled_here(id, en) : store.set_rule_enabled(id, en)
+          return busy("rule fields were updated but the enable/disable did not persist (store busy or unwritable); retry") unless ok
         end
         Result.new(JSON.build do |j|
           j.object do
             j.field "id", id
+            j.field "scope", scope.label
             j.field "updated", true
             j.field "target", target.label
             j.field "part", part.label
@@ -253,29 +309,74 @@ module Gori
         {op, kind}
       end
 
+      # For a global rule this writes THIS PROJECT's override by default — the same meaning `x`
+      # has in the Rewriter tab. `everywhere: true` changes the library's own default instead,
+      # which reaches every project that has not overridden it.
       private def set_rule_enabled(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) unless id
+        scope = rule_scope(h)
+        return scope if scope.is_a?(Result)
         enabled = optional_bool_arg(h, "enabled")
         return Result.new("missing required 'enabled' (true|false)", is_error: true) if enabled.nil?
-        return not_found("no rule with id #{id}") unless rule_exists?(id)
-        return busy("enable/disable NOT applied (store busy or unwritable); the rule is unchanged and may still be rewriting live traffic") unless store.set_rule_enabled(id, enabled)
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "enabled", enabled } })
+        everywhere = bool_arg(h, "everywhere", false)
+        return err("'everywhere' needs scope=global — a project rule has no default", "INVALID_ARGUMENT", field: "everywhere") if everywhere && !scope.global?
+        return not_found("no #{scope.label} rule with id #{id}") unless rule_exists?(id, scope)
+        ok =
+          if !scope.global?
+            store.set_rule_enabled(id, enabled)
+          elsif everywhere
+            Settings.set_rewriter_rule_enabled(id, enabled)
+          else
+            set_global_rule_enabled_here(id, enabled)
+          end
+        return busy("enable/disable NOT applied (store busy or unwritable); the rule is unchanged and may still be rewriting live traffic") unless ok
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "id", id
+            j.field "scope", scope.label
+            j.field "enabled", enabled
+            j.field "everywhere", everywhere if scope.global?
+          end
+        end)
+      end
+
+      # Make a global rule effectively `enabled` in THIS project. Agreeing with the library's
+      # default CLEARS the override instead of pinning it, so the project keeps following a
+      # later change to that default — the disposition `Rules#toggle` documents.
+      private def set_global_rule_enabled_here(id : Int64, enabled : Bool) : Bool
+        rule = Settings.rewriter_rules.find { |r| r.id == id }
+        return false unless rule
+        rule.enabled == enabled ? store.clear_rewriter_override(id) : store.set_rewriter_override(id, enabled)
       end
 
       private def delete_rule(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) unless id
-        return not_found("no rule with id #{id}") unless rule_exists?(id)
-        return busy("rule NOT deleted (store busy or unwritable); it is unchanged and may still be rewriting live traffic") unless store.delete_rule(id)
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
+        scope = rule_scope(h)
+        return scope if scope.is_a?(Result)
+        return not_found("no #{scope.label} rule with id #{id}") unless rule_exists?(id, scope)
+        ok =
+          if scope.global?
+            deleted = Settings.delete_rewriter_rule(id)
+            store.clear_rewriter_override(id) # this project's disagreement dies with the rule
+            deleted
+          else
+            store.delete_rule(id)
+          end
+        return busy("rule NOT deleted (store busy or unwritable); it is unchanged and may still be rewriting live traffic") unless ok
+        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "scope", scope.label; j.field "deleted", true } })
       end
 
-      # Whether a Match&Replace rule id exists. A full read (the store has no
-      # single-row rule fetch), but the rule set is tiny and enable/disable/delete
-      # are low-frequency actions.
-      private def rule_exists?(id : Int64) : Bool
-        store.match_rules.any? { |r| r.id == id }
+      # Whether a Match&Replace rule id exists IN THAT SCOPE. A full read (neither store has a
+      # single-row rule fetch), but the rule set is tiny and enable/disable/delete are
+      # low-frequency actions.
+      private def rule_exists?(id : Int64, scope : Store::RuleScope) : Bool
+        if scope.global?
+          Settings.rewriter_rules.any? { |r| r.id == id }
+        else
+          store.match_rules.any? { |r| r.id == id }
+        end
       end
 
       # --- extract rules / session bindings (#501) -----------------------------

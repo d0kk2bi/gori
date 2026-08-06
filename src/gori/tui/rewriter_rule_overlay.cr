@@ -21,21 +21,27 @@ module Gori::Tui
   # for the live match PREVIEW. The form owns only WHEN to ask for that preview — see
   # refresh_preview.
   class RewriterRuleOverlay < Overlay
-    ROW_NAME   = 0
-    ROW_TARGET = 1
-    ROW_OP     = 2
-    ROW_MATCH  = 3
-    ROW_PART   = 4
-    ROW_HOST   = 5
-    ROW_FIND   = 6
-    ROW_VALUE  = 7
+    ROW_NAME = 0
+    # Where the rule LIVES, which is who it applies to (`Store::RuleScope`). First of the
+    # cyclers, and directly under the name, because it is the question the operator answers
+    # once per rule and the one that reaches outside this project.
+    ROW_SCOPE  = 1
+    ROW_TARGET = 2
+    ROW_OP     = 3
+    ROW_MATCH  = 4
+    ROW_PART   = 5
+    ROW_HOST   = 6
+    ROW_FIND   = 7
+    ROW_VALUE  = 8
     # short_circuit only: the response BODY file. Sits between the response and Save so the
     # two body sources (inline, in the response buffer; on disk, here) read as one choice.
-    ROW_BODY_FILE =  8
-    ROW_SAVE      =  9
-    ROW_COUNT     = 10
+    ROW_BODY_FILE =  9
+    ROW_SAVE      = 10
+    ROW_COUNT     = 11
 
-    TARGETS   = %w[request response]
+    SCOPES       = %w[project global]
+    SCOPE_LABELS = ["this project", "global (every project)"]
+    TARGETS      = %w[request response]
     OPS       = %w[replace add_header set_header remove_header short_circuit]
     OP_LABELS = ["replace", "add header", "set header", "remove header", "stub"]
     MATCHES   = %w[literal regex]
@@ -45,6 +51,10 @@ module Gori::Tui
     PARTS = %w[head body ws]
 
     getter edit_id : Int64?
+    # The scope the edited rule was OPENED at, so the commit can tell an edit from a re-home:
+    # `scope` is the cycler's current value and these two differing is the whole signal that
+    # the rule has to move between the project table and the global library.
+    getter edit_scope : Store::RuleScope?
 
     # Renders the "affects N of M recent flows" line under the form. Injected at the
     # open-site because it READS TRAFFIC — the form itself stays store-free.
@@ -55,6 +65,7 @@ module Gori::Tui
     # the Runner owns the overlay swap and putting this form back afterwards.
     property on_edit_stub : Proc(Nil)?
 
+    @scope_i : Int32
     @target_i : Int32
     @op_i : Int32
     @match_i : Int32
@@ -67,7 +78,8 @@ module Gori::Tui
     def initialize(*, name : String = "", target : String = "request", op : String = "replace",
                    match : String = "literal", part : String = "head", host : String = "",
                    pattern : String = "", replacement : String = "", @edit_id : Int64? = nil,
-                   body_file : String = "")
+                   body_file : String = "", scope : String = "project",
+                   @edit_scope : Store::RuleScope? = nil)
       @fields = {
         name:      TextField.new(name),
         host:      TextField.new(host),
@@ -79,6 +91,7 @@ module Gori::Tui
       # RewriterStubOverlay rather than in the single-line `value` field the other ops use.
       # Seeded from `replacement`, which is where it is persisted either way.
       @stub = replacement
+      @scope_i = idx(SCOPES, scope)
       @target_i = idx(TARGETS, target)
       @op_i = idx(OPS, op)
       @match_i = idx(MATCHES, match)
@@ -94,7 +107,7 @@ module Gori::Tui
       new(name: rule.name, target: rule.target.label, op: rule.op.label,
         match: rule.match_kind.label, part: rule.part.label, host: rule.host,
         pattern: rule.pattern, replacement: rule.replacement, edit_id: rule.id,
-        body_file: rule.body_file)
+        body_file: rule.body_file, scope: rule.scope.label, edit_scope: rule.scope)
     end
 
     private def idx(list : Array(String), v : String) : Int32
@@ -135,6 +148,10 @@ module Gori::Tui
 
     def body_file : String
       short_circuit_op? ? @fields[:body_file].value.strip : ""
+    end
+
+    def scope : Store::RuleScope
+      Store::RuleScope.from_label(SCOPES[@scope_i])
     end
 
     def target : Store::RuleTarget
@@ -227,7 +244,7 @@ module Gori::Tui
     def candidate_rule : Store::MatchRule
       tgt, prt = Gori::Rules.normalize_shape(op, target, part)
       Store::MatchRule.new(@edit_id || 0_i64, true, tgt, prt,
-        pattern, replacement, op, match_kind, name, host, body_file)
+        pattern, replacement, op, match_kind, name, host, body_file, scope: scope)
     end
 
     def move(d : Int32) : Nil
@@ -250,7 +267,7 @@ module Gori::Tui
     end
 
     private def cycler_row?(row : Int32) : Bool
-      ROW_TARGET <= row <= ROW_PART
+      ROW_SCOPE <= row <= ROW_PART
     end
 
     private def text_field_for(row : Int32) : TextField?
@@ -265,6 +282,7 @@ module Gori::Tui
 
     def adjust(d : Int32) : Nil
       case @sel
+      when ROW_SCOPE  then @scope_i = (@scope_i + d) % SCOPES.size
       when ROW_TARGET then @target_i = (@target_i + d) % TARGETS.size
       when ROW_OP     then @op_i = (@op_i + d) % OPS.size
       when ROW_MATCH  then @match_i = (@match_i + d) % MATCHES.size
@@ -401,6 +419,7 @@ module Gori::Tui
       sc = short_circuit_op?
       case i
       when ROW_NAME   then draw_field(screen, box, py, bg, fg, sel, "name:", @fields[:name])
+      when ROW_SCOPE  then draw_cycle(screen, x, py, bg, fg, "scope:", SCOPE_LABELS, @scope_i, sel)
       when ROW_TARGET then sc ? draw_na(screen, x, py, bg, "target:", "request (a stub answers a request)") : draw_cycle(screen, x, py, bg, fg, "target:", TARGETS, @target_i, sel)
       when ROW_OP     then draw_cycle(screen, x, py, bg, fg, "op:", OP_LABELS, @op_i, sel)
       when ROW_MATCH  then hop ? draw_na(screen, x, py, bg, "match:") : draw_cycle(screen, x, py, bg, fg, "match:", MATCHES, @match_i, sel)

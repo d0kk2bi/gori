@@ -174,7 +174,7 @@ module Gori
         self.decoder_chains = parse_decoder_chains(cv["chains"]?)
       end
       if rw = object_section(root, "rewriter")
-        self.rewriter_presets = parse_rewriter_presets(rw["presets"]?)
+        parse_rewriter(rw)
       end
       parse_mine_prefs(root["mine"]?)
       parse_fuzzer_prefs(root["fuzzer"]?)

@@ -29,7 +29,7 @@ describe Gori::Tui::RewriterRuleOverlay do
 
   it "cycles the op with ←/→ and reports a header op" do
     ov = RewriterRuleOverlay.adding
-    down(ov, 2) # name → target → op
+    down(ov, 3) # name → scope → target → op
     ov.handle_key(skey(Termisu::Input::Key::Right)).should eq(:stay)
     ov.op.should eq(Gori::Store::RuleOp::AddHeader)
     ov.header_op?.should be_true
@@ -37,7 +37,7 @@ describe Gori::Tui::RewriterRuleOverlay do
 
   it "forces a header op onto the HEAD even if part is cycled to body" do
     ov = RewriterRuleOverlay.adding
-    down(ov, 2)                                     # op row
+    down(ov, 3)                                     # op row
     ov.handle_key(skey(Termisu::Input::Key::Right)) # replace → add_header
     down(ov, 2)                                     # op → match → part
     ov.handle_key(skey(Termisu::Input::Key::Right)) # part → body
@@ -52,7 +52,7 @@ describe Gori::Tui::RewriterRuleOverlay do
   it "requires a pattern, and validates a regex replace" do
     ov = RewriterRuleOverlay.adding
     ov.valid?.should be_false                       # empty pattern
-    down(ov, 3)                                     # name → target → op → match
+    down(ov, 4)                                     # name → scope → target → op → match
     ov.handle_key(skey(Termisu::Input::Key::Right)) # literal → regex
     ov.match_kind.should eq(Gori::Store::MatchKind::Regex)
     down(ov, 3)               # match → part → host → find
@@ -80,13 +80,37 @@ describe Gori::Tui::RewriterRuleOverlay do
 
   it "commits from the value row and cancels on esc" do
     ov = RewriterRuleOverlay.adding
-    down(ov, 6) # → find
+    down(ov, 7) # → find
     stype(ov, "a")
     down(ov, 1) # find → value
     ov.handle_key(skey(Termisu::Input::Key::Enter)).should eq(:commit)
 
     ov2 = RewriterRuleOverlay.adding
     ov2.handle_key(skey(Termisu::Input::Key::Escape)).should eq(:cancel)
+  end
+
+  # The scope row: where the rule LIVES, and the one field whose change is a re-home rather
+  # than an edit (RewriterController#apply_rewriter_rule compares it against edit_scope).
+  it "defaults a new rule to this project and cycles the scope row" do
+    ov = RewriterRuleOverlay.adding
+    ov.scope.project?.should be_true
+    ov.edit_scope.should be_nil
+    down(ov, 1) # name → scope
+    ov.handle_key(skey(Termisu::Input::Key::Right)).should eq(:stay)
+    ov.scope.global?.should be_true
+    ov.candidate_rule.scope.global?.should be_true
+  end
+
+  it "seeds the scope from the edited rule and remembers what it was opened at" do
+    rule = Gori::Store::MatchRule.new(3_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "A", "B", scope: Gori::Store::RuleScope::Global)
+    ov = RewriterRuleOverlay.editing(rule)
+    ov.scope.global?.should be_true
+    ov.edit_scope.should eq(Gori::Store::RuleScope::Global)
+    down(ov, 1)
+    ov.handle_key(skey(Termisu::Input::Key::Right))
+    ov.scope.project?.should be_true          # what the operator now wants
+    ov.edit_scope.should eq(Gori::Store::RuleScope::Global) # where it still lives
   end
 
   it "renders without crashing and maps a click to a row" do
@@ -118,7 +142,7 @@ describe "Gori::Tui::RewriterRuleOverlay — Overlay seam" do
     end
 
     h.type("strip-csp")
-    6.times { h.press(Termisu::Input::Key::Down) } # name → … → find
+    7.times { h.press(Termisu::Input::Key::Down) } # name → … → find
     h.type("secret")
     h.press(Termisu::Input::Key::Down) # → value
     h.type("REDACTED")
@@ -170,7 +194,7 @@ describe "Gori::Tui::RewriterRuleOverlay — Overlay seam" do
     ov.preview.should eq("enter a pattern to preview")
     asked.should be_empty
 
-    5.times { h.press(Termisu::Input::Key::Down) } # → find
+    6.times { h.press(Termisu::Input::Key::Down) } # → find
     h.type("secret")
     asked.size.should eq(6) # one scan per character that changed the pattern
     asked.last.pattern.should eq("secret")
@@ -188,7 +212,7 @@ describe "Gori::Tui::RewriterRuleOverlay — Overlay seam" do
   it "labels the preview slot for a header op (\"header name\", not \"pattern\")" do
     ov = RewriterRuleOverlay.adding
     h = OverlayHarness.new(ov)
-    2.times { h.press(Termisu::Input::Key::Down) } # → op
+    3.times { h.press(Termisu::Input::Key::Down) } # → op
     h.press(Termisu::Input::Key::Right)            # replace → add_header
     ov.header_op?.should be_true
     ov.preview.should eq("enter a header name to preview")

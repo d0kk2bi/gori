@@ -9,7 +9,19 @@ module Gori
   # applied in flight. A rule either REPLACES text (literal substring or regex with
   # $1/\1 capture groups) in the HEAD (request/status line + headers) or BODY (the
   # entity), or performs a header operation by NAME (add / set / remove). Rules can be
-  # scoped to a host glob. Human-configured (P4), persisted per project.
+  # scoped to a host glob. Human-configured (P4).
+  #
+  # A rule is persisted in one of TWO places, and which one is part of its identity
+  # (`Store::RuleScope`): a PROJECT rule is a `match_rules` row, a GLOBAL rule lives in
+  # settings.json and applies in every project. `Rules.merged` folds both into the one ordered
+  # list everything below this line reads — globals first, then the project's own — so no
+  # rewrite path, preview or count has to know a rule's scope at all. Only the editing half
+  # does, which is why every mutator takes the {id, scope} PAIR: the two stores number their
+  # rules independently, so an id alone names two different rules.
+  #
+  # Global-first is the standing-policy-then-local-layer order `Env.effective_vars` and
+  # `Probe.custom_rules` already use: a global rule is what the operator wants on every
+  # engagement, a project rule refines the traffic in front of them today.
   #
   # One instance is SHARED between the proxy fibers (which call `rewrite_*` on every
   # message) and the TUI (which edits the rule set). A Mutex guards the rule snapshot so
@@ -66,8 +78,11 @@ module Gori
       @subst_declared = [] of String
       @subst_env_rev = 0_u32
       @subst_binding_rev = 0_u64
-      # Rule ids already reported as blocked on an unbound binding, at that binding revision.
-      @unbound_reported = Set(Int64).new
+      # Rules already reported as blocked on an unbound binding, at that binding revision.
+      # Keyed by {scope, id}, not id: the global library and the project table number their
+      # rules independently, so a bare id would let a global rule's report silence a project
+      # rule's — and the operator would be told about one of two rules that stopped applying.
+      @unbound_reported = Set({Store::RuleScope, Int64}).new
       @unbound_reported_rev = 0_u64
     end
 
@@ -89,7 +104,27 @@ module Gori
     end
 
     def self.load(store : Store) : Rules
-      new(store, store.match_rules)
+      new(store, merged(store))
+    end
+
+    # Every rule that applies in `store`'s project, in apply order: the global library first
+    # (settings.json order), then this project's own rows (`position` order).
+    #
+    # A global rule arrives carrying its EFFECTIVE state — its own default unless this project
+    # overrode it — so `enabled?` means the same thing for both scopes and the hot path never
+    # consults the override map. `overridden?` rides along for the list row to mark; nothing
+    # below this method reads it.
+    def self.merged(store : Store) : Array(Store::MatchRule)
+      overrides = store.rewriter_overrides
+      out = Settings.rewriter_rules.map do |r|
+        if (ov = overrides[r.id]?).nil?
+          r.to_rule
+        else
+          r.to_rule(enabled: ov, overridden: true)
+        end
+      end
+      out.concat(store.match_rules)
+      out
     end
 
     # A copy of the current rules (for the editor UI).
@@ -108,22 +143,64 @@ module Gori
 
     # --- editing (persists, then refreshes the snapshot) ---------------------
 
+    # `scope` picks the STORE the new rule lands in — this project's table, or the global
+    # library every project reads. A global rule is created ENABLED, like a project one: "add"
+    # means the same thing in both scopes, and the surfaces that create one say where it went.
     def add(target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
             op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
-            name : String = "", host : String = "", body_file : String = "") : Nil
+            name : String = "", host : String = "", body_file : String = "",
+            scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true) : Nil
       return if pattern.empty?
       target, part = normalize_shape(op, target, part)
-      @store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, body_file: body_file)
+      if scope.global?
+        Settings.add_rewriter_rule(target.label, part.label, pattern, replacement, op.label,
+          match_kind.label, name, host, body_file, enabled)
+      else
+        @store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled, body_file: body_file)
+      end
       refresh
     end
 
     def update(id : Int64, target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
                op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
-               name : String = "", host : String = "", body_file : String = "") : Nil
+               name : String = "", host : String = "", body_file : String = "",
+               scope : Store::RuleScope = Store::RuleScope::Project) : Nil
       return if pattern.empty?
       target, part = normalize_shape(op, target, part)
-      @store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
+      if scope.global?
+        Settings.update_rewriter_rule(id, target.label, part.label, pattern, replacement,
+          op.label, match_kind.label, name, host, body_file)
+      else
+        @store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
+      end
       refresh
+    end
+
+    # Move a rule to the OTHER scope, keeping its fields and its state in this project. Not an
+    # edit of one row but a re-home: the rule is written into the destination store and dropped
+    # from the source, so promoting a project rule to global makes it appear in every other
+    # project and demoting a global one takes it out of them.
+    #
+    # Ordered destination-first and refuses if the write does not commit, so a failure leaves
+    # the rule where it was rather than deleting it into nowhere. A global rule that this
+    # project had overridden loses the override with the rule (there is nothing left to
+    # disagree with) — its EFFECTIVE state here is what the project rule inherits, because that
+    # is the state the operator is looking at when they press the key.
+    def set_scope(rule : Store::MatchRule, to : Store::RuleScope) : Bool
+      return false if rule.scope == to
+      ok =
+        if to.global?
+          Settings.add_rewriter_rule(rule.target.label, rule.part.label, rule.pattern,
+            rule.replacement, rule.op.label, rule.match_kind.label, rule.name, rule.host,
+            rule.body_file, rule.enabled?) != 0
+        else
+          @store.insert_rule(rule.target, rule.part, rule.pattern, rule.replacement, rule.op,
+            rule.match_kind, rule.name, rule.host, rule.enabled?, body_file: rule.body_file) != 0
+        end
+      return false unless ok
+      ok = remove(rule.id, rule.scope)
+      refresh
+      ok
     end
 
     # The {target, part} an op can actually have. Header ops are head-only; a short-circuit
@@ -152,40 +229,95 @@ module Gori
     # discarded here, so the TUI reported "rule deleted" for a rollback while the headless
     # surfaces (`mcp/tools/rules.cr`, `cli/run/rewriter.cr`) refused to. It means COMMITTED,
     # not "a row existed", which is the store's own contract.
-    def remove(id : Int64) : Bool
-      ok = @store.delete_rule(id)
+    def remove(id : Int64, scope : Store::RuleScope = Store::RuleScope::Project) : Bool
+      ok =
+        if scope.global?
+          # Drop this project's disagreement with it too, so a later rule that inherits the id
+          # cannot inherit the override — belt to the monotonic counter's braces.
+          deleted = Settings.delete_rewriter_rule(id)
+          @store.clear_rewriter_override(id)
+          deleted
+        else
+          @store.delete_rule(id)
+        end
       refresh
       ok
     end
 
     # False when the write did NOT commit; see `remove`. A missing rule is `false` too — there
     # was nothing to toggle, so claiming a state change would be just as wrong.
-    def toggle(id : Int64) : Bool
-      rule = rules.find(&.id.==(id))
+    #
+    # For a GLOBAL rule this writes THIS PROJECT's override, never the rule: `x` in the
+    # Rewriter list means "not here" / "yes here", which is the disagreement an engagement
+    # has with a standing policy. Changing the policy itself is `toggle_default`, a separate
+    # gesture, because it reaches into every other project.
+    def toggle(id : Int64, scope : Store::RuleScope = Store::RuleScope::Project) : Bool
+      rule = rules.find { |r| r.id == id && r.scope == scope }
       return false unless rule
-      ok = @store.set_rule_enabled(id, !rule.enabled?)
+      ok =
+        if scope.global?
+          set_effective(id, !rule.enabled?)
+        else
+          @store.set_rule_enabled(id, !rule.enabled?)
+        end
       refresh
       ok
     end
 
-    # Move a rule one slot up (dir < 0) / down (dir > 0) in the applied order.
-    def move(id : Int64, dir : Int32) : Nil
-      @store.move_rule(id, dir)
+    # Flip a GLOBAL rule's DEFAULT — the state every project without an override follows.
+    # Returns false for a project rule (which has no default to flip) and for an unknown id.
+    def toggle_default(id : Int64) : Bool
+      rule = Settings.rewriter_rules.find { |r| r.id == id }
+      return false unless rule
+      ok = Settings.set_rewriter_rule_enabled(id, !rule.enabled)
       refresh
+      ok
     end
 
-    # Re-read the store snapshot (e.g. after an external MCP / other-instance edit). Same
-    # work `refresh` does, exposed so the Rewriter tab can pull external changes on enter.
+    # Make a global rule effectively `enabled` HERE. When the wanted state is the rule's own
+    # default the override is REMOVED rather than pinned to it: a project that toggled a rule
+    # off and back on goes back to FOLLOWING the library, so a later change to the default
+    # still reaches it. Pinning would silently freeze this project at today's answer.
+    private def set_effective(id : Int64, enabled : Bool) : Bool
+      rule = Settings.rewriter_rules.find { |r| r.id == id }
+      return false unless rule
+      rule.enabled == enabled ? @store.clear_rewriter_override(id) : @store.set_rewriter_override(id, enabled)
+    end
+
+    # Move a rule one slot up (dir < 0) / down (dir > 0) in the applied order, WITHIN its own
+    # scope. The scope boundary is not a position: every global rule applies before every
+    # project one, so "past the end of the global block" means "become a project rule", which
+    # is `set_scope`'s job and a different decision.
+    #
+    # False when nothing moved (an unknown rule, or an edge of its own block), so the caller
+    # can leave the cursor on the rule instead of walking it across a swap that never happened.
+    def move(id : Int64, dir : Int32, scope : Store::RuleScope = Store::RuleScope::Project) : Bool
+      scoped = rules.select { |r| r.scope == scope }
+      i = scoped.index { |r| r.id == id }
+      return false unless i
+      j = i + (dir < 0 ? -1 : 1)
+      return false if j < 0 || j >= scoped.size
+      scope.global? ? Settings.move_rewriter_rule(id, dir) : @store.move_rule(id, dir)
+      refresh
+      true
+    end
+
+    # Re-read the snapshot (e.g. after an external MCP / other-instance edit). Same work
+    # `refresh` does, exposed so the Rewriter tab can pull external changes on enter.
+    #
+    # "External" here means the project DB and this process's own global library. A global rule
+    # another gori PROCESS wrote is not picked up: that would mean re-reading settings.json,
+    # and `Settings.load` replaces every section from disk — including ones this process has
+    # changed but not saved yet. Same reach the Decoder's chain library has always had.
     def reload : Nil
       refresh
     end
 
     # --- one-line rule formatting (shared) -----------------------------------
-    # The Rewriter list renders these two as its op and detail columns; the global
-    # rule-preset library (NamePromptOverlay's subject line, LibraryPicker's detail column)
-    # renders `summary`, which is just the pair joined. They live here, on the type that
-    # owns the rule vocabulary, so a saved preset can never describe itself differently
-    # from the list row it was saved from.
+    # The Rewriter list renders these two as its op and detail columns; `summary` is just the
+    # pair joined, for the places that name a rule in one line (a delete confirm). They live
+    # here, on the type that owns the rule vocabulary, so a rule can never be described one
+    # way in a prompt and another in the row the prompt is about.
 
     # The short op badge — "re/H", "sub/B", "+hdr", "stub", …
     def self.op_tag(rule : Store::MatchRule) : String
@@ -214,18 +346,12 @@ module Gori
     end
 
     # Badge + description + the host glob when the rule is scoped to one. The host is worth
-    # the width HERE and not in the tab's list (which has its own column for it): a preset
-    # scoped to `*.corp.internal` is a different rule from the same pattern unscoped, and
-    # the library card is the only place that distinction is visible before loading.
+    # the width HERE and not in the tab's list (which has its own column for it): a rule scoped
+    # to `*.corp.internal` is a different rule from the same pattern unscoped, and a confirm
+    # prompt naming only the pattern would not say which of the two it is about.
     def self.summary(rule : Store::MatchRule) : String
       s = "#{op_tag(rule)}  #{describe(rule)}"
       rule.host.empty? ? s : "#{s}  @#{rule.host}"
-    end
-
-    # The same line for a not-yet-loaded library preset. Goes through `to_rule` rather than
-    # re-deriving the format, so the picker row and the list row it becomes are identical.
-    def self.preset_summary(preset : Settings::RulePreset) : String
-      summary(preset.to_rule)
     end
 
     # --- HeadRewriter (called from proxy fibers) -----------------------------
@@ -387,7 +513,9 @@ module Gori
     # the wire (`X-Gori-Short-Circuit: error`): the operator's bytes go out untouched, but
     # bytes gori invented say so.
     private def stub_failure(rule : Store::MatchRule, message : String) : Proxy::HeadRewriter::Stub
-      body = "gori: short-circuit rule ##{rule.id} could not be applied: #{message}\n".to_slice
+      # Names the SCOPE as well as the id: the two stores number rules independently, so
+      # "rule #3" would send the operator to the wrong list half the time.
+      body = "gori: short-circuit #{rule.scope.label} rule ##{rule.id} could not be applied: #{message}\n".to_slice
       head = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nX-Gori-Short-Circuit: error\r\n".to_slice
       Proxy::HeadRewriter::Stub.new(head, body, 502, rule.id, error: message)
     end
@@ -701,7 +829,7 @@ module Gori
         @unbound_reported_rev = brev
         @unbound_reported.clear
       end
-      return unless @unbound_reported.add?(rule.id)
+      return unless @unbound_reported.add?({rule.scope, rule.id})
       label = rule.name.presence || rule.pattern
       case refused.reason
       in Refusal::Unbound
@@ -913,7 +1041,7 @@ module Gori
     end
 
     private def refresh : Nil
-      fresh = @store.match_rules
+      fresh = Rules.merged(@store)
       @mutex.synchronize { @rules = fresh }
       @req_head_count.set(active_count(fresh, Store::RuleTarget::Request, part: Store::RulePart::Head))
       @resp_head_count.set(active_count(fresh, Store::RuleTarget::Response, part: Store::RulePart::Head))

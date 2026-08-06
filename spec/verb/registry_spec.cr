@@ -1125,10 +1125,14 @@ private class FakeContext < ExecContext
     false
   end
 
-  def rewriter_save_preset : Nil
+  def rewriter_scope_toggle : Nil
   end
 
-  def rewriter_load_preset : Nil
+  def rewriter_toggle_default : Nil
+  end
+
+  def rewriter_global_rule_selected? : Bool
+    false
   end
 
   def notes_new : Nil

@@ -11,9 +11,13 @@ abstract class Gori::Verb::ExecContext
   abstract def rewriter_duplicate : Nil         # copy the selected rule
   abstract def rewriter_reload : Nil            # re-read rules from the DB (external edits)
   abstract def rewriter_rule_selected? : Bool   # a rule is selected (gates edit/delete/… verbs)
-  abstract def rewriter_rules_sub? : Bool       # the RULES sub-tab is on screen (gates load-preset)
-  abstract def rewriter_save_preset : Nil       # save the selected rule to the global library (name popup)
-  abstract def rewriter_load_preset : Nil       # add a rule from the global library (picker popup)
+  abstract def rewriter_rules_sub? : Bool       # the RULES sub-tab is on screen
+  # The scope half (`Store::RuleScope`): a rule lives either in this project or in the global
+  # library every project reads, and these two are how an operator moves it and how they
+  # change what the library says by default.
+  abstract def rewriter_scope_toggle : Nil            # move the selected rule global ⇄ project
+  abstract def rewriter_toggle_default : Nil          # flip a global rule's default everywhere
+  abstract def rewriter_global_rule_selected? : Bool  # the selection is a global rule
   # The PREVIEW OUTPUT pane holds focus — the read-pane gate, matching the per-tab
   # `*_read_mode?` predicates the other read panes carry. It is the transformed sample, the one
   # place the post-rewrite bytes exist, so it is the only Rewriter pane with a caret to select

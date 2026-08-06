@@ -45,8 +45,9 @@ module Gori::Tui
     # controller cannot open an overlay itself.
     abstract def open_chain_save : Nil
     abstract def open_chain_load : Nil
-    # The Rewriter's preset library has no Host pair: like `c`/`u`/`n`/`r`, its save/load
-    # are space-menu-only, so the verb bodies reach the Runner's openers directly.
+    # The Rewriter has no library pair here: its rules ARE global or project (RuleScope), a
+    # property of the rule itself that `s` flips in place, so there is nothing to save into or
+    # pick out of and no overlay for the Host to open.
     # Open the OAST provider add/edit popup (nil = add a new provider; else edit the given
     # provider — global or project scope, per Oast::ProviderConfig#scope).
     abstract def open_oast_provider_editor(provider : Oast::ProviderConfig?) : Nil

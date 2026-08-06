@@ -263,13 +263,27 @@ module Gori
         end
       end
 
-      # One text row for a rule: `#3 [x] REQ sub/H @host  pattern -> value`.
+      # One text row for a rule: `G#3 [x] REQ sub/H @host  pattern -> value`. The scope letter
+      # leads because it is half of the rule's identity — the two stores number independently,
+      # so `#3` on its own does not say which rule the next command would address.
+      # `*` after it = this project overrides the global default (see Store#rewriter_overrides).
       private def self.rewriter_rule_row(r : Store::MatchRule) : String
         mark = r.enabled? ? "x" : " "
         side = r.target.request? ? "REQ" : "RES"
         name = r.name.empty? ? "" : " [#{r.name}]"
         host = r.host.empty? ? "" : " @#{r.host}"
-        "##{r.id} [#{mark}] #{side} #{rewriter_op_tag(r).ljust(5)}#{name}#{host}  #{rewriter_rule_body(r)}"
+        scope = "#{r.scope.badge}#{r.overridden? ? "*" : ""}"
+        "#{scope}##{r.id} [#{mark}] #{side} #{rewriter_op_tag(r).ljust(5)}#{name}#{host}  #{rewriter_rule_body(r)}"
+      end
+
+      # `--scope` on every rule subcommand: WHICH store the id names (or, on list, which half
+      # to print). Same vocabulary as the MCP tools and the TUI's `scope:` row.
+      private def self.parse_rule_scope(s : String) : Store::RuleScope
+        case s.downcase
+        when "project" then Store::RuleScope::Project
+        when "global"  then Store::RuleScope::Global
+        else                abort "gori run rewriter: invalid --scope '#{s}' (project|global)"
+        end
       end
 
       private def self.rewriter_op_tag(r : Store::MatchRule) : String
@@ -296,16 +310,20 @@ module Gori
         db_path : String? = nil
         project_name : String? = nil
         format = :text
+        scope : Store::RuleScope? = nil
         leftover = [] of String
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run rewriter [options]\n\n" \
+                     "Lists the rules that apply to this project: the global library first,\n" \
+                     "then the project's own — the order the proxy applies them in.\n\n" \
                      "Or run with a subcommand:\n" \
                      "  gori run rewriter add --op=replace --target=request --find=OLD --value=NEW\n" \
-                     "  gori run rewriter add --op=add_header --find=X-Trace --value=on\n" \
+                     "  gori run rewriter add --op=add_header --find=X-Trace --value=on --scope=global\n" \
                      "  gori run rewriter rm|delete <id> | enable <id> | disable <id> | preview ..."
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          p.on("--scope=SCOPE", "Show only project|global rules (default: both)") { |v| scope = parse_rule_scope(v) }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |rest, _| leftover = rest }
@@ -318,25 +336,12 @@ module Gori
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)
         begin
-          rules = store.match_rules
+          rules = Gori::Rules.merged(store)
+          rules = rules.select { |r| r.scope == scope } if scope
           if format == :json
             puts(JSON.build do |j|
               j.array do
-                rules.each do |r|
-                  j.object do
-                    j.field "id", r.id
-                    j.field "enabled", r.enabled?
-                    j.field "name", r.name
-                    j.field "target", r.target.label
-                    j.field "part", r.part.label
-                    j.field "op", r.op.label
-                    j.field "match", r.match_kind.label
-                    j.field "host", r.host
-                    j.field "pattern", r.pattern
-                    j.field "replacement", r.replacement
-                    j.field "body_file", r.body_file
-                  end
-                end
+                rules.each { |r| rewriter_rule_json(j, r) }
               end
             end)
           elsif rules.empty?
@@ -346,6 +351,30 @@ module Gori
           end
         ensure
           store.close
+        end
+      end
+
+      # `enabled` is the EFFECTIVE state in this project; `default_enabled` and `overridden`
+      # only appear for a global rule, where the two can differ. A project rule has one state
+      # and printing two fields for it would invite the reader to look for a difference.
+      private def self.rewriter_rule_json(j : JSON::Builder, r : Store::MatchRule) : Nil
+        j.object do
+          j.field "id", r.id
+          j.field "scope", r.scope.label
+          j.field "enabled", r.enabled?
+          if r.global?
+            j.field "overridden", r.overridden?
+            j.field "default_enabled", Settings.rewriter_rules.find { |g| g.id == r.id }.try(&.enabled)
+          end
+          j.field "name", r.name
+          j.field "target", r.target.label
+          j.field "part", r.part.label
+          j.field "op", r.op.label
+          j.field "match", r.match_kind.label
+          j.field "host", r.host
+          j.field "pattern", r.pattern
+          j.field "replacement", r.replacement
+          j.field "body_file", r.body_file
         end
       end
 
@@ -386,6 +415,7 @@ module Gori
         disabled = false
         body_file = ""
         response_file : String? = nil
+        scope = Store::RuleScope::Project
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run rewriter add [options]\n\n" \
@@ -401,6 +431,7 @@ module Gori
           p.on("--match=KIND", "literal|regex (default literal; replace/short_circuit only)") { |v| match_s = v }
           p.on("--part=PART", "head|body|ws (default head; replace only; ws = a WebSocket message)") { |v| part_s = v }
           p.on("--host=GLOB", "Scope to a host glob ('' = all; '*.example.com')") { |v| host = v }
+          p.on("--scope=SCOPE", "project (default) | global — a global rule applies in EVERY project") { |v| scope = parse_rule_scope(v) }
           p.on("--name=NAME", "Optional rule label") { |v| name = v }
           p.on("-fFIND", "--find=FIND", "Match substring/regex, or header name (required)") { |v| find = v }
           p.on("-vVALUE", "--value=VALUE", "Replacement, header value, or canned response (default empty)") { |v| value = v }
@@ -424,6 +455,17 @@ module Gori
         value = check_short_circuit_args(op, value, response_file, body_file)
         check_ws_part(op, part, "add")
         target, part = Gori::Rules.normalize_shape(op, target, part)
+
+        # A global rule needs no project at all — it lives in settings.json — but resolving one
+        # anyway keeps `--project` meaningful on every subcommand and costs a store open that
+        # the surrounding surface already pays for.
+        if scope.global?
+          id = Settings.add_rewriter_rule(target.label, part.label, f, value, op.label,
+            match.label, name, host, body_file, !disabled)
+          abort "gori run rewriter add: failed to persist rule (settings not writable)" if id == 0
+          puts "Global rule ##{id} added — it applies in every project."
+          return
+        end
 
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)
@@ -478,10 +520,12 @@ module Gori
       private def self.cmd_rewriter_rm(args : Array(String)) : Nil
         db_path : String? = nil
         project_name : String? = nil
+        scope = Store::RuleScope::Project
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run rewriter rm|delete <id> [options]"
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
+          p.on("--scope=SCOPE", "Which <id>: project (default) | global") { |v| scope = parse_rule_scope(v) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.invalid_option { |f| abort "gori run rewriter rm: unknown option: #{f}\n#{p}" }
         end
@@ -491,6 +535,16 @@ module Gori
         abort "gori run rewriter rm: missing <id>" if positional.empty?
         abort "gori run rewriter rm: too many arguments (expected one <id>)" if positional.size > 1
         id = positional[0].to_i64? || abort("gori run rewriter rm: invalid rule id '#{positional[0]}'")
+
+        # A project that had overridden this rule keeps a row pointing at the id, and this
+        # surface cannot reach every project's DB to sweep it. It stays inert: global ids come
+        # from a monotonic counter and are never reused, so nothing can inherit the override.
+        if scope.global?
+          abort "gori run rewriter rm: no global rule with id #{id}" unless Settings.rewriter_rules.any? { |r| r.id == id }
+          abort "gori run rewriter rm: settings not writable (nothing was deleted)" unless Settings.delete_rewriter_rule(id)
+          puts "Global rule ##{id} deleted — from every project."
+          return
+        end
 
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)
@@ -512,11 +566,18 @@ module Gori
       private def self.cmd_rewriter_set_enabled(enable : Bool, args : Array(String)) : Nil
         db_path : String? = nil
         project_name : String? = nil
+        scope = Store::RuleScope::Project
+        everywhere = false
         action = enable ? "enable" : "disable"
         parser = OptionParser.new do |p|
-          p.banner = "Usage: gori run rewriter #{action} <id> [options]"
+          p.banner = "Usage: gori run rewriter #{action} <id> [options]\n\n" \
+                     "With --scope=global this writes THIS project's override of the rule,\n" \
+                     "the way `x` does in the Rewriter tab. --everywhere changes the rule's\n" \
+                     "own default instead, which every project without an override follows."
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
+          p.on("--scope=SCOPE", "Which <id>: project (default) | global") { |v| scope = parse_rule_scope(v) }
+          p.on("--everywhere", "global rules only: change the default for every project") { everywhere = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.invalid_option { |f| abort "gori run rewriter #{action}: unknown option: #{f}\n#{p}" }
         end
@@ -526,10 +587,38 @@ module Gori
         abort "gori run rewriter #{action}: missing <id>" if positional.empty?
         abort "gori run rewriter #{action}: too many arguments (expected one <id>)" if positional.size > 1
         id = positional[0].to_i64? || abort("gori run rewriter #{action}: invalid rule id '#{positional[0]}'")
+        if everywhere && !scope.global?
+          abort "gori run rewriter #{action}: --everywhere needs --scope=global — a project rule has no default"
+        end
+
+        # The rule's own default, read once: `everywhere` writes it, and the per-project branch
+        # below compares against it to decide between an override and dropping one.
+        default = nil.as(Bool?)
+        if scope.global?
+          rule = Settings.rewriter_rules.find { |r| r.id == id }
+          abort "gori run rewriter #{action}: no global rule with id #{id}" unless rule
+          default = rule.enabled
+          if everywhere
+            abort "gori run rewriter #{action}: settings not writable (the rule is unchanged)" unless Settings.set_rewriter_rule_enabled(id, enable)
+            puts "Global rule ##{id} #{enable ? "enabled" : "disabled"} by default (every project without an override)."
+            return
+          end
+        end
 
         project = resolve_read_project(project_name, db_path)
         store = open_store(project)
         begin
+          if scope.global?
+            # Same disposition `Rules#toggle` writes: agreeing with the default DROPS the
+            # override rather than pinning it, so this project keeps following the library.
+            ok = default == enable ? store.clear_rewriter_override(id) : store.set_rewriter_override(id, enable)
+            unless ok
+              store.close
+              abort "gori run rewriter #{action}: project is busy (write did not commit) — try again"
+            end
+            puts "Global rule ##{id} #{enable ? "enabled" : "disabled"} in project #{project.name}."
+            return
+          end
           unless store.match_rules.any? { |r| r.id == id }
             store.close
             abort "gori run rewriter #{action}: no rule with id #{id}"

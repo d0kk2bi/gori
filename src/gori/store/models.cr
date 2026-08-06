@@ -623,6 +623,37 @@ module Gori
       end
     end
 
+    # WHERE a Match & Replace rule lives, which is also WHO it applies to. A `Project` rule is a
+    # row in this project's `match_rules` table; a `Global` rule lives in settings.json
+    # (`rewriter.rules`) and applies in EVERY project, so a standing policy ("strip CSP on
+    # *.corp.internal") outlives the engagement it was written during. The same global-base /
+    # project-layer split `Probe.custom_rules` and `Env.effective_vars` already rest on.
+    #
+    # The scope is part of a rule's IDENTITY, not just a property of it: the two stores number
+    # their rules independently (SQLite rowids on one side, a settings counter on the other), so
+    # `id` alone does not name a rule. Every mutator on `Rules` takes the PAIR, and every surface
+    # that addresses a rule by id (`gori run rewriter`, the MCP rule tools) carries a `scope`
+    # alongside it.
+    enum RuleScope
+      Project
+      Global
+
+      def label : String
+        to_s.downcase
+      end
+
+      # Unknown → Project. Same tolerant shape `MatchKind.from_label` has, and the safe
+      # direction: a mistyped scope addresses THIS project rather than every future one.
+      def self.from_label(s : String) : RuleScope
+        s.downcase == "global" ? Global : Project
+      end
+
+      # The one-letter column the Rewriter list and `gori run rewriter` print.
+      def badge : String
+        global? ? "G" : "P"
+      end
+    end
+
     # A Match&Replace rule (the "Rewriter" tab): rewrites a request/response HEAD
     # (request line + headers) or BODY (the entity body) in flight. Human-authored (P4),
     # persisted per project. `op` selects the action (replace / add-set-remove header);
@@ -635,6 +666,12 @@ module Gori
     # `body_file` belongs to `ShortCircuit` alone: a path whose bytes become the stub body,
     # instead of the inline body in `replacement`. Empty = inline (and every other op ignores
     # it entirely).
+    #
+    # `scope` says which store the rule came out of (see `RuleScope`) and `enabled` is always
+    # the EFFECTIVE state in THIS project — for a global rule that is its own default unless
+    # this project overrides it, which is what `overridden?` reports. The proxy path reads
+    # `enabled?` and nothing else, so a per-project override needs no second gate anywhere
+    # below `Rules.merged`.
     struct MatchRule
       getter id : Int64
       getter? enabled : Bool
@@ -647,10 +684,19 @@ module Gori
       getter name : String
       getter host : String
       getter body_file : String
+      getter scope : RuleScope
+      # Whether THIS project overrides the global default of `enabled`. Always false for a
+      # project rule — there is no default to disagree with. See `Store#rewriter_overrides`.
+      getter? overridden : Bool
 
       def initialize(@id, @enabled, @target, @part, @pattern, @replacement,
                      @op = RuleOp::Replace, @match_kind = MatchKind::Literal,
-                     @name = "", @host = "", @body_file = "")
+                     @name = "", @host = "", @body_file = "",
+                     @scope = RuleScope::Project, @overridden = false)
+      end
+
+      def global? : Bool
+        @scope.global?
       end
     end
 

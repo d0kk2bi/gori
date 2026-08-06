@@ -239,6 +239,11 @@ module Gori::Tui
       return if rect.w < 6 || rect.h < 2
       Frame.card(screen, rect, "MATCH & REPLACE", bg: Theme.bg, border: Frame.pane_border(focused))
       meta = "#{enabled_count}/#{rules.size} enabled"
+      # How many of them come from the global library, so the split is legible even when the
+      # list is scrolled past the `G` rows. Only when there ARE any — a project with none
+      # should not pay border width to be told "0 global".
+      globals = rules.count(&.global?)
+      meta = "#{globals} global · #{meta}" if globals > 0
       # Count rides the top border (right of the title), not a list row.
       if rect.w > meta.size + 20
         screen.text({rect.right - meta.size - 2, rect.x + 18}.max, rect.y, meta, Theme.muted, Theme.bg)
@@ -278,6 +283,7 @@ module Gori::Tui
       mark = rule.enabled? ? '✓' : '·'
       screen.cell(x, py, mark, rule.enabled? ? Theme.accent : Theme.muted, bg)
       x += 2
+      x = render_scope_badge(screen, rule, x, py, bg)
       fg = rule.enabled? ? (selected ? Theme.text_bright : Theme.text) : Theme.muted
       screen.text(x, py, rule.target.request? ? "REQ" : "RES", fg, bg)
       x += 4
@@ -296,6 +302,19 @@ module Gori::Tui
       end
       desc = describe(rule)
       screen.text(x, py, desc, fg, bg, width: {rect.right - x, 1}.max) if x < rect.right
+    end
+
+    # WHERE the rule lives: `G` = the global library (every project), `P` = this project's own
+    # table. `G*` means this project overrides the library's default for it — the ✓/· left of
+    # the badge is then THIS project's answer, not the rule's, and without the mark two rows
+    # meaning opposite things elsewhere would look identical here.
+    #
+    # Always three columns wide, so every field right of it stays aligned down the list.
+    private def render_scope_badge(screen : Screen, rule : Store::MatchRule, x : Int32,
+                                   py : Int32, bg : Color) : Int32
+      badge = rule.overridden? ? "#{rule.scope.badge}*" : rule.scope.badge
+      screen.text(x, py, badge, rule.global? ? Theme.env_known : Theme.muted, bg)
+      x + 3
     end
 
     private def render_preview_input(screen : Screen, rect : Rect, ed : TextArea, focused : Bool) : Nil
