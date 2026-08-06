@@ -263,6 +263,7 @@ module Gori
       "path_normalization_bypass" => {288, "Authentication Bypass Using an Alternate Path or Channel"},
       "url_rewrite_bypass"        => {288, "Authentication Bypass Using an Alternate Path or Channel"},
       "nextjs_action_no_auth"     => {306, "Missing Authentication for Critical Function"},
+      "ssrf_oast"                 => {918, "Server-Side Request Forgery (SSRF)"},
       "jwt_alg_none"              => {347, "Improper Verification of Cryptographic Signature"},
       "jwt_weak_alg"              => {327, "Use of a Broken or Risky Cryptographic Algorithm"},
       "jwt_no_expiry"             => {613, "Insufficient Session Expiration"},
