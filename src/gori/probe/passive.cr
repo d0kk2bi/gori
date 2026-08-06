@@ -14,6 +14,7 @@ require "./passive/jwt"
 require "./passive/sourcemap"
 require "./passive/sri"
 require "./passive/directory_listing"
+require "./passive/exposed_config"
 require "./passive/ws_payloads"
 require "./passive/secrets"
 require "./passive/js_scan"
@@ -47,6 +48,7 @@ module Gori
         SourceMap.new,
         Sri.new,
         DirectoryListing.new,
+        ExposedConfig.new,
         WsPayloads.new,
         DomXss.new,
         DomClobbering.new,

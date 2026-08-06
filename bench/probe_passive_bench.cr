@@ -116,6 +116,35 @@ JS_I18N_BODY = begin
   io.to_slice.dup
 end
 
+# A LARGE HTML document — past Context::BODY_CAP (64 KiB), up against CLIENT_BODY_CAP (256 KiB).
+# Ordinary content-heavy pages (a docs page, a product listing, a dashboard with server-rendered
+# rows) land here routinely, and this is the fixture that actually exercises BodyLeaks' HTML sink
+# checks at their real width: they read `client_body_text`, not the 64 KiB `body_text` the leak
+# scans use, so the 40 KiB HTML_BODY above cannot show their cost at all.
+#
+# It carries NO cleartext URL, no `javascript:` and no `_blank` — that is the point. This is the
+# common case, and it measures whether the literal prefilters really keep a clean page off the
+# regex passes. A fixture that tripped every check would only measure the rare page.
+BIG_HTML_BODY = begin
+  io = IO::Memory.new
+  io << "<!doctype html><html><head><title>Docs</title>"
+  io << %(<link rel="stylesheet" href="https://cdn.example.com/app.css">)
+  io << "</head><body>\n"
+  i = 0
+  while io.bytesize < 200 * 1024
+    io << %(<section class="row"><h2>Section ) << i << "</h2>"
+    io << %(<p>ordinary paragraph text, entirely unremarkable, number ) << i << "</p>"
+    io << %(<a href="/docs/page) << i << %(">next</a></section>) << "\n"
+    i += 1
+  end
+  io << "</body></html>\n"
+  io.to_slice.dup
+end
+
+BIG_HTML_FLOW = flow("GET", "/docs", "text/html; charset=utf-8",
+  ("GET /docs HTTP/1.1\r\nHost: app.example.com\r\n\r\n").to_slice, nil,
+  HTML_RESP_HEAD, BIG_HTML_BODY)
+
 JS_RESP_HEAD = ("HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\n" \
                 "Server: nginx/1.24.0\r\nCache-Control: max-age=31536000\r\n\r\n").to_slice
 
@@ -139,6 +168,7 @@ puts "  (detections: json=#{Gori::Probe::Passive.analyze(JSON_FLOW).size}" \
 Benchmark.ips do |x|
   x.report("JSON API POST flow ") { Gori::Probe::Passive.analyze(JSON_FLOW) }
   x.report("HTML document flow ") { Gori::Probe::Passive.analyze(HTML_FLOW) }
+  x.report("HTML doc, 200 KiB  ") { Gori::Probe::Passive.analyze(BIG_HTML_FLOW) }
   x.report("JS bundle flow     ") { Gori::Probe::Passive.analyze(JS_FLOW) }
   # Must stay in the SAME order of magnitude as the plain JS bundle. A large gap here means the
   # non-ASCII slow path is back.

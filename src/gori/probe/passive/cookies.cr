@@ -112,9 +112,14 @@ module Gori
           end
         end
 
+        # The unmet requirements are joined with " + ", NOT ", ": every cookie code accumulates
+        # its evidence across a (code, host) group, and that merge splits the stored string on
+        # ", " to dedup (Store.merge_evidence). A ", "-joined requirement list would be torn into
+        # bogus fragments ("Path=/" as if it were another cookie's evidence), so the separator
+        # inside one cookie's label has to be something the merge does not split on.
         private def emit_prefix(ctx : Context, name : String, missing : Array(String), acc : Array(Detection)) : Nil
           acc << cookie(ctx, "cookie_prefix_violation", "Cookie violates its #{name.starts_with?(HOST_PREFIX) ? "__Host-" : "__Secure-"} prefix rules",
-            Store::Severity::Medium, "#{name}: needs #{missing.join(", ")}")
+            Store::Severity::Medium, "#{name}: needs #{missing.join(" + ")}")
         end
 
         private def cookie(ctx : Context, code : String, title : String, sev : Store::Severity, name : String) : Detection

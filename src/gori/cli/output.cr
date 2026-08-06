@@ -400,14 +400,22 @@ module Gori
         Probe.group_json(j, g) # shared field shape (also used by the MCP probe_scan tool)
       end
 
-      # "[high]      secret_in_url             api.test   ×3   token"
+      # "[high]      secret_in_url             api.test   ×3   CWE-598   token"
       # plus an indented representative affected URL ("(+N more)" when capped).
+      #
+      # The CWE goes BEFORE the evidence, not after: evidence is the one variable-width field
+      # here (an accumulating code's is a whole ", "-joined list), so appending after it would
+      # push the id off the right of a terminal on exactly the findings that have the most to
+      # say. An unmapped code (tech_*, jwt_in_*, custom_*) contributes nothing — see Probe::CWE.
       def self.probe_group_text(g : Probe::Group) : String
         String.build do |io|
           io << "[#{g.severity.label}]".ljust(11)
           io << g.code.ljust(28)
           io << "  " << term_safe(g.host)
           io << "  ×" << g.hit_count
+          if cwe = Probe.cwe_id(g.code)
+            io << "  " << cwe
+          end
           if ev = g.evidence
             io << "  " << term_safe(ev)
           end
@@ -425,8 +433,9 @@ module Gori
         JSON.build { |j| j.array { issues.each { |i| Probe.issue_json(j, i) } } }
       end
 
-      # "12   [high]      secret_in_url   api.test   ×3   open   token"
-      # Leads with the id, because every triage subcommand addresses a finding by it.
+      # "12   [high]      secret_in_url   api.test   ×3   open   CWE-598   token"
+      # Leads with the id, because every triage subcommand addresses a finding by it. CWE sits
+      # ahead of the variable-width evidence for the same reason as probe_group_text.
       def self.probe_issue_text(i : Store::ProbeIssue) : String
         String.build do |io|
           io << i.id.to_s.ljust(5)
@@ -435,6 +444,9 @@ module Gori
           io << "  " << term_safe(i.host)
           io << "  ×" << i.hit_count
           io << "  " << i.status.label
+          if cwe = Probe.cwe_id(i.code)
+            io << "  " << cwe
+          end
           if ev = i.evidence
             io << "  " << term_safe(ev)
           end

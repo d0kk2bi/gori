@@ -498,7 +498,13 @@ module Gori::Tui
     private def preview_lines(issue : Store::ProbeIssue) : Array({Color, String})
       lines = [] of {Color, String}
       lines << {Theme.text_bright, "#{severity_badge(issue.severity)}  #{issue.title}"}
-      lines << {Theme.muted, "#{issue.host}  ·  #{issue.category}  ·  #{issue.status.label}  ·  ×#{Fmt.count(issue.hit_count)}"}
+      meta = "#{issue.host}  ·  #{issue.category}  ·  #{issue.status.label}  ·  ×#{Fmt.count(issue.hit_count)}"
+      # A code with no CWE (tech fingerprint, the informational jwt_in_* notes, a custom rule)
+      # is unmapped on purpose — append nothing rather than a placeholder.
+      if id = Probe.cwe_id(issue.code)
+        meta = "#{meta}  ·  #{id}"
+      end
+      lines << {Theme.muted, meta}
       if ev = issue.evidence
         lines << {Theme.muted, "detail  #{ev}"}
       end
@@ -650,7 +656,14 @@ module Gori::Tui
       cx = rect.x + 1
       cx = chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
       cx = chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
-      chip(screen, cx + 1, rect.y + 1, " #{issue.category} ", Theme.muted)
+      cx = chip(screen, cx + 1, rect.y + 1, " #{issue.category} ", Theme.muted)
+      # CWE last, and only when the whole chip fits: `chip` draws through screen.text with no
+      # width cap, so an unguarded one on a narrow pane would run past the pane's right edge and
+      # paint over the neighbouring column. Dropping it is the right degradation — the id is also
+      # on the preview meta line and in every export.
+      if (id = Probe.cwe_id(issue.code)) && cx + 1 + id.size + 2 <= rect.right
+        chip(screen, cx + 1, rect.y + 1, " #{id} ", Theme.muted)
+      end
 
       hint = detail_hint(issue.code)
       screen.text(rect.x + 1, rect.y + 2, hint, Theme.muted, width: w) unless hint.empty?

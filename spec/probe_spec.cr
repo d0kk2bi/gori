@@ -4119,3 +4119,302 @@ describe "Gori::Probe::Triage" do
     end
   end
 end
+
+# The in-memory fold (`gori run probe`, MCP probe_scan) and the SQL upsert (TUI/capture) must
+# agree on which codes accumulate their evidence. They did not: Group kept its own three-code
+# copy of the list while Store's had grown to five, so a headless scan reported ONE of a host's
+# third-party hosts and dropped the rest. Both now read Store::ACCUMULATING_EVIDENCE_CODES.
+describe "Gori::Probe evidence accumulation (Group ↔ Store parity)" do
+  # Build N detections of one code on one host, each carrying a different evidence label.
+  private_labels = ->(code : String, labels : Array(String)) do
+    labels.map_with_index do |label, i|
+      Gori::Probe::Detection.new(code, "headers", "acme.test", "https://acme.test/#{i}",
+        "t", Gori::Store::Severity::Low, label)
+    end
+  end
+
+  it "accumulates missing_sri third-party hosts in a headless fold, not just the first" do
+    dets = private_labels.call("missing_sri", ["cdn.a.test", "cdn.b.test", "cdn.c.test"])
+    g = Gori::Probe.group(dets)
+    g.size.should eq(1)
+    ev = g.first.evidence.not_nil!
+    ev.should contain("cdn.a.test")
+    ev.should contain("cdn.b.test")
+    ev.should contain("cdn.c.test")
+  end
+
+  it "accumulates cookie names so a host with several unflagged cookies names them all" do
+    dets = private_labels.call("cookie_no_httponly", ["sid", "csrf", "pref"])
+    ev = Gori::Probe.group(dets).first.evidence.not_nil!
+    %w[sid csrf pref].each { |n| ev.should contain(n) }
+  end
+
+  it "folds evidence identically in memory and in the DB" do
+    with_store do |store|
+      dets = private_labels.call("missing_sri", ["cdn.a.test", "cdn.b.test"])
+      dets.each { |d| store.upsert_probe_issue(d) }
+      stored = store.probe_issues.find(&.code.==("missing_sri")).not_nil!
+      stored.evidence.should eq(Gori::Probe.group(dets).first.evidence)
+    end
+  end
+
+  it "keeps a first-wins sample for a code that is NOT in the accumulating set" do
+    dets = private_labels.call("weak_csp", ["first", "second"])
+    ev = Gori::Probe.group(dets).first.evidence.not_nil!
+    ev.should eq("first")
+  end
+
+  # merge_evidence dedups by splitting the stored string on ", ", so a per-cookie requirement
+  # list joined the same way would be torn into fragments that read as other cookies' evidence.
+  it "joins one cookie's unmet prefix requirements with ' + ' so the merge cannot split them" do
+    with_store do |store|
+      head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" \
+             "Set-Cookie: __Host-sid=a; Domain=acme.test\r\n\r\n"
+      hit = analyze(store, resp_head: head).find(&.code.==("cookie_prefix_violation")).not_nil!
+      ev = hit.evidence.not_nil!
+      ev.should contain("Secure + Path=/ + no Domain")
+      # Two violating cookies on one host merge into two whole labels, not five fragments.
+      other = Gori::Probe::Detection.new("cookie_prefix_violation", "cookies", "acme.test",
+        "https://acme.test/2", "t", Gori::Store::Severity::Medium, "__Secure-tok: needs Secure")
+      merged = Gori::Probe.group([hit, other]).first.evidence.not_nil!
+      merged.split(", ").size.should eq(2)
+    end
+  end
+end
+
+# The tag-shaped HTML sink checks share their subject with Sri — the tags of one document — so
+# they must share its reach. They used to read the 64 KiB body_text while Sri read the 256 KiB
+# client_body_text, which on a large page reported the unhashed third-party script and stayed
+# silent about the cleartext one beside it.
+describe "Gori::Probe::Passive::BodyLeaks (HTML sinks reach the client body cap)" do
+  # An HTML document whose interesting tag sits PAST the 64 KiB body_text prefix but inside
+  # the 256 KiB client_body_text one.
+  padded = ->(tag : String) do
+    String.build do |io|
+      io << "<html><body>"
+      io << ("<p>filler filler filler</p>" * 4000) # ~104 KiB, past BODY_CAP
+      io << tag << "</body></html>"
+    end
+  end
+
+  it "finds active mixed content past the 64 KiB prefix" do
+    with_store do |store|
+      body = padded.call(%(<script src="http://cdn.acme.test/a.js"></script>))
+      body.bytesize.should be > Gori::Probe::Passive::Context::BODY_CAP
+      codes_of(analyze(store, resp_head: "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
+        body: body)).should contain("mixed_content")
+    end
+  end
+
+  it "finds an insecure form action past the 64 KiB prefix" do
+    with_store do |store|
+      codes_of(analyze(store, resp_head: "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
+        body: padded.call(%(<form action="http://acme.test/login">)))).should contain("insecure_form_action")
+    end
+  end
+
+  # The prefilters are ASCII case-INSENSITIVE byte scans; a case-sensitive includes? would have
+  # silently stopped matching the uppercase markup the /i regexes were written to catch.
+  it "still matches uppercase markup through the literal prefilters" do
+    with_store do |store|
+      found = codes_of(analyze(store, resp_head: "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
+        body: %(<A TARGET="_BLANK" HREF="/x">x</A><IMG SRC="HTTP://acme.test/i.png">)))
+      found.should contain("reverse_tabnabbing")
+      found.should contain("mixed_passive")
+    end
+  end
+end
+
+describe "Gori::Probe.cwe" do
+  # A CWE key that no rule emits is dead metadata nobody would ever notice — a typo'd code
+  # ("secret_in_urls") maps forever and shows up nowhere. REMEDIATION is the de-facto registry
+  # of emitted codes, so every CWE key must appear there.
+  it "maps only codes that findings actually carry" do
+    stray = Gori::Probe::CWE.keys.reject { |c| Gori::Probe::REMEDIATION.has_key?(c) }
+    stray.should be_empty
+  end
+
+  # The inverse: a documented code with no CWE must be one of the deliberate exclusions, so a
+  # newly added rule cannot quietly ship unclassified. Update this list ONLY with the reason.
+  it "leaves exactly the deliberately unmapped codes without a CWE" do
+    unmapped = Gori::Probe::REMEDIATION.keys.reject { |c| Gori::Probe::CWE.has_key?(c) }
+    # jwt_in_body/jwt_in_ws are Info notes on where tokens flow — handing the client its own
+    # token is the design, not a weakness (see Passive::Secrets::JWT).
+    unmapped.sort.should eq(["jwt_in_body", "jwt_in_ws"])
+  end
+
+  it "renders the canonical CWE-<id> identifier and name" do
+    Gori::Probe.cwe_id("dom_xss").should eq("CWE-79")
+    Gori::Probe.cwe_name("cookie_no_httponly").should eq("Sensitive Cookie Without 'HttpOnly' Flag")
+    Gori::Probe.cwe_id("tech_server").should be_nil
+    Gori::Probe.cwe_id("custom_p_1").should be_nil
+  end
+
+  it "emits cwe fields in the shared JSON shape, and omits them when unmapped" do
+    mapped = Gori::Probe::Detection.new("dom_xss", "client", "acme.test", "https://acme.test/",
+      "t", Gori::Store::Severity::Medium)
+    json = Gori::CLI::Output.probe_group_json(Gori::Probe.group([mapped]).first)
+    JSON.parse(json)["cwe"].as_s.should eq("CWE-79")
+    JSON.parse(json)["cwe_name"].as_s.should contain("Cross-site Scripting")
+
+    tech = Gori::Probe::Detection.new("tech_server", "tech", "acme.test", "https://acme.test/",
+      "t", Gori::Store::Severity::Info)
+    parsed = JSON.parse(Gori::CLI::Output.probe_group_json(Gori::Probe.group([tech]).first))
+    parsed.as_h.has_key?("cwe").should be_false
+    parsed.as_h.has_key?("cwe_name").should be_false
+  end
+end
+
+describe "Gori::Probe::Passive::Secrets (provider shapes)" do
+  private_hit = ->(s : String) do
+    Gori::Probe::Passive::Secrets::PATTERNS.select { |(re, _)| re.matches?(s) }.map { |(_, l)| l }
+  end
+
+  it "matches the added provider key shapes" do
+    private_hit.call("sk-ant-api03-#{"a" * 95}").should contain("Anthropic API key")
+    private_hit.call("sk-proj-#{"B" * 60}").should contain("OpenAI project key")
+    private_hit.call("xapp-1-A01BCDEFG-1234567890123-#{"0123456789abcdef" * 4}").should contain("Slack app-level token")
+    private_hit.call("shpat_#{"0" * 32}").should contain("Shopify access token")
+    private_hit.call("123456789:AA#{"F" * 33}").should contain("Telegram bot token")
+    private_hit.call("AccountKey=#{"A" * 86}==").should contain("Azure Storage account key")
+  end
+
+  it "flags a database URI carrying real inline credentials" do
+    private_hit.call("mongodb+srv://root:S3cretPassw0rd@cluster0.abcd.mongodb.net")
+      .should contain("database URI with inline credentials")
+  end
+
+  # The docs/tutorial shape is what a naive scheme://user:pass@host pattern would drown in:
+  # a placeholder password, a loopback host, or a reserved example domain.
+  it "does not flag a documentation-style connection string" do
+    ["postgres://user:pass@localhost:5432/dev",
+     "postgres://user:password@db.example.com/app",
+     "redis://admin:changeme@127.0.0.1:6379",
+     "our keys start with sk-ant- as a prefix"].each do |s|
+      private_hit.call(s).should be_empty
+    end
+  end
+
+  it "reaches the response body through BodyLeaks" do
+    with_store do |store|
+      body = %({"db":"postgres://svc:Hunter2Hunter2@db.internal.acme:5432/main"})
+      codes_of(analyze(store, resp_head: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+        content_type: "application/json", body: body)).should contain("secret_in_body")
+    end
+  end
+end
+
+describe "Gori::Probe::Passive::JsScan (navigation + parsing sinks)" do
+  private_pairs = ->(src : String) do
+    Gori::Probe::Passive::JsScan.source_sink_pairs(Gori::Probe::Passive::JsScan.strip(src))
+  end
+
+  # The window is searched as the two sides AROUND the sink, never across the sink's own text.
+  # Without that, `location.href =` (a sink) pairs with `location.href` (a source) matched in
+  # those very bytes, and every ordinary SPA redirect reports a DOM-XSS lead against itself.
+  it "does not pair a navigation sink with its own text" do
+    private_pairs.call(%(location.href = "/dashboard";)).should be_empty
+    private_pairs.call(%(window.location = "/login";)).should be_empty
+    private_pairs.call(%(if (location.href === x) { go(); })).should be_empty
+  end
+
+  it "pairs a navigation sink with a real taint source" do
+    private_pairs.call(%(location.href = document.referrer;)).should_not be_empty
+    private_pairs.call(%(location.replace(location.hash.slice(1));)).should_not be_empty
+    private_pairs.call(%(window.open(location.search, "_blank");)).should_not be_empty
+    private_pairs.call(%(window.open("/help", "_blank");)).should be_empty
+  end
+
+  it "pairs the HTML-parsing sinks" do
+    private_pairs.call(%(el.appendChild(r.createContextualFragment(location.hash));)).should_not be_empty
+    private_pairs.call(%(new DOMParser().parseFromString(document.URL, "text/html");)).should_not be_empty
+  end
+
+  # The split must not regress the sinks that predate it, including the one whose source sits
+  # INSIDE the sink's arguments (that source is on the POST side, which is still searched).
+  it "keeps the pre-existing pairs" do
+    private_pairs.call(%(o.innerHTML = location.hash;)).should_not be_empty
+    private_pairs.call(%(document.write(document.URL);)).should_not be_empty
+    private_pairs.call(%(o.innerHTML = "<b>static</b>";)).should be_empty
+  end
+end
+
+describe Gori::Probe::Passive::ExposedConfig do
+  private_plain = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+  private_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+
+  it "flags a served .git/config" do
+    with_store do |store|
+      body = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n"
+      dets = analyze(store, resp_head: private_plain, content_type: "text/plain", body: body)
+      hit = dets.find(&.code.==("exposed_config")).not_nil!
+      hit.evidence.should eq(".git/config")
+      hit.severity.should eq(Gori::Store::Severity::High)
+    end
+  end
+
+  it "flags a served .env but not an HTML page documenting the same keys" do
+    with_store do |store|
+      env = "APP_ENV=production\nDB_PASSWORD=s3cr3t-value\nMAIL_PASSWORD=hunter2\n"
+      codes_of(analyze(store, resp_head: private_plain, content_type: "text/plain", body: env))
+        .should contain("exposed_config")
+      # The same key names inside a deployment guide are documentation, not the file.
+      doc = "<html><body><pre>DB_PASSWORD=your-password-here</pre><p>Set these in .env</p></body></html>"
+      codes_of(analyze(store, resp_head: private_html, content_type: "text/html", body: doc))
+        .should_not contain("exposed_config")
+    end
+  end
+
+  it "flags phpinfo(), .htpasswd, wp-config credentials, and actuator env" do
+    with_store do |store|
+      [
+        {"<html><head><title>phpinfo()</title></head><body>PHP Version 8.2.1</body></html>", "text/html", "phpinfo() output"},
+        {"admin:$apr1$abcd1234$0123456789abcdefghijkl\n", "text/plain", ".htpasswd credentials"},
+        {"<?php define('DB_PASSWORD', 'p4ssw0rd'); ?>", "text/plain", "wp-config.php credentials"},
+        {"{\"activeProfiles\":[\"prod\"],\"propertySources\":[{\"name\":\"systemEnvironment\"}]}",
+         "application/json", "Spring actuator env"},
+      ].each do |(body, ct, label)|
+        head = "HTTP/1.1 200 OK\r\nContent-Type: #{ct}\r\n\r\n"
+        hit = analyze(store, resp_head: head, content_type: ct, body: body).find(&.code.==("exposed_config"))
+        hit.not_nil!.evidence.should eq(label)
+      end
+    end
+  end
+
+  # The FP that actually matters: a page that TALKS ABOUT the artifact. Each signature is
+  # anchored on the artifact's own structure, so prose naming it must not match.
+  it "does not flag documentation that merely names these artifacts" do
+    with_store do |store|
+      [
+        "Run phpinfo() to inspect your build; see the phpinfo() docs for details.",
+        "Edit the [core] section of your repository configuration to set autocrlf.",
+        "Generate a .htpasswd with htpasswd -c, then point AuthUserFile at it.",
+        "The propertySources concept in Spring lets you layer configuration.",
+      ].each do |prose|
+        codes_of(analyze(store, resp_head: private_html, content_type: "text/html", body: prose))
+          .should_not contain("exposed_config")
+      end
+    end
+  end
+
+  it "ignores a non-2xx page that echoes the requested path" do
+    with_store do |store|
+      body = "[core]\n\trepositoryformatversion = 0\n"
+      codes_of(analyze(store, resp_head: "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n",
+        content_type: "text/plain", body: body, status: 404)).should_not contain("exposed_config")
+    end
+  end
+
+  it "accumulates every artifact a host serves rather than pinning to the first" do
+    with_store do |store|
+      git = analyze(store, resp_head: private_plain, content_type: "text/plain",
+        target: "/.git/config", body: "[core]\n\trepositoryformatversion = 0\n")
+      env = analyze(store, resp_head: private_plain, content_type: "text/plain",
+        target: "/.env", body: "DB_PASSWORD=s3cr3t-value\n")
+      (git + env).each { |d| store.upsert_probe_issue(d) }
+      ev = store.probe_issues.find(&.code.==("exposed_config")).not_nil!.evidence.not_nil!
+      ev.should contain(".git/config")
+      ev.should contain(".env file")
+    end
+  end
+end

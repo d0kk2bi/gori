@@ -47,10 +47,13 @@ module Gori
           # shows a lower-severity title (reflected_param: non-HTML Low vs HTML Medium). A
           # fixed-title code is unaffected.
           title = d.severity.value > g.severity.value ? d.title : g.title
-          # Type-labeled infoleak codes accumulate every distinct type seen (so a body
-          # or host leaking several secret/error types surfaces them all); others keep
-          # the first representative sample. Mirrors Store#upsert_probe_issue.
-          evidence = accumulate_evidence?(d.code) ? merge_evidence(g.evidence, d.evidence) : (g.evidence || d.evidence)
+          # Type-labeled codes accumulate every distinct label seen (so a host leaking several
+          # secret/error types, or shipping several unflagged cookies, surfaces them all);
+          # others keep the first representative sample. Both the decision and the merge come
+          # from Store so this in-memory fold and the SQL upsert CANNOT drift — they did once,
+          # when missing_sri/jwt_sensitive_claims were added to Store's list and not to a copy
+          # that used to live here, which made a headless scan report one third-party host.
+          evidence = Store.accumulate_evidence?(d.code) ? Store.merge_evidence(g.evidence, d.evidence) : (g.evidence || d.evidence)
           acc[key] = Group.new(g.code, g.category, g.host, title, sev, g.hit_count + 1,
             urls, evidence, g.sample_flow_id, g.sample_repeater_id)
         else
@@ -59,19 +62,6 @@ module Gori
         end
       end
       finish_group_sort(acc)
-    end
-
-    # Codes whose evidence is a TYPE label (not a one-off sample) — see Store.
-    private def self.accumulate_evidence?(code : String) : Bool
-      code == "secret_in_body" || code == "error_stack_leak" || code == "secret_in_ws"
-    end
-
-    private def self.merge_evidence(existing : String?, incoming : String?) : String?
-      return existing if incoming.nil? || incoming.empty?
-      return incoming if existing.nil? || existing.empty?
-      parts = existing.split(", ").map(&.strip).reject(&.empty?)
-      return existing if parts.includes?(incoming) || parts.size >= Store::PROBE_EVIDENCE_CAP
-      (parts << incoming).join(", ")
     end
 
     private def self.finish_group_sort(acc : Hash({String, String}, Group)) : Array(Group)
@@ -105,7 +95,18 @@ module Gori
         j.field "first_seen", i.first_seen
         j.field "last_seen", i.last_seen
         j.field "remediation", Probe.remediation(i.code)
+        cwe_fields(j, i.code)
       end
+    end
+
+    # `cwe`/`cwe_name`, emitted only for a code that HAS a mapping. Absent rather than null:
+    # tech fingerprints, the informational jwt_in_* notes, and custom rules are unmapped on
+    # purpose (see Probe::CWE), and a null would read as "we tried and failed to classify it".
+    private def self.cwe_fields(j : JSON::Builder, code : String) : Nil
+      return unless entry = Probe.cwe(code)
+      id, name = entry
+      j.field "cwe", "CWE-#{id}"
+      j.field "cwe_name", name
     end
 
     # The canonical JSON object for one grouped issue — the single source of the field shape
@@ -125,6 +126,7 @@ module Gori
         j.field "sample_flow_id", g.sample_flow_id
         j.field "sample_repeater_id", g.sample_repeater_id
         j.field "remediation", Probe.remediation(g.code)
+        cwe_fields(j, g.code)
       end
     end
   end

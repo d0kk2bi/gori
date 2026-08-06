@@ -1,5 +1,6 @@
 require "./rule"
 require "./secrets"
+require "../../ascii_bytes"
 
 module Gori
   module Probe
@@ -93,6 +94,17 @@ module Gori
         # safe — a guaranteed false positive on any uppercase markup.
         REL_NOOPENER = /\bno(?:opener|referrer)\b/i
 
+        # Allocation-free literal prefilters for the HTML sink checks, one per group, each a
+        # NECESSARY condition of every regex it guards: the five mixed-content/insecure-form
+        # patterns all end in `http://`, INLINE_JS_URI contains `javascript:`, and ANCHOR_BLANK
+        # contains `_blank`. All those regexes are /i, so the tests are ASCII case-INSENSITIVE
+        # byte scans (AsciiBytes wants an already-lowercase needle) — a case-sensitive
+        # `String#includes?` would have quietly stopped matching `HTTP://` and `_BLANK`.
+        # Held as constants so the slices are built once for the process, not per flow.
+        private HTTP_NEEDLE   = "http://".to_slice
+        private JS_URI_NEEDLE = "javascript:".to_slice
+        private BLANK_NEEDLE  = "_blank".to_slice
+
         def check(ctx : Context, acc : Array(Detection)) : Nil
           return unless ctx.response
           return unless texty?(ctx.content_type)
@@ -133,32 +145,55 @@ module Gori
           # client its own token is the normal design, not a disclosure (see Secrets::JWT).
           acc << leak(ctx, "jwt_in_body", "JSON Web Token in a response body",
             Store::Severity::Info, nil) if Secrets::JWT[0].matches?(text)
-          check_html_sinks(ctx, acc, text) if ctx.html?
+          # The tag-shaped checks read the LARGER prefix (client_body_text, CLIENT_BODY_CAP) —
+          # see check_html_sinks. It is nil only when the body is empty, which `text` above has
+          # already ruled out for this branch, so the fallback is belt-and-braces.
+          check_html_sinks(ctx, acc, ctx.client_body_text || text) if ctx.html?
         end
 
         # HTML-only client-side sink checks: mixed content (active/passive), insecure form
         # actions, javascript: URLs, and reverse-tabnabbing links. Split out of check so each
         # method stays under the complexity budget.
+        #
+        # These read `client_body_text` (CLIENT_BODY_CAP, 256 KiB), NOT the 64 KiB `body_text`
+        # the leak scans above use. A tag is a tag wherever it sits in the document, and the
+        # sibling rule that walks the very same tags — Sri — has always read the larger prefix:
+        # on a 120 KiB page that split reported the unhashed third-party <script> and stayed
+        # silent about the plain-http one beside it. The larger text costs no extra decode (it
+        # is one slice of the same shared buffer, already materialised for every HTML flow by
+        # the client-side rules), so only the SCAN grows — and each check now gates on an
+        # allocation-free literal first, which more than pays that back on a clean page.
+        #
+        # The leak scans (private IP / error / secret) deliberately stay on the 64 KiB prefix:
+        # that is the shared BODY_CAP every non-client rule works from, and widening a content
+        # scan is a different, measurable trade from widening a tag scan.
         private def check_html_sinks(ctx : Context, acc : Array(Detection), text : String) : Nil
-          if ctx.scheme == "https"
-            if MIXED_ACTIVE.matches?(text) || MIXED_ACTIVE_LINK.matches?(text) || MIXED_ACTIVE_OBJECT.matches?(text)
-              acc << Detection.new("mixed_content", Category::HEADERS, ctx.host, ctx.url,
-                "Active mixed content (http:// sub-resource on an HTTPS page)", Store::Severity::Low, nil, ctx.fid)
-            end
-            if MIXED_PASSIVE.matches?(text)
-              acc << Detection.new("mixed_passive", Category::HEADERS, ctx.host, ctx.url,
-                "Passive mixed content (http:// image/media on an HTTPS page)", Store::Severity::Info, nil, ctx.fid)
-            end
-            if INSECURE_FORM.matches?(text)
-              acc << Detection.new("insecure_form_action", Category::HEADERS, ctx.host, ctx.url,
-                "Form on an HTTPS page submits over cleartext http://", Store::Severity::Medium, nil, ctx.fid)
-            end
-          end
-          if INLINE_JS_URI.matches?(text)
+          bytes = text.to_slice
+          check_mixed_content(ctx, acc, text) if ctx.scheme == "https" &&
+                                                 AsciiBytes.contains_ci?(bytes, HTTP_NEEDLE)
+          if AsciiBytes.contains_ci?(bytes, JS_URI_NEEDLE) && INLINE_JS_URI.matches?(text)
             acc << Detection.new("inline_js_uri", Category::CLIENT, ctx.host, ctx.url,
               "javascript: URL in an HTML attribute", Store::Severity::Low, nil, ctx.fid)
           end
-          flag_reverse_tabnabbing(ctx, acc, text)
+          flag_reverse_tabnabbing(ctx, acc, text) if AsciiBytes.contains_ci?(bytes, BLANK_NEEDLE)
+        end
+
+        # The three cleartext-subresource findings on an HTTPS page. Reached only once the
+        # `http://` prefilter has passed, so a page with no cleartext URL at all pays one byte
+        # scan instead of five PCRE passes.
+        private def check_mixed_content(ctx : Context, acc : Array(Detection), text : String) : Nil
+          if MIXED_ACTIVE.matches?(text) || MIXED_ACTIVE_LINK.matches?(text) || MIXED_ACTIVE_OBJECT.matches?(text)
+            acc << Detection.new("mixed_content", Category::HEADERS, ctx.host, ctx.url,
+              "Active mixed content (http:// sub-resource on an HTTPS page)", Store::Severity::Low, nil, ctx.fid)
+          end
+          if MIXED_PASSIVE.matches?(text)
+            acc << Detection.new("mixed_passive", Category::HEADERS, ctx.host, ctx.url,
+              "Passive mixed content (http:// image/media on an HTTPS page)", Store::Severity::Info, nil, ctx.fid)
+          end
+          if INSECURE_FORM.matches?(text)
+            acc << Detection.new("insecure_form_action", Category::HEADERS, ctx.host, ctx.url,
+              "Form on an HTTPS page submits over cleartext http://", Store::Severity::Medium, nil, ctx.fid)
+          end
         end
 
         # A target="_blank" anchor with no rel=noopener/noreferrer lets the opened page repoint

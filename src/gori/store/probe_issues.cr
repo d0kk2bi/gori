@@ -43,7 +43,7 @@ module Gori
           # for this (code, host) group so a later flow's different secret/error type
           # isn't masked by the first-wins COALESCE. Other codes keep their first
           # representative sample.
-          new_evidence = accumulate_evidence?(d.code) ? merge_evidence(prev_evidence, d.evidence) : (prev_evidence || d.evidence)
+          new_evidence = Store.accumulate_evidence?(d.code) ? Store.merge_evidence(prev_evidence, d.evidence) : (prev_evidence || d.evidence)
           c.exec("UPDATE probe_issues SET hit_count = hit_count + 1, affected = ?, severity = ?, " \
                  "title = ?, evidence = ?, last_seen = ? WHERE id = ?",
             urls.to_json, new_sev, new_title, new_evidence, ts, id)
@@ -60,22 +60,34 @@ module Gori
       bump_probe_generation if wrote # after commit (exec_task blocks until writer replies)
     end
 
-    # Codes whose evidence is a TYPE label (not a one-off sample), so a (code, host)
-    # group should list every distinct type seen rather than pin to the first. `missing_sri`
-    # and `jwt_sensitive_claims` belong here for the same reason: one host's third-party hosts
-    # (and one host's sensitive claim names) are a SET that only the union describes.
-    private def accumulate_evidence?(code : String) : Bool
-      case code
-      when "secret_in_body", "error_stack_leak", "secret_in_ws",
-           "missing_sri", "jwt_sensitive_claims"
-        true
-      else
-        false
-      end
+    # Codes whose evidence is a TYPE LABEL drawn from a small vocabulary (a secret kind, an
+    # error class, a third-party host, a cookie name, a claim name) rather than a one-off
+    # sample. For these, a (code, host) group is only described by the UNION of what it saw:
+    # first-wins would report one of a host's five insecure cookies, or one of its third
+    # parties, and silently drop the rest.
+    #
+    # THIS IS THE ONE LIST. `Probe::Group` folds detections in memory for the headless
+    # `gori run probe` / MCP `probe_scan` path and must fold them identically, so it reads
+    # this set rather than keeping its own copy — which is exactly how `missing_sri` and
+    # `jwt_sensitive_claims` came to accumulate in the DB but not in a headless scan.
+    #
+    # Membership requires the evidence string to survive a `", "` split/re-join round trip
+    # (see merge_evidence): a label that embeds its own ", " would be split into fragments.
+    # `jwt_sensitive_claims` is already a ", "-joined claim list, which is idempotent here;
+    # `cookie_prefix_violation` joins its unmet requirements with " + " for the same reason.
+    ACCUMULATING_EVIDENCE_CODES = Set{
+      "secret_in_body", "error_stack_leak", "secret_in_ws",
+      "missing_sri", "jwt_sensitive_claims", "secret_in_url", "exposed_config",
+      "cookie_no_secure", "cookie_no_httponly", "cookie_no_samesite",
+      "cookie_samesite_none_insecure", "cookie_prefix_violation",
+    }
+
+    def self.accumulate_evidence?(code : String) : Bool
+      ACCUMULATING_EVIDENCE_CODES.includes?(code)
     end
 
     # Union of distinct evidence labels for one issue group, ", "-joined and capped.
-    private def merge_evidence(existing : String?, incoming : String?) : String?
+    def self.merge_evidence(existing : String?, incoming : String?) : String?
       return existing if incoming.nil? || incoming.empty?
       return incoming if existing.nil? || existing.empty?
       parts = existing.split(", ").map(&.strip).reject(&.empty?)

@@ -657,7 +657,9 @@ module Gori
             "hard-block). Returns " \
             "{flows_scanned, repeaters_scanned, issue_count, issues:[{code, category, host, " \
             "title, severity, hit_count, affected, affected_count, evidence, sample_flow_id, " \
-            "sample_repeater_id, remediation}]}, highest-severity first. Writes nothing." do |s|
+            "sample_repeater_id, remediation, cwe, cwe_name}]}, highest-severity first. " \
+            "`cwe`/`cwe_name` are OMITTED for a code with no meaningful CWE — a technology " \
+            "fingerprint, an informational jwt_in_* note, or a custom rule. Writes nothing." do |s|
             s.field "query", strprop("gori QL filter applied to History flows only; empty scans all (Repeater tabs are always scanned)")
             s.field "active", boolprop("also run active checks that SEND probe requests (default false = passive, request-free); requires write access + a configured scope")
             s.field "severity", strprop("only return issues at/above this level (info|low|medium|high|critical)")
