@@ -394,6 +394,16 @@ module Gori
       # would ship a token minutes-to-days stale into the run and produce the page of 401s the
       # feature exists to remove.
 
+      # The {scheme, host, target} `guard_outbound` judges a `--bind-from` seed by. Named rather
+      # than inlined so the decision is spec-able without a live send, the way
+      # `repeater_out_of_scope?` is for `gori run repeater`. The target comes from
+      # `Outbound.request_target` — the one home for reading a request-target off raw bytes,
+      # which recovers it from an irregular request line instead of gating an empty path.
+      private def self.bind_from_scope_triple(built : Repeater::FlowRequest::Built) : {String, String, String}
+        scheme, host, _port = Repeater::FlowRequest.parse_target(built.target)
+        {scheme, host, Gori::Outbound.request_target(built.bytes)}
+      end
+
       # Replay flow `flow_id` through `Repeater::Sender` — the one extraction source — so its
       # response can fill the binding table before the sweep starts. Aborts on anything that
       # leaves the table unfilled: a seed that silently did nothing would hand the operator
@@ -419,6 +429,17 @@ module Gori
         if err = bind_from_blocker(bindings)
           abort "#{cmd}: #{err}"
         end
+        # Layer 1, on the SEED's own host — which is not the sweep's. Each command guards its
+        # `--target` with `guard_outbound` before it gets here, but `--bind-from FLOW-ID` names
+        # a second, unrelated destination: whatever host that capture was taken from. Without
+        # this the seed replayed a full captured request — cookies and all — to an out-of-scope
+        # host that the very same invocation would have refused as a `--target`, and only
+        # Sandbox/excludes (Layer 2, inside `Repeater::Sender`) could stop it. `Outbound` exists
+        # so no active request leaves gori without a scope decision; a replay is an active
+        # request. `--allow-unscoped` still waives it, exactly as it does for the sweep.
+        # Same gap, same shape, and the same fix as #406 gave `gori run repeater`.
+        gs, gh, gt = bind_from_scope_triple(built)
+        guard_outbound(outbound, gs, gh, gt, "#{cmd}: --bind-from")
         # `evidence: true` is not conditional here and cannot be: `built` is
         # `Repeater::FlowRequest.build(detail)`, which reads `request_head`/`request_body` and
         # nothing else, and the operator supplied one integer. There is no draft on this path

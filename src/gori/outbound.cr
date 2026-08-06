@@ -1,6 +1,7 @@
 require "uri"
 require "./scope"
 require "./store"
+require "./proxy/codec/http1"
 
 module Gori
   # THE outbound chokepoint for gori-originated ("active") traffic.
@@ -281,41 +282,22 @@ module Gori
     # request-target is recovered from a malformed request line. (The bytes themselves still
     # go on the wire byte-exact — P7 — this only feeds the scope decision.)
     #
-    # SCOPE OF THIS FIX: `Outbound` only — repeater/fuzz/mine/sequence/discover/active-probe.
-    # The PROXY path does not come through here: ClientConn passes
-    # `Codec::Http1.parse_request_head`'s `target` (a plain `split(' ')[1]?`) straight to
-    # `Interceptor#sandbox_blocks?` / `#intercepts_request?` / `#intercepts_response?`
-    # (client_conn.cr:241, :267, :494), so the same doubled-space/tab line still yields an
-    # empty target there. Verified against 0.2.0: with `include host:…` + `exclude string:/x`
-    # and Sandbox ON, `GET  /x  HTTP/1.1` reaches the origin while `GET /x HTTP/1.1` is 403'd;
-    # with a URL-keyed include it inverts and fails closed. Do not read this comment as
-    # covering the proxy gate.
+    # It ALSO reads from the first NON-BLANK line rather than blindly the first: a raw request
+    # may arrive with leading blank line(s) — an operator's authored bytes, or a peer that emits
+    # an empty line before the request-line — and reading the first line blindly gates the
+    # innocuous "/" while the REAL target sits on a later line and goes on the wire.
+    #
+    # ONE HOME: the recovery itself now lives on `Codec::Http1.request_target_line`, because the
+    # PROXY gate needs the identical predicate (`Codec::Http1.gate_target` — read its comment
+    # for the bypass it closes) and re-deriving a request-line rule next to a new caller is the
+    # shape AGENTS.md flags as thrice-recurring (#390/#394/#397). `Outbound` keeps these two
+    # names because ~20 active-send call sites and `spec/outbound_spec.cr` speak them.
     def self.request_target(bytes : Bytes) : String
-      request_target_line(String.new(bytes))
+      Proxy::Codec::Http1.request_target_line(String.new(bytes))
     end
 
     def self.request_target(text : String) : String
-      request_target_line(text)
-    end
-
-    # Read the request-TARGET off the request line — but from the first NON-BLANK line,
-    # not blindly the first line. A raw request may arrive with LEADING BLANK LINE(S)
-    # (an operator's authored bytes, or a peer that emits an empty line before the
-    # request-line); `each_line.first?` would then read an empty ("" / bare "\r") first
-    # line, `split[1]?` it to nil, and gate the innocuous "/" while the REAL target sits
-    # on a later line and goes on the wire — a scope/Sandbox bypass, the same failure mode
-    # as the doubled-space case below. So skip leading blank / whitespace-only lines, then
-    # split. The no-arg `split` still collapses whitespace runs (doubled space / tab) and
-    # drops empty parts, and tolerates a stray trailing "\r", so the malformed-first-line
-    # recovery is unchanged; a line with no target (or an all-blank input) still degrades
-    # to "/". The bytes themselves reach the wire byte-exact (P7) — only what the gate
-    # READS changes. (Still `Outbound`-only; see the proxy-gate caveat above.)
-    private def self.request_target_line(text : String) : String
-      text.each_line do |line|
-        next if line.strip.empty? # skip a leading blank / whitespace-only line (incl. a bare "\r")
-        return line.split[1]? || "/"
-      end
-      "/"
+      Proxy::Codec::Http1.request_target_line(text)
     end
 
     # The URL the gate evaluates, ALWAYS anchored on the DIAL target (the scheme/host the

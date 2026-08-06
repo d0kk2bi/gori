@@ -543,16 +543,30 @@ module Gori
       end
     end
 
-    # Retention sweep: keep only the newest `@retention_flows` flows (by id, which
-    # is monotonic), cascading to their ws messages and orphaned h2 frames/conns.
+    # Retention sweep: keep only the newest `@retention_flows` flows, cascading to their ws
+    # messages and orphaned h2 frames/conns.
     # A failure here must not kill the writer or lose the just-committed batch, so
     # it runs in its own transaction and swallows errors (the next sweep, after
     # another PRUNE_INTERVAL inserts, simply tries again).
+    #
+    # The cutoff is the id of the OLDEST flow that SURVIVES, seeked from the rows that actually
+    # exist — deliberately not `MAX(id) - @retention_flows`. `flows.id` is monotonic but NOT
+    # gapless (INTEGER PRIMARY KEY without AUTOINCREMENT, and `delete_flow`/`delete_flows` remove
+    # arbitrary mid-history ids from the History tab, MCP and `gori run history`), and that
+    # arithmetic is "the newest N" only on a gap-free space. With 10 flows of which 6
+    # mid-history ones were hand-deleted (1, 2, 9, 10 survive) and 15 more captured, a cap of 20
+    # computed `cutoff = 25 - 20 = 5` and destroyed flows 1 and 2 — out of 19 rows, under a cap
+    # of 20, where nothing at all should have been dropped. Irreversible, and reported as an
+    # ordinary retention drop. `Compact.prune_old_flows` already documents and fixes this exact
+    # arithmetic; the two sweeps now share one definition of "the newest N".
     private def prune(conn : DB::Connection) : Nil
       return if @retention_flows <= 0
-      max_id = conn.query_one?("SELECT MAX(id) FROM flows", as: Int64?)
-      return unless max_id
-      cutoff = max_id - @retention_flows
+      # Served by the primary key: a rightmost-leaf descending scan of @retention_flows rows.
+      oldest_kept = conn.query_one?(
+        "SELECT MIN(id) FROM (SELECT id FROM flows ORDER BY id DESC LIMIT ?)",
+        @retention_flows, as: Int64?)
+      return unless oldest_kept # no flows at all
+      cutoff = oldest_kept - 1  # everything strictly below the oldest survivor goes
       return if cutoff <= 0
       dropped = 0_i64
       conn.transaction do |tx|

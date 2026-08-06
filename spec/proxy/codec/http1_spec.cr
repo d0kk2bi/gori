@@ -166,4 +166,68 @@ describe Gori::Proxy::Codec::Http1 do
       Http1.request_token_safe?("/검색 ?q=값").should be_false
     end
   end
+
+  describe ".gate_target" do
+    # The target the SCOPE gate reads. `parse_request_head`'s strict `split(' ')` must stay
+    # strict (it feeds resolve_forward/rewrite_request_line, whose `version` is parts[2]), so
+    # the leniency lives here — and ONLY here. See `Http1.gate_target`.
+
+    it "returns the parsed target unchanged for a well-formed request line" do
+      req = Http1.parse_request_head(bytes("GET /admin?q=1 HTTP/1.1\r\nHost: h\r\n\r\n"))
+      req.malformed?.should be_false
+      Http1.gate_target(req).should eq("/admin?q=1")
+      # Same object identity as the parse: the common path allocates nothing new (P6).
+      Http1.gate_target(req).should be(req.target)
+    end
+
+    it "recovers the target a DOUBLED SPACE hid from the strict parse" do
+      # `split(' ')` yields ["GET", "", "/admin", "HTTP/1.1"] — size 4, so `malformed?`, and
+      # `parts[1]?` is the EMPTY string. The gate then evaluated `http://host`, missing an
+      # `exclude string:/admin` that an origin collapsing the whitespace still honours.
+      req = Http1.parse_request_head(bytes("GET  /admin HTTP/1.1\r\nHost: h\r\n\r\n"))
+      req.target.should eq("") # the strict parse is unchanged...
+      req.malformed?.should be_true
+      Http1.gate_target(req).should eq("/admin") # ...and the gate no longer reads it
+    end
+
+    it "recovers the target a TAB hid, which the strict parse turned into garbage" do
+      # Nastier than the empty case: ["GET\t/admin", "HTTP/1.1"] makes `parts[1]?` the
+      # VERSION, so the gate evaluated `http://hostHTTP/1.1` — a string a `string:` rule can
+      # match in ways nobody intended, in either direction.
+      req = Http1.parse_request_head(bytes("GET\t/admin HTTP/1.1\r\nHost: h\r\n\r\n"))
+      req.target.should eq("HTTP/1.1")
+      Http1.gate_target(req).should eq("/admin")
+    end
+
+    it "reads past LEADING BLANK LINES rather than gating an innocuous \"/\"" do
+      # RFC 9112 §2.2 tells a recipient to ignore an empty line before the request-line, so the
+      # real target reaches the origin while the first line the strict parse read was "".
+      req = Http1.parse_request_head(bytes("\r\n\r\nGET /admin HTTP/1.1\r\nHost: h\r\n\r\n"))
+      req.target.should eq("")
+      Http1.gate_target(req).should eq("/admin")
+    end
+
+    it "degrades to \"/\" when the request line carries no target at all" do
+      # Pinned, not incidental: `""` would make the scope URL `http://host` and `"/"` makes it
+      # `http://host/`, which is a different answer for an anchored regex rule. `"/"` is the
+      # value `Outbound.request_target` has always returned, and the two must not disagree.
+      Http1.gate_target(Http1.parse_request_head(bytes("GET\r\nHost: h\r\n\r\n"))).should eq("/")
+      Http1.gate_target(Http1.parse_request_head(bytes("\r\n\r\n"))).should eq("/")
+    end
+
+    it "answers identically to Outbound.request_target on every shape" do
+      # One predicate, one home: `Outbound.request_target` delegates here, so an active send
+      # (fuzz/mine/repeater) and the proxy gate can never grade the same bytes differently.
+      {
+        "GET /a HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET  /a HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET\t/a HTTP/1.1\r\nHost: h\r\n\r\n",
+        "\r\nGET /a HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET\r\nHost: h\r\n\r\n",
+      }.each do |raw|
+        Http1.gate_target(Http1.parse_request_head(bytes(raw)))
+          .should eq(Gori::Outbound.request_target(raw))
+      end
+    end
+  end
 end
