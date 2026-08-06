@@ -93,7 +93,51 @@ describe "ProjectView#commit_scope_rule" do
       view.commit_scope_rule("include", "host", "").should eq(:empty)
       view.commit_scope_rule("include", "regex", "(bad").should eq(:invalid)
       view.commit_scope_rule("include", "host", "127.0.0.1:9091").should eq(:invalid) # host+port can never match
-      view.commit_scope_rule("exclude", "string", "/admin").should eq(:dup)           # same triple, new add
+      view.commit_scope_rule("include", "host", "https://acme.test/x").should eq(:invalid) # URL-shaped host: dead rule
+      view.commit_scope_rule("exclude", "string", "/admin").should eq(:dup)                # same triple, new add
+
+      # A no-op self-edit is NOT a duplicate — the popup re-committing the rule it was seeded
+      # from must not be rejected by the pre-write dup check that splits :dup from :failed.
+      view.commit_scope_rule("exclude", "string", "/admin", updated.id).should eq(:ok)
+    ensure
+      store.close
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
+    end
+  end
+end
+
+# The HOST OVERRIDES inline row serves BOTH add and edit, but reported one `:ok` that the
+# controller toasted as "host override added" even after an edit — and folded a store refusal
+# into `:dup`, telling an operator who was already editing to "edit it (e)".
+describe "ProjectView#ov_commit" do
+  it "distinguishes an add from an edit, and a real duplicate from either" do
+    path = File.tempname("gori-ov-commit", ".db")
+    store = Gori::Store.open(path)
+    begin
+      overrides = Gori::HostOverrides.load(store)
+      view = ProjectView.new(Gori::Scope.load(store), overrides)
+
+      view.ov_add_start
+      "10.0.0.1 staging.acme.test".each_char { |c| view.ov_input(c) }
+      view.ov_commit.should eq(:ok)
+      overrides.connect_address("staging.acme.test").should eq("10.0.0.1")
+
+      # Re-committing the row the edit was SEEDED from is a no-op self-edit, not a duplicate —
+      # the pre-write dup check that splits :dup from :failed has to skip the row being edited.
+      view.ov_edit_start
+      view.ov_commit.should eq(:updated)
+      overrides.connect_address("staging.acme.test").should eq("10.0.0.1")
+
+      view.ov_add_start
+      "10.0.0.9 staging.acme.test".each_char { |c| view.ov_input(c) }
+      view.ov_commit.should eq(:dup) # a DIFFERENT row already maps that host
+      overrides.connect_address("staging.acme.test").should_not eq("10.0.0.9")
+
+      view.ov_add_start
+      "not-an-ip host.test".each_char { |c| view.ov_input(c) }
+      view.ov_commit.should eq(:invalid)
     ensure
       store.close
       File.delete?(path)

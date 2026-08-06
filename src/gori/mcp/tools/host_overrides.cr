@@ -27,17 +27,20 @@ module Gori
         return err("invalid host/ip (host hostname-shaped; ip an IPv4/IPv6 literal, optionally IP:PORT or [v6]:PORT)", "INVALID_ARGUMENT") unless HostOverrides.valid?(host, ip)
         ov = HostOverrides.load(store)
         normalized = host.strip.downcase
-        # host/ip are already validated above and HostOverrides#add reports NOTHING about the
-        # store write, so its only remaining false is a DUPLICATE — a deterministic condition
-        # that can never succeed on retry. Reporting it as retryable PROJECT_BUSY made an agent
-        # that trusts `retryable` loop forever (the #414 shape, fixed there in add_scope_rule).
+        # The DUPLICATE question is deterministic and can never succeed on retry, so answer it
+        # here as a non-retryable INVALID_ARGUMENT — reporting it as retryable PROJECT_BUSY made
+        # an agent that trusts `retryable` loop forever (the #414 shape, fixed there in
+        # add_scope_rule).
         if ov.entries.any? { |e| e.host == normalized }
           return err("a host override for '#{normalized}' already exists (update it by id with update_host_override)",
             "INVALID_ARGUMENT", field: "host")
         end
         unless ov.add(host, ip)
-          return err("host override rejected (host must be hostname-shaped; ip an IPv4/IPv6 literal, optionally IP:PORT or [v6]:PORT)",
-            "INVALID_ARGUMENT", field: "host")
+          # host/ip were validated above and the duplicate is answered above, so what is left is
+          # the store refusing the write — which `add` only started reporting once it verified
+          # the row landed. Before that it returned true here and this tool emitted `{"id": null}`
+          # as success for an override the proxy would never dial.
+          return busy("host override NOT added (store busy or unwritable); no override was created")
         end
         entry = ov.entries.find { |e| e.host == normalized }
         Result.new(JSON.build do |j|

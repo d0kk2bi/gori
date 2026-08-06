@@ -327,4 +327,57 @@ describe Gori::Proxy::Upstream do
       Gori::Proxy::Upstream.loops_to_self?("evil.test", 8070, ov, {"127.0.0.1", 8070}).should be_false
     end
   end
+
+  # Scope and Rules both expose `reload` and are pulled by the TUI's data_version poll
+  # (Runner#apply_external_change) and headless capture's reload fiber (App#spawn_reload_loop);
+  # HostOverrides — read on the SAME dial path, written by the SAME external surfaces
+  # (`gori run project host-override`, MCP add/update/delete_host_override) — had no such
+  # method, so a running session kept dialing the old address for the rest of its life while
+  # the writing surface reported success. `peer` here stands in for that other process.
+  describe "#reload (external writes by a peer process against the same db)" do
+    it "picks up an add, an update and a delete a peer made" do
+      with_store do |store|
+        live = Gori::HostOverrides.load(store) # the running session's proxy + Project pane
+        peer = Gori::HostOverrides.load(store) # `gori run project host-override …`
+
+        peer.add("staging.acme.test", "10.0.0.1").should be_true
+        live.connect_address("staging.acme.test").should be_nil # stale: the whole bug
+        live.reload
+        live.connect_address("staging.acme.test").should eq("10.0.0.1")
+        live.size.should eq(1)
+
+        peer.update(peer.entries.first.id, "staging.acme.test", "10.0.0.2:8443").should be_true
+        live.reload
+        live.connect_address("staging.acme.test").should eq("10.0.0.2:8443")
+
+        peer.remove(peer.entries.first.id).should be_true
+        live.reload
+        live.connect_address("staging.acme.test").should be_nil
+        live.size.should eq(0)
+      end
+    end
+
+    # The stale list also broke the WRITE path, not just lookups: `add` dedupes against its own
+    # in-memory entries, so against a stale list it issued an INSERT the store's
+    # `UNIQUE(host)` + `INSERT OR IGNORE` silently dropped — and the post-write reload then
+    # surfaced the PEER's address under an "override added" toast. Reloading first turns that
+    # into the honest duplicate answer the caller already knows how to report.
+    it "reports a peer-created host as the duplicate it is instead of claiming the write landed" do
+      with_store do |store|
+        live = Gori::HostOverrides.load(store)
+        peer = Gori::HostOverrides.load(store)
+        peer.add("staging.acme.test", "10.0.0.1").should be_true
+
+        # Even WITHOUT a reload first — the in-memory dedupe can't see the peer's row, so the
+        # INSERT OR IGNORE is dropped by UNIQUE(host). `add` used to return true anyway and the
+        # caller announced an override at 10.9.9.9 that the proxy would never dial.
+        live.add("staging.acme.test", "10.9.9.9").should be_false
+        live.connect_address("staging.acme.test").should eq("10.0.0.1") # peer's value, unclaimed
+
+        live.reload
+        live.add("staging.acme.test", "10.9.9.9").should be_false
+        live.connect_address("staging.acme.test").should eq("10.0.0.1")
+      end
+    end
+  end
 end

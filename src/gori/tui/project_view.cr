@@ -576,17 +576,25 @@ module Gori::Tui
       @scope.rules[@sel]?
     end
 
-    # Commit from the SCOPE popup. Returns :ok | :empty | :invalid | :dup for toasts.
+    # Commit from the SCOPE popup. Returns :ok | :empty | :invalid | :dup | :failed for toasts.
+    # :dup and :failed are answered separately because they send the operator to different
+    # places — "you already have this rule" vs "the store refused the write, the scope is
+    # unchanged". Scope#add/#update collapse both into one false, so the duplicate is settled
+    # HERE (against the same rules the popup was seeded from) and whatever false survives that
+    # is the store.
     def commit_scope_rule(kind : String, match_type : String, pattern : String, edit_id : Int64? = nil) : Symbol
       pattern = pattern.strip
       return :empty if pattern.empty?
       return :invalid unless Scope.valid?(match_type, pattern)
+      if @scope.rules.any? { |r| r.id != edit_id && r.kind == kind && r.match_type == match_type && r.pattern == pattern }
+        return :dup
+      end
       ok = if id = edit_id
              @scope.update(id, kind, match_type, pattern)
            else
              @scope.add(kind, match_type, pattern)
            end
-      return :dup unless ok
+      return :failed unless ok
       clamp_sel
       :ok
     end
@@ -598,6 +606,15 @@ module Gori::Tui
       @scope.remove(rule.id)
       clamp_sel
       rule.pattern
+    end
+
+    # Pull BOTH list selections back inside their (possibly externally shrunk) lists. Called
+    # by the controller after Runner#apply_external_change reloaded the live Scope /
+    # HostOverrides — this view renders straight out of those objects, so a peer process
+    # deleting the last rule would otherwise leave the highlight past the end.
+    def clamp_selections : Nil
+      clamp_sel
+      clamp_ov_sel
     end
 
     private def clamp_sel : Nil
@@ -667,24 +684,33 @@ module Gori::Tui
     end
 
     # Commit the add/edit row. Parses "IP host" (/etc/hosts order — IP first). Returns
-    # :ok | :empty | :invalid | :dup so the controller toasts.
+    # :ok | :updated | :empty | :invalid | :dup | :failed so the controller toasts.
+    #
+    # :ok vs :updated because this row serves BOTH actions and the one toast it had said
+    # "added" after an edit. :dup vs :failed for the same reason commit_scope_rule splits
+    # them: HostOverrides#add/#update collapse "that host is already mapped" and "the store
+    # refused the write" into one false, and on the EDIT path the duplicate reading was
+    # simply wrong — it told an operator fixing an address to "edit it (e)", which is what
+    # they were already doing.
     def ov_commit : Symbol
       text = @ov_input.strip
       return :empty if text.empty?
       parsed = HostOverrides.parse_line(text)
       return :invalid unless parsed
       host, ip = parsed
-      ok = if id = @ov_edit_id
-             @host_overrides.update(id, host, ip)
-           else
-             added = @host_overrides.add(host, ip)
-             @ov_sel = @host_overrides.entries.size - 1 if added # select the new row, like ENV add
-             added
-           end
-      return :dup unless ok
-      cancel_ov_add
-      clamp_ov_sel
-      :ok
+      return :dup if @host_overrides.entries.any? { |e| e.id != @ov_edit_id && e.host == host }
+      if id = @ov_edit_id
+        return :failed unless @host_overrides.update(id, host, ip)
+        cancel_ov_add
+        clamp_ov_sel
+        :updated
+      else
+        return :failed unless @host_overrides.add(host, ip)
+        @ov_sel = @host_overrides.entries.size - 1 # select the new row, like ENV add
+        cancel_ov_add
+        clamp_ov_sel
+        :ok
+      end
     end
 
     # Removes the selected override, returning its host (for the toast) or nil.

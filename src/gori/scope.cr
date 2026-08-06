@@ -331,7 +331,15 @@ module Gori
     end
 
     # Add a rule (validates regex, dedupes on the kind/type/pattern triple). Returns
-    # false (no-op) on an empty pattern, an invalid regex, or a duplicate.
+    # false (no-op) on an empty pattern, an invalid regex, a duplicate — or a store write
+    # that did not commit.
+    #
+    # That last case used to return TRUE: unlike update/remove (exec_task_ok) the INSERT goes
+    # through exec_task, which reports nothing, so a busy/locked/closing store rolled the
+    # batch back and `add` still said yes. The rule then wasn't in the store OR in @rules, and
+    # every caller reported a rule that gates traffic but does not exist — MCP even emitted
+    # `{"id": null}` as ordinary success. The reload right above already fetches the truth, so
+    # the answer is simply to look: present ⇒ stored.
     def add(kind : String, match_type : String, pattern : String) : Bool
       pattern = pattern.strip
       return false if pattern.empty? || !Scope.valid?(match_type, pattern)
@@ -339,8 +347,8 @@ module Gori
         return false if @rules.any? { |r| r.kind == kind && r.match_type == match_type && r.pattern == pattern }
         @store.add_scope_rule(kind, match_type, pattern)
         reload_rules_unlocked
+        @rules.any? { |r| r.kind == kind && r.match_type == match_type && r.pattern == pattern }
       end
-      true
     end
 
     # Edit a rule in place (by id). Same validation; dedupes against OTHER rules so a
@@ -413,14 +421,18 @@ module Gori
     #           claimed actually hold for the next caller.
     #   regex — must compile (the SQLite REGEXP callback + the proxy hot path both call
     #           Regex.new and would otherwise raise).
-    #   host  — must NOT carry a :PORT. A host rule matches the BARE host on any port
-    #           (Rule#host_match? compares the port-less host, and the scope URL built by
-    #           request_url carries no port for origin-form flows), so "127.0.0.1:9091"
-    #           could NEVER match and would sit in the store as a silent dead rule.
+    #   host  — must be a BARE host: no scheme, path, userinfo, query/fragment or whitespace
+    #           (host_pattern_shape_error), and no :PORT. A host rule matches the BARE host on
+    #           any port (Rule#host_match? compares the port-less host, and the scope URL built
+    #           by request_url carries no port for origin-form flows), so "127.0.0.1:9091" or
+    #           "https://acme.test/admin" could NEVER match and would sit in the store as a
+    #           silent dead rule.
     def self.validation_error(match_type : String, pattern : String) : String?
       case match_type
       when "host"
-        if host_pattern_has_port?(pattern)
+        if e = host_pattern_shape_error(pattern)
+          e
+        elsif host_pattern_has_port?(pattern)
           "host rule must not include a port — a host rule already matches every port; " \
           "use the bare host #{host_without_port(pattern).inspect} (matches any port)"
         end
@@ -437,6 +449,53 @@ module Gori
     # callers use (Scope#add/#update gate, the overlay's Save-button + commit path).
     def self.valid?(match_type : String, pattern : String) : Bool
       validation_error(match_type, pattern).nil?
+    end
+
+    # Characters a request host can NEVER contain, so a host-type pattern carrying one can
+    # never fire. Deliberately a BLACKLIST, not a hostname whitelist: an IDN target typed in
+    # its unicode form, or a name with an underscore, is the operator's business — only the
+    # shapes that are provably dead are rejected.
+    HOST_PATTERN_FORBIDDEN = {'/', '\\', '?', '#', '@'}
+
+    # A host rule matches the BARE host of a request (Rule#host_match? / host_cond both
+    # compare against the `host` column alone), so a pattern carrying a scheme, a path,
+    # userinfo, a query/fragment or whitespace is a rule that matches NOTHING while sitting
+    # in the operator's scope list looking configured. That is worse than a typo in both
+    # directions: a dead INCLUDE under the Sandbox blocks ALL traffic while `include_count`
+    # stays non-zero, so even the "blocks everything" warning stays quiet; a dead EXCLUDE
+    # fails OPEN and carves out nothing. Same silent-dead-rule failure the :PORT check below
+    # prevents, and the same mistake that produces it — pasting a URL where a host goes.
+    private def self.host_pattern_shape_error(pattern : String) : String?
+      offender = pattern.each_char.find { |c| c.whitespace? || c.in?(HOST_PATTERN_FORBIDDEN) }
+      return nil unless offender
+      shown = offender.whitespace? ? "whitespace" : offender.to_s.inspect
+      base = "host rule must be a bare host — #{pattern.inspect} contains #{shown}, " \
+             "which a request host never does"
+      if suggestion = host_from_urlish(pattern)
+        "#{base}; use #{suggestion.inspect} (a host rule already matches every scheme, port and path)"
+      else
+        "#{base} (use a string or regex rule to match a URL)"
+      end
+    end
+
+    # Best-effort "what the operator meant": the host of a URL-ish pattern, with the scheme,
+    # userinfo, path/query/fragment and :PORT peeled off. nil when what's left still isn't
+    # host-shaped (e.g. "acme.test admin", where guessing which half was meant would be
+    # worse than saying nothing), so the message degrades to the plain complaint rather than
+    # suggesting a pattern that is itself dead.
+    private def self.host_from_urlish(pattern : String) : String?
+      s = pattern.strip
+      if i = s.index("://")
+        s = s[(i + 3)..]
+      end
+      s = s.split(/[\/?#]/, 2).first
+      if at = s.rindex('@')
+        s = s[(at + 1)..]
+      end
+      return nil if s.empty?
+      return nil if s.each_char.any? { |c| c.whitespace? || c.in?(HOST_PATTERN_FORBIDDEN) }
+      s = host_without_port(s) if host_pattern_has_port?(s)
+      bare_host(s).presence
     end
 
     # True ⇔ a host-type pattern carries an explicit :PORT suffix a host rule can never

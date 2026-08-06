@@ -595,6 +595,72 @@ describe Gori::Scope do
   end
 end
 
+# A host rule matches the BARE host, so a pattern carrying a scheme/path/userinfo/whitespace
+# can never fire — the same silent-dead-rule failure the :PORT check prevents, reached by the
+# same mistake (pasting a URL where a host goes). Only the port shape was checked, so
+# `include host https://acme.test/admin` was stored, listed as configured scope, and matched
+# nothing: fail-CLOSED under the Sandbox (every request blocked while include_count stays
+# non-zero, so even the "blocks everything" warning stays quiet) and fail-OPEN as an exclude.
+describe "Gori::Scope host-rule shape validation" do
+  it "proves the URL-shaped host pattern it now rejects could never have matched" do
+    # Built directly (bypassing validation), the way a pre-existing stored row would be.
+    rule = Gori::Scope::Rule.new(1_i64, "include", "host", "https://acme.test/admin")
+    rule.matches?("https://acme.test/admin", "acme.test").should be_false
+    rule.matches?("https://acme.test/", "acme.test").should be_false
+  end
+
+  it "rejects a scheme/path/userinfo/whitespace host pattern and names the bare host to use" do
+    {
+      "https://acme.test"           => "acme.test",
+      "http://acme.test/admin"      => "acme.test",
+      "acme.test/admin"             => "acme.test",
+      "https://user@acme.test/x"    => "acme.test",
+      "https://acme.test:8443/api"  => "acme.test", # scheme AND port peeled for the suggestion
+      "https://[::1]:8443/api"      => "::1",       # bare IPv6 form, matching the port check's advice
+      "acme.test?q=1"               => "acme.test",
+      "https://*.acme.test/"        => "*.acme.test", # a glob survives the peel
+    }.each do |pattern, suggestion|
+      Gori::Scope.valid?("host", pattern).should be_false
+      err = Gori::Scope.validation_error("host", pattern).not_nil!
+      err.should contain("bare host")
+      err.should contain(suggestion.inspect)
+      # The suggestion is itself storable — following the advice must not land on a second
+      # rejection (this is what the :PORT check's "use the bare host" contract already promises).
+      Gori::Scope.valid?("host", suggestion).should be_true
+    end
+  end
+
+  it "rejects whitespace but suggests nothing rather than guessing which half was meant" do
+    err = Gori::Scope.validation_error("host", "acme.test admin").not_nil!
+    err.should contain("whitespace")
+    err.should contain("string or regex") # points at the rule types that CAN match a URL
+    err.should_not contain("\"acme.test\"")
+  end
+
+  it "leaves every legitimate host pattern (and string/regex rules) alone" do
+    ["acme.test", "*.acme.test", "api.acme.test", "127.0.0.1", "::1", "fe80::1", "[::1]",
+     "under_score.test", "xn--9n2bp8q.test", "한국.test"].each do |p|
+      Gori::Scope.validation_error("host", p).should be_nil
+    end
+    # string/regex rules match the whole URL, so URL syntax is exactly what belongs there.
+    Gori::Scope.valid?("string", "https://acme.test/admin").should be_true
+    Gori::Scope.valid?("regex", "^https://acme\\.test/admin").should be_true
+  end
+
+  it "keeps the dead rule out of the store on add AND on update" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "https://acme.test/admin").should be_false
+      store.scope_rules.should be_empty
+
+      scope.add("include", "host", "acme.test").should be_true
+      id = scope.rules.first.id
+      scope.update(id, "include", "host", "https://acme.test/admin").should be_false
+      scope.rules.first.pattern.should eq("acme.test") # still gating traffic, unchanged
+    end
+  end
+end
+
 describe Gori::QL do
   it "ANDs two filters and absorbs the empty filter" do
     a = Gori::QL::Filter.new("host = ?", ["x"] of DB::Any)

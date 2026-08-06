@@ -17,13 +17,22 @@ module Gori
           return err(e, "INVALID_ARGUMENT", field: "pattern")
         end
         scope = Scope.load(store)
-        unless scope.add(kind, match_type, pattern)
-          # kind/match_type/pattern are already validated above, so a false here means the rule
-          # is a DUPLICATE — a deterministic condition that will never succeed on retry. Report it
-          # as a non-retryable INVALID_ARGUMENT, not PROJECT_BUSY/retryable (which made an agent
-          # that trusts `retryable` loop forever, #414).
+        # Answer the DUPLICATE question here, before the write, the way add_host_override does.
+        # It is deterministic and will never succeed on retry, so it must be a non-retryable
+        # INVALID_ARGUMENT — reporting it as PROJECT_BUSY/retryable made an agent that trusts
+        # `retryable` loop forever (#414).
+        if scope.rules.any? { |r| r.kind == kind && r.match_type == match_type && r.pattern == pattern }
           return err("scope rule already exists (identical kind/match_type/pattern)",
             "INVALID_ARGUMENT", field: "pattern")
+        end
+        unless scope.add(kind, match_type, pattern)
+          # Everything deterministic is now ruled out above (kind/match_type/pattern validated,
+          # duplicate answered), so the remaining false is the store refusing the write — which
+          # `add` only started reporting once it verified the row landed. Before that it returned
+          # true here and this tool emitted `{"id": null}` as success for a rule that does not
+          # exist and gates nothing. A racing peer that created the same rule in between lands
+          # here too; the retry then gets the deterministic duplicate answer above.
+          return busy("scope rule NOT added (store busy or unwritable); the scope is unchanged")
         end
         # Scope#add reloads @rules from the store before returning, so this lookup
         # already sees the freshly assigned id.

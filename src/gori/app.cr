@@ -385,6 +385,14 @@ module Gori
             rescue ex
               Log.error(exception: ex) { "scope rule reload failed" }
             end
+            begin
+              # The per-project /etc/hosts is read on the SAME dial path as the two above and
+              # is edited by the same external surfaces (`gori run project host-override`,
+              # MCP add/update/delete_host_override), so it goes stale the same way.
+              session.host_overrides.reload
+            rescue ex
+              Log.error(exception: ex) { "host override reload failed" }
+            end
           end
         end
       end

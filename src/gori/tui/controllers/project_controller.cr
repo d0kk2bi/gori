@@ -324,6 +324,14 @@ module Gori::Tui
       @project_view.reload(@host.session.project, @host.session.store)
     end
 
+    # Runner#apply_external_change already refreshed the live Scope / HostOverrides objects
+    # this view renders straight out of; all that is left is to pull the two list selections
+    # back inside a list another process may have SHRUNK, so the highlight doesn't sit on a
+    # row that no longer exists.
+    def on_external_change : Nil
+      @project_view.clamp_selections
+    end
+
     def save : Nil
       @project_view.save(@host.session.store)
     end
@@ -503,6 +511,12 @@ module Gori::Tui
       when :dup
         @host.status("scope: duplicate rule")
         false
+      when :failed
+        # The store refused the write (busy/locked/closing). Distinct from :dup on purpose —
+        # the scope is UNCHANGED and still gating traffic, and a retry is worth making, which
+        # is the opposite of what "duplicate rule" tells the operator to do.
+        @host.status("scope rule NOT saved (store busy or unwritable) — the scope is unchanged")
+        false
       when :ok
         n = @host.session.scope.size
         edited = !edit_id.nil?
@@ -630,6 +644,8 @@ module Gori::Tui
       when :empty   then @host.status("host override: empty")
       when :invalid then @host.status(%(host override: need "IP host" — a valid IP + a hostname))
       when :dup     then @host.status("host override: host already mapped — edit it (e)")
+      when :failed  then @host.status("host override NOT saved (store busy or unwritable) — nothing changed")
+      when :updated then @host.status("host override updated — #{@host.session.host_overrides.size} total")
       when :ok      then @host.status("host override added — #{@host.session.host_overrides.size} total")
       end
     end
