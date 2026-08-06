@@ -46,6 +46,7 @@ module Gori::Tui
     FuzzSet
     FuzzAdvanced
     OastProvider
+    OastSession
     ProbeRule
     RewriterRule
     ExtractRule

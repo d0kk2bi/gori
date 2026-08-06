@@ -9,7 +9,7 @@ describe "Gori::Verbs.register_oast" do
   it "splits Callbacks and Providers into distinct scopes" do
     # a/e/t/d on the Providers list must never reach the Callbacks list (and vice versa);
     # the scope split is what keeps them apart, not an available? predicate.
-    %w[oast.listen oast.stop oast.generate oast.copy oast.filter].each do |id|
+    %w[oast.listen oast.stop oast.generate oast.copy oast.filter oast.sessions oast.issue].each do |id|
       r[id].scope.should eq(Gori::Verb::Scope::OastCallbacks)
     end
     %w[oast.add-provider oast.edit-provider oast.toggle-provider oast.delete-provider].each do |id|
@@ -23,6 +23,8 @@ describe "Gori::Verbs.register_oast" do
      "oast.generate"        => :oast_generate,
      "oast.copy"            => :oast_copy,
      "oast.filter"          => :oast_filter,
+     "oast.sessions"        => :oast_sessions,
+     "oast.issue"           => :oast_issue_create,
      "oast.add-provider"    => :oast_add_provider,
      "oast.edit-provider"   => :oast_edit_provider,
      "oast.toggle-provider" => :oast_toggle_provider,
@@ -37,6 +39,28 @@ describe "Gori::Verbs.register_oast" do
       ctx.args_for(:focus_pane).should eq(["menu"])
       r[id].hidden?.should be_true
     end
+  end
+
+  # Resume is the action that makes a persisted session mean anything, so it must be reachable
+  # by reflex, not only from the space menu. `r` is free in the Callbacks body (the controller
+  # deliberately does not claim it) and ^R/^X stay the pair for start/stop.
+  it "puts resume on a plain `r`, beside the ^R/^X pair" do
+    r["oast.sessions"].chords.should eq([Gori::Verb::Chord.new("r")])
+    r["oast.sessions"].menu_key.should eq('r')
+  end
+
+  # ⇧F is History's `issue.create` chord: "file what I'm looking at" is one gesture across the
+  # app, and Keymap#lookup is per-scope so the two never resolve together.
+  it "files a callback as an issue on ⇧F, gated on a selected callback" do
+    r["oast.issue"].chords.should eq([Gori::Verb::Chord.new("f", shift: true)])
+    r["oast.issue"].menu_key.should eq('a')
+    r["issue.create"].chords.should eq(r["oast.issue"].chords)
+
+    ctx = FakeExecContext.new
+    ctx.oast_callback_selected = false
+    r["oast.issue"].available?(ctx).should be_false
+    ctx.oast_callback_selected = true
+    r["oast.issue"].available?(ctx).should be_true
   end
 
   it "gates the cross-tab payload verbs on BOTH the host tab and an active listener" do

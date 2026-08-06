@@ -11,6 +11,7 @@ require "../../settings"
 require "../../oast"
 require "../../oast/provider_config"
 require "../oast_provider_overlay"
+require "../oast_session_picker"
 
 module Gori::Tui
   # The OAST tab: register out-of-band payload URLs and watch the DNS/HTTP/SMTP callbacks
@@ -66,13 +67,35 @@ module Gori::Tui
       source : String?, destination : String, provider : String, at : Time,
       raw_request : String, raw_response : String?
 
+    # The "Add issue" prefill for one callback (see callback_issue_draft). A record rather
+    # than three loose returns because the Runner opens the form with it verbatim, and
+    # because `host` being NIL is a decision worth naming: an OAST interaction has a source
+    # (whoever called back) and a destination (our own listener), and NEITHER is the target
+    # host every other issue's `host` column means. Filing the source IP there would poison
+    # the Issues tab's `host:` filter with a second meaning; it goes in the title and the
+    # evidence instead, where it cannot be mistaken for one.
+    record IssueDraft, title : String, host : String?, notes : String
+
+    # How much of each raw side rides into the issue notes. A callback is evidence and the
+    # notes column is where it belongs, but `raw_request` is attacker-shaped input from a
+    # third-party server — an interactsh domain collects unsolicited scanner traffic — and an
+    # issue is exported to Markdown/JSON and read in editors. 8 KiB is far past a DNS query or
+    # a blind-SSRF GET, and the untruncated bytes are still in `oast_callbacks`.
+    EVIDENCE_CAP = 8192
+
     # register() outcomes carried back to the main fiber (register is a network call run off
     # the main fiber; persistence + poller start happen here on drain). `db_provider_id` is
     # the project-DB row id to persist on the session (nil for a global-scope provider — it
-    # has no row in this project's DB; the session just won't re-resolve to a provider NAME
-    # after restart, falling back to the kind label like an already-deleted provider does).
+    # has no row in this project's DB; `provider_config_for` re-resolves those by kind +
+    # endpoint instead, so a global provider's sessions still come back named and resumable).
+    # `resumed` distinguishes the two round trips this record carries back. A fresh register
+    # mints server state and needs an `oast_sessions` row; a RESUME re-arms a session that
+    # already has one (`session.id` is its row id, set before the spawn). Inserting again there
+    # would fork the callback history: the poller would file the same interactions under a
+    # second session id, and the first row — the one holding the payloads the operator planted
+    # — would sit at its old hit count forever.
     record RegOk, session : Oast::Session, provider : Oast::Provider, provider_key : String,
-      db_provider_id : Int64?, provider_label : String, want_payload : Bool
+      db_provider_id : Int64?, provider_label : String, want_payload : Bool, resumed : Bool = false
     record RegErr, message : String, provider_label : String, provider_key : String
     alias RegResult = RegOk | RegErr
 
@@ -278,8 +301,12 @@ module Gori::Tui
       reload
     end
 
+    # The name a session's rows are labelled with. Routes through `provider_config_for`, so a
+    # session registered against a GLOBAL provider — which has no project-DB row id to key off,
+    # and so used to fall back to the bare kind label after every restart — comes back named.
+    # Only a provider that is genuinely gone reaches the fallback now.
     private def provider_label_for(s : Store::OastSessionRecord) : String
-      if (pid = s.provider_id) && (p = @providers.find { |pr| pr.project_id == pid })
+      if p = provider_config_for(s)
         p.name
       else
         Oast::ProviderKind.parse?(s.kind).try(&.label) || s.kind
@@ -354,14 +381,14 @@ module Gori::Tui
       listener = listener_for(prov.key)
       return @host.status("not listening with #{prov.name}") unless listener
       stop_listener(listener)
-      @host.status("stopped listening with #{prov.name}")
+      @host.status("stopped listening with #{prov.name} — session kept, resume it with `r`")
     end
 
     # Stop every live listener on a project-level exit (leave project / quit). A listener
     # is an `:oast` job like any other, so it answers `Jobs#any_active?` and is named in the
     # leave confirm — leaving it polling a third-party provider from a project the operator
     # believes they closed is the same defect as a crawl that keeps sending. Reuses
-    # stop_listener, so the provider is deregistered exactly as an explicit stop does.
+    # stop_listener, so quitting keeps the sessions resumable exactly as an explicit stop does.
     # Iterates a COPY: stop_listener deletes from @listeners.
     def stop_all : Nil
       @listeners.dup.each { |l| stop_listener(l) }
@@ -393,19 +420,169 @@ module Gori::Tui
       @host.status("registering with #{label}…")
     end
 
+    # =========================================================================
+    # Persisted sessions (resume / release)
+    # =========================================================================
+
+    # Every persisted session of this project, newest first, as the resume picker's rows.
+    # Newest first because a session list is read as a stack: the one you were just using is
+    # the one you want back.
+    def session_rows : Array(OastSessionPicker::Row)
+      live = @listeners.select(&.active?).map(&.session.id).to_set
+      @host.session.store.oast_sessions.reverse.map do |s|
+        OastSessionPicker::Row.new(
+          session_id: s.id,
+          provider: @session_label[s.id]? || provider_label_for(s),
+          payload_host: payload_host_for(s),
+          started_at: Time.unix(s.created_at // 1_000_000),
+          hits: callbacks_for(s.id),
+          live: live.includes?(s.id))
+      end
+    end
+
+    # Re-arm a persisted session and start polling it again. The network half (`resume`) runs
+    # off the main fiber and lands back through the SAME @reg_events channel a fresh register
+    # uses, so a resume and a register can never race into two listeners for one provider.
+    def resume_session(session_id : Int64) : Nil
+      rec = @host.session.store.get_oast_session(session_id)
+      return @host.status("session ##{session_id} is gone") unless rec
+      return @host.status("already listening on session ##{session_id}") if @listeners.any? { |l| l.active? && l.session.id == session_id }
+      kind = Oast::ProviderKind.parse?(rec.kind)
+      return @host.status("session ##{session_id} names an unknown provider type #{rec.kind}") unless kind
+
+      # A listener is addressed BY ITS PROVIDER everywhere else in this tab — ^X, `g` and the
+      # payload picker all resolve through `listener_for(picked_provider.key)` — so a resumed
+      # session must land under a provider key or it would be a poller the operator could see
+      # and never stop.
+      config = provider_config_for(rec)
+      unless config
+        return @host.status("session ##{session_id}'s provider is gone — re-add #{rec.kind} #{rec.server_url} in Providers to resume it")
+      end
+      key = config.key
+      return @host.status("already registering with #{config.name}…") if @registering.includes?(key)
+      # ONE listener per provider key, the invariant `listener_for` rests on. Resuming a second
+      # session of a provider that is already listening would put two Listeners under one key,
+      # and every lookup after that — stop, generate, the job note — would silently pick one.
+      if listener_for(key)
+        return @host.status("already listening with #{config.name} — stop it first (^X)")
+      end
+
+      session = session_from_record(rec)
+      # The HOST comes from the session, never from the provider config: the session's secrets
+      # only mean anything to the server that minted them, and a provider whose host was edited
+      # since would send this correlation id somewhere that has never heard of it. The TOKEN
+      # does prefer the config — it is a credential, and a rotated one is the live one.
+      provider = Oast::Provider.build(kind, rec.server_url, config.token || rec.token)
+      label = config.name
+      http = poll_http
+      reg = @reg_events
+      db_id = config.project_id
+      @registering << key
+      spawn(name: "gori-oast-resume") do
+        begin
+          provider.resume(http, session)
+          reg.send(RegOk.new(session, provider, key, db_id, label, false, resumed: true))
+        rescue ex
+          reg.send(RegErr.new(ex.message || "resume failed", label, key))
+        end
+      end
+      @host.status("resuming #{label} session ##{session_id}…")
+    end
+
+    # Deregister a session's server-side state, stopping its poller first if it is live. The
+    # local row and every callback it collected stay — this releases the LISTENER, not the
+    # evidence, and an operator who wanted the findings gone would say so on the Issues tab.
+    def release_session(session_id : Int64) : Nil
+      rec = @host.session.store.get_oast_session(session_id)
+      return @host.status("session ##{session_id} is gone") unless rec
+      if listener = @listeners.find { |l| l.session.id == session_id }
+        stop_listener(listener, release: true)
+      else
+        kind = Oast::ProviderKind.parse?(rec.kind)
+        return @host.status("session ##{session_id} names an unknown provider type #{rec.kind}") unless kind
+        config = provider_config_for(rec)
+        deregister(Oast::Provider.build(kind, rec.server_url, config.try(&.token) || rec.token),
+          session_from_record(rec))
+      end
+      @host.status("released session ##{session_id} — its callbacks stay")
+    end
+
+    # Rebuild the engine Session from its row. The inverse of what apply_registration persists,
+    # and the reason `oast_sessions` carries the private key at all. `registered: true` because
+    # the row exists precisely because a register once succeeded.
+    private def session_from_record(rec : Store::OastSessionRecord) : Oast::Session
+      kind = Oast::ProviderKind.parse?(rec.kind) || Oast::ProviderKind::Interactsh
+      Oast::Session.new(rec.id, kind, rec.server_url, rec.correlation_id, rec.secret,
+        private_key_pem: rec.private_key_pem, token: rec.token, registered: true)
+    end
+
+    # The provider a session belongs to, by row id where it has one.
+    #
+    # A GLOBAL provider has no row in this project's DB, so `insert_oast_session` recorded a
+    # NULL provider_id for it — by design (see RegOk#db_provider_id), and the reason this
+    # cannot simply give up on nil: a global provider is the ordinary case for anyone who
+    # configured interactsh once and reuses it across projects, and every one of their sessions
+    # would be unresumable. Re-resolve those by the only identity the row still carries, the
+    # kind and the server it registered against.
+    private def provider_config_for(rec : Store::OastSessionRecord) : Oast::ProviderConfig?
+      if pid = rec.provider_id
+        return @providers.find { |p| p.project_id == pid }
+      end
+      @providers.find { |p| p.kind == rec.kind && same_endpoint?(p.host, rec.server_url) }
+    end
+
+    # Compare a configured host against a session's server_url the way `Provider#base_url`
+    # normalises them — the session stored the NORMALISED form ("https://oast.pro") while the
+    # provider row holds whatever was typed ("oast.pro"), so a raw == would never match.
+    private def same_endpoint?(host : String, server_url : String) : Bool
+      normalize_endpoint(host) == normalize_endpoint(server_url)
+    end
+
+    private def normalize_endpoint(url : String) : String
+      h = url.strip.rstrip('/')
+      h.starts_with?("http") ? h : "https://#{h}"
+    end
+
+    # What the operator recognises a session BY: the host its payloads point at. That is the
+    # session's own server_url host for every provider whose payload is a URL, and the
+    # interactsh server host for the one whose payload is a bare DNS name — which is what
+    # `Session#host` already computes, so build one and ask it.
+    private def payload_host_for(rec : Store::OastSessionRecord) : String
+      session_from_record(rec).host
+    end
+
     private def listener_for(provider_key : String?) : Listener?
       return nil unless provider_key
       @listeners.find { |l| l.provider_key == provider_key && l.active? }
     end
 
-    private def stop_listener(listener : Listener) : Nil
+    # Stop polling. `release` is what separates "I'm done watching for now" from "I'm done
+    # with this engagement".
+    #
+    # It defaults to FALSE, and that default is the whole resume feature. Stopping used to
+    # deregister unconditionally, which for interactsh tells the server to forget the
+    # correlation id — so every payload already planted stopped resolving the moment the
+    # operator pressed ^X, and quitting gori (stop_all) did the same to every session at once.
+    # For the one workbench whose findings arrive HOURS after the request that caused them,
+    # that turned a normal exit into evidence destruction. Now the server state outlives the
+    # poll fiber, and `resume_session` picks it back up.
+    #
+    # Release stays reachable — it is the honest counterpart, and leaving state on a public
+    # third-party interaction server after an engagement is its own hygiene problem — but it
+    # is now something the operator ASKS for, from the resume picker's `x`.
+    private def stop_listener(listener : Listener, release : Bool = false) : Nil
       listener.poller.try(&.stop)
       @host.jobs.finish(listener.job_id, :stopped, "stopped") if listener.job_id != 0
-      http = Oast::HttpClient.new(verify_tls: !@host.session.config.insecure_upstream?)
-      provider = listener.provider
-      session = listener.session
-      spawn(name: "gori-oast-deregister") { provider.deregister(http, session) rescue nil }
+      deregister(listener.provider, listener.session) if release
       @listeners.delete(listener)
+    end
+
+    # Best-effort release of server-side state, off the main fiber. `Provider#deregister` is
+    # documented never to raise, and the `rescue nil` is the belt to that braces: this runs
+    # detached, where an exception would take out the fiber with no one to report to.
+    private def deregister(provider : Oast::Provider, session : Oast::Session) : Nil
+      http = poll_http
+      spawn(name: "gori-oast-deregister") { provider.deregister(http, session) rescue nil }
     end
 
     private def deliver_payload(url : String) : Nil
@@ -864,6 +1041,9 @@ module Gori::Tui
         end
       when c == 'g' then generate_payload
       when c == 'y' then copy_payload
+      # `r` (resume) and `a` (add issue) are NOT claimed here: both open an overlay, which a
+      # controller cannot do, so they stay verbs with plain chords and reach the keymap through
+      # the `return false` below — the same fall-through every unhandled key takes.
       else               return false
       end
       sync_scroll
@@ -1093,20 +1273,27 @@ module Gori::Tui
         @host.status("OAST register failed (#{reg.provider_label}): #{reg.message}")
       when RegOk
         unless @providers.any? { |p| p.key == reg.provider_key }
-          # The provider was deleted or scope-migrated while register() was in flight — its
+          # The provider was deleted or scope-migrated while the round trip was in flight — its
           # key no longer resolves to anything in @providers, so a Listener built from it
-          # could never be found/stopped again. Deregister best-effort and drop the result
-          # instead of leaking an unreachable poller (mirrors stop_listener's deregister).
-          http = poll_http
-          provider = reg.provider
-          session = reg.session
-          spawn(name: "gori-oast-deregister") { provider.deregister(http, session) rescue nil }
-          return @host.status("OAST register for #{reg.provider_label} finished after its provider was removed — discarded")
+          # could never be found/stopped again. Drop the result rather than leak an
+          # unreachable poller.
+          #
+          # A FRESH registration is also deregistered here, and only a fresh one: nothing about
+          # it is worth keeping — it has no row, so the resume picker could never offer it, and
+          # no payload was handed out. A RESUMED session is the opposite on every count. It has
+          # a row, it has callbacks, and its payloads are planted out in the world right now;
+          # releasing that server state because a provider row vanished mid-flight would throw
+          # away exactly what the operator asked to get back. Re-add the provider and resume.
+          deregister(reg.provider, reg.session) unless reg.resumed
+          return @host.status("OAST #{reg.resumed ? "resume" : "register"} for #{reg.provider_label} finished after its provider was removed — discarded")
         end
-        store = @host.session.store
-        id = store.insert_oast_session(reg.db_provider_id, reg.session.kind.label, reg.session.server_url,
-          reg.session.correlation_id, reg.session.secret, reg.session.private_key_pem, reg.session.token)
-        reg.session.id = id
+        # A resume already HAS its row (see RegOk#resumed); only a fresh registration inserts.
+        unless reg.resumed
+          reg.session.id = @host.session.store.insert_oast_session(reg.db_provider_id,
+            reg.session.kind.label, reg.session.server_url, reg.session.correlation_id,
+            reg.session.secret, reg.session.private_key_pem, reg.session.token)
+        end
+        id = reg.session.id
         listener = Listener.new(reg.session, reg.provider, reg.provider_key, reg.provider_label)
         listener.job_id = @host.jobs.start(:oast, "OAST #{reg.provider_label}", goto: Jobs::Goto.new(:oast))
         poller = Oast::Poller.new(reg.provider, reg.session, poll_http, POLL_INTERVAL, @oast_events)
@@ -1117,6 +1304,11 @@ module Gori::Tui
         @session_label[id] = reg.provider_label
         if reg.want_payload
           deliver_payload(reg.provider.generate_payload(reg.session))
+        elsif reg.resumed
+          # Name the hits already on file. A resume that only said "listening" would look
+          # identical to a fresh register, and the whole point of the action is that this
+          # session has a history — and payloads still out there — that a new one does not.
+          @host.status("resumed #{reg.provider_label} session ##{id} (#{callbacks_for(id)} callbacks so far)")
         else
           @host.status("listening with #{reg.provider_label}")
         end
@@ -1185,6 +1377,73 @@ module Gori::Tui
     def reveal_session(id : Int64) : Nil
       @active_sub = 0
       @host.focus_body
+    end
+
+    # =========================================================================
+    # Promote a callback to an Issue
+    # =========================================================================
+
+    # True when there is a callback to file an issue from — the verb's gate. Deliberately NOT
+    # gated on the detail being open: the list row is the natural place to decide a callback
+    # is real, and the drill-in is one ↵ further in.
+    def callback_selected? : Bool
+      callbacks_sub? && !selected_callback.nil?
+    end
+
+    # Prefill the NEW ISSUE form from the selected callback. A callback is the strongest
+    # evidence this tool produces — the target's own infrastructure reached a server it had no
+    # business reaching — and until now the only way to record one was to retype it: the tab
+    # could copy the payload out and the raw interaction out, but not turn either into a
+    # finding. The guide has linked "promote a confirmed callback into an Issue" the whole
+    # time; this is that link.
+    def callback_issue_draft : IssueDraft?
+      row = selected_callback
+      return nil unless row
+      IssueDraft.new(issue_title_for(row), nil, issue_notes_for(row))
+    end
+
+    # "OAST DNS callback from 203.0.113.5" — protocol and source, the two facts that make the
+    # finding legible in a list. Falls back to the destination when the provider reports no
+    # source IP (webhook.site and postbin both can), so the title never trails off into "from".
+    private def issue_title_for(row : CbRow) : String
+      what = "OAST #{row.protocol.upcase} callback"
+      if src = row.source.presence
+        "#{what} from #{src}"
+      else
+        "#{what} on #{row.destination}"
+      end
+    end
+
+    private def issue_notes_for(row : CbRow) : String
+      String.build do |io|
+        io << "Out-of-band callback received by gori's OAST listener.\n\n"
+        io << "protocol:    " << row.protocol
+        row.method.try { |m| io << " (" << m << ")" }
+        io << '\n'
+        io << "source:      " << (row.source.presence || "unknown") << '\n'
+        io << "destination: " << row.destination << '\n'
+        io << "provider:    " << row.provider << '\n'
+        io << "received:    " << row.at.to_rfc3339 << '\n'
+        evidence_section(io, "raw request", row.raw_request)
+        row.raw_response.try { |r| evidence_section(io, "raw response", r) }
+      end
+    end
+
+    # One fenced evidence block, truncated at EVIDENCE_CAP and SAYING so when it truncates —
+    # evidence that was silently cut is evidence you can draw the wrong conclusion from.
+    private def evidence_section(io : IO, label : String, body : String) : Nil
+      return if body.empty?
+      io << "\n--- " << label << " ---\n"
+      if body.bytesize > EVIDENCE_CAP
+        # byte_slice, not `body[0, n]`: a raw interaction is bytes off the wire that were
+        # never promised to be UTF-8, and `scrub` puts it back in a shape the notes column
+        # and the Markdown export can both hold.
+        io << body.byte_slice(0, EVIDENCE_CAP).scrub
+        io << "\n… truncated at " << EVIDENCE_CAP << " bytes (full callback kept in the OAST tab)\n"
+      else
+        io << body.scrub
+        io << '\n' unless body.ends_with?('\n')
+      end
     end
 
     # --- READ-pane delegators (the callback detail's read verbs + the Runner's read_* ladders) ---

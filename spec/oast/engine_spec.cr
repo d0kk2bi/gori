@@ -62,6 +62,20 @@ private class FakeHttp < O::Http
   end
 end
 
+# FakeHttp plus the REQUEST BODY, which resume's whole contract lives in: it must replay the
+# persisted correlation id / secret / public key rather than mint new ones, and the only place
+# that shows is what it POSTs.
+private class RecordingHttp < FakeHttp
+  getter bodies = [] of String?
+
+  def request(method : String, url : String,
+              headers : Hash(String, String) = {} of String => String,
+              body : String? = nil) : O::Http::Response
+    @bodies << body
+    super
+  end
+end
+
 describe Gori::Oast do
   describe O::RsaKeyPair do
     it "generates a 2048 key and exports a valid SPKI PEM that round-trips" do
@@ -173,6 +187,90 @@ describe Gori::Oast do
         "abc123", "sec", private_key_pem: PRIV_PEM)
       http = FakeHttp.new("/poll", "", 204)
       provider.poll(http, session).should be_empty
+    end
+
+    # Resume is what makes a payload survive the process that minted it. Without it a restart
+    # could only `register` a NEW correlation id, so every payload already planted — the whole
+    # point of an out-of-band test, whose callbacks arrive hours later — was dead on exit.
+    it "resume re-registers the PERSISTED correlation id, secret and public key" do
+      provider = O::Interactsh.new("https://oast.pro")
+      rsa = O::RsaKeyPair.from_private_pem(PRIV_PEM)
+      session = O::Session.new(7_i64, O::ProviderKind::Interactsh, "https://oast.pro",
+        "persisted-corr-id", "persisted-sec", private_key_pem: PRIV_PEM, registered: true)
+      http = RecordingHttp.new("/register", "")
+
+      provider.resume(http, session)
+
+      body = JSON.parse(http.bodies.first.not_nil!)
+      body["correlation-id"].as_s.should eq("persisted-corr-id")
+      body["secret-key"].as_s.should eq("persisted-sec")
+      # The SAME key, not a fresh one — the server has to hand back interactions this session
+      # can still decrypt, and only this private key opens them.
+      Base64.decode_string(body["public-key"].as_s).should eq(rsa.public_spki_pem)
+    end
+
+    # The server's answer to "I already know that id" is a 409 or a 400 naming it. Both mean
+    # the session is alive, which is exactly the outcome resume wants — treating either as a
+    # failure would refuse to resume the sessions that never needed rebuilding in the first place.
+    it "resume accepts the server's already-registered answers" do
+      provider = O::Interactsh.new("https://oast.pro")
+      session = O::Session.new(7_i64, O::ProviderKind::Interactsh, "https://oast.pro",
+        "abc123", "sec", private_key_pem: PRIV_PEM)
+      provider.resume(RecordingHttp.new("/register", "", 409), session)
+      provider.resume(RecordingHttp.new("/register", "correlation-id already exists", 400), session)
+    end
+
+    it "resume raises when the server rejects it, so a dead listener is never started" do
+      provider = O::Interactsh.new("https://oast.pro")
+      session = O::Session.new(7_i64, O::ProviderKind::Interactsh, "https://oast.pro",
+        "abc123", "sec", private_key_pem: PRIV_PEM)
+      expect_raises(Gori::Error, /resume failed/) do
+        provider.resume(RecordingHttp.new("/register", "nope", 500), session)
+      end
+    end
+
+    # A session restored from a row whose private key is missing cannot decrypt anything the
+    # server would return, so resuming it would produce a listener that polls forever and
+    # reports nothing. Fail at the resume, where the operator is watching.
+    it "resume raises when the restored session has no private key" do
+      provider = O::Interactsh.new("https://oast.pro")
+      session = O::Session.new(7_i64, O::ProviderKind::Interactsh, "https://oast.pro",
+        "abc123", "sec")
+      expect_raises(Gori::Error, /no private key/) do
+        provider.resume(RecordingHttp.new("/register", ""), session)
+      end
+    end
+
+    # `session.server_url`, NOT the provider's configured host: the correlation id only means
+    # something to the server that minted it, and a provider edited to point elsewhere since
+    # must not re-register this session against a host that has never heard of it.
+    it "resume targets the session's own server, not the provider's current host" do
+      provider = O::Interactsh.new("https://oast.pro")
+      session = O::Session.new(7_i64, O::ProviderKind::Interactsh, "https://oast.live",
+        "abc123", "sec", private_key_pem: PRIV_PEM)
+      http = RecordingHttp.new("/register", "")
+      provider.resume(http, session)
+      http.calls.first.should eq("POST https://oast.live/register")
+    end
+  end
+
+  # The other four backends keep (or never had) server-side state independently of gori, so
+  # resuming them is just polling the persisted correlation id again. Pinned because `resume`
+  # is a network call on the abstract Provider: an override added later that forgets one of
+  # these would turn a working resume into a round trip that can fail.
+  describe "Provider#resume default" do
+    it "is a no-op for every non-interactsh backend" do
+      {
+        O::CustomHttp.new("https://my.oast.example/log"),
+        O::WebhookSite.new("https://webhook.site"),
+        O::Boast.new("https://odiss.eu:2096/events", "sec"),
+        O::Postbin.new("https://www.postb.in"),
+      }.each do |provider|
+        http = RecordingHttp.new("never", "")
+        session = O::Session.new(1_i64, provider.kind, provider.host, "corr", "sec")
+        provider.resume(http, session)
+        http.calls.should be_empty
+      end
     end
   end
 

@@ -39,18 +39,37 @@ Each listener is a **provider**. Add one from the **Providers** sub-tab (`a` add
 
 With interactsh, gori generates an RSA key pair locally, registers the public key, and decrypts each callback (the private key is stored `0600` in the project database and never logged). The payload id is derived locally from the correlation id, so you can mint many payloads from one registration without another round trip.
 
-Callbacks are durable per-project history. A listener can be resumed manually (its key is persisted); there is no automatic resume on restart.
+## Resuming a Listener
+
+The callbacks that matter most arrive late: a stored payload that only fires when someone opens a back-office page, a webhook a nightly job replays, an injection behind a queue. So a listener outlives the session that started it.
+
+`Ctrl-X` stops polling but **keeps the registration**, and so does quitting gori or leaving the project. The payloads you already planted keep resolving. Press `r` to open **RESUME LISTENER**, pick a saved session, and gori starts polling it again — every callback the provider buffered while you were away lands on the next poll, and the session's existing callbacks are still there under it.
+
+| Key | In the picker |
+|-----|---------------|
+| `↵` | Resume polling this session |
+| `x` | Release it — deregister the server-side state for a finished engagement. Its callbacks stay. |
+
+Callbacks are durable per-project history. Resume is a deliberate action, not something gori does on startup: reopening a project does not put you back on a third-party provider without asking.
+
+Only the TUI resumes sessions. `gori run oast` and the MCP `oast_*` tools are ad-hoc listeners with no project database behind them, so their registrations end with the process.
 
 ## Keys
 
 | Key | Action |
 |-----|--------|
 | `Ctrl-R` | Start listening (register a payload and begin polling) |
-| `Ctrl-X` | Stop the active listener |
+| `Ctrl-X` | Stop polling (the session is kept — resume it with `r`) |
+| `r` | Resume a saved listener |
 | `g` | Get / copy the current payload |
 | `y` | Copy the selected callback |
+| `Shift-F` | File the selected callback as an Issue |
 | `/` | Filter the callback list |
 | `a` / `e` / `t` / `d` | Providers sub-tab: add / edit / set type / delete |
+
+## Filing a Callback
+
+A callback is the strongest evidence this tool produces: the target's own infrastructure reached a server it was never given a reason to reach. `Shift-F` (or `Space` → **Add issue**) files the selected callback as an **Issue**, prefilled with its protocol and source and carrying the raw interaction in as the notes. It opens at **HIGH** — Tab re-rates it before you commit.
 
 ## Headless
 

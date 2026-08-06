@@ -2710,6 +2710,10 @@ module Gori::Tui
         @toast = "issue updated"
       else
         new_id = @session.store.insert_issue(title, form.severity, form.host, form.flow_id)
+        # `insert_issue` writes notes '' — it has no notes parameter, and giving it one would
+        # touch every caller. A second write is fine here: this is a one-off create, not the
+        # data path, and it is skipped entirely unless the open-site supplied evidence.
+        @session.store.update_issue(new_id, notes: form.notes) if new_id != 0 && !form.notes.empty?
         # History's marked set beyond the primary evidence flow (#442) — one issue, N flows.
         # insert_issue already linked form.flow_id, so exclude it and never re-link. A flow the
         # store can't resolve (a stale mark) is dropped rather than filing an orphan link row, and

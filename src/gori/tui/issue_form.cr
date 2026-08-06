@@ -38,12 +38,19 @@ module Gori::Tui
     # for the same reason as `link_ref`: cancelling the form drops the pending attachments
     # with it instead of leaving them for a later create to pick up.
     getter extra_flow_ids : Array(Int64)
+    # Notes to write into the issue on CREATE. The evidence an open-site already holds and the
+    # form cannot ask for: an OAST callback's raw interaction has no flow to link, so without
+    # this the finding would be filed as a bare title and the proof left behind on another tab.
+    # Ignored on an edit (`edit_id`) — that path re-titles an issue whose notes the operator
+    # owns, and overwriting them from a form that never showed them would be a silent loss.
+    getter notes : String
 
     def initialize(@issue_title : String = "", @host : String? = nil, @flow_id : Int64? = nil,
                    @severity : Store::Severity = Store::Severity::Medium,
                    @edit_id : Int64? = nil, @heading : String = "NEW ISSUE",
                    @link_ref : {Store::LinkRefKind, Int64}? = nil,
-                   @extra_flow_ids : Array(Int64) = [] of Int64)
+                   @extra_flow_ids : Array(Int64) = [] of Int64,
+                   @notes : String = "")
       @cx = @issue_title.size
       @preedit = ""
     end
