@@ -88,9 +88,10 @@ module Gori
       abstract def subtab_search_count : Int32 # active tab's open sub-tab count (gates the search entry)
       abstract def subtab_filter_open : Nil    # open the `/` sub-tab filter bar for the active tab (issue #121)
 
-      # entity links (cross-tab attach + link-target ids for availability gating)
-      abstract def link_to_issue : Nil
-      abstract def link_to_note : Nil
+      # entity links (cross-tab attach + link-target ids for availability gating).
+      # ONE attach intent, not one per owner kind: the picker it opens holds issues and
+      # notes on the same list, plus a create row for each (see Tui::LinkPicker).
+      abstract def link_attach : Nil
       abstract def link_flow_id : Int64?
       abstract def link_repeater_id : Int64?
       abstract def link_fuzz_id : Int64?

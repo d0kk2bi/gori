@@ -28,7 +28,7 @@ end
 # from_sym now RAISES if it is not a member (it used to be a silent no-op).
 private EXPECTED_OVERLAY_SYMS = {
   :none, :detail, :palette, :issue_new, :confirm, :browser, :choice, :tabs_more,
-  :comparer_pick, :repeater_subtab, :links, :issue_pick, :note_pick, :preferences,
+  :comparer_pick, :repeater_subtab, :links, :link_pick, :preferences,
   :settings, :tabs, :hosts, :env, :hotkeys, :notifications, :passthrough, :listeners, :probe_active,
   :discover_config, :discover_headers, :fuzz_set, :fuzz_advanced, :oast_provider,
   :probe_rule, :rewriter_rule, :extract_rule, :rewriter_stub, :ca_import, :import, :export, :scope_rule, :sequence_config,
@@ -67,8 +67,7 @@ private MIGRATED_KINDS = [
   OverlayKind::ComparerPick,
   OverlayKind::RepeaterSubtab,
   OverlayKind::Links,
-  OverlayKind::IssuePick,
-  OverlayKind::NotePick,
+  OverlayKind::LinkPick,
   # C5 — the Preferences family
   OverlayKind::Preferences,
   OverlayKind::Settings,

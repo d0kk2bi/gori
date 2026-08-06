@@ -29,8 +29,8 @@ private def every_picker : Array(PickerOverlay)
   [
     FlowPicker.new(flow_rows, :a),
     SubtabPicker.new("FIND SUB-TAB", [SubtabPicker::Row.new(0, "a", "b")]),
-    IssuePicker.new([Gori::Store::Issue.new(1_i64, 0_i64, 0_i64, "t", Gori::Store::Severity::High, "h.test", nil, "")]),
-    NotePicker.new([NotePicker::Row.new(1_i64, "n", "d")]),
+    LinkPicker.new([LinkPicker::Row.new(Gori::Store::LinkOwnerKind::Issue, 1_i64,
+      "#1 [high] t", "t", "h.test · open")]),
     LinksOverlay.new(Gori::Store::LinkOwnerKind::Issue, 1_i64),
     CopyPicker.new("COPY AS", [CopyMenu::Option.new("URL", 'u', "https://a.test/")]),
     SendPicker.new("Send selection to", "abc", SendMenu.destinations),

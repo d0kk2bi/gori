@@ -4,8 +4,8 @@ require "./frame"
 require "./overlay"
 
 module Gori::Tui
-  # Shared base for the seven selection-list modals — copy-as, send-to, the Comparer
-  # flow picker, the sub-tab search, and the issue/note/links pickers.
+  # Shared base for the selection-list modals — copy-as, send-to, the Comparer flow
+  # picker, the sub-tab search, and the link picker / links list.
   #
   # Each of them used to repeat the SAME dispatch by hand in runner.cr (esc cancels,
   # ↑/↓ move, ↵ picks, a row click selects-and-picks, a click outside dismisses, the
@@ -16,8 +16,8 @@ module Gori::Tui
     getter selected : Int32 = 0
     @scroll = 0
 
-    # Navigable rows, INCLUDING any pinned action row (IssuePicker/NotePicker keep
-    # "+ New …" at index 0, so their count is one more than the filtered list).
+    # Navigable rows, INCLUDING any pinned action row (LinkPicker keeps "+ New issue…" /
+    # "+ New note…" above the list, so its count is two more than the filtered list).
     abstract def entry_count : Int32
 
     # Row index under (mx, my) inside the card, or nil off the list.

@@ -122,7 +122,7 @@ Two more tools round out analysis:
 - **Notes**: free-form, per-project Markdown documents (multiple notes per project). Create, edit, and close notes from the Notes tab; list or dump them headless with `gori run notes` / `gori run notes --all`. Agents can manage notes over MCP (`list_notes`, `get_note`, `create_note`, …).
 - **Comparer**: load two flows into slots A and B for a line-by-line diff, useful for spotting how a response changed between requests. Send a flow from History with `Space` → Comparer, or swap slots on the Comparer tab.
 
-Issues, notes, repeaters, and fuzz/miner sessions can be linked so you jump from an issue straight back to the evidence flow or the session that produced it.
+Issues, notes, repeaters, and fuzz/miner sessions can be linked so you jump from an issue straight back to the evidence flow or the session that produced it. `Space` → **Link…** from History, the Repeater, the Fuzzer, or the Miner opens one card holding every issue *and* every note, with `+ New issue…` / `+ New note…` pinned above them — so filing a brand-new issue for what you are looking at, already linked, is the same keystroke as attaching it to an existing one. Type to filter by title, host, status, or the words `issue` / `note`; whatever you typed becomes the new issue's title if you land on the create row.
 
 ## Next Steps
 

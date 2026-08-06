@@ -112,7 +112,7 @@ describe "Gori::Verbs.register_history" do
         set = marked(4_i64, 9_i64)
         %w[history.copy history.copy-as history.delete history.repeater history.fuzz
           history.mine history.probe-active history.discover history.compare
-          scope.add-host issue.create link.history.to-issue link.history.to-note].each do |id|
+          scope.add-host issue.create link.history.attach].each do |id|
           r[id].available?(set).should be_true
           r[id].available?(on(:history)).should be_false # neither marks nor a cursor row
         end
@@ -260,17 +260,14 @@ describe "Gori::Verbs.register_history" do
       verb_intents(r, "repeater.toggle-sni").should eq([:repeater_toggle_sni])
     end
 
-    it "gates Link to issue/note on the session having been persisted" do
+    it "gates Link… on the session having been persisted" do
       # link_repeater_id is nil until the session has a row — linking before that would
       # attach evidence to an id that does not exist.
       ctx = on(:repeater)
-      r["link.repeater.to-issue"].available?(ctx).should be_false
-      r["link.repeater.to-note"].available?(ctx).should be_false
+      r["link.repeater.attach"].available?(ctx).should be_false
       ctx.link_repeater = 4_i64
-      r["link.repeater.to-issue"].available?(ctx).should be_true
-      r["link.repeater.to-note"].available?(ctx).should be_true
-      verb_intents(r, "link.repeater.to-issue").should eq([:link_to_issue])
-      verb_intents(r, "link.repeater.to-note").should eq([:link_to_note])
+      r["link.repeater.attach"].available?(ctx).should be_true
+      verb_intents(r, "link.repeater.attach").should eq([:link_attach])
     end
   end
 
@@ -332,20 +329,17 @@ describe "Gori::Verbs.register_history" do
       verb_intents(r, "fuzzer.copy").should eq([:read_copy])
     end
 
-    it "gates Link to issue/note on the FUZZ session id, not the repeater one" do
+    it "gates Link… on the FUZZ session id, not the repeater one" do
       # link.fuzzer.* and link.repeater.* are near-identical registrations; each must read
-      # its OWN id, or the Fuzzer entries are offered against a session that isn't there.
+      # its OWN id, or the Fuzzer entry is offered against a session that isn't there.
       ctx = on(:fuzzer)
-      ctx.link_repeater = 4_i64 # a live repeater session must not unlock the Fuzzer verbs
-      r["link.fuzzer.to-issue"].available?(ctx).should be_false
-      r["link.fuzzer.to-note"].available?(ctx).should be_false
+      ctx.link_repeater = 4_i64 # a live repeater session must not unlock the Fuzzer verb
+      r["link.fuzzer.attach"].available?(ctx).should be_false
       ctx.link_fuzz = 8_i64
-      r["link.fuzzer.to-issue"].available?(ctx).should be_true
-      r["link.fuzzer.to-note"].available?(ctx).should be_true
+      r["link.fuzzer.attach"].available?(ctx).should be_true
       ctx.current_tab = :repeater
-      r["link.fuzzer.to-issue"].available?(ctx).should be_false # linkable fuzz, wrong tab
-      verb_intents(r, "link.fuzzer.to-issue").should eq([:link_to_issue])
-      verb_intents(r, "link.fuzzer.to-note").should eq([:link_to_note])
+      r["link.fuzzer.attach"].available?(ctx).should be_false # linkable fuzz, wrong tab
+      verb_intents(r, "link.fuzzer.attach").should eq([:link_attach])
     end
   end
 

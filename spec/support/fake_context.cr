@@ -1276,12 +1276,8 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:issues_copy_all)
   end
 
-  def link_to_issue : Nil
-    rec(:link_to_issue)
-  end
-
-  def link_to_note : Nil
-    rec(:link_to_note)
+  def link_attach : Nil
+    rec(:link_attach)
   end
 
   # The four linkable-entity ids, settable so both sides of the link.* gates can be
