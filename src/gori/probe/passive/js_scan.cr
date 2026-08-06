@@ -66,6 +66,17 @@ module Gori
           {/\bset(?:Timeout|Interval)\s*\(/, "setTimeout/setInterval"},
           {/\bdangerouslySetInnerHTML\b/, "dangerouslySetInnerHTML"},
           {/\.html\s*\(/, "jQuery.html()"},
+          # Navigation sinks. A tainted navigation target is how `javascript:`-URL XSS and
+          # client-side open redirect both land, and neither is reachable through the HTML/eval
+          # sinks above. The bare-`location` form deliberately also matches `document.location =`
+          # and `window.location =` (the `\b` holds after the dot); `(?!=)` keeps `==`/`===` out.
+          {/\b(?:window\.)?location(?:\.href)?\s*=(?!=)/, "location assignment"},
+          {/\blocation\.(?:replace|assign)\s*\(/, "location.replace/assign"},
+          {/\bwindow\.open\s*\(/, "window.open"},
+          # HTML-parsing sinks: both turn a string into live nodes, which is the same capability
+          # as innerHTML once the result is inserted.
+          {/\.createContextualFragment\s*\(/, "createContextualFragment"},
+          {/\bparseFromString\s*\(/, "DOMParser.parseFromString"},
         ] of {Regex, String}
 
         # A random-access `Char` view over ASCII bytes, used instead of `String#chars` on the
@@ -441,10 +452,21 @@ module Gori
             end
             j += 1
           end
-          # A window edge can land mid-char, so scrub before handing the slice to PCRE (invalid
-          # UTF-8 makes the match raise). Bounded to ~2*WINDOW bytes, so this costs nothing.
-          seg = String.new(bytes[lo, hi - lo]).scrub
-          SOURCES.each { |(re, label)| return label if re.matches?(seg) }
+          # The statement is searched as the two sides AROUND the sink — [lo, from) and [to, hi) —
+          # never as one span covering the sink's own matched text. A sink whose pattern CONTAINS
+          # a source spelling would otherwise pair with itself: `location.href =` is a navigation
+          # sink, and the `location.href` source matches those very bytes, so every ordinary
+          # `location.href = "/dashboard"` in every SPA would have reported a DOM-XSS lead with
+          # itself as the taint. Splitting is behaviour-identical for the sinks that came before
+          # (none of `.innerHTML=`, `document.write(`, `eval(`, `.html(` contains a source), and a
+          # source really inside the sink's arguments still sits in the POST side, which is where
+          # `document.write(document.URL)` has always been read from.
+          #
+          # A window edge can land mid-char, so scrub before handing a slice to PCRE (invalid
+          # UTF-8 makes the match raise). Both slices are bounded by WINDOW, so this costs nothing.
+          pre = String.new(bytes[lo, from - lo]).scrub
+          post = String.new(bytes[to, hi - to]).scrub
+          SOURCES.each { |(re, label)| return label if re.matches?(pre) || re.matches?(post) }
           nil
         end
       end

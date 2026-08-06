@@ -181,3 +181,59 @@ describe "Gori::Probe.custom_rules merge" do
     end
   end
 end
+
+# A custom finding used to store `evidence: nil`, so every surface could say a rule fired on a
+# host but never what tripped it — the operator had to re-run the pattern by hand against the
+# sample flow. A regex rule now reports its match.
+describe "Gori::Probe::CustomRule evidence" do
+  it "reports capture group 1 when the pattern defines one" do
+    with_store do |store|
+      dets = matches?(store, rule(kind: "regex", pattern: "build-id:\\s*([0-9a-f]{8})"),
+        body: "meta build-id: deadbeef end")
+      dets.size.should eq(1)
+      dets.first.evidence.should eq("deadbeef")
+    end
+  end
+
+  it "reports the whole match when the pattern has no group" do
+    with_store do |store|
+      dets = matches?(store, rule(kind: "regex", pattern: "internal-[a-z]+\\.corp"),
+        body: "host is internal-billing.corp today")
+      dets.first.evidence.should eq("internal-billing.corp")
+    end
+  end
+
+  # A string rule's match is byte-identical to its own pattern, which every surface already
+  # shows next to the rule, so reporting it again would be pure duplication.
+  it "reports no evidence for a string rule" do
+    with_store do |store|
+      dets = matches?(store, rule(kind: "string", pattern: "SECRET"), body: "a SECRET here")
+      dets.size.should eq(1)
+      dets.first.evidence.should be_nil
+    end
+  end
+
+  it "caps a greedy pattern so it cannot write a whole body into the issue row" do
+    with_store do |store|
+      dets = matches?(store, rule(kind: "regex", pattern: "A.*"), body: "A#{"z" * 500}")
+      ev = dets.first.evidence.not_nil!
+      ev.size.should be <= Gori::Probe::CustomRule::EVIDENCE_CAP + 1
+      ev.should end_with("…")
+    end
+  end
+
+  it "strips control bytes out of the captured text before it reaches storage or the TUI" do
+    with_store do |store|
+      bel = 7.chr
+      dets = matches?(store, rule(kind: "regex", pattern: "tag:(.+)"),
+        body: "tag:val#{bel}ue")
+      dets.first.evidence.should eq("val ue")
+    end
+  end
+
+  it "still degrades a bad pattern to no match instead of raising" do
+    with_store do |store|
+      matches?(store, rule(kind: "regex", pattern: "([unclosed"), body: "anything").should be_empty
+    end
+  end
+end

@@ -27,6 +27,34 @@ module Gori
           {/\b(?:pk|sk)\.eyJ[\w\-]{20,}\.[\w\-]{20,}\b/, "Mapbox token"},
           {/\bhttps:\/\/hooks\.slack\.com\/services\/T[0-9A-Za-z]+\/B[0-9A-Za-z]+\/[0-9A-Za-z]{16,}/, "Slack webhook url"},
           {/\bSK[0-9a-f]{32}\b/, "Twilio api key"},
+          # LLM provider keys. Both vendors' formats are prefix-anchored and long, so the
+          # prefix alone is already the discriminator — the length floors just stop a prose
+          # mention of the prefix ("keys start with sk-ant-") from matching.
+          {/\bsk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_\-]{40,}/, "Anthropic API key"},
+          {/\bsk-proj-[A-Za-z0-9_\-]{40,}/, "OpenAI project key"},
+          # Slack app-level token (`xapp-`), a shape the existing xox[baprs]- pattern does not
+          # cover: different prefix, different body (version-counter, app id, 64 hex chars).
+          {/\bxapp-\d-[A-Z0-9]+-\d+-[a-f0-9]{64}\b/, "Slack app-level token"},
+          {/\bshp(?:at|ss|ca|pa)_[0-9a-f]{32}\b/, "Shopify access token"},
+          {/\bsq0(?:atp|csp)-[A-Za-z0-9_\-]{20,}/, "Square access token"},
+          # Telegram bot token: the `<numeric id>:AA…` shape is the distinctive part.
+          {/\b\d{8,10}:AA[A-Za-z0-9_\-]{32,35}\b/, "Telegram bot token"},
+          {/\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{50,}/, "PyPI API token"},
+          # Azure Storage connection string — AccountKey is the credential; the surrounding
+          # DefaultEndpointsProtocol/AccountName literals make it unmistakable.
+          {/AccountKey=[A-Za-z0-9+\/]{86}==/, "Azure Storage account key"},
+          # A database/broker URI carrying inline credentials — the single most common shape a
+          # leaked config file or a stack trace exposes. Guarded twice against the tutorial /
+          # docs-page false positive that a bare `scheme://user:pass@host` would produce: the
+          # password must be at least 8 characters (placeholder passwords in documentation are
+          # `pass`, `pwd`, `secret`, `password`, `changeme`, all shorter or excluded below), and
+          # the host must not be a loopback or a reserved example domain. Those two together are
+          # what keep this out of the "every page that documents a connection string" trap.
+          {/\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?|clickhouse):\/\/
+            [^\s:@\/]{1,64}:
+            (?!password@|changeme@|secret@|yourpass)[^\s:@\/]{8,}
+            @(?!localhost|127\.0\.0\.1|\[::1\]|example\.(?:com|org|net)\b)[\w.\-]+/x,
+           "database URI with inline credentials"},
         ]
 
         # A JSON Web Token, held OUT of PATTERNS on purpose.

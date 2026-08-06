@@ -157,6 +157,7 @@ module Gori
       "jwt_sensitive_claims"           => "JWT payloads are base64url, not encrypted — anything in them is readable by the client and by anyone who sees the token. Keep roles/permissions and personal data server-side (or in an encrypted JWE) and reference them by an opaque subject id.",
       "sourcemap_exposed"              => "The script points at its source map, from which the original, unminified sources are reconstructable. Stop deploying .map files to production (or serve them only to authenticated/internal clients) and drop the sourceMappingURL comment from production builds.",
       "missing_sri"                    => "A cross-origin script/stylesheet is loaded with no integrity hash, so whoever controls that third party controls this page. Add integrity=\"sha384-…\" plus crossorigin=\"anonymous\", pin the exact version, or self-host the asset.",
+      "exposed_config"                 => "A server-side configuration or diagnostic artifact is being served to clients (the evidence names which). Remove it from the web root or block it at the edge, then treat every credential it contained as compromised and rotate it: a readable .env / wp-config / .htpasswd hands over live secrets outright, a .git/config lets the whole repository be reconstructed, and phpinfo() / Spring actuator env expose paths, versions, and environment variables that make every other attack cheaper. Deny dotfiles and VCS directories at the reverse proxy rather than relying on the application not to route them.",
       "directory_listing"              => "The server auto-generated a directory index, enumerating every file in it (backups, editor leftovers, old releases). Turn the listing off (Apache `Options -Indexes`, nginx `autoindex off;`) and add an index file where a directory must stay browsable.",
       "dom_xss"                        => "A DOM taint source reaches an execution sink in one statement — review and sanitize: assign text via textContent, build nodes with the DOM API, or run untrusted HTML through a sanitizer (DOMPurify) before it touches innerHTML/write/eval. Heuristic; confirm the data path in a browser.",
       "dom_clobbering"                 => "Don't trust globals that HTML id/name attributes can define: declare variables with let/const, look elements up defensively, and avoid the window.X = window.X || … fallback. A strict CSP and sanitizing injected markup (dropping id/name) also mitigate clobbering.",
@@ -174,6 +175,112 @@ module Gori
 
     def self.remediation(code : String) : String
       REMEDIATION[code]? || (code.starts_with?("tech_") ? TECH_REMEDIATION : "")
+    end
+
+    # The CWE each finding code maps to: {numeric id, CWE name}. This is the vocabulary every
+    # downstream consumer already speaks — a report template, a Jira field, a scanner-comparison
+    # spreadsheet, an agent asked "does this codebase have any CWE-79" — and gori was the only
+    # part of that chain that could not answer it.
+    #
+    # One CWE per code, chosen as the weakness the finding IS rather than the attack it enables:
+    # `missing_hsts` is cleartext transmission (319), not "clickjacking"; `cookie_no_httponly` has
+    # its own precise entry (1004) and does not get filed under a generic 200. Where CWE genuinely
+    # has no better entry than the abstract "a protection mechanism is absent or ineffective",
+    # 693 is used deliberately rather than forcing a specific-sounding but wrong id.
+    #
+    # DELIBERATELY UNMAPPED, and not an oversight:
+    #   * `tech_*` — a fingerprint is a project fact, not a weakness; there is nothing to file.
+    #   * `jwt_in_body` / `jwt_in_ws` — Info notes on where tokens flow. Handing the client its
+    #     own token is the design (see Secrets::JWT), so stamping a CWE on it would re-create the
+    #     exact "a High that fires everywhere" problem splitting these codes out was meant to fix.
+    #   * `custom_*` — the operator's own rule; only they know what it means.
+    # `cwe` returns nil for these, and every surface omits the field rather than inventing one.
+    CWE = {
+      # --- transport / headers -----------------------------------------------------------
+      "missing_hsts"                   => {319, "Cleartext Transmission of Sensitive Information"},
+      "short_hsts"                     => {319, "Cleartext Transmission of Sensitive Information"},
+      "insecure_basic_auth"            => {319, "Cleartext Transmission of Sensitive Information"},
+      "mixed_content"                  => {319, "Cleartext Transmission of Sensitive Information"},
+      "mixed_passive"                  => {319, "Cleartext Transmission of Sensitive Information"},
+      "insecure_form_action"           => {319, "Cleartext Transmission of Sensitive Information"},
+      "missing_csp"                    => {693, "Protection Mechanism Failure"},
+      "csp_report_only"                => {693, "Protection Mechanism Failure"},
+      "weak_csp"                       => {693, "Protection Mechanism Failure"},
+      "missing_x_content_type_options" => {693, "Protection Mechanism Failure"},
+      "missing_permissions_policy"     => {693, "Protection Mechanism Failure"},
+      "weak_permissions_policy"        => {693, "Protection Mechanism Failure"},
+      "missing_x_frame_options"        => {1021, "Improper Restriction of Rendered UI Layers or Frames"},
+      "missing_referrer_policy"        => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "weak_referrer_policy"           => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "cacheable_json"                 => {524, "Use of Cache Containing Sensitive Information"},
+      # --- cookies -----------------------------------------------------------------------
+      "cookie_no_secure"              => {614, "Sensitive Cookie in HTTPS Session Without 'Secure' Attribute"},
+      "cookie_no_httponly"            => {1004, "Sensitive Cookie Without 'HttpOnly' Flag"},
+      "cookie_no_samesite"            => {1275, "Sensitive Cookie with Improper SameSite Attribute"},
+      "cookie_samesite_none_insecure" => {1275, "Sensitive Cookie with Improper SameSite Attribute"},
+      "cookie_prefix_violation"       => {693, "Protection Mechanism Failure"},
+      # --- CORS / origin -----------------------------------------------------------------
+      "cors_wildcard"          => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
+      "cors_null_origin"       => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
+      "cors_reflected_origin"  => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
+      "cors_arbitrary_origin"  => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
+      "postmessage_no_origin"  => {346, "Origin Validation Error"},
+      "document_domain_set"    => {346, "Origin Validation Error"},
+      "postmessage_wildcard"   => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      # --- information disclosure --------------------------------------------------------
+      "private_ip_leak"      => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "secret_in_body"       => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "secret_in_ws"         => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "graphql_introspection" => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "jwt_sensitive_claims"  => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "error_stack_leak"      => {209, "Generation of Error Message Containing Sensitive Information"},
+      "secret_in_url"         => {598, "Use of GET Request Method With Sensitive Query Strings"},
+      "sourcemap_exposed"     => {540, "Inclusion of Sensitive Information in Source Code"},
+      "directory_listing"     => {548, "Exposure of Information Through Directory Listing"},
+      "exposed_config"        => {538, "Insertion of Sensitive Information into Externally-Accessible File or Directory"},
+      # --- client-side execution ---------------------------------------------------------
+      "reflected_param"           => {79, "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"},
+      "dom_xss"                   => {79, "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"},
+      "inline_js_uri"             => {79, "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"},
+      "prototype_pollution"       => {1321, "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"},
+      "prototype_pollution_param" => {1321, "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"},
+      "dom_clobbering"            => {913, "Improper Control of Dynamically-Managed Code Resources"},
+      "reverse_tabnabbing"        => {1022, "Use of Web Link to Untrusted Target with window.opener Access"},
+      "missing_sri"               => {494, "Download of Code Without Integrity Check"},
+      # --- injection / traversal ---------------------------------------------------------
+      "lfi_param_traversal"  => {22, "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"},
+      "nginx_alias_traversal" => {22, "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"},
+      "open_redirect"         => {601, "URL Redirection to Untrusted Site ('Open Redirect')"},
+      "crlf_injection"        => {113, "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')"},
+      "ssti"                  => {1336, "Improper Neutralization of Special Elements Used in a Template Engine"},
+      "backslash_powered"     => {20, "Improper Input Validation"},
+      "host_header_injection" => {20, "Improper Input Validation"},
+      "request_smuggling_clte" => {444, "Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')"},
+      "request_smuggling_tecl" => {444, "Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')"},
+      "request_smuggling_tete" => {444, "Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')"},
+      # --- authn / authz / crypto --------------------------------------------------------
+      "forbidden_bypass"          => {290, "Authentication Bypass by Spoofing"},
+      "path_normalization_bypass" => {288, "Authentication Bypass Using an Alternate Path or Channel"},
+      "url_rewrite_bypass"        => {288, "Authentication Bypass Using an Alternate Path or Channel"},
+      "nextjs_action_no_auth"     => {306, "Missing Authentication for Critical Function"},
+      "jwt_alg_none"              => {347, "Improper Verification of Cryptographic Signature"},
+      "jwt_weak_alg"              => {327, "Use of a Broken or Risky Cryptographic Algorithm"},
+      "jwt_no_expiry"             => {613, "Insufficient Session Expiration"},
+    }
+
+    # {id, name} for a finding code, or nil when the code is deliberately unmapped (see CWE).
+    def self.cwe(code : String) : {Int32, String}?
+      CWE[code]?
+    end
+
+    # The canonical "CWE-79" identifier for a finding code, or nil. This is the string every
+    # surface prints and every export field carries, so the "CWE-" prefix is spelled ONCE.
+    def self.cwe_id(code : String) : String?
+      CWE[code]?.try { |(id, _)| "CWE-#{id}" }
+    end
+
+    def self.cwe_name(code : String) : String?
+      CWE[code]?.try { |(_, name)| name }
     end
 
     # Codes whose product name is fixed (protocol/framework identity, not carried in a value).

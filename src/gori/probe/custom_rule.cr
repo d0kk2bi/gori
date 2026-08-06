@@ -60,9 +60,10 @@ module Gori
         return if pattern.empty?
         text = region_text(ctx)
         return if text.nil? || text.empty?
-        return unless matches?(text)
+        hit, evidence = match_evidence(text)
+        return unless hit
         acc << Detection.new(code, Category::CUSTOM, ctx.host, ctx.url, title, severity,
-          evidence: nil, flow_id: ctx.fid)
+          evidence: evidence, flow_id: ctx.fid)
       end
 
       # The scrubbed text for this rule's side × region (nil when that region is absent, e.g. a
@@ -89,16 +90,42 @@ module Gori
         "#{head}\r\n#{body}"
       end
 
-      # Byte-safe match: text is pre-scrubbed; a bad user regex (compile raise) degrades to no
-      # match rather than dropping the whole flow's detections.
-      private def matches?(text : String) : Bool
+      # Byte-safe match returning {matched?, evidence}. Text is pre-scrubbed; a bad user regex
+      # (compile raise) degrades to no match rather than dropping the whole flow's detections.
+      #
+      # A regex rule now REPORTS WHAT IT MATCHED. Every custom finding used to store
+      # `evidence: nil`, so the Probe detail pane, `gori run probe`, and the MCP tools could all
+      # say a rule fired on a host but not what tripped it — the operator had to re-run the
+      # pattern by hand against the sample flow to find out. Capture group 1 wins when the
+      # pattern defines one (that is how you say "report THIS part" — the id out of a URL, the
+      # version out of a banner); otherwise the whole match is reported.
+      #
+      # A STRING rule reports nothing, deliberately: its match is byte-identical to its own
+      # `pattern`, which every surface already shows next to the rule, so the field would be
+      # pure duplication.
+      private def match_evidence(text : String) : {Bool, String?}
         if kind == "regex"
-          SafeRegexp.compile(pattern).matches?(text)
+          m = SafeRegexp.compile(pattern).match(text)
+          return {false, nil} unless m
+          {true, safe_evidence(m[1]? || m[0])}
         else
-          text.includes?(pattern)
+          {text.includes?(pattern), nil}
         end
       rescue
-        false
+        {false, nil}
+      end
+
+      # The captured text is CONTENT — server bytes, or the operator's own traffic — landing in
+      # a stored row and in the TUI, so it gets the same treatment every other rule gives
+      # content-derived evidence (cf. Passive::Sri#safe_host, SourceMap#safe_ref): printable
+      # ASCII only, and capped. The cap also keeps a greedy user pattern (`.*`) from writing a
+      # whole 64 KiB body into the issue row.
+      EVIDENCE_CAP = 120
+
+      private def safe_evidence(raw : String) : String?
+        cleaned = raw.scrub.gsub(/[^\x20-\x7e]/, " ").strip
+        return nil if cleaned.empty?
+        cleaned.size > EVIDENCE_CAP ? "#{cleaned[0, EVIDENCE_CAP]}…" : cleaned
       end
     end
 
