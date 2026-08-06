@@ -22,6 +22,13 @@ private def with_config_home(&)
     Gori::Settings.upstream_rules = [] of Gori::Settings::UpstreamRule
     Gori::Settings.theme = Gori::Settings::DEFAULT_THEME
     Gori::Settings.env_vars = [] of {String, String}
+    # Overlay scratch must not leak into MineConfigOverlay / Discover specs that run later
+    # in the same process (class_properties, not the temp settings.json).
+    Gori::Settings.mine_locations = [] of String
+    Gori::Settings.mine_concurrency = 10
+    Gori::Settings.mine_notify = "when-found"
+    Gori::Settings.mine_prefs_saved = false
+    Gori::Settings.discover_prefs_saved = false
     FileUtils.rm_rf(dir)
   end
 end

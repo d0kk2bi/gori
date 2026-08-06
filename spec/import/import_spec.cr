@@ -1120,8 +1120,8 @@ describe Gori::Import::Builder do
     it "does NOT rescue a body that was never chunk framing to begin with" do
       # The complement, and the reason the relaxation is bounded: a DECODED body a
       # third-party HAR shipped under a Transfer-Encoding header still loses the header,
-      # truncation flag or no truncation flag. No CL is invented either — fabricating one
-      # would change a close-delimited (or unframed) entity into length-framed (P7).
+      # truncation flag or no truncation flag. CL is restated so framing matches the
+      # stored body (the TE-strip case) — not invented when the source stated no framing.
       headers = Gori::Import::Builder::Headers.new
       headers << {"Transfer-Encoding", "chunked"}
       empty = Gori::Import::Builder::Headers.new
@@ -1130,7 +1130,7 @@ describe Gori::Import::Builder do
         headers, "hello world".to_slice, "text/plain", nil, nil, 5_000_i64)
       head = String.new(pair.response.not_nil!.head)
       head.should_not contain("Transfer-Encoding")
-      head.should_not contain("Content-Length")
+      head.should contain("Content-Length: 11\r\n")
     end
 
     it "does NOT relax the walk for an UNtruncated body" do
