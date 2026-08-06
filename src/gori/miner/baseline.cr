@@ -42,12 +42,23 @@ module Gori::Miner
     end
 
     def calibrate(locations : Array(Location)) : Report
-      probes = [] of Probe
       rounds = {@config.stability_rounds, 1}.max
-      rounds.times do
+      # Calibration is pure round-trip time and it runs BEFORE a single candidate is tested,
+      # so on a real target its cost is `stability_rounds + locations` RTTs of dead air at the
+      # head of every mine — on a 100ms origin that is most of a second before the run does
+      # anything. The probes do not depend on each other (the stability rounds are N copies of
+      # the same request; the controls are one independent bucket per location), so they go out
+      # concurrently, in two waves: the tolerance bands the controls are judged against come
+      # from the stability wave.
+      #
+      # Indexed writes, not appends: `probes.first` is the round the whole report is built
+      # from, so the answer must not depend on which fiber finished first.
+      slots = Array(Probe?).new(rounds, nil)
+      in_parallel(rounds) do |i|
         raw = @backend.send(@base)
-        probes << Fingerprint.probe(raw) if raw.error.nil?
+        slots[i] = Fingerprint.probe(raw) if raw.error.nil?
       end
+      probes = slots.compact
       return unreachable if probes.empty?
 
       base = probes.first
@@ -68,8 +79,12 @@ module Gori::Miner
 
       reflection_only = Hash(Location, Bool).new
       reflects_all = Hash(Location, Bool).new
-      locations.each do |loc|
-        reacts, echoes = control_signals(loc, base, length_tol, words_tol, lines_tol)
+      signals = Array({Bool, Bool}?).new(locations.size, nil)
+      in_parallel(locations.size) do |i|
+        signals[i] = control_signals(locations[i], base, length_tol, words_tol, lines_tol)
+      end
+      locations.each_with_index do |loc, i|
+        reacts, echoes = signals[i] || {false, false}
         reflection_only[loc] = reacts
         reflects_all[loc] = echoes
       end
@@ -77,6 +92,54 @@ module Gori::Miner
       Report.new(base.metrics.status, length_tol, words_tol, lines_tol,
         base.metrics.length, base.metrics.words, base.metrics.lines,
         stable, reflection_only, reflects_all, baseline_warning(stable, statuses, reflects_all))
+    end
+
+    # Call the block for `0...count` through at most `concurrency` fibers, and return only
+    # once every call has finished.
+    #
+    # SEQUENTIAL when the run is paced (`--rate` / `--throttle`): calibration has never
+    # charged itself against the pacer, which was invisible while it also sent one request at
+    # a time. Firing `stability_rounds` at once would turn "1 request per second, please" into
+    # a burst on the very first thing the target sees from a mine — the opposite of what the
+    # operator asked for, and the calibration is a handful of requests either way.
+    #
+    # An exception inside the block is re-raised on THIS fiber rather than escaping on a
+    # worker's: an unhandled exception in a spawned fiber takes the process down, and until
+    # this ran concurrently every raise here landed inside `Engine#orchestrate`'s rescue and
+    # became an ErrorEvent. The first one wins; the rest are already-failed work.
+    private def in_parallel(count : Int32, &block : Int32 ->) : Nil
+      return if count <= 0
+      workers = {count, {@config.concurrency, 1}.max}.min
+      workers = 1 if @config.rps || @config.throttle_ms
+      if workers <= 1
+        count.times { |i| block.call(i) }
+        return
+      end
+
+      jobs = Channel(Int32).new
+      done = Channel(Nil).new(workers)
+      failure = nil.as(Exception?)
+      workers.times do
+        spawn(name: "miner-baseline") do
+          begin
+            while i = jobs.receive?
+              begin
+                block.call(i)
+              rescue ex
+                failure ||= ex
+              end
+            end
+          ensure
+            done.send(nil)
+          end
+        end
+      end
+      count.times { |i| jobs.send(i) }
+      jobs.close
+      workers.times { done.receive }
+      if ex = failure
+        raise ex
+      end
     end
 
     # Inject a bucket of random non-existent names ONCE per location. Returns

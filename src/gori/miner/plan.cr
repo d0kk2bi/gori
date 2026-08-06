@@ -148,6 +148,7 @@ module Gori::Miner
     getter request_target : String
     # The candidate parameter names (built-in list + the user wordlist).
     getter names : Array(String)
+
     # Resolved locations that `Detect` says do NOT apply to this request — a surface can
     # only reach these by naming them explicitly, and `gori run mine` warns per location
     # rather than dropping them silently.
@@ -157,6 +158,14 @@ module Gori::Miner
                    @origin : Fuzz::Origin, @http2 : Bool, @request : Bytes,
                    @request_target : String, @names : Array(String),
                    @inapplicable : Array(Location))
+    end
+
+    # The run's keep-alive pool, or nil when it runs connection-per-send (h2, or
+    # `config.keep_alive?` off). Surfaces read its counters to report how many handshakes the
+    # run actually paid for — the one directly observable measure of what pooling bought.
+    # Same accessor `Fuzz::Plan` publishes, so the two CLI reporters stay one shape.
+    def pool : Fuzz::ConnPool?
+      @sender.pool
     end
 
     # The number of distinct (name × location) tests this run performs — the progress
@@ -212,8 +221,12 @@ module Gori::Miner
       # untouched captured request, and `Baseline#calibrate` sends it raw before any
       # injection at all. Reproduced: `gori run mine <flow> --bind-from <flow>` put the live
       # session token on the wire in 6 of 8 requests.
+      #
+      # `idle_conns: concurrency` — one parked socket per worker fiber is the most that can
+      # ever be checked out at once, so a larger pool would only hold dead sockets open.
       sender = Fuzz::Sender.new(origin, outbound, http2: options.http2?, verify: options.verify?,
         sni: options.sni, timeout: config.timeout, overrides: options.overrides,
+        keep_alive: config.keep_alive?, idle_conns: config.concurrency,
         evidence: options.evidence?)
       new(engine: Engine.new(request, options.http2?, names, sender, config), sender: sender,
         config: config, origin: origin, http2: options.http2?, request: request,

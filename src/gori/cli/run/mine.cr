@@ -23,6 +23,7 @@ module Gori
         timeout : Time::Span? = nil
         retries = 1
         max_requests : Int64? = nil
+        keep_alive = true
         format = :text
         allow_unscoped = false
         bind_from : Int64? = nil
@@ -47,6 +48,7 @@ module Gori
           p.on("--timeout=SEC", "Per-request connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("--retries=N", "Retries on a network error") { |v| retries = parse_nonneg(v, "--retries") }
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
+          p.on("--no-keep-alive", "Dial a fresh connection for every probe (default: reuse)") { keep_alive = false }
           p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run mine") }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
@@ -75,6 +77,7 @@ module Gori
         config.retries = retries
         config.max_requests = max_requests
         config.user_wordlist = wordlist
+        config.keep_alive = keep_alive
         # `--locations=` with no usable value (empty, or only blanks/commas) is an operator
         # mistake, not a request to auto-detect — abort instead of silently mining defaults.
         if (loc = locations) && loc.empty?
@@ -115,7 +118,7 @@ module Gori
           # invocation, so `--bind-from` replays one here. An unseeded `$NAME` ships literally
           # rather than refusing the sweep (see `Env.unbound`).
           (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run mine")
-          run_mine_stream(plan.engine, origin.scheme, origin.host, origin.port, plan.config, format)
+          run_mine_stream(plan.engine, origin.scheme, origin.host, origin.port, plan.config, format, plan.pool)
         ensure
           outbound.close
         end
@@ -204,7 +207,8 @@ module Gori
       end
 
       private def self.run_mine_stream(engine : Miner::Engine, scheme : String, host : String,
-                                       port : Int32, config : Miner::Config, format : Symbol) : Nil
+                                       port : Int32, config : Miner::Config, format : Symbol,
+                                       pool : Fuzz::ConnPool? = nil) : Nil
         total = engine.total_names
         STDERR.puts "mining #{scheme}://#{host}:#{port} · #{config.locations.map(&.label).join("/")} · #{total} names"
         # Names the wordlist supplied that this location cannot carry. Dropping them is
@@ -222,7 +226,7 @@ module Gori
           when Miner::BaselineEvent then mine_baseline(ev)
           when Miner::FindingEvent  then findings << ev.finding; emit_mine_finding(ev.finding, format)
           when Miner::ProgressEvent then mine_progress(ev, total)
-          when Miner::DoneEvent     then mine_done(ev, findings.size, config)
+          when Miner::DoneEvent     then mine_done(ev, findings.size, config); mine_connections(pool)
           when Miner::ErrorEvent    then had_error = true; STDERR.puts "mine error: #{ev.message}"
           end
         end
@@ -289,6 +293,18 @@ module Gori
         # operator never passed would send them after the wrong thing.
         why = config.max_requests ? "budget exhausted — raise or drop --max-requests" : "incomplete"
         STDERR.puts "#{why} · #{left} of #{p.names_total} names never tested"
+      end
+
+      # Handshakes actually paid for. Worth a line for the same reason `gori run fuzz` prints
+      # it: it is how an operator sees whether the origin honoured keep-alive at all (dialed ≈
+      # sent means it closed after every response, or the probes were too odd to share a socket
+      # — see ConnPool). Nothing is printed for a --no-keep-alive or h2 run, which has no pool.
+      private def self.mine_connections(pool : Fuzz::ConnPool?) : Nil
+        return unless pool && pool.dialed > 0
+        STDERR.puts "connections · #{pool.dialed} dialed · #{pool.reused} reused" \
+                    "#{pool.stale_retries > 0 ? " · #{pool.stale_retries} re-sent on a closed connection" : ""}" \
+                    "#{pool.unsafe_stale > 0 ? " · #{pool.unsafe_stale} not re-sent (non-idempotent method)" : ""}" \
+                    "#{pool.pooling? ? "" : " · keep-alive gave up (origin closes every connection)"}"
       end
     end
   end

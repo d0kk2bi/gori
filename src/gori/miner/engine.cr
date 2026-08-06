@@ -12,9 +12,10 @@ module Gori::Miner
 
   # Drives a parameter-mining run: calibrate a baseline, then for each location stuff
   # candidate names into buckets, diff vs baseline, and BINARY-SEARCH each interesting
-  # bucket to isolate the responsible name. Concurrency = level-synchronized BFS per
-  # location: the current frontier of buckets runs concurrently through a bounded worker
-  # pool, children (bisection halves) are collected, then the next frontier runs.
+  # bucket to isolate the responsible name. Concurrency = ONE work queue for the whole run,
+  # drained by a bounded worker pool: every location's buckets go in together and a
+  # bisection's halves are pushed straight back, so nothing waits on a round barrier or on
+  # another location finishing. See `drain`.
   #
   # Single-threaded fiber scheduler (no -Dpreview_mt): plain ivar increments and array
   # appends never yield mid-op, so the counters and per-round outcome array need no locks.
@@ -49,6 +50,11 @@ module Gori::Miner
     @names_done : Int64
     @names_total : Int64
     @last_dispatch : Time::Instant
+    # Buckets dispatched to a worker and not yet accounted for, and the 1-slot channel a
+    # worker pokes when one lands. Together they are the mine's "is there still work?"
+    # answer — see `drain` / `wait_for_worker`.
+    @inflight : Int32
+    @idle : Channel(Nil)
 
     # The first per-send failure reason of the run. `@errors` counts refusals and drops the
     # string, which is how a scope-blocked run could report "0 found" and exit 0 with the
@@ -96,6 +102,8 @@ module Gori::Miner
       @names_done = 0_i64
       @names_total = 0_i64
       @last_dispatch = Time.instant
+      @inflight = 0
+      @idle = Channel(Nil).new(1)
     end
 
     # The number of distinct (name × location) tests this run will perform — the stable
@@ -142,56 +150,75 @@ module Gori::Miner
       @report = report
       @events.send(BaselineEvent.new(report.stable, report.warning))
 
-      @config.locations.each do |loc|
-        break if @state.stopped?
-        frontier = initial_buckets(loc, valid_names_for(loc))
-        until frontier.empty? || @state.stopped?
-          frontier = run_round(frontier).flat_map { |children| children }
-        end
-      end
+      work = Deque(Task).new
+      @config.locations.each { |loc| initial_buckets(loc, valid_names_for(loc)).each { |t| work << t } }
+      drain(work)
       @events.send(DoneEvent.new(snapshot, @state.stopped?))
     rescue ex
       @events.send(ErrorEvent.new(ex.message || "miner error"))
       @events.send(DoneEvent.new(snapshot, @state.stopped?))
     ensure
+      # Every worker has left `drain` by here, so no fiber can be holding a checked-out
+      # socket: release the keep-alive pool's parked ones instead of waiting for GC to
+      # finalize them (a stopped 40-worker run would otherwise sit on 40 fds). Same close
+      # `Fuzz::Engine#coordinate` performs, at the miner's equivalent seam.
+      @backend.close
       @events.close
     end
 
-    # Run one frontier concurrently; returns each task's children (next frontier).
-    private def run_round(tasks : Array(Task)) : Array(Array(Task))
-      outcomes = [] of Array(Task)
-      return outcomes if tasks.empty?
-      # Never spawn more workers than there are tasks: the tail bisection/isolation rounds carry
-      # 1–2 tasks, so a fixed pool of @concurrency (up to 100) would spawn dozens of fibers that
-      # only see the closed channel and exit. Capping keeps full parallelism with no idle churn.
-      workers = {@concurrency, tasks.size}.min
-      jobs = Channel(Task).new(workers)
+    # Run every bucket of the whole mine through ONE bounded worker pool, feeding each
+    # task's bisection children straight back into the queue.
+    #
+    # It used to be a level-synchronised BFS per location: `locations.each` ran the locations
+    # one after another, and inside each, a round dispatched the frontier, waited for ALL of
+    # it, then dispatched the children. Both halves of that idled the pool, and a mine is
+    # LATENCY-bound — its request count is small (bucket + bisect + confirm) and almost all of
+    # its wall clock is time-of-flight — so an idle worker is time nobody gets back:
+    #
+    #   * the tail of a bisection is 1-2 tasks wide (that is what isolating one name MEANS),
+    #     so the last log₂(bucket) rounds ran at a concurrency of 1-2 no matter what the
+    #     operator set. Meanwhile the OTHER buckets' subtrees, which are entirely independent,
+    #     sat in a later round waiting on the barrier;
+    #   * a three-location mine took three times as long as its slowest location, for no
+    #     reason at all: query/headers/cookies share nothing but the baseline report.
+    #
+    # A queue removes both without changing what is sent: the tasks are exactly the same
+    # tasks, each still decided against the same calibrated baseline, and a bisection child
+    # still cannot run before its parent — it does not EXIST before its parent. Only the
+    # order of independent work changes, so findings can now interleave across locations.
+    #
+    # Concurrency: single-threaded fiber scheduler (no `-Dpreview_mt`). `Deque#push`/`#shift?`
+    # never yield mid-op, so workers and this fiber can share the queue with no lock, the same
+    # reasoning the counters already rely on.
+    private def drain(work : Deque(Task)) : Nil
+      return if work.empty?
+      # The pool is spawned ONCE for the run, so an idle worker is a fiber parked on a receive
+      # rather than the per-round spawn/exit churn the old code capped against — and the cap
+      # it used (`min(concurrency, frontier.size)`) cannot be computed here anyway: the queue
+      # grows as buckets bisect, and sizing the pool to the first frontier would pin a
+      # 40-worker run to its 4 initial buckets for the whole mine.
+      workers = @concurrency
+      # UNBUFFERED on purpose: a send parks until a worker actually TAKES the task, which is
+      # what keeps `@inflight` bounded by the pool size instead of by the queue's length.
+      jobs = Channel(Task).new
       finished = Channel(Nil).new(workers)
       interval = pace_interval
-
-      spawn(name: "miner-dispatch") do
-        begin
-          tasks.each do |task|
-            break if @state.stopped?
-            park_if_paused
-            break if @state.stopped?
-            # Early-out once the hard cap is hit — the CappedBackend also refuses any
-            # send that slips past this racy check, so the network count never exceeds it.
-            break if @backend.cap_reached?
-            pace(interval)
-            jobs.send(task)
-          end
-        ensure
-          jobs.close
-        end
-      end
+      @inflight = 0
 
       workers.times do |i|
         spawn(name: "miner-worker-#{i}") do
           begin
             while task = jobs.receive?
-              next if @state.stopped? # drain buffered tasks without sending on stop
-              outcomes << process_bucket(task)
+              # Children are queued BEFORE the task is counted out, so the "queue empty and
+              # nothing in flight" test below is a true end-of-work and never races a child in.
+              process_bucket(task).each { |child| work << child } unless @state.stopped?
+              @inflight -= 1
+              # Non-blocking: a worker must never park reporting completion (the dispatcher
+              # only listens while it is idle). Dropping a poke is safe — see `wait_for_worker`.
+              select
+              when @idle.send(nil)
+              else
+              end
             end
           ensure
             finished.send(nil)
@@ -199,8 +226,38 @@ module Gori::Miner
         end
       end
 
+      until @state.stopped?
+        if task = work.shift?
+          park_if_paused
+          break if @state.stopped?
+          # Early-out once the hard cap is hit — the CappedBackend also refuses any
+          # send that slips past this racy check, so the network count never exceeds it.
+          break if @backend.cap_reached?
+          pace(interval)
+          @inflight += 1
+          jobs.send(task)
+        elsif @inflight > 0
+          wait_for_worker # a bucket is still out; its children may refill the queue
+        else
+          break # queue drained and nothing outstanding — the mine is complete
+        end
+      end
+      jobs.close
       workers.times { finished.receive }
-      outcomes
+    end
+
+    # Park until a worker reports a finished bucket.
+    #
+    # A DROPPED poke cannot lose a wake-up, because the only place this is called from tests
+    # `@inflight > 0` and then parks with no yield point in between: the fiber scheduler is
+    # single-threaded and cooperative, so a worker that is still out at the moment of the test
+    # can only run — and only poke — once this receive is already parked, and a parked receiver
+    # is handed the value directly rather than through the buffer. The 1-slot buffer is there
+    # for the reverse case (a poke that lands while the dispatcher is busy dispatching), where
+    # collapsing several into one is exactly right: the dispatcher re-reads the queue and the
+    # counter after every wake, so a wake means "look again", never "one task finished".
+    private def wait_for_worker : Nil
+      @idle.receive
     end
 
     # ── the bucketing + bisection core ──────────────────────────────────────────────

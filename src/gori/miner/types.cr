@@ -187,6 +187,17 @@ module Gori
       property? add_content_length_when_missing : Bool
       property user_wordlist : String?
       property notify : NotifyMode
+      # Reuse one HTTP/1.1 connection across the run's sends (`Repeater::ConnPool`, wired in
+      # `Plan.build`) instead of dialing a fresh one per probe. ON by default, as it is for the
+      # Fuzzer and Discover: a mine is a sweep — baseline calibration, one request per bucket,
+      # then a bisection tree and `confirm_rounds` per finding — all at ONE origin, so without
+      # pooling every one of those pays a TCP handshake and, on https, a TLS handshake before a
+      # payload byte moves. Off is the right answer when the target behaves per-connection
+      # (connection-scoped rate limits, a load balancer pinning by connection) or when the
+      # keep-alive handling is itself what is being probed. Reuse is still opt-in PER MESSAGE
+      # inside the pool — a bucket whose wire body disagrees with its declared length always
+      # gets a fresh socket (see `ConnPool.reusable_request?`).
+      property? keep_alive : Bool
 
       # Per-Burp ceilings; query/form are additionally clamped by the URL byte budget
       # in Inject so a stuffed line can't exceed common request-line limits.
@@ -205,7 +216,7 @@ module Gori
                      @timeout = nil, @retries = 1, @retry_pause = 500.milliseconds,
                      @stability_rounds = 4, @confirm_rounds = 2, @max_requests = nil,
                      @add_content_length_when_missing = false, @user_wordlist = nil,
-                     @notify = NotifyMode::WhenFound)
+                     @notify = NotifyMode::WhenFound, @keep_alive = true)
       end
 
       def bucket_for(loc : Location) : Int32
