@@ -375,15 +375,22 @@ module Gori
           # gives: the pair is the operator's evidence, and a response desync is the same
           # primitive read from the other end.
           both = both_framings?(headers)
+          had_te = false
+          has_cl = false
           headers.each do |k, v|
+            had_te = true if transfer_encoding?(k)
             next if !both && !wire_chunked && transfer_encoding?(k)
+            has_cl = true if !has_cl && k.compare("content-length", case_insensitive: true) == 0
             b << k << ": " << v << "\r\n"
           end
-          # Do NOT invent a Content-Length the source never stated. Close-delimited replies,
-          # bodyless 304/204, and every HTTP/2 head (DATA-framed, no CL) had one fabricated
-          # here, so re-import silently changed framing (P7) and broke export→import. An
-          # incoming CL is kept by the headers loop above; chunked bodies keep TE via
-          # wire_chunked; truncation is already carried by body_size on the DTO.
+          # Invent a Content-Length only when we stripped a lying Transfer-Encoding (decoded
+          # body under a chunked header) so framing still matches the stored bytes. Never
+          # invent one for a source that stated no framing at all — close-delimited, bodyless
+          # 304/204, and HTTP/2 DATA-framed heads must stay without a fabricated CL (P7 /
+          # export→import fixed point). Incoming CL and true chunked bodies are kept above.
+          if body && !has_cl && !wire_chunked && had_te
+            b << "Content-Length: " << body.size << "\r\n"
+          end
           b << "\r\n"
         end.to_slice
       end
