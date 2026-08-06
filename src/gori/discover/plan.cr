@@ -64,10 +64,17 @@ module Gori::Discover
     # Verify upstream TLS certificates.
     property? verify : Bool
     # TLS SNI override — the name presented in the ClientHello (and, under verify, the name
-    # the certificate is checked against) WITHOUT changing the dialed host:port. Mirrors
+    # the certificate is checked against) WITHOUT changing the dialed host:port. Same field as
     # `Miner::PlanOptions#sni` / `Fuzz` / `Sequencer`; discover was the one engine of the four
     # that could not carry it, which made an IP-direct sweep of a name-based vhost
     # inexpressible (the crawler also owns its `Host:` header, so there was no second way in).
+    #
+    # Reached from `gori run discover --sni` and MCP `discover_start{sni}` ONLY. The Discover TAB
+    # cannot set it — `DiscoverController#build_engine` passes neither this nor `http2`, and
+    # `Discover::Config` has no field to hold either, while the Fuzzer/Miner/Sequencer/Repeater
+    # views all carry `sni_override` + `@http2`. That is where the rollout stopped on purpose
+    # (the commit adding these scoped itself to "CLI and to `discover_start`"), not an oversight;
+    # said here because "Mirrors Fuzz/Miner/Sequencer" used to read as settled on all three.
     property sni : String?
     # Send over HTTP/2 (TLS + ALPN `h2`, or h2c prior-knowledge on http://). `Discover::Sender`
     # has always had the field; nothing could set it, so an h2-only origin was unreachable

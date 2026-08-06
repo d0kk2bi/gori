@@ -401,6 +401,16 @@ module Gori
     # add`, the History add-host quick-action) — gate on Scope.valid?, defined below in
     # terms of this, so a rejection here keeps a dead rule out of the store regardless of
     # which entry point created it.
+    #   match_type — must be one of TYPES. This case had no `else`, so any other string fell
+    #           through to nil and `valid?` said yes: `Scope#add` stored it, and `Rule#matches?`
+    #           (whose own `case` DOES end in `else false`) then never matched it. A typo'd
+    #           `exclude strng logout` was listed in the operator's scope and silently excluded
+    #           nothing — fail-OPEN on the exclude gate, and precisely the "silent dead rule"
+    #           the host:port check below exists to prevent. Every write path happens to check
+    #           membership itself today (MCP `tools/scope.cr`, `gori run project scope
+    #           add`/`update`, and the TUI overlay, which can only cycle an index into TYPES),
+    #           so this closes no live hole — it makes the guarantee this comment already
+    #           claimed actually hold for the next caller.
     #   regex — must compile (the SQLite REGEXP callback + the proxy hot path both call
     #           Regex.new and would otherwise raise).
     #   host  — must NOT carry a :PORT. A host rule matches the BARE host on any port
@@ -414,8 +424,12 @@ module Gori
           "host rule must not include a port — a host rule already matches every port; " \
           "use the bare host #{host_without_port(pattern).inspect} (matches any port)"
         end
+      when "string"
+        nil
       when "regex"
         "invalid regex (failed to compile)" unless valid_regex?(pattern)
+      else
+        "unknown match type #{match_type.inspect} (expected #{TYPES.join(", ")})"
       end
     end
 

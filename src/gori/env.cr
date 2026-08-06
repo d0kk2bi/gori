@@ -755,11 +755,34 @@ module Gori
     # `\r\n\r\n` alone and REFUSED to send a bare-LF-terminated request — the exact
     # payload its `verbatim` flag advertises.
     def self.head_body_boundary(bytes : Bytes) : Int32
+      if sep = head_body_separator(bytes)
+        offset, width = sep
+        offset + width
+      else
+        bytes.size
+      end
+    end
+
+    # `{offset of the blank-line separator, its width in bytes}`, or nil when the message
+    # carries none. The SCANNING half of `head_body_boundary`, and the only place the
+    # three terminator spellings are enumerated.
+    #
+    # Two shapes exist because callers want two different things and deriving one from the
+    # other needs the width. `head_body_boundary` wants where the BODY starts (to normalize
+    # or expand the head and copy the body through untouched). A projection that renders the
+    # head as text wants the head WITHOUT its terminator, which is `bytes[0, offset]` — and
+    # it cannot recover that from the boundary alone, because subtracting a fixed 4 is only
+    # right for `\r\n\r\n`. `MCP::Serialize.head_and_body` hard-coded that 4 alongside its own
+    # CRLFCRLF-only scan, so a bare-LF-terminated held message — a CL/TE desync primitive gori
+    # stores byte-exact (P7) — reported its whole body as part of the head with `body_size: 0`,
+    # on MCP `intercept_get`/`intercept_list` AND `gori run intercept show`/`list`, while the
+    # edit path on the same bytes split it correctly.
+    def self.head_body_separator(bytes : Bytes) : {Int32, Int32}?
       n = bytes.size
       i = 0
       while i < n
         if bytes[i] == 0x0A_u8 && i + 1 < n && bytes[i + 1] == 0x0A_u8
-          return i + 2
+          return {i, 2}
         end
         # `\n\r\n` (0x0A 0x0D 0x0A): a bare-LF header terminator followed by a CRLF blank
         # line. The two neighboring checks both miss it — LFLF needs `bytes[i+1]==0x0A`
@@ -767,15 +790,15 @@ module Gori
         # all-head and the body's bare LFs get promoted to CRLF. Body starts at i+3.
         if bytes[i] == 0x0A_u8 && i + 2 < n &&
            bytes[i + 1] == 0x0D_u8 && bytes[i + 2] == 0x0A_u8
-          return i + 3
+          return {i, 3}
         end
         if bytes[i] == 0x0D_u8 && i + 3 < n &&
            bytes[i + 1] == 0x0A_u8 && bytes[i + 2] == 0x0D_u8 && bytes[i + 3] == 0x0A_u8
-          return i + 4
+          return {i, 4}
         end
         i += 1
       end
-      n
+      nil
     end
 
     # Byte-level equivalent of `gsub(/\r?\n/, "\r\n")`: inserts `\r` before any

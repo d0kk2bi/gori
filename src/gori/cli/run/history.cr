@@ -501,7 +501,10 @@ module Gori
               CLI::Output.flow_row_fields(j, detail.row)
             end
             j.field "http_version", detail.http_version
-            j.field "error", detail.error
+            # `Serialize.flow_detail` wraps this same field in `text()`; here it was raw. A
+            # capture failure's text quotes bytes the origin sent (a malformed status line, a
+            # header the codec refused), so it is captured data — see `Output.json_captured`.
+            CLI::Output.json_captured(j, "error", detail.error)
             emit_decoded_json(j, detail, req, resp)
             if req
               j.field "request" do
@@ -531,7 +534,7 @@ module Gori
                           j.object do
                             j.field "direction", m.direction
                             j.field "opcode", m.opcode
-                            Output.emit_ws_shape_json(j, m)
+                            m.emit_shape_json(j)
                             if m.text?
                               j.field "text", String.new(m.payload).scrub
                               # See emit_ws_result: JSON cannot carry a byte that is not valid

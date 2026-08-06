@@ -455,6 +455,12 @@ describe "MCP job-tool parity knobs" do
         {"discover_start", %({"url":"http://127.0.0.1:1/","throttle_ms":5})},
         {"probe_scan", %({"insecure":true})},
         {"intercept_forward_edit", %({"item_id":1,"raw":"GET / HTTP/1.1\\r\\n\\r\\n","update_content_length":false})},
+        # `send_request` was the LAST send surface with no route to an SNI: the schema declared
+        # none and the code only ever read a stored one off a flow/repeater row, so an agent
+        # could not run the vhost-confusion test that every sibling tool's own description
+        # names — and replaying a flow dialled with a ClientHello `gori run repeater
+        # <flow-id> --sni` could change and this could not.
+        {"send_request", %({"url":"http://127.0.0.1:1/","sni":"x"})},
       }.each do |(tool, args)|
         result_text(drive(store, call_line(tool, args))[0])
           .should_not contain("unknown argument")

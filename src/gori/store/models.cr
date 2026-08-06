@@ -1,3 +1,4 @@
+require "json"
 require "../ascii_bytes"
 require "../url"
 require "../token_extract"
@@ -266,6 +267,34 @@ module Gori
       def close_reason : Bytes?
         return nil unless @opcode == 8 && @payload.size > 2
         @payload[2, @payload.size - 2]
+      end
+
+      # This message's frame SHAPE as JSON fields, emitted into an open object. Only what
+      # departs from the default is written, so an ordinary message's object is exactly the
+      # shape it was before V7 — a script keying off field presence is not broken by a feature
+      # it did not ask for. The JSON sibling of `WsOutMessage#shape_label` / `ws_shape_note`.
+      #
+      # Lives on the MODEL, the way `Probe.group_json` and `Jwt.decode_json` do, because two
+      # surfaces render it and neither owns it: `gori run show --format json` and MCP's
+      # `emit_ws_messages`. It used to live in `CLI::Output`, which `MCP::Serialize` then called
+      # — and since `cli/run/{intercept,history}.cr` already call `MCP::Serialize.*`, that made
+      # the two surfaces MUTUALLY dependent, with none of the files declaring the require (it
+      # links only because `src/gori.cr` happens to pull in both). DESIGN.md §2.1 documents the
+      # CLI→MCP direction and prescribes exactly this move.
+      #
+      # This removes the `CLI::Output` edge, NOT the whole cycle: `MCP::Serialize` and
+      # `mcp/tools/{send,repeater}.cr` still reach into `CLI::Run` for `incomplete_reason`,
+      # `ws_seed_rows`, `seed_shape` and `ws_notice_dropped_note` — four more pure functions
+      # over `Repeater::Result` / `Store::WsMessage` that belong under `Repeater::` by the same
+      # argument. Moving them is the rest of this job.
+      def emit_shape_json(j : JSON::Builder) : Nil
+        s = shape
+        j.field "fin", false unless s.fin
+        j.field "rsv", s.rsv if s.rsv != 0
+        s.masked.try { |mk| j.field "masked", mk unless mk }
+        j.field "frames", s.frames if s.frames > 1
+        close_code.try { |c| j.field "close_code", c }
+        close_reason.try { |r| j.field "close_reason", String.new(r).scrub }
       end
     end
 

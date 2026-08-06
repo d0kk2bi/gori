@@ -1190,6 +1190,7 @@ module Gori
               s.field "h2_fields", h2fieldsprop
               s.field "http2", boolprop("use real HTTP/2; defaults to the flow's version when flow_id is set)")
               s.field "timeout_ms", intprop("per-operation connect + idle (read/write) timeout in milliseconds; a timeout surfaces as a network-error result with error_kind (1-600000)")
+              s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni). OVERRIDES the SNI a flow_id/repeater_id source carries, the way `gori run repeater <flow-id> --sni` does; omit to keep the stored one.")
               s.field "insecure", boolprop("skip upstream TLS verification (default false)")
               s.field "apply_rules", boolprop("apply the project's enabled Match & Replace rules (REQUEST side only) to the outgoing request before sending, matching the live proxy; default false — direct sends are byte-exact")
               s.field "record_history", boolprop("record the outbound request and response in History for audit/evidence (default true)")
@@ -2074,7 +2075,16 @@ module Gori
       private def emit_audit(j : JSON::Builder, a : JobAudit, ended_at_ms : Int64?) : Nil
         j.field "audit" do
           j.object do
-            j.field "target", a.target
+            # `Serialize.text`, matching what all four `list_jobs` rows already do with this
+            # exact value (`tools/jobs.cr`) — it was raw only here. For fuzz/mine/sequence the
+            # target is `"#{scheme}://#{host}:#{port}"` built from the plan's origin, and a
+            # flow-seeded job takes that host off a capture: `flows.host` round-trips a byte
+            # above 0x7F (nothing rejects it — `Import::Builder::HOST_INVALID` covers only
+            # `[\x00-\x20\x7f]`) and `FlowRequest.parse_target` passes it through, so
+            # `fuzz_status` could put invalid UTF-8 on the wire while `list_jobs` for the same
+            # job stayed clean. This surface is stdio JSON-RPC, where that is a transport-level
+            # protocol violation rather than a display glitch (see `Serialize.issue`).
+            j.field "target", Serialize.text(a.target)
             j.field "rate", a.rate
             j.field "concurrency", a.concurrency
             j.field "max_requests", a.max_requests

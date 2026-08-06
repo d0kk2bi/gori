@@ -158,17 +158,86 @@ describe "gori run history — CLI::Output rows" do
   # CLI::Output is the shape `gori run history --format json`, `gori run capture`'s
   # JSON-Lines stream, and the MCP list_history tool all mirror. A field added to one
   # serializer and not the other is a silent three-surface drift, and nothing else in the
-  # tree compares them. The ONE deliberate difference is the timestamp field name.
+  # tree compares them. The ONE remaining difference is the CLI's extra human `time`.
+  #
+  # This used to subtract `time` from one side and `created_at_iso` from the other and assert
+  # neither carried both, which made the pin PASS while the two surfaces rendered the same
+  # instant as different strings — `time` is local at second precision, `created_at_iso` is
+  # UTC at millisecond. The keys matched and the values could not be compared. Now the CLI
+  # carries both and the shared key is asserted on VALUE, not just presence.
   it "keeps the flow-row JSON keys in lockstep with the MCP serializer" do
     row = flow_row(target: "/a", host: "h", status: 200, state: Gori::Store::FlowState::Complete)
     cli = JSON.parse(Gori::CLI::Output.flow_row_json(row)).as_h.keys
     mcp = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.flow_row(j, row) }).as_h.keys
 
     # Sorted: the point is a missing/extra FIELD, not the emission order.
-    (cli - ["time"]).sort!.should eq((mcp - ["created_at_iso"]).sort!)
-    cli.should contain("time")               # CLI names it `time`
-    mcp.should contain("created_at_iso")     # MCP names it `created_at_iso`
-    cli.should_not contain("created_at_iso") # …and neither carries both
+    (cli - ["time"]).sort!.should eq(mcp.sort!)
+    cli.should contain("time")           # the CLI's extra, human-facing, local
+    cli.should contain("created_at_iso") # …alongside the machine-readable one MCP names
+  end
+
+  # The half the key-set pin cannot see. `Output.iso_time_utc` is a reimplementation of
+  # `Serialize.unix_micros_iso` (CLI::Output deliberately takes no dependency on MCP::), so
+  # nothing but this assertion stops the two from drifting.
+  it "renders created_at_iso byte-for-byte the same as the MCP serializer" do
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 1_700_000_000_123_456_i64, scheme: "https", method: "GET",
+      host: "h", port: 443, target: "/a", status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    cli = JSON.parse(Gori::CLI::Output.flow_row_json(row))
+    mcp = JSON.parse(JSON.build { |j| Gori::MCP::Serialize.flow_row(j, row) })
+    cli["created_at_iso"].as_s.should eq(mcp["created_at_iso"].as_s)
+    # UTC, milliseconds, Z — and the sub-second micros `time` drops are kept here.
+    cli["created_at_iso"].as_s.should eq("2023-11-14T22:13:20.123Z")
+    Gori::CLI::Output.iso_time_utc(1_700_000_000_123_456_i64)
+      .should eq(Gori::MCP::Serialize.unix_micros_iso(1_700_000_000_123_456_i64))
+  end
+
+  # The class this round closed: `JSON::Builder#string` escapes JSON metacharacters but writes
+  # raw bytes through, so ONE non-UTF-8 byte in a captured field makes the whole document
+  # unparseable to a strict reader (python's json.loads raises UnicodeDecodeError) — and in the
+  # JSON-Lines stream, every later line with it. Proven reachable end-to-end: `flows.host` /
+  # `flows.target` round-trip such a byte through SQLite unchanged.
+  it "emits valid UTF-8 for a captured target and host holding a non-UTF-8 byte" do
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "https", method: "GET",
+      host: String.new(Bytes[104, 255, 120]), port: 443,
+      target: String.new(Bytes[47, 97, 255, 98]), status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete,
+      content_type: String.new(Bytes[116, 255]))
+    json = Gori::CLI::Output.flow_row_json(row)
+    json.valid_encoding?.should be_true
+    parsed = JSON.parse(json)
+    parsed["target"].as_s.should eq("/a�b")
+    parsed["host"].as_s.should eq("h�x")
+    parsed["content_type"].as_s.should eq("t�")
+    # …and the MCP row for the same flow was already clean, which is what made this a drift.
+    JSON.build { |j| Gori::MCP::Serialize.flow_row(j, row) }.valid_encoding?.should be_true
+  end
+
+  it "emits valid UTF-8 for a fuzz row whose extract captured non-UTF-8 response bytes" do
+    bad = String.new(Bytes[115, 61, 255, 254])
+    r = Gori::Fuzz::Result.new(0_i64, ["p"], 0, 200, 10_i64, 2, 1, 100_i64, nil, true, false, bad)
+    Gori::CLI::Output.fuzz_row_json(r).valid_encoding?.should be_true
+    JSON.parse(Gori::CLI::Output.fuzz_row_json(r))["extracted"].as_s.should eq("s=��")
+
+    # …and the same for `error`, the sibling field the `payloads` fix did not cover.
+    e = Gori::Fuzz::Result.new(1_i64, ["p"], 0, nil, 0_i64, 0, 0, 5_i64, bad, false, false, nil)
+    Gori::CLI::Output.fuzz_row_json(e).valid_encoding?.should be_true
+  end
+
+  it "emits valid UTF-8 for a discover finding and a sequencer sample" do
+    bad = String.new(Bytes[47, 255])
+    f = Gori::Discover::Finding.new(
+      url: "http://h/#{bad}", method: "GET", status: 200, length: 1_i64,
+      content_type: bad, source: Gori::Discover::Source::Crawled, depth: 0,
+      confidence: 1.0, note: nil)
+    Gori::CLI::Output.discover_row_json(f).valid_encoding?.should be_true
+
+    s = Gori::Sequencer::Sample.new(
+      index: 0, token: bad, status: 200, length: 2, duration_us: 1_i64, error: nil)
+    Gori::CLI::Output.sequence_sample_json(s).valid_encoding?.should be_true
+    JSON.parse(Gori::CLI::Output.sequence_sample_json(s))["token"].as_s.should eq("/�")
   end
 
   # The same lockstep for the field this round added, since a conditional field is exactly

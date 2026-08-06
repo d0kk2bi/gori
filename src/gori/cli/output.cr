@@ -28,17 +28,26 @@ module Gori
           j.field "id", row.id
           j.field "created_at", row.created_at
           j.field "time", iso_time(row.created_at)
-          j.field "scheme", row.scheme
-          j.field "method", row.method
-          j.field "host", row.host
+          # `created_at_iso` beside `time`, because the two surfaces named and rendered the
+          # same instant differently: `time` is LOCAL at second precision (it drops the
+          # sub-second micros `created_at` carries), while MCP's `flow_row` emits
+          # `created_at_iso` in UTC at millisecond precision. A script correlating
+          # `gori run history --format json` against `list_history` could not compare the two
+          # as strings, and the CLI carried no RFC3339 field anywhere in the tree. Additive:
+          # `time` keeps its exact spelling and value, so nothing reading it breaks.
+          j.field "created_at_iso", iso_time_utc(row.created_at)
+          # Wire-derived, every one of them — see `json_captured`.
+          json_captured(j, "scheme", row.scheme)
+          json_captured(j, "method", row.method)
+          json_captured(j, "host", row.host)
           j.field "port", row.port
-          j.field "target", row.target
+          json_captured(j, "target", row.target)
           j.field "status", row.status
           j.field "state", row.state.to_s.downcase
           j.field "size", row.size
           j.field "response_size", row.response_size
           j.field "duration_us", row.duration_us
-          j.field "content_type", row.content_type
+          json_captured(j, "content_type", row.content_type)
           # Kept in lockstep with MCP::Serialize.flow_row (spec/cli/run/history_spec.cr pins
           # the two key sets against each other): a consumer of either feed has no other way
           # to tell a gori-authored stub response from one the origin actually sent (#511).
@@ -47,12 +56,40 @@ module Gori
           # a rule that structurally could not run on it, a request the ORIGIN invented in a
           # PUSH_PROMISE. Emitted only when there is one, so a script keying off field
           # presence is not broken by a field it never asked for — the same discipline
-          # `emit_ws_shape_json` uses.
+          # `Store::WsMessage#emit_shape_json` uses.
           advisories = row.advisories
           unless advisories.empty?
             j.field("advisory") { j.array { advisories.each { |l| j.string(term_safe(l)) } } }
           end
         end
+      end
+
+      # Emit `name` carrying a CAPTURED string, scrubbed to U+FFFD. The JSON counterpart of
+      # `term_safe`, and the ONE seam every wire-derived string field on this surface goes
+      # through — the point being that a field added later cannot be added unscrubbed.
+      #
+      # `JSON::Builder#string` escapes JSON metacharacters but writes raw bytes through, and
+      # a captured host / path / header / body-derived value can be invalid UTF-8 without
+      # carrying a single control byte (`term_safe`'s doc names the hazard). One such byte
+      # makes the WHOLE document invalid, not just its own field: `python3 json.loads` fails
+      # outright with UnicodeDecodeError, and in a JSON-Lines stream every later line is lost
+      # with it. This was fixed field-by-field as each instance was found — fuzz `payloads`
+      # (`fuzz_row_fields`), every sitemap label, `grpc_message` in three emitters — while
+      # `flow_row_fields`, `discover_finding_fields`, `sequence_sample_json` and the `error`
+      # fields kept emitting raw. `MCP::Serialize.text` is the same decision on the agent
+      # surface; this is its name here.
+      #
+      # NOT `term_safe`: control bytes are legitimate content in a JSON string (they are
+      # escaped as \u00XX and no terminal ever sees them raw), so replacing them with '·'
+      # would corrupt a value a script is meant to read. Only the invalid-UTF-8 half applies.
+      #
+      # Scope is WIRE-DERIVED values. Operator-authored config that happens to be a string —
+      # a rule's name/host, a project name, an OAST provider host, a saved repeater's
+      # target/name — deliberately stays raw here, because MCP emits those raw too
+      # (`tools/rules.cr`, `tools/repeater.cr`) and matching it is the point. Scrub where the
+      # bytes came off a socket; leave alone where the two surfaces already agree.
+      def self.json_captured(j : JSON::Builder, name : String, s : String?) : Nil
+        j.field name, s.try(&.scrub)
       end
 
       # Neutralize terminal control bytes in an untrusted CAPTURED string before it is
@@ -108,19 +145,6 @@ module Gori
         return "(no payload)" if m.payload.empty?
         body = String.new(m.payload)
         body.valid_encoding? ? term_safe(body) : "0x#{m.payload.hexstring}"
-      end
-
-      # The shape fields, for a JSON reader. Only what departs from the default is emitted,
-      # so an ordinary message's object is exactly the shape it was before V7 — a script
-      # keying off field presence is not broken by a feature it did not ask for.
-      def self.emit_ws_shape_json(j : JSON::Builder, m : Store::WsMessage) : Nil
-        s = m.shape
-        j.field "fin", false unless s.fin
-        j.field "rsv", s.rsv if s.rsv != 0
-        s.masked.try { |mk| j.field "masked", mk unless mk }
-        j.field "frames", s.frames if s.frames > 1
-        m.close_code.try { |c| j.field "close_code", c }
-        m.close_reason.try { |r| j.field "close_reason", String.new(r).scrub }
       end
 
       # "#42  GET   https  example.com:443/users  200  1.2kB  3ms  [Complete]"
@@ -180,7 +204,10 @@ module Gori
           j.field "lines", r.lines
           j.field "duration_us", r.duration_us
           j.field "matched", r.matched?
-          j.field "error", r.error
+          # A send failure's text can quote bytes the ORIGIN chose (a status line, a header a
+          # codec refused), so it is captured data like `payloads` two fields up. MCP's
+          # `Serialize.fuzz_result` has always wrapped this in `text()`.
+          json_captured(j, "error", r.error)
           # A declared `¦chain` that could not run on this payload — the payload went out
           # UNTRANSFORMED. Emitted (and only when set) so a script never reads `"error":null`
           # for a request that sent a different test than the operator asked for. `.scrub` for
@@ -200,7 +227,10 @@ module Gori
           if gm = r.grpc_message
             j.field "grpc_message", gm.scrub
           end
-          j.field "extracted", r.extracted
+          # `--extract` is a regex capture out of the RESPONSE BODY, so this is arbitrary
+          # origin bytes BY CONSTRUCTION — the sharpest instance of the class in this file,
+          # and the one the `payloads` fix above did not cover. MCP wraps it in `text()`.
+          json_captured(j, "extracted", r.extracted)
           # Only when true. This is an exception rather than a per-row property, and a `false`
           # on every row of every clean run would bury the one row that matters.
           j.field "retried", true if r.retried?
@@ -236,7 +266,10 @@ module Gori
 
       def self.mine_finding_fields(j : JSON::Builder, f : Miner::Finding) : Nil
         j.object do
-          j.field "name", f.name
+          # A mined parameter name comes from a wordlist FILE the operator supplied, so it can
+          # be arbitrary bytes — the same argument `fuzz_row_fields` makes for `payloads`.
+          # (`canary` below is gori-generated and fixed-length, so it needs nothing.)
+          json_captured(j, "name", f.name)
           j.field "location", f.location.label
           j.field "evidence", f.evidence.label
           j.field "confidence", f.confidence.label
@@ -292,9 +325,15 @@ module Gori
           j.object do
             j.field "index", s.index
             j.field "status", s.status
-            j.field "token", s.token
+            # Extracted from the RESPONSE by the token descriptor — origin bytes by
+            # construction, exactly like the fuzzer's `extracted`. This emitter is a JSONL
+            # STREAM, so one invalid byte does not just break its own line: a reader that
+            # stops at the first parse error loses every sample after it. There is no MCP
+            # counterpart to compare against (`sequence_results` returns only the report),
+            # which is why this one went unnoticed longest.
+            json_captured(j, "token", s.token)
             j.field "length", s.length
-            j.field "error", s.error
+            json_captured(j, "error", s.error)
             # The gRPC CALL's outcome. `status` above is 200 for every gRPC response, so
             # without these a collection against a target denying every call read as healthy.
             # Emitted only when the response actually carried them, so a non-gRPC sample's
@@ -322,11 +361,15 @@ module Gori
 
       def self.discover_finding_fields(j : JSON::Builder, f : Discover::Finding) : Nil
         j.object do
-          j.field "url", f.url
-          j.field "method", f.method
+          # A crawled URL is built from a page's own `<a href>` and `content_type` is a
+          # response header, so both are outside-origin. `Discover::Url.parse` percent-encodes
+          # the octets `<= 0x20` / `0x7F` (#394) but nothing above 0x7F, so a high byte reaches
+          # here intact. MCP's `discover_finding_json` wraps all three in `Serialize.text`.
+          json_captured(j, "url", f.url)
+          json_captured(j, "method", f.method)
           j.field "status", f.status
           j.field "length", f.length
-          j.field "content_type", f.content_type
+          json_captured(j, "content_type", f.content_type)
           j.field "source", f.source.label
           j.field "depth", f.depth
           j.field "confidence", f.confidence.round(2)
@@ -680,9 +723,31 @@ module Gori
         "#{round1(ms / 1000.0)}s"
       end
 
-      # Local ISO-8601 from unix micros (the store's created_at unit).
+      # Local ISO-8601 from unix micros (the store's created_at unit). Lossy on purpose: this
+      # is the field a human reads off a terminal, so it stays in the operator's timezone and
+      # drops the micros. `iso_time_utc` is the machine-readable one.
       def self.iso_time(micros : Int64) : String
         Time.unix(micros // 1_000_000).to_local.to_s("%Y-%m-%dT%H:%M:%S%:z")
+      end
+
+      # RFC3339 UTC at millisecond precision from unix micros — the `*_iso` convention the
+      # MCP surface uses everywhere and the CLI used nowhere (`grep -rn '_iso' src/gori/cli/`
+      # returned zero while MCP had fifteen). Byte-for-byte identical to
+      # `MCP::Serialize.unix_micros_iso`, which `spec/cli/run/history_spec.cr` pins against
+      # this — the same lockstep-by-spec arrangement `emit_body_json` and
+      # `emit_trailers_json` already have with their MCP counterparts.
+      #
+      # Reimplemented rather than called: `CLI::Output` has no dependency on `MCP::` and
+      # should not gain one for four lines. The dependency between these two surfaces is
+      # one-way but still UNDECLARED: `cli/run/{intercept,history}.cr` call `MCP::Serialize.*`
+      # with no `require` of their own (they link because `src/gori.cr` pulls in both). That is
+      # the direction DESIGN.md §2.1 already documents and tolerates; the reverse edge — MCP
+      # reaching into `CLI::Output` for the WS shape — is gone, moved onto the model that owns
+      # the data (`Store::WsMessage#emit_shape_json`). Reimplementing here keeps `CLI::Output`
+      # itself free of `MCP::` rather than adding the first such call to this file.
+      def self.iso_time_utc(micros : Int64) : String
+        sec, micro = micros.divmod(1_000_000)
+        (Time.utc(1970, 1, 1) + sec.seconds + micro.microseconds).to_s("%Y-%m-%dT%H:%M:%S.%LZ")
       end
 
       private def self.round1(n : Float64) : String
