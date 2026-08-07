@@ -47,6 +47,7 @@ require "./tools/projects"
 require "./tools/ql"
 require "./tools/repeater"
 require "./tools/rules"
+require "./tools/color_rules"
 require "./tools/scope"
 require "./tools/send"
 require "./tools/sequence"
@@ -116,6 +117,7 @@ module Gori
         "create_oast_provider", "update_oast_provider", "set_oast_provider_enabled", "delete_oast_provider",
         "minimize_repeater",
         "create_rule", "update_rule", "delete_rule", "set_rule_enabled",
+        "create_color_rule", "update_color_rule", "delete_color_rule", "set_color_rule_enabled", "move_color_rule",
         "create_extract_rule", "update_extract_rule", "delete_extract_rule", "set_extract_rule_enabled",
         "create_note", "update_note", "delete_note",
         "create_repeater", "update_repeater", "delete_repeater",
@@ -873,6 +875,31 @@ module Gori
             s.field "scope", strprop("show only project | global rules (default: both)")
           end
 
+          tool j, "list_color_rules",
+            "List the Colormarker rules for this project — which captured History rows get " \
+            "COLOURED, and how. DISPLAY ONLY: a colour rule never modifies traffic. Listed in " \
+            "PRECEDENCE order (GLOBAL library first, then the project's own): unlike Match & " \
+            "Replace rules, which all compose, the FIRST enabled match paints a row and the rest " \
+            "are never consulted — so order is the rule set's meaning, and move_color_rule " \
+            "changes it. `id` is unique only within a scope, so pass both to the mutation tools. " \
+            "For a global rule, `enabled` is the state in THIS project and `default_enabled` the " \
+            "library's own." do |s|
+            s.field "scope", strprop("show only project | global rules (default: both)")
+          end
+
+          # Listed in the READ set, unlike `preview_rule`. That one sits behind allow_actions
+          # because the call after it may create a rule that rewrites live traffic; this one
+          # counts flows and nothing downstream of it touches a byte, so a --read-only agent can
+          # size a colour rule and then ask a human to create it.
+          tool j, "preview_color_rule",
+            "Estimate how many recent flows a colour-rule condition would MATCH, and how many it " \
+            "would actually PAINT once the rules that already resolve ahead of it are counted " \
+            "(an earlier enabled rule may claim the row first), WITHOUT creating anything. " \
+            "Display only — nothing here modifies traffic." do |s|
+            s.field "when", strprop("the condition to test (see create_color_rule)"), required: true
+            s.field "limit", intprop("recent flows to scan (default 500)")
+          end
+
           tool j, "list_extract_rules",
             "List the project's EXTRACT rules — the read half of a session binding. Each one " \
             "observes a response and binds one named value ($SESSION) in memory, which a Match & " \
@@ -1117,6 +1144,62 @@ module Gori
               "Delete a Match & Replace rule by id. Deleting a GLOBAL rule removes it from every " \
               "project." do |s|
               s.field "id", intprop("rule id from list_rules"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
+            end
+
+            tool j, "create_color_rule",
+              "Add a Colormarker rule: colour the History rows whose captured flow matches a " \
+              "condition. Persisted to the project, or to the global library shared by every " \
+              "project when scope=global. The FIRST enabled matching rule paints a row and the " \
+              "rest are never consulted, so precedence matters — use move_color_rule to change " \
+              "it. Display only — a colour rule never modifies traffic." do |s|
+              s.field "when", strprop("the condition, in the same boolean grammar the conditional-intercept bar uses: host: path: method: scheme: status: proto:, plus AND/OR/NOT, -negation and (grouping). Evaluated against the captured flow row. CAVEATS, each of which otherwise fails silently: `body:` NEVER matches here (a row carries no payload); `host:` is a SUBSTRING, not a DNS-label glob, so host:alpha.test also matches xalpha.test; a flow with no response yet has no status; and there is no header:/size:/dur:/url:/stub: — those are History QL fields that need a query, and this is evaluated on the render path"), required: true
+              s.field "color", strprop("red | orange | yellow | green | blue | purple (default yellow). Resolved through the active theme, so it reads correctly on light and dark alike")
+              s.field "style", strprop("full (tint the whole History row) | strip (one colour cell in a narrow column ahead of TIME) — default full")
+              s.field "name", strprop("optional label for the rule")
+              s.field "scope", strprop("project (default) | global — a global rule lives in settings.json and applies in EVERY project")
+              s.field "enabled", boolprop("create the rule already enabled (default true)")
+            end
+
+            tool j, "update_color_rule",
+              "Update an existing Colormarker rule by id. Omitted fields are left unchanged. " \
+              "For a global rule this edits the LIBRARY entry, which every project sees; to change " \
+              "only this project's on/off answer use set_color_rule_enabled. Display only — a " \
+              "colour rule never modifies traffic." do |s|
+              s.field "id", intprop("rule id from list_color_rules"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
+              s.field "when", strprop("new condition (see create_color_rule for the grammar and its caveats)")
+              s.field "color", strprop("red | orange | yellow | green | blue | purple")
+              s.field "style", strprop("full | strip")
+              s.field "name", strprop("rule label")
+            end
+
+            tool j, "set_color_rule_enabled",
+              "Enable or disable a Colormarker rule by id. For a GLOBAL rule this writes THIS " \
+              "project's override by default; everywhere=true changes the rule's own default, which " \
+              "every project that has not overridden it follows. Setting a global rule back to its " \
+              "own default DROPS the override rather than pinning it, so this project keeps " \
+              "following later changes to that default." do |s|
+              s.field "id", intprop("rule id from list_color_rules"), required: true
+              s.field "enabled", boolprop("true to enable, false to disable"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
+              s.field "everywhere", boolprop("global rules only: change the default for every project instead of this one")
+            end
+
+            tool j, "move_color_rule",
+              "Move a Colormarker rule one slot up or down in PRECEDENCE order. This changes WHICH " \
+              "rule paints a row — the first enabled match wins — so it is a semantic edit, not " \
+              "cosmetics. Moves within the rule's own scope only: every global rule resolves " \
+              "before every project one, so the boundary is not a position." do |s|
+              s.field "id", intprop("rule id from list_color_rules"), required: true
+              s.field "direction", strprop("up (higher precedence) | down (lower)"), required: true
+              s.field "scope", strprop("which id: project (default) | global")
+            end
+
+            tool j, "delete_color_rule",
+              "Delete a Colormarker rule by id. Deleting a GLOBAL rule removes it from every " \
+              "project, and takes this project's override of it along." do |s|
+              s.field "id", intprop("rule id from list_color_rules"), required: true
               s.field "scope", strprop("which id: project (default) | global")
             end
 
@@ -1875,6 +1958,8 @@ module Gori
         when "cookie_forge"            then cookie_forge_tool(h)
         when "sequence_analyze"        then sequence_analyze(h)
         when "list_rules"              then list_rules(h)
+        when "list_color_rules"        then list_color_rules(h)
+        when "preview_color_rule"      then preview_color_rule(h)
         when "list_extract_rules"      then list_extract_rules
         when "list_projects"           then list_projects
         when "ql_explain"              then ql_explain(h)
@@ -1962,6 +2047,11 @@ module Gori
         when "delete_extract_rule"       then gated { delete_extract_rule(h) }
         when "set_extract_rule_enabled"  then gated { set_extract_rule_enabled(h) }
         when "delete_rule"               then gated { delete_rule(h) }
+        when "create_color_rule"         then gated { create_color_rule(h) }
+        when "update_color_rule"         then gated { update_color_rule(h) }
+        when "set_color_rule_enabled"    then gated { set_color_rule_enabled(h) }
+        when "move_color_rule"           then gated { move_color_rule(h) }
+        when "delete_color_rule"         then gated { delete_color_rule(h) }
           # switch is always available (selecting a DB is not a data mutation).
         when "switch_project" then switch_project(h)
           # create when unbound even under --read-only; once bound, actions-gated.

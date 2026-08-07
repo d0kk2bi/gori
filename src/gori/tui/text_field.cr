@@ -42,9 +42,12 @@ module Gori::Tui
     # in the import / CA-import / fuzzer-wordlist overlays, and the fuzzer + sequence
     # overlays populating fields from a parsed spec) wants "value in, ready to keep
     # typing at the end" — same as `initialize`.
-    def set(v : String) : Nil
+    # `caret:` is for the one caller that replaces a SPAN rather than the whole value — QL
+    # token completion, which splices a suggestion into the middle of a condition and has to
+    # leave the caret after what it inserted rather than at the end of the line.
+    def set(v : String, caret : Int32? = nil) : Nil
       @value = v
-      @caret = v.size
+      @caret = (caret || v.size).clamp(0, v.size)
       @preedit = ""
       @sel.clear_selection # the old anchor indexes a string that no longer exists
       @undo_stack.clear

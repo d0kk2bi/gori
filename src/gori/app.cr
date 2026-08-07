@@ -18,6 +18,7 @@ require "./verbs/comparer"
 require "./verbs/decoder"
 require "./verbs/jwt"
 require "./verbs/rewriter"
+require "./verbs/colormarker"
 require "./verbs/notes"
 require "./verbs/host_overrides"
 require "./verbs/env"
@@ -407,6 +408,15 @@ module Gori
             rescue ex
               Log.error(exception: ex) { "host override reload failed" }
             end
+            # `session.colormarker` is DELIBERATELY absent from this loop, and adding it to
+            # "complete the set" would be a regression. The three above each have a headless
+            # consumer — rules rewrites bytes on the proxy path, scope gates the sandbox and
+            # Probe, host_overrides steers the dial — while colour rules are read only by
+            # History's renderer, and `gori run capture` draws no rows. Polling them here
+            # would cost a settings read, a table read and N FilterAst parses every tick for a
+            # value nothing in this process reads. The TUI reloads them in
+            # `Runner#apply_external_change`; the CLI and MCP are one-shot processes that call
+            # `Colormarker.merged(store)` statically and never build the engine at all.
           end
         end
       end

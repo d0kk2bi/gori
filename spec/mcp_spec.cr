@@ -1023,6 +1023,135 @@ describe Gori::MCP::Server do
     end
   end
 
+  describe "colormarker rules" do
+    it "creates, lists, toggles, reorders, and deletes a colour rule" do
+      with_store do |store|
+        create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_color_rule","arguments":{"when":"status:>=500","color":"red","style":"full","name":"prod 5xx"}}})
+        payload = tool_payload(drive(store, create)[0])
+        id = payload["id"].as_i64
+        id.should_not eq(0)
+        payload["color"].as_s.should eq("red")
+        payload["style"].as_s.should eq("full")
+        # `status:` carries an advisory (a pending flow has no status yet) — non-fatal, and
+        # the only channel there is, since an InterceptFilter cannot fail to compile.
+        payload["notes"][0].as_s.should contain("no response yet")
+
+        listed = tool_payload(drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_color_rules"}}))[0])
+        listed["count"].as_i64.should eq(1)
+        rule = listed["rules"][0]
+        rule["when"].as_s.should eq("status:>=500")
+        rule["scope"].as_s.should eq("project")
+        rule["enabled"].as_bool.should be_true
+        rule["name"].as_s.should eq("prod 5xx")
+
+        toggle = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"set_color_rule_enabled","arguments":{"id":#{id},"enabled":false}}})
+        tool_payload(drive(store, toggle)[0])["enabled"].as_bool.should be_false
+        store.color_rules[0].enabled?.should be_false
+
+        # Reorder is a SEMANTIC edit here — the first enabled match paints the row — so it is a
+        # tool rather than a TUI-only affordance.
+        second = %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_color_rule","arguments":{"when":"method:DELETE","color":"orange"}}})
+        id2 = tool_payload(drive(store, second)[0])["id"].as_i64
+        mv = %({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"move_color_rule","arguments":{"id":#{id2},"direction":"up"}}})
+        tool_payload(drive(store, mv)[0])["moved"].as_s.should eq("up")
+        store.color_rules.map(&.id).should eq([id2, id])
+        # …and the edge is refused rather than silently doing nothing.
+        drive(store, %({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"move_color_rule","arguments":{"id":#{id2},"direction":"up"}}}))[0]["result"]["isError"].as_bool.should be_true
+
+        del = %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"delete_color_rule","arguments":{"id":#{id}}}})
+        tool_payload(drive(store, del)[0])["deleted"].as_bool.should be_true
+        store.color_rules.map(&.id).should eq([id2])
+      end
+    end
+
+    # Every refusal here names a rule that would otherwise fail SILENTLY: an InterceptFilter
+    # never fails to compile, so there is no parse error to lean on.
+    it "refuses conditions and enum values that would never do what the caller meant" do
+      with_store do |store|
+        {
+          %({"when":"host:"}),          # a term with an empty value is dropped ⇒ matches everything
+          %({"when":"size:>10000"}),    # a History QL field this backend free-texts ⇒ never fires
+          %({"when":"a","color":"chartreuse"}),
+          %({"when":"a","style":"sideways"}),
+        }.each_with_index do |args, i|
+          call = %({"jsonrpc":"2.0","id":#{i + 1},"method":"tools/call","params":{"name":"create_color_rule","arguments":#{args}}})
+          drive(store, call)[0]["result"]["isError"].as_bool.should be_true
+        end
+        store.color_rules.should be_empty # nothing was persisted by any of them
+      end
+    end
+
+    it "previews without creating, and separates what MATCHES from what would be PAINTED" do
+      with_store do |store|
+        drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_color_rule","arguments":{"when":"host:h.test","color":"blue"}}}))
+        pv = tool_payload(drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"preview_color_rule","arguments":{"when":"body:secret"}}}))[0])
+        pv["would_match"].as_i64.should eq(0)
+        pv["would_paint"].as_i64.should eq(0)
+        pv["notes"][0].as_s.should contain("`body:` never matches here")
+        store.color_rules.size.should eq(1) # the preview created nothing
+      end
+    end
+
+    # The scope half, and the agree-again rule: an override exists ONLY while it differs.
+    it "creates a GLOBAL colour rule, overrides it per project, and refuses an unknown scope" do
+      before = Gori::Settings.colormarker_rules
+      counter = Gori::Settings.colormarker_next_rule_id
+      begin
+        Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+        Gori::Settings.colormarker_next_rule_id = 1_i64
+        with_store do |store|
+          create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_color_rule","arguments":{"when":"host:cdn","color":"blue","style":"strip","scope":"global"}}})
+          payload = tool_payload(drive(store, create)[0])
+          payload["scope"].as_s.should eq("global")
+          id = payload["id"].as_i64
+          store.color_rules.should be_empty # not a project row
+          Gori::Settings.colormarker_rules.size.should eq(1)
+
+          listed = tool_payload(drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_color_rules"}}))[0])
+          rule = listed["rules"][0]
+          rule["scope"].as_s.should eq("global")
+          rule["overridden"].as_bool.should be_false
+          rule["default_enabled"].as_bool.should be_true
+
+          # Disabling WITHOUT `everywhere` is this project's override — the library still says on.
+          off = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"set_color_rule_enabled","arguments":{"id":#{id},"scope":"global","enabled":false}}})
+          tool_payload(drive(store, off)[0])["enabled"].as_bool.should be_false
+          Gori::Settings.colormarker_rules.first.enabled.should be_true
+          store.colormarker_overrides[id].should be_false
+
+          # Setting it back to the library's OWN default drops the override rather than pinning
+          # it, so this project keeps following a later change to that default.
+          on = %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"set_color_rule_enabled","arguments":{"id":#{id},"scope":"global","enabled":true}}})
+          tool_payload(drive(store, on)[0])["enabled"].as_bool.should be_true
+          store.colormarker_overrides.should be_empty
+
+          # …and `everywhere` writes the default itself.
+          everywhere = %({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"set_color_rule_enabled","arguments":{"id":#{id},"scope":"global","enabled":false,"everywhere":true}}})
+          tool_payload(drive(store, everywhere)[0])["everywhere"].as_bool.should be_true
+          Gori::Settings.colormarker_rules.first.enabled.should be_false
+
+          # An id that exists in the OTHER scope is not this rule.
+          drive(store, %({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_color_rule","arguments":{"id":#{id}}}}))[0]["result"]["isError"].as_bool.should be_true
+          Gori::Settings.colormarker_rules.size.should eq(1)
+
+          # A typo'd scope is REFUSED, never clamped to project.
+          drive(store, %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"delete_color_rule","arguments":{"id":#{id},"scope":"globl"}}}))[0]["result"]["isError"].as_bool.should be_true
+
+          # Re-override, then delete: the disagreement dies with the rule.
+          drive(store, %({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"set_color_rule_enabled","arguments":{"id":#{id},"scope":"global","enabled":true}}}))
+          store.colormarker_overrides.should_not be_empty
+          del = %({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"delete_color_rule","arguments":{"id":#{id},"scope":"global"}}})
+          tool_payload(drive(store, del)[0])["deleted"].as_bool.should be_true
+          Gori::Settings.colormarker_rules.should be_empty
+          store.colormarker_overrides.should be_empty
+        end
+      ensure
+        Gori::Settings.colormarker_rules = before
+        Gori::Settings.colormarker_next_rule_id = counter
+      end
+    end
+  end
+
   describe "match&replace rules" do
     it "creates, lists, toggles, and deletes a rule" do
       with_store do |store|

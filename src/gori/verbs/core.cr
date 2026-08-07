@@ -290,7 +290,7 @@ module Gori
         :repeater => "Repeater", :fuzzer => "Fuzzer", :miner => "Miner", :oast => "OAST",
         :sequencer => "Sequencer", :decoder => "Decoder", :jwt => "JWT", :comparer => "Comparer",
         :probe => "Probe", :issues => "Issues", :notes => "Notes",
-        :rewriter => "Rewriter",
+        :rewriter => "Rewriter", :colormarker => "Colormarker",
       }.each do |tab, label|
         r.register Verb::Definition.new(
           "tab.#{tab}", "Go to #{label}", "Focus the #{label} tab", Verb::Scope::Global,

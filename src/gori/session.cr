@@ -5,6 +5,7 @@ require "./capture_lock"
 require "./capture_status"
 require "./store"
 require "./rules"
+require "./colormarker"
 require "./scope"
 require "./host_overrides"
 require "./env"
@@ -41,6 +42,15 @@ module Gori
     getter scope : Scope
     getter host_overrides : HostOverrides
     getter interceptor : Interceptor
+    # Which History rows get painted, and how (display only). Shared the way `scope` and
+    # `host_overrides` are — one live object every reader holds, Mutex-guarded — so an external
+    # edit lands in one place and History repaints from it.
+    #
+    # Built here from `@store` alone rather than threaded through `open`, because that is its
+    # only dependency, and deliberately NOT passed to `Proxy::Server` / `Tls::Tunnel` /
+    # `build_listener`: a colour rule never touches a byte on the wire, so a listener has no
+    # business naming it.
+    getter colormarker : Colormarker
     # Why the live proxy isn't listening (e.g. "port in use"), or nil when capture
     # is up. The project still opens for History/Repeater/Sitemap/etc. — only live
     # capture needs the bind — so a bind failure is non-fatal.
@@ -220,6 +230,7 @@ module Gori
                    @listener_errors : Array(String) = [] of String)
       @intercept_token = Random::Secure.hex(8)
       @listeners_applied = Settings.listeners.dup
+      @colormarker = Colormarker.load(@store)
     end
 
     # True when the `listeners` section on disk no longer matches the one these sockets were

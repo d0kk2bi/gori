@@ -14,6 +14,7 @@ require "./settings/tabs"
 require "./settings/keymap"
 require "./settings/decoder"
 require "./settings/rewriter"
+require "./settings/colormarker"
 require "./settings/miner"
 require "./settings/probe"
 require "./settings/discover"
@@ -183,6 +184,9 @@ module Gori
       end
       if rw = object_section(root, "rewriter")
         parse_rewriter(rw)
+      end
+      if cm = object_section(root, "colormarker")
+        parse_colormarker(cm)
       end
       parse_mine_prefs(root["mine"]?)
       parse_fuzzer_prefs(root["fuzzer"]?)
@@ -436,6 +440,7 @@ module Gori
       theme mouse pretty_bodies layout statusline display pet notifications general update
       network upstream_rules outbound_tls retention listeners editor tabs hostname_overrides
       env scan_rules oast_providers hotkeys mine fuzzer probe discover decoder rewriter
+      colormarker
     )
 
     # Every top-level key the current settings would write — i.e. which sections this install
@@ -594,6 +599,7 @@ module Gori
           serialize_discover(j)
           serialize_decoder(j)
           serialize_rewriter(j)
+          serialize_colormarker(j)
         end
       end
     end

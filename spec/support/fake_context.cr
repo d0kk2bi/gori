@@ -1177,6 +1177,54 @@ class FakeExecContext < Gori::Verb::ExecContext
     @rewriter_preview_out
   end
 
+  # --- colormarker (History row-colour rules) ---
+  property colormarker_rule_selected : Bool = false # settable so the has-rule gate can be exercised
+  property colormarker_global_rule : Bool = false   # settable so the global-rule gate (toggle-default) can be exercised
+
+  def colormarker_add : Nil
+    rec(:colormarker_add)
+  end
+
+  def colormarker_edit : Nil
+    rec(:colormarker_edit)
+  end
+
+  def colormarker_toggle : Nil
+    rec(:colormarker_toggle)
+  end
+
+  def colormarker_delete : Nil
+    rec(:colormarker_delete)
+  end
+
+  def colormarker_move(dir : Int32) : Nil
+    rec(:colormarker_move, dir)
+  end
+
+  def colormarker_duplicate : Nil
+    rec(:colormarker_duplicate)
+  end
+
+  def colormarker_reload : Nil
+    rec(:colormarker_reload)
+  end
+
+  def colormarker_rule_selected? : Bool
+    @colormarker_rule_selected
+  end
+
+  def colormarker_global_rule_selected? : Bool
+    @colormarker_global_rule
+  end
+
+  def colormarker_scope_toggle : Nil
+    rec(:colormarker_scope_toggle)
+  end
+
+  def colormarker_toggle_default : Nil
+    rec(:colormarker_toggle_default)
+  end
+
   def comparer_diff_shown? : Bool
     @comparer_diff
   end

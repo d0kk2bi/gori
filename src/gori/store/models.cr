@@ -747,6 +747,139 @@ module Gori
       end
     end
 
+    # The colour a Colormarker rule paints a History row with. Six hues, and NOT an arbitrary
+    # set: they are exactly the ones `Tui::Theme.marker_hue` already vets as "maximally
+    # separated and present in every palette" (built-in and custom, which inherit a base), so
+    # a rule reads the same on a dark theme and a light one without storing a single hex value.
+    #
+    # No grey: a `Theme.muted` block on the canvas reads as chrome, not as a mark.
+    #
+    # Stored as the `label` string, like every other rule enum here, so a hand-edited
+    # settings.json reads the way `gori run colormarker` prints.
+    enum MarkerColor
+      Red
+      Orange
+      Yellow
+      Green
+      Blue
+      Purple
+
+      def label : String
+        to_s.downcase
+      end
+
+      # Tolerant, and deliberately so: this is fed by a hand-edited settings.json and a
+      # hand-edited SQLite row, and `Settings.load`'s blanket rescue would turn one raise into
+      # a factory reset of every OTHER section. The MCP and CLI boundaries refuse an unknown
+      # label instead — an argument someone just typed gets told it was wrong (see
+      # `Mcp::Tools#marker_color`), a file already on disk gets read as best it can be.
+      #
+      # `cyan`/`magenta`/`grey` are accepted as spellings of the nearest member so the words
+      # an operator reaches for parse, even though the palette has no field for them.
+      # Unknown → Yellow, not Red: an unreadable colour must not present itself as the
+      # highest-alarm one.
+      def self.from_label(s : String) : MarkerColor
+        case s.downcase
+        when "red"              then Red
+        when "orange"           then Orange
+        when "yellow"           then Yellow
+        when "green"            then Green
+        when "blue", "cyan"     then Blue
+        when "purple", "magenta", "violet" then Purple
+        else                         Yellow
+        end
+      end
+
+      # The symbol `Tui::Theme.mark_color` resolves against the active palette. Theme takes a
+      # plain Symbol so it stays decoupled from Store (same reason `Theme.status_color` takes
+      # an Int) — this is the one place the two vocabularies meet.
+      def to_sym : Symbol
+        case self
+        in .red?    then :red
+        in .orange? then :orange
+        in .yellow? then :yellow
+        in .green?  then :green
+        in .blue?   then :blue
+        in .purple? then :purple
+        end
+      end
+    end
+
+    # HOW a Colormarker rule paints its row. `Full` tints the whole row's background; `Strip`
+    # paints one saturated cell in a narrow column History reserves ahead of TIME.
+    #
+    # The two defaults are deliberately different and that asymmetry is the point: parsing an
+    # unknown label yields `Strip`, while every surface that CREATES a rule offers `Full`. A
+    # mis-parsed strip rule paints one cell and cannot hide the cursor band; a mis-parsed full
+    # rule repaints an entire row. But an operator typing `colormarker add --color=red` means
+    # "make the row red", so the ask, not the fallback, is what creation follows.
+    enum MarkerStyle
+      Full
+      Strip
+
+      def label : String
+        to_s.downcase
+      end
+
+      def self.from_label(s : String) : MarkerStyle
+        s.downcase == "full" ? Full : Strip
+      end
+
+      # The one-letter column the Colormarker list and `gori run colormarker` print.
+      # Exhaustive `case` on purpose (like `RulePart#badge`): a third style must not silently
+      # render as an existing one.
+      def badge : Char
+        case self
+        in .full?  then 'F'
+        in .strip? then 'S'
+        end
+      end
+    end
+
+    # A Colormarker rule: paint the History rows whose flow matches `match_filter` in `color`,
+    # using `style`. DISPLAY ONLY — nothing here reaches the proxy. A rule paints a row that
+    # has already been captured, so unlike a `MatchRule` an over-broad one costs an operator a
+    # misleading list, never a modified message.
+    #
+    # `match_filter` is an `InterceptFilter` source string — the SAME grammar `ExtractRule`
+    # uses and the conditional-intercept bar speaks, evaluated here against a `FlowRow` in
+    # memory. Not a new dialect, and NOT QL: QL compiles to SQL against the flows table, and
+    # there is no query to run when the row is already in hand on the render path.
+    #
+    # No `host` field, unlike `MatchRule` and `ExtractRule`: `host:` inside the filter is the
+    # same statement, and a second host axis would make "which one wins" a question with no
+    # good answer. The cost is that the filter's `host:` is a plain lowercase SUBSTRING rather
+    # than the DNS-label-boundary glob `Rules.host_matches?` implements — so `host:alpha.test`
+    # also paints `xalpha.test`. Every surface that accepts a condition says so in those words.
+    #
+    # Colour rules RESOLVE where rewrite rules COMPOSE: the first enabled match wins and the
+    # rest are never consulted. Order is therefore the operator's precedence statement ("red
+    # 5xx above yellow 4xx"), which is why every surface that can create a rule can reorder one.
+    #
+    # `scope` says which store the rule came out of (see `RuleScope`) and `enabled` is always
+    # the EFFECTIVE state in THIS project, exactly as on `MatchRule`.
+    struct ColorRule
+      getter id : Int64
+      getter? enabled : Bool
+      getter name : String
+      getter match_filter : String
+      getter color : MarkerColor
+      getter style : MarkerStyle
+      getter scope : RuleScope
+      # Whether THIS project overrides the global default of `enabled`. Always false for a
+      # project rule. See `Store#colormarker_overrides`.
+      getter? overridden : Bool
+
+      def initialize(@id, @enabled, @match_filter, @color = MarkerColor::Yellow,
+                     @style = MarkerStyle::Full, @name = "",
+                     @scope = RuleScope::Project, @overridden = false)
+      end
+
+      def global? : Bool
+        @scope.global?
+      end
+    end
+
     # A per-project user-defined Probe match rule (probe_custom_rules, V38). String/regex match
     # over one region of a captured flow (side × region); `severity` stamps the emitted finding.
     # The global-scope counterpart lives in settings.json (Settings::ScanRule); both fold into the

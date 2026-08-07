@@ -72,6 +72,7 @@ gori run <subcommand> [options]
 | `issues` · `create` · `update` | List / export issues, or write issues |
 | `links` · `add` · `delete` | Evidence pointers from an issue or note to a flow, Repeater session, or job |
 | `rewriter` · `add` · `rm` · `enable` · `disable` · `preview` | Manage Match & Replace rules |
+| `colormarker` · `add` · `rm` · `enable` · `disable` · `move` · `preview` | Manage History row-colour rules |
 | `project [list]` | List known projects |
 | `project create <name>` | Create (or reopen) a project by name |
 | `project delete <name>` | Delete a project and everything captured in it (`--yes` to confirm) |
@@ -497,6 +498,46 @@ gori run rewriter rm 3
 `preview` takes the same rule flags and reports how many stored flows the rule would have changed, without writing it. `rm` (`delete`), `enable` and `disable` take a rule id from the list — and `--scope`, because the two stores number their rules independently, so an id alone names two different rules. The list prints the scope as a `G`/`P` prefix (`G*` = this project overrides that global rule's default) and shows global rules first, the order the proxy applies them in. See [Global and project rules](/guide/proxy/#global-and-project-rules).
 
 Body rules re-sync `Content-Length` and de-chunk as needed, and an enabled rule forces HTTP/1.1 on hosts it matches. See [Proxy & History](/guide/proxy/) for the interactive editor.
+
+### run colormarker
+
+Manage **Colormarker** rules — which captured History rows get coloured, and how. Display only: a colour rule never modifies traffic, so unlike a Match & Replace rule it costs a misleading list at worst, never a modified message.
+
+```bash
+gori run colormarker                                        # list rules in precedence order
+gori run colormarker add --when 'status:>=500' --color red --style full --name 'prod 5xx'
+gori run colormarker add --when 'host:cdn' --color blue --style strip --scope global
+gori run colormarker move 2 --up                            # higher precedence
+gori run colormarker preview --when 'method:DELETE'
+gori run colormarker disable 1 --scope global               # off in THIS project only
+gori run colormarker disable 1 --scope global --everywhere  # off by default, everywhere
+gori run colormarker rm 3
+```
+
+| Option | Description |
+|--------|-------------|
+| `-w`, `--when=FILTER` | Required. The condition a flow must match — see below |
+| `--color=NAME` | `red`, `orange`, `yellow` (default), `green`, `blue`, `purple`. Resolved through the active theme, so it reads correctly on light and dark alike |
+| `--style=STYLE` | `full` (default) tints the whole row · `strip` paints one colour cell in a narrow column ahead of `TIME` |
+| `--name=NAME` | Label shown in the rule list |
+| `--disabled` | Create the rule without arming it |
+| `--scope=SCOPE` | `project` (default) or `global`. A global rule lives in `settings.json` and applies in every project |
+| `--everywhere` | On `enable`/`disable` of a global rule: change the rule's own default instead of this project's override |
+| `--up` / `--down` | On `move`: raise or lower the rule's precedence |
+
+**Precedence is the rule set's meaning.** Match & Replace rules *compose* — every enabled rule runs, in order. Colour rules *resolve*: the **first enabled match paints the row** and the rest are never consulted. That is why `move` exists here and not on `rewriter`. Global rules resolve before project ones, so a standing policy outranks a local layer.
+
+`--when` uses the same boolean grammar the conditional-intercept bar speaks — `host:` `path:` `method:` `scheme:` `status:` `proto:`, plus `AND` / `OR` / `NOT`, `-negation` and `(grouping)` — evaluated against the captured flow row. Three caveats, each of which would otherwise fail silently, so gori refuses or warns rather than letting you find out from an empty list:
+
+- **`body:` never matches here.** A History row carries no payload. (Warned, not refused — the term is legal.)
+- **`host:` is a substring, not a DNS-label glob.** `host:alpha.test` also matches `xalpha.test`. (Warned.)
+- **There is no `header:` / `size:` / `dur:` / `url:` / `stub:`.** Those are History QL fields that need a query, and this is evaluated on the render path. An unknown field is **refused** — left alone it would quietly become a free-text search and the rule would never fire.
+
+A condition that matches *every* flow (empty, or a half-typed `host:`) is refused too.
+
+`preview` reports how many recent flows the condition **matches** and how many it would actually **paint** — the two differ whenever an earlier enabled rule already claims the row. `rm` (`delete`), `enable`, `disable` and `move` take a rule id from the list, and `--scope`, because the two stores number their rules independently, so an id alone names two different rules. The list prints the scope as a `G`/`P` prefix (`G*` = this project overrides that global rule's default).
+
+The tab is **hidden by default** — show it from `settings:tabs`, next to Rewriter. See [Proxy & History](/guide/proxy/) for the interactive editor.
 
 ### run project
 

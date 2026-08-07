@@ -49,6 +49,7 @@ module Gori::Tui
     OastSession
     ProbeRule
     RewriterRule
+    ColormarkerRule
     ExtractRule
     RewriterStub
     CaImport

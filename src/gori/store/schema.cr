@@ -906,7 +906,44 @@ module Gori
         "CREATE INDEX idx_probe_oast_pending ON probe_oast_probes (id) WHERE matched_at IS NULL",
       ]
 
-      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12]
+      # Colormarker (display only): assign a COLOUR to the History rows whose flow matches a
+      # condition. Nothing here reaches the proxy — a rule paints a row that has already been
+      # captured, so unlike `match_rules` a malformed or over-broad rule costs an operator a
+      # misleading list, never a modified message.
+      #
+      # `match_filter` is an `InterceptFilter` source string — the SAME grammar `extract_rules`
+      # uses and the conditional-intercept bar speaks, evaluated here against a `FlowRow` in
+      # memory. NOT a new dialect, and not QL: QL compiles to SQL against the flows table, and
+      # there is no query to run when the row is already in hand on the render path.
+      #
+      # No `host` column, unlike match_rules and extract_rules: `host:` inside the filter is
+      # the same statement, and a second host axis would make "which one wins" a question with
+      # no good answer. The cost — the filter's `host:` is a plain substring rather than the
+      # DNS-label-boundary glob `Rules.host_matches?` implements — is stated at every surface.
+      #
+      # `position` is load-bearing here in a way it is not in match_rules: rewrite rules
+      # COMPOSE (all of them run, in order), colour rules RESOLVE (the first enabled match wins
+      # and the rest are never consulted). Order is therefore the operator's precedence
+      # statement, which is why reordering exists on the TUI, the CLI and MCP alike.
+      #
+      # No UNIQUE anywhere: two rules may legitimately share a condition (a triage rule being
+      # promoted from yellow to red sits above the one it supersedes), and refusing that would
+      # refuse the workflow the feature exists for.
+      V13 = [
+        <<-SQL,
+        CREATE TABLE color_rules (
+          id           INTEGER PRIMARY KEY,
+          enabled      INTEGER NOT NULL DEFAULT 1,
+          name         TEXT    NOT NULL DEFAULT '',
+          match_filter TEXT    NOT NULL DEFAULT '',
+          color        TEXT    NOT NULL DEFAULT 'yellow',
+          style        TEXT    NOT NULL DEFAULT 'full',
+          position     INTEGER NOT NULL DEFAULT 0
+        )
+        SQL
+      ]
+
+      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13]
 
       def self.migrate!(db : DB::Database) : Nil
         db.using_connection do |conn|

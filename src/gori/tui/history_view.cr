@@ -33,8 +33,11 @@ module Gori::Tui
     # window (in TRIM_SLACK batches so the id index is rebuilt amortized, not per
     # flow). This keeps a long high-traffic session's footprint bounded; the
     # authoritative history still lives in SQLite (reload/QL re-query it).
-    MAX_ROWS   = 5000
-    TRIM_SLACK =  512
+    MAX_ROWS = 5000
+    # Width the Colormarker `strip` column costs the fixed left block when armed: one colour
+    # cell plus a one-column gap. See render_list_body.
+    STRIP_W    = 2
+    TRIM_SLACK = 512
     # Cap on h2 frames / WS messages loaded into a detail view. A long-lived WS
     # (100k+ messages) or a heavily-multiplexed h2 connection would otherwise
     # materialize the whole log (objects + payloads + built lines) on detail-open.
@@ -98,6 +101,15 @@ module Gori::Tui
       @host_suggest_prefix = nil.as(String?) # cache key (downcase prefix)
       @host_suggest_values = [] of String
       @scope = nil.as(Scope?)
+      # Colormarker (the row-colour lens). Nil until `set_colormarker` — every construction
+      # site outside HistoryController leaves it nil, which is what makes the whole feature a
+      # no-op for the existing History specs (no swatch column, no tint, byte-identical render).
+      @colormarker = nil.as(Colormarker?)
+      # Per-row answers, keyed by FLOW ID like @marks and for the same reason: the list
+      # reloads, re-sorts and re-filters constantly, so an index-keyed memo would retarget.
+      # Dropped wholesale whenever the engine's revision moves — see `color_for`.
+      @color_memo = {} of Int64 => Store::ColorRule?
+      @color_rev = 0_u64
       @detail = nil.as(Store::FlowDetail?)
       @detail_ws = nil.as(Array(Store::WsMessage)?)
       @detail_frames = nil.as(Array(Store::H2Frame)?)
@@ -271,6 +283,34 @@ module Gori::Tui
       @scope = scope
     end
 
+    def set_colormarker(cm : Colormarker) : Nil
+      @colormarker = cm
+    end
+
+    # Which rule paints `row`, or nil.
+    #
+    # Memoised per flow id, and invalidated by comparing the engine's `revision` ONCE per call
+    # rather than by any callback: an edit on the Colormarker tab, an `apply_external_change`
+    # pulling in an MCP/CLI/peer-process edit, and a theme-independent reload all move the same
+    # counter, so the counter IS the notification and no cross-tab plumbing is needed.
+    #
+    # The memo (not a per-reload stamp like `Sitemap.stamp_tags!`) because History is the wrong
+    # shape for a stamp: it APPENDS live — `on_event(:inserted)` returns early when not
+    # filtering and never calls `reload`, so on an unfiltered list the next reload may never
+    # come — and it holds MAX_ROWS rows while a screenful is ~50. A stamp would be 100× the work
+    # for the same visible answer, and would leave every live-captured row uncoloured.
+    # `proto` is passed in because the row loop already computes it for the PROTO column —
+    # classifying twice per row per frame would be pure waste.
+    private def color_for(row : Store::FlowRow, proto : Proto::Kind) : Store::ColorRule?
+      cm = @colormarker
+      return nil unless cm
+      if cm.revision != @color_rev
+        @color_rev = cm.revision
+        @color_memo.clear
+      end
+      @color_memo.fetch(row.id) { @color_memo[row.id] = cm.match(row, proto) }
+    end
+
     # True when the displayed list is a filtered subset (QL query or Scope lens).
     def filtering? : Bool
       !@query.blank? || (@scope.try(&.active?) == true)
@@ -422,6 +462,11 @@ module Gori::Tui
       when :updated
         if (idx = index_of(event.id)) && (row = store.flow_row(event.id))
           @rows[idx] = row
+          # The row's ANSWERS changed, so its colour has to be re-asked. An in-flight row has
+          # `status` and `content_type` nil, so `status:>=500` and `proto:sse` genuinely answer
+          # differently once the response lands — without this the row would keep the colour it
+          # had while pending, for the rest of the session.
+          @color_memo.delete(event.id)
         end
       end
     end
@@ -1628,10 +1673,23 @@ module Gori::Tui
         hdr_y += 1
       end
 
-      time_x = rect.x + 1
-      method_x = rect.x + 16 # time column widened to fit MM-DD HH:MM:SS
-      proto_x = rect.x + 24
-      host_x = rect.x + 31
+      # Colormarker's `strip` column: ONE cell of colour between the cursor gutter (rect.x,
+      # which already carries ▎/▌) and TIME, plus a one-column gap so the swatch does not fuse
+      # with the cursor bar into a single two-cell block of mixed colour.
+      #
+      # Reserved ONLY while an enabled `strip` rule exists. Always-on would charge EVERY session
+      # two columns of the fixed left block for a default-hidden feature — and at 65 columns
+      # those two are the DUR column. The cost is that arming a strip rule shifts the columns by
+      # two, which happens on a deliberate edit on another tab and IS the feedback that the rule
+      # took; this list already relayouts on width (the STA/TYPE/SIZE/DUR cluster) and on `/`
+      # (the suggestion row). It also means a HistoryView with no engine renders exactly as it
+      # did before this feature existed.
+      sw = @colormarker.try(&.strip_active?) ? STRIP_W : 0
+      strip_x = rect.x + 1
+      time_x = rect.x + 1 + sw
+      method_x = rect.x + 16 + sw # time column widened to fit MM-DD HH:MM:SS
+      proto_x = rect.x + 24 + sw
+      host_x = rect.x + 31 + sw
       # Right cluster STA · TYPE · SIZE · DUR (status code, response MIME, size,
       # latency — frequently-scanned), anchored to the right edge and sized to FIT:
       # STA always shows; TYPE/SIZE/DUR drop right-to-left when the pane is too narrow
@@ -1709,18 +1767,38 @@ module Gori::Tui
         # cursor row that is ALSO marked (accent band + full bar). Both glyphs are
         # single-width, so no column offset moves — list_top/list_row_at stay valid.
         marked = @marks.includes?(row.id)
-        bg = if selected
-               focused ? Theme.accent_bg : Theme.selection_dim
-             elsif marked
-               Theme.selection_dim
-             else
-               Theme.bg
-             end
+        # PROTO is classified here rather than at its own column below, because Colormarker
+        # needs it to build the match subject and classifying twice per row per frame is waste.
+        kind = Proto.classify(row.status, row.content_type)
+        mark = color_for(row, kind)
+        base = if selected
+                 focused ? Theme.accent_bg : Theme.selection_dim
+               elsif marked
+                 Theme.selection_dim
+               else
+                 Theme.bg
+               end
+        # A `full` rule MIXES its hue into whatever band the row would already have; it never
+        # replaces it. The band is a lightness step (canvas → dim → accent) and the rule is a
+        # hue, so the two compose: a selected coloured row keeps the accent band's brightness
+        # AND gains the hue, and a marked one keeps the dim band plus its fuller ▌ bar.
+        # Replacing the band would make "this is the cursor row" invisible on every coloured
+        # row — the one state the operator navigates by.
+        bg = (m = mark) && m.style.full? ? Theme.row_tint(Theme.mark_color(m.color.to_sym), base) : base
         fg = selected || marked ? Theme.text_bright : Theme.text
 
-        if selected || marked
-          screen.fill(Rect.new(rect.x, y, rect.w, 1), bg)
-          screen.cell(rect.x, y, marked ? '▌' : '▎', Theme.accent, bg)
+        # The fill guard covers a TINTED row too, not just a selected/marked one: without it the
+        # tint would land only in the cells that pass an explicit bg and the gaps between
+        # columns would stay on the canvas — a striped row rather than a band.
+        screen.fill(Rect.new(rect.x, y, rect.w, 1), bg) if selected || marked || bg != Theme.bg
+        screen.cell(rect.x, y, marked ? '▌' : '▎', Theme.accent, bg) if selected || marked
+        # Drawn AFTER the band fill, so on a selected or marked row this one cell overwrites the
+        # band and the rule's colour survives at full saturation — which is what makes "selected
+        # AND red" read as both rather than as a slightly-tinted cursor row. A '█' on the row's
+        # own bg (not a space with a coloured background) composes correctly over a `full` tint
+        # and never punches a hole in the selection band.
+        if sw > 0 && (m = mark) && m.style.strip?
+          screen.cell(strip_x, y, '█', Theme.mark_color(m.color.to_sym), bg)
         end
         screen.text(time_x, y, fmt_time(row.created_at), Theme.muted, bg)
         # METHOD is a FIXED 8-column cell (method_x .. proto_x), so it needs its own clamp —
@@ -1737,8 +1815,8 @@ module Gori::Tui
         # PROTO: surface WS/GRPC/SSE (accented so they pop out of the HTTP stream), each
         # carrying the plaintext-vs-TLS signal the HTTP/HTTPS pair has always carried —
         # `Proto::Kind#label` owns that spelling, because a bare WS tag REPLACED the scheme
-        # and made a `ws://` row and a `wss://` row byte-identical here.
-        kind = Proto.classify(row.status, row.content_type)
+        # and made a `ws://` row and a `wss://` row byte-identical here. (`kind` is classified
+        # at the top of the row, where Colormarker also needs it.)
         # A short-circuited flow says so IN the PROTO column, replacing HTTP/HTTPS (#511).
         # That column already answers "what kind of exchange was this", and for a stub the
         # honest answer is that it was not an exchange at all — gori wrote the response from
@@ -2308,6 +2386,10 @@ module Gori::Tui
       end
       @selected = @selected.clamp(0, {@rows.size - 1, 0}.max)
       @scroll = @scroll.clamp(0, {@rows.size - 1, 0}.max)
+      # The colour memo is keyed by flow id and nothing else prunes it, so a long capture would
+      # otherwise accumulate an entry per flow ever seen. Cleared rather than pruned per dropped
+      # id: it refills from a screenful of rows on the next frame.
+      @color_memo.clear if @color_memo.size > @max_rows
     end
 
     # The detail content as a windowed view (request/response head + body with HTTP

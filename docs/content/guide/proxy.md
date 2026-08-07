@@ -291,6 +291,46 @@ Head rules take effect on connections opened after you save. A rule enabled whil
 
 The same rules are scriptable headless: `gori run rewriter` (list / add / rm / enable / disable / preview) and the MCP `create_rule` / `update_rule` / `list_rules` / `preview_rule` tools. Both carry the `scope` argument, so a global rule can be created and toggled without opening the TUI.
 
+## Colouring rows (Colormarker tab)
+
+Marks are for the set you are working on right now. A **colour rule** is standing: it says "any 5xx on this engagement is red" once, and every matching row stays red as traffic arrives. Same idea as ZAP's neonmarker, driven by a condition rather than a tag.
+
+The tab is **hidden by default** — show it from `settings:tabs`, where it sits next to Rewriter.
+
+Each rule carries a condition, a colour, and a style:
+
+| Style | What it draws |
+|-------|---------------|
+| `full` | Tints the whole History row's background |
+| `strip` | Paints one colour cell in a narrow column ahead of `TIME` — a stripe down the left edge of the list |
+
+Both styles coexist: use `strip` for noise you want to be able to skip past, `full` for the rows you want to be unable to miss. Six colours (`red`, `orange`, `yellow`, `green`, `blue`, `purple`), resolved through the active theme, so they read correctly on light and dark palettes alike.
+
+The tint **mixes into** the cursor and mark bands rather than replacing them, so a selected coloured row still reads as selected, and a marked one keeps its full gutter bar. The swatch column is only reserved while a `strip` rule is enabled, so a project with no colour rules renders exactly as before.
+
+**The first enabled match wins.** This is the one place Colormarker differs from the Rewriter next door: rewrite rules *compose* — every enabled rule runs, in order — while colour rules *resolve*, so the first match paints the row and the rest are never consulted. Order is therefore a real decision, not a tiebreak: `Shift-J` / `Shift-K` reorder, and global rules resolve before project ones, so a standing policy outranks a local layer.
+
+Conditions use the same boolean grammar the conditional-intercept bar speaks — `host:`, `path:`, `method:`, `scheme:`, `status:`, `proto:`, plus `AND` / `OR` / `NOT`, `-negation` and `(grouping)`. `Tab` on the `when:` row completes the token under the caret. Three things behave differently from the History search bar, and gori refuses or warns rather than letting you discover them from an empty list:
+
+- **`body:` never matches here.** A History row carries no payload.
+- **`host:` is a substring, not a DNS-label glob.** `host:alpha.test` also matches `xalpha.test`.
+- **There is no `header:` / `size:` / `dur:` / `url:` / `stub:`.** Those need a query, and a colour is decided while the row is being drawn. An unknown field is refused — left alone it would quietly become a free-text search and the rule would never fire.
+
+A rule lives either in this project or in the **global library** every project reads, exactly like a Match & Replace rule: `s` moves it between the two, `x` toggles it here, and `Shift-X` flips a global rule's default everywhere. A project that disagrees with the library stores only the disagreement, and that disagreement is dropped the moment the two agree again — so a rule you toggled off and back on goes back to following the library rather than pinning today's answer.
+
+| Action | Key |
+|--------|-----|
+| Add / edit a rule | `a` / `Enter` or `e` |
+| Enable or disable here | `x` |
+| Flip a global rule's default everywhere | `Shift-X` |
+| Move between project and global | `s` |
+| Reorder (changes which rule wins) | `Shift-J` / `Shift-K` |
+| Delete | `d` |
+
+The rule form previews as you type: how many recent flows the condition **matches**, and how many it would actually **paint** — the two differ when an earlier rule already claims the row.
+
+Scriptable headless too: `gori run colormarker` (list / add / rm / enable / disable / move / preview) and the MCP `create_color_rule` / `list_color_rules` / `move_color_rule` / `preview_color_rule` tools.
+
 ## Session bindings
 
 A rotating token — a session cookie, a CSRF field, a bearer — is worth nothing to a rule that has to spell it out in advance. A **binding** is a name gori fills in at send time from something it saw in a response, and it has two halves that are two separate rows:
