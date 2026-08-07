@@ -1957,7 +1957,7 @@ describe Gori::Tui::RepeaterView do
     view.request_insert?.should be_false
     backend2 = MemoryBackend.new(120, 24)
     view.render(Screen.new(backend2), Rect.new(0, 0, 120, 24))
-    backend2.contains?("↵:NOR").should be_true
+    backend2.contains?("↵:READ").should be_true
   end
 
   it "resp_move + selection returns plain text for copy" do

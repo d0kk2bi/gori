@@ -191,3 +191,98 @@ describe "Gori::Tui::Tutorial.wrap_sel" do
     Gori::Tui::Tutorial.wrap_sel(1, +1, 1).should eq(0)
   end
 end
+
+# The fake palette had no scrolling and a hard 8-row overlay cap, so its FIFTH row could not
+# be drawn at any terminal size — while ↑/↓ still selected it, the ▎ marker vanished off the
+# bottom and ↵ ran a command that had never been on screen. The click path bounded the row by
+# `rows.size` rather than by what was painted, so a click on the overlay's own bottom border
+# ran an undrawn row. Draw, scroll and hit-test now share these two.
+describe "Gori::Tui::Tutorial palette window" do
+  # border + query + divider + rows + border, so an n-row list needs n + 4.
+  it "counts only the rows between the divider and the bottom border" do
+    Gori::Tui::Tutorial.palette_rows_visible(Gori::Tui::Rect.new(0, 0, 30, 9)).should eq(5)
+    Gori::Tui::Tutorial.palette_rows_visible(Gori::Tui::Rect.new(0, 0, 30, 6)).should eq(2)
+    Gori::Tui::Tutorial.palette_rows_visible(Gori::Tui::Rect.new(0, 0, 30, 4)).should eq(0)
+    Gori::Tui::Tutorial.palette_rows_visible(Gori::Tui::Rect.new(0, 0, 30, 1)).should eq(0)
+  end
+
+  it "does not scroll while the whole list fits" do
+    (0..4).each { |sel| Gori::Tui::Tutorial.palette_scroll(sel, 5, 5).should eq(0) }
+    Gori::Tui::Tutorial.palette_scroll(4, 5, 8).should eq(0)
+  end
+
+  # The bug, in one line: at a 6-row overlay only 2 of 5 rows draw, and sel 4 must still be
+  # one of them.
+  it "keeps the selection inside the window" do
+    (0..4).each do |sel|
+      top = Gori::Tui::Tutorial.palette_scroll(sel, 5, 2)
+      sel.should be >= top
+      sel.should be < top + 2
+    end
+  end
+
+  it "never scrolls past the end of the list" do
+    Gori::Tui::Tutorial.palette_scroll(4, 5, 2).should eq(3)
+    Gori::Tui::Tutorial.palette_scroll(9, 5, 2).should eq(3) # stale selection, list filtered down
+  end
+
+  it "returns 0 for an empty window or an empty list" do
+    Gori::Tui::Tutorial.palette_scroll(0, 5, 0).should eq(0)
+    Gori::Tui::Tutorial.palette_scroll(0, 0, 4).should eq(0)
+  end
+
+end
+
+# The card MIN_CARD_H admits is three rows shorter than CONTENT_ROWS asks for, and the lessons
+# used to walk a FIXED prose height down it — so at an 80x16 terminal (the size the tour's own
+# "too small" message names as its minimum) the shell was left 4 rows, one under render_shell's
+# floor, and Navigate and Practice painted an EMPTY card under "roam the mock". At 13 and 14
+# rows the FLOWS pane showed 1 and 2 of its 3 rows, teaching "↓ list" over a list that could
+# not move. The prose gives way now; these pin the whole reachable band, not one height.
+describe "Gori::Tui::Tutorial.lesson_split" do
+  # box.h at terminal heights 16..22 — step_card gives min(CONTENT_ROWS + 3, max(h - 4, 3)).
+  card = ->(bh : Int32) { Gori::Tui::Rect.new(0, 2, 74, bh) }
+
+  it "gives the mock its rows at every card height the tour will render" do
+    (Gori::Tui::Tutorial::MIN_CARD_H..18).each do |bh|
+      box = card.call(bh)
+      # Navigate / Palette / SpaceMenu / Edit: headline + try line, muted detail rows tradeable.
+      _, sy = Gori::Tui::Tutorial.lesson_split(box, fixed: 2, detail: 2)
+      shell_h = box.bottom - 1 - sy
+      shell_h.should be >= Gori::Tui::Tutorial::SHELL_ROWS
+    end
+  end
+
+  # Practice carries the six goal chips, so it is the tightest lesson — and the one whose key
+  # line teaches "↓ list". One-row chips (fixed: 2) must still clear SHELL_ROWS at the floor.
+  it "clears the mock's rows on Practice once its goal chips fold to one row" do
+    box = card.call(Gori::Tui::Tutorial::MIN_CARD_H)
+    pad = Gori::Tui::Tutorial.prose_gaps(box, 2 + Gori::Tui::Tutorial::SHELL_ROWS, 1)
+    _, sy = Gori::Tui::Tutorial.lesson_split(box, fixed: 2, detail: 0, pad: pad)
+    (box.bottom - 1 - pad - sy).should be >= Gori::Tui::Tutorial::SHELL_ROWS
+  end
+
+  it "spends its spare rows on the prose once the card is tall enough" do
+    box = card.call(18)
+    keep, _ = Gori::Tui::Tutorial.lesson_split(box, fixed: 2, detail: 2)
+    keep.should eq(2) # nothing dropped when there is room for both
+    box12 = card.call(Gori::Tui::Tutorial::MIN_CARD_H)
+    Gori::Tui::Tutorial.lesson_split(box12, fixed: 2, detail: 2)[0].should eq(0)
+  end
+end
+
+# Welcome and Done wrote eleven rows into a card that can hold ten, and the eleventh painted
+# straight over the bottom border ("╰─Re-run this tour anytime: gori tutorial──╯" at 80x16).
+describe "Gori::Tui::Tutorial.prose_gaps" do
+  it "drops spacers before text, and keeps every row inside the card" do
+    [{9, 2}, {8, 2}].each do |(content, want)|
+      (Gori::Tui::Tutorial::MIN_CARD_H..18).each do |bh|
+        box = Gori::Tui::Rect.new(0, 2, 74, bh)
+        gaps = Gori::Tui::Tutorial.prose_gaps(box, content, want)
+        gaps.should be <= want
+        last = Gori::Tui::Tutorial.prose_top(box) + content + gaps - 1
+        last.should be < box.bottom - 1 # never the border row
+      end
+    end
+  end
+end

@@ -10,7 +10,7 @@ include Gori::Tui
 #
 # The ` ^V:… ` chip fixes that, and it rides the TARGET band rather than the REQUEST border on
 # purpose: the request border is a HALF-width column that already carries ^R:SEND, ^L:CL,
-# ^U:PRETTY and the NOR/INS chip, and a fifth badge there pushes the mode chip past `min_x` on a
+# ^U:PRETTY and the READ/INS chip, and a fifth badge there pushes the mode chip past `min_x` on a
 # 100-column terminal — the badge chain drops its leftmost first. The TARGET band is full width
 # and already holds the other "how do we connect" facts (the URL, the SNI override).
 describe "RepeaterView transport chip" do
@@ -40,7 +40,7 @@ describe "RepeaterView transport chip" do
     end
 
     # The reason the chip is not on the REQUEST border: at 100 columns the request column is 49
-    # wide, and SEND+CL+PRETTY+NOR already fill it to within 3 cells of the card title.
+    # wide, and SEND+CL+PRETTY+the mode chip already fill it to within a couple of cells of the card title.
     #
     # h2 is the case that pins the title cleanup: the card used to be titled "REQUEST (h2)",
     # and those five columns moved `min_x` far enough right that the chain dropped its leftmost
@@ -54,14 +54,14 @@ describe "RepeaterView transport chip" do
 
       row = render.call(view, rect).row(border_y)
       row.should contain("^R:SEND")
-      row.should contain("↵:NOR")
+      row.should contain("↵:READ")
       row.should_not contain("^V:")
 
       view.toggle_http2
       row2 = render.call(view, rect).row(border_y)
       row2.should contain("REQUEST")
       row2.should_not contain("(h2)")
-      row2.should contain("↵:NOR")
+      row2.should contain("↵:READ")
     end
 
     # The chip reports state, not on/off: its NAME is the state, so `toggle_badge`'s muted-grey
@@ -169,7 +169,7 @@ describe "RepeaterView transport chip" do
   end
 
   # The SNI marker used to position itself at `right - " SNI ".size - 1`, which is INSIDE the
-  # NOR/INS chip's cells and drawn after it: setting an override painted over the chip's right
+  # READ/INS chip's cells and drawn after it: setting an override painted over the chip's right
   # five columns. Chaining the band's chrome — mode, then SNI, then ^V — is what makes room for
   # the transport chip, and it fixes this at the same time.
   it "keeps the SNI marker, the mode chip and the transport chip on separate cells" do
@@ -179,10 +179,10 @@ describe "RepeaterView transport chip" do
     rect = Rect.new(0, 0, 100, 24)
     row = render.call(view, rect).row(rect.y)
 
-    row.should contain("↵:NOR")
+    row.should contain("↵:READ")
     row.should contain("SNI")
     row.should contain("^V:h1")
     row.index("^V:h1").not_nil!.should be < row.index("SNI").not_nil!
-    row.index("SNI").not_nil!.should be < row.index("↵:NOR").not_nil!
+    row.index("SNI").not_nil!.should be < row.index("↵:READ").not_nil!
   end
 end
