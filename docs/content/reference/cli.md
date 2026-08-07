@@ -710,24 +710,36 @@ gori settings import FILE          # apply a profile's sections
 
 ```bash
 gori settings export --sections network,scan_rules -o team-profile.json
-gori settings import team-profile.json --dry-run     # show what would change
+gori settings import team-profile.json --dry-run     # show what would be applied
 gori settings import team-profile.json --sections network
 ```
 
+`gori settings sections` lists every section gori knows, marking the ones this install has no value for yet:
+
+```
+network
+scan_rules  (not set — at its default)
+env  (holds secrets — excluded unless named; not set — at its default)
+```
+
+A section marked *not set* is still a valid name for `--sections`: exporting it simply carries nothing (gori says so on stderr), and importing one writes it for the first time.
+
 | Flag | Applies to | Description |
 |------|-----------|-------------|
-| `--sections a,b` | both | Comma-separated section names. Export defaults to everything except secret-bearing sections; import defaults to every section in the file |
+| `--sections a,b` | both | Comma-separated section names; at least one. Export defaults to everything except secret-bearing sections; import defaults to every section in the file |
 | `-o`, `--out FILE` | export | Write to a file instead of stdout |
-| `--dry-run` | import | Print which sections would change, then exit without writing |
+| `--dry-run` | import | Print which sections would be applied, then exit without writing |
 
 A section you do not select — or that the profile does not carry — is left **exactly as it was**. That is the guarantee `--sections` is choosing between. Within a section the profile *does* carry:
 
 - **List and table sections replace wholesale**: `upstream_rules`, `outbound_tls`, `listeners`, `scan_rules`, `hostname_overrides`, `tabs`, and the rest. A profile carrying `"upstream_rules": []` clears the table — that is how "no rules" is stated.
 - **Object-of-scalars sections apply key by key**: `network`, `editor`, `probe`. A key the profile omits keeps its current value, so a team profile that pins `network.upstream_proxy` does not also reset everyone's `bind_port` to a default it never mentioned.
 
-Note that `export` omits a section sitting at its factory default, so a profile is a set of values to *apply*, not a snapshot of a whole configuration: exporting from a machine where a value is default will not reset that value on a machine where it is not. Pass `--dry-run` to see exactly which sections an import would touch.
+Note that `export` omits a section sitting at its factory default, so a profile is a set of values to *apply*, not a snapshot of a whole configuration: exporting from a machine where a value is default will not reset that value on a machine where it is not. Pass `--dry-run` to see which sections an import would touch — it errs on the side of listing one, so a section it does *not* name is guaranteed to be a no-op.
 
-Import goes through the same writer the TUI uses, so it keeps the atomic write and cannot clobber a concurrently-running gori's edit to a section it did not touch. Unrecognised sections in the file are reported and ignored.
+Import goes through the same writer the TUI uses, so it keeps the atomic write and cannot clobber a concurrently-running gori's edit to — or deletion of — a section it did not touch. Unrecognised sections in the file are reported and ignored: they reach neither the live settings nor the file.
+
+If gori cannot load your `settings.json` — unparseable, unreadable, or a `--config` pointing at something it cannot open — both `export` and `import` refuse rather than proceeding. Every section is at its factory default at that point, so an import would persist those defaults over every section the profile does not name, and an export would write them out as if they were yours. Fix or remove the file first; an unparseable one is kept alongside it as `settings.json.corrupt`. `--dry-run` is the exception: it writes nothing, so it still runs, and says on stderr that the comparison is against defaults.
 
 `env` and `decoder` are excluded from an export by default: `env` holds token values and `decoder` holds your last input and saved sessions. Naming one explicitly (`--sections env`) is how you consent to include it. Note that `upstream_rules` is safe to share — it stores a username and an environment-variable *name*, never a password.
 

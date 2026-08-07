@@ -221,25 +221,74 @@ module Gori
     # — the same file the TUI's settings:* + ^E editor write); `--edit` opens it in
     # $EDITOR. Lazily created with current defaults on first invocation. ("config"
     # the word is reserved for the runtime Config struct — flags/effective config.)
+    private SETTINGS_USAGE = "Usage: gori settings [--edit]\n" \
+                             "       gori settings sections\n" \
+                             "       gori settings export [--sections a,b] [-o FILE]\n" \
+                             "       gori settings import FILE [--sections a,b] [--dry-run]"
+
+    private SETTINGS_VERBS = {"export", "import", "sections"}
+
+    # A leading BARE WORD that is not one of the three verbs is a typo, not a flag. Letting it
+    # fall through to `run_settings`'s own parser dropped it — OptionParser ignores leftover
+    # positionals with no `unknown_args` handler — so `gori settings expor -o profile.json`
+    # printed the settings path and exited 0: no export, no file, and `… || die` never fires.
+    # That is the silent-no-op-carrying-SUCCESS failure this very file refuses for version flags
+    # (see global_version_flag?), and `run_ca` below already rejects the identical shape.
+    private def self.unknown_settings_verb?(args : Array(String)) : Bool
+      return false unless first = args[0]?
+      !first.starts_with?('-') && !SETTINGS_VERBS.includes?(first)
+    end
+
+    # Parse, then refuse any leftover positional. OptionParser silently DROPS unclaimed bare
+    # words when no `unknown_args` handler is installed, and every `gori settings` verb but
+    # `import` takes none — so `gori settings --edit export` opened the editor and dropped
+    # `export`, `gori settings sections --help` printed the section list and never saw `--help`,
+    # and `gori settings export team-profile.json` (a forgotten `-o`) dumped the profile to
+    # stdout, created no file, and exited 0. `import` parses on its own because it does take a
+    # positional; its own `rest.size > 1` guard is the same rule.
+    private def self.reject_stray_args!(cmd : String, parser : OptionParser, args : Array(String)) : Nil
+      rest = [] of String
+      parser.unknown_args { |before, _| rest = before }
+      parser.parse(args)
+      return if rest.empty?
+      label = cmd.empty? ? "gori settings" : "gori settings #{cmd}"
+      abort "#{label}: unexpected argument(s): #{rest.join(", ")}\n#{parser}"
+    end
+
+    # Refuse to read or write a profile against settings gori could not load. Every section is
+    # at its factory default at that point, so an EXPORT writes those defaults out under the
+    # operator's name — into a file that outlives the stderr warning and gets committed or
+    # shared — and an IMPORT persists them back over the real file (the 3-way merge has no base;
+    # see Settings.load_degraded?). Both directions turn a recoverable local problem into a
+    # permanent one, so neither is worth guessing at.
+    private def self.abort_on_degraded_settings!(cmd : String) : Nil
+      return unless Settings.load_degraded?
+      abort "gori settings #{cmd}: #{Settings.path} could not be loaded (see the warning above, " \
+            "if any), so every section is at its factory default right now — this would #{cmd} " \
+            "those defaults, not your settings.\nFix or remove that file, then re-run."
+    end
+
     private def self.run_settings(args : Array(String)) : Nil
       case args[0]?
       when "export"   then return run_settings_export(args[1..])
       when "import"   then return run_settings_import(args[1..])
-      when "sections" then return run_settings_sections
+      when "sections" then return run_settings_sections(args[1..])
+      end
+      if unknown_settings_verb?(args)
+        STDERR.puts "unknown settings subcommand: #{args[0]}"
+        STDERR.puts SETTINGS_USAGE
+        exit 1
       end
 
       edit = false
       parser = OptionParser.new do |p|
-        p.banner = "Usage: gori settings [--edit]\n" \
-                   "       gori settings sections\n" \
-                   "       gori settings export [--sections a,b] [-o FILE]\n" \
-                   "       gori settings import FILE [--sections a,b] [--dry-run]"
+        p.banner = SETTINGS_USAGE
         p.on("--edit", "Open the settings file in your editor (Settings: Editor / $VISUAL / $EDITOR / vi)") { edit = true }
         p.on("-h", "--help", "Show this help") { puts p; exit 0 }
         p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
         p.missing_option { |flag| abort "missing value for #{flag}" }
       end
-      parser.parse(args)
+      reject_stray_args!("", parser, args)
 
       Paths.ensure_dirs
       Settings.load                                    # pick up the persisted editor pref + existing values
@@ -261,17 +310,46 @@ module Gori
       end
 
       cmd = Settings.editor_command
-      status = Process.run(cmd[0], cmd[1..] + [path],
-        input: Process::Redirect::Inherit, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
+      status =
+        begin
+          Process.run(cmd[0], cmd[1..] + [path],
+            input: Process::Redirect::Inherit, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
+        rescue File::NotFoundError
+          # Process.run RAISES when the program isn't on PATH, and CLI.run's rescue catches only
+          # Gori::Error — so a stale $EDITOR, or an `"editor": {"command": …}` naming something
+          # this box doesn't have, printed a Crystal backtrace at the user. ExternalEditor (the
+          # TUI's ^E path) has always handled this properly; match its wording.
+          abort "gori settings --edit: editor not found: #{cmd[0]}\n" \
+                "Set one with 'Settings: Editor' in the TUI, or via $VISUAL / $EDITOR."
+        rescue ex
+          abort "gori settings --edit: could not run the editor (#{cmd.join(' ')}): #{ex.message}"
+        end
       abort "gori settings: editor (#{cmd.join(' ')}) exited #{status.exit_code}" unless status.success?
     end
 
-    # `gori settings sections` — the top-level keys export/import operate on. Derived from the
-    # live serialization, so a newly added section appears here with no list to update.
-    private def self.run_settings_sections : Nil
+    # `gori settings sections` — the top-level keys export/import operate on.
+    #
+    # Lists Settings::SECTION_KEYS (every section gori knows), not `document_keys` (the ones
+    # this install happens to have a value for). Listing the latter meant a fresh config
+    # advertised 6 of 28 sections, and the ones it hid were exactly the ones export then
+    # rejected as "unknown" — so the message pointing here for "the list" pointed at a list that
+    # did not contain the name. The "not set" annotation keeps the information that was
+    # genuinely useful about the old output.
+    private def self.run_settings_sections(args : Array(String)) : Nil
+      parser = OptionParser.new do |p|
+        p.banner = "Usage: gori settings sections"
+        p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
+      end
+      reject_stray_args!("sections", parser, args)
+
       Settings.load
-      Settings.document_keys.each do |k|
-        puts Settings::SECRET_SECTIONS.includes?(k) ? "#{k}  (holds secrets — excluded unless named)" : k
+      present = Settings.document_keys
+      Settings::SECTION_KEYS.each do |k|
+        notes = [] of String
+        notes << "holds secrets — excluded unless named" if Settings::SECRET_SECTIONS.includes?(k)
+        notes << "not set — at its default" unless present.includes?(k)
+        puts notes.empty? ? k : "#{k}  (#{notes.join("; ")})"
       end
     end
 
@@ -281,18 +359,24 @@ module Gori
       out = nil.as(String?)
       parser = OptionParser.new do |p|
         p.banner = "Usage: gori settings export [--sections a,b] [-o FILE]"
-        p.on("--sections=LIST", "Comma-separated top-level sections (default: all but #{Settings::SECRET_SECTIONS.join('/')})") { |v| sections = split_sections(v) }
+        p.on("--sections=LIST", "Comma-separated top-level sections (default: all but #{Settings::SECRET_SECTIONS.join('/')})") { |v| sections = split_sections("export", v) }
         p.on("-o FILE", "--out=FILE", "Write here instead of stdout") { |v| out = v }
         p.on("-h", "--help", "Show this help") { puts p; exit 0 }
         p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
         p.missing_option { |flag| abort "missing value for #{flag}" }
       end
-      parser.parse(args)
+      reject_stray_args!("export", parser, args)
 
       Settings.load
+      abort_on_degraded_settings!("export")
       if list = sections
-        unknown = list - Settings.document_keys
-        abort "gori settings export: unknown section(s): #{unknown.join(", ")}\nRun 'gori settings sections' for the list." unless unknown.empty?
+        # Names were already validated against SECTION_KEYS in split_sections. What is left is
+        # informational: a KNOWN section this install never touched is omitted by `serialize`,
+        # so it is simply absent from the profile — correct (there is no value to carry), but
+        # silently handing back `{}` for `--sections scan_rules` reads as a bug. Say it, on
+        # STDERR so a piped profile stays clean, and keep exit 0: nothing went wrong.
+        at_default = list - Settings.document_keys
+        STDERR.puts "note: at their default, nothing to export: #{at_default.join(", ")}" unless at_default.empty?
       end
       doc = Settings.export_document(sections)
       if path = out
@@ -345,8 +429,8 @@ module Gori
       dry = false
       parser = OptionParser.new do |p|
         p.banner = "Usage: gori settings import FILE [--sections a,b] [--dry-run]"
-        p.on("--sections=LIST", "Comma-separated top-level sections to apply (default: every section in FILE)") { |v| sections = split_sections(v) }
-        p.on("--dry-run", "Print which sections would change, then exit without writing") { dry = true }
+        p.on("--sections=LIST", "Comma-separated top-level sections to apply (default: every section in FILE)") { |v| sections = split_sections("import", v) }
+        p.on("--dry-run", "Print which sections would be applied, then exit without writing") { dry = true }
         p.on("-h", "--help", "Show this help") { puts p; exit 0 }
         p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
         p.missing_option { |flag| abort "missing value for #{flag}" }
@@ -357,6 +441,10 @@ module Gori
 
       file = rest[0]?
       abort "gori settings import: needs a file\n#{parser}" unless file
+      # One profile per run. Taking rest[0] and dropping the rest turned a typo — a missing
+      # `--sections`, a glob that matched two files — into a half-done import reported as a
+      # full success.
+      abort "gori settings import: one file at a time (got #{rest.size}: #{rest.join(", ")})" if rest.size > 1
       raw = begin
         File.read(file)
       rescue ex
@@ -372,26 +460,84 @@ module Gori
       end
 
       Settings.load
-      changed, unknown = Settings.import_preview(raw, sections)
+      # Settings gori could not load leave EVERY section at its factory default and the 3-way
+      # merge without a base, so the `save` inside import_document writes those defaults over
+      # the operator's real file — theme, env token values, hostname overrides, upstream rules,
+      # the TLS pass-through list — while the summary names only the section they asked for.
+      # `load_root` promises the fallback lasts "for this run"; an import is the surface that
+      # would make it permanent. `--dry-run` writes nothing, so it may proceed — but the
+      # comparison it prints is against defaults, and saying so is the whole point of the note.
+      if dry
+        STDERR.puts "note: the comparison below is against DEFAULTS, not your real settings" if Settings.load_degraded?
+      else
+        abort_on_degraded_settings!("import")
+      end
+
+      applicable, changed, unknown = Settings.import_preview(raw, sections)
       STDERR.puts "warning: unrecognised section(s) ignored: #{unknown.join(", ")}" unless unknown.empty?
 
       if dry
-        if changed.empty?
-          puts "no changes — the selected sections already match #{Settings.path}"
+        if applicable.empty?
+          puts "nothing to apply — #{file} carries none of the selected sections"
+        elsif changed.empty?
+          # Only say "already match" when something really was compared. With no applicable
+          # section this line claimed a match that was never tested.
+          puts "no changes — the #{applicable.size} selected section(s) already match #{Settings.path}"
         else
-          puts "would replace #{changed.size} section(s) in #{Settings.path}:"
-          changed.each { |k| puts "  #{k}" }
+          # This list is EXACTLY what a real run reports as imported, so the two commands agree
+          # on the count; the `(unchanged)` marks carry what printing only the differing subset
+          # used to convey. "apply", not "replace": apply_sections merges the object-of-scalars
+          # sections key by key, and `changed` is an over-approximation of what differs (see
+          # Settings.import_preview) — a marked section may prove a no-op, an unmarked one is
+          # guaranteed to be.
+          puts "would apply #{applicable.size} section(s) to #{Settings.path}:"
+          applicable.each { |k| puts changed.includes?(k) ? "  #{k}" : "  #{k}  (unchanged)" }
         end
         return
       end
 
+      # import_document drops unrecognised keys itself and raises if the write fails, so what it
+      # returns IS what was handed to the settings. Subtracting `unknown` from it here was the
+      # second half of the miscount: with a valid section wrongly classed unknown, the summary
+      # read "imported 0 section(s)" over a write that had just happened.
       applied = Settings.import_document(raw, sections)
-      known = applied - unknown
-      puts "imported #{known.size} section(s) into #{Settings.path}#{known.empty? ? "" : ": #{known.join(", ")}"}"
+      puts "imported #{applied.size} section(s) into #{Settings.path}#{applied.empty? ? "" : ": #{applied.join(", ")}"}"
     end
 
-    private def self.split_sections(value : String) : Array(String)
+    # Split a `--sections` value into names. Pure, so the suite can exercise it — `abort` calls
+    # `exit`, which is not catchable, so the aborts stay at the call site below.
+    private def self.parse_sections_value(value : String) : Array(String)
       value.split(',').compact_map(&.strip.presence)
+    end
+
+    # The names in `list` gori does not know. Static SECTION_KEYS, never `document_keys` — the
+    # latter made this reject a name gori knows perfectly well but has no value for yet, which
+    # is how the documented `--sections network,scan_rules` example failed on a fresh install.
+    private def self.unknown_sections(list : Array(String)) : Array(String)
+      list - Settings::SECTION_KEYS
+    end
+
+    # `--sections` takes at least one KNOWN name, on both export and import.
+    #
+    # Two silent-success holes met here. An empty or all-commas value compact_map'd down to
+    # `[] of String` — TRUTHY in Crystal — so it sailed past the unknown-section check with
+    # nothing to check and then matched nothing: `--sections=""` exported `{}` and imported
+    # nothing, both exit 0, which is where a shell expanding an unset variable lands. And only
+    # export validated the names at all, so `gori settings import p.json --sections netwrok`
+    # selected nothing and reported "imported 0 section(s)" — or, with `--dry-run`, the flatly
+    # wrong "no changes — the selected sections already match".
+    private def self.split_sections(cmd : String, value : String) : Array(String)
+      list = parse_sections_value(value)
+      if list.empty?
+        abort "gori settings #{cmd}: --sections needs at least one section name\n" \
+              "Run 'gori settings sections' for the list."
+      end
+      unknown = unknown_sections(list)
+      unless unknown.empty?
+        abort "gori settings #{cmd}: unknown section(s): #{unknown.join(", ")}\n" \
+              "Run 'gori settings sections' for the list."
+      end
+      list
     end
 
     # `gori ca` is the CA utility surface:

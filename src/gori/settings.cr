@@ -199,6 +199,20 @@ module Gori
       nil
     end
 
+    # A settings file EXISTS but this process could not use it, so every section is sitting at
+    # its factory default AND the 3-way merge has no base — meaning the next `save` writes those
+    # defaults over the operator's file. Only meaningful after a `load`.
+    #
+    # Deliberately NOT `load_warning != nil`. That covers one of the two ways in: `load_root`'s
+    # rescue (present but unparseable) sets the warning, but `load_raw`'s rescue above sets
+    # nothing and swallows every READ failure — EACCES on a settings.json left root-owned by a
+    # `sudo gori`, a `--config` pointing at a directory, a transient I/O error. A guard keyed on
+    # the warning therefore misses exactly the cases that leave no trace at all, which is how
+    # `gori settings import` still replaced a live config with defaults and reported success.
+    def self.load_degraded? : Bool
+      @@loaded_raw.nil? && File.exists?(path)
+    end
+
     # Why the last load fell back to defaults, or nil when it did not. Read by the TUI to
     # put it on the project picker; every headless surface has already had it on STDERR
     # (see load_root). Cleared by a load that parses, so it never outlives the problem.
@@ -351,9 +365,24 @@ module Gori
         j.object do
           keys.each do |k|
             cur_v = cur_h[k]?
-            # I changed this section (mine != base) → mine wins; else take disk's (a
-            # concurrent writer's value, or unchanged). Drop a section absent from both.
-            chosen = cur_v != base_h[k]? ? cur_v : (disk_h[k]? || cur_v)
+            # I changed this section (mine != base) → mine wins; else take disk's, INCLUDING
+            # when disk no longer has the key at all.
+            #
+            # That last clause is the whole point. A `disk_h[k]? || cur_v` fallback sat here,
+            # and it silently undid a concurrent instance's DELETION: sections vanish from
+            # `serialize` the moment they are emptied (`env`, `upstream_rules`, `outbound_tls`,
+            # `listeners`, `scan_rules`, `oast_providers`, `hostname_overrides`, `tabs`,
+            # `hotkeys`, `decoder`, `fuzzer`, `retention` at default, `mine`/`discover` unsaved
+            # — nearly every optional one), so "the operator cleared their env vars in the other
+            # gori window" reached this line as an absent key, and `|| cur_v` wrote our stale
+            # copy — token VALUES and all — straight back. Their EDITS merged correctly the
+            # whole time; only their deletions came back, which is the harder failure to notice.
+            #
+            # Dropping the fallback is the entire fix, because the remaining case it covered is
+            # already handled: if disk lacks the key AND we did not change the section, then
+            # `cur_v == base_h[k]?`, so either base had it (they deleted it → drop, correct) or
+            # nobody ever had it (`cur_v` is nil → dropped anyway, same result).
+            chosen = cur_v != base_h[k]? ? cur_v : disk_h[k]?
             j.field k, chosen if chosen
           end
         end
@@ -377,8 +406,33 @@ module Gori
     # environment-variable NAME, never a password (see settings/upstream_rules.cr).
     SECRET_SECTIONS = ["env", "decoder"]
 
-    # Every top-level key the current settings would write. Also the answer to
-    # `gori settings sections`.
+    # Every top-level key gori KNOWS, whether or not this install currently has a value for one.
+    #
+    # `document_keys` cannot answer that question and must not be used to: it is derived from
+    # `serialize`, and every optional section's `serialize_*` omits itself at its factory
+    # default. Using it as the VALIDITY oracle made a section's NAME valid or invalid depending
+    # on the machine — `gori settings export --sections network,scan_rules` (verbatim the
+    # example in docs/reference/cli.md) aborted with "unknown section(s): scan_rules" on any
+    # install where scan_rules was untouched, and `gori settings import` reported a perfectly
+    # well-known section as "unrecognised … ignored" and then applied it anyway. The `env` case
+    # was the sharp one: on a fresh config `env` is empty, so importing a profile carrying
+    # `env` printed "ignored: env" / "imported 0 section(s)" while writing the token VALUES to
+    # disk — the tool telling the operator a credential section had been ignored when it had not.
+    #
+    # Hand-maintained, deliberately: this is the set of keys the `serialize` dispatcher at the
+    # bottom of this file can emit and `apply_sections` can read, and no runtime expression
+    # produces it without a fully-populated settings object. Add a section → add its key here.
+    # The `document_keys - SECTION_KEYS` guard in spec/settings_profile_spec.cr catches a
+    # rename, and catches an addition as soon as any example populates the new section.
+    SECTION_KEYS = %w(
+      theme mouse pretty_bodies layout statusline display pet notifications general update
+      network upstream_rules outbound_tls retention listeners editor tabs hostname_overrides
+      env scan_rules oast_providers hotkeys mine fuzzer probe discover decoder rewriter
+    )
+
+    # Every top-level key the current settings would write — i.e. which sections this install
+    # actually has a value for. NOT the list of valid names (see SECTION_KEYS): a section
+    # sitting at its factory default is absent from here on purpose.
     def self.document_keys : Array(String)
       (JSON.parse(serialize).as_h?.try(&.keys) || [] of String)
     end
@@ -409,16 +463,35 @@ module Gori
       end
     end
 
-    # The top-level keys in `raw` that would actually CHANGE the current settings, and the keys
-    # it carries that gori does not recognise. Import is destructive at section granularity, so
-    # `--dry-run` prints this before anything is written.
-    def self.import_preview(raw : String, only : Array(String)? = nil) : {Array(String), Array(String)}
+    # What `import_document` would do with `raw`, as three lists: the sections it would APPLY
+    # (selected ∩ recognised), the subset of those whose value differs from the current
+    # settings, and the keys gori does not recognise. `--dry-run` prints this before anything
+    # is written.
+    #
+    # The first list exists because the caller must be able to report the SAME set the real run
+    # reports. Printing only the differing subset made `--dry-run` and the actual import
+    # disagree on the count for identical input — "would apply 1 section(s)", then "imported 6"
+    # — and the count is the one thing `--dry-run` is run to learn.
+    #
+    # "Recognised" is decided by SECTION_KEYS, not by `document_keys` — see SECTION_KEYS for
+    # what using the latter cost. An unrecognised key is reported and then genuinely skipped by
+    # `import_document`, so the two halves of this tuple no longer overlap.
+    #
+    # The first half is an OVER-approximation, and the caller's wording ("would apply") is
+    # chosen to match: a section whose value differs wholesale is compared as a unit, but
+    # `apply_sections` merges the object-of-scalars sections key by key, so a profile pinning
+    # `network.upstream_proxy` to the value already in effect still shows up here. Erring this
+    # way is the safe direction — a section listed here might turn out to be a no-op, but one
+    # NOT listed is guaranteed to be, which is what "no changes" has to mean to be worth
+    # anything. Narrowing it further would need per-section merge semantics restated here (they
+    # differ: `network` preserves an omitted key, `hotkeys` and `env` reset one), i.e. a second
+    # description of `apply_sections` that could silently drift out of step with it.
+    def self.import_preview(raw : String, only : Array(String)? = nil) : {Array(String), Array(String), Array(String)}
       incoming = JSON.parse(raw).as_h
       current = JSON.parse(serialize).as_h
-      known = document_keys
       selected = incoming.keys.select { |k| only.nil? || only.includes?(k) }
-      changed = selected.select { |k| current[k]? != incoming[k] }
-      {changed, selected.reject { |k| known.includes?(k) }}
+      applicable, unknown = selected.partition { |k| SECTION_KEYS.includes?(k) }
+      {applicable, applicable.select { |k| current[k]? != incoming[k] }, unknown}
     end
 
     # Apply the selected sections of `raw` to the live settings and persist. Returns the keys
@@ -447,12 +520,34 @@ module Gori
     # goes through `save`, NOT a raw write: that keeps the atomic temp+rename and the 3-way
     # merge, so an import cannot clobber a concurrent instance's edit to a section it did not
     # touch.
+    # A key gori does not recognise is dropped here rather than passed through to
+    # `apply_sections` (which would ignore it anyway) — so the "unrecognised section(s) ignored"
+    # `import_preview` reports is TRUE. The caller printed a summary derived by subtracting one
+    # list from the other, which was wrong in both directions once `document_keys` decided what
+    # "recognised" meant.
+    #
+    # Returns the sections HANDED to `apply_sections`, which is not quite the same as the ones
+    # that took effect: the per-section parsers are tolerant by design, so a section whose value
+    # is the wrong shape (`"editor": "nvim"` — the #594 guard) is a no-op and still appears here.
+    # Narrowing this to "actually changed something" is not available cheaply: re-serializing
+    # around the apply cannot tell a rejected section from one imported with the value already
+    # in effect, and would report the second as skipped.
     def self.import_document(raw : String, only : Array(String)? = nil) : Array(String)
       incoming = JSON.parse(raw).as_h
-      selected = incoming.keys.select { |k| only.nil? || only.includes?(k) }
+      selected = incoming.keys.select do |k|
+        (only.nil? || only.includes?(k)) && SECTION_KEYS.includes?(k)
+      end
       filtered = JSON.build { |j| j.object { selected.each { |k| j.field k, incoming[k] } } }
       apply_sections(JSON.parse(filtered))
-      save
+      # `save` REPORTS failure rather than raising, because a failed write must not crash the
+      # TUI. Discarding that here meant a full disk, a read-only filesystem or an unwritable
+      # config directory printed "imported N section(s)" and exited 0 with nothing persisted —
+      # the silent-success shape `gori settings` was just fixed to stop producing elsewhere.
+      # There is no TUI on this path; Gori::Error is the CLI's expected-error type and CLI.run
+      # turns it into a clean abort.
+      unless save
+        raise Error.new("settings were applied in memory but could not be written to #{path}")
+      end
       selected
     end
 

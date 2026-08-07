@@ -690,24 +690,36 @@ gori settings import FILE          # 프로필의 섹션들을 적용
 
 ```bash
 gori settings export --sections network,scan_rules -o team-profile.json
-gori settings import team-profile.json --dry-run     # 무엇이 바뀔지 미리 보기
+gori settings import team-profile.json --dry-run     # 무엇이 적용될지 미리 보기
 gori settings import team-profile.json --sections network
 ```
 
+`gori settings sections`는 gori가 아는 모든 섹션을 나열하고, 이 설치본에 아직 값이 없는 것을 표시합니다:
+
+```
+network
+scan_rules  (not set — at its default)
+env  (holds secrets — excluded unless named; not set — at its default)
+```
+
+*not set*으로 표시된 섹션도 `--sections`에 쓸 수 있는 정상적인 이름입니다. export하면 담을 값이 없을 뿐이고(그 사실을 stderr로 알려줍니다), import하면 그 섹션이 처음으로 기록됩니다.
+
 | 플래그 | 대상 | 설명 |
 |------|-----------|-------------|
-| `--sections a,b` | 공통 | 쉼표로 구분한 섹션 이름. export 기본값은 비밀을 담은 섹션을 제외한 전부, import 기본값은 파일에 있는 전부 |
+| `--sections a,b` | 공통 | 쉼표로 구분한 섹션 이름, 최소 하나. export 기본값은 비밀을 담은 섹션을 제외한 전부, import 기본값은 파일에 있는 전부 |
 | `-o`, `--out FILE` | export | stdout 대신 파일로 기록 |
-| `--dry-run` | import | 바뀔 섹션만 출력하고 아무것도 쓰지 않고 종료 |
+| `--dry-run` | import | 적용될 섹션만 출력하고 아무것도 쓰지 않고 종료 |
 
 선택하지 않았거나 프로필에 없는 섹션은 **그대로 남습니다**. `--sections`가 고르는 것이 바로 이 경계입니다. 프로필이 실제로 담고 있는 섹션 안에서는:
 
 - **리스트/테이블 섹션은 통째 교체됩니다**: `upstream_rules`, `outbound_tls`, `listeners`, `scan_rules`, `hostname_overrides`, `tabs` 등. `"upstream_rules": []`를 담은 프로필은 테이블을 비웁니다 — "규칙 없음"을 그렇게 표현합니다.
 - **스칼라 오브젝트 섹션은 키 단위로 적용됩니다**: `network`, `editor`, `probe`. 프로필이 생략한 키는 현재 값을 유지하므로, `network.upstream_proxy`만 지정한 팀 프로필이 언급한 적도 없는 `bind_port`까지 기본값으로 되돌리지 않습니다.
 
-`export`는 공장 기본값 상태인 섹션을 아예 쓰지 않으므로, 프로필은 설정 전체의 스냅샷이 아니라 *적용할 값들의 묶음*입니다 — 어떤 값이 기본값인 머신에서 export해도, 그 값이 기본값이 아닌 머신에서 되돌려지지 않습니다. import가 실제로 무엇을 건드릴지는 `--dry-run`으로 확인하세요.
+`export`는 공장 기본값 상태인 섹션을 아예 쓰지 않으므로, 프로필은 설정 전체의 스냅샷이 아니라 *적용할 값들의 묶음*입니다 — 어떤 값이 기본값인 머신에서 export해도, 그 값이 기본값이 아닌 머신에서 되돌려지지 않습니다. import가 무엇을 건드릴지는 `--dry-run`으로 확인하세요 — 목록에 넣는 쪽으로 넉넉하게 판단하므로, 거기 없는 섹션은 확실히 아무 변화도 없습니다.
 
-import는 TUI와 동일한 저장 경로를 거치므로 원자적 쓰기가 유지되고, 동시에 실행 중인 gori가 건드리지 않은 섹션에 한 편집을 덮어쓰지 않습니다. 파일에 있는 알 수 없는 섹션은 보고하고 무시합니다.
+import는 TUI와 동일한 저장 경로를 거치므로 원자적 쓰기가 유지되고, 동시에 실행 중인 gori가 건드리지 않은 섹션에 한 편집이나 삭제를 덮어쓰지 않습니다. 파일에 있는 알 수 없는 섹션은 보고하고 무시합니다 — 실행 중인 설정에도, 파일에도 반영되지 않습니다.
+
+gori가 `settings.json`을 읽지 못하는 상태 — 파싱 실패, 권한 문제, `--config`가 열 수 없는 대상을 가리키는 경우 — 라면 `export`와 `import` 모두 진행하지 않고 거부합니다. 그 시점의 gori는 모든 섹션이 공장 기본값이므로, import는 프로필이 언급하지 않은 섹션 전부를 기본값으로 디스크에 박고, export는 그 기본값을 당신의 설정인 양 파일로 내보내기 때문입니다. 먼저 파일을 고치거나 지우세요 — 파싱되지 않은 원본은 옆에 `settings.json.corrupt`로 보관됩니다. `--dry-run`은 예외입니다: 아무것도 쓰지 않으므로 그대로 실행되고, 비교 대상이 기본값이라는 사실을 stderr로 알려줍니다.
 
 `env`와 `decoder`는 export에서 기본 제외됩니다 — `env`는 토큰 값을, `decoder`는 마지막 입력과 저장된 세션을 담기 때문입니다. 명시적으로 이름을 적는 것(`--sections env`)이 포함에 대한 동의입니다. `upstream_rules`는 공유해도 안전합니다 — 사용자명과 환경변수 *이름*만 저장하고 비밀번호는 담지 않습니다.
 
