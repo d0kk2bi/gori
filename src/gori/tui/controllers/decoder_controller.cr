@@ -451,7 +451,7 @@ module Gori::Tui
         end
         "chain (> | ,) · ↑ input · ↓ output · ^Y copy · ^X mode · ^S save · ^O load · esc tabs"
       when :output
-        "↑/↓ move · ⇧arrows select · #{y} copy · ⇧←/→ h-scroll · ↑-top chain · space cmds · ^X mode · ^Y copy all · esc tabs"
+        "↑/↓ move · ⇧arrows select · #{y} copy · ↑-top chain · space cmds · ^X mode · ^Y copy all · esc tabs"
       when :input
         if s.input_mode == InputMode::Insert
           "type to edit · esc read · ↓ chain · ^L clear · ^X mode · ^N new · ^W close · ↑ sub-tabs"

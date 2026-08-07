@@ -11,7 +11,8 @@ module Gori::Tui
   module TrafficEmptyState
     extend self
 
-    FULL_MIN_H =  7
+    # No FULL_MIN_H: a full card runs 6..13 rows depending on variant and flags, so a single
+    # shared height floor cannot decide whether one fits. `full_rows` does, per variant.
     FULL_MIN_W = 42
     MED_MIN_H  =  5
     MED_MIN_W  = 30
@@ -42,14 +43,21 @@ module Gori::Tui
 
       host, port = listen || {Settings.effective_bind_host, Settings.effective_bind_port}
       headline = title || default_title(variant, running: running, scan_on: scan_on)
-      min_h = variant == :fuzzer_results ? 5 : FULL_MIN_H
+      # The card has to FIT, not merely clear a shared floor. The old test (7 rows, or 5 for
+      # fuzzer_results) admitted `render_full` for cards up to 13 rows tall, and NOTHING clips
+      # the interior: each renderer walks `y` downward unguarded, so the card drew straight out
+      # of its pane — through the outer frame's bottom border and, at some heights, below the
+      # status bar onto the last terminal row. Degrading to medium/minimal is what this module
+      # already promises for short panes.
+      full_h = full_rows(variant, capturing: capturing, catch_on: catch_on,
+        running: running, scan_on: scan_on)
 
       # This card is the onboarding surface — the address on it is the one the user is
       # meant to TYPE into a client, so a wildcard bind must not render as "0.0.0.0:8070".
       # Only the FULL card has room for the "(all interfaces)" note; the narrower fallbacks
       # inline the address into a longer hint line and take the terse form. Same address
       # either way, so a resize can never appear to move the proxy.
-      if rect.h >= min_h && rect.w >= FULL_MIN_W
+      if rect.h >= full_h && rect.w >= FULL_MIN_W
         addr = BindAddress.display(host, port)
         render_full(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on)
       elsif rect.h >= MED_MIN_H && rect.w >= MED_MIN_W
@@ -59,6 +67,33 @@ module Gori::Tui
         addr = BindAddress.display(host, port, terse: true)
         render_minimal(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on)
       end
+    end
+
+    # Interior row count of each FULL card — ONE source of truth, read by the gate in `render`
+    # and by the renderers below, so the two can never drift apart. Defaults let a variant whose
+    # height ignores a flag omit it at the call site.
+    private def full_inner_h(variant : Symbol, *, capturing : Bool = true, catch_on : Bool = false,
+                             running : Bool = false, scan_on : Bool = true) : Int32
+      case variant
+      when :history        then 5 + (capturing ? 0 : 1) + 3
+      when :sitemap        then 6 + (capturing ? 0 : 1) + 3
+      when :intercept      then 5 + (catch_on ? 0 : 1) + 3 + (capturing ? 0 : 1)
+      when :repeater       then 5 + 2
+      when :fuzzer         then 5 + 2
+      when :fuzzer_results then running ? 3 : 4
+      when :probe          then scan_on ? 6 + (capturing ? 0 : 1) + 2 : 4
+      when :issues         then 5 + 2
+      when :notes          then 5 + 1
+      else                      0 # unknown variant — render_full draws nothing, as before
+      end
+    end
+
+    # Rows the full card needs inside `rect`: its interior plus two borders, plus the headline
+    # row that rides above it for every variant except Notes (which centres in the whole rect).
+    private def full_rows(variant : Symbol, *, capturing : Bool, catch_on : Bool,
+                          running : Bool, scan_on : Bool) : Int32
+      full_inner_h(variant, capturing: capturing, catch_on: catch_on,
+        running: running, scan_on: scan_on) + 2 + (variant == :notes ? 0 : 1)
     end
 
     private def default_title(variant : Symbol, *, running : Bool, scan_on : Bool) : String
@@ -185,7 +220,7 @@ module Gori::Tui
       # +3 (not +2): the intro/addr/diagram block spans through relative row 3, the
       # divider + palette hint reach row 6, and the final "or set your client's proxy"
       # line lands on row 7 — which the old budget pushed onto the card's bottom border.
-      inner_h = 5 + (capturing ? 0 : 1) + 3
+      inner_h = full_inner_h(:history, capturing: capturing)
       _, inner, ix, iw = begin_card(screen, rect, headline, "FLOW LOG", inner_h)
       y = inner.y
 
@@ -209,7 +244,7 @@ module Gori::Tui
                                     addr : String, capturing : Bool) : Nil
       # +3 (not +2): the final "or set your client's proxy" line lands one row below
       # the palette hint, which the old budget pushed onto the card's bottom border.
-      inner_h = 6 + (capturing ? 0 : 1) + 3
+      inner_h = full_inner_h(:sitemap, capturing: capturing)
       _, inner, ix, iw = begin_card(screen, rect, headline, "SITE MAP", inner_h)
       y = inner.y
 
@@ -233,7 +268,7 @@ module Gori::Tui
 
     private def render_intercept_full(screen : Screen, rect : Rect, headline : String,
                                       addr : String, capturing : Bool, catch_on : Bool) : Nil
-      inner_h = 5 + (catch_on ? 0 : 1) + 3 + (capturing ? 0 : 1)
+      inner_h = full_inner_h(:intercept, capturing: capturing, catch_on: catch_on)
       _, inner, ix, iw = begin_card(screen, rect, headline, "INTERCEPT", inner_h)
       y = inner.y
 
@@ -258,7 +293,7 @@ module Gori::Tui
     end
 
     private def render_repeater_full(screen : Screen, rect : Rect, headline : String) : Nil
-      inner_h = 5 + 2
+      inner_h = full_inner_h(:repeater)
       _, inner, ix, iw = begin_card(screen, rect, headline, "REPEATER", inner_h)
       y = inner.y
 
@@ -273,7 +308,7 @@ module Gori::Tui
     end
 
     private def render_fuzzer_full(screen : Screen, rect : Rect, headline : String) : Nil
-      inner_h = 5 + 2
+      inner_h = full_inner_h(:fuzzer)
       _, inner, ix, iw = begin_card(screen, rect, headline, "FUZZER", inner_h)
       y = inner.y
 
@@ -288,7 +323,7 @@ module Gori::Tui
     end
 
     private def render_fuzzer_results_full(screen : Screen, rect : Rect, headline : String, running : Bool) : Nil
-      inner_h = running ? 3 : 4
+      inner_h = full_inner_h(:fuzzer_results, running: running)
       _, inner, ix, iw = begin_card(screen, rect, headline, "RESULTS", inner_h)
       y = inner.y
 
@@ -300,7 +335,7 @@ module Gori::Tui
 
     private def render_probe_full(screen : Screen, rect : Rect, headline : String,
                                   addr : String, capturing : Bool, scan_on : Bool) : Nil
-      inner_h = scan_on ? 6 + (capturing ? 0 : 1) + 2 : 4
+      inner_h = full_inner_h(:probe, capturing: capturing, scan_on: scan_on)
       _, inner, ix, iw = begin_card(screen, rect, headline, "PROBE", inner_h)
       y = inner.y
 
@@ -327,7 +362,7 @@ module Gori::Tui
     end
 
     private def render_issues_full(screen : Screen, rect : Rect, headline : String) : Nil
-      inner_h = 5 + 2
+      inner_h = full_inner_h(:issues)
       _, inner, ix, iw = begin_card(screen, rect, headline, "ISSUES", inner_h)
       y = inner.y
 
@@ -342,7 +377,7 @@ module Gori::Tui
     end
 
     private def render_notes_full(screen : Screen, rect : Rect) : Nil
-      inner_h = 5 + 1
+      inner_h = full_inner_h(:notes)
       card_h = inner_h + 2
       card_w = {rect.w - 4, 46}.min.clamp(FULL_MIN_W, rect.w)
       card = place_centered_card_in(rect, card_w, card_h)

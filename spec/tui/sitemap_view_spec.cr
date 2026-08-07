@@ -74,8 +74,11 @@ describe Gori::Tui::SitemapView do
     tmp_store do |store|
       view = SitemapView.new
       view.reload(store)
-      backend = MemoryBackend.new(70, 14)
-      view.render(Screen.new(backend), Rect.new(0, 0, 70, 14),
+      # 15 rows is the least the SITE MAP card fits in (9 interior + 2 borders + headline,
+      # inside the tree rect below this view's chrome); below that TrafficEmptyState degrades
+      # to plain lines, which keep the address and the hints but drop the card title.
+      backend = MemoryBackend.new(70, 15)
+      view.render(Screen.new(backend), Rect.new(0, 0, 70, 15),
         listen: {"127.0.0.1", 8070}, capturing: true)
       backend.contains?("no traffic captured").should be_true
       backend.contains?("localhost:8070").should be_true

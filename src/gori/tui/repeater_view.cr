@@ -4376,9 +4376,17 @@ module Gori::Tui
       resp_plain = !@resp_hex && @resp_mode == :response
       diff_lit = !@resp_hex && @resp_mode == :diff
       pretty_lit = resp_plain && !@reveal && resp_pretty_applied?
-      x = Frame.chip(screen, rect.x + 12, rect.y, " d:diff ", diff_lit) + 1
-      x = Frame.chip(screen, x, rect.y, " ^X:hex ", @resp_hex) + 1
-      chips_end = Frame.chip(screen, x, rect.y, " p:pretty ", pretty_lit)
+      # These chips are LEFT-anchored, and `Frame.chip` does not clip (unlike its sibling
+      # `Frame.toggle_badge`, which draws nothing when it doesn't fit). RESPONSE is a
+      # half-width split pane, so below ~88 cols the cluster ran through this card's own
+      # '╮' corner and on over the outer frame's border. Stop at the first chip that would
+      # cross `limit`; the meta/⚠ read-out after this was already fit-guarded.
+      limit = rect.right - 1 # keep the corner
+      chips_end = rect.x + 12
+      { {" d:diff ", diff_lit}, {" ^X:hex ", @resp_hex}, {" p:pretty ", pretty_lit} }.each do |label, lit|
+        break if chips_end + Screen.draw_width(label) > limit
+        chips_end = Frame.chip(screen, chips_end, rect.y, label, lit) + 1
+      end
       if result = @result
         meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
         meta_x = rect.right - meta.size - 1
