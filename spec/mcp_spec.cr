@@ -271,6 +271,114 @@ describe Gori::MCP::Server do
         out.should be_empty
       end
     end
+
+    it "answers a message carrying no method at all, id or not" do
+      with_store do |store|
+        # Silence is for a NOTIFICATION — no id, but a method. An object naming no method is
+        # malformed, and JSON-RPC answers it at null rather than dropping it on the floor.
+        out = drive(store, %({"jsonrpc":"2.0","params":{}}))
+        out.size.should eq(1)
+        out[0]["id"].raw.should be_nil
+        out[0]["error"]["code"].as_i.should eq(-32600)
+      end
+    end
+  end
+
+  # SUPPORTED_VERSIONS advertises 2025-03-26 — the one MCP revision that REQUIRES receiving
+  # JSON-RPC batches (2025-06-18 removed batching again). A batch used to come back as a
+  # single `Invalid Request` at id null, so a client tracking one promise per request in the
+  # batch resolved none of them and hung on a revision the server had just claimed.
+  describe "JSON-RPC batches" do
+    it "answers a batch with one array, correlated per member id" do
+      with_store do |store|
+        batch = %([{"jsonrpc":"2.0","id":1,"method":"ping"},) +
+                %({"jsonrpc":"2.0","method":"notifications/initialized"},) +
+                %({"jsonrpc":"2.0","id":"two","method":"ping"}])
+        out = drive(store, batch)
+        out.size.should eq(1) # one framed line, not three
+        arr = out[0].as_a
+        # The notification contributes nothing; the two requests keep their own id types.
+        arr.size.should eq(2)
+        arr[0]["id"].as_i.should eq(1)
+        arr[0]["result"].as_h.should be_empty
+        arr[1]["id"].as_s.should eq("two")
+        arr[1]["result"].as_h.should be_empty
+      end
+    end
+
+    it "answers a bad member beside its siblings instead of voiding the batch" do
+      with_store do |store|
+        batch = %([{"jsonrpc":"2.0","id":1,"method":"ping"},"garbage",) +
+                %({"jsonrpc":"2.0","id":9,"method":"nope"}])
+        arr = drive(store, batch)[0].as_a
+        arr.size.should eq(3)
+        arr[0]["result"].as_h.should be_empty
+        arr[1]["id"].raw.should be_nil # a non-object member has no id to answer with
+        arr[1]["error"]["code"].as_i.should eq(-32600)
+        arr[2]["id"].as_i.should eq(9)
+        arr[2]["error"]["code"].as_i.should eq(-32601)
+      end
+    end
+
+    it "stays silent for an all-notification batch" do
+      with_store do |store|
+        # `[]` back would be a protocol violation of its own, not a harmless empty answer.
+        batch = %([{"jsonrpc":"2.0","method":"notifications/initialized"},) +
+                %({"jsonrpc":"2.0","method":"notifications/cancelled"}])
+        drive(store, batch).should be_empty
+      end
+    end
+
+    it "answers an unparseable batch at id null, not at its first member's id" do
+      with_store do |store|
+        # `1e400` is legal JSON that Crystal's Float64 parser refuses, so the whole LINE
+        # fails to parse. recover_id scrapes the first `"id"` it sees — in a batch that id
+        # belongs to member 1, and answering the batch under it resolves exactly one of the
+        # client's promises while every other member hangs.
+        batch = %([{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"limit":1e400}},) +
+                %({"jsonrpc":"2.0","id":2,"method":"ping"}])
+        out = drive(store, batch)
+        out.size.should eq(1)
+        out[0]["id"].raw.should be_nil
+        out[0]["error"]["code"].as_i.should eq(-32700)
+      end
+    end
+
+    it "answers a member with neither method nor id, keeping the array aligned" do
+      with_store do |store|
+        # A client correlating responses to members BY POSITION needs one element per
+        # member; a silently skipped member shifts every response after it.
+        batch = %([{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","params":{}}])
+        arr = drive(store, batch)[0].as_a
+        arr.size.should eq(2)
+        arr[0]["id"].as_i.should eq(1)
+        arr[1]["id"].raw.should be_nil
+        arr[1]["error"]["code"].as_i.should eq(-32600)
+      end
+    end
+
+    it "rejects an empty batch with a single null-id error" do
+      with_store do |store|
+        out = drive(store, "[]")
+        out.size.should eq(1)
+        out[0]["id"].raw.should be_nil
+        out[0]["error"]["code"].as_i.should eq(-32600)
+      end
+    end
+
+    it "runs real tool calls inside a batch" do
+      with_store do |store|
+        seed_flow(store, "ex.com", "GET", "/a", 200)
+        batch = %([{"jsonrpc":"2.0","id":1,"method":"tools/call",) +
+                %("params":{"name":"list_history","arguments":{"limit":1}}},) +
+                %({"jsonrpc":"2.0","id":2,"method":"tools/list"}])
+        arr = drive(store, batch)[0].as_a
+        arr.size.should eq(2)
+        arr[0]["result"]["isError"].as_bool.should be_false
+        JSON.parse(arr[0]["result"]["content"][0]["text"].as_s).as_a.size.should eq(1)
+        arr[1]["result"]["tools"].as_a.should_not be_empty
+      end
+    end
   end
 
   describe "tools/list" do

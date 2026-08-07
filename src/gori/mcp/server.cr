@@ -41,6 +41,9 @@ module Gori
         # Set when the output pipe breaks (client vanished mid-write): the loop then
         # stops rather than thrashing on a dead stream or raising an unhandled error.
         @closed = false
+        # Non-nil only while a batch is being dispatched: `send` collects into it instead of
+        # writing, so the members' responses leave as the one array the batch is owed.
+        @batch = nil.as(Array(String)?)
       end
 
       # Reads until EOF on `input` (client closed the pipe). Each line is parsed
@@ -60,7 +63,6 @@ module Gori
       end
 
       private def handle_line(line : String) : Nil
-        id = nil.as(JSON::Any?)
         root = begin
           JSON.parse(line)
         rescue ex : JSON::ParseException
@@ -73,6 +75,47 @@ module Gori
           return write_error(recover_id(line), -32700, "Parse error: #{ex.message}")
         end
 
+        if batch = root.as_a?
+          handle_batch(batch)
+        else
+          handle_message(root)
+        end
+      end
+
+      # A JSON-RPC 2.0 batch: an ARRAY of messages, answered by ONE array of the responses
+      # the member requests produced.
+      #
+      # SUPPORTED_VERSIONS advertises `2025-03-26`, the one MCP revision where receiving
+      # batches is mandatory (2025-06-18 removed it again) — and we echo that version back
+      # whenever a client asks for it. Without this, every batch fell through to
+      # handle_message's object check and came back as a SINGLE `Invalid Request` at id
+      # `null`: not one of the ids in the batch, so a client holding a promise per request
+      # resolved none of them and the session hung on a revision we had just claimed.
+      #
+      # Members are dispatched in order through the same path a lone line takes, so a bad
+      # member yields its own error object beside its siblings' results rather than voiding
+      # the batch.
+      private def handle_batch(items : Array(JSON::Any)) : Nil
+        # An empty batch names no request to answer, so the single null-id error IS the
+        # spec's answer here (unlike the case above, where ids existed and were thrown away).
+        return write_error(nil, -32600, "Invalid Request: empty batch") if items.empty?
+
+        collected = [] of String
+        @batch = collected
+        begin
+          items.each { |item| handle_message(item) }
+        ensure
+          @batch = nil
+        end
+
+        # All-notification batches get no response at all — sending `[]` back is explicitly
+        # forbidden, and a client that reads one as a malformed frame drops the connection.
+        return if collected.empty?
+        send("[#{collected.join(',')}]")
+      end
+
+      private def handle_message(root : JSON::Any) : Nil
+        id = nil.as(JSON::Any?)
         obj = root.as_h?
         return write_error(nil, -32600, "Invalid Request") unless obj
 
@@ -81,8 +124,13 @@ module Gori
         params = obj["params"]?
 
         unless method
-          write_error(id, -32600, "Invalid Request: missing method") if id
-          return
+          # No `method` at all is a MALFORMED message, not a notification — a notification is
+          # one that omits `id` while still naming a method, and this one may omit both. It is
+          # answered at whatever id it carried, or at null when it carried none. Staying silent
+          # for the id-less case cost a batch one array element, and a client that correlates
+          # responses to members BY POSITION then pairs every later response with the wrong
+          # request — worse than the error it was trying not to send.
+          return write_error(id, -32600, "Invalid Request: missing method")
         end
 
         if id
@@ -266,6 +314,13 @@ module Gori
       # inside a tool ARGUMENT (get_flow's own `id`, an issue id, …) from being mistaken for
       # the envelope's. Nil when nothing matches: a wrong id is worse than none.
       private def recover_id(line : String) : JSON::Any?
+        # A line that OPENS as an array is a BATCH, and its first `"id"` belongs to the first
+        # MEMBER — there is no envelope id to recover. Answering the whole unparseable batch
+        # under that one id resolves exactly one of the client's pending promises and strands
+        # every other member: the same hang batch support exists to prevent, arrived at from
+        # the other side. A batch parse error is answered at id null, which is also what
+        # JSON-RPC asks for when the request cannot be read.
+        return nil if line.lstrip.starts_with?('[')
         head = line[0, {line.index(%("method")) || line.size, line.index(%("params")) || line.size}.min]
         m = head.match(/"id"\s*:\s*(?:(-?\d{1,18})|"([^"\\]{0,128})")/)
         return nil unless m
@@ -290,6 +345,15 @@ module Gori
 
       private def send(payload : String) : Nil
         return if @closed
+        # Inside a batch this is one member's response, not a frame: buffer it for
+        # handle_batch, which emits the array through this same method once. Deliberately
+        # NOT wire_safe'd here — the joined array gets one pass below, and `[`, `,` and `]`
+        # cannot introduce invalid UTF-8, so scanning each member too would walk a
+        # multi-megabyte batch twice for the same answer.
+        if batch = @batch
+          batch << payload
+          return
+        end
         @output.puts(wire_safe(payload)) # newline framing
         @output.flush                    # or the client blocks on the unterminated line
       rescue ex : IO::Error
