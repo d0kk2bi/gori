@@ -1,4 +1,5 @@
 require "./spec_helper"
+require "file_utils"
 
 # Top-level `gori` dispatch (src/gori/cli.cr). Only the pure argv helpers are exercised
 # here — CLI.run itself starts a TUI / server or calls `exit`, so it is not spec-callable.
@@ -26,6 +27,35 @@ module Gori::CLI
 
   def self.unknown_sections_for_spec(list : Array(String)) : Array(String)
     unknown_sections(list)
+  end
+
+  # What the guards actually decide on. Routed through the PRODUCTION `stray_args` — its
+  # `unknown_args` wiring included — so dropping the `after` half again fails these examples;
+  # re-implementing the join here would have specced the spec. Only the parser is local, shaped
+  # like bare `gori settings`'s, since the guards themselves end in `abort` (not catchable).
+  # `edit` comes back too so that case can pin the ENTIRE original failure: nothing left over
+  # AND the flag never fired — i.e. "printed the path and exited 0".
+  def self.settings_argv_for_spec(args : Array(String)) : {Array(String), Bool}
+    edit = false
+    parser = OptionParser.new do |p|
+      p.on("--edit", "Open the settings file in your editor") { edit = true }
+      p.on("-h", "--help", "Show this help") { }
+    end
+    {stray_args(parser, args), edit}
+  end
+
+  # Same call, `import`'s parser — where the leftovers are FILENAMES rather than an error.
+  def self.import_files_for_spec(args : Array(String)) : Array(String)
+    parser = OptionParser.new do |p|
+      p.on("--sections=LIST", "Sections to apply") { }
+      p.on("--dry-run", "Print what would be applied") { }
+      p.on("-h", "--help", "Show this help") { }
+    end
+    stray_args(parser, args)
+  end
+
+  def self.same_file_for_spec(a : String, b : String) : Bool
+    same_file?(a, b)
   end
 end
 
@@ -150,6 +180,97 @@ describe "gori settings — --sections parsing" do
     Gori::CLI.parse_sections_value_for_spec("").should be_empty
     Gori::CLI.parse_sections_value_for_spec(",,,").should be_empty
     Gori::CLI.parse_sections_value_for_spec("  ").should be_empty
+  end
+end
+
+# The `--` separator used to switch every guard above back off. OptionParser strips the run
+# after it and hands it over as a SECOND list, which `gori settings` discarded — so two
+# characters turned each of these back into the silent-no-op-at-exit-0 the guards exist to
+# stop. `gori wizard` / `gori tutorial` already handled it (reject_extra_args); settings did not.
+describe "gori settings — arguments after a `--` separator" do
+  it "sees a flag pushed past `--` as the stray argument it is" do
+    # `gori settings -- --edit` printed the settings path and exited 0, editor never opened.
+    rest, edit = Gori::CLI.settings_argv_for_spec(["--", "--edit"])
+    edit.should be_false # OptionParser will not claim it, which is exactly why it must be refused
+    rest.should eq(["--edit"])
+  end
+
+  it "sees a bare word pushed past `--`" do
+    # `gori settings export -- team.json` (a `--` where `-o` was meant) dumped the profile to
+    # stdout, created no file, and exited 0 — verbatim the failure reject_stray_args! was
+    # written for, reached around it.
+    Gori::CLI.settings_argv_for_spec(["--", "team.json"]).should eq({["team.json"], false})
+    Gori::CLI.settings_argv_for_spec(["--", "foo"]).should eq({["foo"], false})
+  end
+
+  it "leaves an ordinary invocation alone" do
+    # No `--` at all, and a bare `--` with nothing after it, must both stay clean — the guard
+    # aborts on any leftover, so a false positive here breaks a working command.
+    Gori::CLI.settings_argv_for_spec(["--edit"]).should eq({[] of String, true})
+    Gori::CLI.settings_argv_for_spec([] of String).should eq({[] of String, false})
+    Gori::CLI.settings_argv_for_spec(["--"]).should eq({[] of String, false})
+    Gori::CLI.settings_argv_for_spec(["--edit", "--"]).should eq({[] of String, true})
+  end
+end
+
+# `import` joins the same run instead of rejecting it, because there `--` carries its POSIX
+# meaning: everything after it is a FILENAME.
+describe "gori settings import — arguments after a `--` separator" do
+  it "takes a file named past `--`" do
+    # Aborted with "needs a file", so a profile whose name starts with a dash — the one case
+    # `--` exists for — could not be imported at all.
+    Gori::CLI.import_files_for_spec(["--", "p.json"]).should eq(["p.json"])
+    Gori::CLI.import_files_for_spec(["--", "./--odd.json"]).should eq(["./--odd.json"])
+  end
+
+  it "counts a second file hidden past `--`, so the one-file guard fires" do
+    # Imported a.json, discarded b.json, and reported success — defeating the `rest.size > 1`
+    # guard whose whole purpose is catching a glob that matched two files.
+    Gori::CLI.import_files_for_spec(["a.json", "--", "b.json"]).size.should eq(2)
+    Gori::CLI.import_files_for_spec(["--", "a.json", "b.json"]).size.should eq(2)
+  end
+
+  it "still parses its own flags before the separator" do
+    Gori::CLI.import_files_for_spec(["p.json", "--dry-run"]).should eq(["p.json"])
+    Gori::CLI.import_files_for_spec(["--sections=network", "p.json"]).should eq(["p.json"])
+  end
+end
+
+# `-o` pointing at the live settings file is data loss, not an export: the document omits every
+# section at its default and both secret sections, and write_export is a plain truncate — so it
+# DELETES `env` (token values) and `decoder` in place, says "wrote <path>", and exits 0.
+describe "gori settings export — same-file detection for -o" do
+  it "matches the same file through `..`, a relative path and a symlink" do
+    dir = File.tempname("gori-cli-samefile")
+    Dir.mkdir_p(File.join(dir, "home"))
+    settings = File.join(dir, "home", "settings.json")
+    File.write(settings, "{}")
+    begin
+      Gori::CLI.same_file_for_spec(settings, settings).should be_true
+      Gori::CLI.same_file_for_spec(File.join(dir, "home", "..", "home", "settings.json"), settings).should be_true
+      # A symlinked config directory is the same overwrite spelled differently.
+      link = File.join(dir, "link")
+      File.symlink(File.join(dir, "home"), link)
+      Gori::CLI.same_file_for_spec(File.join(link, "settings.json"), settings).should be_true
+    ensure
+      FileUtils.rm_rf(dir)
+    end
+  end
+
+  it "does not match an ordinary export target beside it" do
+    # A false positive would refuse a perfectly good export, so the negative side matters as
+    # much: same directory, and a target that does not exist yet (the ordinary case).
+    dir = File.tempname("gori-cli-samefile-neg")
+    Dir.mkdir_p(dir)
+    settings = File.join(dir, "settings.json")
+    File.write(settings, "{}")
+    begin
+      Gori::CLI.same_file_for_spec(File.join(dir, "team-profile.json"), settings).should be_false
+      Gori::CLI.same_file_for_spec(File.join(dir, "settings.json.bak"), settings).should be_false
+      Gori::CLI.same_file_for_spec(File.join(dir, "nested", "settings.json"), settings).should be_false
+    ensure
+      FileUtils.rm_rf(dir)
+    end
   end
 end
 
