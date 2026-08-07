@@ -29,7 +29,7 @@ module Gori
           p.on("--allow-unscoped", "Minimize even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run repeater minimize: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run repeater minimize: missing value for #{f}" }
         end

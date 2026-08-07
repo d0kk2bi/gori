@@ -71,7 +71,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| leftover = rest }
+          p.unknown_args { |before, after| leftover = before + after }
           p.invalid_option { |f| abort "gori run rewriter extract: unknown option: #{f}\n#{p}" }
         end
         parser.parse(args)
@@ -210,7 +210,7 @@ module Gori
           p.invalid_option { |f| abort "gori run rewriter extract #{verb}: unknown option: #{f}\n#{p}" }
         end
         rest = [] of String
-        parser.unknown_args { |before, _| rest = before }
+        parser.unknown_args { |before, after| rest = before + after }
         parser.parse(args)
         id = rest.first?.try(&.to_i64?) || abort("gori run rewriter extract #{verb}: expected a rule id")
         {id, open_store(resolve_read_project(project_name, db_path))}
@@ -326,7 +326,7 @@ module Gori
           p.on("--scope=SCOPE", "Show only project|global rules (default: both)") { |v| scope = parse_rule_scope(v) }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| leftover = rest }
+          p.unknown_args { |before, after| leftover = before + after }
           p.invalid_option { |f| abort "gori run rewriter: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run rewriter: missing value for #{f}" }
         end
@@ -530,7 +530,7 @@ module Gori
           p.invalid_option { |f| abort "gori run rewriter rm: unknown option: #{f}\n#{p}" }
         end
         positional = [] of String
-        parser.unknown_args { |rest, _| positional = rest }
+        parser.unknown_args { |before, after| positional = before + after }
         parser.parse(args)
         abort "gori run rewriter rm: missing <id>" if positional.empty?
         abort "gori run rewriter rm: too many arguments (expected one <id>)" if positional.size > 1
@@ -582,7 +582,7 @@ module Gori
           p.invalid_option { |f| abort "gori run rewriter #{action}: unknown option: #{f}\n#{p}" }
         end
         positional = [] of String
-        parser.unknown_args { |rest, _| positional = rest }
+        parser.unknown_args { |before, after| positional = before + after }
         parser.parse(args)
         abort "gori run rewriter #{action}: missing <id>" if positional.empty?
         abort "gori run rewriter #{action}: too many arguments (expected one <id>)" if positional.size > 1

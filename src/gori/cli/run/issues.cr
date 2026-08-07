@@ -40,7 +40,7 @@ module Gori
           p.on("--format=FMT", "Output: text (default) | json | markdown") { |v| format = parse_format(v, [:text, :json, :markdown]) }
           p.on("--export=PATH", "Write to PATH instead of STDOUT") { |v| export_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| leftover = rest }
+          p.unknown_args { |before, after| leftover = before + after }
           p.invalid_option { |f| abort "gori run issues: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run issues: missing value for #{f}" }
         end
@@ -141,7 +141,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run issues delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run issues delete: missing value for #{f}" }
         end
@@ -183,7 +183,7 @@ module Gori
         end
 
         positional = [] of String
-        parser.unknown_args { |rest, _| positional = rest }
+        parser.unknown_args { |before, after| positional = before + after }
         parser.parse(args)
 
         abort "gori run issues update: missing <issue-id>" if positional.empty?

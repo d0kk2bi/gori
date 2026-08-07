@@ -491,6 +491,67 @@ describe Gori::Rules do
       end
     end
 
+    # A re-home is two writes in two different stores, and the ordering only covers the FIRST
+    # one failing. When the copy commits and the source then refuses the delete, the rule is in
+    # BOTH scopes — `merged` lists it twice and the proxy applies it twice — while both callers
+    # (`rewriter_scope_toggle`, `apply_rewriter_rule`) read the false and say "the rule is
+    # unchanged" / "it is still global". A rewrite running twice is the kind of thing that
+    # shows up much later as a doubled header, so the copy is undone before returning.
+    #
+    # Driven through a stale global id, which is the real way this happens: another surface
+    # (MCP, a second gori) deleted the rule after this list was built. `delete_rewriter_rule`
+    # answers false without touching anything, exactly as a refused write does.
+    it "undoes the copy when the source refuses the delete, rather than leaving the rule in both scopes" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "A", "B", name: "twin", scope: Gori::Store::RuleScope::Global)
+          rule = rules.rules.first
+
+          # …and it is gone from the library before the move lands.
+          Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+
+          rules.set_scope(rule, Gori::Store::RuleScope::Project).should be_false
+          store.match_rules.should be_empty # the copy was rolled back, not left behind
+          rules.rules.should be_empty
+        end
+      end
+    end
+
+    # `remove` on a global rule sweeps this project's override with it. That sweep is right for
+    # one of the two ways the delete answers false (no such rule) and wrong for the other
+    # (settings.json not writable): there the rule is still in the library, and dropping the
+    # override puts this project back on the library's default — a rule the operator switched
+    # OFF here turns back ON and resumes rewriting live traffic.
+    it "keeps this project's override when a global delete does not commit" do
+      with_globals do
+        with_store do |store|
+          rules = Gori::Rules.load(store)
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "A", "B", scope: Gori::Store::RuleScope::Global)
+          id = rules.rules.first.id
+          rules.toggle(id, Gori::Store::RuleScope::Global).should be_true
+          store.rewriter_overrides[id]?.should be_false # off HERE, on everywhere else
+
+          # Point settings at a path whose parent is a plain file, so `save` fails and
+          # `delete_rewriter_rule` answers false for the OTHER reason.
+          blocker = File.tempname("gori-settings-blocked", "")
+          File.write(blocker, "")
+          before = Gori::Settings.path_override
+          begin
+            Gori::Settings.path_override = File.join(blocker, "settings.json")
+            rules.remove(id, Gori::Store::RuleScope::Global).should be_false
+          ensure
+            Gori::Settings.path_override = before
+            File.delete?(blocker)
+          end
+
+          store.rewriter_overrides[id]?.should be_false # still off here
+        end
+      end
+    end
+
     it "reorders within a scope only" do
       with_globals do
         with_store do |store|

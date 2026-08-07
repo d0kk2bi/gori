@@ -114,7 +114,7 @@ module Gori
           p.on("--include-sensitive", "Show Authorization/Cookie/etc header values instead of [REDACTED]") { include_sensitive = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| leftover = rest }
+          p.unknown_args { |before, after| leftover = before + after }
           p.invalid_option { |f| abort "gori run intercept: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run intercept: missing value for #{f}" }
         end
@@ -247,7 +247,7 @@ module Gori
           p.on("--include-sensitive", "Also include the full raw message base64 (unredacted)") { include_sensitive = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run intercept get: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run intercept get: missing value for #{f}" }
         end
@@ -357,7 +357,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run intercept #{verb}: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run intercept #{verb}: missing value for #{f}" }
         end
@@ -395,7 +395,7 @@ module Gori
           p.on("--no-update-content-length", "Forward the Content-Length you declared instead of resyncing it to the body (the CL-desync / CL+TE smuggling primitive; mirrors MCP intercept_forward_edit{update_content_length:false})") { update_cl = false }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run intercept edit: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run intercept edit: missing value for #{f}" }
         end
@@ -551,7 +551,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run intercept filter: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run intercept filter: missing value for #{f}" }
         end
@@ -575,7 +575,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run intercept direction: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run intercept direction: missing value for #{f}" }
         end

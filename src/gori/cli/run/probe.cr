@@ -72,7 +72,7 @@ module Gori
           p.on("-k", "--insecure-upstream", "With --active, do not verify upstream TLS certificates") { insecure = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe: missing value for #{f}" }
         end
@@ -232,7 +232,7 @@ module Gori
           p.on("--code=CODE", "Bulk-dismiss every open finding with this check code") { |v| code = v }
           p.on("--host=HOST", "Bulk-dismiss every open finding on this host") { |v| host = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe dismiss: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe dismiss: missing value for #{f}" }
         end
@@ -277,7 +277,7 @@ module Gori
           p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe promote: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe promote: missing value for #{f}" }
         end
@@ -323,7 +323,7 @@ module Gori
           p.on("--all", "Delete EVERY probe finding AND every suppression in the project") { all = true }
           p.on("--yes", "Required with --all (there is no interactive prompt here)") { yes = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe delete: missing value for #{f}" }
         end
@@ -389,7 +389,7 @@ module Gori
           p.on("--kind=KIND", "Only list rules of this kind (passive|active|custom)") { |v| kind = parse_rule_kind(v) }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| leftover = rest }
+          p.unknown_args { |before, after| leftover = before + after }
           p.invalid_option { |f| abort "gori run probe rules: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe rules: missing value for #{f}" }
         end
@@ -427,7 +427,7 @@ module Gori
           p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe rules #{verb}: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe rules #{verb}: missing value for #{f}" }
         end
@@ -523,7 +523,7 @@ module Gori
           p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe rules delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe rules delete: missing value for #{f}" }
         end
@@ -562,7 +562,7 @@ module Gori
           p.on("--project=NAME", "Project to read/write (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run probe mode: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run probe mode: missing value for #{f}" }
         end

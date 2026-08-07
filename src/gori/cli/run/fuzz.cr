@@ -102,7 +102,7 @@ module Gori
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--fail-if-no-matches", "Exit 3 when no result matched") { fail_if_no_matches = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run fuzz: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run fuzz: missing value for #{f}" }
         end

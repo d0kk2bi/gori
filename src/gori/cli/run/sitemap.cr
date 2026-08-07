@@ -118,7 +118,7 @@ module Gori
           p.on("--no-group", "Don't fold path-param ids (/users/<uuid>, /users/1,2,3…)") { group = false }
           p.on("--format=FMT", "Output: text (default tree) | json | paths") { |v| format = parse_format(v, [:text, :json, :paths]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run sitemap: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run sitemap: missing value for #{f}" }
         end
