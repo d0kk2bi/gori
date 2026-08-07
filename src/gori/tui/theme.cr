@@ -1035,6 +1035,60 @@ module Gori::Tui
       focus_gold
     end
 
+    # ── Colormarker row marks ────────────────────────────────────────────────────
+    # The six colours a History row-colour rule can name, resolved through the ACTIVE palette
+    # so a rule reads the same on GORIDARK and GORIDAY (and on any custom theme, which inherits
+    # a base). Same six hues `marker_hue` above already vets as "maximally separated and present
+    # in every palette" — `blue` and `purple` borrow the two syntax hues, which is where the
+    # palette keeps them.
+    #
+    # Takes a plain Symbol so Theme stays decoupled from Store, exactly as `status_color` takes
+    # a plain Int. `Store::MarkerColor#to_sym` is the other half of the handshake.
+    def self.mark_color(name : Symbol) : Color
+      case name
+      when :red    then red
+      when :orange then orange
+      when :yellow then yellow
+      when :green  then green
+      when :blue   then syn_header
+      when :purple then syn_literal
+      else              muted
+      end
+    end
+
+    ROW_TINT      = 0.22 # same ratio, and the same reason, as MARKER_TINT above
+    ROW_TINT_LUMA = 0.10 # hard cap on how far the band's perceived brightness may move
+
+    # A History row's Colormarker band: the rule's hue MIXED INTO whatever band the row would
+    # already have (canvas, the marked dim band, or the focused accent band), never replacing
+    # it. The band is a lightness step and the rule is a hue, so the two compose — a selected
+    # coloured row keeps the accent band's brightness AND gains the hue. Replacing it would
+    # make "this is the cursor row" invisible on every coloured row, and a display feature may
+    # never make the cursor harder to find.
+    #
+    # NOT `paper`/`soot`. Those exist for SHADING, which is a direction — a shadow drawn with
+    # `blend(x, bg, t)` darkens on a dark palette and lightens on a light one, so it inverts on
+    # half the built-ins. A tint is not a direction: it interpolates between two endpoints that
+    # are BOTH already tuned for the pole in question (the hue comes from the active palette,
+    # the base from the active theme's own bands). `marker_bg` is this construction at this
+    # ratio and ships on all 28 built-ins today.
+    #
+    # The luma clamp is what makes the contrast guarantee provable rather than eyeballed.
+    # Rec. 601 luma is a LINEAR combination of r,g,b and `blend` is a per-channel lerp, so
+    #   luma(blend(h, b, t)) == luma(b) + t * (luma(h) - luma(b))
+    # holds exactly. Scaling t down until that delta is within ROW_TINT_LUMA is therefore an
+    # identity, for every hue, every band and both polarities. That matters because the row's
+    # foregrounds are NOT re-picked: `muted` (TIME/TYPE/SIZE/DUR), `method_color` (METHOD) and
+    # `FlowStatus.cell` (STA) each carry a meaning the renderer cannot re-choose for contrast
+    # without destroying it. So the guarantee runs the other way — bound how far the band moves
+    # and the existing semantic foregrounds stay valid on it.
+    def self.row_tint(hue : Color, base : Color) : Color
+      t = ROW_TINT
+      d = (luma(hue) - luma(base)).abs
+      t = ROW_TINT_LUMA / d if d * t > ROW_TINT_LUMA
+      blend(hue, base, t)
+    end
+
     # Linear RGB blend of `hue` toward `base` by ratio t (0 = base, 1 = hue).
     # Public: marker tints here plus the picker's banner entrance (colour fades
     # and the glint sweep) derive their in-between shades from the live palette.

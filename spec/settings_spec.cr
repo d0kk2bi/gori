@@ -1092,6 +1092,99 @@ describe Gori::Settings do
     end
   end
 
+  # Colormarker's GLOBAL rules (settings.json `colormarker.rules`) — the half of the row-colour
+  # list every project reads, and the half `Colormarker.merged` folds in FIRST (so a standing
+  # policy wins over a project-local rule under first-match-wins).
+  it "round-trips the Colormarker global rules" do
+    dir = File.tempname("gori-settings-colormarker")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+      Gori::Settings.colormarker_next_rule_id = 1_i64
+
+      # An untouched install writes no "colormarker" section at all.
+      Gori::Settings.save.should be_true
+      File.read(Gori::Settings.path).should_not contain("colormarker")
+
+      id = Gori::Settings.add_colormarker_rule("status:>=500", "red", "full", "prod 5xx")
+      # Ids count from 1 so that 0 stays free to mean "the write did not commit".
+      id.should eq(1_i64)
+
+      Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.size.should eq(1)
+      r = Gori::Settings.colormarker_rules.first
+      r.name.should eq("prod 5xx")
+      r.match_filter.should eq("status:>=500")
+      r.color.should eq("red")
+      r.style.should eq("full")
+      r.enabled.should be_true
+      r.to_rule.scope.global?.should be_true
+      r.to_rule.color.red?.should be_true
+      r.to_rule.style.full?.should be_true
+
+      # The default is the rule's own; a project's disagreement lives in the project DB.
+      Gori::Settings.set_colormarker_rule_enabled(id, false).should be_true
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.first.enabled.should be_false
+
+      # Ids are monotonic and never reused: a project that overrode #2 must not find its
+      # override silently reattached to a rule created after #2 was deleted.
+      second = Gori::Settings.add_colormarker_rule("host:cdn", "blue", "strip")
+      second.should eq(2_i64)
+      Gori::Settings.delete_colormarker_rule(second).should be_true
+      Gori::Settings.add_colormarker_rule("method:DELETE", "orange", "full").should eq(3_i64)
+      Gori::Settings.load
+      Gori::Settings.colormarker_next_rule_id.should eq(4_i64)
+
+      # Precedence is the array order, and move swaps within it.
+      Gori::Settings.move_colormarker_rule(3_i64, -1).should be_true
+      Gori::Settings.colormarker_rules.map(&.id).should eq([3_i64, 1_i64])
+      Gori::Settings.move_colormarker_rule(3_i64, -1).should be_false # already first
+
+      # a file with no "colormarker" key keeps the current in-memory value
+      File.write(Gori::Settings.path, %({"theme":"goridark"}))
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.size.should eq(2)
+
+      # Malformed rules tolerated: an unknown colour/style label is CLAMPED rather than raised,
+      # and a duplicated id is renumbered so every by-id mutation stays unambiguous.
+      #
+      # The two entries below pin the DELIBERATE departures from parse_rewriter_rules:
+      #   * a missing `enabled` reads as TRUE here (a colour rule touches no traffic, so the
+      #     failure mode to avoid is a hand-written rule that silently never appears);
+      #   * an entry with an EMPTY condition is KEPT, because InterceptFilter::EMPTY matches
+      #     everything — it is a legal "paint every row" rule, and dropping it would delete a
+      #     rule its author can see in their own file. Creation still refuses to make one.
+      File.write(Gori::Settings.path, %({"colormarker":{"rules":[\
+{"id":7,"enabled":true,"name":"ok","when":"host:a.test","color":"chartreuse","style":"sideways"},\
+{"id":7,"name":"dup","when":"status:404"},\
+{"id":9,"name":"paints everything","when":""}]}}))
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.size.should eq(3)
+      kept = Gori::Settings.colormarker_rules.first
+      kept.name.should eq("ok")
+      kept.color.should eq("yellow")
+      kept.style.should eq("full")
+      kept.to_rule.color.yellow?.should be_true # the clamped labels really rebuild a rule
+      dup = Gori::Settings.colormarker_rules[1]
+      dup.id.should_not eq(7_i64)
+      dup.enabled.should be_true # no "enabled" key => ON, unlike a rewriter rule
+      Gori::Settings.colormarker_rules[2].match_filter.should be_empty
+      Gori::Settings.colormarker_next_rule_id.should be >= 9_i64
+
+      Gori::Settings.delete_colormarker_rule(7_i64).should be_true
+      Gori::Settings.colormarker_rules.size.should eq(2)
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+      Gori::Settings.colormarker_next_rule_id = 1_i64
+    end
+  end
+
   # The pre-upgrade preset library. A preset was INERT — it did nothing until loaded into a
   # project — so it must not come back as a live rule in every project.
   it "adopts legacy rewriter presets as DISABLED global rules" do

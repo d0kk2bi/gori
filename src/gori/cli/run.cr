@@ -57,6 +57,7 @@ require "./run/jwt"
 require "./run/cookie"
 require "./run/decoder"
 require "./run/rewriter"
+require "./run/colormarker"
 require "./run/project"
 
 module Gori
@@ -116,6 +117,7 @@ module Gori
         when "cookie"   then cmd_cookie(rest)
         when "decoder"  then cmd_decoder(rest)
         when "rewriter" then cmd_rewriter(rest)
+        when "colormarker" then cmd_colormarker(rest)
         when "project"  then cmd_project(rest)
         else                 dispatch_subcommand3(sub, rest)
         end
@@ -171,6 +173,7 @@ module Gori
         {"cookie [<cookie>]", "Decode, verify, brute-force, or forge a Flask/Rack/Django session cookie"},
         {"decoder <chain>", "Encode/decode/hash via the Decoder engine (base64, hex, url, gzip …)"},
         {"rewriter", "Manage Match & Replace rules (list, add, rm, enable/disable, preview, extract, bindings)"},
+        {"colormarker", "Manage History row-colour rules (list, add, rm, enable/disable, move, preview)"},
         {"project [list]", "List known projects"},
         {"project create", "Create (or reopen) a project by name"},
         {"project delete", "Delete a project and everything captured in it"},

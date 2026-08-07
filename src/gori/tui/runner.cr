@@ -28,6 +28,7 @@ require "./controllers/comparer_controller"
 require "./controllers/decoder_controller"
 require "./controllers/jwt_controller"
 require "./controllers/rewriter_controller"
+require "./controllers/colormarker_controller"
 require "./controllers/statusline_controller"
 require "./history_view"
 require "./repeater_view"
@@ -38,6 +39,7 @@ require "./notes_view"
 require "./project_view"
 require "./intercept_view"
 require "./rewriter_rule_overlay"
+require "./colormarker_rule_overlay"
 require "./extract_rule_overlay"
 require "./rewriter_stub_overlay"
 require "./confirm_dialog"
@@ -106,6 +108,7 @@ require "./runner/probe"
 require "./runner/project"
 require "./runner/repeater"
 require "./runner/rewriter"
+require "./runner/colormarker"
 require "./runner/scope"
 require "./runner/sequencer"
 require "./runner/sitemap"
@@ -281,6 +284,7 @@ module Gori::Tui
         DecoderController.new(self),
         JwtController.new(self),
         RewriterController.new(self),
+        ColormarkerController.new(self),
       ].each { |c| @tabs[c.tab] = c }
     end
 
@@ -365,6 +369,10 @@ module Gori::Tui
 
     private def rewriter_controller : RewriterController
       @tabs[:rewriter].as(RewriterController)
+    end
+
+    private def colormarker_controller : ColormarkerController
+      @tabs[:colormarker].as(ColormarkerController)
     end
 
     def run : Symbol
@@ -935,6 +943,13 @@ module Gori::Tui
       # own inline add/edit row is a separate buffer and is untouched by this (only the
       # underlying list changes), so there is nothing to clobber — same as Scope above.
       @session.host_overrides.reload
+      # Colour rules are read by ANOTHER tab's render path (History's row loop), so this one
+      # cannot ride the active-tab rule below: gating it on `@active_tab == :colormarker`
+      # would leave History painting stale colours for the rest of the session after an
+      # external `gori run colormarker` / MCP `create_color_rule` against this db. Cheap
+      # regardless — `Colormarker#refresh` bails out on an unchanged rule set, so the common
+      # tick recompiles nothing and does not bump the revision History memoises against.
+      @session.colormarker.reload
       # Reload a store-backed view only when it's the ACTIVE tab (others reload on
       # tab entry via on_enter_tab) — avoids re-querying History's page ~1.3×/sec
       # while the user is elsewhere. Own-session captures also arrive via flow_events.
@@ -5092,6 +5107,36 @@ module Gori::Tui
       ov.on_commit = -> { rewriter_controller.apply_rewriter_rule(ov) }
       ov.on_edit_stub = -> { open_rewriter_stub_editor(ov) }
       open_overlay(ov)
+    end
+
+    # Host: open the Colormarker (row-colour) rule popup (nil rule = add; else edit).
+    # Two couplings injected for the same reason the Rewriter's one is: the form stays
+    # store-free. `on_preview` scans recent flows for the match count, and `on_hosts` supplies
+    # the `host:` completion pool (a DISTINCT query the form must not run itself).
+    def open_colormarker_rule_editor(rule : Store::ColorRule?) : Nil
+      ov = rule ? ColormarkerRuleOverlay.editing(rule) : ColormarkerRuleOverlay.adding
+      ov.on_preview = ->colormarker_preview_text(Store::ColorRule)
+      ov.on_hosts = ->(prefix : String) { @session.store.distinct_hosts(prefix: prefix, limit: 16) }
+      ov.on_commit = -> { colormarker_controller.apply_color_rule(ov) }
+      open_overlay(ov)
+    end
+
+    # The "matches N of M recent flows" line under the Colormarker form. Says both what the
+    # condition SELECTS and what it would actually PAINT — the two differ whenever an earlier
+    # enabled rule already claims a row, and only the second number answers "will I see this".
+    # Bounded so a keystroke stays responsive; nothing is written.
+    private def colormarker_preview_text(candidate : Store::ColorRule) : String
+      engine = @session.colormarker
+      # Only the rules AHEAD of this one can claim a row from it. For a new rule that is every
+      # enabled rule; for an edit it is the ones above it in precedence order.
+      rules = engine.rules
+      idx = rules.index { |r| r.id == candidate.id && r.scope == candidate.scope }
+      ahead = idx ? rules[0, idx] : rules
+      pv = Colormarker.preview(@session.store, candidate.match_filter, ahead, 200)
+      more = pv.total > pv.scanned ? " (of #{pv.total})" : ""
+      claimed = pv.matched - pv.painted
+      note = claimed > 0 ? " · #{claimed} claimed by an earlier rule" : ""
+      "matches #{pv.matched} of #{pv.scanned} recent flows#{more}#{note}"
     end
 
     # Host: open the extract-rule popup on the Rewriter tab's `extract` sub-tab (#501).

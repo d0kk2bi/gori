@@ -38,6 +38,8 @@ module Gori::Tui
     abstract def open_custom_rule_editor(rule : Probe::CustomRule?) : Nil
     # Open the Rewriter (Match & Replace) rule popup (nil = add; else edit the given rule).
     abstract def open_rewriter_rule_editor(rule : Store::MatchRule?) : Nil
+    # Open the Colormarker (History row-colour) rule popup (nil = add; else edit).
+    abstract def open_colormarker_rule_editor(rule : Store::ColorRule?) : Nil
     abstract def open_extract_rule_editor(rule : Store::ExtractRule?) : Nil
     # The Decoder's named-chain library (global settings.json): the "save under a name"
     # prompt and the picker over what is already saved. Here rather than driven from the

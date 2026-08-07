@@ -642,6 +642,7 @@ Omitted until you apply or star a wordlist.
 | `hotkeys` | Keybinding overrides (`os` layer + `command_modifier` + `bindings`). See the [Hotkeys guide](/guide/hotkeys/) |
 | `decoder` | Named Decoder chain specs, shared by every project and callable as a chain step by name (open sub-tabs live in the project database) |
 | `rewriter` | GLOBAL Match & Replace rules — applied in every project, each with a default on/off state a project can override. See [Global and project rules](/guide/proxy/#global-and-project-rules) |
+| `colormarker` | GLOBAL History row-colour rules — the same global/project split as `rewriter`. Display only: a colour rule never modifies traffic. See [run colormarker](/reference/cli/#run-colormarker) |
 | `mine` | Saved Param Miner defaults. See [mine](#mine) above |
 | `layout` | History / Probe / Issues previews + Sitemap expand depth. See [layout](#layout) above |
 | `statusline` | Bottom status row that runs a command on an interval. See [statusline](#statusline) above |

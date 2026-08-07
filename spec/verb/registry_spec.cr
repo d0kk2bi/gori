@@ -1145,6 +1145,50 @@ private class FakeContext < ExecContext
     false
   end
 
+  def colormarker_add : Nil
+    @calls << :colormarker_add
+  end
+
+  def colormarker_edit : Nil
+    @calls << :colormarker_edit
+  end
+
+  def colormarker_toggle : Nil
+    @calls << :colormarker_toggle
+  end
+
+  def colormarker_delete : Nil
+    @calls << :colormarker_delete
+  end
+
+  def colormarker_move(dir : Int32) : Nil
+    @calls << :colormarker_move
+  end
+
+  def colormarker_duplicate : Nil
+    @calls << :colormarker_duplicate
+  end
+
+  def colormarker_reload : Nil
+    @calls << :colormarker_reload
+  end
+
+  def colormarker_rule_selected? : Bool
+    true
+  end
+
+  def colormarker_global_rule_selected? : Bool
+    true
+  end
+
+  def colormarker_scope_toggle : Nil
+    @calls << :colormarker_scope_toggle
+  end
+
+  def colormarker_toggle_default : Nil
+    @calls << :colormarker_toggle_default
+  end
+
   def comparer_diff_shown? : Bool
     false
   end

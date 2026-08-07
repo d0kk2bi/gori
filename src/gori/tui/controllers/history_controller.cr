@@ -18,6 +18,7 @@ module Gori::Tui
       super(host)
       @history = HistoryView.new
       @history.set_scope(@host.session.scope)
+      @history.set_colormarker(@host.session.colormarker)
       @query_reload_at = nil.as(Time::Instant?)
     end
 

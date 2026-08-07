@@ -90,9 +90,11 @@ describe "Chrome.visible_tabs" do
 end
 
 describe "Chrome.hidden_tabs" do
-  it "returns the tabs hidden from the bar (Miner + Sequencer + JWT by default) on empty prefs" do
+  it "returns the tabs hidden from the bar (Miner + Sequencer + JWT + Colormarker by default) on empty prefs" do
     hid = Chrome.hidden_tabs([] of {String, Bool}).map(&.first)
-    hid.should eq([:miner, :sequencer, :jwt]) # the default-hidden tabs, in catalog order
+    # Colormarker joins them: it is a niche display lens, and a fresh install should not
+    # spend a tab slot on a list that is empty until someone writes a colour rule.
+    hid.should eq([:miner, :sequencer, :jwt, :colormarker]) # the default-hidden tabs, in catalog order
   end
 
   it "excludes the active tab even when its stored visibility is false (it's force-shown)" do

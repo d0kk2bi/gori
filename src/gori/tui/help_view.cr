@@ -161,6 +161,15 @@ module Gori::Tui
         Item.new("[ / ]", "switch sub-tab: rules · extract · bindings"),
         Item.new("↓ past the list", "the editable preview sample, and the same message after the rules run"),
       ]},
+      {"COLORMARKER", [
+        Item.new("a · ↵/e", "add a History row-colour rule · edit the selected one"),
+        Item.new("x · d", "enable/disable in this project · delete the selected rule"),
+        Item.new("s · ⇧X", "move the rule global ⇄ project · flip a global rule's default everywhere"),
+        Item.new("⇧J / ⇧K", "reorder — the FIRST enabled match paints the row, the rest are skipped"),
+        Item.new("style", "full = tint the whole row · strip = one colour cell ahead of TIME"),
+        Item.new("when:", "host: path: method: scheme: status: proto: — ↹ completes · no header:/size:/dur:"),
+        Item.new("hidden by default", "settings:tabs shows it, next to Rewriter"),
+      ]},
       {"OVERLAYS", [
         Item.new("palette / settings", "↑/↓ · ↵ · esc"),
         Item.new("confirm", "←/→ choose · y / n · ↵"),

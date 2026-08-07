@@ -72,6 +72,7 @@ gori run <subcommand> [options]
 | `issues` · `create` · `update` | 이슈 목록 / 내보내기, 또는 이슈 작성 |
 | `links` · `add` · `delete` | 이슈나 노트에서 플로우, Repeater 세션, 잡으로 이어지는 증거 포인터 |
 | `rewriter` · `add` · `rm` · `enable` · `disable` · `preview` | Match & Replace 규칙 관리 |
+| `colormarker` · `add` · `rm` · `enable` · `disable` · `move` · `preview` | History 행 색상 규칙 관리 |
 | `project [list]` | 알려진 프로젝트 목록 |
 | `project create <name>` | 이름으로 프로젝트 생성 (같은 이름이면 다시 열기) |
 | `project delete <name>` | 프로젝트와 그 안에 캡처된 모든 것 삭제 (`--yes`로 확인) |
@@ -478,6 +479,46 @@ gori run rewriter rm 3
 `preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id와 함께 `--scope`도 받습니다. 두 저장소가 규칙 번호를 각자 매기므로 id 하나가 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 범위를 `G`/`P` 접두어로 출력하고(`G*` 는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻), 프록시가 적용하는 순서 그대로 전역 규칙을 먼저 보여 줍니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#reusing-a-rule-across-projects)을 참고하세요.
 
 본문 규칙은 필요에 따라 `Content-Length`를 다시 맞추고 청크를 해제하며, 활성화된 규칙은 매칭되는 호스트에서 HTTP/1.1을 강제합니다. 대화형 편집기는 [Proxy & History](/guide/proxy/)를 참고하세요.
+
+### run colormarker {#run-colormarker}
+
+**Colormarker** 규칙을 관리합니다. 캡처된 History의 어떤 행을 어떤 방식으로 칠할지 정하는 규칙이며, 표시 전용입니다. 트래픽을 전혀 수정하지 않으므로 Match & Replace 규칙과 달리 잘못 써도 목록이 오해를 부를 뿐, 메시지가 바뀌지는 않습니다.
+
+```bash
+gori run colormarker                                        # 우선순위 순으로 규칙 목록
+gori run colormarker add --when 'status:>=500' --color red --style full --name 'prod 5xx'
+gori run colormarker add --when 'host:cdn' --color blue --style strip --scope global
+gori run colormarker move 2 --up                            # 우선순위 올리기
+gori run colormarker preview --when 'method:DELETE'
+gori run colormarker disable 1 --scope global               # 이 프로젝트에서만 끄기
+gori run colormarker disable 1 --scope global --everywhere  # 모든 프로젝트의 기본값을 끄기
+gori run colormarker rm 3
+```
+
+| 옵션 | 설명 |
+|--------|-------------|
+| `-w`, `--when=FILTER` | 필수. flow가 만족해야 할 조건 (아래 참고) |
+| `--color=NAME` | `red`, `orange`, `yellow`(기본), `green`, `blue`, `purple`. 활성 테마 팔레트로 해석되므로 밝은 테마와 어두운 테마 양쪽에서 제대로 읽힙니다 |
+| `--style=STYLE` | `full`(기본)은 행 전체 배경을 칠하고, `strip`은 `TIME` 앞 좁은 컬럼에 색 셀 하나를 칠합니다 |
+| `--name=NAME` | 규칙 목록에 표시할 라벨 |
+| `--disabled` | 비활성 상태로 생성 |
+| `--scope=SCOPE` | `project`(기본) 또는 `global`. 전역 규칙은 `settings.json`에 저장되어 모든 프로젝트에 적용됩니다 |
+| `--everywhere` | 전역 규칙의 `enable`/`disable` 시: 이 프로젝트의 오버라이드가 아니라 규칙 자체의 기본값을 변경 |
+| `--up` / `--down` | `move` 시: 우선순위를 올리거나 내림 |
+
+**우선순위가 곧 규칙 집합의 의미입니다.** Match & Replace 규칙은 *합성*되어 활성화된 모든 규칙이 순서대로 실행되지만, 색상 규칙은 *해석*됩니다. **첫 번째로 매칭되는 활성 규칙이 행을 칠하고 나머지는 조회조차 되지 않습니다.** `move`가 `rewriter`에는 없고 여기에만 있는 이유입니다. 전역 규칙이 프로젝트 규칙보다 먼저 해석되므로, 상시 정책이 로컬 레이어보다 우선합니다.
+
+`--when`은 조건부 인터셉트 바가 쓰는 것과 같은 불리언 문법입니다. `host:` `path:` `method:` `scheme:` `status:` `proto:`에 `AND` / `OR` / `NOT`, `-부정`, `(그룹)`을 더한 형태이며 캡처된 flow 행에 대해 평가됩니다. 그냥 두면 조용히 실패할 세 가지가 있어, gori는 거부하거나 경고합니다.
+
+- **`body:`는 여기서 절대 매칭되지 않습니다.** History 행에는 payload가 없습니다. (거부가 아니라 경고 — 문법상 적법한 항이기 때문입니다.)
+- **`host:`는 DNS 레이블 글롭이 아니라 부분문자열입니다.** `host:alpha.test`는 `xalpha.test`도 매칭합니다. (경고)
+- **`header:` / `size:` / `dur:` / `url:` / `stub:`는 없습니다.** 이들은 쿼리가 필요한 History QL 필드이고, 여기는 렌더 경로에서 평가됩니다. 모르는 필드는 **거부**됩니다. 그냥 두면 조용히 자유 텍스트 검색이 되어 규칙이 영원히 발동하지 않습니다.
+
+모든 flow에 매칭되는 조건(빈 값이나 입력 중인 `host:`)도 거부됩니다.
+
+`preview`는 조건이 최근 flow 중 몇 개에 **매칭**되는지와, 실제로 몇 개를 **칠하게** 되는지를 함께 보고합니다. 앞선 활성 규칙이 이미 그 행을 차지했다면 두 숫자가 달라집니다. `rm`(`delete`), `enable`, `disable`, `move`는 목록의 규칙 id와 `--scope`를 받습니다. 두 저장소가 서로 독립적으로 번호를 매기므로 id만으로는 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 스코프를 `G`/`P` 접두사로 출력합니다(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻).
+
+탭은 **기본적으로 숨겨져 있습니다.** `settings:tabs`에서 Rewriter 옆에 표시할 수 있습니다. 대화형 편집기는 [프록시 & History](/ko/guide/proxy/)를 참고하세요.
 
 ### run project {#run-project}
 

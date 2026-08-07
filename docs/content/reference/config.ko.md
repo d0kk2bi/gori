@@ -627,6 +627,7 @@ Fuzzer의 Payload 오버레이가 기억하는 워드리스트 경로입니다. 
 | `hotkeys` | 키바인딩 오버라이드 (`os` 계층 + `command_modifier` + `bindings`). [단축키 가이드](/ko/guide/hotkeys/) 참고 |
 | `decoder` | 이름 붙인 Decoder 체인. 모든 프로젝트가 공유하며 체인 단계에서 이름으로 부를 수 있습니다(열려 있는 서브탭은 프로젝트 DB에 있습니다) |
 | `rewriter` | 전역 Match & Replace 규칙. 모든 프로젝트에 적용되며 각 규칙의 기본 켜짐/꺼짐 상태는 프로젝트가 오버라이드할 수 있습니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#reusing-a-rule-across-projects) 참고 |
+| `colormarker` | 전역 History 행 색상 규칙. `rewriter`와 동일한 전역/프로젝트 분리 구조입니다. 표시 전용이며 트래픽을 수정하지 않습니다. [run colormarker](/ko/reference/cli/#run-colormarker) 참고 |
 | `mine` | Param Miner의 저장된 기본값. 위 [mine](#mine) 참고 |
 | `layout` | History / Probe / Issues 미리보기 + Sitemap 펼침 깊이. 위의 [layout](#layout) 참고 |
 | `statusline` | 일정 간격으로 명령을 실행하는 하단 상태 행. 위의 [statusline](#statusline) 참고 |

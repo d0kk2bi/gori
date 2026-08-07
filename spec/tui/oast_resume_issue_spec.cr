@@ -86,6 +86,9 @@ private class FakeHost
   def open_rewriter_rule_editor(rule : Gori::Store::MatchRule?) : Nil
   end
 
+  def open_colormarker_rule_editor(rule : Gori::Store::ColorRule?) : Nil
+  end
+
   def open_extract_rule_editor(rule : Gori::Store::ExtractRule?) : Nil
   end
 
