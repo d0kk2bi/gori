@@ -2149,12 +2149,12 @@ module Gori::Tui
       pretty_x = Frame.toggle_badge(screen, run_x, rect.y, min_x, "^U", "PRETTY", false)
       # The mode chip states the pane's REAL mode, not `focused && …`: `template_chrome_hit` and
       # `apply_chrome_click` both read `template_insert?` alone, so gating the LABEL on focus made
-      # an unfocused pane that had retained INS draw " ↵:NOR " (7 cols) over a 5-col " INS " hit
-      # rect — two dead cells on the left of the chip — and a click on a chip reading "↵:NOR" then
+      # an unfocused pane that had retained INS draw " ↵:READ " (8 cols) over a 5-col " INS " hit
+      # rect — dead cells on the left of the chip — and a click on a chip reading "↵:READ" then
       # EXITED insert mode. Focus is still carried, by the border colour below.
       mode_x = Frame.mode_badge(screen, pretty_x, rect.y, min_x, template_insert? || @chain_focused)
       # …and `§N` chains off the mode chip's left edge. It used to be drawn at `pretty_x - 4`,
-      # which is INSIDE the 7-cell mode badge — so it overwrote "NOR " and the border read
+      # which is INSIDE the mode badge — so it overwrote the label's tail and the border read
       # "↵: §2", destroying the mode chip and leaving the marker count ambiguous. Every other
       # badge on every other pane chains off its neighbour's returned left x; this one did not.
       badge_x = mode_x - badge.size

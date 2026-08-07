@@ -105,10 +105,10 @@ describe "RepeaterView gRPC framing failure" do
 
   # The GRPC REQUEST head is a mode-switched text editor (`i`/esc, READ selection, and — since
   # the READ over-paint reached this branch — a visible NORMAL block caret), so it carries the
-  # NOR/INS chip like every other non-hex request card. Draw and hit-test share
+  # READ/INS chip like every other non-hex request card. Draw and hit-test share
   # `Frame.right_badge_edge` over one badge list; this pins them together, because a chip that
   # is drawn but not hit-testable (or the reverse) is the exact defect `␣K:KEY` had.
-  it "draws a clickable NOR/INS mode chip on the request head" do
+  it "draws a clickable READ/INS mode chip on the request head" do
     grpc_tmp_store do |store|
       view = def_view.call(store)
       view.focus_pane(:request)
@@ -119,8 +119,8 @@ describe "RepeaterView gRPC framing failure" do
       # The request card's top border: below the 3-row TARGET band.
       border_y = rect.y + 3
       row = b.row(border_y)
-      row.should contain("↵:NOR")
-      col = row.index("↵:NOR").not_nil!
+      row.should contain("↵:READ")
+      col = row.index("↵:READ").not_nil!
       view.chrome_hit(rect, col + 1, border_y).should eq(:mode)
 
       # And it reports the mode it is in, rather than a fixed label.
@@ -143,7 +143,7 @@ describe "RepeaterView gRPC framing failure" do
       view.toggle_request_hex.should be_true
       b = MemoryBackend.new(160, 24)
       view.render(Screen.new(b), rect)
-      b.row(border_y).should_not contain("↵:NOR")
+      b.row(border_y).should_not contain("↵:READ")
       (0...160).each { |x| view.chrome_hit(rect, x, border_y).should_not eq(:mode) }
     end
   end

@@ -261,14 +261,17 @@ describe "Frame.left_chip_hit / right_badge_hit" do
     Frame.right_badge_hit(28, y, y, right, 20, badges).should eq(:mark)
   end
 
-  it "hits the NOR/INS mode badge and chains left of right-aligned badges" do
+  it "hits the READ/INS mode badge and chains left of right-aligned badges" do
     y = 2
     right = 40
-    # NOR label is " ↵:NOR " (7 cells) → [right-7, right).
+    # The chip spans [right - label.size, right). Measured from the label rather than a
+    # hardcoded width: the two labels are DIFFERENT widths on purpose, and this hit-test
+    # exists because a caller once drew one over the other's rect.
+    nw = Frame.mode_badge_label(false).size
     Frame.mode_badge_hit(right - 2, y, y, right, 0, false).should be_true
-    Frame.mode_badge_hit(right - 7, y, y, right, 0, false).should be_true # inclusive start
-    Frame.mode_badge_hit(right, y, y, right, 0, false).should be_false    # exclusive end
-    Frame.mode_badge_hit(right - 8, y, y, right, 0, false).should be_false
+    Frame.mode_badge_hit(right - nw, y, y, right, 0, false).should be_true # inclusive start
+    Frame.mode_badge_hit(right, y, y, right, 0, false).should be_false     # exclusive end
+    Frame.mode_badge_hit(right - nw - 1, y, y, right, 0, false).should be_false
     # INS is " INS " (5 cells) → [right-5, right).
     Frame.mode_badge_hit(right - 2, y, y, right, 0, true).should be_true
     Frame.mode_badge_hit(right - 6, y, y, right, 0, true).should be_false
@@ -298,7 +301,7 @@ describe "RepeaterView#chrome_hit" do
     view.chrome_hit(rect, resp.x + 12 + 9, resp.y).should eq(:hex) # past " d:diff " + gap
     view.chrome_hit(rect, resp.x + 12 + 9 + 9, resp.y).should eq(:pretty)
 
-    # REQUEST right-chain: rightmost is SEND, then CL, PRETTY, then NOR/INS
+    # REQUEST right-chain: rightmost is SEND, then CL, PRETTY, then READ/INS
     send_label = " ^R:SEND "
     send_x = (req.right - 1) - send_label.size
     view.chrome_hit(rect, send_x + 1, req.y).should eq(:send)
@@ -308,11 +311,11 @@ describe "RepeaterView#chrome_hit" do
     pretty_label = " ^U:PRETTY "
     pretty_x = cl_x - pretty_label.size
     view.chrome_hit(rect, pretty_x + 1, req.y).should eq(:pretty_req)
-    mode_label = Frame.mode_badge_label(false) # " ↵:NOR "
+    mode_label = Frame.mode_badge_label(false) # the READ label
     mode_x = pretty_x - mode_label.size
     view.chrome_hit(rect, mode_x + 1, req.y).should eq(:mode)
 
-    # TARGET NOR/INS on the top band
+    # TARGET READ/INS on the top band
     view.chrome_hit(rect, rect.right - 3, rect.y).should eq(:target_mode)
 
     # Body click (not on border chrome) → nil so caret path still runs

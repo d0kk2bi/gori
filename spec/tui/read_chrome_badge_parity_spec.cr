@@ -8,16 +8,16 @@ include Gori::Tui
 # hit-test it is drawn for. Every one of them is a place where the screen and the clipboard, or
 # the screen and the click, told the operator different things.
 #
-#   A. FuzzerView drew the `§N` marker-count badge 4 cells INSIDE the 7-cell NOR/INS chip, so the
+#   A. FuzzerView drew the `§N` marker-count badge 4 cells INSIDE the READ/INS chip, so the
 #      TEMPLATE border read "↵: §2" — the mode chip destroyed and the count ambiguous.
 #   B. FuzzerView#template_home/end and JwtSession's Home/End moved the EDITOR caret without
 #      adopting it into the READ cursor. Symptoms differ because the painters differ: the Fuzzer
 #      (which `sync_from`s every frame) kept a phantom band whose ends had crossed, so `y` copied
 #      ""; JWT (which paints purely from its read cursor) moved a caret nobody could see.
-#   C. Every NOR/INS chip was drawn from `focused && insert?` while its hit-test and its click
+#   C. Every READ/INS chip was drawn from `focused && insert?` while its hit-test and its click
 #      handler read `insert?` alone. A pane that retained INS while focus moved away drew the
-#      7-cell " ↵:NOR " over a 5-cell " INS " hit rect — two dead cells — and clicking a chip
-#      that said "↵:NOR" turned insert OFF.
+#      wider " ↵:READ " chip over a 5-cell " INS " hit rect — dead cells on its left — and clicking a chip
+#      that said "↵:READ" turned insert OFF.
 #   D. The READ band and block caret measured the RAW line in the two panes that CONCEAL text
 #      (`§value¦chain§`), so both landed N columns right of what they addressed, and the band —
 #      which re-draws its own text — put the hidden `¦chain` back on screen. Copy was correct
@@ -29,7 +29,7 @@ describe "READ-mode chrome + border badge parity" do
   content_y = 4
 
   describe "A · fuzzer §N badge" do
-    it "chains the marker count clear of the NOR/INS chip" do
+    it "chains the marker count clear of the READ/INS chip" do
       view = FuzzerView.new
       view.load_request("https://h", "GET /?x=§1§&y=§2§ HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
       view.focus_pane(:template)
@@ -38,9 +38,9 @@ describe "READ-mode chrome + border badge parity" do
       row = b.row(border_y)
 
       # Both are legible and neither is inside the other.
-      row.should contain("↵:NOR")
+      row.should contain("↵:READ")
       row.should contain("§2")
-      row.index("§2").not_nil!.should be < row.index("↵:NOR").not_nil! # count chains LEFT
+      row.index("§2").not_nil!.should be < row.index("↵:READ").not_nil! # count chains LEFT
       row.should_not contain("↵: §")                                   # the overlap's signature
     end
 
@@ -51,7 +51,7 @@ describe "READ-mode chrome + border badge parity" do
       rect = Rect.new(0, 0, 120, 30)
       b = MemoryBackend.new(120, 30)
       view.render(Screen.new(b), rect)
-      col = b.row(border_y).index("↵:NOR").not_nil!
+      col = b.row(border_y).index("↵:READ").not_nil!
       view.template_chrome_hit(rect, col + 1, border_y).should eq(:mode)
     end
   end
@@ -104,7 +104,7 @@ describe "READ-mode chrome + border badge parity" do
     end
   end
 
-  describe "C · the NOR/INS chip states the pane's real mode" do
+  describe "C · the READ/INS chip states the pane's real mode" do
     # `Frame.mode_badge`'s two labels are different widths, and `chrome_hit` is called from a
     # click handler with no idea which pane had focus when the frame was drawn.
     it "draws INS on an unfocused Repeater pane that retained it, and hit-tests the same cells" do
@@ -120,7 +120,7 @@ describe "READ-mode chrome + border badge parity" do
       view.render(Screen.new(b), rect)
       row = b.row(border_y)
       row.should contain("INS")
-      row.should_not contain("↵:NOR") # the label no longer lies about the mode
+      row.should_not contain("↵:READ") # the label no longer lies about the mode
 
       # Every cell of the drawn chip hit-tests as :mode, and the run is exactly " INS " wide.
       hits = (0...120).select { |x| view.chrome_hit(rect, x, border_y) == :mode }

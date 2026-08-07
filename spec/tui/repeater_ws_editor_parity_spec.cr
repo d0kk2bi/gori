@@ -316,12 +316,12 @@ describe "RepeaterView WebSocket editor parity" do
       view.chrome_hit(rect, col + 2, border_y).should eq(:ws_key)
     end
 
-    it "hit-tests the NOR/INS mode badge on the HANDSHAKE card" do
+    it "hit-tests the READ/INS mode badge on the HANDSHAKE card" do
       rect = Rect.new(0, 0, 100, 30)
       view, b = render_ws.call(rect, true)
       env, _ = sub_rects.call(view, rect)
       border_y = env.y - 1
-      col = col_of.call(b, border_y, "↵:NOR")
+      col = col_of.call(b, border_y, "↵:READ")
       view.chrome_hit(rect, col + 1, border_y).should eq(:mode)
     end
 

@@ -145,7 +145,7 @@ describe "RepeaterView WebSocket transport override" do
     # behaves as. The WebSocket half of the story moved to the TARGET band's chip, which names
     # BOTH ends (` ^V:WS→h1 `) precisely so the tab is still not mistakable for a plain one.
     #
-    # The title used to carry both facts, and the extra columns pushed the card's own ↵:NOR
+    # The title used to carry both facts, and the extra columns pushed the card's own ↵:READ
     # chip off a 100-col terminal — the badge chain measures its left stop from the title.
     rect = Rect.new(0, 0, 100, 24)
     draw = ->(v : RepeaterView) {
@@ -160,7 +160,7 @@ describe "RepeaterView WebSocket transport override" do
     b.contains?("HANDSHAKE").should be_false # not a handshake pane any more — a request pane
     b.row(rect.y + 3).should contain("REQUEST")
     b.row(rect.y).should contain("^V:WS→h1")  # …and the band is what says it was a handshake
-    b.row(rect.y + 3).should contain("↵:NOR") # the request card keeps its mode chip at 100 cols
+    b.row(rect.y + 3).should contain("↵:READ") # the request card keeps its mode chip at 100 cols
 
     http.cycle_ws_transport # → h2
     draw.call(http).row(rect.y).should contain("^V:WS→h2")

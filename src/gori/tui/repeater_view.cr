@@ -2639,13 +2639,13 @@ module Gori::Tui
       rect.x + 9
     end
 
-    # The TARGET band's right-to-left chrome after the NOR/INS mode chip: the SNI marker,
+    # The TARGET band's right-to-left chrome after the READ/INS mode chip: the SNI marker,
     # then the `^V` transport chip. Returns `{sni_x, transport_right_edge}` — `sni_x` nil when
     # no override is set or the marker doesn't fit. Pure geometry, shared by `render_target`
     # and `chrome_hit`.
     #
     # The SNI marker used to place itself at `rect.right - size - 1`, which is INSIDE the mode
-    # chip's cells: setting an SNI override painted over the right five columns of " ↵:NOR ",
+    # chip's cells: setting an SNI override painted over the right columns of the mode label,
     # leaving a truncated chip behind. Chaining it fixes that too.
     private def target_chrome_chain(rect : Rect) : {Int32?, Int32}
       min_x = target_chip_min(rect)
@@ -4399,7 +4399,7 @@ module Gori::Tui
     # Both facts used to live here — "HANDSHAKE (h1)", "REQUEST (h2)" — because nothing else on
     # screen carried the transport. That cost the card up to five columns of title, and the
     # badge chain measures its left stop from the title: at 100 columns (a 49-wide request
-    # column) an h2 tab pushed its own ` ↵:NOR ` chip past `min_x` and drew no mode chip at all.
+    # column) an h2 tab pushed its own ` ↵:READ ` chip past `min_x` and drew no mode chip at all.
     #
     # An overridden handshake tab is titled REQUEST, not HANDSHAKE: `^R` sends it as an
     # ordinary request and reads a response, the MESSAGES pane is gone, and the card is one

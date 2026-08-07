@@ -158,17 +158,17 @@ module Gori::Tui
     end
 
     # READ/INS mode chip on an editor pane's top border (Repeater REQUEST, Decoder INPUT,
-    # Notes, …). NOR advertises ↵ (and i) as the way into insert; INS is a plain lit label
+    # Notes, …). READ advertises ↵ (and i) as the way into insert; INS is a plain lit label
     # (esc exits — already in the status strip). Clickable via `mode_badge_hit`. Returns
     # the badge's left x for chaining, or `right_edge` when it doesn't fit.
     #
     # `insert` must be the pane's REAL mode — never `focused && insert?`. The two labels are
-    # different WIDTHS (" ↵:NOR " is 7 cells, " INS " is 5), and `mode_badge_hit` is called from a
+    # different WIDTHS (" ↵:READ " is 8 cells, " INS " is 5), and `mode_badge_hit` is called from a
     # click handler that has no idea which pane had focus when the frame was drawn; every caller's
     # hit-test therefore passes the bare mode. Gating the label on focus desynchronised the two:
     # a pane that retained INS while focus moved away (no view exits insert on a focus change)
-    # drew the 7-cell NOR chip over a 5-cell hit rect — two dead cells on its left — and a click
-    # on a chip reading "↵:NOR" ran the INS branch and turned insert OFF. Focus belongs in the
+    # drew the wider READ chip over a 5-cell hit rect — dead cells on its left — and a click
+    # on a chip reading "↵:READ" ran the INS branch and turned insert OFF. Focus belongs in the
     # BORDER (`Frame.pane_border(focused, insert:)`), not in this label.
     def self.mode_badge(screen : Screen, right_edge : Int32, y : Int32, min_x : Int32,
                         insert : Bool) : Int32
@@ -183,9 +183,18 @@ module Gori::Tui
       x
     end
 
-    # Label drawn by `mode_badge` / measured by `mode_badge_hit`. Keep geometry in one place.
+    # Label drawn by `mode_badge` / measured by `mode_badge_hit`. Keep geometry in one place —
+    # every caller derives its x, its hit rect and its chained neighbours from this string, so
+    # the width is free to change here and nowhere else.
+    #
+    # READ, not the "NOR" this used to paint. The rest of gori — the Help tab, the tutorial, the
+    # CLI's own `--help` — has always called this mode READ, in seventeen user-facing strings,
+    # while the only place a user ever SAW the name spelled it NOR. The tutorial is where the
+    # two met: its Edit lesson teaches "Editors open in READ … esc returns to READ" with this
+    # badge painted a few cells away reading "↵:NOR", which is a poor first lesson in a
+    # vocabulary. One name, and it is the one the prose already uses.
     def self.mode_badge_label(insert : Bool) : String
-      insert ? " INS " : " ↵:NOR "
+      insert ? " INS " : " ↵:READ "
     end
 
     # Hit-test for a single `mode_badge` at the same geometry as draw. Miss → false.
