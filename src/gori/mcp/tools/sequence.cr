@@ -18,11 +18,12 @@ module Gori
         Result.new(Sequencer::Present.report_json(Sequencer::Stats.analyze(tokens)))
       end
 
+      # Through the shared `str_list`: a numeric token is a token (it is COERCED, not dropped),
+      # and a non-string entry is refused by name. `compact_map(&.as_s?)` discarded it, so a
+      # 3-token sample was rated as a 2-token one and the report described a set the caller
+      # never submitted.
       private def sequence_token_list(h) : Array(String)
-        raw = h["tokens"]?
-        return [] of String unless raw
-        arr = raw.as_a? || return [] of String
-        arr.compact_map(&.as_s?).map(&.strip).reject(&.empty?)
+        str_list(h, "tokens").map(&.strip).reject(&.empty?)
       end
 
       private def sequence_start(h) : Result

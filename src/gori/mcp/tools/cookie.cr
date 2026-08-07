@@ -135,12 +135,8 @@ module Gori
         end
       end
 
-      private def str_list(h, key : String) : Array(String)
-        raw = h[key]?
-        return [] of String unless raw
-        arr = raw.as_a? || return [] of String
-        arr.compact_map(&.as_s?)
-      end
+      # `str_list` lives in tools.cr now: `secrets` and `tokens` had two near-identical readers
+      # that BOTH dropped a non-string entry, and one grammar gets one behaviour.
     end
   end
 end

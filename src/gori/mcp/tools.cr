@@ -2187,8 +2187,98 @@ module Gori
         j.field "effective_host", Serialize.text(sc.host)
       end
 
+      # A string-shaped argument, held to the same "lenient, but never SILENT" contract every
+      # other primitive on this surface already has.
+      #
+      # `h[key]?.try(&.as_s?)` alone answered nil for EVERY non-string shape, and each of the
+      # ~180 callers reads a nil as "the caller did not pass it". So a mistyped argument was
+      # accepted, checked against nothing, and discarded: `add_scope_rule{pattern: 8080}` came
+      # back "missing required 'pattern'" for a value it had just been handed, and
+      # `create_note{text: [1,2]}` stored an EMPTY note and reported success. The same nil
+      # reaching a tool with a documented default silently ran the default instead — the
+      # failure `bool_value` describes for `probe_scan{active: 1}`, spent on a string.
+      #
+      # A JSON scalar is COERCED, matching `header_pairs`' `v.as_s? || v.to_s` for header
+      # values and `int`'s acceptance of a numeric string: an unquoted `8080` in a string slot
+      # says one thing only. An array/object is REFUSED BY NAME — `JSON::Any#to_s` renders a
+      # Hash in CRYSTAL syntax (`{"a" => 1}`, not JSON), so coercing one would put text the
+      # caller never wrote into the store or onto the wire, which is worse than the drop. A
+      # JSON null stays ABSENT, which is what `present?` already means everywhere else.
+      #
+      # Raising is safe at every call site: `call` rescues `Gori::Error` into a clean
+      # INVALID_ARGUMENT. The one argument read BOTH ways — `ws_out_messages`, string or
+      # array — tries its array branch first, so only the object shape reaches here, and
+      # refusing that is the point (it used to store zero frames).
       private def str(h, key : String) : String?
-        h[key]?.try(&.as_s?)
+        v = h[key]?
+        return nil if v.nil? || v.raw.nil?
+        if s = v.as_s?
+          return s
+        end
+        if shape = container_shape(v)
+          raise Gori::Error.new("invalid '#{key}' (expected a string, got #{shape})")
+        end
+        v.to_s
+      end
+
+      # A string argument that is NOT coerced: only a genuine JSON string will do. For the
+      # `*_base64` arguments, whose whole contract is "these exact octets" — `base64_str`
+      # answered nil for a non-string, so `base64_str(h, "request_base64") || str(h, "request")`
+      # silently stored the NON-byte-exact request and reported success. Coercing would be
+      # worse than the drop here: `1234` would `to_s` into a string that DECODES (3 octets),
+      # so gori would send bytes the caller never named at all.
+      private def strict_str(h, key : String) : String?
+        v = h[key]?
+        return nil if v.nil? || v.raw.nil?
+        v.as_s? || raise Gori::Error.new("invalid '#{key}' (expected a base64 string)")
+      end
+
+      # "an array" / "an object", or nil for a scalar — the shapes `str` must refuse.
+      private def container_shape(v : JSON::Any) : String?
+        return "an array" if v.as_a?
+        return "an object" if v.as_h?
+        nil
+      end
+
+      # One entry of a string LIST, under `str`'s rule: a scalar is coerced, a container is
+      # refused by name. `arr.compact_map(&.as_s?)` silently DROPPED the entry instead, so
+      # `cookie_crack{secrets:["nope",12345]}` tried 1 of the 2 candidates and answered
+      # `found:false` — a false negative with `isError:false` — and `sequence_analyze` rated
+      # the randomness of a sample two thirds the size of the one submitted. Same fix, same
+      # reason as `ws_out_messages_arg`'s (its `compact_map` stored 2 of 4 frames and called
+      # it a clean send).
+      private def str_entry(v : JSON::Any, key : String) : String
+        if s = v.as_s?
+          return s
+        end
+        if (shape = container_shape(v)) || v.raw.nil?
+          raise Gori::Error.new("invalid '#{key}' entry #{v.to_json} (expected a string, got #{shape || "null"})")
+        end
+        v.to_s
+      end
+
+      # A list-of-strings argument in any shape a client sends: a real array, a JSON-ENCODED
+      # array (LLM clients stringify — `fuzz_marks` accepts the same two), or a BARE string as
+      # a one-element list, which is what a caller with a single secret reaches for and which
+      # used to become an empty list and an error naming the argument it had just supplied.
+      # Anything else is refused rather than silently emptied.
+      private def str_list(h, key : String) : Array(String)
+        raw = h[key]?
+        return [] of String if raw.nil? || raw.raw.nil?
+        if s = raw.as_s?
+          return [] of String if s.strip.empty?
+          if s.lstrip.starts_with?('[') && (parsed = (JSON.parse(s) rescue nil)) && (arr = parsed.as_a?)
+            return arr.map { |v| str_entry(v, key) }
+          end
+          return [s]
+        end
+        # A bare SCALAR is one candidate, exactly as a bare string is: `secrets: 12345` is a
+        # single numeric secret, which is the same shape as the numeric ENTRY this reader was
+        # fixed to stop dropping. Only a container in a list slot has no reading, and
+        # `str_entry` is what says so — naming the shape actually sent, rather than telling a
+        # caller who wrote a number that it passed an object.
+        arr = raw.as_a? || return [str_entry(raw, key)]
+        arr.map { |v| str_entry(v, key) }
       end
 
       # A `*_base64` argument decoded into the exact bytes it names, as a String (Crystal
@@ -2201,7 +2291,7 @@ module Gori
       # rather than falling back: a caller reaching for this argument wants exact bytes, and
       # silently sending different ones is the failure it came here to avoid.
       private def base64_str(h, key : String) : String?
-        s = h[key]?.try(&.as_s?)
+        s = strict_str(h, key)
         return nil if s.nil? || s.empty?
         begin
           String.new(Base64.decode(s))

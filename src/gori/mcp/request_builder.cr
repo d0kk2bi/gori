@@ -47,6 +47,32 @@ module Gori
         raise Gori::Error.new("invalid 'headers' (expected an object of name->value)")
       end
 
+      # A string argument that IS the message: `url`, `raw`, `method`, `body`, and the
+      # `*_base64` pair. `args[…]?.try(&.as_s?)` answered nil for every other shape and each
+      # caller read that nil as "absent", so a mistyped argument was accepted and then thrown
+      # away — with `isError:false` and an `effective_request` echo of a request that never
+      # existed:
+      #
+      #   * `method: 123`   → fell back to the DEFAULT and sent a GET. The caller measured a
+      #                       target's handling of a verb it never sent.
+      #   * `body: {…}`     → the shape an LLM reaches for on any JSON API — sent NO body and
+      #                       no Content-Length.
+      #   * `raw: […]`      → fell through to the structured builder and sent a bare GET to
+      #                       `url` instead of the request the caller wrote.
+      #
+      # STRICT, unlike `Tools#str`'s scalar coercion, for the reason `strict_jstr` gives in
+      # fuzz.cr: only a genuine JSON string is ever a sane input for a value spliced straight
+      # onto the wire, and GUESSING at one is the failure `base64_arg` already refuses —
+      # serializing an object body would invent a Content-Type and a length the caller never
+      # stated. `header_pairs` (which accepts the encoded-object form) is the exception, and
+      # it can be: a header set has one unambiguous JSON spelling. A body does not.
+      private def self.wire_str(args : Hash(String, JSON::Any), name : String,
+                                hint : String = "") : String?
+        v = args[name]?
+        return nil if v.nil? || v.raw.nil?
+        v.as_s? || raise Gori::Error.new("invalid '#{name}' (expected a JSON string#{hint})")
+      end
+
       # `args` is the tool's `arguments` object (a parsed JSON hash).
       def self.build(args : Hash(String, JSON::Any)) : Built
         uri, scheme, host, port = parse_origin(args)
@@ -56,7 +82,7 @@ module Gori
             # A base64 input IS the wire: the caller encoded the exact octets it wants sent,
             # so there is nothing to normalise and nothing to expand. See `verbatim?`.
             b64
-          elsif (raw = args["raw"]?.try(&.as_s?)) && !raw.empty?
+          elsif (raw = wire_str(args, "raw", "; use raw_base64 for exact octets")) && !raw.empty?
             # `verbatim` means the operator's bytes ARE the message: no `$VAR` expansion and no
             # bare-LF promotion. `normalize_raw` exists so a hand-typed request still frames,
             # but a bare-LF header terminator is a standard front-end/back-end desync
@@ -82,7 +108,7 @@ module Gori
       end
 
       private def self.parse_origin(args : Hash(String, JSON::Any)) : {URI, String, String, Int32}
-        url = args["url"]?.try(&.as_s?)
+        url = wire_str(args, "url")
         raise Gori::Error.new("'url' is required") if url.nil? || url.empty?
         url = Env.expand(url)
 
@@ -149,7 +175,7 @@ module Gori
       # refuses an unintelligible value through `Tools#bool_arg`; this one now does too.
       # `Gori::Error` is what the tools rescue into a clean caller-facing message.
       def self.verbatim?(args : Hash(String, JSON::Any)) : Bool
-        return true if args["raw_base64"]?.try(&.as_s?).try { |s| !s.empty? }
+        return true if wire_str(args, "raw_base64").try { |s| !s.empty? }
         v = args["verbatim"]?
         return false if v.nil? || v.raw.nil?
         b = v.as_bool?
@@ -172,7 +198,7 @@ module Gori
       # caller reaching for this argument is asking for exact bytes, and quietly sending
       # different ones is the failure it came here to avoid.
       private def self.base64_arg(args : Hash(String, JSON::Any), name : String) : Bytes?
-        s = args[name]?.try(&.as_s?)
+        s = wire_str(args, name)
         return nil if s.nil? || s.empty?
         begin
           Base64.decode(s)
@@ -183,13 +209,14 @@ module Gori
 
       private def self.build_from_parts(uri : URI, scheme : String, host : String, port : Int32,
                                         args : Hash(String, JSON::Any)) : Bytes
-        method = (args["method"]?.try(&.as_s?) || "GET").upcase
+        method = (wire_str(args, "method") || "GET").upcase
         validate_method(method)
         # `body_base64` wins over `body`: it is the byte-exact form, and a caller that sent
         # both meant the precise one. It is NOT env-expanded — the caller already decided
         # every octet, and expanding would change the length it encoded.
         body = base64_arg(args, "body_base64") ||
-               args["body"]?.try(&.as_s?).try { |b| Env.expand(b).to_slice }
+               wire_str(args, "body", "; stringify JSON yourself, or use body_base64 for exact octets")
+                 .try { |b| Env.expand(b).to_slice }
 
         path = uri.path
         path = "/" if path.empty?
