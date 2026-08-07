@@ -262,6 +262,40 @@ module Gori::Tui
 
     # --- input ---------------------------------------------------------------
 
+    # The character a keystroke carries WHEN IT IS NOT A CHORD, else nil.
+    #
+    # `Event::Key#char` is `@char || key.to_char`, so ^P arrives carrying 'p' and ⌥L
+    # carrying 'l'. Every bare `ev.char == …` guard in this file was firing on the chord:
+    # ^L switched a tab in Practice and ticked its "switch" goal, ^O ran the space menu's
+    # `o Open` row, and both text-entry sites typed the chord's letter — ^P then ^T in the
+    # palette lesson's filter left "pt" in the query box, on the lesson whose whole subject
+    # is ^P. The real app guards this at every one of these sites
+    # (Runner#handle_palette_key's `c && !ev.ctrl? && !ev.alt?`,
+    # Runner#handle_space_menu_key's, TextField#handle_edit_key's); the tour guarded it
+    # nowhere. ONE home for the rule, spec-able without a tty, so they cannot drift apart
+    # again.
+    #
+    # The chords the tour DOES bind are matched on `ev.ctrl?` + `ev.key` before this is ever
+    # reached (`palette_open_key?`), so nothing that wants a modifier comes through here.
+    # `Keybind.dealias` composes: it rebuilds the ⌥P event with `char: nil` and Ctrl set, so
+    # `to_char` still yields 'p' and this catches the aliased path too.
+    def self.bare_char(ev : Termisu::Event::Key) : Char?
+      return nil if ev.ctrl? || ev.alt?
+      ev.char
+    end
+
+    # …and the text-entry half: what a keystroke should INSERT, or nil.
+    #
+    # Non-control rather than the printable-ASCII window this replaced (`ord >= 32 && < 127`),
+    # matching `TextField#insert`: the tour's INS demo asks the user to "type a username" and
+    # then silently dropped every Hangul/CJK/accented character they typed. Enter and
+    # Backspace are handled by their own branches ahead of this and carry control chars
+    # anyway.
+    def self.typed_char(ev : Termisu::Event::Key) : Char?
+      return nil unless ch = bare_char(ev)
+      ch.control? ? nil : ch
+    end
+
     private def handle_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
 
@@ -312,8 +346,9 @@ module Gori::Tui
       # Soft try-it on passive lessons (before Next advances).
       case @step
       when Step::Navigate
-        if nav_switch_key?(ev) || key.down? || key.enter? || ev.char == 'j' ||
-           ev.char == '[' || ev.char == ']'
+        ch = Tutorial.bare_char(ev)
+        if nav_switch_key?(ev) || key.down? || key.enter? || ch == 'j' ||
+           ch == '[' || ch == ']'
           start_nav_live
           handle_live_shell_key(ev, practice: false)
           return
@@ -332,9 +367,7 @@ module Gori::Tui
         end
       when Step::Edit
         if edit_enter_key?(ev) || key.enter?
-          @edit_insert = true
-          @edit_typed = ""
-          @tried_edit = true
+          enter_insert
           return
         end
       end
@@ -363,8 +396,7 @@ module Gori::Tui
       return true if ev.key.back_tab?
       return false if @edit_insert
       return false unless @overlay == :none
-      return false if ev.ctrl? || ev.alt? # leave ^P etc. alone
-      ch = ev.char
+      ch = Tutorial.bare_char(ev) # nil for ^P etc. — leave the chords alone
       ch == 'n' || ch == 'N' || ch == 'b' || ch == 'B'
     end
 
@@ -373,7 +405,7 @@ module Gori::Tui
         back
         return
       end
-      case ev.char
+      case Tutorial.bare_char(ev)
       when 'n', 'N' then advance
       when 'b', 'B' then back
       end
@@ -386,7 +418,7 @@ module Gori::Tui
       if live_shell? && @p_level == :body
         @p_level = :menu
         @p_up = true
-        @tried_nav = true if @step.navigate?
+        mark_nav_tried
         return
       end
       # Top level, where esc leaves the tour — but only on a DELIBERATE second press.
@@ -420,17 +452,20 @@ module Gori::Tui
     # ↵ opens detail / INS on the request, ^P / space openers.
     private def handle_live_shell_key(ev : Termisu::Event::Key, *, practice : Bool) : Nil
       key = ev.key
+      # Bare, never the letter a chord happens to carry — ^L used to switch a tab and tick
+      # Practice's "switch" goal. See Tutorial.bare_char.
+      bare = Tutorial.bare_char(ev)
 
       # Global tab cycle (real app: [ / ] from anywhere).
-      if ev.char == '['
+      if bare == '['
         switch_tab(-1)
         return
       end
-      if ev.char == ']'
+      if bare == ']'
         switch_tab(1)
         return
       end
-      if (ch = ev.char) && ch >= '1' && ch <= '9'
+      if (ch = bare) && ch >= '1' && ch <= '9'
         idx = ch.ord - '1'.ord
         if idx < TABS.size
           @p_tab = idx
@@ -463,10 +498,8 @@ module Gori::Tui
 
       # INS only on the REQUEST pane (matches real editors).
       if @p_pane == 1 && (edit_enter_key?(ev) || key.enter?)
-        @edit_insert = true
-        @edit_typed = ""
+        enter_insert
         @p_edit = true if practice
-        @tried_edit = true
         return
       end
 
@@ -476,13 +509,13 @@ module Gori::Tui
         return
       end
 
-      if key.down? || ev.char == 'j'
+      if key.down? || bare == 'j'
         @p_flow = {@p_flow + 1, FLOW_ROWS.size - 1}.min if @p_pane == 0
         return
       end
       # ↑ / k: REQUEST always returns to the tab bar. FLOWS moves the list first,
       # and at the top row also returns to tabs (same focus-ring as real History).
-      if key.up? || ev.char == 'k'
+      if key.up? || bare == 'k'
         if @p_pane == 1
           focus_tabs
         elsif @p_pane == 0
@@ -494,11 +527,11 @@ module Gori::Tui
         end
         return
       end
-      if key.left? || ev.char == 'h'
+      if key.left? || bare == 'h'
         @p_pane = 0 if @p_pane == 1
         return
       end
-      if key.right? || ev.char == 'l'
+      if key.right? || bare == 'l'
         @p_pane = 1 if @p_pane == 0
         return
       end
@@ -507,20 +540,21 @@ module Gori::Tui
     private def focus_tabs : Nil
       @p_level = :menu
       @p_up = true
-      @tried_nav = true
+      mark_nav_tried
     end
 
     private def practice_menu_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
-      if key.left? || ev.char == 'h'
+      bare = Tutorial.bare_char(ev)
+      if key.left? || bare == 'h'
         switch_tab(-1)
-      elsif key.right? || ev.char == 'l'
+      elsif key.right? || bare == 'l'
         switch_tab(1)
-      elsif key.down? || key.enter? || ev.char == 'j'
+      elsif key.down? || key.enter? || bare == 'j'
         @p_level = :body
         @p_pane = 0
         @p_enter = true
-        @tried_nav = true
+        mark_nav_tried
       end
     end
 
@@ -531,31 +565,59 @@ module Gori::Tui
 
     private def mark_switch : Nil
       @p_switch = true
-      @tried_nav = true
+      mark_nav_tried
       # Switching tabs while in the body keeps body focus (real app); stay put.
+    end
+
+    # The two lesson try-it flags that more than one lesson can reach, gated to the lessons
+    # they belong to.
+    #
+    # @tried_nav is the Navigate lesson's ✓ (and Miss Ring's :nav line, "that's it — tab bar
+    # up top, body below"); @tried_edit is the Edit lesson's. Both were set unconditionally
+    # from shared code every lesson runs through — mark_switch, focus_tabs,
+    # handle_shell_click, handle_live_shell_key's INS branch — so a click on the EDIT
+    # lesson's REQUEST pane ticked NAVIGATE's try-it and had Miss Ring congratulate a move
+    # about tab bars on the lesson about typing, and entering INS during the Navigate lesson
+    # pre-✓'d Edit before the user reached it. Practice re-teaches both moves, so it counts
+    # for either; every other lesson counts for neither.
+    private def mark_nav_tried : Nil
+      @tried_nav = true if @step.navigate? || @step.practice?
+    end
+
+    private def mark_edit_tried : Nil
+      @tried_edit = true if @step.edit? || @step.practice?
+    end
+
+    # The three doors into the mock's INS mode — the Edit lesson's `i`/↵, the shared shell's
+    # `i`/↵ on the REQUEST pane, and a click on the Edit lesson's pane — spelled the same
+    # three lines each. One home, so they cannot disagree about the try-it flag the way they
+    # already did about the field.
+    private def enter_insert : Nil
+      @edit_insert = true
+      @edit_typed = ""
+      mark_edit_tried
     end
 
     private def handle_edit_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
       if key.escape?
         @edit_insert = false
-        @tried_edit = true
+        mark_edit_tried
         return
       end
       if key.enter?
         # ↵ leaves INS (like leaving insert in many editors); Next advances the tour.
         @edit_insert = false
-        @tried_edit = true
+        mark_edit_tried
         return
       end
       if key.backspace?
         @edit_typed = @edit_typed[0...-1] unless @edit_typed.empty?
         return
       end
-      ch = ev.char
-      if ch && ch.ord >= 32 && ch.ord < 127 && @edit_typed.size < 16
+      if (ch = Tutorial.typed_char(ev)) && @edit_typed.size < 16
         @edit_typed += ch
-        @tried_edit = true
+        mark_edit_tried
       end
     end
 
@@ -585,24 +647,33 @@ module Gori::Tui
         # except on that one line. Hoisted rather than re-guarded so the two cannot drift
         # apart again. (Crystal's `%` is floored, so -1 wraps to the last row.)
         n = filtered_palette.size
-        if key.up? || ev.char == 'k'
+        # ARROWS ONLY, and everything else types — the rule Runner#handle_palette_key has.
+        # j/k used to move the selection here, in a field the lesson's own key line calls
+        # "type to fuzzy-filter": two letters the real palette accepts were the two this
+        # mock refused, teaching a model gori does not have. (The space menu below is the
+        # surface that DOES fall back to j/k, and it keeps it.)
+        if key.up?
           @pal_sel = Tutorial.wrap_sel(@pal_sel, -1, n)
-        elsif key.down? || ev.char == 'j'
+        elsif key.down?
           @pal_sel = Tutorial.wrap_sel(@pal_sel, +1, n)
         elsif key.backspace?
           @pal_query = @pal_query[0...-1] unless @pal_query.empty?
           @pal_sel = 0
-        elsif (ch = ev.char) && ch.ord >= 32 && ch.ord < 127 && @pal_query.size < 20
+        elsif (ch = Tutorial.typed_char(ev)) && @pal_query.size < 20
           @pal_query += ch
           @pal_sel = 0
         end
       when :space
-        if key.up? || ev.char == 'k'
-          @space_sel = (@space_sel - 1) % SPACE_ROWS.size
-        elsif key.down? || ev.char == 'j'
-          @space_sel = (@space_sel + 1) % SPACE_ROWS.size
-        elsif (ch = ev.char) && SPACE_ROWS.any? { |(k, _)| k == ch }
+        # Mnemonic FIRST, then the j/k fallback — the helix-leader order
+        # Runner#handle_space_menu_key spells out. No SPACE_ROWS key is j or k today, so
+        # this changes nothing now and cannot go wrong the day one is.
+        bare = Tutorial.bare_char(ev)
+        if bare && SPACE_ROWS.any? { |(k, _)| k == bare }
           close_overlay # mnemonic runs the row
+        elsif key.up? || bare == 'k'
+          @space_sel = (@space_sel - 1) % SPACE_ROWS.size
+        elsif key.down? || bare == 'j'
+          @space_sel = (@space_sel + 1) % SPACE_ROWS.size
         end
       end
     end
@@ -693,10 +764,13 @@ module Gori::Tui
       @pal_query = ""
     end
 
+    # The three below read a BARE character (Tutorial.bare_char), never the letter a chord
+    # carries — ⌥I is not "press i", and ^Space is not the action menu.
     private def nav_switch_key?(ev : Termisu::Event::Key) : Bool
       key = ev.key
-      key.left? || key.right? || ev.char == 'h' || ev.char == 'l' ||
-        ev.char == '[' || ev.char == ']'
+      return true if key.left? || key.right?
+      ch = Tutorial.bare_char(ev)
+      ch == 'h' || ch == 'l' || ch == '[' || ch == ']'
     end
 
     private def palette_open_key?(ev : Termisu::Event::Key) : Bool
@@ -704,16 +778,17 @@ module Gori::Tui
     end
 
     private def space_open_key?(ev : Termisu::Event::Key) : Bool
-      ev.key.space? || ev.char == ' '
+      Tutorial.bare_char(ev) == ' '
     end
 
     private def edit_enter_key?(ev : Termisu::Event::Key) : Bool
-      ev.char == 'i' || ev.char == 'I'
+      ch = Tutorial.bare_char(ev)
+      ch == 'i' || ch == 'I'
     end
 
     private def handle_mouse(ev : Termisu::Event::Mouse) : Nil
       return unless ev.press? && !ev.wheel?
-      @esc_armed = false # a click is intent to stay (see #handle_escape)
+      @esc_armed = false          # a click is intent to stay (see #handle_escape)
       mx, my = ev.x - 1, ev.y - 1 # termisu mouse coords are 1-based
 
       # Footer buttons always win (never stuck — Skip/Next/Finish/Prev).
@@ -782,6 +857,17 @@ module Gori::Tui
       # Ensure live takeover when interacting with the Navigate demo.
       start_nav_live if @step.navigate?
 
+      # The Edit lesson draws ONLY the REQUEST pane, and its whole ask is "press i". A click
+      # on it used to fall through to the body-focus branch below — which `render_edit`
+      # ignores entirely, since it always draws that pane focused and reads @edit_insert for
+      # the mode — so the pointer did nothing at all, while still ticking the NAVIGATE
+      # lesson's try-it on the way past. Clicking into a field to type in it is what the
+      # pointer means here.
+      if @step.edit?
+        enter_insert if @request_rect.contains?(mx, my) && !@edit_insert
+        return
+      end
+
       @tab_hits.each do |(rect, idx)|
         if rect.contains?(mx, my)
           @p_tab = idx
@@ -791,11 +877,18 @@ module Gori::Tui
         end
       end
 
+      # Pane clicks only where the mock RENDERS focus: Navigate (made live just above) and
+      # Practice. The Palette and SpaceMenu lessons hand `render_shell` a fixed focus so
+      # their panes have nothing to move — moving @p_level/@p_pane there changed nothing on
+      # screen, and the @p_flow it also moved left the REQUEST pane showing a flow the FLOWS
+      # pane was not marking as selected.
+      return unless live_shell?
+
       if @flows_rect.contains?(mx, my)
         @p_level = :body
         @p_pane = 0
         @p_enter = true
-        @tried_nav = true
+        mark_nav_tried
         # Row hit: interior starts at y+1.
         row = my - (@flows_rect.y + 1)
         @p_flow = row.clamp(0, FLOW_ROWS.size - 1) if row >= 0
@@ -806,7 +899,7 @@ module Gori::Tui
         @p_level = :body
         @p_pane = 1
         @p_enter = true
-        @tried_nav = true
+        mark_nav_tried
         return
       end
     end
@@ -1164,7 +1257,12 @@ module Gori::Tui
         "↵/n finish · click Finish · esc esc leave"
       when Step::Practice
         if @overlay != :none
-          "↑/↓ · ↵ run · esc close · #{tour}"
+          # NOT `tour`: `tour_nav_key?` hands n/b to an open overlay (the palette types
+          # them, the space menu ignores them), so printing "n next · b back" here named two
+          # keys that do nothing — the same defect as the esc note above, pointed the other
+          # way. The Palette lesson's own overlay hint already used the "then" form; these
+          # two were the branches that didn't.
+          "↑/↓ · ↵ run · esc close · then n/Next"
         elsif @edit_insert
           "type · esc → READ · then n/Next"
         elsif practice_done?
@@ -1173,7 +1271,10 @@ module Gori::Tui
           "roam the mock · #{tour} / Skip anytime"
         end
       when Step::Navigate
-        if @nav_live
+        if @edit_insert
+          # Reachable here, not just on Edit/Practice — see the note in `render_navigate`.
+          "type · esc → READ · then n/Next"
+        elsif @nav_live
           "←/→ tabs · ↓ body · ↑ tabs · ⇥ panes · #{tour}"
         elsif @tried_nav
           "✓ #{tour} · or keep exploring"
@@ -1190,7 +1291,7 @@ module Gori::Tui
         end
       when Step::SpaceMenu
         if @overlay == :space
-          "↑/↓ · letter · ↵ · esc · #{tour}"
+          "↑/↓ · letter · ↵ · esc close · then n/Next" # n/b belong to the menu here — see Practice
         elsif @tried_space
           "✓ #{tour}"
         else
@@ -1300,8 +1401,15 @@ module Gori::Tui
 
       shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
       if @nav_live
+        # INS included, because the SHARED shell handler can enter it here: ↵ or i on the
+        # REQUEST pane sets @edit_insert on this lesson exactly as it does on Practice. This
+        # used to draw `insert: false, typed: ""` regardless, so the user landed in an
+        # invisible INS mode — the badge still read READ, nothing showed what they typed,
+        # and `handle_key` routes every key to `handle_edit_key` while it is on, so n and b
+        # went dead with nothing on screen to explain why. The one thing `tour_nav_key?`
+        # exists to prevent.
         render_shell(screen, shell, @p_tab, @p_level == :body, @p_pane, "",
-          flow: @p_flow, insert: false, typed: "")
+          flow: @p_flow, insert: @edit_insert, typed: @edit_typed)
       else
         phase = (@tick // 12) % 5
         active = phase == 0 ? 0 : 1
@@ -1352,7 +1460,10 @@ module Gori::Tui
       draw_try_line(screen, ix, y, iw, "Try: press space, move with ↑/↓, run with a letter or ↵.", @tried_space)
 
       shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
-      render_shell(screen, shell, 0, true, 0, "", flow: 0)
+      # @p_tab, not a hardcoded 0: `render_tab_bar` registers a hit rect for every chip it
+      # draws, so a click on one was already moving @p_tab — this lesson was the only one
+      # that then ignored it, leaving the chips looking clickable and behaving dead.
+      render_shell(screen, shell, @p_tab, true, 0, "", flow: 0)
       if @overlay == :space
         draw_space_overlay(screen, shell, live: true)
       elsif !@tried_space
@@ -1391,7 +1502,7 @@ module Gori::Tui
       px = shell.x + {(shell.w - pw) // 2, 0}.max
       pane = Rect.new(px, shell.y, pw, {shell.h - 1, 3}.max)
       @request_rect = pane
-      render_request_pane(screen, pane, true, insert: insert, typed: typed)
+      render_request_pane(screen, pane, true, insert: insert, typed: typed, flow: 0)
 
       kh = insert ? "INS · type · esc → READ" : "READ · i or ↵ → INS"
       screen.text(shell.x + {(shell.w - kh.size) // 2, 0}.max, shell.bottom - 1, kh, Theme.muted, Theme.bg)
@@ -1520,7 +1631,7 @@ module Gori::Tui
       @flows_rect = flows
       @request_rect = req
       render_flows_pane(screen, flows, in_body && pane == 0, flow)
-      render_request_pane(screen, req, in_body && pane == 1, insert: insert, typed: typed)
+      render_request_pane(screen, req, in_body && pane == 1, insert: insert, typed: typed, flow: flow)
 
       unless keyhint.empty?
         kh = " #{keyhint} "
@@ -1569,7 +1680,7 @@ module Gori::Tui
     end
 
     private def render_request_pane(screen : Screen, rect : Rect, focused : Bool, *,
-                                    insert : Bool, typed : String) : Nil
+                                    insert : Bool, typed : String, flow : Int32) : Nil
       return if rect.w < 8 || rect.h < 3
       Frame.card(screen, rect, "REQUEST", border: Frame.pane_border(focused))
       badge_min = rect.x + 10
@@ -1578,8 +1689,11 @@ module Gori::Tui
       ix = rect.x + 2
       iw = {rect.w - 4, 1}.max
       yy = rect.y + 1
-      # Reflect the selected flow path so the two panes feel linked.
-      path = FLOW_ROWS[@p_flow]?.try(&.[1]) || "/login"
+      # Reflect the selected flow path so the two panes feel linked. The INDEX RENDER_SHELL
+      # WAS HANDED, not @p_flow — its sibling `render_flows_pane` marks the row from the
+      # parameter, and reading the field here meant the two panes could name different flows
+      # on any lesson that draws the shell with a fixed one.
+      path = FLOW_ROWS[flow]?.try(&.[1]) || "/login"
       ["GET #{path} HTTP/1.1", "Host: example.com", "Accept: */*"].each do |ln|
         break if yy >= rect.bottom - 1
         screen.text(ix, yy, ln, Theme.text, Theme.panel, width: iw)
@@ -1633,7 +1747,10 @@ module Gori::Tui
         screen.cell(qx, rect.y + 1, ' ', Theme.bg, Theme.accent)
       else
         screen.text(qx, rect.y + 1, q, Theme.text_bright, Theme.panel, width: qw)
-        caret_x = qx + {q.size, qw - 1}.min
+        # COLUMNS, not characters: the query accepts CJK/Hangul now (Tutorial.typed_char),
+        # and each of those is two columns wide — counting them as one parked the caret
+        # inside the text it is supposed to follow.
+        caret_x = qx + {Screen.draw_width(q), qw - 1}.min
         screen.cell(caret_x, rect.y + 1, ' ', Theme.bg, Theme.accent) if caret_x < rect.right - 1
       end
       Frame.tee_divider(screen, rect, rect.y + 2)
