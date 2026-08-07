@@ -358,14 +358,24 @@ module Gori
     # Linux: plain binary `gori-v{ver}-linux-{x86_64|arm64}`
     # macOS: tarball `gori-v{ver}-osx-{arm64|x86_64}.tar.gz` (contains gori + lib/)
     def self.asset_name(version : String, os : String, arch : String) : String
-      ver = normalize_version(version)
-      os_n = normalize_os(os)
+      release_asset_name("v#{normalize_version(version)}-", os, arch)
+    end
+
+    # The version-less copy release-binary.yml publishes beside every versioned
+    # asset ("Create version-less alias assets"). It exists so a client that only
+    # *guessed* the versioned filename from a tag has a second name to try — see
+    # the 404 retry in update_binary.
+    def self.alias_asset_name(os : String = current_os, arch : String = current_arch) : String
+      release_asset_name("", os, arch)
+    end
+
+    private def self.release_asset_name(version_part : String, os : String, arch : String) : String
       arch_n = normalize_arch(arch)
-      case os_n
+      case normalize_os(os)
       when "linux"
-        "gori-v#{ver}-linux-#{arch_n}"
+        "gori-#{version_part}linux-#{arch_n}"
       when "osx"
-        "gori-v#{ver}-osx-#{arch_n}.tar.gz"
+        "gori-#{version_part}osx-#{arch_n}.tar.gz"
       else
         raise Error.new("unsupported OS for gori release assets: #{os} (need linux or osx/darwin)")
       end
@@ -438,6 +448,13 @@ module Gori
     # ---------------------------------------------------------------------------
     # Release JSON → asset (pure)
     # ---------------------------------------------------------------------------
+
+    # An asset the release does not actually carry (HTTP 404), as distinct from
+    # every other download failure. Split out so the version-less alias retry in
+    # update_binary fires for exactly that case: a checksum mismatch or a
+    # truncated transfer must never be retried under a second name.
+    class AssetNotFound < Error
+    end
 
     struct Asset
       getter name : String
@@ -516,6 +533,30 @@ module Gori
         )
       end
       asset
+    end
+
+    # The version-less alias to try after `asset` came back 404, or nil when there
+    # is none to try (`asset` already IS the alias, or the release does not list one).
+    #
+    # A pure lookup on purpose: no URL is ever guessed here. The redirect path puts
+    # the alias into its synthesized list up front (see synthesize_release_json),
+    # with the digest from the same SHA256SUMS fetch that gave the versioned asset
+    # its own — so the retry inherits a real URL and a real checksum instead of
+    # reaching back out to the host that just failed us.
+    #
+    # On the API path the list is authoritative. It can lack the alias — the step
+    # that produces it in release-binary.yml is continue-on-error — but that step
+    # only *copies* the file; both names then go up in one upload, so an absent
+    # alias implies a present versioned asset and we never get here.
+    def self.alias_asset(release : Release, asset : Asset, *,
+                         os : String = current_os, arch : String = current_arch) : Asset?
+      name = alias_asset_name(os, arch)
+      return nil if asset.name == name
+      release.assets.find { |a| a.name == name }
+    rescue
+      # alias_asset_name raises on an unsupported OS; there is simply nothing to
+      # retry then, and the caller must surface the original 404.
+      nil
     end
 
     # ---------------------------------------------------------------------------
@@ -804,23 +845,38 @@ module Gori
     end
 
     # Stand-in for the API payload, built from a tag alone, so the redirect path
-    # can reuse parse_release/resolve_asset_from_json unchanged. The asset name is
-    # derived exactly as release-binary.yml builds it. `digest` comes from the
-    # release's SHA256SUMS when it has one; without it verify_sha256! no-ops, so
+    # can reuse parse_release/resolve_asset_from_json unchanged. Asset names are
+    # derived exactly as release-binary.yml builds them. Digests come from the
+    # release's SHA256SUMS when it has them; without one verify_sha256! no-ops, so
     # the caller warns that the checksum check was skipped (see update_binary).
+    #
+    # Lists the version-less alias alongside the versioned asset because the
+    # versioned name here is a GUESS made from a tag read out of a Location header.
+    # When that guess is wrong the versioned name 404s and the alias — which
+    # carries no version to get wrong — is the one name still worth trying, so it
+    # has to already be in the list the retry looks through.
     def self.synthesize_release_json(tag : String, os : String = current_os,
                                      arch : String = current_arch,
-                                     digest : String? = nil) : String
-      name = asset_name(tag, os, arch)
+                                     digest : String? = nil,
+                                     alias_digest : String? = nil) : String
+      entries = [] of {String, String?}
+      entries << {asset_name(tag, os, arch), digest}
+      # Guarded: alias_asset_name shares asset_name's unsupported-OS raise, and
+      # having reached here at all means the versioned name resolved fine.
+      if alias_name = (alias_asset_name(os, arch) rescue nil)
+        entries << {alias_name, alias_digest}
+      end
       JSON.build do |json|
         json.object do
           json.field "tag_name", tag
           json.field "assets" do
             json.array do
-              json.object do
-                json.field "name", name
-                json.field "browser_download_url", "#{DOWNLOAD_BASE}/#{tag}/#{name}"
-                json.field "digest", "sha256:#{digest}" if digest
+              entries.each do |(name, hex)|
+                json.object do
+                  json.field "name", name
+                  json.field "browser_download_url", "#{DOWNLOAD_BASE}/#{tag}/#{name}"
+                  json.field "digest", "sha256:#{hex}" if hex
+                end
               end
             end
           end
@@ -828,20 +884,27 @@ module Gori
       end
     end
 
-    # sha256 for `name` out of the release's SHA256SUMS, or nil when the release
+    # {asset name => sha256} from the release's SHA256SUMS, empty when the release
     # publishes none / the fetch fails. Only needed on the redirect fallback: the
     # API hands us a per-asset digest directly, but it is the API that is
     # unavailable there, and SHA256SUMS travels the same no-quota download path.
-    def self.fetch_asset_digest(tag : String, name : String) : String?
+    #
+    # Fetched once and returned whole rather than looked up per name, because that
+    # one file already covers BOTH the versioned asset and its version-less alias
+    # (release-binary.yml emits a line for each). Re-fetching it for the alias would
+    # mean a second round trip on the one code path where GitHub is already known
+    # to be failing — and a transient failure there would silently downgrade the
+    # alias to no checksum at all, after we had told the operator we would verify.
+    def self.fetch_checksums(tag : String) : Hash(String, String)
       body : String? = nil
       with_tempdir("gori-sums-") do |dir|
         dest = File.join(dir, "SHA256SUMS")
         download_to("#{DOWNLOAD_BASE}/#{tag}/SHA256SUMS", dest)
         body = File.read(dest)
       end
-      body.try { |text| parse_checksums(text)[name]? }
+      body.try { |text| parse_checksums(text) } || {} of String => String
     rescue
-      nil
+      {} of String => String
     end
 
     # fetch_latest_release_json, but when GitHub refuses (rate limit, outage) it
@@ -858,8 +921,11 @@ module Gori
       raise ex unless default_api?(api_url)
       tag = resolve_tag_via_redirect(timeout)
       raise ex unless tag
-      digest = fetch_asset_digest(tag, asset_name(tag, current_os, current_arch))
-      {synthesize_release_json(tag, digest: digest), true}
+      sums = fetch_checksums(tag)
+      alias_name = (alias_asset_name(current_os, current_arch) rescue nil)
+      {synthesize_release_json(tag,
+        digest: sums[asset_name(tag, current_os, current_arch)]?,
+        alias_digest: alias_name.try { |n| sums[n]? }), true}
     end
 
     # Maps a non-200 releases-API status onto the error we surface. Split out of
@@ -937,6 +1003,10 @@ module Gori
           end
           unless code == 200
             response.body_io.gets_to_end
+            # 404 gets its own type: it is the one status that means "this exact
+            # name is not in the release", which is the only thing worth retrying
+            # under the version-less alias.
+            raise AssetNotFound.new("download failed HTTP 404 for #{url}") if code == 404
             raise Error.new("download failed HTTP #{code} for #{url}")
           end
           cl = response.headers["Content-Length"]?.try(&.to_i64?) || 0_i64
@@ -970,6 +1040,23 @@ module Gori
       end
     end
 
+    # Put `source` in place of `target` without ever writing into the live target
+    # file: copy to a sibling temp, chmod, then rename over it. The rename is
+    # atomic within the directory, so a failure at any step leaves the binary that
+    # is currently installed exactly as it was.
+    #
+    # There is deliberately NO in-place `cp source, target` fallback. `tmp` is
+    # created in `File.dirname(target)`, so it is on the target's own filesystem and
+    # the cross-device rename such a fallback claimed to rescue does not arise —
+    # the one exception being a target that is itself a bind mountpoint (a
+    # single-file `docker run -v` of the binary), where rename gives EBUSY/EXDEV.
+    # That layout loses its self-update and gets a clear error instead, which is
+    # the better trade: what the fallback actually did was truncate the running
+    # binary and, if the write then died (ENOSPC/EIO), leave a corrupt gori behind
+    # — turning a clean, non-destructive failure into a destructive one.
+    #
+    # Rescues every exception rather than only File::Error: a copy that fails
+    # part-way with, say, IO::Error would otherwise strand `tmp` next to the binary.
     def self.atomic_install(source : String, target : String) : Nil
       dir = File.dirname(target)
       Dir.mkdir_p(dir)
@@ -978,26 +1065,23 @@ module Gori
         FileUtils.cp(source, tmp)
         File.chmod(tmp, 0o755)
         File.rename(tmp, target)
-      rescue ex : File::Error
+      rescue ex
         File.delete?(tmp)
-        # Cross-device rename: fall back to copy into a new temp then rename if possible.
-        tmp2 = File.join(dir, ".gori-update.#{Process.pid}.#{Random::Secure.hex(4)}")
-        begin
-          FileUtils.cp(source, tmp2)
-          File.chmod(tmp2, 0o755)
-          begin
-            File.rename(tmp2, target)
-          rescue
-            # Last resort in-place replace (not crash-safe across power loss).
-            FileUtils.cp(source, target)
-            File.chmod(target, 0o755)
-            File.delete?(tmp2)
-          end
-        rescue ex2
-          File.delete?(tmp2)
-          raise Error.new("failed to install binary to #{target}: #{ex2.message} (earlier: #{ex.message})")
-        end
+        raise Error.new(
+          "failed to install binary to #{target}: #{ex.message} " \
+          "(the binary already installed there was left untouched)"
+        )
       end
+    end
+
+    # `atomic_install` renames a sibling temp file over the target, so replacing
+    # gori needs a writable *directory* — the mode of the binary itself is
+    # irrelevant. Checked before the download because the asset is tens of MB and
+    # "permission denied" is otherwise only discovered once all of it is on disk.
+    def self.install_dir_writable?(target_path : String) : Bool
+      dir = File.dirname(File.expand_path(target_path))
+      return true unless File.directory?(dir) # atomic_install creates it
+      File::Info.writable?(dir)
     end
 
     # Crystal has no Dir.mktmpdir; create a unique dir under Dir.tempdir and clean up.
@@ -1027,31 +1111,97 @@ module Gori
       raise Error.new("tar extract failed: #{tar_err}") unless status.success?
     end
 
+    LIB_BACKUP_SUFFIX  = ".gori-old."
+    LIB_STAGING_SUFFIX = ".gori-new."
+
     # Replace lib/ only at a verified-safe destination. Stages to a temp name then renames.
-    def self.replace_lib_dir(lib_src : String, lib_dst : String) : Nil
+    #
+    # Returns where the previous lib/ was moved to, or nil when there was none.
+    # The backup is NOT deleted here: the caller owns it until the new binary is
+    # in place too (see install_from_download), because a failed binary install is
+    # exactly when the old dylibs have to come back.
+    def self.replace_lib_dir(lib_src : String, lib_dst : String) : String?
       raise Error.new("refusing to install lib/ at unsafe path: #{lib_dst}") if forbidden_lib_destination?(lib_dst)
 
       parent = File.dirname(lib_dst)
       Dir.mkdir_p(parent)
-      staged = "#{lib_dst}.gori-new.#{Process.pid}.#{Random::Secure.hex(4)}"
-      backup = "#{lib_dst}.gori-old.#{Process.pid}.#{Random::Secure.hex(4)}"
-      FileUtils.rm_rf(staged) if File.exists?(staged)
-      FileUtils.cp_r(lib_src, staged)
+
+      # Half-copied staging trees are always garbage, so they go unconditionally.
+      # Backups do NOT: if a previous run died between renaming lib/ aside and
+      # renaming the new one in, that backup is the ONLY surviving copy of the
+      # installed dylibs and deleting it here would destroy them for good. It is
+      # redundant — and only then — when lib/ is standing, which is the window
+      # this sweep exists for (a run killed after the swap but before the binary).
+      sweep_lib_leftovers(lib_dst, LIB_STAGING_SUFFIX)
+      sweep_lib_leftovers(lib_dst, LIB_BACKUP_SUFFIX) if File.exists?(lib_dst)
+
+      staged = "#{lib_dst}#{LIB_STAGING_SUFFIX}#{Process.pid}.#{Random::Secure.hex(4)}"
+      backup = "#{lib_dst}#{LIB_BACKUP_SUFFIX}#{Process.pid}.#{Random::Secure.hex(4)}"
+      moved = false
       begin
+        # Inside the begin: a cp_r that dies on ENOSPC part-way through would
+        # otherwise strand a half-copied dylib tree next to the live install, and
+        # every retry would add another one under a fresh pid.
+        FileUtils.cp_r(lib_src, staged)
         if File.exists?(lib_dst)
-          FileUtils.rm_rf(backup) if File.exists?(backup)
           File.rename(lib_dst, backup)
+          moved = true
         end
         File.rename(staged, lib_dst)
-        FileUtils.rm_rf(backup) if File.exists?(backup)
+        moved ? backup : nil
       rescue ex
         # Best-effort restore
         FileUtils.rm_rf(staged) if File.exists?(staged)
-        if File.exists?(backup) && !File.exists?(lib_dst)
+        if moved && File.exists?(backup) && !File.exists?(lib_dst)
           File.rename(backup, lib_dst) rescue nil
         end
         raise Error.new("failed to install bundled lib/ to #{lib_dst}: #{ex.message}")
       end
+    end
+
+    # Undo what replace_lib_dir did. `backup` nil means there was no previous lib/,
+    # so reverting means removing the one we just installed. Returns whether the
+    # tree is back the way it was — the caller puts that in its error on purpose,
+    # since a silent failure here leaves new dylibs beside an old binary, the one
+    # state the operator cannot fix without a full reinstall.
+    def self.restore_lib_dir(lib_dst : String, backup : String?) : Bool
+      # Check before deleting: losing the new lib/ AND having no backup to put
+      # back is strictly worse than leaving the swap in place.
+      return false if backup && !File.exists?(backup)
+      FileUtils.rm_rf(lib_dst) if File.exists?(lib_dst)
+      File.rename(backup, lib_dst) if backup
+      true
+    rescue
+      false
+    end
+
+    # Remove `lib<suffix>*` siblings stranded by an interrupted run. Never touches
+    # lib/ itself.
+    #
+    # Matches by prefix over Dir.children rather than by Dir.glob: the install path
+    # is the operator's, and a prefix containing `[`, `*` or `?` would make a glob
+    # both miss the real leftovers and rm_rf entries under sibling directories it
+    # was never meant to see.
+    private def self.sweep_lib_leftovers(lib_dst : String, suffix : String) : Nil
+      parent = File.dirname(lib_dst)
+      prefix = "#{File.basename(lib_dst)}#{suffix}"
+      Dir.children(parent).each do |name|
+        FileUtils.rm_rf(File.join(parent, name)) if name.starts_with?(prefix)
+      end
+    rescue
+      # A leftover we cannot clear is cosmetic; never fail an update over it.
+    end
+
+    # The `gori` binary inside an extracted archive: at the top level normally,
+    # otherwise the first match anywhere in the tree that is not itself a slip path.
+    private def self.extracted_binary(dir : String) : String
+      top = File.join(dir, "gori")
+      return top if File.file?(top)
+      found = Dir.glob(File.join(dir, "**", "gori")).find do |p|
+        File.file?(p) && File.basename(p) == "gori" && !unsafe_tar_entry?(p.lchop(dir).lchop('/'))
+      end
+      raise Error.new("archive did not contain a gori binary") unless found
+      found
     end
 
     def self.install_from_download(downloaded : String, target_path : String, archive : Bool) : Nil
@@ -1071,24 +1221,49 @@ module Gori
         with_tempdir("gori-update-") do |dir|
           extract_tar(downloaded, dir)
 
-          new_bin = File.join(dir, "gori")
-          unless File.file?(new_bin)
-            found = Dir.glob(File.join(dir, "**", "gori")).find do |p|
-              File.file?(p) && File.basename(p) == "gori" && !unsafe_tar_entry?(p.lchop(dir).lchop('/'))
-            end
-            raise Error.new("archive did not contain a gori binary") unless found
-            new_bin = found
+          new_bin = extracted_binary(dir)
+          lib_src = File.join(File.dirname(new_bin), "lib")
+          # Install lib first so a failed lib step never leaves a new binary without
+          # dylibs — but hold on to the tree it displaced until the binary is in
+          # place too. The reverse failure (new dylibs, old binary) breaks just as
+          # hard when a bundled dylib's basename changed between releases, and it
+          # used to be unrecoverable: replace_lib_dir deleted the backup on success
+          # and with_tempdir then swept away the new binary on the way out.
+          swapped = Dir.exists?(lib_src)
+          backup = swapped ? replace_lib_dir(lib_src, lib_dst) : nil
+
+          begin
+            atomic_install(new_bin, target_path)
+          rescue ex
+            raise swapped ? lib_rollback_error(ex, lib_dst, backup) : ex
           end
 
-          lib_src = File.join(File.dirname(new_bin), "lib")
-          # Install lib first so a failed lib step never leaves a new binary without dylibs.
-          if Dir.exists?(lib_src)
-            replace_lib_dir(lib_src, lib_dst)
+          # Rescued: the update has fully succeeded by now, and a backup we cannot
+          # reclaim (NFS silly-rename, a held-open file) must not turn that into a
+          # backtrace that suppresses the "Installed …" line and reads as failure.
+          begin
+            FileUtils.rm_rf(backup) if backup && File.exists?(backup)
+          rescue
           end
-          atomic_install(new_bin, target_path)
         end
       else
         atomic_install(downloaded, target_path)
+      end
+    end
+
+    # Roll the lib/ swap back after the binary install failed, and say in the error
+    # whether that worked. Whether it worked is the whole message: a rollback that
+    # succeeded means the installed gori still runs and the user can just retry,
+    # while one that failed means they are looking at a gori that may not start.
+    private def self.lib_rollback_error(ex : Exception, lib_dst : String, backup : String?) : Error
+      if restore_lib_dir(lib_dst, backup)
+        Error.new("#{ex.message} — the bundled lib/ was rolled back, so the installed gori is unchanged")
+      else
+        Error.new(
+          "#{ex.message} — and the bundled lib/ at #{lib_dst} could NOT be rolled back, " \
+          "so the installed gori may no longer start. Re-run `gori update`, or reinstall: " \
+          "curl -fsSL https://gori.hahwul.com/install.sh | bash"
+        )
       end
     end
 
@@ -1104,6 +1279,35 @@ module Gori
         io.puts "Verifying sha256 checksum"
         verify_sha256!(dest, expected_sha, asset.name)
       end
+    end
+
+    # Download `asset` into `dir`; if the release does not carry that exact name,
+    # retry once under the version-less alias. Returns the file written, the asset
+    # it actually came from, and its byte count.
+    #
+    # Only a 404 triggers the retry. A truncated transfer or a checksum mismatch
+    # means the asset IS there and came back wrong — fetching it under a second
+    # name would paper over the signal the integrity checks exist to raise.
+    private def self.download_asset(release : Release, asset : Asset, dir : String, io : IO, *,
+                                    force_progress : Bool) : {String, Asset, Int64}
+      dest = File.join(dir, asset.name)
+      got = download_to(asset.browser_download_url, dest,
+        expected_size: asset.size, progress_io: io, force_progress: force_progress)
+      {dest, asset, got}
+    rescue ex : AssetNotFound
+      # A 404 is not proof the release is unusable: the redirect fallback only ever
+      # GUESSED this filename from a tag. release-binary.yml publishes a
+      # version-less copy of every asset for exactly this second chance, and
+      # install.sh has taken it since #345 — this is the same retry for
+      # `gori update`, which until now simply died here.
+      fallback = alias_asset(release, asset)
+      raise ex unless fallback
+      io.puts "#{asset.name} is not in #{display_version(release.tag_name)};"
+      io.puts "retrying the version-less alias #{fallback.name}"
+      dest = File.join(dir, fallback.name)
+      got = download_to(fallback.browser_download_url, dest,
+        expected_size: fallback.size, progress_io: io, force_progress: force_progress)
+      {dest, fallback, got}
     end
 
     def self.update_binary(target_path : String, io : IO = STDOUT, _err : IO = STDERR, *,
@@ -1139,6 +1343,18 @@ module Gori
         )
       end
 
+      # Same reason, same place: an unwritable install directory is knowable now,
+      # and finding out after pulling tens of MB is the difference between a
+      # one-line error and a wasted download on a metered link.
+      unless install_dir_writable?(target_path)
+        raise Error.new(
+          "cannot write to #{File.dirname(target_path)} — `gori update` installs by renaming " \
+          "a new file into that directory. Re-run as its owner (e.g. `sudo gori update`), or " \
+          "reinstall under a writable prefix: " \
+          "GORI_INSTALL_PREFIX=\"$HOME/.local\" curl -fsSL https://gori.hahwul.com/install.sh | bash"
+        )
+      end
+
       if via_redirect
         io.puts "Note: the GitHub release API was unavailable (rate limit or outage);"
         io.puts "      resolved #{display_version(release.tag_name)} from #{RELEASES_LATEST_URL} instead."
@@ -1152,12 +1368,8 @@ module Gori
       io.puts "Downloading #{asset.name}#{size_note}"
 
       with_tempdir("gori-dl-") do |dir|
-        dest = File.join(dir, asset.name)
         started = Time.instant
-        got = download_to(asset.browser_download_url, dest,
-          expected_size: asset.size,
-          progress_io: io,
-          force_progress: force_progress)
+        dest, asset, got = download_asset(release, asset, dir, io, force_progress: force_progress)
         verify_download!(dest, asset, got, io)
         io.puts "Downloaded #{format_size(got)} in #{format_duration(started.elapsed)}"
         install_from_download(dest, target_path, asset_is_archive?(asset.name))
