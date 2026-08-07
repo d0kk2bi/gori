@@ -128,10 +128,15 @@ module Gori::Tui
     # (Re)load the PROJECT SETTINGS network fields from the effective config — the project
     # override when pinned, else the global default (Session.open populated Settings.project_*
     # from this project's DB on open). @set_overridden drives the "· project/global" marker.
+    #
+    # The bind pair uses `configured_bind_*`, NOT `effective_bind_*`: those two differ only by
+    # the process-only `-l`/`-p` layer, which is neither a project pin nor the global — so it
+    # would be shown here under a "· global" marker that misnames it, and would become an
+    # inherit-baseline that makes the running port unpinnable. See Settings.configured_bind_host.
     private def load_settings_values : Nil
       @set_values = [
-        Settings.effective_bind_host,
-        Settings.effective_bind_port.to_s,
+        Settings.configured_bind_host,
+        Settings.configured_bind_port.to_s,
         Settings.effective_upstream_proxy,
         Settings.effective_connect_timeout_secs.to_s,
         Settings.effective_io_timeout_secs.to_s,

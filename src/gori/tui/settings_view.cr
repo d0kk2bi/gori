@@ -684,6 +684,17 @@ module Gori::Tui
         @status = "invalid TLS passthrough host"
         return err
       end
+      # An explicit bind edit HERE supersedes a `-l`/`-p` launch override. That override is
+      # process-only and invisible on this screen, and the rebind Runner#apply_settings performs
+      # compares `effective_bind_*` — where the override wins — so leaving it in place made this
+      # edit report "settings saved" while the proxy stayed on the flag's address, with no
+      # in-session way to clear it. Only on an actual CHANGE: a save that left the bind alone
+      # (an upstream-proxy or timeout edit) must not silently drop the override and yank the
+      # proxy off the port the operator launched it on.
+      if @values[0].strip != Settings.bind_host || port != Settings.bind_port
+        Settings.cli_bind_host = nil
+        Settings.cli_bind_port = nil
+      end
       Settings.bind_host = @values[0].strip
       Settings.bind_port = port
       Settings.upstream_proxy = up

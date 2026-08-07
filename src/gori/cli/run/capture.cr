@@ -6,6 +6,10 @@ module Gori
         Settings.load # persisted bind is the default; flags override
         listen = Settings.bind_host
         port = Settings.bind_port
+        # Only an actual flag reaches the runtime override layer below — `listen`/`port` are
+        # pre-seeded from Settings and so can't say whether one was given.
+        listen_flag = nil.as(String?)
+        port_flag = nil.as(Int32?)
         db_path : String? = nil
         project_name : String? = nil
         insecure = false
@@ -15,8 +19,8 @@ module Gori
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run capture [options]\n\nRun the proxy and stream captured flows to STDOUT until Ctrl-C (or --for / --max)."
-          p.on("-lHOST", "--listen=HOST", "Listen address (default #{listen})") { |v| listen = v }
-          p.on("-pPORT", "--port=PORT", "Listen port (default #{port})") { |v| port = parse_port(v) }
+          p.on("-lHOST", "--listen=HOST", "Listen address (default #{listen})") { |v| listen = listen_flag = v }
+          p.on("-pPORT", "--port=PORT", "Listen port (default #{port})") { |v| port = port_flag = parse_port(v) }
           p.on("--project=NAME", "Capture into project NAME (created if missing; default 'default')") { |v| project_name = v }
           p.on("--db=PATH", "Capture into an explicit SQLite db file") { |v| db_path = v }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
@@ -33,8 +37,11 @@ module Gori
         parser.parse(args)
 
         Paths.ensure_dirs
-        Settings.bind_host = listen
-        Settings.bind_port = port
+        # The process-only override layer, not the persisted global: Session.open reads
+        # `effective_bind_*`, and any `Settings.save` this run makes must not promote a `-l`/`-p`
+        # into settings.json. See Settings.cli_bind_host.
+        Settings.cli_bind_host = listen_flag
+        Settings.cli_bind_port = port_flag
         project = resolve_capture_project(project_name, db_path)
         config = Config.new(listen, port, project.db_path, Paths.default_ca_dir,
           insecure_upstream: insecure)

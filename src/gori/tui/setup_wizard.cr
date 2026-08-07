@@ -33,6 +33,41 @@ module Gori::Tui
     LIST_MIN        = 24 # minimum theme-list width before the preview is dropped
     THEME_VP_MAX    = 10 # most theme rows shown at once
 
+    # Interior content rows each FIXED-LAYOUT step draws, below the card's top border + 1 pad
+    # row. Each must match what the matching render_* actually draws at its fixed offsets, and
+    # NOTHING CHECKS THAT — the spec pins MIN_H against these numbers, not these numbers against
+    # the renderers, because SetupWizard builds its own TermisuBackend and can't be rendered
+    # headless. So they are load-bearing by hand: at MIN_H the tallest step has exactly ZERO
+    # spare rows (its content ends on `box.bottom - 2`), which means one row added to a render_*
+    # without bumping its constant here draws straight over the card's bottom border, and one
+    # row added to REVIEW raises the real floor above the "min 40x15" the guard advertises.
+    # Count the offsets in the renderer when you touch either.
+    # (Appearance isn't here — it scrolls, so its viewport follows the card height rather than
+    # demanding one; see `content_rows`.)
+    BIND_ROWS   = 8 # heading, gap, ip, port, gap, 2 info lines, status
+    PET_ROWS    = 7 # heading, gap, 2 offer rows, gap, motion row, info line
+    REVIEW_ROWS = 9 # title, gap, 4 recap rows, gap, 2 offer rows
+
+    # ONE size floor for every step, DERIVED from the tallest rather than hand-counted. It used
+    # to be checked per step against each step's own rows, and the steps don't agree — BIND
+    # wanted 14 terminal rows, PET 13, REVIEW 15 — so a 14-row terminal drew BIND, THEME and PET
+    # and then refused to draw REVIEW, the one step where `finish` lives. Input is handled
+    # regardless of that guard, so a blind ↵ still committed; the user simply had no way to know
+    # it would. One floor means the wizard refuses at step 1 or not at all.
+    #
+    # `+ 6`: a card needs `rows + 3` (top border, pad row, content, bottom border) and
+    # `card_h` can only reach `h - 3`. See the spec, which pins the derivation in both
+    # directions so a new REVIEW row can't quietly raise the real floor past this number.
+    MIN_W = 40 # Layout.usable?'s width floor; step_card clamps to 34 columns inside it
+    MIN_H = {BIND_ROWS, PET_ROWS, REVIEW_ROWS}.max + 6
+
+    # The card height `step_card` settles on for a terminal of height `h` and a step wanting
+    # `rows` of content. Pulled out as a pure class method so the MIN_H invariant above is
+    # checkable without standing up a terminal.
+    def self.card_h(h : Int32, rows : Int32) : Int32
+      {rows + 6, {h - 3, 3}.max}.min
+    end
+
     enum Step
       Bind       # bind ip/port
       Appearance # theme (named Appearance to avoid clashing with the Theme module)
@@ -45,8 +80,10 @@ module Gori::Tui
       # Held as the base Backend: TermisuBackend is generic over the terminal type.
       @backend = TermisuBackend.new(@term).as(Backend)
       @step = Step::Bind
-      # Bind step — staged values prefilled from the live Settings (which already
-      # reflect any `gori tui --port` flag).
+      # Bind step — staged values prefilled from the PERSISTED global, which is deliberately
+      # NOT where a `gori tui -l/-p` override lives (that is `Settings.cli_bind_*`, a
+      # process-only layer). Staging the flag here is what used to promote a documented
+      # one-run value into the permanent default on finish.
       @ip = Settings.bind_host
       @port = Settings.bind_port.to_s
       @bind_field = :ip  # :ip | :port
@@ -80,11 +117,20 @@ module Gori::Tui
       # first-run chance to pick ⌥ before hitting a terminal that eats Ctrl+digit. Kept on
       # ←/→ rather than the ↑/↓ offer ring, so Review needs no focus ring.
       @modifier = Settings.command_modifier
+      # Non-nil once a persist attempt has FAILED: drawn in the footer in place of the key
+      # hint, and returned by `run` so the caller can put it somewhere that outlives the alt
+      # screen. `Settings.save` rescues everything and reports failure as a plain `false`,
+      # which both commit paths used to discard — so an unwritable settings.json meant the
+      # wizard walked the user through four steps, accepted "finish", and exited 0 having
+      # written nothing. Worse on the first-run path, whose auto-launch gate is that file's
+      # existence: the wizard then re-opened on every launch with nothing saying why.
+      @save_error = nil.as(String?)
     end
 
-    # Run the wizard to completion (finish) or skip. Returns when the user is done;
-    # the caller (App#run_tui or `gori wizard`) continues afterward.
-    def run : Nil
+    # Run the wizard to completion (finish) or skip. Returns nil, or a one-line reason the
+    # settings could not be persisted — reporting that is the caller's job (App#run_tui puts
+    # it on the picker, `gori wizard` on STDERR), because this screen is about to be wiped.
+    def run : String?
       Theme.load_custom # pick up any user themes dropped under <GORI_HOME>/themes
       @theme_name = Theme.canonical(@theme_name)
       @theme_baseline = Theme.active_name
@@ -105,8 +151,25 @@ module Gori::Tui
         break unless @running
       end
       # Opted into the tour on the Review step → run it now, reusing this terminal
-      # (already enhanced-keyboard + mouse enabled). Skip/Esc leaves it false.
-      Tutorial.new(@term).run if @launch_tutorial
+      # (already in raw mode with enhanced keyboard on). Skip/Esc leaves it false.
+      launch_tour if @launch_tutorial
+      @save_error
+    end
+
+    # Hand this terminal to the guided tour. `gori tutorial` enables the mouse
+    # UNCONDITIONALLY — the tour's Prev/Next buttons and its mock clicks are mouse-driven —
+    # while both wizard callers gate `enable_mouse` on Settings.mouse. So the same tour had
+    # live buttons or dead ones depending on which door the user came through. Borrow the
+    # mouse for the tour when the caller left it off, then hand the terminal back exactly as
+    # it arrived (the picker and Runner that follow honour Settings.mouse themselves).
+    private def launch_tour : Nil
+      borrowed = !Settings.mouse
+      @term.enable_mouse if borrowed
+      begin
+        Tutorial.new(@term).run
+      ensure
+        @term.disable_mouse if borrowed
+      end
     end
 
     # --- input ---------------------------------------------------------------
@@ -118,6 +181,13 @@ module Gori::Tui
         skip # Esc / ^C exits the wizard (revert preview, persist defaults)
         return
       end
+      # Below the floor NOTHING but the two keys above is accepted. `fits?` gates rendering, and
+      # while it was the only gate the "terminal too small" screen stayed fully navigable: four
+      # blind ↵ presses walked Bind → Pet → Review → `finish` and committed a bind/theme/pet the
+      # operator never saw a single frame of. A screen that says it cannot draw the choices must
+      # not accept them either — resizing brings the wizard back with nothing lost, since every
+      # answer is staged in this object.
+      return unless fits?(*@backend.size)
       case @step
       when Step::Bind       then handle_bind_key(ev)
       when Step::Appearance then handle_theme_key(ev)
@@ -203,6 +273,10 @@ module Gori::Tui
         @modifier = @modifier == "alt" ? "ctrl" : "alt"
       elsif key.back_tab?
         @step = Step::Pet
+        # The failed-save footer says "↵ retry", and ↵ only retries HERE (elsewhere it
+        # advances), so the notice doesn't follow the user off this step. A still-blocked write
+        # sets it again on the next ↵, and `skip` reports its own failure independently.
+        @save_error = nil
       end
     end
 
@@ -288,7 +362,16 @@ module Gori::Tui
     end
 
     # Commit the staged choices and persist. The live palette is already @theme_name.
+    #
+    # Every field is snapshotted first so a FAILED write can be rolled back: the wizard has
+    # to stay on REVIEW in that case (nowhere else can report it), and while it is there Esc
+    # must still mean what it says — "leaves Settings untouched". Without the rollback, a
+    # failed finish followed by Esc would have `skip` persist the committed values under the
+    # one keystroke that promises not to.
     private def finish : Nil
+      prev_host, prev_port = Settings.bind_host, Settings.bind_port
+      prev_theme, prev_modifier = Settings.theme, Settings.command_modifier
+      prev_pet, prev_motion = Settings.pet?, Settings.pet_motion
       Settings.bind_host = effective_ip
       Settings.bind_port = @port.strip.to_i? || Settings.bind_port
       Settings.theme = @theme_name
@@ -300,9 +383,28 @@ module Gori::Tui
       # factory-default).
       Settings.pet = @pet_enabled
       Settings.pet_motion = Settings.normalize_pet_motion(@pet_motion) if @pet_enabled
-      Settings.save
-      @launch_tutorial = @offer == :tour # `run` launches the tour after the loop
-      @running = false
+      if Settings.save
+        @save_error = nil
+        @launch_tutorial = @offer == :tour # `run` launches the tour after the loop
+        @running = false
+        return
+      end
+      Settings.bind_host = prev_host
+      Settings.bind_port = prev_port
+      Settings.theme = prev_theme
+      Settings.command_modifier = prev_modifier
+      Settings.pet = prev_pet
+      Settings.pet_motion = prev_motion
+      # Held on REVIEW: the staged choices live on in this object's own fields, so ↵ retries
+      # the write once the user has unblocked it (a full disk, a read-only --config path).
+      # "esc DISCARD", not "esc leave": Esc runs `skip`, which saves the rolled-back values, so
+      # leaving from here throws every answer away. Saying "leave" invited reading it as
+      # "dismiss this error" and losing four screens of work to a keystroke that looked inert.
+      #
+      # This string is FOOTER-ONLY and never reaches a caller: `finish` leaves @running true, so
+      # the loop can exit only through a successful finish (which nils it) or `skip` (which
+      # overwrites it) — see `run`'s return.
+      @save_error = "save failed: could not write #{Settings.path} · ↵ retry · esc discard"
     end
 
     # Exit without committing: revert the live theme preview to the baseline, leave
@@ -311,7 +413,12 @@ module Gori::Tui
     private def skip : Nil
       Theme.apply(@theme_baseline)
       @resized = true
-      Settings.save
+      # Esc means leave, so unlike `finish` a failed write cannot hold the user here — it is
+      # reported through `run`'s return instead. It matters even though nothing was staged:
+      # the file not appearing is exactly what makes the first-run wizard re-open next launch.
+      # Unprefixed: this is the ONE string `run` can return, and each caller frames it for where
+      # it lands ("gori: setup wizard: …" on STDERR, "setup wizard: …" on the picker).
+      @save_error = Settings.save ? nil : "could not write #{Settings.path}"
       @running = false
     end
 
@@ -324,7 +431,8 @@ module Gori::Tui
 
     private def handle_mouse(ev : Termisu::Event::Mouse) : Nil
       return unless ev.press? || ev.wheel?
-      mx, my = ev.x - 1, ev.y - 1 # termisu mouse coords are 1-based
+      return unless fits?(*@backend.size) # same reason handle_key bails: nothing is on screen to hit
+      mx, my = ev.x - 1, ev.y - 1         # termisu mouse coords are 1-based
       if ev.wheel?
         if @step.appearance? && (ev.button.wheel_up? || ev.button.wheel_down?)
           cycle_theme(ev.button.wheel_up? ? -1 : 1)
@@ -340,6 +448,11 @@ module Gori::Tui
       w, h = @backend.size
       box = step_card(w, h)
       return unless box.contains?(mx, my)
+      # The LIST's own columns only. `box.contains?` also covers the live preview panel, the
+      # gap beside it and the card's two border columns, and with `mx` otherwise unused a
+      # click anywhere on a row silently re-picked the theme sitting at it — including a
+      # click on the preview the user had gone there to look at.
+      return unless box.x < mx <= box.x + theme_list_w(box)
       names = Theme.available
       return if names.empty?
       vp = {box.h - 6, 1}.max
@@ -367,34 +480,48 @@ module Gori::Tui
       inner = {w - 4, cols}.min
       cw = {inner, 34}.max
       avail = {h - 3, 3}.max # rows between the header (y0-1) and the hint (y h-1)
-      ch = {content_rows + 6, avail}.min
+      ch = SetupWizard.card_h(h, content_rows)
       cx = {(w - cw) // 2, 0}.max
       cy = 2 + {(avail - ch) // 2, 0}.max
       Rect.new(cx, cy, cw, ch)
     end
 
+    # Columns the theme LIST occupies inside `box`; the rest goes to the preview panel, or
+    # back to the list on a card too narrow to hold both. The ONE source of that split —
+    # render and the click hit-test share it, so a click can't land on a row the list
+    # doesn't own.
+    private def theme_list_w(box : Rect) : Int32
+      full = box.w - 2
+      full >= LIST_MIN + PREVIEW_GAP + PREVIEW_W ? full - PREVIEW_GAP - PREVIEW_W : full
+    end
+
     # Interior content rows a step draws (below the card's top border + 1 pad row).
-    # Must be ACCURATE for the fixed-layout steps: `step_fits?` rejects a terminal too
-    # short to hold them, and render_* draw at fixed offsets up to `box.y + 2 + this`.
+    # Must be ACCURATE for the fixed-layout steps: MIN_H is derived from the largest of
+    # them, and render_* draw at fixed offsets up to `box.y + 2 + this`.
     private def content_rows : Int32
       case @step
-      when Step::Bind   then 8 # heading, gap, ip, port, gap, 2 info lines, status
-      when Step::Pet    then 7 # heading, gap, 2 offer rows, gap, motion row, info line
-      when Step::Review then 9 # title, gap, 4 recap rows, gap, 2 offer rows
-      # ≥7 so the preview panel (header + 3 status rows) is never clipped, capped so a
-      # long theme list scrolls (the list viewport derives from the card height) instead
-      # of demanding the whole screen.
+      when Step::Bind   then BIND_ROWS
+      when Step::Pet    then PET_ROWS
+      when Step::Review then REVIEW_ROWS
+        # ≥7 so the preview panel (header + 3 status rows) is never clipped, capped so a
+        # long theme list scrolls (the list viewport derives from the card height) instead
+        # of demanding the whole screen.
       else { {Theme.available.size, 7}.max, THEME_VP_MAX }.min # appearance
       end
     end
 
-    # Whether the current step's card can hold its content at height `h`. The theme
-    # step scrolls (its viewport derives from the card height) so it fits any usable
-    # size; the fixed-layout steps draw at fixed offsets and need `content_rows` rows
-    # below the top border + pad, i.e. a card height of at least `content_rows + 3`.
-    private def step_fits?(h : Int32) : Bool
-      return true if @step.appearance?
-      step_card(@backend.size[0], h).h - 3 >= content_rows
+    # Whether the wizard can draw AT ALL at `w`×`h`. Deliberately step-independent: the
+    # fixed-layout steps each need `content_rows` rows below their card's top border + pad
+    # (a card height of `content_rows + 3`), and honouring that per step is what let the
+    # wizard accept a terminal at BIND and then dead-end at REVIEW. See MIN_H.
+    #
+    # Also the input gate (handle_key / handle_mouse): a screen that can't draw the choices must
+    # not accept them. Width comes entirely from `Layout.usable?` — MIN_W equals its floor, so a
+    # separate `w >= MIN_W` conjunct here would never reject anything the first term didn't;
+    # MIN_W's job is to be the number in the on-screen message, and the spec pins the two
+    # together so the message can't drift from what actually rejects.
+    private def fits?(w : Int32, h : Int32) : Bool
+      Layout.usable?(w, h) && h >= MIN_H
     end
 
     # --- rendering -----------------------------------------------------------
@@ -404,10 +531,13 @@ module Gori::Tui
       w, h = screen.width, screen.height
       screen.fill(Rect.new(0, 0, w, h), Theme.bg)
 
-      # Below the global minimum, or too short for THIS step's card (the fixed-layout
-      # steps would otherwise draw their lower rows over the card border / footer).
-      unless Layout.usable?(w, h) && step_fits?(h)
-        screen.text(0, 0, "terminal too small for the setup wizard — resize and retry", Theme.red)
+      # Below the wizard's floor. Two rows, both inside MIN_W so neither is ellipsized at
+      # the narrowest terminal that CAN run it: the size actually needed (a bare "resize and
+      # retry" left the user guessing by how much) and the fact that Esc still works — input
+      # is live behind this screen, which is the only thing that makes it escapable.
+      unless fits?(w, h)
+        screen.text(0, 0, "terminal too small for the setup wizard", Theme.red, Theme.bg)
+        screen.text(0, 1, "min #{MIN_W}x#{MIN_H} · resize, or esc to skip", Theme.muted, Theme.bg)
         @term.hide_cursor
         flush
         return
@@ -465,6 +595,13 @@ module Gori::Tui
     end
 
     private def render_footer(screen : Screen, w : Int32, h : Int32) : Nil
+      # A failed write displaces the key hint rather than taking a card row of its own:
+      # REVIEW's interior is already exactly `content_rows` tall, so a row there would push
+      # MIN_H from 15 to 16 and lock out terminals that can otherwise finish setup.
+      if err = @save_error
+        screen.text({(w - err.size) // 2, 0}.max, h - 1, err, Theme.red, Theme.bg)
+        return
+      end
       hint = case @step
              when Step::Bind       then "↵ next · ↑/↓ field · esc skip"
              when Step::Appearance then "↑/↓ pick theme · ↵ next · ⇧⇥ back · esc skip"
@@ -523,9 +660,8 @@ module Gori::Tui
       return if names.empty?
       sel = names.index(@theme_name) || 0
       vp = {box.h - 6, 1}.max
-      list_full = box.w - 2
-      two_col = list_full >= LIST_MIN + PREVIEW_GAP + PREVIEW_W
-      list_w = two_col ? list_full - PREVIEW_GAP - PREVIEW_W : list_full
+      list_w = theme_list_w(box)
+      two_col = list_w < box.w - 2 # theme_list_w gives the list everything when it can't fit both
 
       # Scroll-follow: clamp to a valid window, then keep `sel` on screen.
       @theme_scroll = @theme_scroll.clamp(0, {names.size - vp, 0}.max)
@@ -616,13 +752,17 @@ module Gori::Tui
     private def render_pet(screen : Screen, box : Rect) : Nil
       ix = box.x + 3
       # Hold the sprite's column band back before laying out the text, so a line can never
-      # run under her — the same order Tutorial.step_card reserves her band in.
+      # run under her — the same order Tutorial.step_card reserves her band in. But ONLY while
+      # she is actually standing there: every consumer of that reservation (the text width here,
+      # the accent band below, draw_pet_preview at the end) is gated the same way, so under
+      # "No mascot" the step uses the card's full interior instead of ellipsizing its copy and
+      # clipping its rows 14 columns short of an edge with nothing behind it.
       px = box.right - 2 - PET_PREVIEW_W
-      iw = {px - PET_PREVIEW_GAP - ix, 1}.max
+      iw = @pet_enabled ? {px - PET_PREVIEW_GAP - ix, 1}.max : {box.right - 1 - ix, 1}.max
       screen.text(ix, box.y + 2, "A mascot in the corner, off unless you want her.",
         Theme.text, Theme.panel, width: iw)
       ry = box.y + 4
-      band = px - PET_PREVIEW_GAP # the accent band stops short of her plate
+      band = @pet_enabled ? px - PET_PREVIEW_GAP : nil
       render_offer_row(screen, box, ry, "Show Miss Ring", @pet_enabled, band)
       render_offer_row(screen, box, ry + 1, "No mascot", !@pet_enabled, band)
       # Only while she is on — a motion row under "No mascot" offers a setting for
@@ -674,10 +814,10 @@ module Gori::Tui
       # No prompt line above the offer: the two rows below say "Take the guided tour" /
       # "Skip — finish setup" in full, so "New to gori? Take a quick tour of the TUI:" was
       # restating them. Dropping it is what keeps the Miss Ring recap row free — adding a
-      # fourth recap row otherwise pushed content_rows from 9 to 10, which moved the whole
-      # step's minimum height from 15 rows to 16. That is the worst row to lose: REVIEW is
-      # where `finish` lives, so a 15-row terminal could no longer commit the wizard at
-      # all (Esc skips without committing). Net rows are unchanged and the floor holds.
+      # fourth recap row otherwise pushed content_rows from 9 to 10, which moved this step's
+      # minimum height from 15 rows to 16 and, since REVIEW is the tallest step, MIN_H along
+      # with it. That is the worst row to lose: `finish` lives here, so every row added
+      # locks another terminal size out of completing setup. Net rows are unchanged.
       render_offer_row(screen, box, y, "Take the guided tour", @offer == :tour); y += 1
       render_offer_row(screen, box, y, "Skip — finish setup", @offer == :skip)
     end
