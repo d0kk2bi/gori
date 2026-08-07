@@ -201,13 +201,18 @@ module Gori
                                                   token : String?, enabled : Bool?) : Nil
         existing = store.oast_providers.find { |p| p.id == row }
         abort "gori run oast providers update: no project OAST provider with id 'p_#{row}'" if existing.nil?
-        store.update_oast_provider(row,
+        # The store answers whether the write COMMITTED, and this was the one provider verb
+        # that dropped it — `enable/disable`, `delete` and `add` in this same file all check
+        # theirs. So a busy/locked project printed "updated." over a provider whose host or
+        # token was unchanged, and the next `oast` listen went out against the old one.
+        ok = store.update_oast_provider(row,
           name.try(&.strip).presence || existing.name,
           kind.try(&.label) || existing.kind,
           host.try(&.strip).presence || existing.host,
           # See the MCP twin: `--token=` with an empty value is a CLEAR, not an omission.
           token.nil? ? existing.token : token.strip.presence,
           enabled.nil? ? existing.enabled? : enabled)
+        abort "gori run oast providers update: NOT applied (project busy) — the provider is unchanged" unless ok
         puts "OAST provider p_#{row} updated."
       end
 

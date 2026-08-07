@@ -97,9 +97,13 @@ module Gori
 
         applied = false
         if apply && !report.aborted && !report.removed.empty?
+          # ws_keep_key/ws_http_only for the reason the CLI twin gives: update_repeater's SQL
+          # sets both columns unconditionally and its signature defaults them to false, so
+          # omitting them CLEARS a session that carried either.
           applied = store.update_repeater(id: id, target: rec.target,
             request: report.minimized_text.to_slice, http2: rec.http2?,
-            auto_cl: rec.auto_content_length?, sni: rec.sni)
+            auto_cl: rec.auto_content_length?, sni: rec.sni,
+            ws_keep_key: rec.ws_keep_key?, ws_http_only: rec.ws_http_only?)
         end
 
         Result.new(JSON.build do |j|

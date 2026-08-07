@@ -364,10 +364,20 @@ module Gori
       true
     end
 
-    def remove(id : Int64) : Nil
+    # Returns whether the DELETE COMMITTED (false = store busy/locked/closing).
+    #
+    # Unlike `add` above — where `add_scope_rule` goes through `exec_task` and genuinely
+    # reports nothing, so looking at the reloaded list is the only answer available —
+    # `remove_scope_rule` is `exec_task_ok` and has had the answer all along. Dropping it made
+    # every caller claim a security rule was deleted while it was still gating traffic, and
+    # each surface invented its own workaround: MCP bypassed `Scope` entirely to reach the
+    # flag, and the CLI re-read the reloaded rule list. One dropped return value, three
+    # treatments — so it is returned here instead.
+    def remove(id : Int64) : Bool
       @mutex.synchronize do
-        @store.remove_scope_rule(id)
+        ok = @store.remove_scope_rule(id)
         reload_rules_unlocked
+        ok
       end
     end
 

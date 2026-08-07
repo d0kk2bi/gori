@@ -480,8 +480,14 @@ module Gori::Tui
     end
 
     def scope_delete_rule : Nil
+      # Read the selection BEFORE the delete so a refused write can be told apart from an
+      # empty list: `scope_delete` returns nil for both, and staying silent about the first
+      # leaves the rule on screen with no hint that the keypress did nothing.
+      selected = @project_view.selected_rule
       if pat = @project_view.scope_delete
         @host.status("removed scope rule: #{pat}#{scope_blackhole_note}")
+      elsif selected
+        @host.status("scope rule NOT removed (project busy) — it still gates traffic")
       end
     end
 

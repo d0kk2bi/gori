@@ -226,14 +226,20 @@ module Gori
           end
           row_id = custom_rule_row_id(id)
           return err("malformed custom rule id '#{id}'", "INVALID_ARGUMENT", field: "id") unless row_id
-          store.set_probe_custom_rule_enabled(row_id, enabled)
+          ok = store.set_probe_custom_rule_enabled(row_id, enabled)
         else
           disabled = store.probe_disabled_rules
           # `set_rule_enabled` (not a bare delete/add) so a DEFAULT-OFF rule toggles correctly:
           # for those ids the stored-set membership is INVERTED — see `Probe::DEFAULT_DISABLED_RULES`.
           Probe.set_rule_enabled(disabled, id, enabled)
-          store.set_probe_disabled_rules(disabled)
+          ok = store.set_probe_disabled_rules(disabled)
         end
+        # Both writers report whether the toggle COMMITTED. Returning `{enabled: false}` over a
+        # rolled-back batch tells an agent a scan rule is muted while it keeps firing on every
+        # later scan — the same refusal the CLI twin makes (cli/run/probe.cr).
+        # `busy`, not a bare `err`: a rolled-back batch is transient, so the Result must carry
+        # `retryable: true` the way every other PROJECT_BUSY refusal in this server does.
+        return busy("scan rule '#{id}' NOT updated (store busy or unwritable); it is unchanged") unless ok
         Result.new({"id" => id, "enabled" => enabled, "kind" => entry.kind}.to_json)
       end
 
