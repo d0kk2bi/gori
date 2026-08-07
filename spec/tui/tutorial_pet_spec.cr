@@ -165,6 +165,86 @@ describe Gori::Tui::Tutorial do
   end
 end
 
+# `Event::Key#char` is `@char || key.to_char`, so a CHORD arrives carrying its bare letter:
+# ^P is char 'p', ⌥L is char 'l'. Every `ev.char == …` guard in the tour was reading the chord
+# as the letter, which was reproducible end to end at four separate sites:
+#
+#   ^L in Practice        → switched a tab and ticked the "switch" goal
+#   ^O with space open    → ran the menu's `o Open` row and closed it
+#   ^P then ^T in INS     → typed "pt" into the mock request body
+#   ^P then ^T in the palette filter → left "pt" in the query box, ON THE ^P LESSON
+#
+# The real app guards this at each of the matching sites (Runner#handle_palette_key,
+# Runner#handle_space_menu_key, TextField#handle_edit_key); the tour guarded it nowhere.
+# These pin the shared rule, which is a class method for exactly this reason — the four
+# call sites need a tty, the rule does not.
+private def tut_key(k : Termisu::Input::Key,
+                    mods : Termisu::Input::Modifier = Termisu::Input::Modifier::None,
+                    char : Char? = nil) : Termisu::Event::Key
+  Termisu::Event::Key.new(k, mods, char)
+end
+
+private def tut_char_key(c : Char,
+                         mods : Termisu::Input::Modifier = Termisu::Input::Modifier::None) : Termisu::Event::Key
+  # char: nil is what the Ctrl+letter parser branch produces (and what Keybind.dealias
+  # rebuilds ⌥P as), so `char` falls back through `key.to_char` — the fallback that is the
+  # whole bug.
+  tut_key(Termisu::Input::Key.from_char(c), mods)
+end
+
+describe "Gori::Tui::Tutorial.bare_char" do
+  it "passes an unmodified key through" do
+    Gori::Tui::Tutorial.bare_char(tut_char_key('l')).should eq('l')
+    Gori::Tui::Tutorial.bare_char(tut_char_key('[')).should eq('[')
+    Gori::Tui::Tutorial.bare_char(tut_char_key('3')).should eq('3')
+    # space_open_key? reads this one — Key::Space.to_char is ' '.
+    Gori::Tui::Tutorial.bare_char(tut_key(Termisu::Input::Key::Space)).should eq(' ')
+  end
+
+  it "refuses the letter a ctrl or alt chord carries" do
+    Gori::Tui::Tutorial.bare_char(tut_char_key('l', Termisu::Input::Modifier::Ctrl)).should be_nil
+    Gori::Tui::Tutorial.bare_char(tut_char_key('o', Termisu::Input::Modifier::Ctrl)).should be_nil
+    Gori::Tui::Tutorial.bare_char(tut_char_key('p', Termisu::Input::Modifier::Ctrl)).should be_nil
+    Gori::Tui::Tutorial.bare_char(tut_char_key('i', Termisu::Input::Modifier::Alt)).should be_nil
+    # …including when the terminal attached the char explicitly rather than via to_char.
+    Gori::Tui::Tutorial.bare_char(
+      tut_key(Termisu::Input::Key::LowerJ, Termisu::Input::Modifier::Ctrl, 'j')).should be_nil
+  end
+
+  it "keeps ⇧ — a capital is a bare character, and the Edit lesson accepts I" do
+    Gori::Tui::Tutorial.bare_char(
+      tut_key(Termisu::Input::Key::UpperI, Termisu::Input::Modifier::Shift)).should eq('I')
+  end
+end
+
+describe "Gori::Tui::Tutorial.typed_char" do
+  it "inherits the chord guard, so a chord never reaches a text field" do
+    Gori::Tui::Tutorial.typed_char(tut_char_key('p', Termisu::Input::Modifier::Ctrl)).should be_nil
+    Gori::Tui::Tutorial.typed_char(tut_char_key('t', Termisu::Input::Modifier::Ctrl)).should be_nil
+    Gori::Tui::Tutorial.typed_char(tut_char_key('s', Termisu::Input::Modifier::Alt)).should be_nil
+  end
+
+  it "types ordinary printables" do
+    Gori::Tui::Tutorial.typed_char(tut_char_key('a')).should eq('a')
+    Gori::Tui::Tutorial.typed_char(tut_key(Termisu::Input::Key::Space)).should eq(' ')
+  end
+
+  # The window this replaced was `ord >= 32 && ord < 127`, so the lesson that asks the user
+  # to "type a username" silently dropped every character a Korean/Japanese/accented keyboard
+  # produces. TextField#insert has no such limit.
+  it "accepts non-ASCII text the way the real editor does" do
+    Gori::Tui::Tutorial.typed_char(tut_key(Termisu::Input::Key::Unknown, char: '한')).should eq('한')
+    Gori::Tui::Tutorial.typed_char(tut_key(Termisu::Input::Key::Unknown, char: 'é')).should eq('é')
+  end
+
+  it "refuses control characters" do
+    # Enter and Backspace are handled by their own branches ahead of the append, and carry
+    # control chars besides — Key::Enter.to_char is '\n'.
+    Gori::Tui::Tutorial.typed_char(tut_key(Termisu::Input::Key::Enter)).should be_nil
+    Gori::Tui::Tutorial.typed_char(tut_key(Termisu::Input::Key::Unknown, char: '\u{7F}')).should be_nil
+  end
+end
+
 # The tour's fake palette is filterable, so its row list can be EMPTY — and the ↑ arm took its
 # modulo before checking, so `gori tutorial` → palette step → `^P` → type a non-matching
 # character → ↑ died with an unhandled DivisionByZeroError. Both arrows now go through one
@@ -230,7 +310,6 @@ describe "Gori::Tui::Tutorial palette window" do
     Gori::Tui::Tutorial.palette_scroll(0, 5, 0).should eq(0)
     Gori::Tui::Tutorial.palette_scroll(0, 0, 4).should eq(0)
   end
-
 end
 
 # The card MIN_CARD_H admits is three rows shorter than CONTENT_ROWS asks for, and the lessons
