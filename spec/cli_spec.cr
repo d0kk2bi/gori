@@ -12,6 +12,21 @@ module Gori::CLI
     _, subargs = split_subcommand(argv)
     global_version_flag?(subargs)
   end
+
+  # `gori settings` helpers. Only the PURE ones are reachable: the guards themselves end in
+  # `abort`, which calls `exit` and is not catchable, so each of these is the decision the
+  # abort is made on rather than the abort itself.
+  def self.unknown_settings_verb_for_spec(args : Array(String)) : Bool
+    unknown_settings_verb?(args)
+  end
+
+  def self.parse_sections_value_for_spec(value : String) : Array(String)
+    parse_sections_value(value)
+  end
+
+  def self.unknown_sections_for_spec(list : Array(String)) : Array(String)
+    unknown_sections(list)
+  end
 end
 
 describe "gori — global version flag" do
@@ -95,5 +110,62 @@ describe "gori — global version flag" do
     Gori::CLI.global_version_flag_for_spec(["--verbose"]).should be_false
     Gori::CLI.global_version_flag_for_spec(["-vv"]).should be_false
     Gori::CLI.global_version_flag_for_spec(["run", "decoder", "--input", "-vsomething"]).should be_false
+  end
+end
+
+# `gori settings` argv guards. Each one closes a silent-no-op-carrying-SUCCESS hole — the
+# failure mode the `global_version_flag?` comment above condemns at length, which `gori
+# settings` was reproducing on a typo'd verb, an empty `--sections`, and a misspelt one.
+describe "gori settings — subcommand dispatch" do
+  it "rejects a bare word that is not one of the three verbs" do
+    # `gori settings expor -o profile.json` used to print the settings path and exit 0: no
+    # export, no file, and `… || die` never fires.
+    Gori::CLI.unknown_settings_verb_for_spec(["expor"]).should be_true
+    Gori::CLI.unknown_settings_verb_for_spec(["expor", "-o", "p.json"]).should be_true
+    Gori::CLI.unknown_settings_verb_for_spec(["blahblah", "nonsense"]).should be_true
+  end
+
+  it "accepts the three verbs and every flag-only form" do
+    Gori::CLI.unknown_settings_verb_for_spec(["export"]).should be_false
+    Gori::CLI.unknown_settings_verb_for_spec(["import", "p.json"]).should be_false
+    Gori::CLI.unknown_settings_verb_for_spec(["sections"]).should be_false
+    # Bare `gori settings`, and the flag forms it has always taken.
+    Gori::CLI.unknown_settings_verb_for_spec([] of String).should be_false
+    Gori::CLI.unknown_settings_verb_for_spec(["--edit"]).should be_false
+    Gori::CLI.unknown_settings_verb_for_spec(["-h"]).should be_false
+  end
+end
+
+describe "gori settings — --sections parsing" do
+  it "trims and drops empties" do
+    Gori::CLI.parse_sections_value_for_spec("network, theme ").should eq(["network", "theme"])
+    Gori::CLI.parse_sections_value_for_spec("network,,theme").should eq(["network", "theme"])
+  end
+
+  # The caller aborts on an empty result. It has to check emptiness explicitly: `[] of String`
+  # is TRUTHY in Crystal, so `if list = sections` used to pass with nothing in it, and
+  # `--sections=""` exported `{}` / imported nothing at exit 0 — where a shell expanding an
+  # unset variable lands.
+  it "yields nothing for an empty or all-comma value" do
+    Gori::CLI.parse_sections_value_for_spec("").should be_empty
+    Gori::CLI.parse_sections_value_for_spec(",,,").should be_empty
+    Gori::CLI.parse_sections_value_for_spec("  ").should be_empty
+  end
+end
+
+describe "gori settings — section-name validation" do
+  # Static SECTION_KEYS, never `document_keys`: a section at its factory default is absent from
+  # the latter, which is how `--sections network,scan_rules` (the example in the CLI reference)
+  # aborted as "unknown" on every fresh install.
+  it "accepts a known section this install has no value for" do
+    Gori::CLI.unknown_sections_for_spec(["network", "scan_rules"]).should be_empty
+    Gori::CLI.unknown_sections_for_spec(Gori::Settings::SECTION_KEYS).should be_empty
+  end
+
+  it "names the ones gori does not know" do
+    # Import used not to validate at all, so `--sections netwrok` selected nothing and reported
+    # "imported 0 section(s)" with exit 0.
+    Gori::CLI.unknown_sections_for_spec(["netwrok"]).should eq(["netwrok"])
+    Gori::CLI.unknown_sections_for_spec(["network", "bogus", "theme"]).should eq(["bogus"])
   end
 end

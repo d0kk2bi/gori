@@ -33,6 +33,120 @@ private def with_config_home(&)
   end
 end
 
+# A profile that puts a NON-DEFAULT value in every one of Settings::SECTION_KEYS, so
+# `document_keys` (derived from `serialize`, which omits a section at its default) can be
+# compared against SECTION_KEYS exactly rather than as a one-way subset. Every entry here is
+# shaped to survive its section's tolerant parser — a rejected entry leaves the section empty,
+# the section then does not serialize, and the guard silently weakens instead of failing.
+private MAXIMAL_PROFILE = <<-JSON
+  {
+    "theme": "goriday",
+    "mouse": false,
+    "pretty_bodies": false,
+    "layout": { "history_preview": true, "history_list_order": "oldest" },
+    "statusline": { "command": "echo hi" },
+    "display": { "history_time_format": "relative" },
+    "pet": { "enabled": true, "notices": false },
+    "notifications": { "bell": true, "toast": false },
+    "general": { "confirm_quit": false, "clipboard_osc52": false },
+    "update": { "notified_version": "9.9.9" },
+    "network": { "bind_port": 9191 },
+    "upstream_rules": [ { "host": "*.corp", "kind": "direct" } ],
+    "outbound_tls": [ { "host": "a.test", "min_version": "tls1.2" } ],
+    "retention": { "max_flows": 4242 },
+    "listeners": [ { "host": "127.0.0.1", "port": 8099, "mode": "proxy" } ],
+    "editor": { "command": "nvim" },
+    "tabs": [ { "id": "history", "visible": true } ],
+    "hostname_overrides": [ { "host": "api.corp", "ip": "10.0.0.5" } ],
+    "env": { "vars": [ { "key": "TOKEN", "value": "v" } ] },
+    "scan_rules": [ { "id": "r1", "title": "t", "pattern": "p", "enabled": false } ],
+    "oast_providers": [ { "id": "o1", "name": "p1", "kind": "interactsh", "host": "x.test" } ],
+    "hotkeys": { "os": "linux" },
+    "mine": { "locations": ["query"], "concurrency": 11 },
+    "fuzzer": { "recent_wordlists": ["/tmp/w.txt"] },
+    "probe": { "active_notify": "always" },
+    "discover": { "containment": "strict", "max_depth": 3 },
+    "decoder": { "chains": [ { "name": "c1", "spec": "base64-decode" } ] },
+    "rewriter": { "next_rule_id": 2, "rules": [] }
+  }
+  JSON
+
+# Settings are class_properties — process-global, not per-example — so an example that
+# populates all 28 sections would leak every one of them into whatever spec file runs next.
+# `with_config_home` already resets the handful its own examples touch; this restores the rest
+# by SNAPSHOT rather than by naming defaults, so it stays correct whatever state it inherits.
+private def with_every_section_populated(&)
+  pretty = Gori::Settings.pretty_bodies_default
+  mouse = Gori::Settings.mouse
+  hist_preview = Gori::Settings.history_preview
+  hist_order = Gori::Settings.history_list_order
+  statusline = Gori::Settings.statusline_command
+  time_format = Gori::Settings.history_time_format
+  pet = Gori::Settings.pet?
+  pet_notices = Gori::Settings.pet_notices?
+  bell = Gori::Settings.notify_bell?
+  toast = Gori::Settings.notify_toast?
+  osc52 = Gori::Settings.clipboard_osc52?
+  confirm_quit = Gori::Settings.confirm_quit?
+  notified = Gori::Settings.update_notified_version
+  outbound = Gori::Settings.outbound_tls
+  retention = Gori::Settings.retention_max_flows
+  listeners = Gori::Settings.listeners
+  editor = Gori::Settings.editor
+  tabs = Gori::Settings.tab_prefs
+  overrides = Gori::Settings.hostname_overrides
+  scan_rules = Gori::Settings.scan_rules
+  oast = Gori::Settings.oast_providers
+  keymap_os = Gori::Settings.keymap_os
+  wordlists = Gori::Settings.fuzz_recent_wordlists
+  probe_notify = Gori::Settings.probe_active_notify
+  containment = Gori::Settings.discover_containment
+  depth = Gori::Settings.discover_max_depth
+  chains = Gori::Settings.decoder_chains
+  rules = Gori::Settings.rewriter_rules
+  next_id = Gori::Settings.rewriter_next_rule_id
+  # `parse_mine_prefs`/`parse_discover_prefs` end with `keep_alive = obj["keep_alive"]? != false`,
+  # so a mine/discover block that omits the key forces BOTH to true — a leak this helper exists
+  # to prevent, and one no other reset in this file covers.
+  mine_keep_alive = Gori::Settings.mine_keep_alive?
+  discover_keep_alive = Gori::Settings.discover_keep_alive?
+  begin
+    yield
+  ensure
+    Gori::Settings.pretty_bodies_default = pretty
+    Gori::Settings.mouse = mouse
+    Gori::Settings.history_preview = hist_preview
+    Gori::Settings.history_list_order = hist_order
+    Gori::Settings.statusline_command = statusline
+    Gori::Settings.history_time_format = time_format
+    Gori::Settings.pet = pet
+    Gori::Settings.pet_notices = pet_notices
+    Gori::Settings.notify_bell = bell
+    Gori::Settings.notify_toast = toast
+    Gori::Settings.clipboard_osc52 = osc52
+    Gori::Settings.confirm_quit = confirm_quit
+    Gori::Settings.update_notified_version = notified
+    Gori::Settings.outbound_tls = outbound
+    Gori::Settings.retention_max_flows = retention
+    Gori::Settings.listeners = listeners
+    Gori::Settings.editor = editor
+    Gori::Settings.tab_prefs = tabs
+    Gori::Settings.hostname_overrides = overrides
+    Gori::Settings.scan_rules = scan_rules
+    Gori::Settings.oast_providers = oast
+    Gori::Settings.keymap_os = keymap_os
+    Gori::Settings.fuzz_recent_wordlists = wordlists
+    Gori::Settings.probe_active_notify = probe_notify
+    Gori::Settings.discover_containment = containment
+    Gori::Settings.discover_max_depth = depth
+    Gori::Settings.decoder_chains = chains
+    Gori::Settings.rewriter_rules = rules
+    Gori::Settings.rewriter_next_rule_id = next_id
+    Gori::Settings.mine_keep_alive = mine_keep_alive
+    Gori::Settings.discover_keep_alive = discover_keep_alive
+  end
+end
+
 describe "settings profiles" do
   describe ".path resolution" do
     it "prefers --config over $GORI_CONFIG over GORI_HOME" do
@@ -188,17 +302,32 @@ describe "settings profiles" do
       with_config_home do
         Gori::Settings.theme = "goridark"
         raw = %({"theme":"goriday","mouse":#{Gori::Settings.mouse},"bogus":{"a":1}})
-        changed, unknown = Gori::Settings.import_preview(raw)
+        applicable, changed, unknown = Gori::Settings.import_preview(raw)
+        applicable.should eq(["theme", "mouse"]) # both recognised, both would be applied
         changed.should contain("theme")
         changed.should_not contain("mouse") # identical to current → not a change
         unknown.should eq(["bogus"])
       end
     end
 
+    # `applicable` is what BOTH `--dry-run` and the real run report, so the two commands agree
+    # on the count. Reporting `changed` from one and `applied` from the other let a six-section
+    # profile preview as "would apply 1 section(s)" and then import as "imported 6".
+    it "returns the set a real import would apply, not just the differing subset" do
+      with_config_home do
+        Gori::Settings.theme = "goridark"
+        raw = %({"theme":"goridark","network":{"bind_port":9999}})
+        applicable, changed, _ = Gori::Settings.import_preview(raw)
+        changed.should eq(["network"])             # theme already matches
+        applicable.should eq(["theme", "network"]) # …but both are still applied
+        Gori::Settings.import_document(raw).should eq(applicable)
+      end
+    end
+
     it "honours a section filter" do
       with_config_home do
         raw = %({"theme":"goriday","network":{"bind_port":9999}})
-        changed, _ = Gori::Settings.import_preview(raw, ["network"])
+        _, changed, _ = Gori::Settings.import_preview(raw, ["network"])
         changed.should eq(["network"])
       end
     end
@@ -318,6 +447,128 @@ describe "Settings.apply_sections — a non-object section must not abandon the 
       Gori::Settings.editor.should eq("nvim")
       Gori::Settings.bind_port.should eq(9123)
       Gori::Settings.theme.should eq("goriday")
+    end
+  end
+end
+
+# `document_keys` is derived from `serialize`, so a section sitting at its factory default is
+# absent from it. Using it as the VALIDITY oracle made a section's NAME valid or invalid
+# depending on the machine: `gori settings export --sections network,scan_rules` — the example
+# in docs/reference/cli.md — aborted with "unknown section(s): scan_rules" on any install where
+# scan_rules was untouched, and `gori settings import` called a well-known section
+# "unrecognised … ignored" and then applied it anyway. Settings::SECTION_KEYS is the static
+# answer to "does gori know this name?"; these pin the two apart.
+describe "Settings::SECTION_KEYS" do
+  it "matches every key `serialize` can emit, in both directions" do
+    with_every_section_populated do
+      with_config_home do
+        # The RETURN value matters as much as the on-disk keys: import_document filters
+        # `selected` through SECTION_KEYS, so a name missing from the registry is silently
+        # dropped on the way IN — it would never reach `apply_sections` and would never show up
+        # in document_keys either, leaving the comparison below trivially satisfied.
+        applied = Gori::Settings.import_document(MAXIMAL_PROFILE)
+        applied.sort.should eq(Gori::Settings::SECTION_KEYS.sort)
+
+        keys = Gori::Settings.document_keys
+        # A section added to `serialize` without a SECTION_KEYS entry — the regression that
+        # reintroduces the export abort and the bogus "unrecognised" warning.
+        (keys - Gori::Settings::SECTION_KEYS).should be_empty
+        # A SECTION_KEYS entry naming nothing real (a typo, or a section since removed), which
+        # would advertise a name in `gori settings sections` that export then silently drops.
+        (Gori::Settings::SECTION_KEYS - keys).should be_empty
+      end
+    end
+  end
+
+  it "still knows a section this install has never touched" do
+    with_config_home do
+      Gori::Settings.document_keys.should_not contain("scan_rules") # at its default → not serialized
+      Gori::Settings::SECTION_KEYS.should contain("scan_rules")     # …but gori knows the name
+    end
+  end
+end
+
+describe "Settings.import_preview / import_document — recognised vs applied" do
+  # The headline: a valid section at its factory default was reported "unrecognised … ignored"
+  # and then written anyway. `env` is the sharp case — on a fresh config it is empty, so gori
+  # told the operator the credential-bearing section had been ignored while writing the token
+  # values to disk.
+  it "does not call a valid-but-default section unrecognised, and counts it as applied" do
+    with_config_home do
+      raw = %({"env":{"vars":[{"key":"TOKEN","value":"leaked"}]}})
+      applicable, changed, unknown = Gori::Settings.import_preview(raw, ["env"])
+      unknown.should be_empty
+      applicable.should eq(["env"])
+      changed.should eq(["env"])
+
+      Gori::Settings.import_document(raw, ["env"]).should eq(["env"])
+      Gori::Settings.env_vars.should eq([{"TOKEN", "leaked"}])
+    end
+  end
+
+  it "reports a genuinely unknown section AND leaves it out of the applied set" do
+    with_config_home do
+      raw = %({"network":{"bind_port":9191},"bogus":{"a":1}})
+      applicable, changed, unknown = Gori::Settings.import_preview(raw)
+      unknown.should eq(["bogus"])
+      applicable.should eq(["network"]) # the unknown key is not offered for application
+      changed.should eq(["network"])
+
+      # "ignored" has to be TRUE: the key is dropped before apply_sections, so it reaches
+      # neither the live settings nor the file, and the returned list is exactly what landed.
+      Gori::Settings.import_document(raw).should eq(["network"])
+      JSON.parse(File.read(Gori::Settings.path)).as_h.has_key?("bogus").should be_false
+    end
+  end
+end
+
+# The 3-way merge exists so persisting one field cannot discard a concurrent writer's edit to
+# an unrelated one. It got EDITS right and DELETIONS wrong: a `disk_h[k]? || cur_v` fallback
+# treated "the peer removed this section" as "the peer has nothing to say about it" and wrote
+# our stale copy back. Sections vanish from `serialize` the moment they are emptied, so
+# clearing your env vars in one gori window and saving anything in another resurrected the
+# token values.
+describe "Settings.save — merging against a concurrent writer" do
+  it "honours a peer's deletion of a section this process did not change" do
+    with_config_home do
+      Gori::Settings.env_vars = [{"TOKEN", "super-secret"}]
+      Gori::Settings.upstream_rules = [Gori::Settings::UpstreamRule.new("*.corp", "http", "proxy:3128")]
+      Gori::Settings.save
+      Gori::Settings.load # this read is the merge BASE
+
+      # A peer clears both sections (they stop serializing) and changes something of its own.
+      peer = JSON.parse(File.read(Gori::Settings.path)).as_h
+      peer.delete("env")
+      peer.delete("upstream_rules")
+      peer["theme"] = JSON::Any.new("goriday")
+      File.write(Gori::Settings.path, peer.to_pretty_json)
+
+      Gori::Settings.mouse = !Gori::Settings.mouse # an unrelated change of ours
+      Gori::Settings.save
+
+      on_disk = JSON.parse(File.read(Gori::Settings.path)).as_h
+      on_disk.has_key?("env").should be_false
+      on_disk.has_key?("upstream_rules").should be_false
+      on_disk["theme"].as_s.should eq("goriday") # their EDIT still merges through
+    end
+  end
+
+  it "still lets a section THIS process changed win over disk" do
+    with_config_home do
+      Gori::Settings.save
+      Gori::Settings.load
+      peer = JSON.parse(File.read(Gori::Settings.path)).as_h
+      peer.delete("env")
+      peer["theme"] = JSON::Any.new("goriday")
+      File.write(Gori::Settings.path, peer.to_pretty_json)
+
+      # We add env AFTER loading, so mine != base for it — the deletion rule must not eat it.
+      Gori::Settings.env_vars = [{"TOKEN", "ours"}]
+      Gori::Settings.save
+
+      on_disk = JSON.parse(File.read(Gori::Settings.path)).as_h
+      on_disk["env"].to_json.should contain("ours")
+      on_disk["theme"].as_s.should eq("goriday")
     end
   end
 end
