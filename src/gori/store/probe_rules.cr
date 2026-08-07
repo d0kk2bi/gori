@@ -42,7 +42,10 @@ module Gori
       out
     end
 
-    def set_probe_disabled_rules(ids : Set(String)) : Nil
+    # Returns whether the write COMMITTED (false = store busy/locked/closing). Both branches
+    # already had the answer — `set_setting`/`delete_setting` are `exec_task_ok` — and this
+    # threw it away, so every caller that toggles a scan rule had to claim success blind.
+    def set_probe_disabled_rules(ids : Set(String)) : Bool
       if ids.empty?
         delete_setting(PROBE_DISABLED_KEY)
       else
@@ -85,8 +88,12 @@ module Gori
       }
     end
 
-    def set_probe_custom_rule_enabled(id : Int64, enabled : Bool) : Nil
-      exec_task ->(c : DB::Connection) { c.exec("UPDATE probe_custom_rules SET enabled = ? WHERE id = ?", enabled ? 1 : 0, id); nil }
+    # `exec_task_ok`, not `exec_task`: an UPDATE reports nothing through last_insert_rowid, so
+    # this is the only way a caller can tell a committed toggle from a rolled-back one — and
+    # this one mutes or unmutes a security scan rule. Same reason `set_rule_enabled` (Match &
+    # Replace) and `update_probe_issue_status` already return Bool.
+    def set_probe_custom_rule_enabled(id : Int64, enabled : Bool) : Bool
+      exec_task_ok ->(c : DB::Connection) { c.exec("UPDATE probe_custom_rules SET enabled = ? WHERE id = ?", enabled ? 1 : 0, id); nil }
     end
 
     def delete_probe_custom_rule(id : Int64) : Nil

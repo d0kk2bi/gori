@@ -438,17 +438,24 @@ module Gori
         begin
           entry = Probe::RuleCatalog.load(store).find { |e| e.id == id } ||
                   abort("gori run probe rules #{verb}: no scan rule with id '#{id}' (see `gori run probe rules`)")
-          if entry.kind == "custom"
-            abort "gori run probe rules #{verb}: '#{id}' is a GLOBAL custom rule (stored in settings.json, shared across projects) — it cannot be toggled per project" if entry.scope == "global"
-            row_id = probe_custom_row_id(id) || abort("gori run probe rules #{verb}: malformed custom rule id '#{id}'")
-            store.set_probe_custom_rule_enabled(row_id, enabled)
-          else
-            disabled = store.probe_disabled_rules
-            # `set_rule_enabled` (not a bare delete/add) so a DEFAULT-OFF rule toggles correctly:
-            # for those ids the stored-set membership is INVERTED — see Probe::DEFAULT_DISABLED_RULES.
-            Probe.set_rule_enabled(disabled, id, enabled)
-            store.set_probe_disabled_rules(disabled)
-          end
+          # Both writers now answer whether the toggle COMMITTED, so this stops claiming a
+          # scan rule was muted (or unmuted) over a busy/locked project that kept the old
+          # setting — the same refusal `probe dismiss` and `probe delete` already make in this
+          # file. A silently-ignored `disable` leaves a rule firing on every later scan; a
+          # silently-ignored `enable` leaves a class of finding switched off.
+          ok =
+            if entry.kind == "custom"
+              abort "gori run probe rules #{verb}: '#{id}' is a GLOBAL custom rule (stored in settings.json, shared across projects) — it cannot be toggled per project" if entry.scope == "global"
+              row_id = probe_custom_row_id(id) || abort("gori run probe rules #{verb}: malformed custom rule id '#{id}'")
+              store.set_probe_custom_rule_enabled(row_id, enabled)
+            else
+              disabled = store.probe_disabled_rules
+              # `set_rule_enabled` (not a bare delete/add) so a DEFAULT-OFF rule toggles correctly:
+              # for those ids the stored-set membership is INVERTED — see Probe::DEFAULT_DISABLED_RULES.
+              Probe.set_rule_enabled(disabled, id, enabled)
+              store.set_probe_disabled_rules(disabled)
+            end
+          abort "gori run probe rules #{verb}: NOT applied (project busy) — rule '#{id}' is unchanged" unless ok
           puts "Rule '#{id}' is now #{enabled ? "enabled" : "disabled"}."
         ensure
           store.close

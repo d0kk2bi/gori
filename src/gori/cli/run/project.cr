@@ -46,7 +46,7 @@ module Gori
           list               List known projects (default when no subcommand)
           create <name>      Create (or reopen) a project by name
           delete|rm <name>   Delete a project and everything captured in it
-          scope              Manage scope rules (list, add, delete, enable/disable)
+          scope              Manage scope rules (list, add, update, delete, enable/disable)
           sandbox            Get/set the hard-containment sandbox gate (status, on, off)
           env                Manage project env vars ($KEY substitution)
           host-override      Manage host overrides (list, add, update, delete)
@@ -336,7 +336,7 @@ module Gori
             cmd_scope_list(args)
           else
             STDERR.puts "gori run project scope: unknown subcommand '#{sub}'"
-            STDERR.puts "Usage: gori run project scope [list options] | add | delete|rm | enable | disable"
+            STDERR.puts "Usage: gori run project scope [list options] | add | update|edit <rule-id> | delete|rm <rule-id> | enable | disable"
             exit 1
           end
         end
@@ -352,6 +352,7 @@ module Gori
           p.banner = "Usage: gori run project scope [options]\n\n" \
                      "Or run with a subcommand:\n" \
                      "  gori run project scope add --kind=include/exclude --type=host/string/regex --pattern=...\n" \
+                     "  gori run project scope update|edit <rule-id> [--kind=... --type=... --pattern=...]\n" \
                      "  gori run project scope delete|rm <rule-id>\n" \
                      "  gori run project scope enable\n" \
                      "  gori run project scope disable"
@@ -450,6 +451,17 @@ module Gori
           if err = Scope.validation_error(new_type, new_pattern)
             abort "gori run project scope update: #{err}"
           end
+          # `scope_rules` carries UNIQUE(kind, match_type, pattern) (store/schema.cr), and this
+          # command writes straight through the store rather than via `Scope#update`, which
+          # dedupes. Without this pre-check the constraint violation rolled the writer batch
+          # back, `update_scope_rule` returned false, and the busy-store abort below reported a
+          # duplicate as "store busy or unwritable" — sending the operator to hunt for a lock.
+          # `scope add` already names the duplicate; this makes the two agree.
+          if scope.rules.any? { |r| r.id != id && r.kind == new_kind && r.match_type == new_type && r.pattern == new_pattern }
+            store.close
+            abort "gori run project scope update: rule ##{id} NOT updated — #{new_kind} #{new_type} #{new_pattern} " \
+                  "already exists as another rule; the scope is unchanged"
+          end
           unless store.update_scope_rule(id, new_kind, new_type, new_pattern)
             abort "gori run project scope update: rule NOT updated (store busy or unwritable); it is unchanged and still gates traffic"
           end
@@ -545,7 +557,14 @@ module Gori
             store.close
             abort "gori run project scope delete: no scope rule with id #{id}"
           end
-          scope.remove(id)
+          # `Scope#remove` now hands back `remove_scope_rule`'s committed flag (it is
+          # `exec_task_ok`, so the answer always existed). Without this a busy/locked project
+          # reported a security rule "deleted successfully" while it was still gating traffic —
+          # the failure mode `scope enable/disable` and `sandbox on/off` already refuse to have.
+          unless scope.remove(id)
+            store.close
+            abort "gori run project scope delete: rule ##{id} NOT deleted (project busy) — try again"
+          end
           puts "Scope rule ##{id} deleted successfully."
           warn_scope_blackhole(scope, "gori run project scope delete")
         ensure

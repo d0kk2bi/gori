@@ -38,7 +38,14 @@ module Gori
         id_s = positional.first? || abort("gori run repeater minimize: <repeater-id> is required")
         id = id_s.to_i64? || abort("gori run repeater minimize: invalid repeater id #{id_s.inspect}")
 
-        store = open_store(resolve_read_project(project_name, db_path))
+        # Resolved ONCE and reused by the `--apply` write below. `resolve_read_project` with no
+        # --project/--db falls through to `registry.list.first`, and that list is sorted by each
+        # project's DB-file MTIME (`Project#last_modified`) — so the "most-recently-active"
+        # project can change identity while this command runs, and a minimize is minutes long
+        # (up to SEND_CAP real sends). Re-resolving at apply time therefore let a peer's write
+        # steer the UPDATE into a DIFFERENT project's `repeaters` row #id.
+        project = resolve_read_project(project_name, db_path)
+        store = open_store(project)
         # HostOverrides.load snapshots rows into memory, so it is safe to keep past the close.
         # Loaded from the SAME open that fetched `rec` rather than via cli_host_overrides,
         # which returns nil without an explicit --project/--db — a repeater session always
@@ -83,13 +90,40 @@ module Gori
         STDERR.print "\r\e[K" if meter
         outbound.close
 
-        if apply && !report.aborted && !report.removed.empty?
-          w = open_store(resolve_read_project(project_name, db_path))
+        # `--apply` writes the minimized REQUEST back — and only that. `auto_cl` above folds in
+        # `--verbatim`, which is a PER-SEND choice ("same meaning as `repeater send
+        # --verbatim`", per its own help), so persisting it here turned one
+        # `minimize --apply --verbatim` into a PERMANENT Auto-Content-Length OFF on the
+        # session: `session_plan_options` reads `rec.auto_content_length?`, so every later
+        # non-verbatim `repeater send <id>` — and the TUI — silently stopped resyncing
+        # Content-Length after `$KEY` expansion, framing an expanded body under the stale
+        # length. Confirmed on the binary (`auto_content_length` 1 → 0). The MCP twin already
+        # writes the stored value and says so in a parenthetical (mcp/tools/minimize.cr); this
+        # makes the two agree.
+        #
+        # The store also answers whether the write COMMITTED, and dropping that let a
+        # busy/locked project print "saved back to session #N" — and report `"applied": true`
+        # to a script — over a session still holding the un-minimized request. Same reason
+        # `history delete`, `issues delete` and `project scope enable` all check theirs.
+        applied = false
+        wanted_apply = apply && !report.aborted && !report.removed.empty?
+        if wanted_apply
+          w = open_store(project)
           begin
-            w.update_repeater(id: id, target: rec.target, request: report.minimized_text.to_slice,
-              http2: rec.http2?, auto_cl: auto_cl, sni: rec.sni)
+            # EVERY column `update_repeater` writes comes off the stored row. Its SQL sets
+            # ws_keep_key and ws_http_only unconditionally and its signature defaults both to
+            # false, so omitting them CLEARS them — and a session can hold either flag with a
+            # request that is not a WebSocket upgrade (`repeater create --ws-http-only -f
+            # plain.txt`), which is exactly the shape `minimize_target_or_abort` lets through.
+            applied = w.update_repeater(id: id, target: rec.target, request: report.minimized_text.to_slice,
+              http2: rec.http2?, auto_cl: rec.auto_content_length?, sni: rec.sni,
+              ws_keep_key: rec.ws_keep_key?, ws_http_only: rec.ws_http_only?)
           ensure
             w.close
+          end
+          unless applied
+            STDERR.puts "gori run repeater minimize: --apply did NOT commit (project busy) — " \
+                        "session ##{id} still holds the original request"
           end
         end
         # The report is rendered through the SAME resolver the search used, so the request
@@ -99,8 +133,11 @@ module Gori
         # search nor what a later `repeater send` would produce. `--apply` still stores the
         # source form (that is what the session row holds, and re-resolving it on every send
         # is the point of storing it).
-        report_repeater_minimize(id, report, format, apply, resolve)
-        exit 1 if report.aborted
+        report_repeater_minimize(id, report, format, applied, resolve)
+        # A refused `--apply` is a failed mutation, so it must not exit 0 — but the report is
+        # printed first either way: the search already spent real sends, and throwing its
+        # result away would cost the operator the run as well as the write.
+        exit 1 if report.aborted || (wanted_apply && !applied)
       end
 
       # The editor-text → wire-bytes step `Minimize` sends through, and the ONE thing
@@ -236,6 +273,10 @@ module Gori
 
       # `resolve` is the SAME proc the search sent through, so `minimized_request` is the
       # request that was actually tested rather than the pre-resolution source text.
+      #
+      # `applied` is the OUTCOME of the write, not the `--apply` flag: the caller already
+      # folded in "aborted", "nothing removed" AND "the store committed it", so re-deriving
+      # the first two here would report a refused write as a successful one.
       private def self.report_repeater_minimize(id : Int64, report : Repeater::Minimize::Report,
                                                 format : Symbol, applied : Bool,
                                                 resolve : Proc(String, Bytes)) : Nil
@@ -255,7 +296,7 @@ module Gori
                 end
               end
               j.field "removed_count", report.removed.size
-              j.field "applied", applied && !report.aborted && !report.removed.empty?
+              j.field "applied", applied
               # The RESOLVED wire, plus the source form the session stores, because they are
               # different questions and the operator needs both: the first is what was sent,
               # the second is what `--apply` writes back and what a later send re-resolves.
@@ -273,7 +314,7 @@ module Gori
         end
         STDERR.puts "#{report.note} · #{report.sends} send#{report.sends == 1 ? "" : "s"}"
         report.removed.each { |r| STDERR.puts "  - [#{r.kind.to_s.downcase}] #{r.label}" }
-        STDERR.puts "saved back to session ##{id}" if applied && !report.aborted && !report.removed.empty?
+        STDERR.puts "saved back to session ##{id}" if applied
         STDOUT.write(wire)
         STDOUT.puts unless wire.empty? || wire[-1] == 0x0A_u8
       end

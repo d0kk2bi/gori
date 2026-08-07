@@ -436,12 +436,30 @@ module Gori::Tui
         # add/delete): a DEFAULT-OFF rule inverts the stored-set membership — see
         # Gori::Probe::DEFAULT_DISABLED_RULES.
         Gori::Probe.set_rule_enabled(dis, row.rule_id, !row.enabled?)
-        store.set_probe_disabled_rules(dis)
+        # Both scan-rule writers report whether the toggle COMMITTED. Without this the status
+        # bar said `disabled rule "X"` while the very next `reload_rules` re-drew the row as
+        # still enabled — two lines of UI contradicting each other with no way to tell which
+        # was true. Same refusal as the CLI/MCP twins.
+        unless store.set_probe_disabled_rules(dis)
+          @host.status("rule \"#{row.title}\" NOT changed (project busy)")
+          return
+        end
         @host.status(row.enabled? ? "disabled rule \"#{row.title}\"" : "enabled rule \"#{row.title}\"")
       when :custom
         c = row.custom.not_nil!
         on = !c.enabled
-        c.global? ? Settings.set_scan_rule_enabled(c.id, on) : store.set_probe_custom_rule_enabled(c.id.to_i64, on)
+        ok = if c.global?
+               # settings.json, not the project DB — there is no transaction and so no commit
+               # flag to read. Only the PROJECT writer can report a rolled-back batch.
+               Settings.set_scan_rule_enabled(c.id, on)
+               true
+             else
+               store.set_probe_custom_rule_enabled(c.id.to_i64, on)
+             end
+        unless ok
+          @host.status("rule \"#{c.title}\" NOT changed (project busy)")
+          return
+        end
         @host.status(on ? "enabled rule \"#{c.title}\"" : "disabled rule \"#{c.title}\"")
       else
         return

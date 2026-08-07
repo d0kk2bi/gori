@@ -154,6 +154,46 @@ describe "Gori::Store custom-rule config" do
       store.probe_custom_rules.empty?.should be_true
     end
   end
+
+  # Both scan-rule writers report whether the toggle COMMITTED, so `gori run probe rules
+  # enable/disable` can refuse instead of printing "Rule 'x' is now disabled." over a
+  # busy/locked project that kept the old setting. They used to return Nil — the settings one
+  # while already holding the answer, since set_setting/delete_setting are both exec_task_ok.
+  # A `true` here means the batch COMMITTED, which is not the same as "a row matched" — so the
+  # state is asserted beside every return value. Without that second half the example would
+  # still pass for a bogus id, i.e. it would certify exactly the weakness the guard is meant to
+  # close.
+  it "reports whether a scan-rule toggle committed, and commits it" do
+    with_store do |store|
+      store.set_probe_disabled_rules(Set{"cookies"}).should be_true
+      store.probe_disabled_rules.should eq(Set{"cookies"})
+      store.set_probe_disabled_rules(Set(String).new).should be_true # the delete_setting branch
+      store.probe_disabled_rules.empty?.should be_true
+
+      id = store.insert_probe_custom_rule("t", "d", "response", "body", "string", "x", Gori::Store::Severity::Low)
+      store.set_probe_custom_rule_enabled(id, false).should be_true
+      store.probe_custom_rules.first.enabled?.should be_false
+      store.set_probe_custom_rule_enabled(id, true).should be_true
+      store.probe_custom_rules.first.enabled?.should be_true
+    end
+  end
+
+  it "reports a scan-rule toggle as NOT committed once the store is closing" do
+    path = File.tempname("gori-custom-closed", ".db")
+    # Open + seed INSIDE the begin, like `with_store` does: a raise in Store.open or the insert
+    # would otherwise leak the temp db and its -wal/-shm siblings.
+    begin
+      store = Gori::Store.open(path)
+      id = store.insert_probe_custom_rule("t", "d", "response", "body", "string", "x", Gori::Store::Severity::Low)
+      store.close
+      store.set_probe_disabled_rules(Set{"cookies"}).should be_false
+      store.set_probe_custom_rule_enabled(id, false).should be_false
+    ensure
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
+    end
+  end
 end
 
 describe "Gori::Probe.custom_rules merge" do

@@ -608,7 +608,10 @@ module Gori::Tui
     def scope_delete : String?
       rule = selected_rule
       return nil unless rule
-      @scope.remove(rule.id)
+      # `Scope#remove` now reports whether the DELETE committed. A rolled-back batch must not
+      # produce a "removed scope rule: <pattern>" toast over a rule that is still gating
+      # traffic; the caller turns this nil into a busy message instead.
+      return nil unless @scope.remove(rule.id)
       clamp_sel
       rule.pattern
     end
