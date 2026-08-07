@@ -870,7 +870,12 @@ module Gori
       read_only = false
       use_active_project = false
       no_project = false
-      install_target = nil.as(String?)
+      # A LIST, not a single slot: `gori mcp --install-claude-code --install-codex` is what
+      # someone who runs two agents types, and the last-one-wins slot this used to be
+      # configured Codex alone and said nothing about the client it skipped — the same
+      # "accepted, then quietly discarded" failure MCP::Install.build_args documents for the
+      # selector flags, spent on a whole client instead of one flag.
+      install_targets = [] of String
 
       parser = OptionParser.new do |p|
         p.banner = "Usage: gori mcp [options]\n\n" \
@@ -885,11 +890,11 @@ module Gori
         p.on("--no-project", "Start unbound even inside a Git workspace (agent picks via list/create/switch)") { no_project = true }
         p.on("--insecure-upstream", "send_request: skip upstream TLS verification") { insecure_upstream = true }
         p.on("--read-only", "Disable action tools (send_request, create/update_issue)") { read_only = true }
-        p.on("--install-agy", "Install gori as an MCP server in Antigravity (~/.gemini/antigravity-cli/mcp_config.json)") { install_target = "agy" }
-        p.on("--install-codex", "Install gori as an MCP server in Codex (~/.codex/config.toml)") { install_target = "codex" }
-        p.on("--install-claude", "Install gori as an MCP server in Claude Desktop config") { install_target = "claude" }
-        p.on("--install-claude-code", "Install gori as an MCP server in Claude Code (~/.claude.json)") { install_target = "claude-code" }
-        p.on("--install-grok", "Install gori as an MCP server in Grok (~/.grok/config.toml)") { install_target = "grok" }
+        p.on("--install-agy", "Install gori as an MCP server in Antigravity (~/.gemini/antigravity-cli/mcp_config.json)") { install_targets << "agy" }
+        p.on("--install-codex", "Install gori as an MCP server in Codex (~/.codex/config.toml)") { install_targets << "codex" }
+        p.on("--install-claude", "Install gori as an MCP server in Claude Desktop config") { install_targets << "claude" }
+        p.on("--install-claude-code", "Install gori as an MCP server in Claude Code (~/.claude.json)") { install_targets << "claude-code" }
+        p.on("--install-grok", "Install gori as an MCP server in Grok (~/.grok/config.toml)") { install_targets << "grok" }
         p.on("-h", "--help", "Show this help") { puts p; exit 0 }
         p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
         p.missing_option { |flag| abort "missing value for #{flag}" }
@@ -903,9 +908,12 @@ module Gori
         abort "gori mcp: --no-project cannot be combined with --db/--project/--use-active-project"
       end
 
-      if target = install_target
-        install_mcp_config(target, db_path, project, read_only, insecure_upstream, use_active_project)
-        exit 0
+      unless install_targets.empty?
+        # Settings.path_override is `--config`, already stripped from argv by CLI.run before
+        # dispatch — so run_mcp never sees the flag and can only read it back from here.
+        ok = install_mcp_config(install_targets, db_path, project, read_only, insecure_upstream,
+          use_active_project, no_project, Settings.path_override)
+        exit(ok ? 0 : 1)
       end
 
       # Logs to STDERR ONLY — STDOUT is reserved for the JSON-RPC stream.
@@ -960,17 +968,36 @@ module Gori
       end
     end
 
-    private def self.install_mcp_config(target : String, db_path : String?, project : String?, read_only : Bool,
-                                        insecure_upstream : Bool, use_active_project : Bool) : Nil
-      path = MCP::Install.install(target, db_path: db_path, project: project,
-        read_only: read_only, insecure_upstream: insecure_upstream,
-        use_active_project: use_active_project)
+    # Writes the MCP entry into every named client config. Returns false if ANY target
+    # failed — reported per target, and never as an abort partway through, which would have
+    # made "which clients did gori configure?" depend on the order the flags were typed in.
+    private def self.install_mcp_config(targets : Array(String), db_path : String?, project : String?,
+                                        read_only : Bool, insecure_upstream : Bool,
+                                        use_active_project : Bool, no_project : Bool,
+                                        settings_path : String?) : Bool
       exe = MCP::Install.executable_path
-      args = MCP::Install.build_args(db_path, project, read_only, insecure_upstream, use_active_project)
-      puts "Successfully installed gori MCP server configuration to #{path}"
-      puts "Command: #{exe} #{args.join(" ")}"
+      outcomes = MCP::Install.install_all(targets, exe_path: exe, db_path: db_path, project: project,
+        read_only: read_only, insecure_upstream: insecure_upstream,
+        use_active_project: use_active_project, no_project: no_project,
+        settings_path: settings_path)
+      outcomes.each do |outcome|
+        if path = outcome.path
+          puts "Successfully installed gori MCP server configuration to #{path}"
+        else
+          STDERR.puts "Failed to install MCP config for #{outcome.target}: #{outcome.error}"
+        end
+      end
+      # Once, and read back off an Outcome: the argv is identical for every target, and this
+      # is the array the installs actually wrote rather than a second build of it.
+      outcomes.first?.try { |first| puts "Command: #{exe} #{first.args.join(" ")}" }
+      outcomes.all?(&.ok?)
     rescue ex
-      abort "Failed to install MCP config for #{target}: #{ex.message}"
+      # `executable_path` (gori invoked through a PATH entry that has since moved) and
+      # `build_args` (a deleted working directory) both raise before any target is attempted.
+      # Neither is a Gori::Error, so CLI.run's narrow rescue lets them out as a backtrace —
+      # they were covered by this method's own rescue before it grew a loop, and a setup
+      # failure affecting every target still belongs here rather than in an Outcome.
+      abort "Failed to install MCP config: #{ex.message.presence || ex.class}"
     end
 
     private def self.resolve_mcp_project(db : String?, project : String?, *, workspace_project : Bool,
