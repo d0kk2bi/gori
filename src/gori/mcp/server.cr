@@ -224,7 +224,9 @@ module Gori
       private def handle_tools_call(id : JSON::Any, params : JSON::Any?) : Nil
         name = obj_field(params, "name").try(&.as_s?)
         return write_error(id, -32602, "tools/call: missing 'name'") unless name
-        args = obj_field(params, "arguments") || EMPTY_ARGS
+        args = tool_arguments(params)
+        return write_error(id, -32602,
+          "tools/call: 'arguments' must be an object (or a JSON-encoded one)") unless args
         result = @tools.call(name, args)
         write_result(id) do |j|
           j.object do
@@ -243,6 +245,31 @@ module Gori
             j.field "isError", result.is_error
           end
         end
+      end
+
+      # `params.arguments` as the object the tools layer reads, or nil when it is a shape that
+      # is not an argument list at all.
+      #
+      # An `as_h?`-only read answered nil for every other shape, and `Tools#call` substituted
+      # an EMPTY hash for it — so a client that stringifies its arguments (which happens, and
+      # which `RequestBuilder.header_pairs` already accepts one level down) had every argument
+      # silently dropped and was told "missing required 'id'" for a call that named `id`. The
+      # agent then "fixed" an argument it had sent correctly, in a loop. Parse the encoded
+      # form; refuse anything else HERE, as a protocol error, rather than run a tool with none
+      # of the arguments it was called with.
+      #
+      # Absent / null / blank all stay "no arguments" — a tool with only optional arguments is
+      # legitimately called that way, and `""` is what an LLM emits for it.
+      private def tool_arguments(params : JSON::Any?) : JSON::Any?
+        raw = obj_field(params, "arguments")
+        return EMPTY_ARGS if raw.nil? || raw.raw.nil?
+        return raw if raw.as_h?
+        if s = raw.as_s?
+          return EMPTY_ARGS if s.strip.empty?
+          parsed = (JSON.parse(s) rescue nil)
+          return parsed if parsed && parsed.as_h?
+        end
+        nil
       end
 
       # The structured-error contract: {error_code, message, field?, retryable,

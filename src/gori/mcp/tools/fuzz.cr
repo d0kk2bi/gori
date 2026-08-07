@@ -467,7 +467,7 @@ module Gori
         pattern = strict_jstr(obj, "pattern")
         raise FuzzArgError.new(%(processor "regex_replace" needs a non-empty 'pattern' string)) if pattern.nil? || pattern.empty?
         regex = Regex.new(pattern) rescue raise FuzzArgError.new("invalid processors.regex_replace pattern '#{pattern}'")
-        Fuzz::RegexReplace.new(regex, strict_jstr(obj, "replacement") || "")
+        Fuzz::RegexReplace.new(regex, demanded_jstr(obj, "replacement", %(processor "regex_replace")) || "")
       end
 
       # Like `jstr`, but WITHOUT its `v.to_s` fallback: a JSON null/array/object stays nil
@@ -509,7 +509,11 @@ module Gori
 
       private def fuzz_source_from(obj : Hash(String, JSON::Any), spec : JSON::Any) : Fuzz::PayloadSource
         if list = obj["list"]?.try(&.as_a?)
-          Fuzz::InlineList.new(list.map { |x| x.as_s? || x.to_s })
+          # `x.as_s? || x.to_s` coerced a nested array/object too, and `JSON::Any#to_s`
+          # renders those in CRYSTAL syntax (`{"a" => 1}`) — so a mistyped entry became a
+          # payload nobody wrote and every request built from it was wasted. Scalars still
+          # coerce (`list: [1,2]` means "1","2"); a container is refused by name.
+          Fuzz::InlineList.new(list.map { |x| str_entry(x, "list") })
         elsif b64 = obj["list_base64"]?.try(&.as_a?)
           # The byte-exact payload list. `list` entries are JSON strings put on the wire as
           # their UTF-8 encoding, so `é` went out as 2 bytes and a byte-level set (0x00-0xFF,
@@ -524,7 +528,7 @@ module Gori
           # on the server's disk ("file": built-in first, de-duped). Reject a typo up front
           # with the list, rather than let it surface as an empty run.
           raise FuzzArgError.new("unknown preset #{preset.inspect} (available: #{Fuzz::Presets.names.join(", ")})") unless Fuzz::Presets.exists?(preset)
-          Fuzz::PresetSource.new(preset, obj["file"]?.try(&.as_s?).presence)
+          Fuzz::PresetSource.new(preset, demanded_jstr(obj, "file", "payload set").try(&.presence))
         elsif nums = obj["numbers"]?
           fuzz_numbers(nums)
         elsif (nul = obj["null"]?) && (n = (nul.as_i64? || nul.as_s?.try(&.to_i64?)))
@@ -648,11 +652,28 @@ module Gori
           end
         {status: jstr(obj, "status"), grpc: jstr(obj, "grpc"), size: jstr(obj, "size"),
          words: jstr(obj, "words"), lines: jstr(obj, "lines"),
-         regex: obj["regex"]?.try(&.as_s?)}
+         regex: demanded_jstr(obj, "regex", which)}
       end
 
+      # A matcher/filter condition as text. `status: 500` means "500" — that leniency is the
+      # point of the `to_s` — but a CONTAINER used to stringify too, and `JSON::Any#to_s`
+      # renders one in Crystal syntax (`{"a" => 1}`), which then failed the condition grammar
+      # under a message naming a value the caller never wrote. `str_entry` is the one rule.
       private def jstr(obj : Hash(String, JSON::Any), key : String) : String?
-        obj[key]?.try { |v| v.as_s? || v.to_s }
+        obj[key]?.try { |v| v.raw.nil? ? nil : str_entry(v, key) }
+      end
+
+      # `strict_jstr`, except that a PRESENT non-string raises instead of reading as absent —
+      # `Tools#str`'s rule, for the three fuzz arguments that were still falling back
+      # silently. Each one quietly changed the sweep the caller then read as complete: a
+      # non-string `replacement` became `""` (so the processor DELETED every match instead of
+      # replacing it), a non-string `file` dropped the user's merged wordlist from the run, and
+      # a non-string `regex` dropped a whole MATCHER while the results were reported as
+      # filtered.
+      private def demanded_jstr(obj : Hash(String, JSON::Any), key : String, which : String) : String?
+        v = obj[key]?
+        return nil if v.nil? || v.raw.nil?
+        v.as_s? || raise FuzzArgError.new("#{which} '#{key}' must be a string")
       end
 
       private def fuzz_regex(s : String?, which : String) : Regex?
