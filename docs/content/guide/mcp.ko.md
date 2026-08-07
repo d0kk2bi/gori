@@ -71,11 +71,14 @@ gori는 널리 쓰이는 클라이언트의 MCP 설정을 대신 작성해 줍�
 gori mcp --install-claude-code
 gori mcp --install-codex
 gori mcp --install-grok
+gori mcp --install-claude-code --install-codex  # 한 번에 여러 클라이언트
 ```
 
-Codex와 Grok은 JSON이 아니라 `[mcp_servers.gori]` 테이블이 있는 TOML을 사용합니다. 설치 후 클라이언트를 재시작하거나 세션을 다시 열어 MCP 서버를 다시 로드하세요.
+Codex와 Grok은 JSON이 아니라 `[mcp_servers.gori]` 테이블이 있는 TOML을 사용합니다. 설치 후 클라이언트를 재시작하거나 세션을 다시 열어 MCP 서버를 다시 로드하세요. 기존 설정 파일은 제자리에서 갱신됩니다. 다른 서버·테이블·주석은 그대로 두고, 파일 권한도 유지하며, 교체는 원자적이라 설치가 중간에 끊겨도 파일이 잘려 나가지 않습니다.
 
 클라이언트가 리포지토리 디렉터리 밖에서 MCP를 시작해도 서버는 unbound로 연결되며, 에이전트가 도구로 프로젝트를 고르거나 만들 수 있습니다. 설치 시점에 고정 engagement를 박아 두려면 선택자를 넘기세요. 예: `gori mcp --project my-engagement --install-codex`.
+
+`--install-*`과 함께 넘긴 플래그는 모두 설치되는 커맨드에 그대로 기록됩니다. 선택자(`--project`, `--db`, `--no-project`, `--use-active-project`)는 물론 `--read-only`, `--insecure-upstream`, `--config`까지 포함되므로 클라이언트가 띄우는 커맨드가 입력한 그대로가 됩니다. 경로는 절대 경로로 변환됩니다. 클라이언트는 사용자가 고르지 않은 작업 디렉터리에서 서버를 실행하기 때문입니다.
 
 ## 도구 {#tools}
 

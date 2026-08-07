@@ -8,6 +8,17 @@ module Gori
     module Install
       SERVER_NAME = "gori"
 
+      # What one `--install-*` target did. `error` is nil on success and carries the failure
+      # sentence otherwise — COLLECTED rather than raised, because a run naming several
+      # clients must not let the first broken config file decide the fate of the rest.
+      # `args` is the argv actually written, carried back so the caller PRINTS the same array
+      # the install wrote instead of rebuilding it from the same inputs at a second site.
+      record Outcome, target : String, path : String?, error : String?, args : Array(String) do
+        def ok? : Bool
+          error.nil?
+        end
+      end
+
       # Returns the absolute config path for *target* (`agy`, `codex`, `claude`,
       # `claude-code`, `grok`). Raises on unknown targets.
       def self.config_path(target : String) : String
@@ -42,14 +53,32 @@ module Gori
       end
 
       # Build the argv passed to the gori binary after the executable path.
+      #
+      # EVERY flag `gori mcp` accepts alongside an `--install-*` has to be reproduced here:
+      # the installed entry is the only thing the client ever spawns, so a flag this method
+      # does not emit is a flag the user typed, gori validated, and then silently discarded
+      # into a config file nobody re-reads. `--no-project` and `--config` were both dropped
+      # that way — the first left a server that path-binds to whatever workspace the client
+      # happens to launch in (the exact opposite of what was asked for), the second left one
+      # reading the default settings.json.
       def self.build_args(db_path : String? = nil, project : String? = nil,
                           read_only : Bool = false, insecure_upstream : Bool = false,
-                          use_active_project : Bool = false) : Array(String)
+                          use_active_project : Bool = false, no_project : Bool = false,
+                          config_path : String? = nil) : Array(String)
         args = ["mcp"]
-        # expand_path (not realpath): the db need not exist yet — `gori mcp` creates it on
-        # first serve. realpath raises File::NotFoundError on a fresh path and aborts install.
-        args << "--db=#{File.expand_path(db_path)}" if db_path && !db_path.empty?
+        # expand_path throughout (not realpath): neither the db nor the config need exist yet
+        # — `gori mcp` creates the db on first serve, and realpath raises File::NotFoundError
+        # on a fresh path and aborts the install. Absolute either way, because the client
+        # spawns this command from a working directory the user never chose.
+        #
+        # `home: true` because a QUOTED tilde reaches us unexpanded (`--db '~/e.db'`), and
+        # without it the leading `~` is kept as a literal directory name joined onto the CWD.
+        # Anywhere else that is a one-run mistake; written into a client config it is a
+        # permanent one, and the server silently falls back to defaults on every launch.
+        args << "--config=#{File.expand_path(config_path, home: true)}" if config_path && !config_path.empty?
+        args << "--db=#{File.expand_path(db_path, home: true)}" if db_path && !db_path.empty?
         args << "--project=#{project}" if project && !project.empty?
+        args << "--no-project" if no_project
         args << "--read-only" if read_only
         args << "--insecure-upstream" if insecure_upstream
         args << "--use-active-project" if use_active_project
@@ -64,12 +93,23 @@ module Gori
       end
 
       # Install gori into the target client's config. Returns the path written.
+      # *settings_path* is `gori --config PATH` (the gori settings file the installed server
+      # should read); it is named apart from the local `config_path`, which is the CLIENT's
+      # config file this method writes.
       def self.install(target : String, *, exe_path : String = executable_path,
                        db_path : String? = nil, project : String? = nil,
                        read_only : Bool = false, insecure_upstream : Bool = false,
-                       use_active_project : Bool = false) : String
+                       use_active_project : Bool = false, no_project : Bool = false,
+                       settings_path : String? = nil) : String
+        install_argv(target, exe_path, build_args(db_path, project, read_only, insecure_upstream,
+          use_active_project, no_project, settings_path))
+      end
+
+      # Write *args* into *target*'s config file, returning the path written. The argv is
+      # passed IN rather than rebuilt, so `install_all` hands the caller the very array it
+      # installed and the command gori prints cannot drift from the one it wrote.
+      private def self.install_argv(target : String, exe_path : String, args : Array(String)) : String
         config_path = config_path(target)
-        args = build_args(db_path, project, read_only, insecure_upstream, use_active_project)
         Dir.mkdir_p(File.dirname(config_path)) unless Dir.exists?(File.dirname(config_path))
 
         if toml_target?(target)
@@ -78,6 +118,33 @@ module Gori
           install_json(config_path, exe_path, args)
         end
         config_path
+      end
+
+      # Install into EVERY named target (deduped, order preserved), one Outcome each.
+      #
+      # Deliberately does not raise. `install` refuses a config file it cannot parse, and one
+      # hand-broken `~/.claude.json` must not decide whether the Codex entry beside it gets
+      # written: letting that failure out of the loop would stop after some targets were
+      # already on disk, so WHICH clients ended up configured would depend on the order the
+      # flags happened to be typed in, and the targets never reached would go unmentioned.
+      # Every target is attempted and reported by name; the caller sets the exit status
+      # from `ok?`.
+      def self.install_all(targets : Array(String), *, exe_path : String = executable_path,
+                           db_path : String? = nil, project : String? = nil,
+                           read_only : Bool = false, insecure_upstream : Bool = false,
+                           use_active_project : Bool = false, no_project : Bool = false,
+                           settings_path : String? = nil) : Array(Outcome)
+        # Built once, outside the loop: every target writes the identical argv, and building
+        # it here is what lets each Outcome carry exactly what was installed.
+        args = build_args(db_path, project, read_only, insecure_upstream, use_active_project,
+          no_project, settings_path)
+        targets.uniq.map do |target|
+          begin
+            Outcome.new(target, install_argv(target, exe_path, args), nil, args)
+          rescue ex
+            Outcome.new(target, nil, ex.message.presence || ex.class.to_s, args)
+          end
+        end
       end
 
       # --- JSON clients (Claude Desktop, Claude Code, Antigravity) -------------
@@ -113,7 +180,7 @@ module Gori
         mcp_servers[SERVER_NAME] = JSON::Any.new(gori_entry)
         config["mcpServers"] = JSON::Any.new(mcp_servers)
 
-        File.write(config_path, config.to_pretty_json)
+        write_atomic(config_path, config.to_pretty_json)
       end
 
       # --- TOML clients (Codex, Grok) ------------------------------------------
@@ -125,7 +192,71 @@ module Gori
           io << "command = #{toml_string(exe_path)}\n"
           io << "args = #{toml_string_array(args)}\n"
         end
-        File.write(config_path, upsert_toml_table(existing, table, body))
+        write_atomic(config_path, upsert_toml_table(existing, table, body))
+      end
+
+      # --- Durable writes -------------------------------------------------------
+
+      # Replace *path*'s contents with no window in which it is truncated or half-written.
+      #
+      # These are the user's files, not gori's: `~/.claude.json` is Claude Code's entire CLI
+      # state (projects, auth, every other MCP server), `~/.codex/config.toml` is Codex's.
+      # install_json already refuses to clobber one it cannot parse — but a plain File.write
+      # truncates FIRST and fills after, so a crash, a full disk, or a SIGINT between those
+      # two steps destroys exactly what that check exists to protect, and the installer that
+      # was only adding one entry is what destroyed it.
+      #
+      # Temp file in the SAME directory (rename is atomic only within a filesystem), fsync
+      # before the rename so the rename cannot land ahead of the bytes, and carry the
+      # original's permissions across — a credential-bearing config found at 0600 must not
+      # come back 0644 because gori recreated it under the umask.
+      #
+      # Resolve a symlink to its target FIRST. These paths are dotfiles, which people
+      # routinely symlink into a dotfiles repo; File.write wrote THROUGH the link, and a
+      # rename over the link itself would quietly detach it — the client would then read a
+      # plain file while the repo copy it was linked to went stale, with nothing to show
+      # for it in `git status`. A HARDLINKED config is not detectable this way and does get
+      # detached (rename installs a new inode); that is the standing cost of an atomic
+      # replace, and it is the trade every durable writer in this repo already makes.
+      private def self.write_atomic(path : String, content : String) : Nil
+        target = resolve_symlink(path)
+        dir = File.dirname(target)
+        # The mode to land on: the file's own if it has one, else private — these hold auth
+        # and are nobody else's business.
+        perm = File.info?(target).try(&.permissions) || File::Permissions.new(0o600)
+        # Randomized, not pid-derived: a pid repeats, and a temp left behind by a killed run
+        # would then be re-opened (mode intact, since `perm` only applies on CREATE) and
+        # renamed into place at whatever mode it was abandoned with.
+        tmp = File.tempname(".#{File.basename(target)}.gori", ".tmp", dir: dir)
+        begin
+          # Create at the final mode rather than widening under the umask and narrowing
+          # after: the content is written before any chmod could run, so a 0644 temp holding
+          # an auth-bearing ~/.claude.json is a window the in-place File.write never opened.
+          File.open(tmp, "w", perm: perm) do |file|
+            file.print(content)
+            file.flush
+            file.fsync
+          end
+          File.chmod(tmp, perm)
+          File.rename(tmp, target)
+        rescue ex
+          # `rescue nil` on the cleanup: an unwritable directory or a read-only filesystem
+          # makes the delete raise too, and that exception would REPLACE the ENOSPC (or
+          # whatever actually failed) with a permission complaint about a temp file the user
+          # has never heard of. The cause is what install_all is about to report.
+          File.delete?(tmp) rescue nil
+          raise ex
+        end
+      end
+
+      # The path a symlink points at, or *path* itself. A broken link (or an unreadable
+      # one) resolves to itself, so the write replaces the dangling link with a real file
+      # rather than failing the install over it.
+      private def self.resolve_symlink(path : String) : String
+        return path unless File.symlink?(path)
+        File.realpath(path)
+      rescue
+        path
       end
 
       # Replace or append a TOML table named *header* (without brackets), including any

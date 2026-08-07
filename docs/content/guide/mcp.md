@@ -71,11 +71,14 @@ gori can write the MCP configuration for common clients for you:
 gori mcp --install-claude-code
 gori mcp --install-codex
 gori mcp --install-grok
+gori mcp --install-claude-code --install-codex  # several clients in one run
 ```
 
-Codex and Grok use TOML with an `[mcp_servers.gori]` table (not JSON). Restart the client (or re-open the session) after installing so it reloads MCP servers.
+Codex and Grok use TOML with an `[mcp_servers.gori]` table (not JSON). Restart the client (or re-open the session) after installing so it reloads MCP servers. Existing config files are updated in place: other servers, tables and comments are preserved, the file's permissions are kept, and the replacement is atomic so an interrupted install can never truncate it.
 
 If a client starts MCP outside your repository directory, the server starts unbound and the agent can pick or create a project over tools. To pin a fixed engagement at install time instead, pass a selector, for example `gori mcp --project my-engagement --install-codex`.
+
+Every flag you pass alongside `--install-*` is written into the installed command, so what the client spawns matches what you typed — selectors (`--project`, `--db`, `--no-project`, `--use-active-project`), `--read-only`, `--insecure-upstream`, and `--config`. Paths are made absolute, because the client spawns the server from a working directory you did not choose.
 
 ## Tools
 

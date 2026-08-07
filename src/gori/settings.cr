@@ -69,6 +69,14 @@ module Gori
       @@path_override = p.try(&.presence)
     end
 
+    # The `--config PATH` this process was started with, or nil. Distinct from `path`, which
+    # answers where settings live after every fallback: a surface that has to REPRODUCE the
+    # invocation (`gori mcp --install-*` writing the argv a client will spawn) must carry only
+    # what was explicitly asked for, not bake in a default that should stay a default.
+    def self.path_override : String?
+      @@path_override
+    end
+
     def self.path : String
       @@path_override || ENV["GORI_CONFIG"]?.presence || File.join(Paths.home_dir, "settings.json")
     end
