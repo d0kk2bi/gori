@@ -57,6 +57,24 @@ describe Gori::Proxy::H2::HPACK do
     expect_raises(Gori::Error, /dynamic index/) { HPACK::Decoder.new.decode(hexb("be")) }
   end
 
+  it "raises Gori::Error (not IndexError) on a literal field truncated before its value" do
+    # `0x50` = literal with incremental indexing, static name index 16, and the block ends —
+    # so the value string's length byte is off the end. `read_string` used to index past the
+    # block and raise a raw IndexError, escaping every caller that rescues only Gori::Error
+    # (the repeater h2 engine's response decode among them → a truncated-HPACK origin response
+    # crashed the exchange). Must be a named Gori::Error now.
+    expect_raises(Gori::Error, /truncated/) { HPACK::Decoder.new.decode_fields(hexb("50")) }
+    expect_raises(Gori::Error, /truncated/) { HPACK::Decoder.new.decode_fields(hexb("40")) } # index 0 → literal NAME, also truncated
+    # And it stays a Gori::Error across every single-byte block (no raw IndexError anywhere).
+    256.times do |i|
+      begin
+        HPACK::Decoder.new.decode_fields(Bytes[i.to_u8])
+      rescue Gori::Error
+        # fine — the sanctioned channel
+      end
+    end
+  end
+
   it "Huffman round-trips arbitrary bytes" do
     ["www.example.com", "Mon, 21 Oct 2013 20:13:21 GMT", "ABCxyz0189-_/:%", ""].each do |s|
       HPACK.huffman_decode(HPACK.huffman_encode(s)).should eq(s)
