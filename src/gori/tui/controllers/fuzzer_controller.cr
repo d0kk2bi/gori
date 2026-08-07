@@ -141,7 +141,7 @@ module Gori::Tui
         end
       when :config  then config_hint(v, run)
       when :results then "↑/↓ select · ↵ detail · o sort · m matched · v dist · #{run} run · #{stop} stop · space cmds · ↹ pane"
-      when :detail  then "↑/↓ move · #{read_common} · ←/→ pane · ⇧←/→ h-scroll · esc back"
+      when :detail  then "↑/↓ move · #{read_common} · ←/→ pane · esc back"
       else               "↹/esc tabs"
       end
     end
@@ -646,6 +646,11 @@ module Gori::Tui
       return true.tap { @host.open_space_menu } if ev.key.space? && !ev.ctrl? && !ev.alt?
       key = ev.key
       selecting = ev.shift?
+      # Home / End / PgUp / PgDn, ⇧ extending. Must come BEFORE the printable-char
+      # fall-through below, and cannot be left to the Runner: this tab has no `body_scroll`
+      # override, so `page_nav_delta` → `body_scroll` returns false and the trailing `true`
+      # here simply swallowed all four keys.
+      return true if v.detail_motion_key(ev)
       case
       when key.up?, key.lower_k?
         v.detail_cursor_at_top? ? v.focus_pane(:results) : v.detail_move(-1, 0, selecting: selecting)

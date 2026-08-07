@@ -1350,6 +1350,16 @@ module Gori::Tui
       @detail_read.scroll_view(step)
     end
 
+    # Home / End / PgUp / PgDn, ⇧ extending — the shared `ReadPane` set. False when the key
+    # was not one of them, so the controller can go on matching. This pane was the last
+    # `ReadPane` consumer in the tree without it (`fuzzer` was the only tab controller with
+    # neither this nor a `body_scroll`), which left those four keys dead here alone.
+    def detail_motion_key(ev : Termisu::Event::Key) : Bool
+      return false unless detail_navigable?
+      sync_detail_source
+      @detail_read.motion_key(ev)
+    end
+
     def detail_plain_lines : Array(String)
       r = selected_result
       return [] of String unless r
@@ -2239,21 +2249,32 @@ module Gori::Tui
 
       # Mode / Advanced + the run-size read-out anchor to the bottom 3 rows; the sets list +
       # Add row fill the space between the header and that tail (windowed if they overflow).
-      tail_top = {inner.bottom - 3, inner.y + 1}.max
+      #
+      # The tail SHRINKS rather than climbing into the sets. `{inner.bottom - 3, inner.y + 1}.max`
+      # used to clamp `tail_top` onto the sets' own first row, and since neither writer pads its
+      # row, Mode landed ON a set row with the set text bleeding through its gaps
+      # ("Modeist‹ sniper ›hP×N,four,…"); with no sets the Add row landed on the "PAYLOAD SETS"
+      # header and — it DOES pad — erased it. Reserve the header plus one sets row first, then
+      # hand the tail what is left, dropping the run read-out, then Advanced, then Mode.
+      tail_rows = (inner.h - 2).clamp(0, 3)
+      tail_top = inner.bottom - tail_rows
       render_sets(screen, inner, inner.y + 1, focused, tail_top)
-      render_mode_row(screen, inner, tail_top, focused)
-      render_advanced_row(screen, inner, tail_top + 1, focused)
-      render_run_summary(screen, inner, tail_top + 2)
+      render_mode_row(screen, inner, tail_top, focused) if tail_rows >= 1
+      render_advanced_row(screen, inner, tail_top + 1, focused) if tail_rows >= 2
+      render_run_summary(screen, inner, tail_top + 2) if tail_rows >= 3
     end
 
     # Payload-set rows within [y0, limit), followed by the "+ Add payload set…" row.
     # `limit` is the first row the bottom tail occupies, so sets never overwrite it.
     private def render_sets(screen, inner : Rect, y0 : Int32, focused : Bool, limit : Int32) : Nil
+      return if y0 >= limit           # the tail owns every row under the header — nothing to fill
       pp = @config.mode.per_position? # set i → marker i (Pitchfork/ClusterBomb)
-      avail = {limit - y0, 1}.max
+      # REAL rows. This used to be `{limit - y0, 1}.max`, which fabricated a row the pane did
+      # not have and put the first set (or the Add row) on top of the tail.
+      avail = limit - y0
       if @sets.empty?
-        screen.text(inner.x + 1, y0, "(no sets yet)", Theme.muted, Theme.bg) if y0 < limit
-        draw_add_row(screen, inner, {y0 + 1, limit - 1}.min, focused)
+        screen.text(inner.x + 1, y0, "(no sets yet)", Theme.muted, Theme.bg)
+        draw_add_row(screen, inner, y0 + 1, focused, limit)
         return
       end
       set_rows = {avail - 1, 1}.max # reserve the last available row for the Add row
@@ -2264,7 +2285,7 @@ module Gori::Tui
           render_set_row(screen, inner, y, s, i, set_selected?(focused, i), pp)
           y += 1
         end
-        draw_add_row(screen, inner, y, focused)
+        draw_add_row(screen, inner, y, focused, limit)
       else
         visible = {set_rows - 1, 1}.max # 1 row for the overflow hint, 1 for Add
         # Only re-anchor scroll to the cursor when it's actually on a set row; on a tail
@@ -2283,8 +2304,8 @@ module Gori::Tui
         end
         above, below = @cfg_scroll, @sets.size - stop
         hint = above > 0 && below > 0 ? "… #{above} above · #{below} below" : (above > 0 ? "… #{above} above" : "… +#{below} more")
-        screen.text(inner.x + 1, y, hint, Theme.muted, Theme.bg)
-        draw_add_row(screen, inner, y + 1, focused)
+        screen.text(inner.x + 1, y, hint, Theme.muted, Theme.bg) if y < limit
+        draw_add_row(screen, inner, y + 1, focused, limit)
       end
     end
 
@@ -2292,8 +2313,10 @@ module Gori::Tui
       focused && config_row == :set && current_set_index == i
     end
 
-    private def draw_add_row(screen, inner : Rect, y : Int32, focused : Bool) : Nil
-      return if y >= inner.bottom
+    # `limit` is the tail's first row: the Add row PADS its width, so an unbounded one
+    # erased whatever the tail (or the header) had already drawn there.
+    private def draw_add_row(screen, inner : Rect, y : Int32, focused : Bool, limit : Int32) : Nil
+      return if y >= limit || y >= inner.bottom
       foc = focused && config_row == :add
       bg = foc ? Theme.accent_bg : Theme.bg
       screen.fill(Rect.new(inner.x, y, inner.w, 1), bg) if foc

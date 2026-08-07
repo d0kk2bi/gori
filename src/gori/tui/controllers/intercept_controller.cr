@@ -59,7 +59,7 @@ module Gori::Tui
       fa = Hotkeys.binding_label(reg, "intercept.forward-all", "⇧F")
       filt = Hotkeys.binding_label(reg, "intercept.filter", "/")
       catch = Hotkeys.binding_label(reg, "intercept.direction", "c")
-      "↑/↓ move · #{mark} mark · ⇧↑/↓ range · ⇧←/→ h-scroll · ↵/e edit · #{f} fwd · #{d} drop · #{fa} all · #{filt} filter · #{catch} catch · space cmds · esc tabs"
+      "↑/↓ move · #{mark} mark · ⇧↑/↓ range · ↵/e edit · #{f} fwd · #{d} drop · #{fa} all · #{filt} filter · #{catch} catch · space cmds · esc tabs"
     end
 
     def goto_symbol : Symbol? # the held-message editor is ^G/^F-searchable

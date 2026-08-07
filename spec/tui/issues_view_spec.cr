@@ -70,8 +70,13 @@ describe Gori::Tui::IssuesView do
     tmp_store do |store|
       view = IssuesView.new
       view.reload(store)
-      backend = MemoryBackend.new(80, 12)
-      view.render(Screen.new(backend), Rect.new(0, 0, 80, 12))
+      # 13 rows is the least this card fits in: TrafficEmptyState admits the FULL card only
+      # when its own height fits (7 interior + 2 borders + the headline row, inside the list
+      # rect below this view's chrome). At 12 it degrades to the plain-lines form — which
+      # still carries the message and the chord, just no card title. It used to be admitted
+      # at 12 and overflow the list rect by a row.
+      backend = MemoryBackend.new(80, 13)
+      view.render(Screen.new(backend), Rect.new(0, 0, 80, 13))
       backend.contains?("no issues yet").should be_true
       backend.contains?("ISSUES").should be_true
       backend.contains?("⇧F").should be_true
