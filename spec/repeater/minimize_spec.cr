@@ -182,6 +182,29 @@ describe Gori::Repeater::Minimize do
     report.sends.should be > 0
   end
 
+  it "strips cosmetic crumbs from a SECOND Cookie header even when the first is load-bearing" do
+    # HTTP/2 splits cookies across multiple `cookie` field lines (RFC 9113 §8.2.2). The crumb
+    # remover used to target the FIRST Cookie header only, so once a crumb there was load-bearing
+    # (keeping that header un-emptied and un-deleted, hence perpetually "first"), every crumb in a
+    # later Cookie header was silently unremovable — the minimizer under-minimized and said so.
+    text = [
+      "GET /p HTTP/1.1",
+      "Host: h",
+      "X-Keep: yes",
+      "Cookie: sid=abc123",     # load-bearing → header 1 is never emptied/deleted
+      "Cookie: junk=1; trash=2", # cosmetic → must still be reachable and removed
+    ].join("\n")
+
+    report = minimize(FakeOrigin.new, text)
+    report.aborted.should be_false
+    labels = report.removed.map(&.label)
+    labels.should contain("junk")
+    labels.should contain("trash")
+    report.minimized_text.should contain("sid=abc123")
+    report.minimized_text.should_not contain("junk")
+    report.minimized_text.should_not contain("trash")
+  end
+
   it "removes an unused body param and re-lengths, keeping a load-bearing one (auto-CL on)" do
     text = [
       "POST /submit HTTP/1.1",

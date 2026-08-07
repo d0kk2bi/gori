@@ -331,12 +331,18 @@ module Gori::Repeater
     private def self.cookie_candidate(crumb : String) : Candidate
       Candidate.new(Kind::Cookie, crumb.split('=', 2).first, ->(text : String) {
         hl, body, sep = split_text(text)
-        idx = (1...hl.size).find { |k| header_name(hl[k]).downcase == "cookie" }
+        # Find the Cookie header that CONTAINS this crumb, not merely the FIRST one. HTTP/2
+        # routinely splits cookies across several `cookie` field lines (RFC 9113 §8.2.2), and a
+        # `.find` on the first header could never excise a crumb living in a later one: once a
+        # crumb in the first header was load-bearing (so that header was never emptied and
+        # deleted), every crumb in every SUBSEQUENT Cookie header was silently unremovable.
+        idx = (1...hl.size).find do |k|
+          header_name(hl[k]).downcase == "cookie" && cookie_crumbs(hl[k]).includes?(crumb)
+        end
         return nil unless idx
         colon = hl[idx].index(':').not_nil!
         prefix = hl[idx][0...colon]
         crumbs = hl[idx][(colon + 1)..].strip.split(/;\s*/).reject(&.empty?)
-        return nil unless crumbs.includes?(crumb)
         crumbs.delete(crumb)
         if crumbs.empty?
           hl.delete_at(idx)
