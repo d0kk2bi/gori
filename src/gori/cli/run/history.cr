@@ -27,7 +27,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run history delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run history delete: missing value for #{f}" }
         end
@@ -107,7 +107,7 @@ module Gori
             format = :json if format == :jsonl # this listing's json IS JSON-Lines; accept the standard name too
           end
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run history: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run history: missing value for #{f}" }
         end
@@ -206,7 +206,7 @@ module Gori
           p.on("--request-only", "Only the request side") { req_only = true }
           p.on("--response-only", "Only the response side") { resp_only = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run show: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run show: missing value for #{f}" }
         end

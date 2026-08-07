@@ -30,7 +30,7 @@ module Gori
           p.on("-oMODE", "--output=MODE", "Render final bytes: auto (default) | text | base64 | hex") { |v| output_mode = parse_render_mode(v) }
           p.on("--format=FMT", "Output: text (default) | json (per-step detail)") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run decoder: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run decoder: missing value for #{f}" }
         end

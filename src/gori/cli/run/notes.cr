@@ -43,7 +43,7 @@ module Gori
           p.on("--all", "Print every note in full instead of the one-line list") { all = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run notes: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run notes: missing value for #{f}" }
         end
@@ -84,7 +84,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("--text=TEXT", "Note body (else positional args, else STDIN)") { |v| text = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run notes create: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run notes create: missing value for #{f}" }
         end
@@ -127,7 +127,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| positional = rest }
+          p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run notes delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run notes delete: missing value for #{f}" }
         end

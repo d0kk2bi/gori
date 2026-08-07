@@ -186,21 +186,34 @@ module Gori
     # project had overridden loses the override with the rule (there is nothing left to
     # disagree with) — its EFFECTIVE state here is what the project rule inherits, because that
     # is the state the operator is looking at when they press the key.
+    #
+    # The half the ordering does NOT cover on its own is the second step failing: the copy is
+    # committed in the destination and the source store then refuses the delete, which leaves
+    # the rule in BOTH scopes — `merged` lists it twice and the proxy applies it twice, while
+    # both callers say "the rule is unchanged". So the copy is undone before returning false.
+    # The undo targets the store that just accepted a write rather than the one that just
+    # refused, so it is far likelier to land; it is still best-effort, and if it too fails the
+    # duplicate stands, which is why the id is kept rather than the copy re-found by fields
+    # (that would pick the wrong twin).
     def set_scope(rule : Store::MatchRule, to : Store::RuleScope) : Bool
       return false if rule.scope == to
-      ok =
+      copy_id =
         if to.global?
           Settings.add_rewriter_rule(rule.target.label, rule.part.label, rule.pattern,
             rule.replacement, rule.op.label, rule.match_kind.label, rule.name, rule.host,
-            rule.body_file, rule.enabled?) != 0
+            rule.body_file, rule.enabled?)
         else
           @store.insert_rule(rule.target, rule.part, rule.pattern, rule.replacement, rule.op,
-            rule.match_kind, rule.name, rule.host, rule.enabled?, body_file: rule.body_file) != 0
+            rule.match_kind, rule.name, rule.host, rule.enabled?, body_file: rule.body_file)
         end
-      return false unless ok
-      ok = remove(rule.id, rule.scope)
+      return false if copy_id == 0
+      unless remove(rule.id, rule.scope)
+        to.global? ? Settings.delete_rewriter_rule(copy_id) : @store.delete_rule(copy_id)
+        refresh
+        return false
+      end
       refresh
-      ok
+      true
     end
 
     # The {target, part} an op can actually have. Header ops are head-only; a short-circuit
@@ -234,8 +247,23 @@ module Gori
         if scope.global?
           # Drop this project's disagreement with it too, so a later rule that inherits the id
           # cannot inherit the override — belt to the monotonic counter's braces.
+          #
+          # Only once the rule is actually gone, though. `delete_rewriter_rule` answers false
+          # for two different reasons and they want opposite handling here:
+          #
+          #   no such rule        — nothing left to disagree with, so the stale override is
+          #                         swept (this is the case the sweep was written for)
+          #   settings not saved  — the rule is still in the library on disk, and clearing the
+          #                         override would drop this project back to the library's
+          #                         default: a rule the operator switched OFF here turns back
+          #                         ON, resuming a live traffic rewrite nobody asked for
+          #
+          # Which one it was has to be captured BEFORE the call. `delete_rewriter_rule` drops
+          # the rule from the in-memory list and only then saves, so asking afterwards reports
+          # "gone" for both — it cannot tell them apart.
+          existed = Settings.rewriter_rules.any? { |r| r.id == id }
           deleted = Settings.delete_rewriter_rule(id)
-          @store.clear_rewriter_override(id)
+          @store.clear_rewriter_override(id) if deleted || !existed
           deleted
         else
           @store.delete_rule(id)

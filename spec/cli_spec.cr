@@ -326,3 +326,39 @@ describe "gori ca — leftover positionals" do
     Gori::CLI.ca_leftover_error("ca regenerate", [] of String).should be_nil
   end
 end
+
+# Every `gori run` subcommand, as a CLASS.
+#
+# `OptionParser#unknown_args` yields TWO lists — the words it could not claim, and the run
+# following a `--` separator, which it strips and hands over separately. A handler that binds
+# only the first silently DISCARDS everything past a `--`, which switches the subcommand's own
+# argument handling off at exit 0. `gori settings` was fixed for exactly this (see the two
+# describes above); every `src/gori/cli/run/*.cr` site had the same hole, reproduced through the
+# built binary:
+#
+#   gori run decoder base64-encode hello       → aGVsbG8=
+#   gori run decoder base64-encode -- hello    → nothing, exit 0 (input dropped, reads STDIN)
+#   gori run links add --owner=… -- junk       → sailed past the guard that refuses positionals
+#
+# Asserted over the SOURCE rather than per-command, because the defect is one a new subcommand
+# reintroduces by copying the idiom from its neighbours — which is how all ~60 of them got it.
+# A per-command example would only ever cover the commands someone remembered to write one for.
+#
+# No `gori` command uses `--` as a pass-through separator (nothing forwards argv to a
+# subprocess), so joining both halves is right everywhere: each site either refuses the
+# leftovers or reads them as positionals, and both want the full set.
+describe "gori run — the `--` half of unknown_args" do
+  it "is bound by every subcommand parser" do
+    dir = File.join(__DIR__, "..", "src", "gori", "cli", "run")
+    offenders = [] of String
+    Dir.glob(File.join(dir, "**", "*.cr")).sort.each do |path|
+      File.read_lines(path).each_with_index do |line, i|
+        next unless line.includes?("unknown_args")
+        # The second block parameter discarded as `_` — the whole defect, in one token.
+        next unless line.matches?(/unknown_args\s*(\{|do)\s*\|\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*_\s*\|/)
+        offenders << "#{File.basename(path)}:#{i + 1}"
+      end
+    end
+    offenders.should be_empty
+  end
+end

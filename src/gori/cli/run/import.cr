@@ -41,7 +41,8 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to import into (created if absent)") { |v| db_path = v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args do |rest, _|
+          p.unknown_args do |before, after|
+            rest = before + after
             abort "gori run import: unexpected argument#{rest.size == 1 ? "" : "s"} #{rest.join(" ").inspect} — pass the file via a source flag, e.g. --har PATH" unless rest.empty?
           end
           p.invalid_option { |f| abort "gori run import: unknown option: #{f}\n#{p}" }

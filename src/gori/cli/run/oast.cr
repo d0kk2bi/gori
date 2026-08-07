@@ -101,7 +101,7 @@ module Gori
           p.on("--show-tokens", "Print provider auth tokens instead of [REDACTED]") { show_tokens = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| leftover = rest }
+          p.unknown_args { |before, after| leftover = before + after }
           p.invalid_option { |f| abort "gori run oast providers: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run oast providers: missing value for #{f}" }
         end
@@ -170,7 +170,7 @@ module Gori
           p.on("--enabled", "Turn the provider on") { enabled = true }
           p.on("--disabled", "Turn the provider off") { enabled = false }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| id = rest.first? }
+          p.unknown_args { |before, after| id = (before + after).first? }
           p.invalid_option { |f| abort "gori run oast providers #{verb}: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run oast providers #{verb}: missing value for #{f}" }
         end
@@ -240,7 +240,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| id = rest.first? }
+          p.unknown_args { |before, after| id = (before + after).first? }
           p.invalid_option { |f| abort "gori run oast providers #{verb}: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run oast providers #{verb}: missing value for #{f}" }
         end
@@ -266,7 +266,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |rest, _| id = rest.first? }
+          p.unknown_args { |before, after| id = (before + after).first? }
           p.invalid_option { |f| abort "gori run oast providers delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run oast providers delete: missing value for #{f}" }
         end
