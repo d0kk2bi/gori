@@ -26,12 +26,19 @@ module Gori::Tui
     # Miss Ring's stand in the PET step's card: the sprite plus a column of plate either
     # side, held off the card's right border.
     PET_PREVIEW_W   = Mascot::W + 2
-    PET_PREVIEW_GAP =  2 # min columns between the text column and her plate
-    LABEL_W         =  9 # widest bind label ("Bind Port")
-    PREVIEW_W       = 30 # theme-preview panel width (two-column theme step)
-    PREVIEW_GAP     =  2
-    LIST_MIN        = 24 # minimum theme-list width before the preview is dropped
-    THEME_VP_MAX    = 10 # most theme rows shown at once
+    PET_PREVIEW_GAP = 2 # min columns between the text column and her plate
+    # Narrowest text column the PET step will lay out AROUND her sprite: the width of its
+    # opening line ("A mascot in the corner, off unless you want her."), the one sentence
+    # that says what the step is asking. Below it she is dropped and the copy takes the
+    # card — see `self.pet_preview_x`. Coupled BY HAND to that sentence, exactly the way
+    # BIND_ROWS/PET_ROWS/REVIEW_ROWS are coupled to their renderers and just as unchecked:
+    # reword the line and this number is what decides whether the reworded one survives.
+    PET_TEXT_MIN = 48
+    LABEL_W      =  9 # widest bind label ("Bind Port")
+    PREVIEW_W    = 30 # theme-preview panel width (two-column theme step)
+    PREVIEW_GAP  =  2
+    LIST_MIN     = 24 # minimum theme-list width before the preview is dropped
+    THEME_VP_MAX = 10 # most theme rows shown at once
 
     # Interior content rows each FIXED-LAYOUT step draws, below the card's top border + 1 pad
     # row. Each must match what the matching render_* actually draws at its fixed offsets, and
@@ -61,11 +68,40 @@ module Gori::Tui
     MIN_W = 40 # Layout.usable?'s width floor; step_card clamps to 34 columns inside it
     MIN_H = {BIND_ROWS, PET_ROWS, REVIEW_ROWS}.max + 6
 
+    # The failed-save footer once the full one no longer fits — see render_footer.
+    SAVE_FAILED_SHORT = "save failed · ↵ retry · esc discard"
+
     # The card height `step_card` settles on for a terminal of height `h` and a step wanting
     # `rows` of content. Pulled out as a pure class method so the MIN_H invariant above is
     # checkable without standing up a terminal.
     def self.card_h(h : Int32, rows : Int32) : Int32
       {rows + 6, {h - 3, 3}.max}.min
+    end
+
+    # The card WIDTH `step_card` settles on for a terminal `w` columns wide and a step
+    # wanting `cols`. Pure for the same reason `card_h` is: it's what makes the pet-preview
+    # threshold below checkable from a spec that cannot stand up a terminal.
+    def self.card_w(w : Int32, cols : Int32) : Int32
+      { {w - 4, cols}.min, 34 }.max
+    end
+
+    # The column Miss Ring's static preview stands at inside `box`, or nil when the card is
+    # too narrow to hold her BESIDE the step's own copy. Same drop `theme_list_w` performs on
+    # the theme preview panel, and for the same reason — except that her band is held back out
+    # of the text column, so on a narrow card she did not shrink the copy, she shredded it. At
+    # the advertised MIN_W the text column came out 19 columns wide and all three lines,
+    # including the one sentence that says what the step is asking, rendered as a stub plus an
+    # ellipsis. `box.x + 3` is render_pet's `ix`; keep the two in step.
+    #
+    # What this guarantees is the OPENING LINE, not the whole step: the two supporting lines
+    # want 53 and 54 columns, so she reappears (w ≥ 69) a few columns before they stop
+    # clipping (w ≥ 75), and across that band widening the terminal costs those two their
+    # tails to buy the sprite back. Deliberate — she is the thing the step is asking about,
+    # and a step that describes a mascot you cannot see is the worse trade. `theme_list_w`
+    # doesn't have this band only because a theme NAME fits either side of its threshold.
+    def self.pet_preview_x(box : Rect) : Int32?
+      px = box.right - 2 - PET_PREVIEW_W
+      px - PET_PREVIEW_GAP - (box.x + 3) >= PET_TEXT_MIN ? px : nil
     end
 
     enum Step
@@ -210,6 +246,10 @@ module Gori::Tui
         move_cursor(-1)
       elsif key.right?
         move_cursor(1)
+      elsif key.home?
+        @cursor = 0
+      elsif key.end?
+        @cursor = bind_value.size
       elsif key.backspace?
         bind_backspace
       elsif key.delete?
@@ -288,6 +328,13 @@ module Gori::Tui
 
     private def advance_from_bind : Nil
       if Settings.bind_host_error(@ip)
+        # Put the caret back on the field the message is about. This is only ever reached from
+        # the PORT field — ↵ on the IP field moves focus here first — so "invalid bind IP" was
+        # reported with the accent band and the caret both sitting on Bind Port, pointing at a
+        # field the user had already been moved off and that was not the one at fault. Typing
+        # in the field we land on clears the status (bind_insert), which is the fix the message
+        # is asking for.
+        switch_bind_field(:ip)
         @status = "invalid bind IP (e.g. 127.0.0.1)"
         return
       end
@@ -477,8 +524,7 @@ module Gori::Tui
       # the list, Review's Shortcuts row spells out a chord family, and Pet holds her
       # sprite's band back out of the same interior its copy runs across.
       cols = @step.bind? ? 64 : 84
-      inner = {w - 4, cols}.min
-      cw = {inner, 34}.max
+      cw = SetupWizard.card_w(w, cols)
       avail = {h - 3, 3}.max # rows between the header (y0-1) and the hint (y h-1)
       ch = SetupWizard.card_h(h, content_rows)
       cx = {(w - cw) // 2, 0}.max
@@ -503,9 +549,15 @@ module Gori::Tui
       when Step::Bind   then BIND_ROWS
       when Step::Pet    then PET_ROWS
       when Step::Review then REVIEW_ROWS
-        # ≥7 so the preview panel (header + 3 status rows) is never clipped, capped so a
-        # long theme list scrolls (the list viewport derives from the card height) instead
-        # of demanding the whole screen.
+        # ≥7 so the preview panel (header + 3 status rows) is unclipped whenever the card can
+        # actually have the rows it ASKS for, capped so a long theme list scrolls (the list
+        # viewport derives from the card height) instead of demanding the whole screen. The
+        # floor is a request, not a guarantee: `card_h` clamps to `h - 3`, so at MIN_H the card
+        # is 12 rows however many this returns, the list viewport is 6, and the preview's third
+        # status row falls to render_theme_preview's own `break`. One mock row, on the shortest
+        # terminal the wizard runs on at all — cheaper than the alternative, which is REVIEW
+        # (the tallest step, and the only one that can commit) losing terminal sizes to a
+        # higher MIN_H.
       else { {Theme.available.size, 7}.max, THEME_VP_MAX }.min # appearance
       end
     end
@@ -599,25 +651,45 @@ module Gori::Tui
       # REVIEW's interior is already exactly `content_rows` tall, so a row there would push
       # MIN_H from 15 to 16 and lock out terminals that can otherwise finish setup.
       if err = @save_error
+        # The path is the more useful half when there is room for it; the KEYS are the half
+        # that has to survive. `Screen#text` ellipsizes from the RIGHT, and the long form runs
+        # ~84 columns for a default `~/.gori` path — more than twice MIN_W — so what it dropped
+        # first was precisely the "↵ retry · esc discard" telling the user four screens of
+        # answers are still in hand. Keep SAVE_FAILED_SHORT's tail in step with the string
+        # `finish` builds; that is the only one that reaches here (`skip`'s never renders,
+        # see there).
+        err = SAVE_FAILED_SHORT if err.size > w
         screen.text({(w - err.size) // 2, 0}.max, h - 1, err, Theme.red, Theme.bg)
         return
       end
-      hint = case @step
-             when Step::Bind       then "↵ next · ↑/↓ field · esc skip"
-             when Step::Appearance then "↑/↓ pick theme · ↵ next · ⇧⇥ back · esc skip"
-             when Step::Pet        then pet_footer_hint
-             else                       "↑/↓ choose · ←/→ shortcuts · ↵ confirm · ⇧⇥ back · esc skip"
-             end
+      hints = footer_hints
+      hint = hints.find { |s| s.size <= w } || hints.last
       screen.text({(w - hint.size) // 2, 0}.max, h - 1, hint, Theme.muted, Theme.bg)
     end
 
-    # ←/→ is only offered while she is on — it does nothing under "No mascot", and the
-    # motion row it drives is hidden there too.
-    private def pet_footer_hint : String
-      if @pet_enabled
-        "↑/↓ choose · ←/→ motion · ↵ next · ⇧⇥ back · esc skip"
+    # This step's key hints, widest first; `render_footer` takes the first that fits.
+    #
+    # EVERY entry ends in "esc", because a single string plus right-hand ellipsis meant the
+    # exit was the first thing to go: at the advertised MIN_W of 40 the PET hint (53 columns)
+    # and the REVIEW one (59) were 13 and 19 over, so the two steps where a user is most
+    # likely to want out — REVIEW being the one where `finish` lives — were the two that
+    # stopped advertising a way. Same reason the too-small screen spells out esc.
+    private def footer_hints : Array(String)
+      case @step
+      when Step::Bind
+        ["↵ next · ↑/↓ field · esc skip", "↵ next · esc skip"]
+      when Step::Appearance
+        ["↑/↓ pick theme · ↵ next · ⇧⇥ back · esc skip", "↑/↓ theme · ↵ next · esc skip"]
+      when Step::Pet
+        # ←/→ is only offered while she is on — it does nothing under "No mascot", and the
+        # motion row it drives is hidden there too.
+        if @pet_enabled
+          ["↑/↓ choose · ←/→ motion · ↵ next · ⇧⇥ back · esc skip", "←/→ motion · ↵ next · esc skip"]
+        else
+          ["↑/↓ choose · ↵ next · ⇧⇥ back · esc skip", "↑/↓ choose · ↵ next · esc skip"]
+        end
       else
-        "↑/↓ choose · ↵ next · ⇧⇥ back · esc skip"
+        ["↑/↓ choose · ←/→ shortcuts · ↵ confirm · ⇧⇥ back · esc skip", "↵ confirm · esc skip"]
       end
     end
 
@@ -753,16 +825,17 @@ module Gori::Tui
       ix = box.x + 3
       # Hold the sprite's column band back before laying out the text, so a line can never
       # run under her — the same order Tutorial.step_card reserves her band in. But ONLY while
-      # she is actually standing there: every consumer of that reservation (the text width here,
-      # the accent band below, draw_pet_preview at the end) is gated the same way, so under
-      # "No mascot" the step uses the card's full interior instead of ellipsizing its copy and
-      # clipping its rows 14 columns short of an edge with nothing behind it.
-      px = box.right - 2 - PET_PREVIEW_W
-      iw = @pet_enabled ? {px - PET_PREVIEW_GAP - ix, 1}.max : {box.right - 1 - ix, 1}.max
+      # she is actually standing there, which is two conditions, not one: she is switched on
+      # AND the card is wide enough to hold her beside the copy (self.pet_preview_x). Every
+      # consumer of the reservation — the text width here, the accent band below,
+      # draw_pet_preview at the end — reads that ONE answer, so the step either lays out
+      # around her or takes the card's full interior, never half of each.
+      px = @pet_enabled ? SetupWizard.pet_preview_x(box) : nil
+      band = px.try { |x| x - PET_PREVIEW_GAP }
+      iw = {(band || (box.right - 1)) - ix, 1}.max
       screen.text(ix, box.y + 2, "A mascot in the corner, off unless you want her.",
         Theme.text, Theme.panel, width: iw)
       ry = box.y + 4
-      band = @pet_enabled ? px - PET_PREVIEW_GAP : nil
       render_offer_row(screen, box, ry, "Show Miss Ring", @pet_enabled, band)
       render_offer_row(screen, box, ry + 1, "No mascot", !@pet_enabled, band)
       # Only while she is on — a motion row under "No mascot" offers a setting for
@@ -773,7 +846,7 @@ module Gori::Tui
       # at the keyboard, which is why she is opt-in at all.
       screen.text(ix, ry + 4, "She reacts to results, then dozes off after 90s idle.",
         Theme.muted, Theme.panel, width: iw)
-      draw_pet_preview(screen, px, ry) if @pet_enabled
+      px.try { |x| draw_pet_preview(screen, x, ry) }
     end
 
     # Her plate is the card's own panel colour, so she sits ON the card rather than in a
