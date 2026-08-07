@@ -205,6 +205,44 @@ describe Gori::FilterAst do
       dash, _ = Gori::FilterAst.partition("NOT (-tag:x)") { |t| t.text.starts_with?("tag:") }
       dash.map(&.negate?).should eq([false])
     end
+
+    it "keeps the NOT for a group made ENTIRELY of the other backend's terms" do
+      # A NOT-group with no OWNED (tag:) term used to be decomposed anyway: the inner terms
+      # went to the residual and the leading NOT was DROPPED, so Sitemap's residual for
+      # `NOT (host:evil)` came back as `( host:evil )` and QL then SHOWED only evil — the
+      # negation silently inverted. A term-less group can't feed `taken`, so keep it verbatim.
+      taken, residual = Gori::FilterAst.partition("NOT (host:evil)") { |t| t.text.starts_with?("tag:") }
+      taken.should be_empty
+      residual.should eq("NOT (host:evil)")
+
+      # The module's own documented example, all-residual for a tag: backend.
+      _, res2 = Gori::FilterAst.partition("NOT (host:cdn OR host:static)") { |t| t.text.starts_with?("tag:") }
+      res2.should eq("NOT (host:cdn OR host:static)")
+
+      # A tag term alongside still splits out; the residual NOT-group keeps its negation.
+      tk, res3 = Gori::FilterAst.partition("tag:done NOT (host:evil)") { |t| t.text.starts_with?("tag:") }
+      tk.map(&.text).should eq(["tag:done"])
+      res3.should eq("NOT (host:evil)")
+    end
+
+    it "makes NOT tag:x and -tag:x identical INSIDE a group (the grammar's core equivalence)" do
+      # An inner NOT keyword before an owned term used to fall into the residual, so the term
+      # took only the OUTER run's polarity: `NOT (NOT tag:a)` excluded what `NOT (-tag:a)`
+      # included. Inner and dash negation must compose the same way.
+      %w(a b).each do |x|
+        {"NOT (NOT tag:#{x})", "NOT (-tag:#{x})"}.tap do |kw, dash|
+          kwp = Gori::FilterAst.partition(kw) { |t| t.text.starts_with?("tag:") }[0].map(&.negate?)
+          dp = Gori::FilterAst.partition(dash) { |t| t.text.starts_with?("tag:") }[0].map(&.negate?)
+          kwp.should eq(dp)
+        end
+      end
+      # NOT (NOT tag:a) is a double negation → positive.
+      Gori::FilterAst.partition("NOT (NOT tag:a)") { |t| t.text.starts_with?("tag:") }[0]
+        .map(&.negate?).should eq([false])
+      # NOT (tag:a NOT tag:b): outer negates a, inner+outer cancel on b.
+      Gori::FilterAst.partition("NOT (tag:a NOT tag:b)") { |t| t.text.starts_with?("tag:") }[0]
+        .map { |t| {t.text, t.negate?} }.should eq([{"tag:a", true}, {"tag:b", false}])
+    end
   end
 
   describe ".spans" do
