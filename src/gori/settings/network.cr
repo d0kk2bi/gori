@@ -311,11 +311,57 @@ module Gori::Settings
     self.project_capture_max_mib = store.setting(PROJECT_CAPTURE_MAX_KEY).try(&.to_i?)
   end
 
+  # A `-l` / `-p` (`gori tui`, `gori run capture`) override for THIS PROCESS only, nil when the
+  # flag wasn't given. Its own layer rather than an assignment into `bind_host`/`bind_port`,
+  # because those two ARE the persisted global: writing a flag there meant any later
+  # `Settings.save` in the session flushed it to settings.json — the pet toggle, tab prefs, the
+  # update-check stamp, the first-run wizard's own commit — silently promoting a one-run
+  # override into the permanent default that every future project then inherits. Which is
+  # precisely the invariant `Runner.port_fallback` spells out for the startup port fallback;
+  # the CLI flag is the same kind of value and belongs on the same side of the line.
+  #
+  # `gori tui --help`, `gori wizard --help` and the wizard's own NETWORK step all promise this
+  # is temporary; before this layer existed, `gori tui -p 9999 -l 0.0.0.0` on a fresh install
+  # left every later launch bound to every interface.
+  #
+  # Ordered BELOW a project pin and above the persisted global — the precedence the flag has
+  # always had, since it used to reach the proxy by way of `bind_host` itself.
+  class_property cli_bind_host : String? = nil
+  class_property cli_bind_port : Int32? = nil
+
   def self.effective_bind_host : String
-    project_bind_host || bind_host
+    project_bind_host || cli_bind_host || bind_host
   end
 
   def self.effective_bind_port : Int32
+    project_bind_port || cli_bind_port || bind_port
+  end
+
+  # The bind before any project is open: the persisted global with this run's flag on top.
+  # What `Config` is seeded from, and what a "no project yet" surface should report.
+  def self.startup_bind_host : String
+    cli_bind_host || bind_host
+  end
+
+  def self.startup_bind_port : Int32
+    cli_bind_port || bind_port
+  end
+
+  # The bind this project is CONFIGURED for, deliberately excluding the process-only CLI layer:
+  # its own pin if it has one, else the persisted global. What the Project pane displays and
+  # compares against, for two reasons that pull the same way:
+  #
+  #   - the pane labels each row "· project" or "· global" off `project_bind_*`, so seeding it
+  #     from `effective_*` showed a `-l`/`-p` value under a "· global" marker while the actual
+  #     global was something else — the pane asserting a shared default that isn't one;
+  #   - the same value is the baseline `apply_project_network` reads as "unchanged means
+  #     inherit", and against `effective_*` the port the operator is RUNNING ON becomes
+  #     impossible to pin: typing it matches the baseline and clears the key instead.
+  def self.configured_bind_host : String
+    project_bind_host || bind_host
+  end
+
+  def self.configured_bind_port : Int32
     project_bind_port || bind_port
   end
 

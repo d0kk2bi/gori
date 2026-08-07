@@ -188,7 +188,12 @@ module Gori
         # theme setup once. Inside `begin` so the `ensure term.close` restores
         # the terminal if it raises. The wizard persists settings.json (even on skip),
         # so it never auto-launches again.
-        Tui::SetupWizard.new(term).run unless File.exists?(Settings.path)
+        #
+        # It stages `Settings.bind_host`/`bind_port` — the PERSISTED global, which a `-l`/`-p`
+        # flag deliberately no longer touches (Settings.cli_bind_host). That separation is what
+        # keeps the wizard from writing a one-run override into settings.json as the permanent
+        # default, while this session still binds where the flag said.
+        wizard_error = File.exists?(Settings.path) ? nil : Tui::SetupWizard.new(term).run
         # `notice` is the picker's one-line "here is why you are looking at this screen".
         # A failed open used to fall through to the picker in SILENCE, its reason reachable
         # only by knowing to read ~/.gori/gori.log, so an operator who typo'd `--db` saw
@@ -198,7 +203,13 @@ module Gori
         # A corrupt settings.json starts on the row and a failed --db open then displaces
         # it, being the more immediate explanation of what is on screen. Neither is lost:
         # the settings warning also went to STDERR and names the `.corrupt` copy it kept.
-        notice = settings_warning
+        #
+        # A failed wizard persist outranks both, and unlike the others it never touched STDERR —
+        # the wizard hands it back precisely because its own screen was about to be wiped. It is
+        # specifically the SKIP path's failure: a failed `finish` keeps the user on REVIEW to
+        # retry, so what reaches here is "settings.json could not be materialised at all", whose
+        # only other symptom is the wizard silently re-opening on every launch.
+        notice = wizard_error.try { |e| "setup wizard: #{e}" } || settings_warning
         if open_db_path
           outcome, db_error = open_and_run(project_for_db_path(open_db_path), term)
           return if outcome == :quit
@@ -281,9 +292,12 @@ module Gori
     # which are :back, and only one of which is worth putting on screen.
     private def open_and_run(project : Project, term : Termisu) : {Symbol, String?}
       # Pick up any bind address / verify-upstream toggle changed via Settings since startup
-      # (the previous session kept its values; this one opens on the new ones).
-      @config.listen = Settings.bind_host
-      @config.port = Settings.bind_port
+      # (the previous session kept its values; this one opens on the new ones). `startup_*`,
+      # not the bare globals: a `-l`/`-p` flag lives in its own layer now, and dropping it here
+      # would silently un-apply the override on the second project opened in a session.
+      # Session.open then layers the project's own pin on top (effective_bind_*).
+      @config.listen = Settings.startup_bind_host
+      @config.port = Settings.startup_bind_port
       @config.insecure_upstream = !Settings.verify_upstream?
       session =
         begin

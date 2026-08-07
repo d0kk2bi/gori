@@ -5479,6 +5479,12 @@ module Gori::Tui
     # override layer, then rebinds the live proxy (the upstream is already live via effective_*).
     def apply_project_network(bind_host : String, bind_port : Int32, upstream : String,
                               connect_secs : Int32, io_secs : Int32, capture_mib : Int32) : String
+      # The bind pair compares against the bare GLOBAL, which is exactly what ProjectView seeded
+      # the pane with for an unpinned project (`Settings.configured_bind_*`) — so "unchanged
+      # means inherit" tracks what the operator was shown. A `-l`/`-p` override is in neither
+      # value, which is what keeps a one-run flag from being pinned into this project's DB the
+      # next time someone saves this pane for an unrelated reason: the mistake
+      # `Runner.port_fallback` describes, one layer down.
       set_or_clear(Settings::PROJECT_BIND_HOST_KEY, bind_host, Settings.bind_host)
       set_or_clear(Settings::PROJECT_BIND_PORT_KEY, bind_port.to_s, Settings.bind_port.to_s)
       set_or_clear(Settings::PROJECT_UPSTREAM_KEY, upstream, Settings.upstream_proxy)

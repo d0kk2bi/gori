@@ -182,13 +182,20 @@ module Gori
       ca_dir = Paths.default_ca_dir
       insecure = false
 
+      # Tracked separately from `listen`/`port` (which are pre-seeded from Settings and so can't
+      # say whether a flag was actually GIVEN), because only an actual flag goes into the
+      # process-only override layer below. See Settings.cli_bind_host.
+      listen_flag = nil.as(String?)
+      port_flag = nil.as(Int32?)
+
       parser = OptionParser.new do |p|
         p.banner = "Usage: gori tui [options]"
-        p.on("-lHOST", "--listen=HOST", "Listen address (default #{Settings.bind_host})") { |v| listen = v }
+        p.on("-lHOST", "--listen=HOST", "Listen address (default #{Settings.bind_host})") { |v| listen = v; listen_flag = v }
         p.on("-pPORT", "--port=PORT", "Listen port (default #{Settings.bind_port})") do |v|
           parsed = v.to_i?
           abort "gori: invalid --port '#{v}' (expected 0-65535)" unless parsed && 0 <= parsed <= 65535
           port = parsed
+          port_flag = parsed
         end
         p.on("--db=PATH", "SQLite database path (opens it directly, skipping the project picker)") { |v| db_path = v; db_explicit = true }
         p.on("--ca-dir=PATH", "Directory for the root CA") { |v| ca_dir = v }
@@ -202,13 +209,18 @@ module Gori
       parser.parse(args)
 
       Paths.ensure_dirs
-      # Reflect the active bind (after any CLI override) in the settings UI; the
-      # upstream proxy was already loaded by Settings.load.
-      Settings.bind_host = listen
-      Settings.bind_port = port
-      # --insecure-upstream is a launch override of the persisted verify toggle (mirrors the
-      # bind override above): force verify off for this session so the settings:network editor
-      # reflects the active state; toggling it there re-syncs the live proxy + persists.
+      # Publish the bind override into its OWN runtime layer, NOT into Settings.bind_host /
+      # bind_port. Those are the persisted global, so assigning them here handed every later
+      # `Settings.save` in the session a one-run flag to write to disk — see
+      # Settings.cli_bind_host for the whole story. `effective_bind_*` (what the proxy binds,
+      # and what every surface displays) picks the override up from there.
+      Settings.cli_bind_host = listen_flag
+      Settings.cli_bind_port = port_flag
+      # --insecure-upstream stays a write into the PERSISTED property, deliberately unlike the
+      # bind above: it carries no one-run promise to break (nothing documents it as temporary),
+      # and the settings:network editor is expected to show verification as actually off so
+      # toggling it back re-syncs the live proxy. Giving it an override layer too would be a
+      # behaviour change, not a bug fix.
       Settings.verify_upstream = false if insecure
       config = Config.new(listen, port, db_path, ca_dir, !Settings.verify_upstream?)
       # Settings.load already put any corrupt-file warning on STDERR, which the alt screen
@@ -729,6 +741,43 @@ module Gori
       Run.dispatch(args)
     end
 
+    # `gori wizard` and `gori tutorial` take no arguments at all. `unknown_args` runs BEFORE
+    # `invalid_option` (both fire for an undeclared flag), so this is what actually reports one
+    # — the `invalid_option` handlers below are the fallback, not the primary path. A stray flag
+    # and a stray word are named apart so `gori wizard --port 9000` reads as the misplaced
+    # `gori tui` flag it actually is.
+    #
+    # `after` is the run following a `--` separator, which OptionParser strips and hands over
+    # separately. It has to be rejected too: discarding it left `gori wizard -- --port 9000`
+    # launching with the flag silently dropped, which is the whole failure this replaced.
+    private def self.reject_extra_args(cmd : String, rest : Array(String), after : Array(String),
+                                       parser : OptionParser) : Nil
+      return if (first = (rest + after).first?).nil?
+      abort "unknown option: #{first}\n#{parser}" if first.starts_with?('-')
+      abort "gori #{cmd} takes no arguments (got #{first.inspect})\n#{parser}"
+    end
+
+    # Run `body` against a terminal `Tui.open_terminal` has just switched into raw mode + the
+    # alternate screen, and restore it on every way out — including a DELIVERED SIGNAL, which
+    # never reaches an `ensure` at all (the default disposition kills the process with no
+    # stack unwind). `gori wizard` and `gori tutorial` were the only two surfaces that opened
+    # a terminal without this: an SSH drop's SIGHUP, or `pkill gori`, handed the operator's
+    # pane back in raw mode with the alternate screen up and mouse reporting on, recoverable
+    # only with `reset`. App#run_tui has armed the same guard for the TUI all along — see
+    # App::SignalGuard for why it restores and re-raises rather than nudging a channel.
+    private def self.with_tui_terminal(term : Termisu, &)
+      App::SignalGuard.new(-> { term.close; nil }).install
+      begin
+        yield
+      ensure
+        term.close # restore the terminal even on error
+        # Disarmed AFTER the close, in that order for the reason App#run_tui gives: until the
+        # terminal is actually restored the guard is the only thing between a delivered
+        # signal and a wrecked tty, and afterwards it would only re-close a closed Termisu.
+        App::TUI_SIGNALS.each(&.reset)
+      end
+    end
+
     # `gori wizard` launches the interactive, step-by-step setup wizard (bind
     # address → theme). It also runs automatically on first launch
     # (App#run_tui, when settings.json doesn't exist yet); this command re-runs it
@@ -736,14 +785,23 @@ module Gori
     # its own terminal directly instead of going through App (which eagerly loads
     # the CA).
     private def self.run_wizard(args : Array(String)) : Nil
-      if args.any? { |a| ["-h", "--help"].includes?(a) }
-        puts "Usage: gori wizard"
-        puts "  Interactive setup wizard: global proxy bind (default for projects), TUI theme, Miss Ring."
-        puts "  Runs automatically on first launch; use this to re-run it anytime."
-        puts "  Bind is the shared default — pin a different address per project in the Project tab;"
-        puts "  --listen/--port override settings for one run only (not written to disk)."
-        return
+      # A real OptionParser, not a hand-rolled scan for -h: this used to IGNORE everything it
+      # didn't recognise, so `gori wizard --port 9000` — which the help text below all but
+      # invites, and which belongs to `gori tui` — was a silent no-op. Every other subcommand
+      # aborts on an unknown flag; this one now does too.
+      parser = OptionParser.new do |p|
+        p.banner = "Usage: gori wizard\n" \
+                   "  Interactive setup wizard: global proxy bind (default for projects), TUI theme, Miss Ring.\n" \
+                   "  Runs automatically on first launch; use this to re-run it anytime.\n" \
+                   "  Bind is the shared default — pin a different address per project in the Project tab;\n" \
+                   "  `gori tui --listen/--port` override settings for one run only (not written to disk)."
+        p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
+        p.missing_option { |flag| abort "missing value for #{flag}" }
+        p.unknown_args { |rest, after| reject_extra_args("wizard", rest, after, p) }
       end
+      parser.parse(args)
+
       Paths.ensure_dirs
       Settings.load
       Tui::Theme.load_custom           # register user themes before the theme step
@@ -752,12 +810,20 @@ module Gori
       # while a real terminal is still present), so the guard lives at the shared
       # Tui.open_terminal construction point (same as App#run_tui).
       term = Tui.open_terminal("run the wizard directly, not under CI or a detached/background job")
-      term.enable_enhanced_keyboard       # Kitty disambiguation for IME/Unicode (mirrors App#run_tui)
-      term.enable_mouse if Settings.mouse # SGR-1006 click + scroll-wheel nav
-      begin
+      # The wizard hands a failed persist back rather than printing onto a screen that is
+      # about to be wiped — report it here, on the restored terminal, and fail the command.
+      # Silently exiting 0 having written nothing was the worst version of this.
+      err = with_tui_terminal(term) do
+        # INSIDE the guarded block, mirroring App#run_tui: a signal delivered while these run
+        # would otherwise leave the tty raw with the alternate screen up, and an enable_* that
+        # raises needs the `ensure term.close` to cover it.
+        term.enable_enhanced_keyboard       # Kitty disambiguation for IME/Unicode
+        term.enable_mouse if Settings.mouse # SGR-1006 click + scroll-wheel nav
         Tui::SetupWizard.new(term).run
-      ensure
-        term.close # restore the terminal even on error
+      end
+      if err
+        STDERR.puts "gori: setup wizard: #{err}"
+        exit 1
       end
     end
 
@@ -767,26 +833,29 @@ module Gori
     # / first launch; this command repeaters it anytime. Like the wizard it drives
     # /dev/tty directly, so it sets up its own terminal instead of going through App.
     private def self.run_tutorial(args : Array(String)) : Nil
-      if args.any? { |a| ["-h", "--help"].includes?(a) }
-        puts "Usage: gori tutorial"
-        puts "  Interactive tour of gori's TUI on a mock UI: tab/pane navigation,"
-        puts "  the command palette (^P), the action menu (space), and edit mode"
-        puts "  (READ/INS). Each lesson asks you to try the key; a final practice"
-        puts "  step covers all four moves, then a first-session checklist."
-        puts "  Also offered at the end of `gori wizard`; safe to re-run anytime."
-        return
+      parser = OptionParser.new do |p| # same reasoning as run_wizard's: no silent no-ops
+        p.banner = "Usage: gori tutorial\n" \
+                   "  Interactive tour of gori's TUI on a mock UI: tab/pane navigation,\n" \
+                   "  the command palette (^P), the action menu (space), and edit mode\n" \
+                   "  (READ/INS). Each lesson asks you to try the key; a final practice\n" \
+                   "  step covers all four moves, then a first-session checklist.\n" \
+                   "  Also offered at the end of `gori wizard`; safe to re-run anytime."
+        p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
+        p.missing_option { |flag| abort "missing value for #{flag}" }
+        p.unknown_args { |rest, after| reject_extra_args("tutorial", rest, after, p) }
       end
+      parser.parse(args)
+
       Paths.ensure_dirs
       Settings.load
       Tui::Theme.load_custom           # honour user themes so the mock matches the real UI
       Tui::Theme.apply(Settings.theme) # render the tour in the persisted theme
       term = Tui.open_terminal("run the tutorial directly, not under CI or a detached/background job")
-      term.enable_enhanced_keyboard # Kitty disambiguation (mirrors the wizard)
-      term.enable_mouse             # always on for the tour: Prev/Next buttons + mock clicks
-      begin
+      with_tui_terminal(term) do
+        term.enable_enhanced_keyboard # Kitty disambiguation (mirrors the wizard)
+        term.enable_mouse             # always on for the tour: Prev/Next buttons + mock clicks
         Tui::Tutorial.new(term).run
-      ensure
-        term.close # restore the terminal even on error
       end
     end
 
