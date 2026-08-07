@@ -364,13 +364,51 @@ module Gori
           next
         end
         # `NOT (tag:x)` — same desugar, but the NOT sits before a GROUP. An LParen lexeme
-        # has `term == nil`, so the branch above never fired and the inner `tag:x` was
-        # taken UNNEGATED while `NOT ( )` fell into residual and folded away — Sitemap
-        # `NOT (tag:done)` then showed ONLY the tagged nodes, silently inverted, with no
-        # "invalid filter" note. Walk the group, apply the run's polarity to every taken
-        # term inside (XOR with a dash already on the leaf), and leave non-matching
-        # structure in the residual. Empty residual groups fold the same way as before.
+        # has `term == nil`, so the run-before-term branch never fires for it.
         if run > 0 && nxt && nxt.tok.l_paren?
+          # First locate the matching `)` and learn whether the group holds ANY owned term.
+          scan = i + run
+          depth = 0
+          has_taken = false
+          close = scan # last lexeme index that belongs to this group (unclosed ⇒ to EOF)
+          while scan < lexemes.size
+            lx = lexemes[scan]
+            if lx.tok.l_paren?
+              depth += 1
+            elsif lx.tok.r_paren?
+              depth -= 1
+              if depth == 0
+                close = scan
+                break
+              end
+            elsif (t = lx.term) && yield t
+              has_taken = true
+            end
+            close = scan
+            scan += 1
+          end
+
+          unless has_taken
+            # No owned term in the group → keep the WHOLE `NOT ( … )` verbatim in the residual
+            # (source spans, so the parens and NOTs survive) rather than decomposing it. The old
+            # walk emitted only the inner terms + parens and DROPPED the leading NOT, so a group
+            # made entirely of the OTHER backend's terms lost its negation: Sitemap's residual for
+            # `NOT (host:cdn OR host:static)` — the module's own example — came back as
+            # `( host:cdn OR host:static )` and `QL.parse` then SHOWED only cdn/static, the exact
+            # inversion the surrounding fixes exist to prevent. A term-less group can't feed
+            # `taken` anyway, so verbatim is both correct and lossless here.
+            first = lexemes[i]
+            last = lexemes[close]
+            kept << query[first.start, (last.start + last.size) - first.start]
+            i = close + 1
+            next
+          end
+
+          # The group DOES own terms: decompose it, pushing the run's polarity down to each
+          # taken term (De Morgan holds because `taken` is ANDed). `NOT (tag:done)` used to
+          # take `tag:done` UNNEGATED; now the run negates it. XOR with a `-` already on the
+          # leaf. Non-owned structure stays in the residual (a MIXED group can't round-trip
+          # through a flat AND — documented — but a homogeneous all-owned group is exact).
           j = i + run
           depth = 0
           while j < lexemes.size
@@ -378,17 +416,34 @@ module Gori
             if lx.tok.l_paren?
               depth += 1
               kept << query[lx.start, lx.size]
+              j += 1
             elsif lx.tok.r_paren?
               depth -= 1
               kept << query[lx.start, lx.size]
               j += 1
               break if depth == 0
-            elsif (t = lx.term) && yield t
-              taken << (run.odd? ? t.negated : t)
             else
-              kept << query[lx.start, lx.size]
+              # Consume a run of INNER `NOT` keywords the same way the top-level loop does, so
+              # the grammar's `-x == NOT x` equivalence holds inside the group too: an inner
+              # `NOT` lexeme (term "NOT", rejected by the field predicate) used to fall into the
+              # residual and the term took ONLY the outer run's polarity — so `NOT (NOT tag:a)`
+              # EXCLUDED what `NOT (-tag:a)` included. Combine the inner run with `run`, negate once.
+              inner = 0
+              while j + inner < lexemes.size && lexemes[j + inner].tok.not?
+                inner += 1
+              end
+              nx = lexemes[j + inner]?
+              if inner > 0 && nx && (t = nx.term) && yield t
+                taken << ((run + inner).odd? ? t.negated : t)
+                j += inner + 1
+              elsif inner == 0 && (t = lx.term) && yield t
+                taken << (run.odd? ? t.negated : t)
+                j += 1
+              else
+                kept << query[lx.start, lx.size]
+                j += 1
+              end
             end
-            j += 1
           end
           i = j
           next

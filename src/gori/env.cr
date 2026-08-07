@@ -567,14 +567,23 @@ module Gori
           end
         end
         if i + plen <= n && prefix_bytes.each_with_index.all? { |b, j| bytes[i + j] == b }
-          if prefix_at?(bytes, prefix_bytes, i + plen)
+          # A verbatim span starting ahead of `i` caps how far a token opened here may read:
+          # its NAME (and the second `$` of an escape) must stop at the span, never reach INTO
+          # it. Without the cap a `$NAME` whose `$` sits just before a fuzz payload consumed
+          # and substituted the payload's leading bytes — the exact splice `verbatim` exists to
+          # prevent (a live credential spliced into the payload under test). vi already points
+          # past every span ending at/behind `i`, and we are NOT inside one (that branch ran
+          # above), so `verbatim[vi]` is the next span ahead. No verbatim → `key_end == n`, the
+          # unchanged common path.
+          key_end = (verbatim && vi < verbatim.size) ? verbatim[vi][0] : n
+          if i + 2 * plen <= key_end && prefix_at?(bytes, prefix_bytes, i + plen)
             # `$$` — one escaped literal `$`. Both prefixes are consumed and the token behind
             # them is never read, which is what makes the escape mean the same thing whether
             # or not the name after it happens to resolve.
             buf << prefix
             buf << prefix if escape.preserve?
             i += 2 * plen
-          elsif parsed = read_key_bytes(bytes, i + plen, n)
+          elsif parsed = read_key_bytes(bytes, i + plen, key_end)
             key, consumed = parsed
             if val = vars[key]?
               buf << val
@@ -708,11 +717,15 @@ module Gori
           end
         end
         if i + plen <= n && prefix_bytes.each_with_index.all? { |b, j| bytes[i + j] == b }
-          if prefix_at?(bytes, prefix_bytes, i + plen)
+          # Cap the token at the next verbatim span exactly as `expand` does — the two MUST
+          # agree about where a token ends (see the note there), so a `$NAME` reaching into a
+          # payload span is neither substituted by `expand` nor reported here.
+          key_end = (verbatim && vi < verbatim.size) ? verbatim[vi][0] : n
+          if i + 2 * plen <= key_end && prefix_at?(bytes, prefix_bytes, i + plen)
             # `$$` — an escape, not a reference. Same advance as `expand`'s escape branch, so
             # the two agree about where the NEXT token starts.
             i += 2 * plen
-          elsif parsed = read_key_bytes(bytes, i + plen, n)
+          elsif parsed = read_key_bytes(bytes, i + plen, key_end)
             key, consumed = parsed
             if vars.has_key?(key)
               i += plen + consumed

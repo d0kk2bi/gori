@@ -74,6 +74,16 @@ describe Gori::Cookie do
       Gori::Cookie.int_to_b64(Gori::Cookie.b64_to_int(seg)).should eq(seg)
     end
 
+    it "b64_to_int? answers nil (not raise) on an invalid or oversized segment" do
+      # The tolerant DECODE sibling of b64_to_int, mirroring the nil contract base62_decode
+      # already gives Django, so a mangled Flask timestamp renders "(invalid …)"/null instead
+      # of raising CookieError and refusing the whole cookie.
+      seg = FLASK.split('.')[1]
+      Gori::Cookie.b64_to_int?(seg).should eq(Gori::Cookie.b64_to_int(seg)) # a real ts still decodes
+      Gori::Cookie.b64_to_int?("@@@bad@@@").should be_nil                    # not valid base64
+      Gori::Cookie.b64_to_int?("AAAAAAAAAAAAAAAA").should be_nil             # decodes to > 8 bytes
+    end
+
     it "secure_compare is length- and content-exact" do
       Gori::Cookie.secure_compare("abc", "abc").should be_true
       Gori::Cookie.secure_compare("abc", "abd").should be_false
@@ -111,6 +121,16 @@ describe Gori::Cookie do
       forged = Gori::Cookie::Flask.forge(%({"admin":true}), SECRET, 1785656674_i64)
       Gori::Cookie::Flask.verify(forged, SECRET).should be_true
       Gori::Cookie::Flask.verify(forged, "other").should be_false
+    end
+
+    it "decodes a cookie with a mangled timestamp instead of crashing (Django parity)" do
+      # A crafted timestamp segment must not refuse the whole cookie: the payload and
+      # signature are perfectly readable, and Django already degrades this gracefully.
+      bad_ts = FLASK.sub(FLASK.split('.')[1], "@@@bad@@@")
+      txt = Gori::Cookie.decode(bad_ts, "flask")
+      txt.should contain("invalid timestamp")
+      txt.should contain("alice") # the payload is still shown
+      JSON.parse(Gori::Cookie.decode_json(bad_ts, "flask"))["timestamp"].raw.should be_nil
     end
   end
 

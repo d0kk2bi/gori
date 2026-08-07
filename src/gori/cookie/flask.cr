@@ -109,11 +109,12 @@ module Gori
 
       def decode_text(cookie : String) : String
         p = parse(cookie)
+        ts = Cookie.b64_to_int?(p.ts_seg)
         String.build do |io|
           io << "// format: flask (itsdangerous secure cookie)\n"
           io << "// payload" << (p.payload_seg.starts_with?('.') ? " (zlib-compressed)\n" : "\n")
           io << payload_pretty(p) << "\n\n"
-          io << "// timestamp: " << Cookie.unix_to_s(Cookie.b64_to_int(p.ts_seg)) << "\n"
+          io << "// timestamp: " << (ts ? Cookie.unix_to_s(ts) : "(invalid timestamp #{p.ts_seg.inspect})") << "\n"
           io << "// signature (not verified): " << p.signature
         end
       end
@@ -125,7 +126,7 @@ module Gori
             j.field "format", "flask"
             j.field "payload" { j.raw(payload_json_or_null(p)) }
             j.field "compressed", p.payload_seg.starts_with?('.')
-            j.field "timestamp", Cookie.b64_to_int(p.ts_seg)
+            j.field "timestamp", Cookie.b64_to_int?(p.ts_seg)
             j.field "signature", p.signature
           end
         end

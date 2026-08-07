@@ -431,6 +431,14 @@ module Gori::Proxy::H2
 
       # HPACK string (§5.2): H-bit + length, then raw or Huffman-coded octets.
       private def read_string(block : Bytes, pos : Int32) : {String, Int32}
+        # A block that ends exactly at a string boundary (a literal field with no value byte,
+        # e.g. the single byte `0x50` — a static name index and nothing after it) reached this
+        # `block[pos]` out of bounds and raised a raw `IndexError`, breaking the module's "hostile
+        # input raises only Gori::Error" contract (`read_int` above states it). It escaped every
+        # caller that rescues only `Gori::Error`/`IO::Error` — the repeater h2 engine's response
+        # decode (`absorb`) among them, so a truncated-HPACK ORIGIN response crashed the exchange
+        # — and the assembler papered over it by widening its rescue to `IndexError`. Fail by name.
+        raise Gori::Error.new("hpack: truncated string length") if pos >= block.size
         huffman = block[pos] & 0x80 != 0
         len, pos = read_int(block, pos, 7)
         raise Gori::Error.new("hpack: string overruns block") if pos + len > block.size

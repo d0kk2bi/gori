@@ -92,6 +92,18 @@ describe Gori::Env do
     Gori::Settings.env_prefix = "$"
   end
 
+  it "expand does not let a $NAME read INTO a verbatim span (a fuzz payload stays untouched)" do
+    vars = {"ADMIN" => "SECRET"}
+    # "x=$ADMIN": the `$` at index 2 is OUTSIDE the payload span; the name reaches into it.
+    # The read used to run to end-of-buffer, so the payload ADMIN — declared verbatim, the
+    # thing under test — was consumed and substituted, splicing a live credential into it.
+    Gori::Env.expand("x=$ADMIN", vars, "$", [{3, 8}]).should eq("x=$ADMIN")
+    # A name FULLY before the span still resolves; the payload after it is copied through.
+    Gori::Env.expand("$ADMIN|PAY", vars, "$", [{7, 10}]).should eq("SECRET|PAY")
+    # The `$$` escape must not reach into the span either (payload keeps its leading `$`).
+    Gori::Env.expand("a$$X", {} of String => String, "$", [{2, 4}], Gori::Env::Escape::Consume).should eq("a$$X")
+  end
+
   it "expand_wire does not raise and still normalizes CRLF when the text has invalid UTF-8" do
     Gori::Settings.env_prefix = "$"
     Gori::Settings.env_vars = [] of {String, String}
