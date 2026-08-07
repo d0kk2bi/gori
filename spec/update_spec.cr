@@ -15,6 +15,20 @@ private def with_env(vars : Hash(String, String?), &)
   end
 end
 
+# chmod-based permission examples say nothing when the process ignores the mode:
+# access(2) succeeds unconditionally for root. CI runs `crystal spec` on a plain
+# ubuntu-latest runner (non-root), so the negative cases below do execute there;
+# this guard is for someone running the suite inside a root container. Probe the
+# actual behaviour rather than guessing from the uid.
+private def mode_enforced?(dir : String) : Bool
+  probe = File.join(dir, ".gori-perm-probe")
+  File.write(probe, "x")
+  File.delete?(probe)
+  false
+rescue
+  true
+end
+
 describe Gori::Update do
   describe ".detect_channel" do
     it "detects Homebrew Cellar paths" do
@@ -767,6 +781,64 @@ describe Gori::Update do
     end
   end
 
+  # --- fail-fast on an unwritable install directory --------------------------
+  # The macOS archive-layout check already refuses before the download; a target
+  # we cannot write is knowable at the same moment, and used to be discovered
+  # only after tens of MB were on disk.
+
+  describe ".install_dir_writable?" do
+    it "reports on the directory, not the file — atomic_install renames into it" do
+      dir = File.tempname("gori-perm-")
+      Dir.mkdir_p(dir)
+      begin
+        target = File.join(dir, "gori")
+        File.write(target, "old")
+        # A read-only *file* in a writable directory is still replaceable.
+        File.chmod(target, 0o444)
+        Gori::Update.install_dir_writable?(target).should be_true
+
+        File.chmod(dir, 0o500)
+        Gori::Update.install_dir_writable?(target).should be_false if mode_enforced?(dir)
+      ensure
+        File.chmod(dir, 0o755) rescue nil
+        FileUtils.rm_rf(dir) if File.exists?(dir)
+      end
+    end
+
+    it "allows a directory atomic_install would still have to create" do
+      Gori::Update.install_dir_writable?(File.join(File.tempname("gori-absent-"), "gori")).should be_true
+    end
+  end
+
+  describe ".update_binary permission pre-check" do
+    it "refuses an unwritable install dir before downloading anything" do
+      root = File.tempname("gori-ro-")
+      Dir.mkdir_p(root)
+      begin
+        want = Gori::Update.asset_name("99.0.0", Gori::Update.current_os, Gori::Update.current_arch)
+        target_dir = File.join(root, "opt", "gori")
+        Dir.mkdir_p(target_dir)
+        target = File.join(target_dir, "gori")
+        File.write(target, "old")
+        File.chmod(target_dir, 0o500)
+
+        if mode_enforced?(target_dir)
+          # An unreachable download URL: reaching it at all would mean the pre-check
+          # did not fire, so a passing example also proves nothing was fetched.
+          json = %({"tag_name":"v99.0.0","assets":[{"name":"#{want}","browser_download_url":"http://127.0.0.1:1/nope","size":1}]})
+          io = IO::Memory.new
+          expect_raises(Gori::Error, /cannot write to/) do
+            Gori::Update.update_binary(target, io, release_json: json)
+          end
+          io.to_s.should_not contain("Downloading")
+        end
+      ensure
+        File.chmod(File.join(root, "opt", "gori"), 0o755) rescue nil
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+  end
+
   describe ".install_from_download (plain binary)" do
     it "replaces the target path with the downloaded file via the shipped installer" do
       dir = File.tempname("gori-inst-")
@@ -783,6 +855,36 @@ describe Gori::Update do
 
         File.read(target).should contain("new-build")
         File::Info.executable?(target).should be_true
+      ensure
+        FileUtils.rm_rf(dir) if File.exists?(dir)
+      end
+    end
+
+    # atomic_install used to end in an in-place `cp source, target` as a "cross
+    # device rename" fallback. tmp lives in File.dirname(target), so that rename
+    # can never be cross-device — all the fallback could actually do is truncate
+    # the live binary and, on a mid-write failure, leave a corrupt gori behind.
+    it "leaves the installed binary untouched when the install cannot complete" do
+      dir = File.tempname("gori-noclobber-")
+      Dir.mkdir_p(dir)
+      begin
+        source = File.join(dir, "new-gori")
+        File.write(source, "#!/bin/sh\necho new-build\n")
+        # A directory at the target path: the rename fails, and an in-place copy
+        # would fail too — the point is that neither is attempted destructively.
+        target = File.join(dir, "gori")
+        Dir.mkdir_p(target)
+        File.write(File.join(target, "sentinel"), "still here")
+
+        expect_raises(Gori::Error, /left untouched/) do
+          Gori::Update.atomic_install(source, target)
+        end
+
+        File.read(File.join(target, "sentinel")).should eq("still here")
+        # No orphaned staging file next to it either.
+        # Dir.children, not Dir.glob: glob skips dotfiles by default, so a glob for
+        # `.gori-update.*` reports empty even when the orphan is right there.
+        Dir.children(dir).select(&.starts_with?(".gori-update.")).should be_empty
       ensure
         FileUtils.rm_rf(dir) if File.exists?(dir)
       end
@@ -815,6 +917,205 @@ describe Gori::Update do
 
         File.read(target).should contain("from-tar")
         File.read(File.join(target_dir, "lib", "libexample.dylib")).should eq("dylib-bytes")
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    # A binary install that fails AFTER lib/ was swapped used to leave new dylibs
+    # beside the old binary with the backup already deleted — unrecoverable when a
+    # bundled dylib's basename changed between releases.
+    it "rolls lib/ back when the binary install fails" do
+      root = File.tempname("gori-rollback-")
+      Dir.mkdir_p(root)
+      begin
+        stage = File.join(root, "stage")
+        Dir.mkdir_p(File.join(stage, "lib"))
+        File.write(File.join(stage, "gori"), "#!/bin/sh\necho new\n")
+        File.chmod(File.join(stage, "gori"), 0o755)
+        File.write(File.join(stage, "lib", "libexample.dylib"), "new-dylib")
+        archive = File.join(root, "gori-v0.0.0-osx-arm64.tar.gz")
+        Process.run("tar", ["czf", archive, "-C", stage, "gori", "lib"],
+          output: Process::Redirect::Close, error: Process::Redirect::Close)
+
+        target_dir = File.join(root, "opt", "gori")
+        Dir.mkdir_p(File.join(target_dir, "lib"))
+        File.write(File.join(target_dir, "lib", "libexample.dylib"), "old-dylib")
+        # Make the binary install fail without touching permissions: a *directory*
+        # at the target path cannot be renamed over by a regular file.
+        target = File.join(target_dir, "gori")
+        Dir.mkdir_p(target)
+
+        expect_raises(Gori::Error, /was rolled back/) do
+          Gori::Update.install_from_download(archive, target, true)
+        end
+
+        File.read(File.join(target_dir, "lib", "libexample.dylib")).should eq("old-dylib")
+        # And no staging debris survives the failure.
+        Dir.glob(File.join(target_dir, "lib.gori-*")).should be_empty
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "removes a freshly installed lib/ when the target had none to restore" do
+      # The other rollback branch: the archive carries lib/ but the install dir did
+      # not, so reverting means taking the new tree back out rather than moving one
+      # back in. Untested, this is a silent rm_rf.
+      root = File.tempname("gori-rollback-nolib-")
+      Dir.mkdir_p(root)
+      begin
+        stage = File.join(root, "stage")
+        Dir.mkdir_p(File.join(stage, "lib"))
+        File.write(File.join(stage, "gori"), "#!/bin/sh\necho new\n")
+        File.chmod(File.join(stage, "gori"), 0o755)
+        File.write(File.join(stage, "lib", "libexample.dylib"), "new-dylib")
+        archive = File.join(root, "gori-v0.0.0-osx-arm64.tar.gz")
+        Process.run("tar", ["czf", archive, "-C", stage, "gori", "lib"],
+          output: Process::Redirect::Close, error: Process::Redirect::Close)
+
+        target_dir = File.join(root, "opt", "gori")
+        Dir.mkdir_p(target_dir)
+        target = File.join(target_dir, "gori")
+        Dir.mkdir_p(target) # a directory here makes atomic_install fail
+
+        expect_raises(Gori::Error, /was rolled back/) do
+          Gori::Update.install_from_download(archive, target, true)
+        end
+
+        Dir.exists?(File.join(target_dir, "lib")).should be_false
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "refuses to drop lib/ when the backup it would restore is gone" do
+      # Deleting the installed tree and only then discovering there is nothing to
+      # put back is strictly worse than leaving the swap in place, so the existence
+      # check has to happen first. Nothing else pins that ordering.
+      root = File.tempname("gori-restore-")
+      Dir.mkdir_p(root)
+      begin
+        lib_dst = File.join(root, "lib")
+        Dir.mkdir_p(lib_dst)
+        File.write(File.join(lib_dst, "libexample.dylib"), "installed")
+
+        Gori::Update.restore_lib_dir(lib_dst, File.join(root, "no-such-backup")).should be_false
+        File.read(File.join(lib_dst, "libexample.dylib")).should eq("installed")
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "restores the backup over whatever is currently installed" do
+      root = File.tempname("gori-restore-ok-")
+      Dir.mkdir_p(root)
+      begin
+        lib_dst = File.join(root, "lib")
+        Dir.mkdir_p(lib_dst)
+        File.write(File.join(lib_dst, "libexample.dylib"), "new")
+        backup = File.join(root, "lib.gori-old.1.aaaa")
+        Dir.mkdir_p(backup)
+        File.write(File.join(backup, "libexample.dylib"), "old")
+
+        Gori::Update.restore_lib_dir(lib_dst, backup).should be_true
+        File.read(File.join(lib_dst, "libexample.dylib")).should eq("old")
+        File.exists?(backup).should be_false
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "keeps a stranded backup that is the only surviving copy of lib/" do
+      # A run killed between `rename(lib, backup)` and `rename(staged, lib)` leaves
+      # no lib/ and a backup holding the ONLY copy of the installed dylibs. Sweeping
+      # that away would destroy them for good — and then a later rollback, finding
+      # no backup to restore, would remove lib/ altogether.
+      root = File.tempname("gori-nosweep-")
+      Dir.mkdir_p(root)
+      begin
+        src = File.join(root, "src-lib")
+        Dir.mkdir_p(src)
+        File.write(File.join(src, "libexample.dylib"), "new")
+
+        dst_parent = File.join(root, "opt", "gori")
+        Dir.mkdir_p(dst_parent)
+        lib_dst = File.join(dst_parent, "lib") # deliberately absent
+        only_copy = File.join(dst_parent, "lib.gori-old.999.deadbeef")
+        Dir.mkdir_p(only_copy)
+        File.write(File.join(only_copy, "libexample.dylib"), "the-only-copy")
+
+        Gori::Update.replace_lib_dir(src, lib_dst).should be_nil
+        File.read(File.join(only_copy, "libexample.dylib")).should eq("the-only-copy")
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "clears a half-copied staging tree left by an interrupted run" do
+      root = File.tempname("gori-staging-")
+      Dir.mkdir_p(root)
+      begin
+        src = File.join(root, "src-lib")
+        Dir.mkdir_p(src)
+        File.write(File.join(src, "libexample.dylib"), "new")
+
+        dst_parent = File.join(root, "opt", "gori")
+        Dir.mkdir_p(File.join(dst_parent, "lib"))
+        stranded = File.join(dst_parent, "lib.gori-new.999.deadbeef")
+        Dir.mkdir_p(stranded)
+        File.write(File.join(stranded, "partial.dylib"), "half")
+
+        Gori::Update.replace_lib_dir(src, File.join(dst_parent, "lib"))
+        # Always garbage, unlike a backup — a half-copy is never worth keeping.
+        File.exists?(stranded).should be_false
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "sweeps by name prefix, so glob metacharacters in the install path are literal" do
+      # `~/opt/gori[stable]/lib` under Dir.glob would parse `[stable]` as a
+      # character class: it would miss the real backup and could rm_rf entries
+      # under sibling directories it was never pointed at.
+      root = File.tempname("gori-meta-")
+      Dir.mkdir_p(root)
+      begin
+        src = File.join(root, "src-lib")
+        Dir.mkdir_p(src)
+        File.write(File.join(src, "libexample.dylib"), "new")
+
+        dst_parent = File.join(root, "gori[stable]")
+        Dir.mkdir_p(File.join(dst_parent, "lib"))
+        stranded = File.join(dst_parent, "lib.gori-new.999.deadbeef")
+        Dir.mkdir_p(stranded)
+
+        Gori::Update.replace_lib_dir(src, File.join(dst_parent, "lib"))
+        File.exists?(stranded).should be_false
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "clears a lib backup stranded by an earlier interrupted run" do
+      root = File.tempname("gori-sweep-")
+      Dir.mkdir_p(root)
+      begin
+        src = File.join(root, "src-lib")
+        Dir.mkdir_p(src)
+        File.write(File.join(src, "libexample.dylib"), "new")
+
+        dst_parent = File.join(root, "opt", "gori")
+        Dir.mkdir_p(File.join(dst_parent, "lib"))
+        File.write(File.join(dst_parent, "lib", "libexample.dylib"), "old")
+        stranded = File.join(dst_parent, "lib.gori-old.999.deadbeef")
+        Dir.mkdir_p(stranded)
+        File.write(File.join(stranded, "libexample.dylib"), "ancient")
+
+        backup = Gori::Update.replace_lib_dir(src, File.join(dst_parent, "lib"))
+        File.exists?(stranded).should be_false
+        # The caller now owns the backup — it must still be there to roll back to.
+        File.exists?(backup.not_nil!).should be_true
       ensure
         FileUtils.rm_rf(root) if File.exists?(root)
       end
@@ -931,6 +1232,195 @@ describe Gori::Update do
       release = Gori::Update.parse_release(
         Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64", digest: hex))
       Gori::Update.parse_sha256_digest(release.assets.first.digest).should eq(hex)
+    end
+
+    # The versioned name here is a GUESS made from a tag read out of a Location
+    # header. When it is wrong the versioned asset 404s, and the alias — which has
+    # no version to get wrong — is the only name left worth trying, so it has to
+    # already be in the list download_asset's retry looks through.
+    it "lists the version-less alias beside the guessed versioned asset" do
+      release = Gori::Update.parse_release(
+        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64"))
+      release.assets.map(&.name).should eq(["gori-v9.9.9-linux-x86_64", "gori-linux-x86_64"])
+      release.assets[1].browser_download_url.should eq(
+        "https://github.com/hahwul/gori/releases/download/v9.9.9/gori-linux-x86_64")
+
+      versioned = Gori::Update.select_asset(release, "linux", "x86_64").not_nil!
+      versioned.name.should eq("gori-v9.9.9-linux-x86_64")
+      Gori::Update.alias_asset(release, versioned, os: "linux", arch: "x86_64")
+        .not_nil!.name.should eq("gori-linux-x86_64")
+    end
+
+    it "gives the alias its own SHA256SUMS digest, so the retry is still verified" do
+      # Both names sit in one SHA256SUMS (release-binary.yml emits a line for each),
+      # fetched once. Re-fetching it for the alias would mean a second round trip on
+      # the one path where GitHub is already failing — and a flake there would drop
+      # the retry to no checksum after we said we would verify.
+      versioned_hex = "a" * 64
+      alias_hex = "b" * 64
+      release = Gori::Update.parse_release(
+        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64",
+          digest: versioned_hex, alias_digest: alias_hex))
+      Gori::Update.parse_sha256_digest(release.assets[0].digest).should eq(versioned_hex)
+      Gori::Update.parse_sha256_digest(release.assets[1].digest).should eq(alias_hex)
+    end
+
+    it "omits the alias entirely when the platform has no naming for it" do
+      release = Gori::Update.parse_release(
+        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64"))
+      release.assets.size.should eq(2)
+      # asset_name would raise for plan9 before we ever get here; the point is that
+      # the alias guard degrades rather than taking the whole synthesis down.
+      Gori::Update.alias_asset_name("linux", "arm64").should eq("gori-linux-arm64")
+    end
+  end
+
+  # --- version-less alias retry ----------------------------------------------
+  # release-binary.yml publishes `gori-linux-x86_64` beside `gori-v1.2.3-linux-x86_64`.
+  # install.sh has retried the alias since #345; `gori update` used to just die on
+  # the 404, which matters because the redirect fallback only GUESSES the
+  # versioned filename from a tag it read out of a Location header.
+
+  describe ".alias_asset_name" do
+    it "drops the version from the platform asset name" do
+      Gori::Update.alias_asset_name("linux", "x86_64").should eq("gori-linux-x86_64")
+      Gori::Update.alias_asset_name("darwin", "arm64").should eq("gori-osx-arm64.tar.gz")
+    end
+
+    it "rejects unsupported OS just like asset_name" do
+      expect_raises(Gori::Error, /unsupported OS/) do
+        Gori::Update.alias_asset_name("plan9", "x86_64")
+      end
+    end
+  end
+
+  describe ".alias_asset" do
+    it "prefers the entry the release actually lists" do
+      release = Gori::Update.parse_release(<<-JSON)
+        {"tag_name":"v9.9.9","assets":[
+          {"name":"gori-v9.9.9-linux-x86_64","browser_download_url":"http://x/versioned","size":1},
+          {"name":"gori-linux-x86_64","browser_download_url":"http://x/alias","size":2}
+        ]}
+        JSON
+      versioned = Gori::Update.select_asset(release, "linux", "x86_64").not_nil!
+      alias_asset = Gori::Update.alias_asset(release, versioned, os: "linux", arch: "x86_64").not_nil!
+      alias_asset.name.should eq("gori-linux-x86_64")
+      alias_asset.browser_download_url.should eq("http://x/alias")
+    end
+
+    it "never invents a download URL — an unlisted alias is simply no retry" do
+      # A pure lookup. The redirect path seeds the alias (with its digest) into the
+      # list up front, so there is nothing left for this to guess; guessing anyway
+      # would send us back to the host that just 404'd, without a checksum.
+      release = Gori::Update.parse_release(
+        %({"tag_name":"v9.9.9","assets":[{"name":"gori-v9.9.9-linux-x86_64","browser_download_url":"http://x/v","size":1}]}))
+      versioned = Gori::Update.select_asset(release, "linux", "x86_64").not_nil!
+      Gori::Update.alias_asset(release, versioned, os: "linux", arch: "x86_64").should be_nil
+    end
+
+    it "returns nil rather than raising when the platform has no alias name" do
+      # alias_asset_name raises on an unsupported OS, and that must degrade to
+      # "nothing to retry" — the caller has to surface the original 404, not a
+      # second, unrelated error.
+      release = Gori::Update.parse_release(
+        %({"tag_name":"v9.9.9","assets":[{"name":"gori-v9.9.9-plan9-x86_64","browser_download_url":"http://x/v","size":1}]}))
+      Gori::Update.alias_asset(release, release.assets.first,
+        os: "plan9", arch: "x86_64").should be_nil
+    end
+
+    it "returns nil when the asset already IS the alias (no second retry)" do
+      release = Gori::Update.parse_release(
+        %({"tag_name":"v9.9.9","assets":[{"name":"gori-linux-x86_64","browser_download_url":"http://x/a","size":1}]}))
+      already = release.assets.first
+      Gori::Update.alias_asset(release, already, os: "linux", arch: "x86_64").should be_nil
+    end
+  end
+
+  describe "update_binary alias retry" do
+    it "falls back to the version-less alias when the versioned name 404s" do
+      payload = "#!/bin/sh\necho from-alias\n"
+      root = File.tempname("gori-alias-")
+      Dir.mkdir_p(root)
+      begin
+        os = Gori::Update.current_os
+        arch = Gori::Update.current_arch
+        want = Gori::Update.asset_name("99.0.0", os, arch)
+        alias_name = Gori::Update.alias_asset_name(os, arch)
+        body_bytes = if Gori::Update.asset_is_archive?(alias_name)
+                       stage = File.join(root, "stage")
+                       Dir.mkdir_p(File.join(stage, "lib"))
+                       File.write(File.join(stage, "gori"), payload)
+                       File.chmod(File.join(stage, "gori"), 0o755)
+                       File.write(File.join(stage, "lib", "libexample.dylib"), "dylib")
+                       archive = File.join(root, "asset.tar.gz")
+                       Process.run("tar", ["czf", archive, "-C", stage, "gori", "lib"],
+                         output: Process::Redirect::Close, error: Process::Redirect::Close)
+                       File.read(archive).to_slice
+                     else
+                       payload.to_slice
+                     end
+
+        # Only the alias is servable; the versioned name 404s. Both are listed in
+        # the release JSON, so the retry resolves entirely against 127.0.0.1 — a
+        # spec that quietly reached github.com would pass here and flake in CI.
+        with_mock_release_server(tag: "v99.0.0", body: body_bytes, asset_names: [alias_name]) do |srv|
+          json = <<-JSON
+            {"tag_name":"v99.0.0","assets":[
+              {"name":"#{want}","browser_download_url":"#{srv.download_url(want)}","size":0},
+              {"name":"#{alias_name}","browser_download_url":"#{srv.download_url(alias_name)}","size":0}
+            ]}
+            JSON
+
+          target_dir = File.join(root, "opt", "gori")
+          Dir.mkdir_p(target_dir)
+          target = File.join(target_dir, "gori")
+          File.write(target, "#!/bin/sh\necho old\n")
+          File.chmod(target, 0o755)
+
+          io = IO::Memory.new
+          Gori::Update.update_binary(target, io, release_json: json)
+
+          out = io.to_s
+          out.should contain("#{want} is not in v99.0.0")
+          out.should contain("retrying the version-less alias #{alias_name}")
+          out.should contain("Installed v99.0.0")
+          File.read(target).should contain("from-alias")
+        end
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
+    end
+
+    it "does not retry the alias for a non-404 failure" do
+      # A truncated transfer (or a checksum mismatch) means the asset IS there and
+      # came back wrong. Retrying it under a second name would paper over exactly
+      # the signal the integrity checks exist to raise.
+      payload = "z" * 40_000
+      root = File.tempname("gori-no-retry-")
+      Dir.mkdir_p(root)
+      begin
+        os = Gori::Update.current_os
+        arch = Gori::Update.current_arch
+        want = Gori::Update.asset_name("99.0.0", os, arch)
+        alias_name = Gori::Update.alias_asset_name(os, arch)
+        with_mock_release_server(tag: "v99.0.0", body: payload, asset_names: [want, alias_name],
+          reported_size: 0_i64, truncate_at: 20_000) do |srv|
+          target_dir = File.join(root, "opt", "gori")
+          Dir.mkdir_p(target_dir)
+          target = File.join(target_dir, "gori")
+          File.write(target, "old")
+          File.chmod(target, 0o755)
+
+          io = IO::Memory.new
+          expect_raises(Gori::Error, /truncated/) do
+            Gori::Update.update_binary(target, io, release_json: srv.release_json)
+          end
+          io.to_s.should_not contain("retrying the version-less alias")
+          File.read(target).should eq("old")
+        end
+      ensure
+        FileUtils.rm_rf(root) if File.exists?(root)
+      end
     end
   end
 
