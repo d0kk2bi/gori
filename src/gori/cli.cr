@@ -251,6 +251,33 @@ module Gori
       !first.starts_with?('-') && !SETTINGS_VERBS.includes?(first)
     end
 
+    # Everything OptionParser did not claim: the unrecognised words BEFORE a `--` separator, AND
+    # the run after it, which OptionParser strips and hands over as a SECOND list.
+    #
+    # Discarding that second list is a hole this file already closed once — `reject_extra_args`
+    # below carries the same fix for `gori wizard` / `gori tutorial`, and says why. `gori
+    # settings` never got it, so a `--` switched every guard here back off, silently, at exit 0:
+    # `gori settings -- --edit` printed the path with the flag dropped, `gori settings sections
+    # -- foo` ignored the word, and `gori settings export -- team.json` dumped the profile to
+    # stdout and created no file — verbatim the failure `reject_stray_args!` exists to stop,
+    # reached by adding two characters. `import` needs the same join for the opposite reason:
+    # there `--` means "the rest are FILENAMES", and dropping them made
+    # `gori settings import -- ./--odd.json` unrunnable while
+    # `gori settings import a.json -- b.json` imported one file, discarded the other, and
+    # reported success — defeating the very `rest.size > 1` guard written to catch two files.
+    #
+    # Parses, and RETURNS the leftovers rather than acting on them, because the two callers act
+    # on them oppositely (one refuses, one reads them as filenames) — and because the suite can
+    # then drive this exact wiring, which is the only way an example can fail if the `after`
+    # half is dropped again. Same split, for the same reason, as `parse_sections_value` under
+    # `split_sections`: the guard itself ends in `abort`, and `abort` calls `exit`.
+    private def self.stray_args(parser : OptionParser, args : Array(String)) : Array(String)
+      rest = [] of String
+      parser.unknown_args { |before, after| rest = before + after }
+      parser.parse(args)
+      rest
+    end
+
     # Parse, then refuse any leftover positional. OptionParser silently DROPS unclaimed bare
     # words when no `unknown_args` handler is installed, and every `gori settings` verb but
     # `import` takes none — so `gori settings --edit export` opened the editor and dropped
@@ -259,9 +286,7 @@ module Gori
     # stdout, created no file, and exited 0. `import` parses on its own because it does take a
     # positional; its own `rest.size > 1` guard is the same rule.
     private def self.reject_stray_args!(cmd : String, parser : OptionParser, args : Array(String)) : Nil
-      rest = [] of String
-      parser.unknown_args { |before, _| rest = before }
-      parser.parse(args)
+      rest = stray_args(parser, args)
       return if rest.empty?
       label = cmd.empty? ? "gori settings" : "gori settings #{cmd}"
       abort "#{label}: unexpected argument(s): #{rest.join(", ")}\n#{parser}"
@@ -303,9 +328,18 @@ module Gori
       reject_stray_args!("", parser, args)
 
       Paths.ensure_dirs
-      Settings.load                                    # pick up the persisted editor pref + existing values
-      Settings.save unless File.exists?(Settings.path) # lazily materialize with current defaults
+      Settings.load # pick up the persisted editor pref + existing values
       path = Settings.path
+      # Lazily materialize with current defaults. `save` REPORTS failure rather than raising (a
+      # failed write must not crash the TUI), and discarding that here printed a path to a file
+      # that is not there and exited 0 — then `--edit` opened an editor on it, so the operator
+      # typed a config into a location gori had already found unwritable and learned about it
+      # from `:wq`. Not fatal: the path itself is still the honest answer to `gori settings`,
+      # and $EDITOR may yet be able to write where gori's temp+rename could not.
+      unless File.exists?(path) || Settings.save
+        STDERR.puts "gori settings: could not create #{path} (check the directory's permissions" \
+                    " and free space) — the path below is where it would go"
+      end
 
       unless edit
         puts path
@@ -381,6 +415,9 @@ module Gori
 
       Settings.load
       abort_on_degraded_settings!("export")
+      # Before the note below and before the document is built: a refusal should not arrive
+      # underneath a line about what the export was going to contain.
+      out.try { |target| refuse_export_over_settings!(target) }
       if list = sections
         # Names were already validated against SECTION_KEYS in split_sections. What is left is
         # informational: a KNOWN section this install never touched is omitted by `serialize`,
@@ -395,6 +432,55 @@ module Gori
         write_export(path, doc, Settings.exported_secret_sections(sections))
       else
         puts doc
+      end
+    end
+
+    # `-o` aimed at the LIVE settings file is data loss wearing an export's clothes, so refuse
+    # it outright.
+    #
+    # A profile is deliberately NOT a snapshot: `export_document` omits every section sitting at
+    # its factory default, and omits SECRET_SECTIONS entirely unless they were named. Writing
+    # that back over settings.json therefore DELETES the sections it left out — `env` and its
+    # token VALUES, the decoder chains — in place, prints "wrote <path>", and exits 0. Nothing
+    # recovers it either: `write_export` is a plain truncate-and-write, not the atomic
+    # temp+rename 3-way merge every other writer of this file goes through, so there is no
+    # `.corrupt` copy and no concurrent-instance merge to put the section back.
+    #
+    # `-o "$GORI_CONFIG"` is an easy thing to type when the point of the export is to move a
+    # config, and the failure is invisible until the next run comes up without the token.
+    private def self.refuse_export_over_settings!(target : String) : Nil
+      return unless same_file?(target, Settings.path)
+      omitted = Settings::SECRET_SECTIONS.join(" and ")
+      abort "gori settings export: -o #{target} is your live settings file (#{Settings.path}).\n" \
+            "An export omits every section at its factory default — and #{omitted} unless " \
+            "--sections names them — so writing it back would DELETE those sections, not " \
+            "update them. Export to a different path."
+    end
+
+    # Whether two paths name the same file, with `..`, a relative path and a symlink all
+    # resolved — `-o ./settings.json` from inside GORI_HOME, and an `-o` through a symlinked
+    # config directory, are the same overwrite as spelling the path out in full.
+    #
+    # `File.realpath` raises on a path that does not exist yet, which is the ORDINARY case for
+    # an export target — so fall back to resolving the parent directory (that does exist) and
+    # keeping the basename. A path whose parent is missing too resolves to itself: it cannot
+    # collide with a settings file that loaded, and the write is about to fail on its own terms.
+    private def self.same_file?(a : String, b : String) : Bool
+      canonical_path(a) == canonical_path(b)
+    end
+
+    private def self.canonical_path(p : String) : String
+      abs = File.expand_path(p)
+      begin
+        File.realpath(abs)
+      rescue
+        dir = File.dirname(abs)
+        resolved = begin
+          File.realpath(dir)
+        rescue
+          dir
+        end
+        File.join(resolved, File.basename(abs))
       end
     end
 
@@ -414,7 +500,13 @@ module Gori
       perm = File::Permissions.new(secrets.empty? ? 0o644 : 0o600)
       begin
         File.open(path, "w", perm: perm) do |f|
-          File.chmod(path, perm) unless secrets.empty?
+          # Best-effort, exactly like Settings.write_private, and exactly what the paragraph
+          # above promises: a raising chmod aborted the whole export — AFTER `File.open` had
+          # already truncated the target — so the filesystem this was written to tolerate turned
+          # a working export into a destroyed file. Swallowing it hides nothing: the mode is
+          # read back below, and the WARNING branch there is what tells the operator the file is
+          # unprotected.
+          (File.chmod(path, perm) rescue nil) unless secrets.empty?
           f.print(doc)
         end
       rescue ex
@@ -447,9 +539,9 @@ module Gori
         p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
         p.missing_option { |flag| abort "missing value for #{flag}" }
       end
-      rest = [] of String
-      parser.unknown_args { |before, _| rest = before }
-      parser.parse(args)
+      # Same leftovers as every other verb, read as FILENAMES instead of refused — `--` carries
+      # its POSIX meaning here. See `stray_args` for both halves of what dropping its run cost.
+      rest = stray_args(parser, args)
 
       file = rest[0]?
       abort "gori settings import: needs a file\n#{parser}" unless file

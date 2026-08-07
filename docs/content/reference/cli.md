@@ -745,6 +745,8 @@ If gori cannot load your `settings.json` — unparseable, unreadable, or a `--co
 
 `env` and `decoder` are excluded from an export by default: `env` holds token values and `decoder` holds your last input and saved sessions. Naming one explicitly (`--sections env`) is how you consent to include it. Note that `upstream_rules` is safe to share — it stores a username and an environment-variable *name*, never a password.
 
+`-o` pointing at your live `settings.json` is refused. An export is not a snapshot — it omits every section at its factory default, and omits `env` and `decoder` unless you name them — so writing one back over the real file would delete those sections rather than update it.
+
 When an export **does** carry one of those sections, `-o FILE` is created `0600` and gori says so, naming what is in the file. Consenting to export a credential is not consenting to leave it world-readable. An ordinary export stays `0644`, and an export that names `env` on an install with no env vars is an ordinary export — the mode follows what the document actually contains, not what you typed.
 
 ### `--config PATH`
