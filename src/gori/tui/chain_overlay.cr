@@ -105,7 +105,12 @@ module Gori::Tui
       when .ok?
         bytes = step.output
         shown = bytes ? Decoder.display(bytes)[0] : ""
-        {step.converter.try(&.category.saved?) ? Theme.marker_accent : Theme.text, Theme.green, shown}
+        # `env_known`, not `marker_accent`. That accessor is `focus_gold` under another name,
+        # documented for exactly one job (the closing § of a marker hiding a ¦chain), and gold
+        # is focus + brand. What this cell means is PROVENANCE — the step resolved to a chain
+        # from the saved library rather than an inline converter — which is the same question
+        # `env_known` answers for a `$TOKEN` that resolved.
+        {step.converter.try(&.category.saved?) ? Theme.env_known : Theme.text, Theme.green, shown}
       when .skipped?
         {Theme.muted, Theme.muted, "(skipped)"}
       else # failed / unknown

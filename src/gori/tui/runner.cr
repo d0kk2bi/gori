@@ -1613,9 +1613,16 @@ module Gori::Tui
     # own precedence: `:detail` is a History body drill-in rather than a capturing modal, so a
     # press inside it reaches the tab — and so must the drag and the double-click that follow,
     # or the request/response text is the one place selection works by keyboard and not by mouse.
+    # The contexts that swallow a press without owning any geometry a pointer gesture could
+    # continue into — the space menu, the copy-as / send-to pickers, and the four bottom
+    # prompts. Shared by the drag and double-click tiers so the two can't drift apart.
+    private def pointer_capture_elsewhere? : Bool
+      @space_menu_open || copy_as_shown? || send_to_shown? ||
+        @goto_open || @search_open || @rename_open || @tag_edit_open
+    end
+
     private def drag_press_target?(layout : Layout, mx : Int32, my : Int32) : Bool
-      return false if @space_menu_open || copy_as_shown? || send_to_shown?
-      return false if @goto_open || @search_open || @rename_open || @tag_edit_open
+      return false if pointer_capture_elsewhere?
       # An overlay hit-tests its own card, so the shell asks only whether it opts in — it owns
       # no geometry inside the modal to test against.
       if ov = active_overlay
@@ -1638,8 +1645,25 @@ module Gori::Tui
       @tabs[@active_tab]?.try(&.handle_drag(layout.body, mx, my))
     end
 
+    # Whether a double-click can reach the thing under the pointer at all: the same context
+    # rejections as `drag_press_target?`, and NOT its two `supports_drag?` questions.
+    #
+    # Those are different questions, and gating on the drag one made a whole gesture silently
+    # dead: `ColormarkerController#handle_double_click` opens the rule editor, and Colormarker
+    # — a list, with no text to extend a selection over — answers `supports_drag?` false, so
+    # the shell never asked. A double-click there read as two selects. The default
+    # `handle_double_click` returns false and `press_left` then falls through to the ordinary
+    # click, so a tab that implements nothing is unaffected by being offered the pair.
+    private def double_click_target?(layout : Layout, mx : Int32, my : Int32) : Bool
+      return false if pointer_capture_elsewhere?
+      return true if active_overlay # hit-tests its own card; the shell owns no geometry inside
+      return false if modal_overlay?
+      return false unless @focus == :body
+      layout.body.contains?(mx, my)
+    end
+
     private def dispatch_double_click(layout : Layout, mx : Int32, my : Int32) : Bool
-      return false unless drag_press_target?(layout, mx, my)
+      return false unless double_click_target?(layout, mx, my)
       # The first press of the pair already placed the caret and focused the pane, so the
       # word selection lands where the operator is looking.
       if ov = active_overlay
@@ -3120,15 +3144,15 @@ module Gori::Tui
       # read as "your query is not in there".
       if n < 0
         return status("replace: this buffer holds bytes that are not valid UTF-8 — " \
-                      "search and replace cannot run over it (^F highlighting still works)")
+                      "search and replace can't run over it (^F highlighting still works)")
       end
       return if n == 0
       q, r = @search_buffer, @search_replace_buffer
       plural = n == 1 ? "" : "s"
       msg = if r.empty?
-              "Delete #{n} occurrence#{plural} of \"#{q}\"?"
+              "Delete #{n} occurrence#{plural} of “#{q}”?"
             else
-              "Replace #{n} occurrence#{plural} of \"#{q}\" with \"#{r}\"?"
+              "Replace #{n} occurrence#{plural} of “#{q}” with “#{r}”?"
             end
       confirm("REPLACE ALL", "#{msg}\nOne undo step — ^Z puts it back.",
         confirm_label: r.empty? ? "delete" : "replace", danger: true) do
@@ -3232,18 +3256,26 @@ module Gori::Tui
       end
     end
 
+    # Glyph prefixes for the status strip, matched against the message TEXT. That coupling is
+    # the thing to know about this method: it is the one place where changing a toast's wording
+    # silently changes its appearance. `fuzz error:` was renamed `fuzzer error:` (one noun per
+    # engine, across both its channels) and the ✗ quietly stopped appearing — nothing failed,
+    # the mark was simply gone. `ERROR_PREFIXES` now carries every engine so the next one
+    # inherits the mark instead of needing a line here.
+    ERROR_PREFIXES = [
+      "repeater error:", "ws repeater error:", "fuzz:",
+      "fuzzer error:", "discover error:", "miner error:", "sequencer error:", "probe error:",
+    ]
+    BUSY_PREFIXES = ["sending →", "ws sending →", "fuzzing ", "fuzz running", "stopping"]
+    DONE_PREFIXES = ["sent →", "ws sent:", "Fuzzer:"]
+
     private def format_status_message(message : String?) : String?
       return nil unless message
-      if message.starts_with?("sending →") || message.starts_with?("ws sending →") ||
-         message.starts_with?("fuzzing ") || message.starts_with?("fuzz running") ||
-         message.starts_with?("stopping")
+      if BUSY_PREFIXES.any? { |p| message.starts_with?(p) }
         "#{SPINNER[@spinner_frame % SPINNER.size]} #{message}"
-      elsif message.starts_with?("sent →") || message.starts_with?("ws sent:") ||
-            message.starts_with?("Fuzzer:")
+      elsif DONE_PREFIXES.any? { |p| message.starts_with?(p) }
         "✓ #{message}"
-      elsif message.starts_with?("repeater error:") || message.starts_with?("ws repeater error:") ||
-            message.starts_with?("fuzz error:") || message.starts_with?("fuzz:") ||
-            message.starts_with?("cannot run")
+      elsif ERROR_PREFIXES.any? { |p| message.starts_with?(p) }
         "✗ #{message}"
       else
         message
@@ -4865,8 +4897,11 @@ module Gori::Tui
       ov = active_overlay.as?(DiscoverConfigOverlay)
       names = hdrs.first(3).map { |n, _| n }.join(", ")
       names += ", …" if hdrs.size > 3
-      confirm("Use this flow's headers?",
-        "#{hdrs.size} header(s) from flow ##{id}: #{names}",
+      # The heading is the card's TITLE, so it takes the same shape as every other confirm
+      # (and every other card in gori): an uppercase noun for what this is about. The question
+      # itself belongs in the body, one line down, where the rest of them ask it.
+      confirm("USE FLOW HEADERS",
+        "Use this flow's headers? #{hdrs.size} header(s) from flow ##{id}: #{names}",
         confirm_label: "use", cancel_label: "start clean",
         danger: false, return_to: :discover_config) { ov.try(&.set_headers(hdrs)) }
     end
@@ -4919,7 +4954,7 @@ module Gori::Tui
 
     private def open_mine_config(seed : MineSeed?, extra : Array(MineSeed) = [] of MineSeed) : Nil
       unless seed
-        @toast = "cannot mine this request"
+        @toast = "can't mine this request"
         return
       end
       if seed.applicable.empty?
@@ -4970,7 +5005,7 @@ module Gori::Tui
 
     private def open_sequence_config(seed : SequenceSeed?) : Nil
       unless seed
-        @toast = "cannot sequence this request"
+        @toast = "can't sequence this request"
         return
       end
       ov = SequenceConfigOverlay.new(seed)
@@ -4993,7 +5028,7 @@ module Gori::Tui
     # --- Discover config popup (Sitemap/History → "Discover here") ---
     private def open_discover_config(seed : DiscoverSeed?) : Nil
       unless seed
-        @toast = "cannot discover from here"
+        @toast = "can't discover from here"
         return
       end
       ov = DiscoverConfigOverlay.new(seed)

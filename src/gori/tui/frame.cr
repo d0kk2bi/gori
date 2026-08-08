@@ -62,6 +62,42 @@ module Gori::Tui
       screen.text(inner.x + 1, y, " ‹ list ", Theme.accent, bg, Attribute::Bold)
     end
 
+    # A short right-aligned annotation riding a card's TOP border, right of the title —
+    # "2/2 enabled", "lens:off · 3", "4 entries". Rides the hairline the way `list_back_hint`
+    # does, so it costs no interior row.
+    #
+    # Every card that wanted one used to hand-roll this, and the copies had drifted into
+    # different magic numbers for the same layout: the Rewriter list guarded on
+    # `rect.w > meta.size + 20` and floored at `rect.x + 18`, its Colormarker twin at `+ 18`
+    # and `+ 16`, so the two lists dropped their count at different widths. Neither number
+    # was derived from anything — the title they were protecting is right there. `Frame.card`
+    # draws its title as ` TITLE ` from `rect.x + 2`, which is the only fact this needs, and
+    # it is now stated once.
+    #
+    # Draws nothing when the card is too narrow to hold the meta clear of the title, which is
+    # what makes it safe to call unconditionally.
+    # `min_x` overrides the left stop for a card whose border carries more than a title —
+    # the Repeater's RESPONSE header runs a left-anchored `chip` cluster there, so the meta
+    # has to clear the chips rather than the (shorter) title. Callers pass the x their own
+    # chrome ended at; everyone else lets the title decide.
+    #
+    # Returns the x it drew at, or nil when it drew nothing — so a caller can CHAIN something
+    # further left (the Repeater hangs an `⚠ incomplete` marker off the meta it just placed)
+    # without re-deriving a position this method already computed.
+    def self.border_meta(screen : Screen, rect : Rect, title : String, meta : String,
+                         bg : Color = Theme.bg, fg : Color = Theme.muted,
+                         min_x : Int32? = nil, right_edge : Int32? = nil) : Int32?
+      return nil if meta.empty? || rect.w < 4
+      stop = min_x || (rect.x + 2 + (title.empty? ? 0 : Screen.draw_width(title) + 2))
+      # `right_edge` (exclusive) for a border that ALREADY carries a badge: the meta right-aligns
+      # to the left of it instead of to the card's corner. Discover's RUNS card is the case —
+      # `border_meta` ran before the run badge and was simply overpainted by it.
+      x = (right_edge || (rect.right - 2)) - Screen.draw_width(meta)
+      return nil if x <= stop
+      screen.text(x, rect.y, meta, fg, bg)
+      x
+    end
+
     # A slim vertical scroll gauge riding the right border of a framed content area.
     # The thumb's height is proportional to how much of the content is on screen, so a
     # glance reads as "roughly how big is this", and its position tracks the scroll
@@ -86,13 +122,52 @@ module Gori::Tui
       end
     end
 
+    # Inverse of `scroll_gauge`: the `top` a click on the gauge column asks for, or nil when
+    # the pointer is not on it — including when no gauge was drawn, since this refuses on the
+    # same `track < 2 || total <= track` test the draw does. A body that fits has no target.
+    #
+    # The clicked cell becomes the MIDDLE of the thumb, which is what a click on a scrollbar
+    # track means everywhere else: the row you point at is the row you want to be looking at,
+    # not the row that ends up at the top of the viewport.
+    def self.scroll_gauge_top(content : Rect, total : Int32, mx : Int32, my : Int32) : Int32?
+      track = content.h
+      return nil if track < 2 || total <= track
+      return nil if mx != content.right # the frame's right border column — where the draw puts it
+      i = my - content.y
+      return nil if i < 0 || i >= track
+      thumb = (track.to_i64 * track // total).to_i.clamp(1, track - 1)
+      span = track - thumb
+      return 0 if span <= 0
+      max_top = total - track
+      off = (i - thumb // 2).clamp(0, span)
+      (off.to_i64 * max_top // span).to_i.clamp(0, max_top)
+    end
+
+    # The ROW a click on the gauge points at, for a list whose scroll is DERIVED from its
+    # selection: those views run an `ensure_visible` on every render, so setting `top`
+    # directly would simply be undone on the next frame. Proportional — the top of the track
+    # is row 0, the bottom is the last row — which is also what an operator dragging a
+    # scrollbar to the end expects to land on.
+    def self.scroll_gauge_row(content : Rect, total : Int32, mx : Int32, my : Int32) : Int32?
+      track = content.h
+      return nil if track < 2 || total <= track
+      return nil if mx != content.right
+      i = my - content.y
+      return nil if i < 0 || i >= track
+      (i.to_i64 * (total - 1) // (track - 1)).to_i.clamp(0, total - 1)
+    end
+
     # A `├───┤` divider across a card's interior at absolute row `y` — the seam
     # between an input/header band and the list below it.
-    def self.tee_divider(screen : Screen, rect : Rect, y : Int32, bg : Color = Theme.panel) : Nil
+    # `border` matches the enclosing card's outline, so a seam under a FOCUSED strip can light
+    # with it instead of staying a stray grey hairline — the same reason `inner_divider` takes
+    # one. Defaults to the resting hairline, so every existing caller is unchanged.
+    def self.tee_divider(screen : Screen, rect : Rect, y : Int32, bg : Color = Theme.panel,
+                         border : Color = Theme.border) : Nil
       return if rect.w < 2 || y <= rect.y || y >= rect.bottom - 1
-      screen.cell(rect.x, y, TEE_L, Theme.border, bg)
-      screen.hline(rect.x + 1, y, rect.w - 2, fg: Theme.border, bg: bg)
-      screen.cell(rect.right - 1, y, TEE_R, Theme.border, bg)
+      screen.cell(rect.x, y, TEE_L, border, bg)
+      screen.hline(rect.x + 1, y, rect.w - 2, fg: border, bg: bg)
+      screen.cell(rect.right - 1, y, TEE_R, border, bg)
     end
 
     # A tee-connected section divider for content rendered INSIDE a frame, where
@@ -117,6 +192,87 @@ module Gori::Tui
     # at rest. The one place this mapping lives.
     def self.pane_border(focused : Bool) : Color
       focused ? Theme.focus_gold : Theme.border
+    end
+
+    # One `label: opt opt opt ‹/›` option row — the control every rule form and config popup
+    # uses for a choice the ←/→ keys walk. Returns the x past what it drew.
+    #
+    # Three dialects had grown for this. Four rule forms carried a byte-identical private copy
+    # (the strip below); the OAST provider form and the Scope form's `kind:` row drew ONLY the
+    # lit value, so an operator could not see that other choices existed; and the Miner and
+    # Sequencer configs drew the value with `‹/›` in the value's own colour, unconditionally.
+    #
+    # The rule this settles on is neither "always a strip" nor "always the value". A strip is
+    # how a choice advertises itself, so it wins WHEN IT FITS — but `MAX_REQ_CHOICES` is eight
+    # numbers plus `uncapped`, and forcing that into a 72-column card would push the row off
+    # its own edge. So: measure, draw the strip if there is room, otherwise fall back to the
+    # lit value alone. One renderer, one look wherever the width allows it, and the fallback is
+    # a width response rather than a per-file opinion.
+    #
+    # `right` is the exclusive right edge the row may use (a card's `box.right - 2`).
+    # The `‹/›` cue is drawn ONLY when the row has focus — it names keys that do nothing
+    # anywhere else, and several of these forms used to show it on every row at once.
+    # `value_x` pins the options to a fixed column instead of letting them follow the label.
+    # Only the Sequencer's config passes one: its rows share a value column with a text field,
+    # and dropping the alignment to gain the shared renderer would have been a trade in the
+    # wrong direction. Where a form has no such column — everywhere else — the options sit one
+    # cell past the label, as they always have.
+    def self.option_cycle(screen : Screen, x : Int32, y : Int32, right : Int32, bg : Color,
+                          label : String, options : Array(String), selected : Int32,
+                          focused : Bool, value_x : Int32? = nil,
+                          lit : Color? = nil) : Int32
+      after_label = screen.text(x, y, label, Theme.muted, bg) + 1
+      tx = value_x || after_label
+      cue = focused ? " ‹/›" : ""
+      cue_w = Screen.draw_width(cue)
+      strip_w = options.sum { |o| Screen.draw_width(o) + 2 }
+      # `lit` overrides the colour of the CHOSEN option. One caller needs it: the Probe active
+      # scan's `unsafe methods:` row, where the chosen state can put DELETE on the wire and has
+      # to shout in red. Passing the colour beats repainting the option afterwards, which would
+      # mean re-deriving the x this method already knows.
+      lit_col = lit || (focused ? Theme.text_bright : Theme.accent)
+      if tx + strip_w + cue_w <= right
+        options.each_with_index do |opt, i|
+          on = i == selected
+          tx = screen.text(tx, y, " #{opt} ", on ? lit_col : Theme.muted, bg,
+            on ? Attribute::Bold : Attribute::None)
+        end
+      elsif value = options[selected]?
+        tx = screen.text(tx, y, value, lit_col, bg, Attribute::Bold)
+      end
+      focused ? screen.text(tx, y, cue, Theme.muted, bg) : tx
+    end
+
+    # A right-anchored run of BARE text chips — no fill, one column of gap, each dropped
+    # whole when it would cross `min_x`. `chips` is right-to-left: the first entry is the
+    # rightmost, matching `right_badge_hit`'s convention. Returns the leftmost x actually
+    # drawn, or `right_edge + 1` when nothing fit, so the caller can size what sits left of it.
+    #
+    # This is the filter-bar cluster four views had each written out: History's
+    # `count · ⇧S scope · f:follow`, Sitemap's `count · ⇧S scope · g:fold`, and the bare
+    # `count · ⇧S scope` in Issues and Probe. Same shape, four copies, and they had already
+    # drifted on the gap — a TWO-column step after the count, a ONE-column step between the
+    # chips, in the same method. `toggle_badge` is not this: it fills a `" chord:NAME "` pill,
+    # where these are plain fg-coloured words on the bar.
+    def self.right_text_chain(screen : Screen, right_edge : Int32, y : Int32, min_x : Int32,
+                              chips : Array({String, Color}), bg : Color = Theme.bg) : Int32
+      x = right_edge + 1
+      chips.each do |(text, color)|
+        w = Screen.draw_width(text)
+        left = x - 1 - w
+        next if left < min_x # drop this one, keep trying the shorter ones further left
+        screen.text(left, y, text, color, bg)
+        x = left
+      end
+      x
+    end
+
+    # A filled severity/status pill: the label inked in the canvas colour ON `color`, bold.
+    # `Frame.chip`'s lit/muted pair cannot express this — the fill IS the datum here (a
+    # severity's own hue), not an on/off state — which is why Issues and Probe each grew a
+    # private `chip` for it. They were byte-identical.
+    def self.tag_chip(screen : Screen, x : Int32, y : Int32, label : String, color : Color) : Int32
+      screen.text(x, y, label, Theme.bg, color, Attribute::Bold)
     end
 
     # A left-aligned mode/toggle chip at (x,y), returning the x past it. `lit` (active)
@@ -207,6 +363,14 @@ module Gori::Tui
       mx >= x && mx < x + text.size
     end
 
+    # Left edge after a `mode_badge` — the right_edge for whatever chains further left of it.
+    # Mirrors `mode_badge`'s own return, unchanged edge and all, so a hit-test can follow the
+    # chain past the mode chip the way the Repeater's ` ^K:MARK ` is drawn past it.
+    def self.mode_badge_edge(right_edge : Int32, min_x : Int32, insert : Bool) : Int32
+      x = right_edge - mode_badge_label(insert).size
+      x < min_x ? right_edge : x
+    end
+
     # Left edge after a right-chained `toggle_badge`/`action_badge` run — the right_edge
     # to pass the next (leftward) badge, including `mode_badge`. Same skip-past-min_x rule
     # as draw/hit. Pure geometry for chrome hit-tests that need to chain mode after others.
@@ -216,7 +380,7 @@ module Gori::Tui
       badges.each do |(_, chord, name)|
         text = " #{chord}:#{name} "
         x = edge - text.size
-        break if x < min_x
+        next if x < min_x # `next`, not `break` — see right_badge_hit
         edge = x
       end
       edge
@@ -246,11 +410,19 @@ module Gori::Tui
     # Hit-test for a left-to-right run of `Frame.chip` labels. `chips` is
     # `{id, label}` in draw order; each chip is followed by a 1-col gap (matching
     # the `+ 1` callers use after `Frame.chip`). Miss → nil. Pure geometry — no Screen.
+    #
+    # `limit` (exclusive) mirrors a caller that STOPS drawing at the first chip which would
+    # cross it. `Frame.chip` does not clip itself, so most runs have no limit and none is
+    # passed; the Repeater's RESPONSE cluster does, because that pane is half-width and the
+    # run used to spill through the card's own '╮'. Without this the hit walked all three
+    # chips regardless, so below ~88 columns ` ^X:hex ` and ` p:pretty ` kept 9 and 10 live
+    # cells on and past a border with nothing painted on them.
     def self.left_chip_hit(mx : Int32, my : Int32, y : Int32, start_x : Int32,
-                           chips : Array({Symbol, String})) : Symbol?
+                           chips : Array({Symbol, String}), limit : Int32? = nil) : Symbol?
       return nil if my != y
       x = start_x
       chips.each do |(id, label)|
+        break if limit && x + Screen.draw_width(label) > limit
         return id if mx >= x && mx < x + label.size
         x += label.size + 1
       end
@@ -262,6 +434,13 @@ module Gori::Tui
     # matching successive `toggle_badge` calls that pass the previous return as
     # the next right_edge). Labels are `" #{chord}:#{name} "`. A badge that
     # would sit left of `min_x` is skipped (same as draw). Miss → nil.
+    #
+    # `next`, not `break`, and that is the whole point: `toggle_badge` returns its
+    # `right_edge` UNCHANGED when it does not fit, so the chain keeps going and a shorter
+    # badge further along still draws at that same edge. This loop used to `break` while
+    # claiming "(same as draw)" in the line above — so on the Repeater's request border, at a
+    # width where ` ^R:SEND ` (9) does not fit but ` ^L:CL ` (7) does, CL was drawn and
+    # un-clickable, and every badge left of it hit-tested against an edge that never moved.
     def self.right_badge_hit(mx : Int32, my : Int32, y : Int32, right_edge : Int32, min_x : Int32,
                              badges : Array({Symbol, String, String})) : Symbol?
       return nil if my != y
@@ -269,7 +448,7 @@ module Gori::Tui
       badges.each do |(id, chord, name)|
         text = " #{chord}:#{name} "
         x = edge - text.size
-        break if x < min_x
+        next if x < min_x
         return id if mx >= x && mx < x + text.size
         edge = x
       end

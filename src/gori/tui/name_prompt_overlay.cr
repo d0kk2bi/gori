@@ -63,8 +63,8 @@ module Gori::Tui
     LABEL_W = 7 # value column offset ("Name" + padding)
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 72}.min
-      h = {area.h - 4, 9}.min
+      w = {area.w - 4, 72}.min
+      h = {area.h - 2, 9}.min
       return nil if w < 34 || h < 7
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end

@@ -196,7 +196,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · ←/→ kind · type when/selector · ↵ save · esc cancel"
+      "↑/↓ field · ←/→ options · type when/selector · ↵ save · esc cancel"
     end
 
     def handle_key(ev : Termisu::Event::Key) : Symbol
@@ -250,10 +250,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 72}.min
-      h = {area.h - 2, ROW_COUNT + 4}.min # title + rows + hint + padding
-      return nil if w < 40 || h < 10
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, ROW_COUNT)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -269,8 +266,8 @@ module Gori::Tui
         break if py >= box.bottom - 1
         draw_row(screen, box, i, py)
       end
-      hint_y = box.bottom - 1
-      screen.text(box.x + 2, hint_y, hint, Theme.muted, Theme.panel, width: box.w - 4) if hint_y > first
+      # No key hint on the bottom border — the shell draws `hint` in the status strip for the
+      # open modal (Runner#key_hints). See RewriterRuleOverlay#render for the whole argument.
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
@@ -284,7 +281,7 @@ module Gori::Tui
       when ROW_NAME then draw_field(screen, box, py, bg, fg, sel, "name: $", @fields[:name])
       when ROW_WHEN then draw_field(screen, box, py, bg, fg, sel, "when:", @fields[:filter])
       when ROW_HOST then draw_field(screen, box, py, bg, fg, sel, "host:", @fields[:host])
-      when ROW_KIND then draw_cycle(screen, x, py, bg, fg, "from:", KINDS.map(&.label), @kind_i, sel)
+      when ROW_KIND then Frame.option_cycle(screen, x, py, box.right - 2, bg, "from:", KINDS.map(&.label), @kind_i, sel)
       when ROW_SELECTOR
         draw_field(screen, box, py, bg, fg, sel, selector_label, @fields[:selector]) unless position?
       when ROW_RANGE
@@ -304,18 +301,6 @@ module Gori::Tui
       in Gori::ExtractKind::JsonPath then "path:"
       in Gori::ExtractKind::Position then "range:"
       end
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
-                           label : String, opts : Array(String), sel_i : Int32, row_sel : Bool) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      tx = x + label.size + 1
-      opts.each_with_index do |opt, oi|
-        lit = oi == sel_i
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx, py, " #{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
-      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,

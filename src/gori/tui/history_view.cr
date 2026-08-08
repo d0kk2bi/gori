@@ -36,7 +36,7 @@ module Gori::Tui
     MAX_ROWS = 5000
     # Width the Colormarker `strip` column costs the fixed left block when armed: one colour
     # cell plus a one-column gap. See render_list_body.
-    STRIP_W    = 2
+    STRIP_W    =   2
     TRIM_SLACK = 512
     # Cap on h2 frames / WS messages loaded into a detail view. A long-lived WS
     # (100k+ messages) or a heavily-multiplexed h2 connection would otherwise
@@ -505,6 +505,18 @@ module Gori::Tui
       return nil if i < 0 || i >= list_h
       ri = @scroll + i
       ri < @rows.size ? ri : nil
+    end
+
+    # The row a click on the list's scroll gauge asks for. The gauge rides the frame's right
+    # hairline — one column OUTSIDE the list rect, which is why `list_row_at` cannot answer it
+    # — and this list's `@scroll` is DERIVED from the selection by render's `ensure_visible`,
+    # so the answer is a selection, not an offset. See `Frame.scroll_gauge_row`.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      list_rect, _ = list_split(rect)
+      return nil if list_rect.empty?
+      lt = list_top(list_rect)
+      Frame.scroll_gauge_row(Rect.new(list_rect.x, lt, list_rect.w, {list_rect.bottom - lt, 0}.max),
+        @rows.size, mx, my)
     end
 
     # Which preview sub-pane (if any) contains (mx,my). :req | :res | nil.
@@ -1839,6 +1851,11 @@ module Gori::Tui
         screen.text(size_x, y, fmt_size(row.response_size), Theme.muted, bg, width: 6) if show_size
         screen.text(dur_x, y, fmt_dur(row.duration_us), Theme.muted, bg, width: 6) if show_dur
       end
+      # The busiest list in gori, and it had no position feedback at all: a 12-row window over
+      # 400 flows looked exactly like a 12-row window over 12. `rect` is the framed interior,
+      # so `rect.right` is the frame's own hairline — where `scroll_gauge` draws.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, list_top, rect.w, list_h),
+        @rows.size, @scroll, focused)
     end
 
     # Bottom preview pane: REQUEST | RESPONSE for the selected flow (settings:layout).
@@ -1890,8 +1907,11 @@ module Gori::Tui
       return if rect.empty?
       bg = active ? Theme.selection_dim : Theme.bg
       screen.fill(rect, bg) if active
-      label = active ? " #{title} ▎" : " #{title} "
-      screen.text(rect.x + 1, rect.y, label, active ? Theme.accent : Theme.muted, bg, attr: Attribute::Bold)
+      # `▎` in the marker column, not trailing the title — this was the one place in gori
+      # where the bar followed its label instead of leading the row. Written on both states so
+      # the title sits at the same column either way.
+      screen.cell(rect.x, rect.y, active ? '▎' : ' ', Theme.accent, bg)
+      screen.text(rect.x + 1, rect.y, " #{title} ", active ? Theme.accent : Theme.muted, bg, attr: Attribute::Bold)
       lines ||= ["(empty)"]
       content_y = rect.y + 1
       content_h = {rect.bottom - content_y, 0}.max
@@ -1903,6 +1923,12 @@ module Gori::Tui
         break if li >= lines.size
         screen.text(rect.x + 1, content_y + i, lines[li], Theme.text, bg, width: w)
       end
+      # Both preview halves scroll independently and neither said so. `rect.right` is the
+      # frame's hairline for the stacked layout and the RIGHT half of the split one; for the
+      # LEFT half it is the vertical `│` this pane draws between them, which the gauge
+      # replaces in place — a vertical rule either way, now one that also says where you are.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, content_y, rect.w, content_h),
+        lines.size, sc, active, bg)
     end
 
     private def preview_text_lines(head : Bytes?, body : Bytes?) : Array(String)
@@ -2124,6 +2150,12 @@ module Gori::Tui
           Wrap.mark_search(screen, body.x + gw, y, text, vr.a, vr.b, @search_hl, body.x + gw + cw)
         end
       end
+      # The detail body scrolls (`@detail_scroll`) and had no gauge, while the Repeater's
+      # structurally identical response pane has had one all along. `total` is LINES, and
+      # `detail_rows` windows by wrapped ROWS, so the two disagree on a wrapped line — the
+      # gauge is a proportion, and lines are the number the operator's ↑/↓ and the gutter
+      # both count in, which makes it the honest one to show.
+      Frame.scroll_gauge(screen, body, total, @detail_scroll, focused)
     end
 
     # Windowed render of revealed (whitespace-visible) lines — mirrors the normal
@@ -2230,27 +2262,20 @@ module Gori::Tui
       # Right cluster: a scope-lens chip (always shown so the ⇧S toggle is discoverable)
       # and, when filtering, the row count. The scope lens is a filter too, so it lives
       # on the filter bar next to the QL query.
-      scope_on = @scope.try(&.active?) == true
-      chip, chip_color = scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted}
-      rx = rect.right - 1
+      # One right-anchored chain, drawn by `Frame.right_text_chain` — rightmost first. The
+      # `f:follow` toggle shares the scope chip's accent/muted dress so the two read as one
+      # cluster, and the mark chip joins them rather than being placed by hand afterwards.
+      chips = [] of {String, Color}
       if filtering?
         # @rows is capped at PAGE by the search LIMIT; show "N+" at the cap so the count
         # isn't silently misread as the exact match total when more actually match.
-        count = @rows.size >= PAGE ? "#{PAGE}+" : @rows.size.to_s
-        screen.text({rx - count.size, rect.x}.max, rect.y, count, Theme.muted)
-        rx -= count.size + 2
+        chips << {@rows.size >= PAGE ? "#{PAGE}+" : @rows.size.to_s, Theme.muted}
       end
-      scope_x = {rx - chip.size, rect.x}.max
-      screen.text(scope_x, rect.y, chip, chip_color)
-      # The live-tail (follow) toggle, left of the scope chip — same fg accent/muted
-      # style so the two mode toggles read as one cluster, surfacing the `f` chord
-      # (today follow is only implicit in the selection sitting on the newest row).
-      fchip = "f:follow"
-      fx = scope_x - fchip.size - 1
-      follow_shown = fx > rect.x + 1
-      screen.text(fx, rect.y, fchip, @follow ? Theme.accent : Theme.muted) if follow_shown
-
-      lx = render_mark_chip(screen, rect, follow_shown ? fx : scope_x)
+      scope_on = @scope.try(&.active?) == true
+      chips << (scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted})
+      chips << {"f:follow", @follow ? Theme.accent : Theme.muted}
+      chips << {mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
+      lx = Frame.right_text_chain(screen, rect.right - 1, rect.y, rect.x + 2, chips)
 
       left_w = {lx - (rect.x + 1) - 1, 0}.max
       if !@query.blank?
@@ -2273,14 +2298,14 @@ module Gori::Tui
     # survive a tab switch, so this chip is what keeps the set from being invisible when you
     # come back. The hidden split covers marks the current filter/window doesn't show, so the
     # count never silently exceeds what's on screen.
-    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
-      return right_x if @marks.empty?
+    # The mark chip's TEXT, or nil when there is nothing marked. It used to place itself,
+    # which is why it needed a `right_x` and its own too-narrow guard; as a string it joins
+    # the same chain as its neighbours and `Frame.right_text_chain` drops it on a narrow bar
+    # for the same reason it drops any of them.
+    private def mark_chip_text : String?
+      return nil if @marks.empty?
       hidden = marked_hidden_count
-      chip = hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
-      x = right_x - chip.size - 1
-      return right_x unless x > rect.x + 1 # too narrow — the row count/scope chips win
-      screen.text(x, rect.y, chip, Theme.accent)
-      x
+      hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
     end
 
     private def render_suggestions(screen : Screen, rect : Rect, y : Int32) : Nil

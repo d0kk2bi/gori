@@ -92,7 +92,10 @@ module Gori::Tui
       unless out_c.empty?
         out_lines = output_ok ? output.split('\n') : ["✗ #{output}"]
         @out_lines = out_lines.size
-        title = "OUTPUT#{output_ok ? "" : "  ✗ invalid JSON"}"
+        # Just "OUTPUT". The failure is already the body's first line (`✗ <reason>`, in red,
+        # two lines below) — the title said a shorter version of the same thing, and a card
+        # title is what the card IS, not what state it is in.
+        title = "OUTPUT"
         @out_h, @out_scroll = draw_text_card(screen, out_c, title, out_lines, @out_scroll,
           focused && pane == :output, fg: output_ok ? Theme.text : Theme.red)
       end
@@ -104,9 +107,12 @@ module Gori::Tui
       reading = active && mode == InputMode::Read
       insert = active && mode == InputMode::Insert
       Frame.card(screen, card, "INPUT", bg: Theme.bg, border: Frame.pane_border(active))
-      if active
-        Frame.mode_badge(screen, card.right - 1, card.y, card.x + 8, insert)
-      end
+      # `mode`, not `insert` — the badge states the pane's own mode, and `JwtController`
+      # hit-tests exactly that. Gating the draw on `active` (and passing the focus-folded
+      # `insert`) left a live 8-cell target on an unpainted border: with focus on DECODED,
+      # ATTACKS or SECRET, clicking the INPUT card's top-right corner toggled insert.
+      # See the same fix in notes_view / fuzzer_view; focus stays in the border colour.
+      Frame.mode_badge(screen, card.right - 1, card.y, card.x + 8, mode == InputMode::Insert)
       body = card.inset(1, 1)
       input.render(screen, body, cursor: insert, gauge: true, gauge_focused: active)
       paint_read_chrome(screen, body, input, read) if reading
@@ -140,7 +146,8 @@ module Gori::Tui
 
     # ---- ATTACKS list (one selectable row per generated payload) ----
     private def render_attacks(screen : Screen, card : Rect, attacks : Array(Jwt::Attack), focused : Bool) : Nil
-      Frame.card(screen, card, "ATTACKS · #{attacks.size}", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.card(screen, card, "ATTACKS", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.border_meta(screen, card, "ATTACKS", attacks.size.to_s)
       body = card.inset(1, 1)
       return if body.h <= 0
       if attacks.empty?
@@ -156,9 +163,11 @@ module Gori::Tui
         idx = @atk_scroll + i
         a = attacks[idx]?
         break unless a
-        sel = focused && idx == @atk_sel
+        # Dimmed rather than erased when focus leaves this pane — the selection is still the
+        # attack ↵ applies, and with the marker gone there was nothing on screen saying which.
+        sel = idx == @atk_sel
         y = body.y + i
-        bg = sel ? Theme.accent_bg : Theme.bg
+        bg = sel ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
         screen.fill(Rect.new(body.x, y, body.w, 1), bg) if sel
         x = screen.text(body.x, y, sel ? "▎" : " ", Theme.accent, bg)
         x = screen.text(x, y, a.name, sel ? Theme.text_bright : Theme.text, bg, width: {body.w // 3, 8}.max)
@@ -245,6 +254,37 @@ module Gori::Tui
 
     def attacks_selected : Int32
       @atk_sel
+    end
+
+    # Mouse: the attack index under a click in the ATTACKS card, or nil (past the last row).
+    # Mirrors render_attacks' inset → @atk_scroll + i; the list has no header row. The pane
+    # drew a cursor and moved it with ↑/↓ and the wheel, and the pointer could not place it.
+    def attacks_row_at(card : Rect, my : Int32, count : Int32) : Int32?
+      return nil if count <= 0
+      body = card.inset(1, 1)
+      return nil if body.h <= 0
+      i = my - body.y
+      return nil if i < 0 || i >= body.h
+      idx = @atk_scroll + i
+      idx < count ? idx : nil
+    end
+
+    # The attack a click on the ATTACKS gauge asks for. `@atk_scroll` is derived from
+    # `@atk_sel` by render, so this answers with a selection. See `Frame.scroll_gauge_row`.
+    def attacks_gauge_row(card : Rect, mx : Int32, my : Int32, count : Int32) : Int32?
+      Frame.scroll_gauge_row(card.inset(1, 1), count, mx, my)
+    end
+
+    def select_attack_row(idx : Int32, count : Int32) : Nil
+      @atk_sel = idx.clamp(0, {count - 1, 0}.max)
+    end
+
+    # Hit-test the SECRET card's ` ^A:<alg> ` badge. Geometry mirrors render_secret. The
+    # Decoder's structurally identical ` ^X:<mode> ` on its OUTPUT card has always answered a
+    # click; this one, on the sibling tool tab, did not.
+    def secret_alg_hit(card : Rect, mx : Int32, my : Int32, alg : String) : Bool
+      !Frame.right_badge_hit(mx, my, card.y, card.right - 1, card.x + 9,
+        [{:alg, "^A", alg}] of {Symbol, String, String}).nil?
     end
 
     def decoded_at_top? : Bool

@@ -376,6 +376,14 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:fuzz_automark)
   end
 
+  def fuzz_mark_word : Nil
+    rec(:fuzz_mark_word)
+  end
+
+  def fuzz_insert_marker : Nil
+    rec(:fuzz_insert_marker)
+  end
+
   def fuzz_attach_chain : Nil
     rec(:fuzz_attach_chain)
   end
@@ -466,6 +474,22 @@ class FakeExecContext < Gori::Verb::ExecContext
 
   def sequence_report_ready? : Bool
     @sequence_report_ready
+  end
+
+  def miner_rename_subtab : Nil
+    rec(:miner_rename_subtab)
+  end
+
+  def miner_close_subtab : Nil
+    rec(:miner_close_subtab)
+  end
+
+  def sequencer_rename_subtab : Nil
+    rec(:sequencer_rename_subtab)
+  end
+
+  def sequencer_close_subtab : Nil
+    rec(:sequencer_close_subtab)
   end
 
   def miner_duplicate_subtab : Nil
@@ -1171,6 +1195,14 @@ class FakeExecContext < Gori::Verb::ExecContext
 
   def rewriter_rules_sub? : Bool
     @rewriter_rules_sub
+  end
+
+  # Defaults to "the list has focus" so every existing rule-verb expectation keeps its
+  # meaning; a test that wants a preview pane focused sets it false.
+  property rewriter_rule_list_focused = true
+
+  def rewriter_rule_list_focused? : Bool
+    @rewriter_rules_sub && @rewriter_rule_list_focused
   end
 
   def rewriter_preview_out? : Bool

@@ -70,5 +70,36 @@ module Gori::Tui
       return unit(m, "m") if m.round < 60
       unit(us / 3_600_000_000.0, "h")
     end
+
+    # Compact relative age — "3s" / "5m" / "2h" / "1d" — for a row that reports how long ago
+    # something happened. Three overlays each carried a private copy of these eight lines
+    # (the OAST session picker, the notifications centre, the TLS passthrough inventory),
+    # identical apart from one guard, which is the reason this lives here now.
+    #
+    # That guard: elapsed is CLAMPED AT ZERO. Two of the three read a wall-clock `Time`, which
+    # can move backwards under an NTP correction or when the record was written by another
+    # machine — the passthrough list lacked the clamp and would render `-5s` for a bypass it
+    # believed happened in the future. The notifications centre is safe by construction
+    # (`Time::Instant` is monotonic) and passes through the same door anyway.
+    def self.ago(seconds : Int64) : String
+      secs = {seconds, 0_i64}.max
+      return "#{secs}s" if secs < 60
+      mins = secs // 60
+      return "#{mins}m" if mins < 60
+      hours = mins // 60
+      return "#{hours}h" if hours < 24
+      "#{hours // 24}d"
+    end
+
+    # Wall-clock overload. `Time.local - t` is a Span; the clamp above is what makes a
+    # backwards clock render "0s" rather than a negative age.
+    def self.ago(t : Time) : String
+      ago((Time.local - t).total_seconds.to_i64)
+    end
+
+    # Monotonic overload — process-relative instants, which cannot run backwards.
+    def self.ago(t : Time::Instant) : String
+      ago((Time.instant - t).total_seconds.to_i64)
+    end
   end
 end

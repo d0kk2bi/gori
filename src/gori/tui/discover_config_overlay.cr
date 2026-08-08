@@ -232,15 +232,21 @@ module Gori::Tui
       screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
       x = box.x + 3
       case i
-      when ROW_TARGET  then cyc(screen, x, py, bg, sel, "start at:", selected_path, @seed.choices.size > 1)
+      when ROW_TARGET
+        # The one row whose options come from the seed rather than a constant — and the one
+        # that may not be cyclable at all (a single candidate). `focused: false` then drops
+        # the ‹/› cue, which is honest: the keys do nothing here.
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "start at:",
+          @seed.choices.map(&.to_s), @seed.choices.index(selected_path) || 0,
+          sel && @seed.choices.size > 1)
       when ROW_SPIDER  then check(screen, x, py, bg, sel, @spider, "spider (follow links)")
       when ROW_BRUTE   then check(screen, x, py, bg, sel, @bruteforce, "bruteforce (probe paths)")
       when ROW_EXT     then check(screen, x, py, bg, sel, @ext, "probe common extensions")
       when ROW_KEEP    then check(screen, x, py, bg, sel, @keep_alive, "reuse connections (keep-alive)")
-      when ROW_DEPTH   then cyc(screen, x, py, bg, sel, "max depth:", DEPTHS[@depth_idx].to_s)
-      when ROW_CONTAIN then cyc(screen, x, py, bg, sel, "scope:", CONTAINMENTS[@contain_idx].label)
-      when ROW_CONC    then cyc(screen, x, py, bg, sel, "concurrency:", CONCS[@conc_idx].to_s)
-      when ROW_MAXREQ  then cyc(screen, x, py, bg, sel, "max requests:", MAX_REQ_CHOICES[@maxreq_idx].try(&.to_s) || "uncapped")
+      when ROW_DEPTH   then Frame.option_cycle(screen, x, py, box.right - 2, bg, "max depth:", DEPTHS.map(&.to_s), @depth_idx, sel)
+      when ROW_CONTAIN then Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", CONTAINMENTS.map(&.label), @contain_idx, sel)
+      when ROW_CONC    then Frame.option_cycle(screen, x, py, box.right - 2, bg, "concurrency:", CONCS.map(&.to_s), @conc_idx, sel)
+      when ROW_MAXREQ  then Frame.option_cycle(screen, x, py, box.right - 2, bg, "max requests:", MAX_REQ_CHOICES.map { |c| c.try(&.to_s) || "uncapped" }, @maxreq_idx, sel)
       when ROW_HEADERS then headers_row(screen, x, py, bg, sel)
       else                  start_row(screen, x, py, bg)
       end
@@ -263,12 +269,6 @@ module Gori::Tui
       vx = x + label.size + 1
       screen.text(vx, py, val, sel ? Theme.text_bright : Theme.text, bg)
       screen.text(vx + val.size + 2, py, "↵ edit", Theme.muted, bg)
-    end
-
-    private def cyc(screen : Screen, x : Int32, py : Int32, bg : Color, sel : Bool, label : String, val : String, cyclable : Bool = true) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      shown = cyclable ? "#{val}  ‹/›" : val
-      screen.text(x + label.size + 1, py, shown, sel ? Theme.text_bright : Theme.text, bg)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?

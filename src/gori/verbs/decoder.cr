@@ -37,7 +37,7 @@ module Gori
       # Clears the INPUT text (and its chain spec) — the INPUT pane's own action.
       r.register Verb::Definition.new(
         "decoder.clear", "Clear input + chain", "Clear the current input and chain spec",
-        Verb::Scope::Decoder, available: in_decoder, mnemonic: 'l', section: :input) { |ctx| ctx.decoder_clear; nil }
+        Verb::Scope::Decoder, [Verb::Chord.new("l", ctrl: true)], available: in_decoder, mnemonic: 'l', section: :input) { |ctx| ctx.decoder_clear; nil }
 
       in_decoder_read = ->(ctx : Verb::ExecContext) { ctx.current_tab == :decoder && ctx.decoder_read_mode? }
       # The single smart Copy (see repeater.copy in verbs/history.cr) — copy-all is gone.
@@ -49,7 +49,7 @@ module Gori
       # Cycles the OUTPUT pane's display mode — tagged :output.
       r.register Verb::Definition.new(
         "decoder.mode", "Cycle output mode", "Cycle the output display: text / hex / base64",
-        Verb::Scope::Decoder, available: in_decoder, mnemonic: 'm', section: :output) { |ctx| ctx.decoder_cycle_mode; nil }
+        Verb::Scope::Decoder, [Verb::Chord.new("x", ctrl: true)], available: in_decoder, mnemonic: 'm', section: :output) { |ctx| ctx.decoder_cycle_mode; nil }
 
       # Save/load a chain spec by name — COMMON, like New/Close above and for the same
       # reason. These were tagged :tab, which put them ONLY in the tab-bar space menu:
@@ -60,11 +60,11 @@ module Gori
       # library is now reachable wherever the conversion is.
       r.register Verb::Definition.new(
         "decoder.save", "Save chain by name", "Save the current chain spec under a name",
-        Verb::Scope::Decoder, available: in_decoder, mnemonic: 's') { |ctx| ctx.decoder_save; nil }
+        Verb::Scope::Decoder, [Verb::Chord.new("s", ctrl: true)], available: in_decoder, mnemonic: 's') { |ctx| ctx.decoder_save; nil }
 
       r.register Verb::Definition.new(
         "decoder.load", "Load a saved chain", "Pick from the saved chain specs (^X deletes one)",
-        Verb::Scope::Decoder, available: in_decoder, mnemonic: 'o') { |ctx| ctx.decoder_load; nil }
+        Verb::Scope::Decoder, [Verb::Chord.new("o", ctrl: true)], available: in_decoder, mnemonic: 'o') { |ctx| ctx.decoder_load; nil }
 
       # Search-and-jump across conversion sub-tabs (section :tab — like repeater.find-subtab)
       # so jumping never needs Ctrl+digit. 'f' (find) since 's'/'o' are taken by Save/Load,

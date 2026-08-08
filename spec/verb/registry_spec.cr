@@ -324,6 +324,14 @@ private class FakeContext < ExecContext
     @calls << :fuzz_automark
   end
 
+  def fuzz_mark_word : Nil
+    @calls << :fuzz_mark_word
+  end
+
+  def fuzz_insert_marker : Nil
+    @calls << :fuzz_insert_marker
+  end
+
   def fuzz_attach_chain : Nil
     @calls << :fuzz_attach_chain
   end
@@ -422,6 +430,22 @@ private class FakeContext < ExecContext
 
   def sequence_report_ready? : Bool
     false
+  end
+
+  def miner_rename_subtab : Nil
+    @calls << :miner_rename_subtab
+  end
+
+  def miner_close_subtab : Nil
+    @calls << :miner_close_subtab
+  end
+
+  def sequencer_rename_subtab : Nil
+    @calls << :sequencer_rename_subtab
+  end
+
+  def sequencer_close_subtab : Nil
+    @calls << :sequencer_close_subtab
   end
 
   def miner_duplicate_subtab : Nil
@@ -1138,6 +1162,10 @@ private class FakeContext < ExecContext
   end
 
   def rewriter_rules_sub? : Bool
+    true
+  end
+
+  def rewriter_rule_list_focused? : Bool
     true
   end
 

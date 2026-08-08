@@ -132,6 +132,11 @@ module Gori::Tui
   class DiscoverView
     PANE_ORDER = [:runs, :findings]
 
+    # The RUNS card's title, as a constant because THREE places measure it: the card, the
+    # run badge's `min_x`, and that badge's hit-test. It used to read `RUNS (#{@runs.size})`,
+    # so the badge's left stop moved every time the count gained a digit.
+    RUNS_TITLE = "RUNS"
+
     # Run-row column widths. The blocks are laid out from the right edge and DROP when the
     # body is narrow (counts first, then techniques) so a run's target and its status —
     # the two things an action needs — survive at any width.
@@ -326,8 +331,7 @@ module Gori::Tui
     end
 
     private def render_runs(screen : Screen, rect : Rect, focused : Bool) : Nil
-      title = "RUNS (#{@runs.size})"
-      Frame.card(screen, rect, title, border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.card(screen, rect, RUNS_TITLE, border: Frame.pane_border(focused), bg: Theme.bg)
       inner = rect.inset(1, 1)
       return if inner.h <= 0 || inner.w <= 0
       r = current
@@ -339,7 +343,12 @@ module Gori::Tui
       # The badge tracks the SELECTED row, which is what ^R/^X act on — so a stopped run
       # selected while another still crawls offers RUN, not STOP.
       chord, name = r.running? ? {"^X", "STOP"} : {"^R", "RUN"}
-      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + title.size + 4, chord, name, r.running?)
+      badge_x = Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + RUNS_TITLE.size + 4, chord, name, r.running?)
+      # The count rides `border_meta`, not the title, like the FINDINGS card below it: a title
+      # that grows a digit moves every `min_x` derived from its width — the run badge's is.
+      # AFTER the badge and stopped at its left edge, because this border already carries one
+      # and the meta was otherwise drawn first and painted straight over.
+      Frame.border_meta(screen, rect, RUNS_TITLE, @runs.size.to_s, right_edge: badge_x - 1)
 
       rows_y, rows_cap, detail_y = run_bands(rect)
       runs_header_row(screen, inner) if rows_y > inner.y
@@ -459,7 +468,8 @@ module Gori::Tui
     private def render_findings(screen : Screen, rect : Rect, focused : Bool) : Nil
       r = current
       n = r ? r.findings.size : 0
-      Frame.card(screen, rect, "FINDINGS (#{n})", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      Frame.card(screen, rect, "FINDINGS", border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "FINDINGS", n.to_s)
       inner = rect.inset(1, 1)
       # A card under 3 rows has no interior — `inset` floors the height at 0 but keeps
       # `inner.y` one row down, so an unguarded placeholder lands OUTSIDE the pane.
@@ -490,6 +500,11 @@ module Gori::Tui
         break if idx >= r.findings.size
         draw_row(screen, inner, r.findings[idx], idx, inner.y + 1 + i, focused)
       end
+      # The RUNS card six rows above has had a gauge all along; this one had none. A
+      # difference like that INSIDE one view reads as breakage rather than as a gap. Rows
+      # start at `inner.y + 1` — `inner.y` is the header — so the gauge measures from there.
+      Frame.scroll_gauge(screen, Rect.new(inner.x, inner.y + 1, inner.w, cap),
+        r.findings.size, @scroll, focused)
     end
 
     private def header_row(screen : Screen, inner : Rect) : Nil
@@ -537,19 +552,77 @@ module Gori::Tui
       res_rect.contains?(mx, my) ? :findings : nil
     end
 
-    # Focus the clicked pane, and on a RUNS row select that run — clicking a row is the
-    # discoverable way to reach an earlier crawl before pressing ^X on it.
+    # Focus the clicked pane, and select the row under the cursor in EITHER list — clicking a
+    # row is the discoverable way to reach an earlier crawl before pressing ^X on it, and
+    # FINDINGS used to fall out of this method one line in, so a click there focused the pane
+    # and left the cursor where it was. Its own sibling four lines up already selected.
     def click(rect : Rect, mx : Int32, my : Int32) : Nil
+      # Either card's scroll gauge first: it rides the frame hairline, which `pane_at` and
+      # both row hit-tests exclude.
+      if hit = gauge_hit(rect, mx, my)
+        pane, row = hit
+        focus_pane(pane)
+        pane == :runs ? select_run(row) : (@fsel = row)
+        return
+      end
       return unless pane = pane_at(rect, mx, my)
       focus_pane(pane)
-      return unless pane == :runs
-      card, _ = pane_rects(rect) # the same rect render framed, so a row click can't miss it
-      rows_y, rows_cap, _ = run_bands(card)
-      row = my - rows_y
-      return unless 0 <= row < rows_cap
-      idx = @rscroll + row
-      return unless 0 <= idx < @runs.size
-      select_run(idx)
+      runs_card, res_card = pane_rects(rect) # the tiling render drew into, not a re-derivation
+      if pane == :runs
+        rows_y, rows_cap, _ = run_bands(runs_card)
+        row = my - rows_y
+        return unless 0 <= row < rows_cap
+        idx = @rscroll + row
+        return unless 0 <= idx < @runs.size
+        select_run(idx)
+      else
+        return unless idx = findings_row_at(res_card, my)
+        @fsel = idx
+      end
+    end
+
+    # Mouse: the findings index under `my` within the FINDINGS card, or nil (no run, empty
+    # list, the header row, or past the last populated row). Mirrors render_findings'
+    # inset → header → @scroll+i. Y-only, like every other list hit-test here.
+    private def findings_row_at(card : Rect, my : Int32) : Int32?
+      r = current
+      return nil if r.nil? || r.findings.empty?
+      inner = card.inset(1, 1)
+      return nil if inner.h <= 0 || inner.w <= 0
+      i = my - (inner.y + 1) # rows start one line below the header
+      return nil if i < 0 || i >= {inner.h - 1, 0}.max
+      idx = @scroll + i
+      idx < r.findings.size ? idx : nil
+    end
+
+    # The RUNS / FINDINGS row a click on either card's scroll gauge asks for. Both scrolls
+    # are derived from their selection, so both answer with a selection.
+    def gauge_hit(rect : Rect, mx : Int32, my : Int32) : {Symbol, Int32}?
+      runs_card, res_card = pane_rects(rect)
+      rows_y, rows_cap, _ = run_bands(runs_card)
+      if row = Frame.scroll_gauge_row(Rect.new(runs_card.inset(1, 1).x, rows_y, runs_card.inset(1, 1).w, rows_cap),
+           @runs.size, mx, my)
+        return {:runs, row}
+      end
+      r = current || return nil
+      inner = res_card.inset(1, 1)
+      return nil if inner.h <= 1
+      if row = Frame.scroll_gauge_row(Rect.new(inner.x, inner.y + 1, inner.w, inner.h - 1),
+           r.findings.size, mx, my)
+        return {:findings, row}
+      end
+      nil
+    end
+
+    # Hit-test the RUNS card's run control (^R:RUN / ^X:STOP). It tracks the SELECTED row,
+    # exactly as render_runs draws it, so the click acts on the run the badge is describing.
+    def run_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
+      r = current || return nil
+      card, _ = pane_rects(rect)
+      return nil if card.empty?
+      chord, name = r.running? ? {"^X", "STOP"} : {"^R", "RUN"}
+      Frame.right_badge_hit(mx, my, card.y, card.right - 1, card.x + RUNS_TITLE.size + 4,
+        [{:run, chord, name}] of {Symbol, String, String})
     end
 
     private def select_run(idx : Int32) : Nil

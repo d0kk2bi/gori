@@ -281,7 +281,7 @@ module Gori::Tui
     PANES = [:desc, :scope, :overrides, :env, :settings]
     # Chip labels, in PANES order. Kept parallel rather than derived from the symbols so a
     # label can read well ("HOST OVERRIDES") without renaming the pane it addresses.
-    PANE_LABELS = ["DESCRIPTION", "SCOPE", "HOST OVERRIDES", "ENV", "PROJECT SETTINGS"]
+    PANE_LABELS = ["Description", "Scope", "Host overrides", "Env", "Project settings"]
     # One row for the sub-tab chips.
     STRIP_H = 1
 
@@ -419,6 +419,32 @@ module Gori::Tui
 
     # Shared row hit-test for the SCOPE/HOST-OVERRIDES list interiors: account for the
     # optional add-row offset and scroll_for's windowing. Mirrors render_*_list.
+    # The row a click on a card's scroll gauge asks for. All three lists window from a
+    # selection-derived `scroll_for`, so the answer is a selection. Same `y`/`rows` the draw
+    # and `row_at` use, which is why it takes `adding` too.
+    def scope_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless card = card_rect(rect, :scope)
+      gauge_row(card.inset(1, 1), mx, my, false, @scope.rules.size)
+    end
+
+    def ov_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless card = card_rect(rect, :overrides)
+      gauge_row(ov_list_inner(card.inset(1, 1)), mx, my, @ov_adding, @host_overrides.entries.size)
+    end
+
+    def env_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless card = card_rect(rect, :env)
+      gauge_row(env_list_inner(card.inset(1, 1)), mx, my, @env_adding, @env_items.size)
+    end
+
+    private def gauge_row(inner : Rect, mx : Int32, my : Int32, adding : Bool, n : Int32) : Int32?
+      return nil if inner.h <= 0
+      y = adding ? inner.y + 1 : inner.y
+      rows = adding ? inner.h - 1 : inner.h
+      return nil if rows <= 0
+      Frame.scroll_gauge_row(Rect.new(inner.x, y, inner.w, rows), n, mx, my)
+    end
+
     private def row_at(inner : Rect, mx : Int32, my : Int32, adding : Bool, sel : Int32, n : Int32) : Int32?
       return nil if inner.h <= 0 || !inner.contains?(mx, my)
       y = adding ? inner.y + 1 : inner.y
@@ -721,6 +747,13 @@ module Gori::Tui
       end
     end
 
+    # The selected override's host, for the delete CONFIRM to name what it is about to remove.
+    # Read-only and separate from `ov_delete` because the confirm has to say the name BEFORE
+    # the row is gone, and `ov_delete` can only report it after.
+    def selected_override_host : String?
+      current_override.try(&.host)
+    end
+
     # Removes the selected override, returning its host (for the toast) or nil.
     def ov_delete : String?
       entry = current_override
@@ -855,6 +888,13 @@ module Gori::Tui
       cancel_env_add
       clamp_env_sel
       :ok
+    end
+
+    # The selected variable's KEY, for the delete confirm to name it before it is gone. Never
+    # the value: a confirm that echoed a secret would print it into a modal the operator may
+    # be screen-sharing, and the key alone identifies the row.
+    def selected_env_key : String?
+      @env_items[@env_sel]?.try { |(key, _)| key }
     end
 
     def env_delete : String?
@@ -1121,9 +1161,10 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "SCOPE", bg: Theme.bg, border: Frame.pane_border(focused))
       n = @scope.rules.size
-      meta = " lens:#{@scope.enabled? ? "on" : "off"} · #{n} "
-      mx = {rect.right - meta.size - 1, rect.x + 8}.max
-      screen.text(mx, rect.y, meta, @scope.active? ? Theme.text_bright : Theme.muted, Theme.bg) if rect.w > meta.size + 10
+      # An ACTIVE lens is the one card meta that shouts — it changes what every other tab
+      # shows — so this one passes its own fg rather than taking `border_meta`'s muted default.
+      Frame.border_meta(screen, rect, "SCOPE", "lens:#{@scope.enabled? ? "on" : "off"} · #{n}",
+        fg: @scope.active? ? Theme.text_bright : Theme.muted)
       render_scope_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -1136,7 +1177,7 @@ module Gori::Tui
       return if rows <= 0
 
       if rules.empty?
-        screen.text(inner.x, y, "(no rules — a to add)", Theme.muted)
+        screen.text(inner.x, y, "no scope rules — press a to add", Theme.muted, Theme.bg)
         return
       end
 
@@ -1146,14 +1187,21 @@ module Gori::Tui
         idx = scroll + i
         rule = rules[idx]
         ry = y + i
-        selected = focused && idx == @sel
-        bg = selected ? Theme.accent_bg : Theme.bg
-        if selected
-          screen.fill(Rect.new(inner.x, ry, inner.w, 1), bg)
-          screen.cell(inner.x, ry, '▎', Theme.accent, bg)
-        end
+        # The selection SURVIVES a focus change, dimmed — every other list in gori does this
+        # (`Theme.selection_dim`, see RewriterView/ProbeRulesView/DiscoverView…). These three
+        # project cards were the only ones that gated the whole marker on `focused`, so moving
+        # focus to a sibling card erased any sign of where you were in this one, and coming
+        # back meant finding your row again by eye.
+        selected = idx == @sel
+        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(inner.x, ry, inner.w, 1), bg) if selected
+        # The marker column is written on EVERY row (a space when unselected), the way every
+        # other list writes it — so the column is owned here rather than left to whatever was
+        # on the canvas underneath.
+        screen.cell(inner.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_rule_row(screen, inner, ry, rule, selected, bg)
       end
+      Frame.scroll_gauge(screen, Rect.new(inner.x, y, inner.w, rows), rules.size, scroll, focused)
     end
 
     private def render_rule_row(screen : Screen, inner : Rect, y : Int32, rule : Scope::Rule, selected : Bool, bg : Color) : Nil
@@ -1172,9 +1220,8 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "HOST OVERRIDES", bg: Theme.bg, border: Frame.pane_border(focused))
       n = @host_overrides.size
-      meta = " #{n} "
-      mx = {rect.right - meta.size - 1, rect.x + 14}.max
-      screen.text(mx, rect.y, meta, n > 0 ? Theme.text_bright : Theme.muted, Theme.bg) if rect.w > meta.size + 16
+      Frame.border_meta(screen, rect, "HOST OVERRIDES", n.to_s,
+        fg: n > 0 ? Theme.text_bright : Theme.muted)
       render_overrides_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -1200,7 +1247,7 @@ module Gori::Tui
       return if rows <= 0
 
       if entries.empty?
-        screen.text(list.x, y, "(no overrides — a to add)", Theme.muted) unless @ov_adding
+        screen.text(list.x, y, "no overrides — press a to add", Theme.muted, Theme.bg) unless @ov_adding
         return
       end
 
@@ -1210,14 +1257,17 @@ module Gori::Tui
         idx = scroll + i
         entry = entries[idx]
         ry = y + i
-        selected = focused && idx == @ov_sel && !@ov_adding
-        bg = selected ? Theme.accent_bg : Theme.bg
-        if selected
-          screen.fill(Rect.new(list.x, ry, list.w, 1), bg)
-          screen.cell(list.x, ry, '▎', Theme.accent, bg)
-        end
+        # Dimmed rather than erased when focus leaves — see the SCOPE list above. `@ov_adding`
+        # still clears it outright: while the add-row is open there is no selected ENTRY.
+        selected = idx == @ov_sel && !@ov_adding
+        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(list.x, ry, list.w, 1), bg) if selected
+        screen.cell(list.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_ov_row(screen, list, ry, entry, selected, bg)
       end
+      # `y`/`rows` are already past the add-row when one is open, so the gauge measures the
+      # entries actually windowed rather than the card interior.
+      Frame.scroll_gauge(screen, Rect.new(list.x, y, list.w, rows), entries.size, scroll, focused)
     end
 
     # The HOST OVERRIDES list area: the card interior minus the top example-hint row. ONE
@@ -1250,9 +1300,7 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "ENVIRONMENT", bg: Theme.bg, border: Frame.pane_border(focused))
       n = @env_items.size
-      meta = "prefix #{Settings.env_prefix} · #{n}"
-      mx = {rect.right - meta.size - 1, rect.x + 14}.max
-      screen.text(mx, rect.y, meta, Theme.muted, Theme.bg, width: {rect.right - mx - 1, 1}.max) if rect.w > meta.size + 16
+      Frame.border_meta(screen, rect, "ENVIRONMENT", "prefix #{Settings.env_prefix} · #{n}")
       render_env_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -1274,7 +1322,7 @@ module Gori::Tui
       end
       return if rows <= 0
       if @env_items.empty?
-        screen.text(list.x, y, "(no vars — a to add)", Theme.muted) unless @env_adding || @env_prefix_editing
+        screen.text(list.x, y, "no env vars — press a to add", Theme.muted, Theme.bg) unless @env_adding || @env_prefix_editing
         return
       end
       scroll = scroll_for(@env_sel, @env_items.size, rows)
@@ -1283,14 +1331,14 @@ module Gori::Tui
         idx = scroll + i
         key, val = @env_items[idx]
         ry = y + i
-        selected = focused && idx == @env_sel && !@env_adding
-        bg = selected ? Theme.accent_bg : Theme.bg
-        if selected
-          screen.fill(Rect.new(list.x, ry, list.w, 1), bg)
-          screen.cell(list.x, ry, '▎', Theme.accent, bg)
-        end
+        # Dimmed rather than erased when focus leaves — see the SCOPE list above.
+        selected = idx == @env_sel && !@env_adding
+        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(list.x, ry, list.w, 1), bg) if selected
+        screen.cell(list.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_env_row(screen, list, ry, key, val, selected, bg)
       end
+      Frame.scroll_gauge(screen, Rect.new(list.x, y, list.w, rows), @env_items.size, scroll, focused)
     end
 
     private def env_list_inner(inner : Rect) : Rect
@@ -1327,20 +1375,16 @@ module Gori::Tui
     private def render_desc_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
       ins = focused && desc_insert_mode?
-      border = desc_pane_border(focused, ins)
+      border = Frame.pane_border(focused)
       Frame.card(screen, rect, "DESCRIPTION", bg: Theme.bg, border: border)
-      if focused
-        Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 14, ins)
-      end
+      # The REAL mode, always drawn — `Frame.mode_badge`'s contract. `project_controller`
+      # hit-tests the bare `desc_insert_mode?`, so gating the draw on focus left a live
+      # target on a border with nothing on it. Focus is carried by the border colour above.
+      Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 14, desc_insert_mode?)
       inner = rect.inset(1, 1)
       @desc_area.render(screen, inner, cursor: ins,
         highlight: Settings.editor_markdown ? :markdown : nil, gauge: true, gauge_focused: focused)
       paint_desc_read_chrome(screen, inner, focused && !ins)
-    end
-
-    private def desc_pane_border(focused : Bool, insert : Bool) : Color
-      return Frame.pane_border(false) unless focused
-      insert ? Theme.accent : Frame.pane_border(true)
     end
 
     # The shared over-paint — see `TextReadState#paint_chrome`, which carries the reasoning

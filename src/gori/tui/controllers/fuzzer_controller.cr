@@ -118,7 +118,12 @@ module Gori::Tui
       y = Hotkeys.binding_label(reg, "fuzzer.copy", "y")
       run = Hotkeys.binding_label(reg, "fuzz.run", "^R")
       stop = Hotkeys.binding_label(reg, "fuzz.stop", "^X")
-      mark = Hotkeys.binding_label(reg, "fuzz.automark", "^A")
+      # One phrasing for the marker trio, shared with the Repeater's request footer. This
+      # used to name `^A` in both modes and `^K` in INSERT only, and `^T` nowhere.
+      params = Hotkeys.binding_label(reg, "fuzz.automark", "^A")
+      word = Hotkeys.binding_label(reg, "fuzz.mark-word", "^K")
+      point = Hotkeys.binding_label(reg, "fuzz.insert-marker", "^T")
+      marks = "#{params} params · #{word} word · #{point} point"
       read_common = "⇧arrows select · #{y} copy · space cmds"
       sni = Hotkeys.binding_label(reg, "fuzz.toggle-sni", "^S")
       case v.focus
@@ -135,9 +140,9 @@ module Gori::Tui
           # `↹ text` and not `↹ pane`: Tab types a TAB here (a header value may hold one), the
           # same thing it does in the Repeater's request editor. The old wording promised a
           # focus move Tab has never made from an editor in INSERT.
-          "type · ⇧arrows select · ^Z undo · #{mark} params · ^K word · ^O config · #{run} run · esc read · ↹ text"
+          "type · ⇧arrows select · ^Z undo · #{marks} · ^O config · #{run} run · esc read · ↹ text"
         else
-          "i/↵ edit · #{read_common} · #{mark} params · ^O config · #{run} run · ↹ pane · esc tabs"
+          "i/↵ edit · #{read_common} · #{marks} · ^O config · #{run} run · ↹ pane · esc tabs"
         end
       when :config  then config_hint(v, run)
       when :results then "↑/↓ select · ↵ detail · o sort · m matched · v dist · #{run} run · #{stop} stop · space cmds · ↹ pane"
@@ -257,10 +262,8 @@ module Gori::Tui
     # Run the action a chord mapped to; false when it was not a chord (fall through).
     private def dispatch_chord(action : Symbol?, v : FuzzerView, c : Char?) : Bool
       case action
-      when :palette   then save_current; @host.open_palette
-      when :close     then request_close
-      when :markword  then @host.status(v.mark_word)
-      when :markpoint then @host.status(v.insert_marker)
+      when :palette then save_current; @host.open_palette
+      when :close   then request_close
       when :undo
         # Only the TEMPLATE pane has a text buffer; anywhere else ^Z is not ours, so it falls
         # through to the keymap rather than being silently swallowed.
@@ -273,16 +276,17 @@ module Gori::Tui
       true
     end
 
-    # The ctrl-chord (or digit sub-tab switch) this key maps to, else nil. run/stop/
-    # automark are NOT here — they're keymap-driven verbs (rebindable) and fall through.
+    # The ctrl-chord (or digit sub-tab switch) this key maps to, else nil. run/stop/automark
+    # are NOT here — they're keymap-driven verbs (rebindable) and fall through. Neither are
+    # ^K/^T any more: claiming them here meant the two most-used marker actions never reached
+    # the registry, so they were absent from the space menu and could not be rebound, while
+    # their four siblings were `fuzz.*` verbs. See `fuzz.mark-word` / `fuzz.insert-marker`.
     private def chord_action(ev : Termisu::Event::Key, c : Char?) : Symbol?
       return nil unless ev.ctrl?
       key = ev.key
       case
       when key.lower_p?         then :palette
       when key.lower_w?         then :close
-      when key.lower_k?         then :markword
-      when key.lower_t?         then :markpoint
       when key.lower_o?         then :config
       when key.lower_z?         then :undo
       when c && '1' <= c <= '9' then :switch
@@ -534,11 +538,6 @@ module Gori::Tui
     end
 
     # Every modified key the TEMPLATE editor owns rather than the keymap — see `handle_body_key`.
-    private def editing_motion?(ev : Termisu::Event::Key) : Bool
-      return false unless ev.ctrl? || ev.alt?
-      key = ev.key
-      key.left? || key.right? || key.home? || key.end? || word_delete?(ev)
-    end
 
     # A backspace/forward-delete of a marker delimiter (§/¦) would unbalance the marker and
     # expose its concealed ¦chain. Confirm first; on accept, strip the WHOLE marker down to
@@ -666,6 +665,15 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       body = body_rect_below_filter(rect)
       return true unless v = current_view
+      # The RESULTS gauge on the card hairline — `results_row_at` requires the pane rect,
+      # which excludes that column.
+      if row = v.results_gauge_row(body, mx, my)
+        save_current
+        @host.focus_body
+        v.focus_pane(:results)
+        v.select_result_row(row)
+        return true
+      end
       # RESULTS border badges (DIST / MATCH / sort) before row select.
       if chip = v.results_chrome_hit(body, mx, my)
         save_current
@@ -952,7 +960,7 @@ module Gori::Tui
         # feed (the AI firehose logs freely; only the human center suppresses it).
         @host.jobs.finish(v.job_id, :error, ev.message)
         log_event(v, :error, "Fuzzer: #{ev.message} on #{v.summary}")
-        @host.status("fuzz error: #{ev.message}")
+        @host.status("fuzzer error: #{ev.message}")
       end
     end
 
@@ -1030,7 +1038,7 @@ module Gori::Tui
       engine, err = v.build_engine(!@host.session.config.insecure_upstream?,
         @host.session.scope, @host.session.host_overrides)
       unless engine
-        @host.status(err || "cannot run")
+        @host.status(err || "can't run")
         return
       end
       total = begin
@@ -1219,7 +1227,7 @@ module Gori::Tui
 
     def request_close : Nil
       return unless tab = current_tab_obj
-      @host.confirm("CLOSE FUZZER", "Close fuzz session \"#{tab.view.summary}\"?\nIts template/config and results are discarded.",
+      @host.confirm("CLOSE FUZZER", "Close fuzz session “#{tab.view.summary}”?\nIts template/config and results are discarded.",
         confirm_label: "close", danger: true) { close_tab }
     end
 

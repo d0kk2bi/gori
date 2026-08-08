@@ -150,12 +150,13 @@ describe Gori::Tui::FuzzAdvancedOverlay do
     #
     # Production hands `layout.body`, which is what makes this reachable: the card clips to
     # 14 rows there, so only 11 of the 17 ROWS are drawn. Under the harness's 80x24 default
-    # every row fits and `visible == ROWS.size` hides the whole bug.
-    body = Gori::Tui::Rect.new(2, 4, 76, 18)
+    # every row fits and `visible == ROWS.size` hides the whole bug. The 16-row body is what
+    # yields that 14-row card now that every modal insets from its area by 2.
+    body = Gori::Tui::Rect.new(2, 4, 76, 16)
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     h = OverlayHarness.new(ov, area: body)
     box = h.box.not_nil!
-    box.y.should eq(6) # rows run box.y+1 (7) .. 17; hint on 18, border on 19
+    box.y.should eq(5) # rows run box.y+1 (6) .. 16; hint on 17, border on 18
 
     h.click_in_box(2, 12).should eq(:open) # the hint row
     h.click_in_box(2, 13).should eq(:open) # the bottom border
@@ -175,12 +176,12 @@ describe Gori::Tui::FuzzAdvancedOverlay do
   end
 
   it "offsets a click by the scroll position once the list has scrolled" do
-    # Production hands an overlay `layout.body` — 6 rows shorter and offset from the screen —
-    # so this 18-row card renders clipped to 14 and the row list must scroll to reach the
+    # Production hands an overlay `layout.body` — shorter than the screen and offset from it —
+    # so this 16-row body renders a card clipped to 14 and the row list must scroll to reach the
     # bottom fields. That scroll is what makes handle_click's `@scroll + i` load-bearing:
     # @scroll only ever advances inside `render`, so a click example that never renders
     # leaves it at 0, where `@scroll + i` and plain `i` are indistinguishable.
-    body = Gori::Tui::Rect.new(2, 4, 76, 18)
+    body = Gori::Tui::Rect.new(2, 4, 76, 16)
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     h = OverlayHarness.new(ov, area: body)
     h.box.should_not be_nil

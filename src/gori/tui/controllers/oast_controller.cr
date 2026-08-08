@@ -208,7 +208,9 @@ module Gori::Tui
         return "type to filter · ↵ keep · esc clear" if @filter_editing
         "↑/↓ select · ‹/› provider · g payload · y copy · / filter · ^R listen · ^X stop · ↵ detail · space cmds"
       else
-        "↑/↓ select · a add · e edit · t toggle · d delete · space cmds · esc tabs"
+        # `x on/off` and `↵/e edit` — the vocabulary the three sibling rule lists use. Toggle was
+        # `t` here alone, and ↵ has always opened the editor without the hint saying so.
+        "↑/↓ select · a add · ↵/e edit · x on/off · d delete · space cmds · esc sub-tabs"
       end
     end
 
@@ -628,7 +630,7 @@ module Gori::Tui
 
     def delete_provider : Nil
       return unless p = selected_provider
-      @host.confirm("DELETE PROVIDER", "Delete OAST provider \"#{p.name}\"?\nIts callback history is kept.",
+      @host.confirm("DELETE PROVIDER", "Delete OAST provider “#{p.name}”?\nIts callback history is kept.",
         confirm_label: "delete", danger: true) do
         if l = @listeners.find { |ls| ls.provider_key == p.key }
           stop_listener(l)
@@ -870,7 +872,8 @@ module Gori::Tui
     end
 
     private def render_providers(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "PROVIDERS (#{@providers.size})", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      Frame.card(screen, rect, "PROVIDERS", border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "PROVIDERS", @providers.size.to_s)
       inner = rect.inset(1, 1)
       if @providers.empty?
         screen.text(inner.x + 1, inner.y, "no providers — press a to add one (interactsh is prefilled)", Theme.muted, Theme.bg, width: inner.w - 2)
@@ -1041,10 +1044,10 @@ module Gori::Tui
         end
       when c == 'g' then generate_payload
       when c == 'y' then copy_payload
-      # `r` (resume) and `a` (add issue) are NOT claimed here: both open an overlay, which a
-      # controller cannot do, so they stay verbs with plain chords and reach the keymap through
-      # the `return false` below — the same fall-through every unhandled key takes.
-      else               return false
+        # `r` (resume) and `a` (add issue) are NOT claimed here: both open an overlay, which a
+        # controller cannot do, so they stay verbs with plain chords and reach the keymap through
+        # the `return false` below — the same fall-through every unhandled key takes.
+      else return false
       end
       sync_scroll
       true
@@ -1077,7 +1080,7 @@ module Gori::Tui
       when key.down?, key.lower_j? then @prov_sel = {@prov_sel + 1, {@providers.size - 1, 0}.max}.min
       when key.enter?, c == 'e'    then open_edit_provider
       when c == 'a'                then open_add_provider
-      when c == 't'                then toggle_provider
+      when c == 'x'                then toggle_provider
       when c == 'd'                then delete_provider
       else                              return false
       end

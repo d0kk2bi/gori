@@ -266,16 +266,18 @@ module Gori::Tui
         decoder_new
       elsif ev.ctrl? && key.lower_w?
         decoder_close
-      elsif ev.ctrl? && key.lower_l?
-        clear_all
       elsif ev.ctrl? && key.lower_y?
+        # ^Y stays inline: it copies the OUTPUT specifically, and `decoder.copy` is the
+        # focused-pane copy on bare `y`. No verb to defer to.
         copy_output
-      elsif ev.ctrl? && key.lower_x?
-        cycle_output_mode
-      elsif ev.ctrl? && key.lower_s?
-        @host.open_chain_save
-      elsif ev.ctrl? && key.lower_o?
-        @host.open_chain_load
+      elsif ev.ctrl_z? || editing_motion?(ev)
+        # Undo and ⌥/⌃ word motion belong to the focused editor, not the keymap.
+        return route_pane_keys(ev, c)
+      elsif ev.ctrl? || ev.alt?
+        # Every OTHER modified chord defers to the central keymap, so it is rebindable — the
+        # rule the Repeater and Fuzzer already follow. Without it the pane handlers below can
+        # swallow it, which is why ^L/^X/^S/^O had to be hardcoded above.
+        return false
       elsif key.escape?
         @popup.close
         s = cur
@@ -287,13 +289,18 @@ module Gori::Tui
           @host.request_focus(:subtabs)
         end
       else
-        return case cur.pane
-        when :input  then edit_input(ev, c)
-        when :output then handle_output(ev)
-        else              edit_chain(ev, c); true
-        end
+        return route_pane_keys(ev, c)
       end
       true
+    end
+
+    # The focused pane's own key handling — shared by the fall-through above and the ^Z arm.
+    private def route_pane_keys(ev : Termisu::Event::Key, c : Char?) : Bool
+      case cur.pane
+      when :input  then edit_input(ev, c)
+      when :output then handle_output(ev)
+      else              edit_chain(ev, c); true
+      end
     end
 
     # The autocomplete popup owns Tab/Enter/↑/↓/Esc while it is open. The shell's
@@ -447,16 +454,16 @@ module Gori::Tui
       case s.pane
       when :chain
         if @popup.open?
-          return @popup_engaged ? "↑/↓ pick · ↹/↵ complete · esc close · type to filter" : "↓ browse · type to filter · ⇥ output · esc tabs"
+          return @popup_engaged ? "↑/↓ pick · ↹/↵ complete · esc close · type to filter" : "↓ browse · type to filter · ⇥ output · esc sub-tabs"
         end
-        "chain (> | ,) · ↑ input · ↓ output · ^Y copy · ^X mode · ^S save · ^O load · esc tabs"
+        "chain (> | ,) · ↑ input · ↓ output · ^Y copy · ^X mode · ^S save · ^O load · esc sub-tabs"
       when :output
-        "↑/↓ move · ⇧arrows select · #{y} copy · ↑-top chain · space cmds · ^X mode · ^Y copy all · esc tabs"
+        "↑/↓ move · ⇧arrows select · #{y} copy · ↑-top chain · space cmds · ^X mode · ^Y copy all · esc sub-tabs"
       when :input
         if s.input_mode == InputMode::Insert
           "type to edit · esc read · ↓ chain · ^L clear · ^X mode · ^N new · ^W close · ↑ sub-tabs"
         else
-          "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓/↹ chain · ^X mode · ^N new · esc tabs"
+          "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓/↹ chain · ^X mode · ^N new · esc sub-tabs"
         end
       else
         ""
@@ -912,7 +919,7 @@ module Gori::Tui
         return
       end
       if name.matches?(/[>|,¦§]/)
-        @host.status("chain name cannot contain > | , ¦ or §")
+        @host.status("chain name can't contain > | , ¦ or §")
         return
       end
       if (c = registry[name]?) && !c.category.saved?

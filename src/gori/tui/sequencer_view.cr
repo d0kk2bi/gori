@@ -696,7 +696,8 @@ module Gori::Tui
     end
 
     private def render_samples(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "SAMPLES (#{@samples.size})", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      Frame.card(screen, rect, "SAMPLES", border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "SAMPLES", @samples.size.to_s)
       inner = rect.inset(1, 1)
       # A card under 3 rows has no interior — `inset` floors the height at 0 but keeps
       # `inner.y` one row down, so an unguarded placeholder lands OUTSIDE the pane.
@@ -911,6 +912,53 @@ module Gori::Tui
       return :samples if s_rect.contains?(mx, my)
       return :analysis if a_rect.contains?(mx, my)
       cfg_rect.contains?(mx, my) ? :config : nil
+    end
+
+    # Mouse: the sample index under a click, or nil (outside SAMPLES, on the header row, or
+    # past the last populated row). Mirrors render_samples' inset → header → @scroll+i. The
+    # cursor moved with ↑/↓ and the wheel and could not be placed with the pointer.
+    def samples_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil if @focus == :detail || @samples.empty?
+      _, s_rect, _ = pane_rects(rect)
+      return nil if s_rect.empty? || !s_rect.contains?(mx, my)
+      inner = s_rect.inset(1, 1)
+      return nil if inner.h <= 0 || inner.w <= 0
+      i = my - (inner.y + 1) # rows start one line below the header
+      return nil if i < 0 || i >= {inner.h - 1, 0}.max
+      idx = @scroll + i
+      idx < @samples.size ? idx : nil
+    end
+
+    # The row a click on the scroll gauge asks for. The gauge rides the frame's right hairline,
+    # one column outside the list rect, so `row_at` cannot answer it — and `@scroll` here is
+    # DERIVED from the selection, so the answer is a selection. See `Frame.scroll_gauge_row`.
+    def samples_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil if @focus == :detail
+      _, s_rect, _ = pane_rects(rect)
+      return nil if s_rect.empty?
+      inner = s_rect.inset(1, 1)
+      return nil if inner.h <= 0 || inner.w <= 0
+      Frame.scroll_gauge_row(Rect.new(inner.x, inner.y + 1, inner.w, inner.h - 1),
+        @samples.size, mx, my)
+    end
+
+    def select_sample_row(idx : Int32) : Nil
+      @sel = idx.clamp(0, {@samples.size - 1, 0}.max)
+    end
+
+    def samples_selected_index : Int32
+      @sel
+    end
+
+    # Hit-test the SEQUENCER card's run control — same dress as the Repeater's ` ^R:SEND `
+    # and the Fuzzer's ` ^R:RUN `, which both answer a click. Mirrors render_config.
+    def config_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
+      return nil if @focus == :detail
+      cfg, _, _ = pane_rects(rect)
+      return nil if cfg.empty?
+      chord, name = @running ? {"^X", "STOP"} : {"^R", "RUN"}
+      Frame.right_badge_hit(mx, my, cfg.y, cfg.right - 1, cfg.x + "SEQUENCER".size + 4,
+        [{:run, chord, name}] of {Symbol, String, String})
     end
   end
 end

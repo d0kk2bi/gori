@@ -42,6 +42,12 @@ module Gori::Tui
         Item.new("↹ / ⇧↹", "focus ring: tab bar ↔ panes"),
         Item.new("↵ / ↓", "enter the tab body"),
         Item.new("1-9", "jump to the Nth visible tab"),
+        # Seventeen surfaces bind j/k and no hint anywhere named them, so a whole navigation
+        # layer was reachable only by guessing. It belongs HERE rather than in each tab's
+        # hint: it is a global convention like ^P or ^D, the hints are already at the width
+        # the status strip gives them, and spending six cells per tab to repeat one rule
+        # would push a tab-specific key off the end.
+        Item.new("j / k", "move down / up — anywhere ↑/↓ moves (h/l where ←/→ do)"),
         Item.new("Settings: Tabs", "show/hide + reorder tabs"),
         Item.new("esc", "pop back to the tab bar"),
       ]},
@@ -77,6 +83,11 @@ module Gori::Tui
         Item.new("space", "command menu (READ mode on request/target/response)"),
         Item.new("y", "copy selection/line (READ)", "repeater.copy"),
         Item.new("x · ⇧arrows", "select the current line · extend selection"),
+        # The §…§ marker trio, same keys and same order as the FUZZER section below — the
+        # Repeater grew `^K`/`^T` to match and Help documented neither.
+        Item.new("^A · ^K · ^T", "auto-mark params · mark word · mark point (manual §)", "repeater.auto-mark"),
+        Item.new("space → c", "clear every § marker", "repeater.clear-marks"),
+        Item.new("^Y", "edit the decoder chain on the marker at the cursor", "repeater.attach-chain"),
         Item.new("^X", "hex-edit the request", "repeater.toggle-hex"),
         Item.new("^S", "SNI override (on the target)", "repeater.toggle-sni"),
         Item.new("^L", "toggle auto Content-Length", "repeater.toggle-auto-content-length"),
@@ -93,9 +104,16 @@ module Gori::Tui
         Item.new("^N / ^W", "new / close a sub-tab"),
         Item.new("i / ↵", "enter INS (edit) on target/template · esc back to READ"),
         Item.new("space", "command menu (READ mode on target/template/results/detail)"),
-        Item.new("y · O", "copy selection/line · copy all pane (READ)"),
+        # NOT `y · O`. The `*.copy-all` verbs are gone — `Runner#read_copy` folds it into one
+        # key: `y` copies the selection if there is one, else the whole pane. The row was
+        # advertising an `O` that stopped existing when they merged.
+        Item.new("y", "copy the selection — or the whole pane when nothing is selected (READ)"),
         Item.new("⇧arrows", "select text (line or char)"),
-        Item.new("^A · ^K · ^T · ^U", "auto-mark params · mark word · mark point (manual §) · clear §"),
+        Item.new("^A · ^K · ^T", "auto-mark params · mark word · mark point (manual §)"),
+        # NOT `^U clear §` — that was wrong twice over: ^U is fuzz.pretty-template (the tab's
+        # own ` ^U:PRETTY ` badge says so), and clear-marks has no chord at all. The advertised
+        # key silently reflowed the template you had just finished marking by hand.
+        Item.new("^U", "pretty-print the template body (space → c clears §)"),
         Item.new("^V", "toggle transport HTTP/1.1 ↔ HTTP/2"),
         Item.new("^S", "SNI override (on the target)", "fuzz.toggle-sni"),
         Item.new("^O", "focus the config pane (payload sets · Mode · Advanced · Run)"),
@@ -107,6 +125,34 @@ module Gori::Tui
         Item.new("o · m", "sort · matched-only"),
         Item.new("r", "rename the sub-tab (on the strip)"),
         Item.new("⇧←/→", "detail: scroll a long line sideways"),
+      ]},
+      # Miner, OAST and JWT had NO section at all, while Sequencer — also a default-hidden
+      # tab — has a full one, so "it's hidden" was never the rule being applied. Three tabs
+      # whose entire keyboard surface was undiscoverable from the one screen that exists to
+      # answer "what can I press here".
+      {"MINER", [
+        Item.new("Mine parameters", "from History/Repeater (space menu) — finds params the app accepts but never shows"),
+        Item.new("^R · ^X", "mine · stop", "mine.run"),
+        Item.new("↹", "summary ⟷ findings"),
+        Item.new("↑/↓ · ↵", "findings: select · open detail"),
+        Item.new("space → R", "send the selected finding to Repeater (param injected)", "mine.repeater"),
+        Item.new("^N / ^W", "new / close a sub-tab"),
+      ]},
+      {"JWT", [
+        Item.new("^T", "switch decode ⟷ encode", "jwt.toggle-mode"),
+        Item.new("^A", "cycle the signing alg (alg=none included)", "jwt.cycle-alg"),
+        Item.new("^L · ^Y", "clear the session · copy everything", "jwt.clear"),
+        Item.new("↹", "cycle INPUT → DECODED → ATTACKS (decode) / HEADER → PAYLOAD → SECRET → OUTPUT (encode)"),
+        Item.new("i / ↵", "enter INS on an editable pane · esc back to READ"),
+        Item.new("↑/↓ · ↵", "attacks: select · copy the selected payload"),
+        Item.new("^N / ^W", "new / close a sub-tab"),
+      ]},
+      {"OAST", [
+        Item.new("^R · ^X", "start listening · stop", "oast.listen"),
+        Item.new("↑/↓ · ↵", "callbacks: select · open detail"),
+        Item.new("space → p", "promote a callback to an Issue", "oast.promote"),
+        Item.new("space → a", "add a provider · e edit · x enable/disable"),
+        Item.new("payload", "insert an OAST payload into the focused editor (space → O)", "oast.insert-payload"),
       ]},
       {"SEQUENCER", [
         Item.new("Send to Sequencer", "from History/Repeater/Sitemap (space menu) — replay + analyze a token"),
@@ -132,7 +178,7 @@ module Gori::Tui
         Item.new("^B", "reveal whitespace"),
       ]},
       {"OTHER TABS", [
-        Item.new("Sitemap", "↑/↓ · / filter · ↵/→ expand · t mark · ⇧T tag · g fold · ⇧S scope"),
+        Item.new("Sitemap", "↑/↓ · / filter · ↵/→ expand · t mark · g fold · ⇧S scope · space → T tag"),
         Item.new("Issues", "list: t mark · ⇧T all · ⇧arrows range · notes: i/↵ edit · x line · y copy · space cmds"),
         Item.new("Probe", "↑/↓ ↵ open · m mode · c dismiss · a all · / filter · ⇧S scope · space cmds"),
         Item.new("Notes", "i/↵ edit · x line · ⇧arrows select · y copy · space cmds (Copy selected when highlighted)"),

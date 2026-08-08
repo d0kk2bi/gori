@@ -382,8 +382,8 @@ module Gori::Tui
     LABEL_W = 9 # value column offset (widest field label "Charset" + padding)
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 66}.min
-      h = {area.h - 4, 20}.min
+      w = {area.w - 4, 66}.min
+      h = {area.h - 2, 20}.min
       return nil if w < 34 || h < 8
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end
@@ -400,7 +400,7 @@ module Gori::Tui
       # bg: Theme.bg (not the card default panel) so the embedded List TextArea, which
       # always paints on Theme.bg, doesn't two-tone against the card interior.
       Frame.card(screen, box, card_title, bg: Theme.bg, border: Theme.border_focus)
-      render_meta(screen, box)
+      render_meta(screen, box, card_title)
       render_type_row(screen, box)
       Frame.tee_divider(screen, box, box.y + 2, Theme.bg)
       case @ptype
@@ -412,11 +412,12 @@ module Gori::Tui
       render_path_dropdown(screen, box) if @ptype == :wordlist
     end
 
-    private def render_meta(screen : Screen, box : Rect) : Nil
+    # `title` is threaded in rather than re-derived: it is dynamic here (` · edit` / ` · new`),
+    # and `Frame.border_meta` keeps the count clear of whichever one was drawn.
+    private def render_meta(screen : Screen, box : Rect, title : String) : Nil
       return unless @ptype == :list
       n = list_values.size
-      meta = "#{n} value#{n == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 22}.max, box.y, meta, Theme.muted, Theme.bg)
+      Frame.border_meta(screen, box, title, "#{n} value#{n == 1 ? "" : "s"}")
     end
 
     private def render_type_row(screen : Screen, box : Rect) : Nil

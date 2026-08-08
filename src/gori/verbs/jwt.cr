@@ -18,16 +18,17 @@ module Gori
         Verb::Scope::Jwt, available: in_jwt, mnemonic: 'w') { |ctx| ctx.jwt_close; nil }
       r.register Verb::Definition.new(
         "jwt.toggle-mode", "Toggle decode/encode", "Flip between the DECODE and ENCODE lenses",
-        Verb::Scope::Jwt, available: in_jwt, mnemonic: 'e') { |ctx| ctx.jwt_toggle_mode; nil }
+        Verb::Scope::Jwt, [Verb::Chord.new("t", ctrl: true)],
+        available: in_jwt, mnemonic: 'e') { |ctx| ctx.jwt_toggle_mode; nil }
       r.register Verb::Definition.new(
         "jwt.cycle-alg", "Cycle signing alg", "Cycle the signing algorithm: HS256 / HS384 / HS512 / none",
-        Verb::Scope::Jwt, available: in_jwt, mnemonic: 'a') { |ctx| ctx.jwt_cycle_alg; nil }
+        Verb::Scope::Jwt, [Verb::Chord.new("a", ctrl: true)], available: in_jwt, mnemonic: 'a') { |ctx| ctx.jwt_cycle_alg; nil }
       r.register Verb::Definition.new(
         "jwt.load-decoded", "Load decoded claims", "Seed the ENCODE editors from the INPUT token's header + payload",
         Verb::Scope::Jwt, available: in_jwt, mnemonic: 'l') { |ctx| ctx.jwt_load_decoded; nil }
       r.register Verb::Definition.new(
         "jwt.clear", "Clear session", "Clear the token, editors, and secret of the active session",
-        Verb::Scope::Jwt, available: in_jwt, mnemonic: 'k') { |ctx| ctx.jwt_clear; nil }
+        Verb::Scope::Jwt, [Verb::Chord.new("l", ctrl: true)], available: in_jwt, mnemonic: 'k') { |ctx| ctx.jwt_clear; nil }
 
       # The single smart Copy (selection if any, else the focused pane) — chord 'y'.
       in_jwt_read = ->(ctx : Verb::ExecContext) { ctx.current_tab == :jwt && ctx.jwt_read_mode? }

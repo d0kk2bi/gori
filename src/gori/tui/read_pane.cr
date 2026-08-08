@@ -278,6 +278,15 @@ module Gori::Tui
     # `selecting` is the drag half: the anchor stays where the press left it.
     def click(rect : Rect, mx : Int32, my : Int32, selecting : Bool = false) : Nil
       return if empty? || rect.empty?
+      # The scroll gauge rides `rect.right` (see render) — a click on that column scrolls
+      # instead of placing the read caret, for every ReadPane at once: History detail, Probe
+      # AFFECTED, the Miner FINDING, the Comparer, the Fuzzer result. Through `scroll_view`,
+      # which pulls the caret into the new window so `ensure_visible` cannot snap it back.
+      # Not on a DRAG — a selection extending past the right edge must keep growing.
+      if !selecting && (top = Frame.scroll_gauge_top(rect, @size, mx, my))
+        scroll_view(top - @scroll)
+        return
+      end
       # A drag that has left the pane through the TOP scrolls the view up under it, one row per
       # motion report, so a selection can be grown past the first visible row. Downward already
       # worked — the hit test puts the caret past the window's last row and `ensure_visible`

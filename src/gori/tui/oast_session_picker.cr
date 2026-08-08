@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./fmt"
 require "./frame"
 require "./picker_overlay"
 
@@ -173,7 +174,7 @@ module Gori::Tui
     end
 
     private def meta_text(row : Row) : String
-      base = "#{row.hits} hit#{row.hits == 1 ? "" : "s"} · #{ago(row.started_at)}"
+      base = "#{row.hits} hit#{row.hits == 1 ? "" : "s"} · #{Fmt.ago(row.started_at)}"
       row.live ? "#{base} · ● live" : base
     end
 
@@ -190,14 +191,5 @@ module Gori::Tui
     # the session's start is a wall-clock stamp read back out of the project DB, so it is a
     # `Time`, not a monotonic tick. Clamped at 0 so a clock that moved backwards between the
     # write and this read shows "0s" rather than a negative age.
-    private def ago(t : Time) : String
-      secs = {(Time.local - t).total_seconds.to_i, 0}.max
-      return "#{secs}s" if secs < 60
-      mins = secs // 60
-      return "#{mins}m" if mins < 60
-      hours = mins // 60
-      return "#{hours}h" if hours < 24
-      "#{hours // 24}d"
-    end
   end
 end

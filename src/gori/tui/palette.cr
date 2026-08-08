@@ -69,7 +69,7 @@ module Gori::Tui
     # Returns an empty Rect (w/h 0) when too small to draw (render's early-return).
     def overlay_box(area : Rect) : Rect
       w = {area.w - 4, 60}.min
-      h = {area.h - 4, 16}.min
+      h = {area.h - 2, 16}.min
       return Rect.new(0, 0, 0, 0) if w < 10 || h < 4
       x = area.x + (area.w - w) // 2
       y = area.y + (area.h - h) // 2

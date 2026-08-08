@@ -18,6 +18,10 @@ module Gori::Tui
   # (see overlay.cr).
   class ProbeActiveOverlay < Overlay
     NOTIFY_CHOICES = Miner::NotifyMode.values
+    # The unsafe opt-in reads as a choice between two named states rather than a checkbox: it
+    # is not "one of many things to include" but "which of these two modes", which is what a
+    # cycler says.
+    UNSAFE_LABELS = ["off", "ON"]
 
     # Every flow this run covers (#442 — History's multi-select). `detail` is the FIRST, kept
     # as its own getter because the single-flow callers and the header text speak of one
@@ -283,13 +287,16 @@ module Gori::Tui
       screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
       x = box.x + 3
       if i == notify_row
-        screen.text(x, py, "notification:", Theme.muted, bg)
-        screen.text(x + 14, py, "#{notify_mode.label}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg,
+          "notification:", NOTIFY_CHOICES.map(&.label), @notify_idx, sel)
       elsif @show_unsafe_row && i == unsafe_row
-        screen.text(x, py, "unsafe methods:", Theme.muted, bg)
-        state = @allow_unsafe ? "ON" : "off"
-        col = @allow_unsafe ? Theme.red : (sel ? Theme.text_bright : Theme.text)
-        screen.text(x + 16, py, "#{state}  ‹/›", col, bg)
+        # The two-option cycler it always was, except the strip now shows `off` as the
+        # alternative instead of only naming the current state. `lit:` paints the chosen
+        # option red when it is ON — this is the one choice on the card that can put a DELETE
+        # on the wire, so it keeps the shout it had.
+        Frame.option_cycle(screen, x, py, box.right - 2, bg,
+          "unsafe methods:", UNSAFE_LABELS, @allow_unsafe ? 1 : 0, sel,
+          lit: @allow_unsafe ? Theme.red : nil)
       else
         screen.text(x, py, "[ Run active scan ]", Theme.accent, bg, Attribute::Bold)
       end

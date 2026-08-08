@@ -110,9 +110,13 @@ module Gori::Tui
     private def render_input(screen : Screen, card : Rect, input : TextArea, active : Bool,
                              mode : InputMode, read : TextReadState?, reading : Bool) : Nil
       Frame.card(screen, card, "INPUT", bg: Theme.bg, border: Frame.pane_border(active || reading))
-      if active || reading
-        Frame.mode_badge(screen, card.right - 1, card.y, card.x + 6, mode == InputMode::Insert)
-      end
+      # The REAL mode, drawn unconditionally — `Frame.mode_badge`'s contract, and the same
+      # bug Notes and the Fuzzer TEMPLATE already fixed. `DecoderController#handle_click`
+      # hit-tests `s.input_mode` alone, so gating the DRAW on focus left a live 5-cell target
+      # on a border with nothing painted on it: with focus on CHAIN or OUTPUT, a click on the
+      # INPUT card's blank top-right corner flipped the editor into insert. Nothing exits
+      # insert on a pane change, so that state is ordinary. Focus is carried by the border.
+      Frame.mode_badge(screen, card.right - 1, card.y, card.x + 6, mode == InputMode::Insert)
       body = card.inset(1, 1)
       input.render(screen, body, cursor: active, gauge: true, gauge_focused: active)
       paint_input_read_chrome(screen, body, input, read, reading) if reading && read

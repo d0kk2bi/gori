@@ -536,7 +536,8 @@ module Gori::Tui
     end
 
     private def render_results(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "FINDINGS (#{@results.size})", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      Frame.card(screen, rect, "FINDINGS", border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "FINDINGS", @results.size.to_s)
       inner = rect.inset(1, 1)
       # A card under 3 rows has no interior — `inset` floors the height at 0 but keeps
       # `inner.y` one row down, so an unguarded placeholder lands OUTSIDE the pane.
@@ -673,6 +674,56 @@ module Gori::Tui
       sum_rect, res_rect = pane_rects(rect)
       return :results if res_rect.contains?(mx, my)
       sum_rect.contains?(mx, my) ? :summary : nil
+    end
+
+    # Mouse: the findings index under a click, or nil (outside the pane, on the header row,
+    # or past the last populated row). Mirrors render_results' inset → header → @scroll+i.
+    # The pane drew a cursor and moved it with ↑/↓ and the wheel from the start; only the
+    # pointer had no way to place it, so a click landed on a row and selected nothing.
+    def results_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil if @focus == :detail || @results.empty?
+      _, res = pane_rects(rect)
+      return nil if res.empty? || !res.contains?(mx, my)
+      inner = res.inset(1, 1)
+      return nil if inner.h <= 0 || inner.w <= 0
+      i = my - (inner.y + 1) # rows start one line below the header
+      return nil if i < 0 || i >= {inner.h - 1, 0}.max
+      idx = @scroll + i
+      idx < @results.size ? idx : nil
+    end
+
+    # The row a click on the scroll gauge asks for. The gauge rides the frame's right hairline,
+    # one column outside the list rect, so `row_at` cannot answer it — and `@scroll` here is
+    # DERIVED from the selection, so the answer is a selection. See `Frame.scroll_gauge_row`.
+    def results_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil if @focus == :detail
+      _, res = pane_rects(rect)
+      return nil if res.empty?
+      inner = res.inset(1, 1)
+      return nil if inner.h <= 0 || inner.w <= 0
+      # Rows start one line below the header — the band the draw hands the gauge.
+      Frame.scroll_gauge_row(Rect.new(inner.x, inner.y + 1, inner.w, inner.h - 1),
+        @results.size, mx, my)
+    end
+
+    def select_result_row(idx : Int32) : Nil
+      @sel = idx.clamp(0, {@results.size - 1, 0}.max)
+    end
+
+    def results_selected_index : Int32
+      @sel
+    end
+
+    # Hit-test the MINER card's run control. It is drawn in the same dress as the Repeater's
+    # ` ^R:SEND ` and the Fuzzer's ` ^R:RUN `, both of which answer a click; this one and its
+    # Sequencer/Discover twins did not. Geometry mirrors render_summary exactly.
+    def summary_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
+      return nil if @focus == :detail
+      sum, _ = pane_rects(rect)
+      return nil if sum.empty?
+      chord, name = @running ? {"^X", "STOP"} : {"^R", "MINE"}
+      Frame.right_badge_hit(mx, my, sum.y, sum.right - 1, sum.x + "MINER".size + 4,
+        [{:run, chord, name}] of {Symbol, String, String})
     end
   end
 end

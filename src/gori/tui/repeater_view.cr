@@ -1679,7 +1679,7 @@ module Gori::Tui
       # …and provenance is all that arrives: the row holds the request TEXT and the flow id,
       # nothing that says which `§` in it the operator typed. Undeclared is the answer gori
       # can defend — see `markers_live?`. (A marked-up capture reopens with its markers inert
-      # and the border chip saying so; ^K re-declares.)
+      # and the border chip saying so; ^T re-declares.)
       @markers_declared = false
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key, ws_http_only)
 
@@ -2318,7 +2318,7 @@ module Gori::Tui
       # capture that carries one there is nothing to gain by declaring — and everything to
       # lose: the capture's own `§` would become live positions in exchange for zero new ones.
       # Name that instead of doing it silently.
-      return "the capture's own § would become markers and auto-mark adds none — ^K marks the token at the cursor" if literal_markers?
+      return "the capture's own § would become markers and auto-mark adds none — ^T marks at the cursor" if literal_markers?
       declare_markers
       @editor.set_text(Fuzz::Template.auto_mark(@editor.text))
       @dirty = true
@@ -2375,7 +2375,7 @@ module Gori::Tui
     # those bytes exactly; the TUI was the one surface that did not.
     #
     # So on an EVIDENCE tab markers start INERT and the operator declares them — by marking
-    # (^A / ^K / insert §), the same explicit act the Fuzzer's ⇧I → ^A workflow already is.
+    # (^A / ^T / insert §), the same explicit act the Fuzzer's ⇧I → ^A workflow already is.
     # Declaring is per-buffer and monotone: from then on every `§` in the buffer is a marker
     # (the status line says so when the capture carried one), which is the honest reading of
     # "this buffer is now a template".
@@ -2428,7 +2428,7 @@ module Gori::Tui
     end
 
     private def literal_marker_hint : String
-      "§ here is captured data, not a marker — ^K marks a token (the capture's § become markers too)"
+      "§ here is captured data, not a marker — ^T marks at the cursor (the capture's § become markers too)"
     end
 
     # Insert an OAST payload URL at the request-editor caret (cross-tab "Insert OAST
@@ -2763,11 +2763,15 @@ module Gori::Tui
       # RESPONSE: d:diff / x:hex / p:pretty (not drawn in WS/gRPC/group transcript modes)
       unless ws_mode? || @grpc_mode || group_mode?
         if right.w >= 2 && my == right.y
+          # `limit:` is render_response's own `rect.right - 1` stop. The draw breaks at the
+          # first chip that would cross the card's '╮'; without the same stop here the hit
+          # walked all three anyway, so on a half-width RESPONSE below ~88 columns hex and
+          # pretty answered clicks on the border and past it.
           if hit = Frame.left_chip_hit(mx, my, right.y, right.x + 12, [
                {:diff, " d:diff "},
                {:hex, " ^X:hex "},
                {:pretty, " p:pretty "},
-             ] of {Symbol, String})
+             ] of {Symbol, String}, limit: right.right - 1)
             return hit
           end
         end
@@ -2807,6 +2811,17 @@ module Gori::Tui
           mode_edge = Frame.right_badge_edge(right_edge, min_x, badges)
           if Frame.mode_badge_hit(mx, my, req_card.y, mode_edge, min_x, request_insert?)
             return :mode
+          end
+          # ` ^T:MARK ` chains LEFT of the mode chip, under exactly the condition
+          # render_request draws it: only when a `§` is in the buffer. It was the one badge on
+          # this border missing from the hit list while its four neighbours all answered.
+          if !@grpc_mode && !ws_mode? && !decode_mode? &&
+             (literal_markers? || (@evidence && markers_active?))
+            mark_edge = Frame.mode_badge_edge(mode_edge, min_x, request_insert?)
+            if Frame.right_badge_hit(mx, my, req_card.y, mark_edge, min_x,
+                 [{:mark, "^T", "MARK"}] of {Symbol, String, String})
+              return :mark
+            end
           end
         end
       end
@@ -4262,7 +4277,7 @@ module Gori::Tui
               else
                 "DECODED · GraphQL"
               end
-      Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, label, bg: Theme.bg, border: Frame.pane_border(focused))
       if ws_mode?
         # The seeded frames this pane cannot render as a line. Without this the operator sees
         # an empty (or short) MESSAGES pane and has no way to know a PING, a CLOSE 1002 or an
@@ -4294,15 +4309,10 @@ module Gori::Tui
       paint_request_read_chrome(screen, inner, @decoded, focused && !ins)
     end
 
-    private def pane_border(focused : Bool, insert : Bool = false) : Color
-      return Frame.pane_border(false) unless focused
-      insert ? Theme.accent : Theme.focus_gold
-    end
-
     private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.h < 2
       ins = focused && target_insert?
-      Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: pane_border(focused, insert: ins))
+      Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: Frame.pane_border(focused))
       Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 8, target_insert?) # the REAL mode, not focused&&mode — see Frame.mode_badge
       sni_x, tr_edge = target_chrome_chain(rect)
       # An at-a-glance SNI marker on the top border (right of the title) whenever an
@@ -4315,12 +4325,17 @@ module Gori::Tui
       # already drops its NOR/INS chip when a fifth badge is chained onto it.
       #
       # Two dresses, no third: a filled chip at rest (the NAME is the state, so muted grey
-      # would read as "disabled"), and the ^R:SEND gold when the operator has overridden
+      # would read as "disabled"), and a BOLD ACCENT pill when the operator has overridden
       # auto-detection — a handshake tab that will NOT speak WebSocket is the one thing on this
       # band worth interrupting a glance for.
+      #
+      # Accent, not the ^R:SEND gold it used to borrow. This chip rides the TARGET card's top
+      # border, and that border IS `focus_gold` when the card has focus — so an overridden
+      # transport on a focused card put two golds on one edge and "gold means focus is here"
+      # stopped being readable. Gold is focus and the brand mark; nothing else.
       if transport_switchable?
         fg, bg, attr = if transport_badge_lit?
-                         {Theme.ink_on(Theme.focus_gold), Theme.focus_gold, Attribute::Bold}
+                         {Theme.ink_on(Theme.accent), Theme.accent, Attribute::Bold}
                        else
                          {Theme.text_bright, Theme.accent_bg, Attribute::None}
                        end
@@ -4389,11 +4404,13 @@ module Gori::Tui
       end
       if result = @result
         meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
-        meta_x = rect.right - meta.size - 1
-        screen.text(meta_x, rect.y, meta, Theme.muted, Theme.bg) if meta_x > chips_end + 1
+        # `min_x:` because this border's left stop is the CHIP cluster, not the title.
+        meta_x = Frame.border_meta(screen, rect, "", meta, min_x: chips_end + 1)
         # A persistent amber marker when the response was cut short (the body the
-        # origin sent is incomplete) — the transient send toast scrolls away.
-        if result.incomplete?
+        # origin sent is incomplete) — the transient send toast scrolls away. Chained off
+        # where the meta actually landed; when the meta did not fit there is nothing to
+        # hang it on, and the row is already too tight to carry it.
+        if result.incomplete? && meta_x
           warn = "⚠ incomplete"
           warn_x = meta_x - warn.size - 2
           screen.text(warn_x, rect.y, warn, Theme.yellow, Theme.bg) if warn_x > chips_end + 1
@@ -4424,7 +4441,7 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       label = render_request_label
       ins = focused && request_insert?
-      Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused, insert: ins))
+      Frame.card(screen, rect, label, bg: Theme.bg, border: Frame.pane_border(focused))
       min_x = rect.x + label.size + 4 # keep clear of the pane title on the top border
       right_edge = rect.right - 1     # leave the right border cell untouched
       # Primary action rides the REQUEST border (discoverable without the footer chord):
@@ -4474,10 +4491,15 @@ module Gori::Tui
       mode_x = Frame.toggle_badge(screen, cl_x, rect.y, min_x, "^U", "PRETTY", false)
       mark_x = Frame.mode_badge(screen, mode_x, rect.y, min_x, request_insert?) # the REAL mode — see Frame.mode_badge
       # Only when a `§` is actually in the buffer, so a request without one draws exactly the
-      # border it drew before. Unlit = the capture's § are literal bytes (^K declares them);
+      # border it drew before. Unlit = the capture's § are literal bytes (^T declares them);
       # lit = this buffer is a template and ^R renders them. See `markers_live?`.
-      if literal_markers? || (@evidence && markers_active?)
-        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^K", "MARK", markers_live?)
+      #
+      # …and NOT on a decode split. `repeater.toggle-decoded` is context-sensitive: on a
+      # SAML/GraphQL tab `^T` switches ENVELOPE ⇄ DECODED instead of inserting a §, so a badge
+      # reading `^T:MARK` there names a key that does something else entirely. Marking is still
+      # reachable from the space menu (`w` word / `i` point) and from ^K.
+      if !decode_mode? && (literal_markers? || (@evidence && markers_active?))
+        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^T", "MARK", markers_live?)
       end
       update_request_marker_tint
       render_plain_request_editor(screen, rect.inset(1, 1), focused, ins)
@@ -4583,11 +4605,12 @@ module Gori::Tui
     #     cursor coordinates address a different document.
     private def render_ws_handshake(screen : Screen, rect : Rect, focused : Bool, active : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "HANDSHAKE RESPONSE", bg: Theme.bg, border: pane_border(focused && active))
+      Frame.card(screen, rect, "HANDSHAKE RESPONSE", bg: Theme.bg, border: Frame.pane_border(focused && active))
       if result = @result
         meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
-        meta_x = rect.right - meta.size - 1
-        screen.text(meta_x, rect.y, meta, Theme.muted, Theme.bg) if meta_x > rect.x + 22
+        # `rect.x + 22` used to stand in for "HANDSHAKE RESPONSE" — the title's width, copied
+        # by hand into a guard that would not follow it if the title ever changed.
+        Frame.border_meta(screen, rect, "HANDSHAKE RESPONSE", meta)
       end
       body = rect.inset(1, 1)
       rv = resp_view
@@ -4645,7 +4668,7 @@ module Gori::Tui
         render_transcript(screen, rect, focused, "GROUP · #{g.size} req", group_transcript_lines, total)
         return
       end
-      Frame.card(screen, rect, "RESPONSE", bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, "RESPONSE", bg: Theme.bg, border: Frame.pane_border(focused))
       render_response_chrome(screen, rect)
       body = rect.inset(1, 1)
       if @resp_hex
@@ -4673,11 +4696,10 @@ module Gori::Tui
                                   title : String, lines : Array({String, Color}), dur_us : Int64?,
                                   active : Bool = true) : Nil
       lit = focused && active
-      Frame.card(screen, rect, title, bg: Theme.bg, border: pane_border(lit))
+      Frame.card(screen, rect, title, bg: Theme.bg, border: Frame.pane_border(lit))
       if d = dur_us
         meta = Fmt.dur(d)
-        mx = rect.right - meta.size - 1
-        screen.text(mx, rect.y, meta, Theme.muted, Theme.bg) if mx > rect.x + title.size + 4
+        Frame.border_meta(screen, rect, title, meta)
       end
       body = rect.inset(1, 1)
       return if body.h <= 0
@@ -4787,7 +4809,11 @@ module Gori::Tui
           rows << {"→ sent #{reqn} request message#{reqn == 1 ? "" : "s"} (#{grpc_send_body.size}b)", Theme.muted}
           rows << {"⚠ #{Proxy::H2::Grpc.framing_error(@grpc_req_residual)}", Theme.yellow} if @grpc_req_residual > 0
           st = result.response.try(&.status) || 0
-          rows << {"HTTP #{st}", st >= 400 ? Theme.red : Theme.text}
+          # `status_color`, not a local `>= 400 ? red`. This line painted a 404 RED while
+          # line ~4812 of this same file painted it yellow, and every other status cell in
+          # gori (flow_status, the Fuzzer results, Discover) reads the shared ladder. Red is
+          # 5xx; a 4xx that shows as red says "the server broke" about a 404.
+          rows << {"HTTP #{st}", Theme.status_color(st)}
           grpc_response_rows(result).each { |r| rows << r }
           rows << grpc_status_row(result)
         end
@@ -4807,7 +4833,9 @@ module Gori::Tui
         results = @group_results || [] of {String, Repeater::Result}
         results.each_with_index do |(label, res), i|
           st = res.response.try(&.status)
-          head_color = res.error ? Theme.red : ((st && st >= 400) ? Theme.yellow : Theme.green)
+          # Same ladder. The hand-rolled version also collapsed 3xx into green, where
+          # `status_color` gives it accent — a redirect is not a 2xx.
+          head_color = res.error ? Theme.red : Theme.status_color(st)
           rows << {"══ req #{i + 1} · #{label}", Theme.text_bright}
           summary = if res.error && !res.head.empty?
                       "HTTP #{st} · #{res.error}" # a partial response + a read error (e.g. a CL+TE desync)

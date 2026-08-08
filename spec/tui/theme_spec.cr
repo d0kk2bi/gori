@@ -326,7 +326,11 @@ describe "SettingsView theme list" do
       area = Rect.new(0, 0, 80, 24)
       view.render(Screen.new(backend), area)
       box = view.overlay_box(area)
-      tick_x = box.right - 9 # first swatch tick = the theme's accent (see draw_swatch)
+      # First swatch tick = the theme's accent. The swatch is 7 cells ending on the last
+      # interior column, so it starts at `box.right - 8` and `draw_swatch` puts tick 0 one
+      # cell in. It gained a column when the per-row ▲/▼/↕ scroll marker that used to hold
+      # `box.right - 2` was replaced by `Frame.scroll_gauge` on the card's hairline.
+      tick_x = box.right - 7
       # The on-screen row for a theme index, via field_at's inverse (robust to scroll).
       screen_row = ->(idx : Int32) do
         (box.y + 2...box.y + box.h).find { |y| view.field_at(box, box.x + 5, y) == idx } ||

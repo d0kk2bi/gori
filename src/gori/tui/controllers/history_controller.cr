@@ -153,6 +153,15 @@ module Gori::Tui
         flush_query_reload
         @history.stop_query
       end
+      # The scroll gauge on the frame's right hairline: a click there jumps the cursor to the
+      # row it points at. Before the pane test — the gauge column is inside the preview split's
+      # rect too, and the gauge is what the pointer was aiming at.
+      if row = @history.gauge_row_at(inner, mx, my)
+        @history.set_preview_focus(:list)
+        end_range_gesture
+        @history.select_row(row)
+        return true
+      end
       # Preview pane click focuses that side (settings:layout).
       if pane = @history.preview_pane_at(inner, mx, my)
         @history.set_preview_focus(pane)
@@ -551,13 +560,17 @@ module Gori::Tui
       # Marks can outlive the visible window (a filter change, a trim), so a batch confirm
       # spells out the split: this dialog — not the list chip — is the last thing read
       # before data is destroyed.
-      label =
+      # TWO labels, because the two surfaces read differently: the confirm body is a sentence
+      # and quotes the name (curly, like every other confirm), the toast is a one-line report
+      # where the `:` already marks what follows as the name.
+      name =
         if ids.size == 1
-          "\"#{@history.flow_summary(ids.first)}\""
+          @history.flow_summary(ids.first)
         else
           hidden = @history.marked_hidden_count
           "#{ids.size} flows#{hidden > 0 ? " (#{hidden} not visible)" : ""}"
         end
+      label = ids.size == 1 ? "“#{name}”" : name
       # return_to: :detail when launched from the open flow detail, so CANCEL restores the
       # detail (instead of dropping to the list) and the guard below still fires on accept
       # (the flow is gone, so :detail → :none).
@@ -567,11 +580,11 @@ module Gori::Tui
         # place — say so instead of reporting a delete that didn't happen, so the set is still
         # there to retry.
         unless @history.delete_ids(@host.session.store, ids)
-          @host.status("delete failed — project busy, marks kept; try again")
+          @host.status("flow NOT deleted (project busy) — the marks are kept, try again")
           next
         end
         @host.request_overlay(:none) if @host.overlay == :detail
-        @host.status("deleted #{label}")
+        @host.status("flow deleted: #{name}")
       end
     end
 

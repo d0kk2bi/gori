@@ -91,7 +91,15 @@ module Gori::Tui
       mode = Hotkeys.binding_label(reg, "probe.mode", "m")
       filt = Hotkeys.binding_label(reg, "probe.filter", "/")
       if rules_tab?
-        return "↑/↓ move · ↵/x toggle · a add · e edit · d delete · space cmds · ↑ sub-tabs · esc tabs"
+        # `↵/e edit`, matching every other rule list — ↵ no longer toggles here (see
+        # verbs/probe.cr). Edit and delete are named ONLY when they can fire: both are gated
+        # to a selected CUSTOM rule, and built-ins are most of this list, so advertising them
+        # on a built-in row promised two keys that did nothing on most of the rows.
+        #
+        # `esc sub-tabs`, not `esc tabs`: escape goes to the strip (handle_body_key), and the
+        # strip is always shown here, so `focus_pane` never downgrades it to the tab bar.
+        edits = rules_custom_selected? ? " · ↵/e edit · d delete" : ""
+        return "↑/↓ select · x on/off · a add#{edits} · space cmds · ↑ sub-tabs · esc sub-tabs"
       elsif @probe.detail_open?
         "↑/↓ URL · ⇧arrows select · y copy · o flow · r repeater · p promote · space cmds · ←/esc back"
       elsif @probe.querying?
@@ -103,7 +111,7 @@ module Gori::Tui
       elsif @probe.preview_enabled?
         "↑/↓ move · ↵ open · ↹ preview · #{mode} mode · #{filt} filter · space cmds"
       else
-        "o flow · r repeater · p promote · c dismiss · d delete · #{mode} mode · #{filt} filter · space cmds"
+        "↑/↓ move · ↵ open · o flow · r repeater · p promote · c dismiss · d delete · #{mode} mode · #{filt} filter · space cmds"
       end
     end
 
@@ -125,9 +133,16 @@ module Gori::Tui
       content = BodyChrome.content_rect(rect, strip: true) # inside the frame, below the sub-tab strip
       if rules_tab?
         @host.focus_body
-        if idx = @rules.row_at(content, mx, my)
-          # Select first; a click on the already-selected row toggles it (whole row is the switch).
-          @rules.selected_index == idx ? rules_toggle_selected : @rules.select_index(idx)
+        if row = @rules.gauge_row_at(content, mx, my)
+          @rules.select_index(row)
+        elsif idx = @rules.row_at(content, mx, my)
+          # SELECT ONLY, like the Rewriter's and Colormarker's rule lists. A second click used
+          # to toggle — the exact reflex `probe-rules.toggle` gave up its `↵` for, and for the
+          # same reason: no other rule list flips a scanning rule off from a repeat gesture,
+          # and here the row that answered a double-click was often a BUILT-IN, where `↵`
+          # (now edit, gated to custom rules) does nothing at all. One row, two gestures, two
+          # answers. `x` toggles.
+          @rules.select_index(idx)
         end
         return true
       end
@@ -143,6 +158,20 @@ module Gori::Tui
         return true
       end
       list_rect, _ = @probe.list_split(content)
+      # The list's scroll gauge on the frame's right hairline — `list_row_at` excludes that
+      # column, so it was the one part of the list a click could not reach.
+      if row = @probe.gauge_row_at(content, mx, my)
+        @probe.set_preview_focus(:list)
+        @probe.select_index(row)
+        return true
+      end
+      # Row 0 — the MODE band. Its chip and its `a:CLOSED` badge are drawn in the dresses this
+      # codebase uses for clickable chrome and were the only two that answered nothing.
+      if chip = @probe.mode_band_hit(list_rect, mx, my)
+        # `probe.set-mode` lives on the Runner (it raises a picker), unlike the lens toggle.
+        chip == :mode ? @host.probe_set_mode : probe_toggle_closed
+        return true
+      end
       if my == list_rect.y + 1 && !@probe.querying? # the filter-bar row (below the MODE band)
         @probe.start_query
         return true
@@ -269,7 +298,7 @@ module Gori::Tui
           # into the notification center (#127). Still logged to the #124 event feed
           # (the AI firehose logs freely; only the human center suppresses it).
           @host.session.store.insert_event("probe", "error", "error", "Probe: #{ev.message}", goto_tab: "probe")
-          @host.status(ev.message)
+          @host.status("probe error: #{ev.message}")
         when Probe::CompleteEvent
           # A manual "Run active scan" in Always mode came back clean — the analyzer only emits
           # this when the operator asked to be told either way, so it always posts to the tray.
@@ -321,7 +350,7 @@ module Gori::Tui
       # probe_generation reload can shift the selection in between — so both the suppress and
       # the delete must target THIS issue by id, not whatever happens to be selected at confirm.
       id, code, host, title = i.id, i.code, i.host, i.title
-      @host.confirm("DELETE ISSUE", "Delete \"#{title}\" on #{host}?", confirm_label: "delete", danger: true) do
+      @host.confirm("DELETE ISSUE", "Delete “#{title}” on #{host}?", confirm_label: "delete", danger: true) do
         # Suppress FIRST: delete's exec_task yields to the store writer, and an
         # in-flight Active/passive fiber can re-upsert the same (code, host) in
         # that window if suppress runs after delete.
@@ -370,7 +399,7 @@ module Gori::Tui
     def probe_dismiss_code : Nil
       return unless i = @probe.target_issue
       code = i.code
-      @host.confirm("DISMISS GROUP", "Dismiss all open \"#{code}\" issues?", confirm_label: "dismiss", danger: false) do
+      @host.confirm("DISMISS GROUP", "Dismiss all open “#{code}” issues?", confirm_label: "dismiss", danger: false) do
         n = ProbeController.dismiss_open_by_code(@host.session.store, @host.session.scope, code)
         @probe.reload(@host.session.store)
         @host.status("dismissed #{n} \"#{code}\" issue#{n == 1 ? "" : "s"}")
@@ -471,19 +500,37 @@ module Gori::Tui
       @host.open_custom_rule_editor(nil)
     end
 
+    # Both of these are reachable only from a selected CUSTOM rule, and both used to return
+    # in silence on anything else — so `e` and `d` on a built-in were dead keys with no word
+    # about why. The hint no longer promises them there (see `body_hint`), but a key can still
+    # be pressed on the strength of muscle memory, and a rule list that answers nothing is the
+    # same "did gori see that?" moment every sibling list avoids.
     def rules_edit : Nil
-      c = @rules.selected_row.try(&.custom) || return
+      c = selected_custom_rule || return
       @host.open_custom_rule_editor(c)
     end
 
+    # The selected CUSTOM rule, or nil with the reason on the strip. Built-ins live in code —
+    # there is nothing to open and nothing to remove — so the message names that rather than
+    # saying "nothing selected", which would be false: a row IS selected.
+    private def selected_custom_rule : Probe::CustomRule?
+      row = @rules.selected_row
+      return row.custom if row && row.custom
+      @host.status(row ? "built-in rules can't be edited or deleted — x turns one off" : "no rule selected")
+      nil
+    end
+
     def rules_delete : Nil
-      c = @rules.selected_row.try(&.custom) || return
-      @host.confirm("DELETE RULE",
-        "Delete custom rule \"#{c.title}\"?\nExisting findings from it are kept until cleared.",
+      c = selected_custom_rule || return
+      # Sentence-case title, `Delete` button — the same dress every other policy-rule delete
+      # wears. This one shouted "DELETE RULE" over a lowercase `delete` button, so the one
+      # dialog an operator sees least often was also the one that looked unlike the rest.
+      @host.confirm("DELETE PROBE RULE",
+        "Delete custom rule “#{c.title}”? Existing findings from it are kept until cleared.",
         confirm_label: "delete", danger: true) do
         c.global? ? Settings.delete_scan_rule(c.id) : @host.session.store.delete_probe_custom_rule(c.id.to_i64)
         reload_rules
-        @host.status("deleted rule \"#{c.title}\"")
+        @host.status("probe rule deleted: #{c.title}")
       end
     end
 

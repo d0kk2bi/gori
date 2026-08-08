@@ -297,7 +297,11 @@ module Gori::Tui
       Frame.card(screen, box, "PREFERENCES", border: Theme.border_focus)
       strip = Rect.new(box.x + 2, box.y + 2, box.w - 4, 1)
       @strip_start = Chrome.render_tab_strip(screen, strip, GROUP_LABELS, @group, @on_strip, @strip_start)
-      screen.hline(box.x + 1, box.y + 3, box.w - 2, fg: @on_strip ? Theme.focus_gold : Theme.border, bg: Theme.panel)
+      # `tee_divider`, not a bare hline: the seam now lands ├ and ┤ ON the card's side borders
+      # instead of butting `─` straight into `│`, which is the whole reason frame.cr grew the
+      # helper. Same focus tint as before.
+      Frame.tee_divider(screen, box, box.y + 3, Theme.panel,
+        @on_strip ? Theme.focus_gold : Theme.border)
       render_group(screen, content_rect(box), !@on_strip)
       render_footer(screen, box)
     end
@@ -353,6 +357,12 @@ module Gori::Tui
         end
         y += 1 # spacer between sections
       end
+      # This form scrolls (`ensure_scroll` exists for it) and had no indicator at all, so a
+      # group taller than the card gave no sign there was more below. `content` is inset TWO
+      # columns from the card, so widen by one to land the gauge on the frame's own hairline
+      # the way every other list does — `scroll_gauge` draws at `content.right`.
+      Frame.scroll_gauge(screen, Rect.new(content.x, content.y, content.w + 1, content.h),
+        group_height, @scroll, body_focused, Theme.panel)
     end
 
     # `dirty` appends a ● so an edited-but-unsaved section is visible while you are still in
@@ -360,7 +370,11 @@ module Gori::Tui
     private def draw_subheader(screen : Screen, content : Rect, title : String, y : Int32, dirty : Bool) : Nil
       return unless content.y <= y < content.bottom
       screen.fill(Rect.new(content.x, y, content.w, 1), Theme.panel)
-      screen.text(content.x, y, title.upcase, Theme.focus_gold, Theme.panel, Attribute::Bold, width: content.w)
+      # `Theme.accent`, not `focus_gold`. Gold is gori's FOCUS colour — a focused pane's
+      # outline, the strip above this one when it has the keys — so spending it on a static
+      # section heading makes two different things look like the same thing. The Probe rules
+      # list already headed its sections in accent; this is the other half of that pair.
+      screen.text(content.x, y, title.upcase, Theme.accent, Theme.panel, Attribute::Bold, width: content.w)
       screen.text(content.x + title.size + 1, y, "● unsaved", Theme.yellow, Theme.panel, width: {content.right - content.x - title.size - 1, 1}.max) if dirty
     end
 
@@ -409,7 +423,7 @@ module Gori::Tui
       # successful one just because it came through the modal.
       note_fg = @status ? (@status_warn ? Theme.yellow : Theme.green) : Theme.muted
       screen.text(box.x + 2, note_y, note, note_fg, Theme.panel, width: iw)
-      hint = @on_strip ? "←/→ group · ↓/↵ enter · esc close" : "↑/↓ field · ←/→ edit · ↵ save · ^R reset · esc close"
+      hint = @on_strip ? "←/→ group · ↓/↵ enter · esc close" : "↑/↓ field · ←/→ edit · ↵ save/open · ^R reset · esc close"
       hx = {box.right - hint.size - 2, box.x + 2}.max
       screen.text(hx, hint_y, hint, Theme.muted, Theme.panel, width: {box.right - hx - 1, 0}.max)
     end

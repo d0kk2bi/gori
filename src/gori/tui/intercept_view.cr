@@ -783,6 +783,15 @@ module Gori::Tui
       idx < @items.size ? idx : nil
     end
 
+    # The row a click on the list's scroll gauge asks for. The gauge rides the frame's right
+    # hairline — one column OUTSIDE the list rect, which is why `list_row_at` cannot answer it
+    # — and this list's `@scroll` is DERIVED from the selection by render's `ensure_visible`,
+    # so the answer is a selection, not an offset. See `Frame.scroll_gauge_row`.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      left, _ = split_panes(body_rect(rect))
+      Frame.scroll_gauge_row(left.inset(1, 1), @items.size, mx, my)
+    end
+
     # Set the selection, clamped to the populated rows (mirrors `move`).
     def select_index(idx : Int32) : Nil
       return if @items.empty?
@@ -847,13 +856,11 @@ module Gori::Tui
       label, color = direction_chip
       x = screen.text(x, rect.y, label, color, Theme.bg, Attribute::Bold) + 2
 
-      rx = rect.right - 1
-      if !@items.empty?
-        count = @items.size.to_s
-        screen.text({rx - count.size, rect.x}.max, rect.y, count, Theme.muted)
-        rx -= count.size + 2
-      end
-      rx = render_mark_chip(screen, rect, rx)
+      # One right-anchored chain — see HistoryView#render_ql_bar, which this mirrors.
+      chips = [] of {String, Color}
+      chips << {@items.size.to_s, Theme.muted} unless @items.empty?
+      chips << {mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
+      rx = Frame.right_text_chain(screen, rect.right - 1, rect.y, rect.x + 2, chips)
 
       left_w = {rx - x, 0}.max
       if @query.blank?
@@ -871,13 +878,11 @@ module Gori::Tui
     # of the chip cluster. No "hidden" split (History's chip carries one): the queue renders
     # every pending item, and reload prunes marks whose item is gone, so the count can never
     # exceed what is on screen.
-    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
-      return right_x if @marks.empty?
-      chip = "#{@marks.size} marked"
-      x = right_x - chip.size - 1
-      return right_x unless x > rect.x + 1 # too narrow — the held count wins
-      screen.text(x, rect.y, chip, Theme.accent)
-      x
+    # The mark chip's TEXT, or nil when nothing is marked — see HistoryView#mark_chip_text.
+    # No hidden-count half here: the held queue has no filter that can hide a marked row, so
+    # there is never a "· N hidden" to report.
+    private def mark_chip_text : String?
+      @marks.empty? ? nil : "#{@marks.size} marked"
     end
 
     # The Tab-completion row under the condition input: the leading candidate is what ↹
@@ -906,10 +911,6 @@ module Gori::Tui
               else                      "c:ALL"
               end
       {label, @enabled ? Theme.accent : Theme.muted}
-    end
-
-    private def pane_border(focused : Bool) : Color
-      Frame.pane_border(focused)
     end
 
     # --- what a queue row IS ---------------------------------------------------
@@ -979,7 +980,8 @@ module Gori::Tui
 
     private def render_list(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "QUEUE (#{@items.size})", bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, "QUEUE", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.border_meta(screen, rect, "QUEUE", @items.size.to_s)
       inner = rect.inset(1, 1)
       ensure_visible(inner.h)
       (0...inner.h).each do |i|
@@ -1019,7 +1021,7 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       it = selected_item
       title = it.nil? ? "DETAIL" : detail_title(it)
-      Frame.card(screen, rect, title, bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, title, bg: Theme.bg, border: Frame.pane_border(focused))
       # `e` (or ↵) toggles editing the held bytes vs previewing them — lit while editing,
       # a muted hint while previewing, so the edit affordance rides the border. A binary WS
       # message says READ-ONLY there instead: the affordance must not advertise an edit the
@@ -1052,7 +1054,7 @@ module Gori::Tui
       x = Frame.toggle_badge(screen, rect.right - 1, rect.y, min_x, "e", "EDIT", @editing)
       return unless @editing
       return if @loaded_ws # a WS payload has no head — the sync never runs on it
-      Frame.toggle_badge(screen, x, rect.y, min_x, "^l", "CL", @sync_content_length)
+      Frame.toggle_badge(screen, x, rect.y, min_x, "^L", "CL", @sync_content_length)
     end
 
     # Where `e`:EDIT would ride, for a message the editor must not open. Right-aligned with

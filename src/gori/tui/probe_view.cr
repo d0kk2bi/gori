@@ -231,6 +231,17 @@ module Gori::Tui
       idx < @issues.size ? idx : nil
     end
 
+    # The row a click on the scroll gauge asks for. The gauge rides the frame's right hairline
+    # — one column outside the list rect, which is why `row_at` cannot answer it — and `@scroll`
+    # here is DERIVED from the selection by `ensure_visible`, so the answer is a selection, not
+    # an offset. See `Frame.scroll_gauge_row`.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      list_rect, _ = list_split(rect)
+      top = list_rect.y + 4 # the band list_row_at and the gauge draw both measure
+      Frame.scroll_gauge_row(Rect.new(list_rect.x, top, list_rect.w, {list_rect.bottom - top, 0}.max),
+        @issues.size, mx, my)
+    end
+
     # True when (mx,my) lands in the bottom preview pane.
     def preview_at?(rect : Rect, mx : Int32, my : Int32) : Bool
       _, prev = list_split(rect)
@@ -463,6 +474,8 @@ module Gori::Tui
         break if idx >= @issues.size
         draw_row(screen, rect, @issues[idx], top + i, idx == @selected, focused)
       end
+      Frame.scroll_gauge(screen, Rect.new(rect.x, top, rect.w, list_h),
+        @issues.size, @scroll, focused)
     end
 
     # Bottom summary of the selected issue (settings:layout probe_preview).
@@ -493,6 +506,7 @@ module Gori::Tui
         fg, text = lines[li]
         screen.text(body.x + 1, body.y + i, text, fg, bg, width: w)
       end
+      Frame.scroll_gauge(screen, body, lines.size, sc, false, bg)
     end
 
     private def preview_lines(issue : Store::ProbeIssue) : Array({Color, String})
@@ -578,7 +592,7 @@ module Gori::Tui
     # Row 0: a filled MODE chip (with its `m` cycle chord) + detected-tech summary + the
     # `a:CLOSED` lens toggle + right-aligned severity tallies.
     private def render_mode_band(screen : Screen, rect : Rect) : Nil
-      x = chip(screen, rect.x + 1, rect.y, " m:#{@mode.title} ", mode_color(@mode)) + 1
+      x = Frame.tag_chip(screen, rect.x + 1, rect.y, mode_chip_label, mode_color(@mode)) + 1
       tallies_x = render_tallies(screen, rect, x + 1) # right-aligned, but never left of the mode chip
       # The CLOSED lens toggle chains left of the tallies; lit when showing closed/dismissed
       # issues, muted (its default open-only) otherwise — so the `a` chord stays in view.
@@ -588,21 +602,35 @@ module Gori::Tui
       end
     end
 
-    # Draws the right-aligned severity tallies; returns the leftmost x they occupy (or
-    # rect.right-1 when there are none) so the CLOSED lens badge can chain to their left.
-    private def render_tallies(screen : Screen, rect : Rect, floor : Int32) : Int32
+    # The severity tallies, as `{label, colour}` in draw order. Shared by the draw and by the
+    # geometry the CLOSED badge's hit-test chains off, so the two cannot drift.
+    private def tally_parts : Array({String, Color})
       labels = {4 => "C", 3 => "H", 2 => "M", 1 => "L", 0 => "I"}
       parts = [] of {String, Color}
       labels.each do |val, lab|
         n = @counts[val]
         parts << {"#{lab}:#{n}", severity_color(Store::Severity.new(val))} if n > 0
       end
+      parts
+    end
+
+    # Leftmost x the tallies occupy (or rect.right-1 when there are none) — the right_edge the
+    # CLOSED lens badge chains from. Right-aligned, but never left of `floor` (the mode chip):
+    # on a band too narrow to hold everything the tallies truncate at the right edge instead of
+    # overpainting the mode indicator. On a normal-width band nothing truncates.
+    private def tallies_left(rect : Rect, floor : Int32) : Int32
+      parts = tally_parts
       return rect.right - 1 if parts.empty?
       total = parts.sum { |(s, _)| s.size + 1 } - 1
-      # Right-align, but never start left of `floor` (the mode chip): on a band too narrow to
-      # hold everything the tallies truncate at the right edge instead of overpainting the mode
-      # indicator. On a normal-width band `left` is unchanged and nothing truncates.
-      left = rx = {rect.right - 1 - total, floor}.max
+      {rect.right - 1 - total, floor}.max
+    end
+
+    # Draws the right-aligned severity tallies; returns `tallies_left`.
+    private def render_tallies(screen : Screen, rect : Rect, floor : Int32) : Int32
+      parts = tally_parts
+      left = tallies_left(rect, floor)
+      return left if parts.empty?
+      rx = left
       parts.each do |(s, color)|
         break if rx >= rect.right
         rx = screen.text(rx, rect.y, s, color, width: {rect.right - rx, 0}.max)
@@ -610,6 +638,29 @@ module Gori::Tui
         rx = screen.text(rx, rect.y, " ", Theme.muted, width: 1)
       end
       left
+    end
+
+    # Hit-test the MODE band's two controls. Both are drawn in the dresses this codebase uses
+    # FOR clickable chrome — a filled `Frame.tag_chip` and a keyed `Frame.toggle_badge` — and
+    # both name a real chord (`m` cycles the mode, `a` toggles the closed lens). Neither
+    # answered a click: `handle_click` claimed the filter row one line below and the rows four
+    # below that, and left row 0 unowned.
+    def mode_band_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
+      return nil if my != rect.y
+      cx = rect.x + 1
+      chip_w = Screen.draw_width(mode_chip_label)
+      return :mode if mx >= cx && mx < cx + chip_w
+      # `x + 1` in render_mode_band, where `x` is one past the chip — the same floor it hands
+      # `render_tallies` and the same `min_x` it hands the badge.
+      floor = cx + chip_w + 2
+      Frame.right_badge_hit(mx, my, rect.y, tallies_left(rect, floor), floor,
+        [{:closed, "a", "CLOSED"}] of {Symbol, String, String})
+    end
+
+    # The MODE chip's text, in one place: the draw positions everything after it from this
+    # width, and so does `mode_band_hit`.
+    private def mode_chip_label : String
+      " m:#{@mode.title} "
     end
 
     private def render_filter_bar(screen : Screen, rect : Rect, y : Int32) : Nil
@@ -623,16 +674,12 @@ module Gori::Tui
       end
       # Right cluster: a scope-lens chip (always shown so the ⇧S toggle is discoverable,
       # mirroring HistoryView/SitemapView) and, when filtering, the row count.
+      # One right-anchored chain — see HistoryView#render_ql_bar.
+      chips = [] of {String, Color}
+      chips << {@issues.size.to_s, Theme.muted} if filtering?
       scope_on = scope_active?
-      chip, chip_color = scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted}
-      rx = rect.right - 1
-      if filtering?
-        count = @issues.size.to_s
-        screen.text({rx - count.size, rect.x}.max, y, count, Theme.muted)
-        rx -= count.size + 2
-      end
-      scope_x = {rx - chip.size, rect.x}.max
-      screen.text(scope_x, y, chip, chip_color)
+      chips << (scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted})
+      scope_x = Frame.right_text_chain(screen, rect.right - 1, y, rect.x + 2, chips)
       left_w = {scope_x - (rect.x + 1) - 1, 0}.max
       if filtering?
         label = @query.blank? ? "(in-scope only)" : ": #{@query}"
@@ -654,15 +701,15 @@ module Gori::Tui
       screen.text(rect.x + 3, rect.y, issue.title, Theme.text_bright, width: title_w, attr: Attribute::Bold)
 
       cx = rect.x + 1
-      cx = chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
-      cx = chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
-      cx = chip(screen, cx + 1, rect.y + 1, " #{issue.category} ", Theme.muted)
+      cx = Frame.tag_chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
+      cx = Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
+      cx = Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{issue.category} ", Theme.muted)
       # CWE last, and only when the whole chip fits: `chip` draws through screen.text with no
       # width cap, so an unguarded one on a narrow pane would run past the pane's right edge and
       # paint over the neighbouring column. Dropping it is the right degradation — the id is also
       # on the preview meta line and in every export.
       if (id = Probe.cwe_id(issue.code)) && cx + 1 + id.size + 2 <= rect.right
-        chip(screen, cx + 1, rect.y + 1, " #{id} ", Theme.muted)
+        Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{id} ", Theme.muted)
       end
 
       hint = detail_hint(issue.code)
@@ -705,10 +752,6 @@ module Gori::Tui
       issue = @detail || return
       sync_affected(issue)
       yield
-    end
-
-    private def chip(screen : Screen, x : Int32, y : Int32, label : String, color : Color) : Int32
-      screen.text(x, y, label, Theme.bg, color, Attribute::Bold)
     end
 
     # Detail-pane one-liner: built-in remediation, or the custom rule's own description for a
@@ -758,11 +801,15 @@ module Gori::Tui
     end
 
     private def status_color(s : Store::Status) : Color
+      # SEVERITY owns the colour ladder on these rows; triage status does not compete for it.
+      # The two were drawn five columns apart out of the SAME hues — `CRIT conf` was two reds
+      # meaning two different axes, `LOW open` two accents — on a list whose whole job is
+      # "scan for red". The four words (conf / fp / done / open) already tell the statuses
+      # apart, so what is left for colour here is the one distinction the WORDS do not make
+      # at a glance: still live, or already handled.
       case s
-      when .confirmed?      then Theme.red
-      when .false_positive? then Theme.muted
-      when .resolved?       then Theme.green
-      else                       Theme.accent
+      when .false_positive?, .resolved? then Theme.muted
+      else                                   Theme.text
       end
     end
 

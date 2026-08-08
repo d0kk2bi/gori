@@ -42,9 +42,9 @@ module Gori::Tui
     SCOPES       = %w[project global]
     SCOPE_LABELS = ["this project", "global (every project)"]
     TARGETS      = %w[request response]
-    OPS       = %w[replace add_header set_header remove_header short_circuit]
-    OP_LABELS = ["replace", "add header", "set header", "remove header", "stub"]
-    MATCHES   = %w[literal regex]
+    OPS          = %w[replace add_header set_header remove_header short_circuit]
+    OP_LABELS    = ["replace", "add header", "set header", "remove header", "stub"]
+    MATCHES      = %w[literal regex]
     # `ws` rewrites a WebSocket MESSAGE on an upgraded (101) flow, with `target:` picking
     # the direction (request = client→server, response = server→client). It is its own part
     # rather than a flavour of `body` so that no existing body rule starts touching frames.
@@ -377,11 +377,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      # 72, not 66: a fifth op pushed the option row past the card edge at the old width.
-      w = {area.w - 4, 72}.min
-      h = {area.h - 2, ROW_COUNT + 5}.min # title + rows + preview + hint + padding
-      return nil if w < 40 || h < 13
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, ROW_COUNT, preview: true)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -403,9 +399,11 @@ module Gori::Tui
         screen.fill(Rect.new(box.x + 1, pv_y, box.w - 2, 1), Theme.panel)
         screen.text(box.x + 2, pv_y, "▶ #{@preview}", Theme.muted, Theme.panel, width: box.w - 4)
       end
-      hint_y = box.bottom - 1
-      screen.text(box.x + 2, hint_y, "↑/↓ field · ←/→ options · ↵ save · esc cancel",
-        Theme.muted, Theme.panel, width: box.w - 4) if hint_y > first
+      # No key hint on the bottom border: the shell already draws `hint` in the status strip
+      # for whichever modal is open (Runner#key_hints), so a second copy here was the same
+      # advice twice — and the two had already drifted apart, this one having dropped the
+      # `type find/value` clause the method still carries. Per-row affordances stay where the
+      # key applies (the `‹/›` a cycler draws when it has focus).
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
@@ -419,11 +417,11 @@ module Gori::Tui
       sc = short_circuit_op?
       case i
       when ROW_NAME   then draw_field(screen, box, py, bg, fg, sel, "name:", @fields[:name])
-      when ROW_SCOPE  then draw_cycle(screen, x, py, bg, fg, "scope:", SCOPE_LABELS, @scope_i, sel)
-      when ROW_TARGET then sc ? draw_na(screen, x, py, bg, "target:", "request (a stub answers a request)") : draw_cycle(screen, x, py, bg, fg, "target:", TARGETS, @target_i, sel)
-      when ROW_OP     then draw_cycle(screen, x, py, bg, fg, "op:", OP_LABELS, @op_i, sel)
-      when ROW_MATCH  then hop ? draw_na(screen, x, py, bg, "match:") : draw_cycle(screen, x, py, bg, fg, "match:", MATCHES, @match_i, sel)
-      when ROW_PART   then (hop || sc) ? draw_na(screen, x, py, bg, "part:", sc ? "head (matches the request head)" : nil) : draw_cycle(screen, x, py, bg, fg, "part:", PARTS, @part_i, sel)
+      when ROW_SCOPE  then Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPE_LABELS, @scope_i, sel)
+      when ROW_TARGET then sc ? draw_na(screen, x, py, bg, "target:", "request (a stub answers a request)") : Frame.option_cycle(screen, x, py, box.right - 2, bg, "target:", TARGETS, @target_i, sel)
+      when ROW_OP     then Frame.option_cycle(screen, x, py, box.right - 2, bg, "op:", OP_LABELS, @op_i, sel)
+      when ROW_MATCH  then hop ? draw_na(screen, x, py, bg, "match:") : Frame.option_cycle(screen, x, py, box.right - 2, bg, "match:", MATCHES, @match_i, sel)
+      when ROW_PART   then (hop || sc) ? draw_na(screen, x, py, bg, "part:", sc ? "head (matches the request head)" : nil) : Frame.option_cycle(screen, x, py, box.right - 2, bg, "part:", PARTS, @part_i, sel)
       when ROW_HOST   then draw_field(screen, box, py, bg, fg, sel, "host:", @fields[:host])
       when ROW_FIND   then draw_field(screen, box, py, bg, fg, sel, hop ? "header:" : "find:", @fields[:pattern])
       when ROW_VALUE
@@ -459,18 +457,6 @@ module Gori::Tui
     private def draw_na(screen : Screen, x : Int32, py : Int32, bg : Color, label : String, note : String? = nil) : Nil
       screen.text(x, py, label, Theme.muted, bg)
       screen.text(x + label.size + 1, py, note || "n/a (header op)", Theme.muted, bg)
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
-                           label : String, opts : Array(String), sel_i : Int32, row_sel : Bool) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      tx = x + label.size + 1
-      opts.each_with_index do |opt, oi|
-        lit = oi == sel_i
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx, py, " #{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
-      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,

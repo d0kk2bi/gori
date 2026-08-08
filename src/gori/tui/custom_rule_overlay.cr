@@ -234,10 +234,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 62}.min
-      h = {area.h - 2, ROW_COUNT + 4}.min # title + rows + footer + padding
-      return nil if w < 34 || h < 11
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, ROW_COUNT)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -254,9 +251,8 @@ module Gori::Tui
         break if py >= box.bottom - 1
         draw_row(screen, box, i, py)
       end
-      hint_y = box.bottom - 1
-      screen.text(box.x + 2, hint_y, "↑/↓ field · ←/→ options · ↵ save · esc cancel",
-        Theme.muted, Theme.panel, width: box.w - 4) if hint_y > first
+      # No key hint on the bottom border — the shell draws `hint` in the status strip for the
+      # open modal (Runner#key_hints). See RewriterRuleOverlay#render for the whole argument.
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
@@ -270,28 +266,16 @@ module Gori::Tui
       when ROW_TITLE   then draw_field(screen, box, py, bg, fg, sel, "title:", @fields[:title])
       when ROW_DESC    then draw_field(screen, box, py, bg, fg, sel, "desc:", @fields[:desc])
       when ROW_PATTERN then draw_field(screen, box, py, bg, fg, sel, "pattern:", @fields[:pattern])
-      when ROW_SCOPE   then draw_cycle(screen, x, py, bg, fg, "scope:", SCOPES, @scope_i, sel)
-      when ROW_SIDE    then draw_cycle(screen, x, py, bg, fg, "side:", SIDES, @side_i, sel)
-      when ROW_REGION  then draw_cycle(screen, x, py, bg, fg, "region:", REGIONS, @region_i, sel)
-      when ROW_KIND    then draw_cycle(screen, x, py, bg, fg, "match:", KINDS, @kind_i, sel)
-      when ROW_SEV     then draw_cycle(screen, x, py, bg, fg, "severity:", SEVS, @sev_i, sel)
+      when ROW_SCOPE   then Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPES, @scope_i, sel)
+      when ROW_SIDE    then Frame.option_cycle(screen, x, py, box.right - 2, bg, "side:", SIDES, @side_i, sel)
+      when ROW_REGION  then Frame.option_cycle(screen, x, py, box.right - 2, bg, "region:", REGIONS, @region_i, sel)
+      when ROW_KIND    then Frame.option_cycle(screen, x, py, box.right - 2, bg, "match:", KINDS, @kind_i, sel)
+      when ROW_SEV     then Frame.option_cycle(screen, x, py, box.right - 2, bg, "severity:", SEVS, @sev_i, sel)
       else
         ok = valid?
         label = ok ? "[ Save rule ]" : "[ complete title, description & pattern ]"
         screen.text(x, py, label, ok ? Theme.accent : Theme.muted, bg, Attribute::Bold)
       end
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
-                           label : String, opts : Array(String), sel_i : Int32, row_sel : Bool) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      tx = x + label.size + 1
-      opts.each_with_index do |opt, oi|
-        lit = oi == sel_i
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx, py, " #{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
-      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,

@@ -68,7 +68,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · ←/→ kind·type · type pattern · ↵ save · esc cancel"
+      "↑/↓ field · ←/→ options · type pattern · ↵ save · esc cancel"
     end
 
     # Click a field row to select it; a click on Save commits; a click outside the card
@@ -167,10 +167,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 52}.min
-      h = {area.h - 2, 11}.min # title + 4 rows + padding
-      return nil if w < 28 || h < 8
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, row_count)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -187,12 +184,8 @@ module Gori::Tui
         break if py >= box.bottom - 1
         draw_row(screen, box, i, py)
       end
-      # Footer hint
-      hint_y = box.bottom - 1
-      if hint_y > first
-        screen.text(box.x + 2, hint_y, "↑/↓ field · ←/→ kind·type · ↵ save · esc cancel",
-          Theme.muted, Theme.panel, width: box.w - 4)
-      end
+      # No key hint on the bottom border — the shell draws `hint` in the status strip for the
+      # open modal (Runner#key_hints). See RewriterRuleOverlay#render for the whole argument.
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
@@ -204,18 +197,12 @@ module Gori::Tui
       fg = sel ? Theme.text_bright : Theme.text
       case i
       when 0
-        screen.text(x, py, "kind:", Theme.muted, bg)
-        screen.text(x + 6, py, "#{kind}  ‹/›", fg, bg)
+        # `kind:` used to print the current value ALONE — so a form whose whole first question
+        # is "include or exclude?" never showed that the other answer existed. Both rows are
+        # strips now, through the same renderer as every other cycler in gori.
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "kind:", Scope::KINDS, @kind_idx, sel)
       when 1
-        screen.text(x, py, "type:", Theme.muted, bg)
-        # Show all types; the current one is bold (and bright when the row is selected)
-        tx = x + 6
-        Scope::TYPES.each_with_index do |t, ti|
-          lit = ti == @type_idx
-          col = lit ? (sel ? Theme.text_bright : Theme.accent) : Theme.muted
-          tx = screen.text(tx, py, " #{t} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-        end
-        screen.text(tx, py, " ‹/›", Theme.muted, bg)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "type:", Scope::TYPES, @type_idx, sel)
       when 2
         screen.text(x, py, "pattern:", Theme.muted, bg)
         vx = x + 9

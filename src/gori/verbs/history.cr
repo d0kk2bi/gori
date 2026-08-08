@@ -136,13 +136,20 @@ module Gori
       # across Body COMMON (lowercase 'x' is select-line). Mirrors probe.delete-selected.
       r.register Verb::Definition.new(
         "history.delete", "Delete flow", "Delete the selected flow from History (asks first)",
-        Verb::Scope::Body, available: history_targets, mnemonic: 'X', group: :danger) { |ctx| ctx.history_delete; nil }
+        Verb::Scope::Body, available: history_targets, mnemonic: 'D', group: :danger) { |ctx| ctx.history_delete; nil }
 
       # Wipe the project's entire History (confirm-gated). Menu-only; 'C' is free across
       # Body COMMON (lowercase 'c' is compare). Available whenever History has any rows.
+      # `X` wipes THIS TAB, `D` deletes the selected row — the pairing `probe.clear` (X) and
+      # `probe.delete-selected` (d) already had, and the one History inverted: it read `X` as
+      # delete-one and `C` as clear-all, so `X` meant "one flow" here and "every issue" one
+      # tab over, both in the danger group. `C` also collided with `Send to Comparer`, which
+      # is `C` in the Repeater and the Fuzzer — the Repeater→History move being the most
+      # travelled in the app, that letter went from "make a diff" to "wipe the capture".
+      # `d` cannot take delete here: it is `history.discover`, which fires outbound traffic.
       r.register Verb::Definition.new(
         "history.clear", "Clear history", "Delete ALL History flows for this project (asks first)",
-        Verb::Scope::Body, available: in_history, mnemonic: 'C', group: :danger) { |ctx| ctx.history_clear; nil }
+        Verb::Scope::Body, available: in_history, mnemonic: 'X', group: :danger) { |ctx| ctx.history_clear; nil }
 
       # --- repeater workbench (request editing is inline; these power the palette
       # and show their key hints — actual keys are handled directly by the TUI) ---
@@ -236,9 +243,13 @@ module Gori
       r.register Verb::Definition.new(
         "repeater.insert-marker", "Insert marker", "Drop a single § at the cursor to bracket a region by hand",
         Verb::Scope::Repeater, available: in_repeater, mnemonic: 'i', section: :request) { |ctx| ctx.repeater_insert_marker; nil }
+      # ^K, matching the Fuzzer's. The two panes are the same editor over the same template
+      # grammar, and this was the one marker action reachable in one and not the other —
+      # the Repeater had it on the space menu alone while the Fuzzer had it on a chord.
       r.register Verb::Definition.new(
         "repeater.mark-word", "Mark word", "Toggle a §…§ marker around the token at the cursor",
-        Verb::Scope::Repeater, available: in_repeater, mnemonic: 'w', section: :request) { |ctx| ctx.repeater_mark_word; nil }
+        Verb::Scope::Repeater, [Verb::Chord.new("k", ctrl: true)],
+        available: in_repeater, mnemonic: 'w', section: :request) { |ctx| ctx.repeater_mark_word; nil }
       r.register Verb::Definition.new(
         "repeater.auto-mark", "Auto-mark params", "Wrap every request parameter value in a §…§ marker",
         Verb::Scope::Repeater, [Verb::Chord.new("a", ctrl: true)],
@@ -256,10 +267,16 @@ module Gori
       # request bytes, switch its envelope/decoded split, pretty-print its body —
       # mnemonics added so they front the :request space-menu group (previously
       # ctrl-only, so menu_key was nil and they were invisible there).
+      # 'x', matching its own ^X. It was 'b', and `b` is the app's WHITESPACE letter: the
+      # global reveal is ^B (`view.reveal-ws`) and the History detail binds bare `b` to
+      # `detail.toggle-ws`. So the Repeater's menu read `b` as hex while the drill-in one
+      # keystroke away read it as whitespace. `x` was free in `common ∪ :request` — the
+      # response pane's is not (`repeater.select-line` owns `x` there), which is why
+      # `repeater.toggle-resp-hex` keeps 'h' and `detail.toggle-hex` keeps 'e'.
       r.register Verb::Definition.new(
         "repeater.toggle-hex", "Toggle hex edit", "Edit the request as raw bytes — sends exactly what you type",
         Verb::Scope::Repeater, [Verb::Chord.new("x", ctrl: true)],
-        available: in_repeater, mnemonic: 'b', section: :request) { |ctx| ctx.repeater_toggle_hex; nil }
+        available: in_repeater, mnemonic: 'x', section: :request) { |ctx| ctx.repeater_toggle_hex; nil }
       r.register Verb::Definition.new(
         "repeater.toggle-decoded", "Switch envelope/decoded", "SAML/GraphQL/WS flow: switch envelope/decoded · otherwise: insert a § marker at the cursor",
         Verb::Scope::Repeater, [Verb::Chord.new("t", ctrl: true)],
@@ -278,7 +295,7 @@ module Gori
       r.register Verb::Definition.new(
         "repeater.toggle-auto-content-length", "Toggle auto Content-Length", "Recompute Content-Length from the body on send",
         Verb::Scope::Repeater, [Verb::Chord.new("l", ctrl: true)],
-        available: in_repeater) { |ctx| ctx.repeater_toggle_auto_content_length; nil }
+        available: in_repeater, mnemonic: 'L', section: :request) { |ctx| ctx.repeater_toggle_auto_content_length; nil }
       r.register Verb::Definition.new(
         "repeater.toggle-http2", "Toggle HTTP/2 (h2)", "Send this request over HTTP/2 or HTTP/1.1, overriding the captured protocol",
         Verb::Scope::Repeater, [Verb::Chord.new("v", ctrl: true)],
@@ -400,9 +417,14 @@ module Gori
         "detail.copy-as", "Copy as…", "Pick a copy format for this pane (url/headers/body/cookies/curl/raw)",
         Verb::Scope::HistoryDetail, mnemonic: 'Y', group: :copy) { |ctx| ctx.copy_as_open; nil }
 
+      # 'F' for flow, not 'O': `O` is the OAST-payload letter in three scopes
+      # (`history.oast-copy` in this very list, `repeater.oast-insert`, `fuzzer.oast-insert`),
+      # and HistoryDetail carries no OAST verb — so one `↵` into the drill-in the same letter
+      # silently stopped meaning "OAST payload" and started meaning "copy the whole flow".
+      # `y` cannot take it here: in the detail that is `detail.copy`, the SELECTION copy.
       r.register Verb::Definition.new(
         "detail.copy-flow", "Copy flow", "Copy this flow's raw request to the clipboard",
-        Verb::Scope::HistoryDetail, mnemonic: 'O', group: :copy) { |ctx| ctx.copy_selection; nil }
+        Verb::Scope::HistoryDetail, mnemonic: 'F', group: :copy) { |ctx| ctx.copy_selection; nil }
 
       # Send the open flow to the Fuzzer (mirrors history.fuzz ⇧I/'z' from the list) —
       # close the detail first so it doesn't float over the Fuzzer tab.
@@ -423,12 +445,13 @@ module Gori
         "detail.probe-active", "Run active scan", "Run the Probe active checks against this flow (shows the request count first)",
         Verb::Scope::HistoryDetail, mnemonic: 'A', group: :send) { |ctx| ctx.close_detail; ctx.probe_active_selected; nil }
 
-      # Delete the open flow (mirrors history.delete). Menu-only 'X' — free in HistoryDetail
-      # (lowercase 'x' is select-line). Confirm runs after the menu closes; the controller
-      # captures the id so a live reload can't retarget the delete.
+      # Delete the open flow (mirrors history.delete, and its letter): menu-only 'D', so the
+      # drill-in does not read `X` as "this one" while the list one keystroke away reads it as
+      # "all of them". Confirm runs after the menu closes; the controller captures the id so a
+      # live reload can't retarget the delete.
       r.register Verb::Definition.new(
         "detail.delete", "Delete flow", "Delete this flow from History (asks first)",
-        Verb::Scope::HistoryDetail, mnemonic: 'X', group: :danger) { |ctx| ctx.history_delete; nil }
+        Verb::Scope::HistoryDetail, mnemonic: 'D', group: :danger) { |ctx| ctx.history_delete; nil }
     end
 
     # Fuzzer/Intruder verbs: the cross-tab "send to Fuzzer" (⇧I from History, palette
@@ -509,13 +532,29 @@ module Gori
       r.register Verb::Definition.new(
         "fuzz.duplicate-subtab", "Duplicate subtab", "Open a new fuzz session with the same template and config",
         Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'd', section: :subtab) { |ctx| ctx.fuzzer_duplicate_subtab; nil }
+      # Space-menu letters follow the REPEATER's, which is where the muscle memory lives: this
+      # section and `repeater.*`'s `:request` are the same five marker actions, and three of
+      # them disagreed — auto-mark was 'a' there and 'm' here, and attach-chain / clear-marks
+      # were 'c'/'e' there and 'e'/'c' here, i.e. SWAPPED, which is worse than merely different.
       r.register Verb::Definition.new(
         "fuzz.automark", "Auto-mark params", "Mark every request parameter value", Verb::Scope::Fuzzer,
-        [Verb::Chord.new("a", ctrl: true)], available: in_fuzzer, mnemonic: 'm', section: :template) { |ctx| ctx.fuzz_automark; nil }
+        [Verb::Chord.new("a", ctrl: true)], available: in_fuzzer, mnemonic: 'a', section: :template) { |ctx| ctx.fuzz_automark; nil }
+      # ^K / ^T, the Repeater's twins by name and by mnemonic. They used to live in
+      # `FuzzerController#chord_action`, dispatched before the keymap ever saw them — which is
+      # why the two marker actions an operator reaches for MOST were the two missing from the
+      # Fuzzer's space menu, and the only ones in the family that could not be rebound.
+      r.register Verb::Definition.new(
+        "fuzz.mark-word", "Mark word", "Toggle a §…§ marker around the token at the cursor",
+        Verb::Scope::Fuzzer, [Verb::Chord.new("k", ctrl: true)],
+        available: in_fuzzer, mnemonic: 'w', section: :template) { |ctx| ctx.fuzz_mark_word; nil }
+      r.register Verb::Definition.new(
+        "fuzz.insert-marker", "Insert marker", "Drop a single § at the cursor to bracket a region by hand",
+        Verb::Scope::Fuzzer, [Verb::Chord.new("t", ctrl: true)],
+        available: in_fuzzer, mnemonic: 'i', section: :template) { |ctx| ctx.fuzz_insert_marker; nil }
       r.register Verb::Definition.new(
         "fuzz.attach-chain", "Edit decoder chain", "Focus the CHAIN pane to edit the encode/decode chain of the marker at the cursor (applied to each payload on send)",
         Verb::Scope::Fuzzer, [Verb::Chord.new("y", ctrl: true)],
-        available: in_fuzzer, mnemonic: 'c', section: :template) { |ctx| ctx.fuzz_attach_chain; nil }
+        available: in_fuzzer, mnemonic: 'e', section: :template) { |ctx| ctx.fuzz_attach_chain; nil }
       r.register Verb::Definition.new(
         "fuzz.list-paste", "Add List payload set", "Open the payload-set editor pre-seeded to a List — a multi-line editor, one value per line (paste splits automatically)",
         Verb::Scope::Fuzzer, [Verb::Chord.new("l", ctrl: true)],
@@ -530,7 +569,7 @@ module Gori
         available: in_fuzzer, mnemonic: 'h', section: :template) { |ctx| ctx.fuzz_toggle_http2; nil }
       r.register Verb::Definition.new(
         "fuzz.clear-marks", "Clear markers", "Strip every §…§ marker (and its attached chain) from the template",
-        Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'e', section: :template) { |ctx| ctx.fuzz_clear_marks; nil }
+        Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'c', section: :template) { |ctx| ctx.fuzz_clear_marks; nil }
       # Target-pane toggle (SNI override), the twin of repeater.toggle-sni: same ^S, same
       # two-line editor, same focus rule. `FuzzerView` already carried @sni, persisted it
       # with the session and handed it to build_engine — a session seeded from History had
@@ -581,18 +620,38 @@ module Gori
         "mine.stop", "Stop mining", "Stop the running mine", Verb::Scope::Miner,
         [Verb::Chord.new("x", ctrl: true)], available: in_miner, mnemonic: 's') { |ctx| ctx.mine_stop; nil }
       # Send the selected finding (injected into the session request) to Repeater. COMMON so
-      # it's reachable from summary/results/detail; gated on a selected finding. 'p' is free
-      # in COMMON ∪ :subtab (COMMON: r/s/k/u; :subtab: d).
+      # it's reachable from summary/results/detail; gated on a selected finding. 'R', not 'p':
+      # `fuzz.repeater` had to move off `r` too and its comment names 'R' as "the letter the
+      # other tabs use for Repeater" — the two tabs with the same problem picked different
+      # answers. 'R' is free in COMMON ∪ :subtab here (COMMON: r/s/k/u; :subtab: d).
       r.register Verb::Definition.new(
         "mine.repeater", "Send to Repeater", "Open the selected finding as a request in Repeater (param injected)",
         Verb::Scope::Miner,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :miner && ctx.miner_finding_selected? },
-        mnemonic: 'p') { |ctx| ctx.mine_repeater_selected; nil }
+        mnemonic: 'R') { |ctx| ctx.mine_repeater_selected; nil }
       # Content-only clone of the active miner session (request + config; no findings).
       # 'd' is free in COMMON ∪ :subtab (COMMON: r/s/k/u/p).
       r.register Verb::Definition.new(
         "mine.duplicate-subtab", "Duplicate subtab", "Open a new miner session with the same request and config",
         Verb::Scope::Miner, available: in_miner, mnemonic: 'd', section: :subtab) { |ctx| ctx.miner_duplicate_subtab; nil }
+      # The strip's `r` rename / ^W close, which `Runner#renameable_subtabs?` and
+      # `#subtab_close` have supported for :miner all along with no verbs to show for it —
+      # so this `:subtab` group held Duplicate alone while six other multi-session tabs
+      # (Repeater, Fuzzer, Comparer, Decoder, JWT, Notes) list all three. 'e'/'w' are free
+      # in COMMON ∪ :subtab here (COMMON: r/s/k/y/v/x/S/R; :subtab: d).
+      r.register Verb::Definition.new(
+        "mine.rename-subtab", "Rename subtab", "Rename the active miner session's sub-tab chip",
+        Verb::Scope::Miner, available: in_miner, mnemonic: 'e', section: :subtab) { |ctx| ctx.miner_rename_subtab; nil }
+      # `:common`, not `:subtab` — the space menu renders COMMON ∪ the FOCUSED PANE's section,
+      # so a `:subtab` close is invisible from the body and reachable only after moving focus
+      # to the strip. Decoder and JWT fixed that for themselves; this is the same fix.
+      #
+      # Repeater and Fuzzer deliberately do NOT follow: `repeater.mark-word` / `fuzz.mark-word`
+      # own 'w' in their `:request` / `:template` sections, so a COMMON 'w' would collide there
+      # and `Registry#validate_menu_keys!` would raise at boot. Their close stays in :subtab.
+      r.register Verb::Definition.new(
+        "mine.close-subtab", "Close subtab", "Close the active miner session",
+        Verb::Scope::Miner, available: in_miner, mnemonic: 'w') { |ctx| ctx.miner_close_subtab; nil }
 
       # Sub-tab search + inline filter (issue #121), section :tab — brings Miner to full
       # sub-tab parity (it had neither). Both gate on ≥2 sessions. 'f'/'/' are free here.

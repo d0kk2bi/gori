@@ -23,7 +23,7 @@ module Gori::Tui
     # that says whether the first one worked. Splitting them across the tab bar would have
     # hidden that they are one workflow.
     SUBS       = [:rules, :extract, :bindings]
-    SUB_LABELS = ["rules", "extract", "bindings"]
+    SUB_LABELS = ["Rules", "Extract", "Bindings"]
     SUB_H      = 1
 
     # The strip row and what is left for the sub-tab's own body.
@@ -101,6 +101,7 @@ module Gori::Tui
         render_extract_row(screen, inner, rules[idx], bound.includes?(rules[idx].name),
           inner.y + i, idx == sel, body_focused)
       end
+      Frame.scroll_gauge(screen, inner, rules.size, scroll, body_focused)
     end
 
     # The `bindings` sub-tab: the debugging readout. Name, bound?, descriptor, host scope,
@@ -124,6 +125,7 @@ module Gori::Tui
         break if idx >= rows.size
         render_binding_row(screen, inner, rows[idx], inner.y + i, idx == sel, body_focused, now)
       end
+      Frame.scroll_gauge(screen, inner, rows.size, scroll, body_focused)
     end
 
     private def render_sub_strip(screen : Screen, rect : Rect, active : Symbol, focused : Bool) : Nil
@@ -220,6 +222,25 @@ module Gori::Tui
       idx < count ? idx : nil
     end
 
+    # The row a click on a list's scroll gauge asks for. Three lists here — the RULES list
+    # (its own `layout` card, note-aware) and the two flat sub-tab lists — all with a scroll
+    # DERIVED from their selection, so all three answer with a selection.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32, count : Int32) : Int32?
+      _, body = sub_layout(rect)
+      Frame.scroll_gauge_row(body.inset(1, 1), count, mx, my)
+    end
+
+    # The RULES list's own gauge: the card is `layout`'s first rect, and `live` steals its
+    # bottom row for the engine note exactly as `row_at` accounts for.
+    def rules_gauge_row_at(rect : Rect, mx : Int32, my : Int32, count : Int32, live : Bool) : Int32?
+      list_r, _, _ = layout(rect)
+      inner = list_r.inset(1, 1)
+      return nil if inner.empty?
+      list_h = inner.h
+      list_h -= 1 if live && list_h > 1
+      Frame.scroll_gauge_row(Rect.new(inner.x, inner.y, inner.w, list_h), count, mx, my)
+    end
+
     # The sub-tab whose strip label contains (mx,my), or nil.
     def sub_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
       strip, _ = sub_layout(rect)
@@ -245,9 +266,7 @@ module Gori::Tui
       globals = rules.count(&.global?)
       meta = "#{globals} global · #{meta}" if globals > 0
       # Count rides the top border (right of the title), not a list row.
-      if rect.w > meta.size + 20
-        screen.text({rect.right - meta.size - 2, rect.x + 18}.max, rect.y, meta, Theme.muted, Theme.bg)
-      end
+      Frame.border_meta(screen, rect, "MATCH & REPLACE", meta)
       inner = rect.inset(1, 1)
       return if inner.empty?
 
@@ -271,6 +290,10 @@ module Gori::Tui
         break if idx >= rules.size
         render_row(screen, inner, rules[idx], list_top + i, idx == sel, focused)
       end
+      # The gauge tracks the LIST viewport, not the whole interior — the live note below it
+      # is not a row you can scroll to. No-ops when everything fits.
+      Frame.scroll_gauge(screen, Rect.new(inner.x, list_top, inner.w, list_h),
+        rules.size, scroll, focused)
     end
 
     private def render_row(screen : Screen, rect : Rect, rule : Store::MatchRule, py : Int32,

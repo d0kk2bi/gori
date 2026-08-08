@@ -39,7 +39,11 @@ describe "Discover RUNS list" do
     backend.contains?("http://a.test/").should be_true
     backend.contains?("http://b.test/").should be_true
     backend.contains?("http://c.test/").should be_true
-    backend.contains?("RUNS (3)").should be_true
+    # The count moved out of the card TITLE and onto `Frame.border_meta`: the run badge's
+    # `min_x` is derived from the title's width, so `RUNS (9)` → `RUNS (10)` shifted the chrome.
+    # Still on the border, still says how many — just right-aligned and independent of the title.
+    backend.row(0).should contain("RUNS")
+    backend.row(0).should contain("3")
     # Each row carries its own status, so "which one is still sending" is readable at a glance.
     row_of(backend, "http://b.test/").should_not eq(-1)
     backend.row(row_of(backend, "http://b.test/")).should contain("paused")
@@ -82,7 +86,11 @@ describe "Discover RUNS list" do
     backend = render_runs(view)
     # The newest run is selected, so the window must have followed the selection down.
     backend.contains?("http://h19.test/").should be_true
-    backend.contains?("RUNS (20)").should be_true
+    # The count moved out of the card TITLE and onto `Frame.border_meta`: the run badge's
+    # `min_x` is derived from the title's width, so `RUNS (9)` → `RUNS (10)` shifted the chrome.
+    # Still on the border, still says how many — just right-aligned and independent of the title.
+    backend.row(0).should contain("RUNS")
+    backend.row(0).should contain("20")
 
     view.move_run(-19) # back to the first run
     top = render_runs(view)

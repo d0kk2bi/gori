@@ -50,16 +50,16 @@ module Gori::Tui
     def body_hint(focus : Symbol) : String
       case @project_view.pane
       when :scope
-        "↑/↓ move · a add · ↵/e edit · d del · space cmds · esc sub-tabs"
+        "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc sub-tabs"
       when :overrides
-        @project_view.ov_adding? ? "type \"IP host\" · ↵ save · esc cancel" : "↑/↓ move · a add · ↵/e edit · d del · space cmds · esc sub-tabs"
+        @project_view.ov_adding? ? "type \"IP host\" · ↵ save · esc cancel" : "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc sub-tabs"
       when :env
         if @project_view.env_prefix_editing?
           "type prefix · ↵ save · esc cancel"
         elsif @project_view.env_adding?
           "type \"KEY VALUE\" · ↵ save · esc cancel"
         else
-          "↑/↓ move · a add · ↵/e edit · d del · space cmds · esc sub-tabs"
+          "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc sub-tabs"
         end
       when :settings
         if @project_view.settings_text_row?
@@ -171,17 +171,26 @@ module Gori::Tui
       case pane
       when :scope
         @project_view.focus_pane(:scope)
-        if idx = @project_view.scope_row_at(rect, mx, my)
+        # The card's scroll gauge rides its right hairline, which `scope_row_at` excludes.
+        if row = @project_view.scope_gauge_row(rect, mx, my)
+          @project_view.select_scope(row)
+        elsif idx = @project_view.scope_row_at(rect, mx, my)
           @project_view.select_scope(idx)
         end
       when :overrides
         @project_view.focus_pane(:overrides)
-        if idx = @project_view.ov_row_at(rect, mx, my)
+        # The card's scroll gauge rides its right hairline, which `ov_row_at` excludes.
+        if row = @project_view.ov_gauge_row(rect, mx, my)
+          @project_view.select_override(row)
+        elsif idx = @project_view.ov_row_at(rect, mx, my)
           @project_view.select_override(idx)
         end
       when :env
         @project_view.focus_pane(:env)
-        if idx = @project_view.env_row_at(rect, mx, my)
+        # The card's scroll gauge rides its right hairline, which `env_row_at` excludes.
+        if row = @project_view.env_gauge_row(rect, mx, my)
+          @project_view.select_env(row)
+        elsif idx = @project_view.env_row_at(rect, mx, my)
           @project_view.select_env(idx)
         end
       when :desc
@@ -472,22 +481,33 @@ module Gori::Tui
       @host.open_scope_rule_editor(nil, "include", "host", "")
     end
 
+    # Says what is missing, like `scope_delete_rule` below and like every rule list in gori.
+    # `e` on an empty list used to be a dead key: the guard was here, it just never spoke, so
+    # the pane answered a keypress with nothing at all while `d` two methods down explained
+    # itself. Three panes on this tab had the same split.
     def scope_edit_rule : Nil
-      rule = @project_view.selected_rule
-      return unless rule
+      rule = @project_view.selected_rule || return @host.status("no scope rule selected")
       @project_view.focus_pane(:scope)
       @host.open_scope_rule_editor(rule.id, rule.kind, rule.match_type, rule.pattern)
     end
 
+    # Deleting a scope rule CONFIRMS, the way deleting a rewrite, colour or probe rule already
+    # did. These three project lists were the only policy rules `d` removed outright — and of
+    # the four, a scope rule is the one whose loss changes what the proxy lets through, so an
+    # accidental keypress here is the most expensive of the set.
     def scope_delete_rule : Nil
-      # Read the selection BEFORE the delete so a refused write can be told apart from an
-      # empty list: `scope_delete` returns nil for both, and staying silent about the first
-      # leaves the rule on screen with no hint that the keypress did nothing.
-      selected = @project_view.selected_rule
-      if pat = @project_view.scope_delete
-        @host.status("removed scope rule: #{pat}#{scope_blackhole_note}")
-      elsif selected
-        @host.status("scope rule NOT removed (project busy) — it still gates traffic")
+      rule = @project_view.selected_rule || return @host.status("no scope rule selected")
+      label = "#{rule.include? ? "incl" : "excl"} #{rule.match_type} #{rule.pattern}"
+      @host.confirm("DELETE SCOPE RULE", "Delete “#{label}”? This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        # The store's answer, not an assumption: a rolled-back batch leaves the rule gating
+        # traffic, and reporting "removed" over one that still gates is the failure this
+        # branch exists to prevent. Selection cannot have moved — the confirm is modal.
+        if pat = @project_view.scope_delete
+          @host.status("scope rule deleted: #{pat}#{scope_blackhole_note}")
+        else
+          @host.status("scope rule NOT removed (project busy) — it still gates traffic")
+        end
       end
     end
 
@@ -635,13 +655,18 @@ module Gori::Tui
     end
 
     def hostov_edit_entry : Nil
+      return @host.status("no host override selected") unless @project_view.selected_override_host
       @host.focus_body
       @project_view.ov_edit_start
     end
 
     def hostov_delete_entry : Nil
-      if host = @project_view.ov_delete
-        @host.status("removed host override: #{host}")
+      host = @project_view.selected_override_host || return @host.status("no host override selected")
+      @host.confirm("DELETE HOST OVERRIDE", "Delete the override for “#{host}”? This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        if removed = @project_view.ov_delete
+          @host.status("host override deleted: #{removed}")
+        end
       end
     end
 
@@ -691,14 +716,20 @@ module Gori::Tui
     end
 
     def env_edit_var : Nil
+      return @host.status("no env var selected") unless @project_view.selected_env_key
       @host.focus_body
       @project_view.env_edit_start
     end
 
     def env_delete_var : Nil
-      if key_name = @project_view.env_delete
-        Env.save_project(@host.session.store, @project_view.env_vars)
-        @host.status("removed env: #{key_name}")
+      key = @project_view.selected_env_key || return @host.status("no env var selected")
+      # The KEY, never the value — a confirm is a modal an operator may be sharing a screen on.
+      @host.confirm("DELETE ENV VAR", "Delete “#{key}”? This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        if removed = @project_view.env_delete
+          Env.save_project(@host.session.store, @project_view.env_vars)
+          @host.status("env var deleted: #{removed}")
+        end
       end
     end
 
@@ -735,9 +766,12 @@ module Gori::Tui
 
     private def commit_project_env : Nil
       case @project_view.env_commit
-      when :empty   then @host.status("env var: empty")
-      when :invalid then @host.status(%(env var: need "KEY VALUE" or "KEY=value"))
-      when :dup     then @host.status("env var: KEY already defined")
+      when :empty then @host.status("env var: empty")
+      when :invalid then @host.status( # The KEY rule spelled out, as the global editor's copy of this message already did — a
+      # rejected entry is usually a key with a dash or a leading digit, so naming the shape is
+      # the difference between one retry and three.
+%(env var: need "KEY VALUE" or "KEY=value" — KEY is [A-Za-z_][A-Za-z0-9_]*))
+      when :dup then @host.status("env var: KEY already defined")
       when :ok
         Env.save_project(@host.session.store, @project_view.env_vars)
         n = @project_view.env_vars.size

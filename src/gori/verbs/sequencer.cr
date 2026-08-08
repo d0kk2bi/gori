@@ -51,14 +51,38 @@ module Gori
         "sequence.export", "Export report…", "Write this session's randomness report to a Markdown file (asks for the path)",
         Verb::Scope::Sequencer, [Verb::Chord.new("e", shift: true)], available: has_report,
         mnemonic: 'E') { |ctx| ctx.sequence_export(:markdown); nil }
+      # 'J', because without a mnemonic AND without a chord this verb was reachable from
+      # NOTHING: `menu_key` returns nil, `SpaceMenu#open` filters on `menu_key`, and the
+      # palette only queries Global scope — so a shipped export had no keyboard path at all.
+      # Its Markdown twin four lines up carries ⇧E + 'E'; Issues solves the same two-format
+      # problem by registering the palette entries in `Scope::Global` instead.
       r.register Verb::Definition.new(
         "sequence.export-json", "Export report (JSON)…", "Write this session's randomness report to a JSON file (asks for the path)",
-        Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report) { |ctx| ctx.sequence_export(:json); nil }
+        Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report,
+        mnemonic: 'J') { |ctx| ctx.sequence_export(:json); nil }
       r.register Verb::Definition.new(
         "sequence.promote", "File as issue", "Record this randomness verdict in the Issues report (no token values)",
         Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report,
         mnemonic: 'i') { |ctx| ctx.sequence_promote; nil }
 
+      # The strip's `r` rename / ^W close. `Runner#renameable_subtabs?` and `#subtab_close`
+      # have listed :sequencer all along, but with no verbs this tab had NO `:subtab` menu
+      # group at all — the only multi-session tab without one. 'e'/'w' are free in
+      # COMMON ∪ :subtab (COMMON: r/s/c/i/x/y/v/S/E/J).
+      in_seq = ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer }
+      r.register Verb::Definition.new(
+        "sequence.rename-subtab", "Rename subtab", "Rename the active sequencing session's sub-tab chip",
+        Verb::Scope::Sequencer, available: in_seq, mnemonic: 'e', section: :subtab) { |ctx| ctx.sequencer_rename_subtab; nil }
+      # `:common`, not `:subtab` — the space menu renders COMMON ∪ the FOCUSED PANE's section,
+      # so a `:subtab` close is invisible from the body and reachable only after moving focus
+      # to the strip. Decoder and JWT fixed that for themselves; this is the same fix.
+      #
+      # Repeater and Fuzzer deliberately do NOT follow: `repeater.mark-word` / `fuzz.mark-word`
+      # own 'w' in their `:request` / `:template` sections, so a COMMON 'w' would collide there
+      # and `Registry#validate_menu_keys!` would raise at boot. Their close stays in :subtab.
+      r.register Verb::Definition.new(
+        "sequence.close-subtab", "Close subtab", "Close the active sequencing session",
+        Verb::Scope::Sequencer, available: in_seq, mnemonic: 'w') { |ctx| ctx.sequencer_close_subtab; nil }
       r.register Verb::Definition.new(
         "sequence.find-subtab", "Search sub-tabs", "Filter the open sequencing sessions and jump to one",
         Verb::Scope::Sequencer,

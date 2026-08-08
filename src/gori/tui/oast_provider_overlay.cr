@@ -120,7 +120,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · ←/→ scope/type · type name/host/token · ↵ save · esc cancel"
+      "↑/↓ field · ←/→ options · type name/host/token · ↵ save · esc cancel"
     end
 
     # Click a field row to select it; a click on Save commits; a click outside the card
@@ -217,10 +217,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 56}.min
-      h = {area.h - 2, ROW_COUNT + 6}.min # title + rows + padding
-      return nil if w < 30 || h < 10
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, ROW_COUNT)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -237,11 +234,10 @@ module Gori::Tui
         break if py >= box.bottom - 1
         draw_row(screen, box, i, py)
       end
-      hint_y = box.bottom - 1
-      if hint_y > first
-        screen.text(box.x + 2, hint_y, "↑/↓ field · ←/› options · ↵ save · esc cancel",
-          Theme.muted, Theme.panel, width: box.w - 4)
-      end
+      # No key hint on the bottom border — the shell draws `hint` in the status strip for the
+      # open modal (Runner#key_hints). See RewriterRuleOverlay#render for the whole argument.
+      # This copy is also where a `←/›` typo had been sitting, unreachable from the method
+      # every other surface reads.
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
@@ -254,23 +250,15 @@ module Gori::Tui
       case i
       when ROW_NAME then draw_field(screen, box, py, "name:", @name, sel, bg, fg)
       when ROW_SCOPE
-        draw_cycle(screen, x, py, bg, sel, "scope:", SCOPES, @scope_i)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPES, @scope_i, sel)
       when ROW_TYPE
-        draw_cycle(screen, x, py, bg, sel, "type:", KINDS.map(&.label), @kind_idx)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "type:", KINDS.map(&.label), @kind_idx, sel)
       when ROW_HOST  then draw_field(screen, box, py, "host:", @host, sel, bg, fg)
       when ROW_TOKEN then draw_field(screen, box, py, "token:", @token, sel, bg, fg)
       else
         label = valid? ? "[ Save provider ]" : "[ name + host required ]"
         screen.text(x, py, label, valid? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
       end
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, row_sel : Bool,
-                           label : String, opts : Array(String), sel_i : Int32) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      col = row_sel ? Theme.text_bright : Theme.accent
-      tx = screen.text(x + label.size + 1, py, opts[sel_i], col, bg, Attribute::Bold)
-      screen.text(tx, py, "  ‹/›", Theme.muted, bg)
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, label : String,

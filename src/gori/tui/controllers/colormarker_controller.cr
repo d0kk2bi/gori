@@ -18,7 +18,6 @@ module Gori::Tui
       @view = ColormarkerView.new
       @sel = 0
       @scroll = 0
-      @last_body = Rect.new(0, 0, 0, 0) # last content rect — click/wheel geometry
     end
 
     def tab : Symbol
@@ -68,7 +67,6 @@ module Gori::Tui
       body_focused = focus == :body
       # multi_pane: false — one list, no second pane to hand focus to.
       BodyChrome.framed(screen, rect, BodyChrome.shell_focused(focus, multi_pane: false)) do |inner|
-        @last_body = inner
         list = rule_list
         @sel = @sel.clamp(0, {list.size - 1, 0}.max)
         ensure_visible(inner, list.size)
@@ -77,7 +75,7 @@ module Gori::Tui
     end
 
     private def ensure_visible(inner : Rect, count : Int32) : Nil
-      lh = @view.row_capacity(inner)
+      lh = @view.row_capacity(inner, count)
       return if lh <= 0
       if @sel < @scroll
         @scroll = @sel
@@ -88,7 +86,11 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
-      "↑/↓ select · a add · e edit · x on/off · s scope · ⇧J/⇧K reorder · d delete"
+      # Rewriter's shape, which this list is otherwise a twin of. It used to advertise `s scope`
+      # and `⇧K/⇧J reorder` — its two least-used keys — while naming neither `space cmds` nor
+      # `esc`, both of which it binds. That is backwards: the space menu is the one affordance
+      # that reveals every other key, including the two this line was spending its width on.
+      "↑/↓ select · a add · ↵/e edit · x on/off · d delete · space cmds · esc tabs"
     end
 
     # --- keys ---
@@ -100,7 +102,13 @@ module Gori::Tui
       when key.up?, c == 'k'                   then move_up
       when key.down?, c == 'j'                 then move_sel(1)
       when key.escape?                         then @host.request_focus(:menu)
-      else                                          return handle_action_key(ev, c)
+      else
+        # Everything else — a/↵/e/d/x/⇧X/s/⇧J/⇧K — defers to the central keymap, so the rule
+        # actions are REBINDABLE and dispatch through the same `available?` gate the space
+        # menu uses. They were a hand-rolled `case` here while the four sibling rule lists
+        # (Scope, Env, Host overrides, Probe rules) all bound real chords and deferred; this
+        # list and the Rewriter's were the two that could not be rebound.
+        return false
       end
       true
     end
@@ -114,22 +122,6 @@ module Gori::Tui
       end
     end
 
-    private def handle_action_key(ev : Termisu::Event::Key, c : Char?) : Bool
-      key = ev.key
-      case
-      when key.enter?, c == 'e' then colormarker_edit
-      when c == 'a'             then colormarker_add
-      when c == 'd'             then colormarker_delete
-      when c == 'x'             then colormarker_toggle
-      when c == 'X'             then colormarker_toggle_default
-      when c == 's'             then colormarker_scope_toggle
-      when c == 'J'             then colormarker_move(1)
-      when c == 'K'             then colormarker_move(-1)
-      else                           return false
-      end
-      true
-    end
-
     private def move_sel(d : Int32) : Nil
       n = rule_list.size
       return if n == 0
@@ -140,9 +132,15 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
       inner = BodyChrome.frame_inner(rect)
-      @last_body = inner
-      if idx = @view.row_at(inner, my, @scroll)
-        @sel = idx.clamp(0, {rule_list.size - 1, 0}.max) if idx < rule_list.size
+      # The scroll gauge on the card's right hairline, which `row_at` excludes by construction.
+      if row = @view.gauge_row_at(inner, mx, my, rule_list.size)
+        @sel = row
+        return true
+      end
+      # `row_at` already refuses the note row and anything past the last rule, so a hit is
+      # a real index — the clamp below is the belt to its braces, not the bounds check.
+      if idx = @view.row_at(inner, my, @scroll, rule_list.size)
+        @sel = idx.clamp(0, {rule_list.size - 1, 0}.max)
       end
       true
     end
@@ -153,11 +151,12 @@ module Gori::Tui
       true
     end
 
+    # The SELECTION, like the Rewriter twin and every other selection-carrying list in the
+    # tree — not the viewport. Scrolling `@scroll` alone left the cursor off screen, and
+    # `e`/`x`/`d` then acted on a rule the operator could not see. `render`'s `ensure_visible`
+    # brings the viewport along, which is how ↑/↓ has always worked here.
     def handle_wheel(step : Int32) : Bool
-      return false if @last_body.empty?
-      lh = @view.row_capacity(@last_body)
-      return false if lh <= 0
-      @scroll = (@scroll + step).clamp(0, {rule_list.size - lh, 0}.max)
+      move_sel(step)
       true
     end
 
@@ -181,14 +180,14 @@ module Gori::Tui
       # A global rule is deleted out of EVERY project, and the prompt has to say so — the row
       # differs from a project rule's by one badge, and the confirm is the last place to notice.
       note = rule.global? ? " It is a GLOBAL rule — this removes it from every project." : ""
-      @host.confirm("Delete colour rule", "Delete “#{label}”?#{note} This can't be undone.",
-        confirm_label: "Delete", danger: true) do
+      @host.confirm("DELETE COLOUR RULE", "Delete “#{label}”?#{note} This can't be undone.",
+        confirm_label: "delete", danger: true) do
         # The store's answer, not an assumption. The failure text says what is actually still
         # true — the row keeps its colour — rather than borrowing the Rewriter's "still
         # rewriting live traffic", which would be alarmist AND false for a display rule.
         ok = engine.remove(rule.id, rule.scope)
         @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
-        @host.status(ok ? "colour rule deleted" : "rule NOT deleted (project busy) — the row colour is unchanged")
+        @host.status(ok ? "colour rule deleted: #{label}" : "colour rule NOT deleted (project busy) — the row colour is unchanged")
       end
     end
 

@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./fmt"
 require "./frame"
 require "./overlay"
 require "../settings"
@@ -78,7 +79,11 @@ module Gori::Tui
     def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
       box = overlay_box(area)
       return :cancel if box.nil? || !box.contains?(mx, my)
-      if idx = row_at(box, mx, my)
+      # The gauge on the card's right hairline, before `row_at` — which has no `mx` bound and
+      # would otherwise read a click there as a plain pick of whatever row shares its `my`.
+      if row = gauge_row_at(box, mx, my)
+        set_selected(row)
+      elsif idx = row_at(box, mx, my)
         set_selected(idx)
       end
       :stay
@@ -112,20 +117,22 @@ module Gori::Tui
       end
       Frame.card(screen, box, "TLS PASSTHROUGH", border: Theme.border_focus)
       meta = "#{@hosts.size} host#{@hosts.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 18}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "TLS PASSTHROUGH", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
       return if cap <= 0
+      start = list_window(cap)
       if @hosts.empty?
         screen.text(box.x + 3, box.y + 2, empty_message, Theme.muted, Theme.panel)
       else
-        start = list_window(cap)
         cap.times do |row|
           i = start + row
           break if i >= @hosts.size
           draw_row(screen, box, i, box.y + 2 + row)
         end
       end
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        @hosts.size, start, true, Theme.panel)
       draw_footer(screen, box)
     end
 
@@ -164,10 +171,12 @@ module Gori::Tui
       sel = i == @selected
       bg = sel ? Theme.accent_bg : Theme.panel
       screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.yellow, bg)
+      # `Theme.accent` — the selection bar reads the same in every list. The yellow it used to
+      # carry said nothing this row does not: the pattern column below is already yellow.
+      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
 
       conns = "#{entry.connections} conn#{entry.connections == 1 ? "" : "s"}"
-      stamp = ago(entry.first_seen)
+      stamp = Fmt.ago(entry.first_seen)
       tail = "#{stamp}  #{conns}"
       tail_x = box.right - 1 - Screen.display_width(tail)
 
@@ -185,6 +194,13 @@ module Gori::Tui
 
     # Row index under (mx,my) — inverts render's windowed layout so a click maps to the same
     # row that was drawn.
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    def gauge_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      Frame.scroll_gauge_row(Rect.new(box.x + 1, box.y + 2, box.w - 2, list_capacity(box)),
+        @hosts.size, mx, my)
+    end
+
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless box.contains?(mx, my)
       cap = list_capacity(box)
@@ -208,14 +224,5 @@ module Gori::Tui
     # Compact relative age: "3s" / "5m" / "2h" / "1d". Mirrors NotificationsOverlay#ago, but
     # over a wall-clock Time (the inventory is written by a proxy fiber and read much later,
     # so it records when the bypass happened, not a monotonic tick).
-    private def ago(t : Time) : String
-      secs = (Time.local - t).total_seconds.to_i
-      return "#{secs}s" if secs < 60
-      mins = secs // 60
-      return "#{mins}m" if mins < 60
-      hours = mins // 60
-      return "#{hours}h" if hours < 24
-      "#{hours // 24}d"
-    end
   end
 end

@@ -175,8 +175,8 @@ module Gori::Tui
 
     # --- rendering ----------------------------------------------------------
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 60}.min
-      h = {area.h - 4, ROWS.size + 4}.min
+      w = {area.w - 4, 60}.min
+      h = {area.h - 2, ROWS.size + 4}.min
       return nil if w < 30 || h < 8
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end
@@ -208,7 +208,10 @@ module Gori::Tui
         break if ri >= ROWS.size
         render_row(screen, box, ri, top + i, vx)
       end
-      screen.text(box.x + 2, box.bottom - 2, "⇥/↑↓ field · ←/→ edit · space toggle · esc applies", Theme.muted, Theme.bg, width: box.w - 4)
+      # No key hint on the card — the shell draws `hint` in the status strip for the open
+      # modal (Runner#key_hints). This copy had drifted furthest of the nine: it spelled the
+      # same three keys differently (`⇥/↑↓` for `↑/↓/⇥`, `space` for `␣`) and omitted `↵ next`
+      # entirely, so the two lines on screen disagreed about what the form could do.
     end
 
     private def render_row(screen : Screen, box : Rect, ri : Int32, y : Int32, vx : Int32) : Nil

@@ -113,14 +113,21 @@ describe "Gori::Verbs.register_sitemap" do
     clear.available?(ctx).should be_true
   end
 
-  it "gives `t` to marking and moves tagging to ⇧T (with an explicit menu key)" do
-    # The two lists agree on `t` = mark; a shifted chord yields no menu key on its own, so the
-    # tag entry carries 'T' explicitly.
+  it "gives `t` to marking and leaves ⇧T unbound, with tagging menu-only" do
+    # The lists agree on `t` = mark. ⇧T is where they STOPPED agreeing: History, Issues and
+    # Intercept all read it as "mark all", so a hand that learnt the `t`/⇧T pair there opened
+    # a text prompt here. Tagging is a space-menu entry now, like `sitemap.mark-clear`, and
+    # ⇧T is deliberately left free rather than reassigned — a tree has no useful "mark every
+    # row" today (see sitemap.mark-toggle), and this keeps the letter for the day it does.
     r["sitemap.mark-toggle"].chords.should eq([Gori::Verb::Chord.new("t")])
     r["sitemap.mark-toggle"].menu_key.should eq('t')
     tag = r["sitemap.tag"]
-    tag.chords.should eq([Gori::Verb::Chord.new("t", shift: true)])
+    tag.chords.should be_empty
     tag.menu_key.should eq('T')
+    shift_t = Gori::Verb::Chord.new("t", shift: true)
+    sitemap_verbs = [] of Gori::Verb::Definition
+    r.each { |v| sitemap_verbs << v if v.scope.sitemap? }
+    sitemap_verbs.none? { |v| v.chords.includes?(shift_t) }.should be_true
   end
 
   it "extends the range on ⇧arrows without shadowing plain tree nav" do

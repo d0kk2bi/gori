@@ -117,6 +117,16 @@ module Gori::Tui
       @sub == :rules
     end
 
+    # …and the FOCUS half of the same question. `rules_sub?` says the list is on screen;
+    # this says it is the thing the keyboard is pointed at. Both are needed now that the
+    # rule verbs carry real chords: the preview panes sit in the same body, and `d` there
+    # would otherwise delete the rule behind them. The menu was already safe by a different
+    # route (`command_section` answers :preview, and the verbs are `section: :rules`) — a
+    # chord has no section to hide behind.
+    def rule_list_focused? : Bool
+      @sub == :rules && @focus == :list
+    end
+
     # --- render ---
     def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
       body_focused = focus == :body
@@ -281,7 +291,21 @@ module Gori::Tui
       when key.up?, c == 'k'                   then move_up
       when key.down?, c == 'j'                 then list_down
       when key.escape?                         then @host.request_focus(:menu)
-      else                                          return handle_action_key(ev, c)
+      when c == 'x'
+        # The one action still dispatched here, and not an oversight: `rewriter.select-line`
+        # binds bare `x` in this same SCOPE for the preview pane, and `Keymap#lookup` is keyed
+        # by scope alone — a chord on `rewriter.toggle` would shadow one of the two. The
+        # keymap has no focus dimension; this method only runs when the LIST has focus, so it
+        # is the disambiguator. (Trade-off: `x` alone is not rebindable here.)
+        rewriter_toggle
+      else
+        # a/↵/e/d/⇧X/s/⇧J/⇧K defer to the central keymap, so the rule actions are
+        # REBINDABLE and dispatch through the same `available?` gate the space menu uses —
+        # which is now focus-aware (`rewriter_rule_list_focused?`), because a chord has no
+        # `section:` to keep it away from the preview panes the way the menu entries do.
+        # This list and the Colormarker's were the last two rule lists still hand-rolling
+        # their keys while the other four bound real chords.
+        return false
       end
       true
     end
@@ -304,22 +328,6 @@ module Gori::Tui
       else
         move_sel(-1)
       end
-    end
-
-    private def handle_action_key(ev : Termisu::Event::Key, c : Char?) : Bool
-      key = ev.key
-      case
-      when key.enter?, c == 'e' then rewriter_edit
-      when c == 'a'             then rewriter_add
-      when c == 'd'             then rewriter_delete
-      when c == 'x'             then rewriter_toggle
-      when c == 'X'             then rewriter_toggle_default
-      when c == 's'             then rewriter_scope_toggle
-      when c == 'J'             then rewriter_move(1)
-      when c == 'K'             then rewriter_move(-1)
-      else                           return false
-      end
-      true
     end
 
     # Everything below the three pane-crossing arms is `TextArea#handle_motion_key` — the ONE
@@ -428,9 +436,17 @@ module Gori::Tui
         return true
       end
       unless @sub == :rules
-        if idx = @view.sub_row_at(inner, mx, my, @sub_scroll, sub_count)
+        if row = @view.gauge_row_at(inner, mx, my, sub_count)
+          @sub_sel = row
+        elsif idx = @view.sub_row_at(inner, mx, my, @sub_scroll, sub_count)
           @sub_sel = idx
         end
+        return true
+      end
+      # The RULES list's scroll gauge rides the card's right hairline, which `row_at` excludes.
+      if row = @view.rules_gauge_row_at(inner, mx, my, rule_list.size, rules_engine.active?)
+        @focus = :list
+        @sel = row
         return true
       end
       case @view.pane_at(inner, mx, my)
@@ -557,25 +573,25 @@ module Gori::Tui
       if rule = selected_rule
         @host.open_rewriter_rule_editor(rule)
       else
-        @host.status("no rule selected")
+        @host.status("no rewrite rule selected")
       end
     end
 
     def rewriter_delete : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       label = rule.name.empty? ? rule.pattern : rule.name
       # A global rule is deleted out of EVERY project, and the prompt has to say so — the row
       # looks the same as a project rule's apart from one badge, and the confirm is the last
       # place to notice which of the two is about to go.
       note = rule.global? ? " It is a GLOBAL rule — this removes it from every project." : ""
-      @host.confirm("Delete rule", "Delete “#{label}”?#{note} This can't be undone.",
-        confirm_label: "Delete", danger: true) do
+      @host.confirm("DELETE RULE", "Delete “#{label}”?#{note} This can't be undone.",
+        confirm_label: "delete", danger: true) do
         # The store's answer, not an assumption: a rolled-back write left the rule rewriting
         # live traffic while this toasted "rule deleted". Both headless surfaces already
         # refuse to say that (`mcp/tools/rules.cr`, `cli/run/rewriter.cr`).
         ok = rules_engine.remove(rule.id, rule.scope)
         @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
-        @host.status(ok ? "rule deleted" : "rule NOT deleted (project busy) — it is still rewriting traffic")
+        @host.status(ok ? "rule deleted: #{label}" : "rule NOT deleted (project busy) — it is still rewriting traffic")
       end
     end
 
@@ -584,7 +600,7 @@ module Gori::Tui
     # the change lands — the same keypress means "off in this engagement", not "off everywhere"
     # (that is ⇧X / `rewriter_toggle_default`).
     def rewriter_toggle : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       unless rules_engine.toggle(rule.id, rule.scope)
         return @host.status("enable/disable NOT applied (project busy) — the rule is unchanged")
       end
@@ -594,7 +610,7 @@ module Gori::Tui
 
     # ⇧X: the global DEFAULT — what every project that has not overridden this rule follows.
     def rewriter_toggle_default : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       return @host.status("only a global rule has a default — this one is project-scoped") unless rule.global?
       unless rules_engine.toggle_default(rule.id)
         return @host.status("default NOT changed (settings not writable) — the rule is unchanged")
@@ -605,7 +621,7 @@ module Gori::Tui
     end
 
     def rewriter_move(dir : Int32) : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       # Only follow the rule when it actually moved: ⇧J on the last GLOBAL rule cannot push it
       # into the project block (that is a scope change, `s`), and walking the cursor there
       # anyway would read as a swap that never happened.
@@ -613,7 +629,7 @@ module Gori::Tui
     end
 
     def rewriter_duplicate : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       name = rule.name.empty? ? "" : "#{rule.name} copy"
       rules_engine.add(rule.target, rule.part, rule.pattern, rule.replacement,
         rule.op, rule.match_kind, name, rule.host, rule.body_file, scope: rule.scope)
@@ -623,7 +639,7 @@ module Gori::Tui
     # `s`: move the selected rule between the global library and this project. The rule keeps
     # its fields and the state it has HERE; what changes is who else sees it.
     def rewriter_scope_toggle : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       to = rule.global? ? Store::RuleScope::Project : Store::RuleScope::Global
       unless rules_engine.set_scope(rule, to)
         return @host.status("scope NOT changed (project busy or settings not writable) — the rule is unchanged")
@@ -701,8 +717,8 @@ module Gori::Tui
 
     def extract_delete : Nil
       rule = selected_extract_rule || return @host.status("no extract rule selected")
-      @host.confirm("Delete extract rule", "Delete “$#{rule.name}”? Its binding is forgotten too.",
-        confirm_label: "Delete", danger: true) do
+      @host.confirm("DELETE EXTRACT RULE", "Delete “$#{rule.name}”? Its binding is forgotten too.",
+        confirm_label: "delete", danger: true) do
         ok = bindings.remove(rule.id)
         @sub_sel = @sub_sel.clamp(0, {extract_list.size - 1, 0}.max)
         @host.status(ok ? "extract rule deleted" : "extract rule NOT deleted (project busy) — it is still observing responses")
@@ -756,7 +772,7 @@ module Gori::Tui
       when :preview_out
         "↑/↓ move · ⇧arrows select · y copy · x line · space cmds · ← input · esc input"
       else
-        "[/] sub-tab · ↑/↓ select · a add · ↵/e edit · x on/off · s global/project · d delete · ⇧J/⇧K reorder · esc tabs"
+        "[/] sub-tab · ↑/↓ select · a add · ↵/e edit · x on/off · s global/project · d delete · ⇧K/⇧J reorder · esc tabs"
       end
     end
   end

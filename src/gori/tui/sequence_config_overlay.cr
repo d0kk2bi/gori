@@ -111,7 +111,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · type to edit selector · ←/→ cycle · ↵ start · esc cancel"
+      "↑/↓ field · type to edit selector · ←/→ options · ↵ start · esc cancel"
     end
 
     # Own key handling (formerly Runner#handle_sequence_config_key). ↑/↓ move fields; the
@@ -258,8 +258,8 @@ module Gori::Tui
       vw = {box.right - 2 - vx, 4}.max
       case i
       when KIND_ROW
-        screen.text(x, py, "token type:", Theme.muted, bg)
-        screen.text(vx, py, "#{kind.label}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg,
+          "token type:", KINDS.map(&.label), @kind_idx, sel, value_x: vx)
       when SELECTOR_ROW
         screen.text(x, py, selector_label, Theme.muted, bg)
         @selector.render(screen, vx, py, vw, sel, sel ? Theme.text_bright : Theme.text, bg)
@@ -267,23 +267,24 @@ module Gori::Tui
         label = valid? ? "[ Start collecting ]" : "[ set a token location ]"
         screen.text(x, py, label, valid? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
       else
-        draw_cycler(screen, x, vx, py, bg, sel, i)
+        draw_cycler(screen, x, vx, py, box.right - 2, bg, sel, i)
       end
     end
 
-    # The four ←/›-cycled rows, split out of draw_row so adding a knob does not keep
-    # growing one branch chain.
-    private def draw_cycler(screen : Screen, x : Int32, vx : Int32, py : Int32,
+    # The four ←/→-cycled rows, split out of draw_row so adding a knob does not keep
+    # growing one branch chain. `value_x` keeps them on this form's shared value column, which
+    # the selector row above them also uses; the strip-or-lit-value decision belongs to
+    # `Frame.option_cycle` and is made by measuring the room left to `right`.
+    private def draw_cycler(screen : Screen, x : Int32, vx : Int32, py : Int32, right : Int32,
                             bg : Color, sel : Bool, i : Int32) : Nil
-      label, value =
+      label, options, idx =
         case i
-        when GOAL_ROW   then {"samples:", GOAL_CHOICES[@goal_idx].to_s}
-        when MAXREQ_ROW then {"max requests:", MAX_REQ_CHOICES[@maxreq_idx].try(&.to_s) || "uncapped"}
-        when CONC_ROW   then {"concurrency:", CONC_CHOICES[@conc_idx].to_s}
-        else                 {"notify:", NOTIFY_CHOICES[@notify_idx].label}
+        when GOAL_ROW   then {"samples:", GOAL_CHOICES.map(&.to_s), @goal_idx}
+        when MAXREQ_ROW then {"max requests:", MAX_REQ_CHOICES.map { |c| c.try(&.to_s) || "uncapped" }, @maxreq_idx}
+        when CONC_ROW   then {"concurrency:", CONC_CHOICES.map(&.to_s), @conc_idx}
+        else                 {"notify:", NOTIFY_CHOICES.map(&.label), @notify_idx}
         end
-      screen.text(x, py, label, Theme.muted, bg)
-      screen.text(vx, py, "#{value}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
+      Frame.option_cycle(screen, x, py, right, bg, label, options, idx, sel, value_x: vx)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?

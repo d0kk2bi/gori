@@ -158,8 +158,8 @@ module Gori::Tui
         size = bytes > 0 ? Fmt.size(bytes) : "—"
         screen.text(box.right - size.size - 2, py, size, bytes > 0 ? Theme.muted : Theme.border, bg)
       elsif i == keep_row
-        screen.text(x, py, "keep newest flows:", Theme.muted, bg)
-        screen.text(x + 19, py, "#{keep_label}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "keep newest flows:",
+          KEEP_CHOICES.map { |n| n.try { |v| Fmt.count(v.to_i64) } || "all" }, @keep_idx, sel)
       else
         screen.text(x, py, "[ Compress ]", Theme.accent, bg, Attribute::Bold)
         hint = "↵ run"

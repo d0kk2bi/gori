@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./fmt"
 require "./frame"
 require "./overlay"
 require "./notifications"
@@ -119,6 +120,12 @@ module Gori::Tui
     def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
       box = overlay_box(area)
       return :cancel if box.nil? || !box.contains?(mx, my)
+      # The gauge on the card's right hairline, before `row_at` — which has no `mx` bound.
+      # Selects without committing: a scrollbar drag is navigation, not "open this one".
+      if row = gauge_row_at(box, mx, my)
+        set_selected(row)
+        return :stay
+      end
       if idx = row_at(box, mx, my)
         set_selected(idx)
         return :commit
@@ -167,7 +174,7 @@ module Gori::Tui
       list = notes
       Frame.card(screen, box, "NOTIFICATIONS", border: Theme.border_focus)
       meta = "#{list.size} item#{list.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 16}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "NOTIFICATIONS", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
       if list.empty?
@@ -181,6 +188,8 @@ module Gori::Tui
         break if i >= list.size
         draw_row(screen, box, list[i], i == sel, box.y + 2 + row)
       end
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        list.size, start, true, Theme.panel)
     end
 
     private def draw_row(screen : Screen, box : Rect, note : Notifications::Note, sel : Bool, py : Int32) : Nil
@@ -191,7 +200,7 @@ module Gori::Tui
       screen.cell(box.x + 3, py, g, gc, bg)
       bold = note.read ? Attribute::None : Attribute::Bold
       fg = sel ? Theme.text_bright : Theme.text
-      stamp = ago(note.created_at)
+      stamp = Fmt.ago(note.created_at)
       # Agent-originated notes (an MCP co-pilot acting in the loop) get a distinct "ai"
       # tag so the human can see at a glance which entries the AI produced. Other sources
       # already name themselves in the message ("Miner: …", "Probe: …"), so no tag.
@@ -206,8 +215,16 @@ module Gori::Tui
       screen.text(box.right - 1 - stamp.size, py, stamp, Theme.muted, bg)
     end
 
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    def gauge_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      Frame.scroll_gauge_row(Rect.new(box.x + 1, box.y + 2, box.w - 2, list_capacity(box)),
+        notes.size, mx, my)
+    end
+
     # Row index under (mx,my) — inverts render's windowed layout so a click maps to the
     # same row that was drawn.
+
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless box.contains?(mx, my)
       cap = list_capacity(box)
@@ -240,14 +257,5 @@ module Gori::Tui
     end
 
     # Compact relative age: "3s" / "5m" / "2h" / "1d".
-    private def ago(t : Time::Instant) : String
-      secs = (Time.instant - t).total_seconds.to_i
-      return "#{secs}s" if secs < 60
-      mins = secs // 60
-      return "#{mins}m" if mins < 60
-      hours = mins // 60
-      return "#{hours}h" if hours < 24
-      "#{hours // 24}d"
-    end
   end
 end

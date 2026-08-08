@@ -84,9 +84,15 @@ module Gori
         "probe.delete-selected", "Delete issue", "Delete the selected issue",
         Verb::Scope::Probe, [Verb::Chord.new("d")], group: :danger) { |ctx| ctx.probe_delete; nil }
 
+      # NO bare chord. This wipes every Probe issue in the project, and it used to answer a
+      # single `x` — one chip to the right, on the Rules sub-tab, `x` is a harmless enable
+      # toggle. Two meanings that far apart do not belong on the same unmodified letter, and
+      # no Probe hint ever named this one, so the destructive reading was the unadvertised
+      # one. It keeps its space-menu entry under `X` (the menu is the deliberate path for a
+      # :danger verb) and stays reachable from the palette; the confirm still gates it.
       r.register Verb::Definition.new(
         "probe.clear", "Clear issues", "Delete all Probe issues for this project", Verb::Scope::Probe,
-        [Verb::Chord.new("x")], group: :danger) { |ctx| ctx.probe_clear; nil }
+        mnemonic: 'X', group: :danger) { |ctx| ctx.probe_clear; nil }
 
       r.register Verb::Definition.new(
         "probe.leave", "Back to menu", "Return focus to the tab menu", Verb::Scope::Probe,
@@ -121,15 +127,22 @@ module Gori
       # Nav (↑/↓, j/k) + Esc→strip are controller-claimed; these are the actions. edit/delete are
       # gated to a selected CUSTOM rule (built-ins can't be edited/removed, only toggled).
       probe_custom = ->(ctx : Verb::ExecContext) { ctx.probe_custom_rule_selected? }
+      # `x` alone, and the space-menu key is `x` too — the same letter the Rewriter and
+      # Colormarker rule lists use for the same action, where it used to be `t` here.
+      #
+      # ↵ is deliberately NOT bound: it toggles in no other rule list. Eight of them (rewrite,
+      # colour, extract, scope, host, env, and the two global editors) open the editor on ↵,
+      # so a reflex carried from any of them silently disabled a scanning rule here.
       r.register Verb::Definition.new(
         "probe-rules.toggle", "Toggle rule", "Enable or disable the selected rule",
-        Verb::Scope::ProbeRules, [Verb::Chord.new("enter"), Verb::Chord.new("x")], mnemonic: 't') { |ctx| ctx.probe_rule_toggle; nil }
+        Verb::Scope::ProbeRules, [Verb::Chord.new("x")], mnemonic: 'x') { |ctx| ctx.probe_rule_toggle; nil }
       r.register Verb::Definition.new(
         "probe-rules.add", "Add custom rule", "Open the popup to add a custom match rule",
         Verb::Scope::ProbeRules, [Verb::Chord.new("a")]) { |ctx| ctx.probe_rule_add; nil }
       r.register Verb::Definition.new(
         "probe-rules.edit", "Edit custom rule", "Edit the selected custom rule",
-        Verb::Scope::ProbeRules, [Verb::Chord.new("e")], available: probe_custom) { |ctx| ctx.probe_rule_edit; nil }
+        Verb::Scope::ProbeRules, [Verb::Chord.new("enter"), Verb::Chord.new("e")],
+        mnemonic: 'e', available: probe_custom) { |ctx| ctx.probe_rule_edit; nil }
       r.register Verb::Definition.new(
         "probe-rules.delete", "Delete custom rule", "Delete the selected custom rule",
         Verb::Scope::ProbeRules, [Verb::Chord.new("d")], available: probe_custom) { |ctx| ctx.probe_rule_delete; nil }

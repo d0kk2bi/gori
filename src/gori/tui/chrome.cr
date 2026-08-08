@@ -288,9 +288,18 @@ module Gori::Tui
       end
     end
 
+    # `· off` in WORDS when capture is paused, not hue alone. Both states used to render the
+    # byte-identical `● 127.0.0.1:8070` and differ only by green-vs-muted — the single most
+    # consequential state in gori, carried by a colour. It fails in three ways: on MATRIX the
+    # two hues are both phosphor green, on HIGH_CONTRAST the palette is deliberately flat, and
+    # a colour is not a thing you can read at a glance in peripheral vision anyway.
+    #
+    # The project picker already does this (`● off · host:port`), and the Listeners overlay
+    # states the rule for itself: "the status is already stated in words on this row".
     private def self.listen_chip(listen : String, capturing : Bool, write_failures : Int32) : {String, Color}
       return {"● #{listen} (#{write_failures})", Theme.red} if write_failures > 0
-      {"● #{listen}", capturing ? Theme.green : Theme.muted}
+      return {"● #{listen}", Theme.green} if capturing
+      {"● #{listen} · off", Theme.muted}
     end
 
     # The drawn rect of a tagged top-bar chip (or nil if absent) — rebuilds the SAME

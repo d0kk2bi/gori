@@ -15,27 +15,41 @@ module Gori
     # leak `Runner#rewriter_rule_selected?` documents, one axis over: it remembered `@sub` and
     # forgot `@focus`.
     def self.register_rewriter(r : Verb::Registry) : Nil
-      in_rw = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter }
-      has_rule = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter && ctx.rewriter_rule_selected? }
+      # Both gates now ask about FOCUS, not just the sub-tab. They have to: these verbs carry
+      # real chords, and the preview panes share this body — `d` with the preview focused
+      # would delete the rule sitting behind it. The space menu was already safe by another
+      # route (`command_section` answers :preview there, and every verb here is
+      # `section: :rules`), but a chord has no section to hide behind.
+      in_rw = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter && ctx.rewriter_rule_list_focused? }
+      has_rule = ->(ctx : Verb::ExecContext) do
+        ctx.current_tab == :rewriter && ctx.rewriter_rule_list_focused? && ctx.rewriter_rule_selected?
+      end
 
       r.register Verb::Definition.new(
         "rewriter.add", "Add rule", "Open the editor to add a Match & Replace rule",
-        Verb::Scope::Rewriter, available: in_rw, mnemonic: 'a', section: :rules) { |ctx| ctx.rewriter_add; nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("a")], available: in_rw, mnemonic: 'a', section: :rules) { |ctx| ctx.rewriter_add; nil }
       r.register Verb::Definition.new(
         "rewriter.edit", "Edit rule", "Edit the selected rule in the popup editor",
-        Verb::Scope::Rewriter, available: has_rule, mnemonic: 'e', section: :rules) { |ctx| ctx.rewriter_edit; nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("enter"), Verb::Chord.new("e")], available: has_rule, mnemonic: 'e', section: :rules) { |ctx| ctx.rewriter_edit; nil }
+      # The ONE rule verb with no chord, and the reason the whole list used to be hand-rolled:
+      # `rewriter.select-line` (read_edit.cr) already binds bare `x` in this SCOPE for the
+      # preview pane. Two `section:`s never render together, so the space menu is fine with
+      # `x` meaning two things — but `Keymap#lookup` is keyed by scope alone and returns ONE
+      # id, so a second `x` here would simply shadow one of them (keymap_spec catches it).
+      # The keymap has no focus dimension; `RewriterController` does, so `x` stays there.
+      # Colormarker could take `x` because it has no read pane at all.
       r.register Verb::Definition.new(
         "rewriter.toggle", "Enable/disable", "Toggle the selected rule on or off in THIS project",
         Verb::Scope::Rewriter, available: has_rule, mnemonic: 'x', section: :rules) { |ctx| ctx.rewriter_toggle; nil }
       r.register Verb::Definition.new(
         "rewriter.delete", "Delete rule", "Delete the selected rule (confirms first)",
-        Verb::Scope::Rewriter, available: has_rule, mnemonic: 'd', section: :rules) { |ctx| ctx.rewriter_delete; nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("d")], available: has_rule, mnemonic: 'd', section: :rules) { |ctx| ctx.rewriter_delete; nil }
       r.register Verb::Definition.new(
         "rewriter.move-up", "Move up", "Move the selected rule earlier in apply order",
-        Verb::Scope::Rewriter, available: has_rule, mnemonic: 'u', section: :rules) { |ctx| ctx.rewriter_move(-1); nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("k", shift: true)], available: has_rule, mnemonic: 'u', section: :rules) { |ctx| ctx.rewriter_move(-1); nil }
       r.register Verb::Definition.new(
         "rewriter.move-down", "Move down", "Move the selected rule later in apply order",
-        Verb::Scope::Rewriter, available: has_rule, mnemonic: 'n', section: :rules) { |ctx| ctx.rewriter_move(1); nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("j", shift: true)], available: has_rule, mnemonic: 'n', section: :rules) { |ctx| ctx.rewriter_move(1); nil }
       r.register Verb::Definition.new(
         "rewriter.duplicate", "Duplicate rule", "Copy the selected rule into a new one",
         Verb::Scope::Rewriter, available: has_rule, mnemonic: 'c', section: :rules) { |ctx| ctx.rewriter_duplicate; nil }
@@ -52,14 +66,17 @@ module Gori
       # default to flip: `x` IS its state. Both gate on a selected rule for the reason
       # `rewriter_rule_selected?` documents — the menu must not act on a row the operator
       # cannot see from the `extract` / `bindings` sub-tabs.
-      global_rule = ->(ctx : Verb::ExecContext) { ctx.current_tab == :rewriter && ctx.rewriter_global_rule_selected? }
+      global_rule = ->(ctx : Verb::ExecContext) do
+        ctx.current_tab == :rewriter && ctx.rewriter_rule_list_focused? && ctx.rewriter_global_rule_selected?
+      end
       r.register Verb::Definition.new(
         "rewriter.scope", "Global/project", "Move the selected rule between this project and the global library",
-        Verb::Scope::Rewriter, available: has_rule, mnemonic: 's', section: :rules) { |ctx| ctx.rewriter_scope_toggle; nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("s")], available: has_rule, mnemonic: 's', section: :rules) { |ctx| ctx.rewriter_scope_toggle; nil }
       r.register Verb::Definition.new(
         "rewriter.toggle-default", "Enable/disable everywhere",
         "Flip a global rule's default — what every project that hasn't overridden it follows",
-        Verb::Scope::Rewriter, available: global_rule, mnemonic: 'g', section: :rules) { |ctx| ctx.rewriter_toggle_default; nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("x", shift: true)],
+        available: global_rule, mnemonic: 'X', section: :rules) { |ctx| ctx.rewriter_toggle_default; nil }
     end
   end
 end

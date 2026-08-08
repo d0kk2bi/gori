@@ -90,7 +90,11 @@ module Gori::Tui
     def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
       box = overlay_box(area)
       return :cancel if box.nil? || !box.contains?(mx, my)
-      if idx = row_at(box, mx, my)
+      # The gauge on the card's right hairline, before `row_at` — which has no `mx` bound and
+      # would otherwise read a click there as a plain pick of whatever row shares its `my`.
+      if row = gauge_row_at(box, mx, my)
+        set_selected(row)
+      elsif idx = row_at(box, mx, my)
         set_selected(idx)
       end
       :stay
@@ -124,20 +128,24 @@ module Gori::Tui
       end
       Frame.card(screen, box, "LISTENERS", border: Theme.border_focus)
       meta = "#{@rows.size} listener#{@rows.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 14}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "LISTENERS", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
       return if cap <= 0
+      start = list_window(cap)
       if @rows.empty?
         screen.text(box.x + 3, box.y + 2, "(no additional listeners configured)", Theme.muted, Theme.panel)
       else
-        start = list_window(cap)
         cap.times do |row|
           i = start + row
           break if i >= @rows.size
           draw_row(screen, box, i, box.y + 2 + row)
         end
       end
+      # A windowed list with no gauge gave an operator scrolling past row `cap` nothing that
+      # said there was more. `true` for focused: an open modal IS the focus.
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        @rows.size, start, true, Theme.panel)
       draw_footer(screen, box)
     end
 
@@ -170,7 +178,13 @@ module Gori::Tui
       sel = i == @selected
       bg = sel ? Theme.accent_bg : Theme.panel
       screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', status_color(row), bg)
+      # `Theme.accent`, not this row's status colour. The glyph is only drawn when the row is
+      # SELECTED (unselected rows get a space, where a foreground colour renders nothing), so
+      # tinting it never coloured the list — it recoloured the one bar whose job is to say
+      # "you are here", making the selection indicator mean two things at once. The status is
+      # already stated in words on this row: the up/down tail below, or the error reason in
+      # the detail column.
+      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
 
       # A broken listener's status is the reason, shown in the detail column, so the right-hand
       # column is left empty rather than saying "down" as well — one fact, one place.
@@ -227,6 +241,13 @@ module Gori::Tui
 
     # Row index under (mx,my) — inverts render's windowed layout so a click maps to the same
     # row that was drawn.
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    def gauge_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      Frame.scroll_gauge_row(Rect.new(box.x + 1, box.y + 2, box.w - 2, list_capacity(box)),
+        @rows.size, mx, my)
+    end
+
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless box.contains?(mx, my)
       cap = list_capacity(box)

@@ -133,6 +133,17 @@ module Gori::Tui
       idx < @issues.size ? idx : nil
     end
 
+    # The row a click on the list's scroll gauge asks for. The gauge rides the frame's right
+    # hairline — one column OUTSIDE the list rect, which is why `list_row_at` cannot answer it
+    # — and this list's `@scroll` is DERIVED from the selection by render's `ensure_visible`,
+    # so the answer is a selection, not an offset. See `Frame.scroll_gauge_row`.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      list_rect, _ = list_split(rect)
+      top = list_rect.y + 3 # same band list_row_at and the gauge draw measure
+      Frame.scroll_gauge_row(Rect.new(list_rect.x, top, list_rect.w, {list_rect.bottom - top, 0}.max),
+        @issues.size, mx, my)
+    end
+
     def preview_at?(rect : Rect, mx : Int32, my : Int32) : Bool
       _, prev = list_split(rect)
       !!prev.try(&.contains?(mx, my))
@@ -755,6 +766,10 @@ module Gori::Tui
         tw = {right - title_x, 0}.max
         screen.text(title_x, y, ellipsize(f.title, tw), title_fg, bg, width: tw)
       end
+      # `ensure_visible`'s own comment already named what was missing here: without a gauge,
+      # 44 results silently read as the 3 that happen to be under the window.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, top, rect.w, list_h),
+        @issues.size, @scroll, focused)
     end
 
     # The cursor row keeps the accent band; a marked row gets the dim one; a row that is both
@@ -800,6 +815,7 @@ module Gori::Tui
         fg, text = lines[li]
         screen.text(body.x + 1, body.y + i, text, fg, bg, width: w)
       end
+      Frame.scroll_gauge(screen, body, lines.size, sc, false, bg)
     end
 
     private def issues_preview_lines(f : Store::Issue) : Array({Color, String})
@@ -835,13 +851,11 @@ module Gori::Tui
           colors: Highlight.filter_query(@query, Theme.text_bright, FilterAst::SEPS_FIELD))
         return
       end
-      rx = rect.right - 1
-      if filtering?
-        count = @issues.size.to_s
-        screen.text({rx - count.size, rect.x}.max, rect.y, count, Theme.muted)
-        rx -= count.size + 2
-      end
-      rx = render_mark_chip(screen, rect, rx)
+      # One right-anchored chain — see HistoryView#render_ql_bar.
+      chips = [] of {String, Color}
+      chips << {@issues.size.to_s, Theme.muted} if filtering?
+      chips << {mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
+      rx = Frame.right_text_chain(screen, rect.right - 1, rect.y, rect.x + 2, chips)
       left_w = {rx - (rect.x + 1), 0}.max
       if filtering?
         # The committed query stays highlighted — this readout is what you scan to
@@ -859,14 +873,11 @@ module Gori::Tui
     # switch, so this chip is what keeps the set from being invisible when you come back. The
     # hidden split covers marks the current filter doesn't show, so the count never silently
     # exceeds what's on screen.
-    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
-      return right_x if @marks.empty?
+    # The mark chip's TEXT, or nil when nothing is marked — see HistoryView#mark_chip_text.
+    private def mark_chip_text : String?
+      return nil if @marks.empty?
       hidden = marked_hidden_count
-      chip = hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
-      x = right_x - chip.size
-      return right_x unless x > rect.x + 1 # too narrow — the match count wins
-      screen.text(x, rect.y, chip, Theme.accent)
-      x - 2
+      hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
     end
 
     private def render_detail(screen : Screen, rect : Rect, focused : Bool) : Nil
@@ -884,8 +895,8 @@ module Gori::Tui
 
       # y1 — chips: a filled severity chip + a status chip.
       cx = rect.x + 1
-      cx = chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
-      chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
+      cx = Frame.tag_chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
+      Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
 
       # y2 — timestamps.
       meta = "created #{fmt_ts(issue.created_at)}"
@@ -924,13 +935,19 @@ module Gori::Tui
           res = @detail_resolved[idx]
           active = idx == @selected_link
           fg = res.stale? ? Theme.muted : (active ? Theme.text_bright : Theme.text)
-          row_x = rect.x + 1
-          if active
-            screen.cell(row_x, list_y + i, '▎', Theme.accent, Theme.bg)
-            row_x += 1
-          end
-          screen.text(row_x, list_y + i, res.line, fg, width: w - (row_x - rect.x - 1))
+          # The marker column is written on EVERY row and the band is filled behind the
+          # selected one — the shape every other list in gori uses. This list drew the bar
+          # ONLY when active and then pushed the row's text one column right to make room,
+          # so the selected link was both hard to see (no band at all) and visibly out of
+          # line with its neighbours.
+          y = list_y + i
+          bg = active ? Theme.accent_bg : Theme.bg
+          screen.fill(Rect.new(rect.x + 1, y, w, 1), bg) if active
+          screen.cell(rect.x + 1, y, active ? '▎' : ' ', Theme.accent, bg)
+          screen.text(rect.x + 2, y, res.line, fg, bg, width: {w - 1, 1}.max)
         end
+        Frame.scroll_gauge(screen, Rect.new(rect.x, list_y, rect.w, list_h),
+          @detail_resolved.size, @links_scroll, focused)
       end
       # NOTES — a real Frame.card (like Decoder INPUT) so INS/READ borders are rounded
       # and the editor body is inset, never colliding with the outline.
@@ -939,14 +956,14 @@ module Gori::Tui
       notes_active = focused && notes_focused?
       ins = focused && notes_insert_mode?
       Frame.card(screen, card, "NOTES", bg: Theme.bg, border: Frame.pane_border(notes_active || ins))
-      if notes_active || ins
-        Frame.mode_badge(screen, card.right - 1, card.y, card.x + 7, ins)
-      elsif !notes_insert_mode?
-        # Unfocused NOTES still hints how to enter insert (same ↵ cue as the mode badge).
-        edit_hint = " ↵ "
-        bx = card.right - edit_hint.size - 1
-        screen.text(bx, card.y, edit_hint, Theme.muted, Theme.bg) if bx >= card.x + 7
-      end
+      # The REAL mode, always drawn — `Frame.mode_badge`'s contract, and this call broke it
+      # in the worst of the three possible ways. In insert-but-unfocused neither branch below
+      # ran, so NOTHING was painted on the border while `issues_controller` went on hit-testing
+      # the bare `notes_insert_mode?`: five blank cells that toggled insert when clicked. The
+      # `elsif` was a third geometry on top of that — a 3-cell ` ↵ ` the hit-test never knew
+      # about. `mode_badge` already draws its READ label muted on the canvas, which is the
+      # same quiet ↵ cue that branch existed to provide.
+      Frame.mode_badge(screen, card.right - 1, card.y, card.x + 7, notes_insert_mode?)
       body = card.inset(1, 1)
       return if body.empty?
       @notes.render(screen, body, cursor: ins, gauge: true, gauge_focused: notes_active)
@@ -975,10 +992,6 @@ module Gori::Tui
 
     # A filled "chip": ` LABEL ` painted with `color` as the background. Returns the
     # x just past it so chips lay out left-to-right.
-    private def chip(screen : Screen, x : Int32, y : Int32, label : String, color : Color) : Int32
-      screen.text(x, y, label, Theme.bg, color, Attribute::Bold)
-    end
-
     private def refresh_detail(store : Store) : Nil
       if issue = @detail
         @detail = store.get_issue(issue.id)
@@ -1009,11 +1022,15 @@ module Gori::Tui
     end
 
     private def status_color(s : Store::Status) : Color
+      # SEVERITY owns the colour ladder on these rows; triage status does not compete for it.
+      # The two were drawn five columns apart out of the SAME hues — `CRIT conf` was two reds
+      # meaning two different axes, `LOW open` two accents — on a list whose whole job is
+      # "scan for red". The four words (conf / fp / done / open) already tell the statuses
+      # apart, so what is left for colour here is the one distinction the WORDS do not make
+      # at a glance: still live, or already handled.
       case s
-      when .confirmed?      then Theme.red
-      when .false_positive? then Theme.muted
-      when .resolved?       then Theme.green
-      else                       Theme.accent # open
+      when .false_positive?, .resolved? then Theme.muted
+      else                                   Theme.text # open
       end
     end
 

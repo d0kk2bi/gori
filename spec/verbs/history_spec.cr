@@ -129,11 +129,19 @@ describe "Gori::Verbs.register_history" do
 
     it "keeps the destructive list verbs menu-only, on capitals that don't shadow a chord" do
       # 'x' is select-line and 'c' is compare in the same Body COMMON view, so delete/clear
-      # take 'X'/'C'. A lowercase mnemonic here would silently shadow one of those.
+      # take capitals. A lowercase mnemonic here would silently shadow one of those.
+      #
+      # WHICH capitals matters: `X` wipes the tab and `D` deletes the row, matching Probe's
+      # `probe.clear` / `probe.delete-selected`. History had them inverted — `X` was one flow
+      # here and every issue one tab over — and `C` collided with Send to Comparer, which is
+      # `C` in both the Repeater and the Fuzzer.
       r["history.delete"].chords.should be_empty
-      r["history.delete"].menu_key.should eq('X')
+      r["history.delete"].menu_key.should eq('D')
       r["history.clear"].chords.should be_empty
-      r["history.clear"].menu_key.should eq('C')
+      r["history.clear"].menu_key.should eq('X')
+      r["probe.clear"].menu_key.should eq('X')      # the pairing this now follows
+      r["repeater.compare"].menu_key.should eq('C') # and the letter it stopped colliding with
+      r["history.clear"].menu_key.should_not eq(r["repeater.compare"].menu_key)
       r["history.probe-active"].menu_key.should eq('A')
       verb_intents(r, "history.probe-active").should eq([:probe_active_selected])
     end
@@ -284,10 +292,15 @@ describe "Gori::Verbs.register_history" do
 
     it "gates the Fuzzer-scope actions on the Fuzzer tab" do
       ctx = on(:fuzzer)
-      {"fuzz.run"             => :fuzz_run,
-       "fuzz.stop"            => :fuzz_stop,
-       "fuzz.new"             => :fuzz_new,
-       "fuzz.automark"        => :fuzz_automark,
+      {"fuzz.run"      => :fuzz_run,
+       "fuzz.stop"     => :fuzz_stop,
+       "fuzz.new"      => :fuzz_new,
+       "fuzz.automark" => :fuzz_automark,
+       # ^K / ^T. Verbs since the Fuzzer's `chord_action` stopped claiming them — which is
+       # what kept them off the space menu and out of the keymap while their four siblings
+       # were here all along.
+       "fuzz.mark-word"       => :fuzz_mark_word,
+       "fuzz.insert-marker"   => :fuzz_insert_marker,
        "fuzz.attach-chain"    => :fuzz_attach_chain,
        "fuzz.list-paste"      => :fuzz_list_paste,
        "fuzz.pretty-template" => :fuzz_pretty_template,

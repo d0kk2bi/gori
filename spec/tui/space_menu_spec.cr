@@ -27,8 +27,10 @@ describe Gori::Tui::SpaceMenu do
     menu.verb_for('y').try(&.id).should eq("history.copy")
     menu.verb_for('Y').try(&.id).should eq("history.copy-as") # pairs with 'y' (was 'F')
     menu.verb_for('r').try(&.id).should eq("history.repeater")
-    menu.verb_for('X').try(&.id).should eq("history.delete")
-    menu.verb_for('C').try(&.id).should eq("history.clear")
+    # `D` deletes the row and `X` wipes the tab — the pairing Probe already had.
+    menu.verb_for('D').try(&.id).should eq("history.delete")
+    menu.verb_for('X').try(&.id).should eq("history.clear")
+    menu.verb_for('C').should be_nil # freed: 'C' is Send to Comparer in the Repeater/Fuzzer
     menu.verb_for('Q').should be_nil # no entry bound to this key
   end
 
@@ -93,7 +95,9 @@ describe Gori::Tui::SpaceMenu do
     menu.verb_for('r').try(&.id).should eq("detail.repeater")
     menu.verb_for('x').try(&.id).should eq("detail.select-line")
     menu.verb_for('e').try(&.id).should eq("detail.toggle-hex")
-    menu.verb_for('X').try(&.id).should eq("detail.delete")
+    # 'D' here too, so the drill-in does not read `X` as "this one" while the list one
+    # keystroke away reads it as "all of them".
+    menu.verb_for('D').try(&.id).should eq("detail.delete")
   end
 
   it "lists the scope-rule actions in the Project scope pane (space replaced the lens toggle)" do
@@ -343,7 +347,9 @@ describe Gori::Tui::SpaceMenu do
     ids.should contain("fuzz.run")      # COMMON
     ids.should contain("fuzz.new")      # Round 5: New moved into COMMON, so it's here too
     ids.should contain("fuzz.automark") # :template
-    menu.verb_for('m').try(&.id).should eq("fuzz.automark")
+    # 'a', matching `repeater.auto-mark`. It was 'm' here while the Repeater — the pane most
+    # operators learn first — has always used 'a' for the same action.
+    menu.verb_for('a').try(&.id).should eq("fuzz.automark")
 
     # Round 5: fuzz.new moved :tab → :common, so Fuzzer no longer has any :tab-only
     # verbs — the tab bar now falls back to a flat COMMON-only render (same rule that
@@ -479,7 +485,11 @@ describe Gori::Tui::SpaceMenu do
     ctx.miner_has_issue = true
     menu.open(Gori::Verb::Scope::Miner, :common, ctx)
     menu.entries.map(&.id).should contain("mine.repeater")
-    menu.verb_for('p').try(&.id).should eq("mine.repeater")
+    # 'R', not 'p': `fuzz.repeater` also had to move off `r` and its comment names 'R' as
+    # "the letter the other tabs use for Repeater" — the two tabs with the same collision had
+    # picked different answers.
+    menu.verb_for('R').try(&.id).should eq("mine.repeater")
+    Gori::Verbs.registry["fuzz.repeater"].menu_key.should eq('R')
   end
 
   it "hides the scope rule edit/delete entries when no rule is selected" do

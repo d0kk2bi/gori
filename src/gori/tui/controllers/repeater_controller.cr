@@ -232,6 +232,16 @@ module Gori::Tui
       sni = Hotkeys.binding_label(reg, "repeater.toggle-sni", "^S")
       diff = Hotkeys.binding_label(reg, "repeater.toggle-diff", "d")
       pretty = Hotkeys.binding_label(reg, "repeater.toggle-pretty", "p")
+      # The §-marker trio, named in both request footers. `^T` in particular was reachable
+      # only by already knowing it: the border badge advertises MARK, not the key that makes
+      # one, and the footer listed goto/find/hex while saying nothing about marking at all —
+      # on the pane whose whole reason to carry markers is that you are about to fuzz it.
+      # `toggle-decoded` IS the ^T verb; on a plain HTTP request it inserts a § at the cursor
+      # (a decode/WS tab has its own hint method, so the label can't mislead there).
+      params = Hotkeys.binding_label(reg, "repeater.auto-mark", "^A")
+      word = Hotkeys.binding_label(reg, "repeater.mark-word", "^K")
+      point = Hotkeys.binding_label(reg, "repeater.toggle-decoded", "^T")
+      marks = "#{params} params · #{word} word · #{point} point"
       # ^R send lives on the REQUEST border chip (` ^R:SEND `) — not re-listed in the
       # request-focus footer (discoverability is the border badge; keys still work).
       return "HEX: 0-9a-f overtype · Ins/Del/⌫ bytes · ←/→/↑/↓ move · #{hex}/esc exit" if v.request_hex?
@@ -262,12 +272,12 @@ module Gori::Tui
           # → `request_tab_insert`) — a header value is allowed to hold one, and this is the
           # only editor that can type it. The pane ring is Tab's job only in READ mode, and
           # the footer said otherwise for both.
-          "type to edit · ⇧arrows select · ^Z undo · ^G goto · ^F find · #{hex} hex · esc read · ↹ text"
+          "type to edit · ⇧arrows select · ^Z undo · #{marks} · ^G goto · ^F find · #{hex} hex · esc read · ↹ text"
         else
           # The way back on an overridden handshake tab: the MESSAGES pane is hidden there, so
           # `^T` — the key that would otherwise reveal it — is not drawn to point at it.
           back = v.ws_http_only? ? " · ^V websocket" : ""
-          "i/↵ edit · #{read_common} · ^G goto · ^F find · #{hex} hex#{back} · ↹ pane · esc tabs"
+          "i/↵ edit · #{read_common} · #{marks} · ^G goto · ^F find · #{hex} hex#{back} · ↹ pane · esc tabs"
         end
       else
         ""
@@ -658,6 +668,14 @@ module Gori::Tui
         # invalidates. Moving focus here would yank the caret out of whatever pane was being
         # edited — the key (`^V`) doesn't, and the click should not differ.
         repeater_toggle_http2 # cycles WS→h1→h2 on a handshake tab, flips h1⇄h2 elsewhere
+      when :mark
+        # The chord the badge names, doing what the chord does. It used to read `^K` — a
+        # legacy key bound to nothing anywhere in the app, echoed by two hint strings — while
+        # the marker an operator actually places comes from `^T` (repeater.toggle-decoded,
+        # which on an ordinary request inserts a § at the cursor). A badge advertising a dead
+        # key is worse than a badge with no key on it.
+        view.focus_pane(:request)
+        repeater_toggle_decoded
       when :send
         view.focus_pane(:request)
         repeater_send
@@ -1394,7 +1412,7 @@ module Gori::Tui
     # are discarded. No-op when no repeater is open.
     def request_close : Nil
       return unless tab = current_repeater_tab
-      @host.confirm("CLOSE REPEATER", "Close repeater \"#{tab.view.summary}\"?\nThe edited request and response are discarded.",
+      @host.confirm("CLOSE REPEATER", "Close repeater “#{tab.view.summary}”?\nThe edited request and response are discarded.",
         confirm_label: "close", danger: true) { close_repeater_tab }
     end
 
@@ -2006,11 +2024,6 @@ module Gori::Tui
     # Every modified key the EDITOR owns rather than the keymap — see the `handle_body_key`
     # branch. Shared with the Fuzzer's controller in spirit, not in code: the two dispatchers
     # have different shapes, and one predicate each is cheaper than a mixin nobody else wants.
-    private def editing_motion?(ev : Termisu::Event::Key) : Bool
-      return false unless ev.ctrl? || ev.alt?
-      key = ev.key
-      key.left? || key.right? || key.home? || key.end? || word_delete?(ev)
-    end
 
     # A modified Home/End — the BUFFER's start/end rather than the line's.
     private def buffer_jump?(ev : Termisu::Event::Key) : Bool

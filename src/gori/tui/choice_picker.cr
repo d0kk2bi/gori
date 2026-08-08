@@ -40,11 +40,15 @@ module Gori::Tui
 
     # The coloured triage-status picker, opened on the current status.
     def self.for_status(current : Int32) : ChoicePicker
+      # Live vs handled, the same two-tier the Issues and Probe lists use — NOT the severity
+      # hues. This picker is where an operator learns what a status colour means, so teaching
+      # `confirmed = red` here and then showing red-for-CRITICAL in the list beside it is how
+      # the two axes came to look like one.
       new("SET STATUS", [
-        Choice.new("open", 'o', Theme.accent, 0),
-        Choice.new("confirmed", 'c', Theme.red, 1),
+        Choice.new("open", 'o', Theme.text, 0),
+        Choice.new("confirmed", 'c', Theme.text, 1),
         Choice.new("false-positive", 'f', Theme.muted, 2),
-        Choice.new("resolved", 'r', Theme.green, 3),
+        Choice.new("resolved", 'r', Theme.muted, 3),
       ], current, :status)
     end
 

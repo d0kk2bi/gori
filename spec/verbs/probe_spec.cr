@@ -28,11 +28,17 @@ describe "Gori::Verbs.register_probe" do
        "probe.repeater-evidence" => "r",
        "probe.promote-selected"  => "p",
        "probe.delete-selected"   => "d",
-       "probe.clear"             => "x",
       }.each do |id, key|
         r[id].scope.should eq(Gori::Verb::Scope::Probe)
         r[id].chords.should eq([Gori::Verb::Chord.new(key)])
       end
+      # `probe.clear` deliberately claims NO chord. It deletes every issue in the project, and
+      # it used to answer a bare `x` — the same unmodified letter that is a harmless enable
+      # toggle one sub-tab to the right, and one that no Probe hint ever named. It keeps a
+      # space-menu handle so the action stays reachable by key, just not by reflex.
+      r["probe.clear"].chords.should be_empty
+      r["probe.clear"].menu_key.should eq('X')
+
       r["probe.open"].chords.first.should eq(Gori::Verb::Chord.new("enter"))
       r["probe.open"].menu_key.should eq('v') # 'o' is reserved for open-evidence
       r["probe.scope-toggle"].chords.should eq([Gori::Verb::Chord.new("s", shift: true)])
@@ -94,7 +100,14 @@ describe "Gori::Verbs.register_probe" do
       ctx = FakeExecContext.new
       r["probe-rules.toggle"].available?(ctx).should be_true
       r["probe-rules.add"].available?(ctx).should be_true
-      r["probe-rules.toggle"].menu_key.should eq('t') # enter/x are its chords
+      # `x` for the chord AND the menu key — the letter the Rewriter and Colormarker rule
+      # lists already use for this action, where this one used to say `t` in the menu.
+      r["probe-rules.toggle"].chords.should eq([Gori::Verb::Chord.new("x")])
+      r["probe-rules.toggle"].menu_key.should eq('x')
+      # ↵ belongs to EDIT here, as it does in every other rule list in gori. Bound to toggle,
+      # it meant a reflex carried from any of them silently disabled a scanning rule.
+      r["probe-rules.toggle"].chords.map(&.key).should_not contain("enter")
+      r["probe-rules.edit"].chords.map(&.key).should contain("enter")
       verb_intents(r, "probe-rules.toggle").should eq([:probe_rule_toggle])
       verb_intents(r, "probe-rules.add").should eq([:probe_rule_add])
     end

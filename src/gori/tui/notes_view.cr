@@ -428,11 +428,19 @@ module Gori::Tui
       area = Rect.new(rect.x + 1, rect.y, {rect.w - 2, 0}.max, rect.h)
       TrafficEmptyState.render(screen, area, variant: :notes) if current_blank?
       ins = focused && insert_mode?
-      if focused
-        Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 1, ins)
-      end
+      # The REAL mode, and drawn unconditionally — `Frame.mode_badge`'s own contract, which
+      # this call broke twice over. `notes_controller` hit-tests the bare `insert_mode?` in
+      # both its click and double-click paths, so gating the DRAW on focus left a live 5-cell
+      # target on a border with nothing painted on it: clicking the blank cells of an
+      # unfocused Notes tab toggled insert. Nothing exits insert on a focus change, so that
+      # state is ordinary rather than exotic. Focus belongs in the BORDER, below.
+      Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 1, insert_mode?)
       ed = current.area
-      ed.render(screen, area, cursor: ins,
+      # `gauge: true` like every other editor in the workbench — Decoder INPUT, JWT INPUT and
+      # DECODED, Issues NOTES, Repeater REQUEST, Fuzzer TEMPLATE, Intercept. `TextArea#render`
+      # defaults it OFF, and Notes was the one editor that never turned it on, so a long note
+      # scrolled with nothing on screen saying where in it you were.
+      ed.render(screen, area, cursor: ins, gauge: true, gauge_focused: focused,
         highlight: Settings.editor_markdown ? :markdown : nil)
       paint_read_chrome(screen, area, ed, focused && !insert_mode?) if !insert_mode?
     end

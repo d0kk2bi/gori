@@ -107,8 +107,8 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 72}.min
-      h = {area.h - 4, 20}.min
+      w = {area.w - 4, 72}.min
+      h = {area.h - 2, 20}.min
       return nil if w < 40 || h < 10
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end
@@ -125,7 +125,11 @@ module Gori::Tui
     def render(screen : Screen, area : Rect) : Nil
       box = overlay_box(area)
       unless box
-        screen.text(area.x + 1, area.y, "stub editor needs a larger window · esc to close", Theme.muted, Theme.bg) unless area.empty?
+        # `esc saves & closes`, not the `esc to close` every CANCELLING modal's degraded line
+        # says: esc here returns :commit (see handle_key), and this line is the only thing on
+        # screen when the card cannot be drawn. Telling an operator "close" about a key that
+        # keeps their unsaved response is the one place the wording has to be exact.
+        screen.text(area.x + 1, area.y, "stub editor needs a larger window · esc saves & closes", Theme.muted, Theme.bg) unless area.empty?
         return
       end
       # bg: Theme.bg (not the card default panel) so the embedded editor, which paints on
@@ -144,7 +148,10 @@ module Gori::Tui
         @editor.render(screen, editor, cursor: true)
       end
       screen.text(box.x + 2, statusy, "▶ #{status_line}", Theme.muted, Theme.bg, width: box.w - 4) if statusy > top
-      screen.text(box.x + 2, hintline, "no origin is dialed — gori answers this itself · esc saves & closes",
+      # What a stub MEANS, which the operator cannot infer from an empty editor. The `esc saves
+      # & closes` tail that used to ride along came off: the shell already draws `hint` in the
+      # status strip for the open modal, and esc is the one key this editor's hint leads with.
+      screen.text(box.x + 2, hintline, "no origin is dialed — gori answers this itself",
         Theme.muted, Theme.bg, width: box.w - 4)
     end
   end

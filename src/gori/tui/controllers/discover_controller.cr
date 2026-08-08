@@ -53,9 +53,9 @@ module Gori::Tui
     def body_hint(focus : Symbol) : String
       return "start from Sitemap/History (space → \"Discover here\")" if @view.empty?
       if @view.focus == :runs
-        "↑/↓ runs · ↵/tab findings · ^R run · ^X stop · p pause · d dismiss · space cmds · esc tabs"
+        "↑/↓ runs · ↵/tab findings · ^R run · ^X stop · p pause · d dismiss · space cmds · esc sub-tabs"
       else
-        "↑/↓ nav · ↵/o request+response · tab runs · [ / ] runs · ^R run · ^X stop · p pause · esc tabs"
+        "↑/↓ nav · ↵/o request+response · tab runs · ^R run · ^X stop · p pause · space cmds · esc sub-tabs"
       end
     end
 
@@ -70,6 +70,13 @@ module Gori::Tui
 
     def handle_click_content(content : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
+      # The RUNS card's run control, before the pane it rides. The badge tracks the SELECTED
+      # run, so the click acts on the one it is describing — same as ^R/^X.
+      if @view.run_chrome_hit(content, mx, my)
+        @view.focus_pane(:runs)
+        @view.current.try(&.running?) ? discover_stop : discover_run
+        return true
+      end
       @view.click(content, mx, my)
       true
     end
@@ -288,7 +295,7 @@ module Gori::Tui
     private def start_run(run : DiscoverRun) : Nil
       engine, err = build_engine(run)
       unless engine
-        @host.status(err || "cannot start discovery")
+        @host.status(err || "can't start discovery")
         return
       end
       run.engine = engine
