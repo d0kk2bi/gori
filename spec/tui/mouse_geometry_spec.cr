@@ -239,6 +239,35 @@ describe "marker actions across the two template editors" do
     end
   end
 
+  # The space-menu letter is the thing a hand learns, so the two panes must not disagree on
+  # it. Three of the five did — auto-mark was 'a' in the Repeater and 'm' in the Fuzzer, and
+  # attach-chain / clear-marks were 'c'/'e' against 'e'/'c', i.e. SWAPPED: pressing the letter
+  # you know from one pane ran a DIFFERENT action in the other, which is worse than a no-op.
+  # Aligned on the Repeater's letters, where the muscle memory is.
+  {
+    {"repeater.auto-mark", "fuzz.automark"},
+    {"repeater.mark-word", "fuzz.mark-word"},
+    {"repeater.insert-marker", "fuzz.insert-marker"},
+    {"repeater.clear-marks", "fuzz.clear-marks"},
+    {"repeater.attach-chain", "fuzz.attach-chain"},
+    {"repeater.pretty-request", "fuzz.pretty-template"},
+    {"repeater.toggle-http2", "fuzz.toggle-http2"},
+  }.each do |(rep, fuzz)|
+    it "gives #{rep.split('.').last} the same menu letter in both panes" do
+      registry[rep].menu_key.should eq(registry[fuzz].menu_key)
+    end
+  end
+
+  it "leaves the SNI pair apart, because the Fuzzer cannot have the Repeater's letter" do
+    # NOT drift, and the one pair deliberately left unmatched: the space menu shows COMMON
+    # plus the focused section, and `fuzz.stop` already owns 's' in the Fuzzer's COMMON —
+    # the Repeater has no stop verb, so 's' was free there. Aligning would raise at boot.
+    registry["repeater.toggle-sni"].menu_key.should eq('s')
+    registry["fuzz.toggle-sni"].menu_key.should_not eq('s')
+    registry.find { |v| v.scope == Gori::Verb::Scope::Fuzzer && v.section == :common && v.menu_key == 's' }
+      .should_not be_nil
+  end
+
   it "gives every marker action a space-menu entry in both panes" do
     # `menu_key` nil ⇒ the verb is EXCLUDED from the space menu. That is what the Fuzzer's
     # two `chord_action` arms amounted to: no verb, so nothing to list.

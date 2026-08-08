@@ -513,9 +513,13 @@ module Gori
       r.register Verb::Definition.new(
         "fuzz.duplicate-subtab", "Duplicate subtab", "Open a new fuzz session with the same template and config",
         Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'd', section: :subtab) { |ctx| ctx.fuzzer_duplicate_subtab; nil }
+      # Space-menu letters follow the REPEATER's, which is where the muscle memory lives: this
+      # section and `repeater.*`'s `:request` are the same five marker actions, and three of
+      # them disagreed — auto-mark was 'a' there and 'm' here, and attach-chain / clear-marks
+      # were 'c'/'e' there and 'e'/'c' here, i.e. SWAPPED, which is worse than merely different.
       r.register Verb::Definition.new(
         "fuzz.automark", "Auto-mark params", "Mark every request parameter value", Verb::Scope::Fuzzer,
-        [Verb::Chord.new("a", ctrl: true)], available: in_fuzzer, mnemonic: 'm', section: :template) { |ctx| ctx.fuzz_automark; nil }
+        [Verb::Chord.new("a", ctrl: true)], available: in_fuzzer, mnemonic: 'a', section: :template) { |ctx| ctx.fuzz_automark; nil }
       # ^K / ^T, the Repeater's twins by name and by mnemonic. They used to live in
       # `FuzzerController#chord_action`, dispatched before the keymap ever saw them — which is
       # why the two marker actions an operator reaches for MOST were the two missing from the
@@ -531,7 +535,7 @@ module Gori
       r.register Verb::Definition.new(
         "fuzz.attach-chain", "Edit decoder chain", "Focus the CHAIN pane to edit the encode/decode chain of the marker at the cursor (applied to each payload on send)",
         Verb::Scope::Fuzzer, [Verb::Chord.new("y", ctrl: true)],
-        available: in_fuzzer, mnemonic: 'c', section: :template) { |ctx| ctx.fuzz_attach_chain; nil }
+        available: in_fuzzer, mnemonic: 'e', section: :template) { |ctx| ctx.fuzz_attach_chain; nil }
       r.register Verb::Definition.new(
         "fuzz.list-paste", "Add List payload set", "Open the payload-set editor pre-seeded to a List — a multi-line editor, one value per line (paste splits automatically)",
         Verb::Scope::Fuzzer, [Verb::Chord.new("l", ctrl: true)],
@@ -546,7 +550,7 @@ module Gori
         available: in_fuzzer, mnemonic: 'h', section: :template) { |ctx| ctx.fuzz_toggle_http2; nil }
       r.register Verb::Definition.new(
         "fuzz.clear-marks", "Clear markers", "Strip every §…§ marker (and its attached chain) from the template",
-        Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'e', section: :template) { |ctx| ctx.fuzz_clear_marks; nil }
+        Verb::Scope::Fuzzer, available: in_fuzzer, mnemonic: 'c', section: :template) { |ctx| ctx.fuzz_clear_marks; nil }
       # Target-pane toggle (SNI override), the twin of repeater.toggle-sni: same ^S, same
       # two-line editor, same focus rule. `FuzzerView` already carried @sni, persisted it
       # with the session and handed it to build_engine — a session seeded from History had

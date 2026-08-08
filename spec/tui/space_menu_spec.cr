@@ -343,7 +343,9 @@ describe Gori::Tui::SpaceMenu do
     ids.should contain("fuzz.run")      # COMMON
     ids.should contain("fuzz.new")      # Round 5: New moved into COMMON, so it's here too
     ids.should contain("fuzz.automark") # :template
-    menu.verb_for('m').try(&.id).should eq("fuzz.automark")
+    # 'a', matching `repeater.auto-mark`. It was 'm' here while the Repeater — the pane most
+    # operators learn first — has always used 'a' for the same action.
+    menu.verb_for('a').try(&.id).should eq("fuzz.automark")
 
     # Round 5: fuzz.new moved :tab → :common, so Fuzzer no longer has any :tab-only
     # verbs — the tab bar now falls back to a flat COMMON-only render (same rule that
