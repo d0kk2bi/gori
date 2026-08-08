@@ -112,12 +112,13 @@ describe Gori::Tui::DiscoverHeadersOverlay do
   it "does not hold the operator behind a refusal the card has no room to draw" do
     # THE TRAP. `try_commit` is this sub-editor's ONLY exit, and it refuses while any line
     # is unusable — but the refusal is drawn on the render branch that needs a card, and
-    # `overlay_box` bails below w 34 / h 8. `Layout.usable?` admits 40x8, so the whole
-    # 8–17-row band is live-but-unrenderable: esc → :stay, click-away → :stay, and the one
+    # `overlay_box` bails below a 34x8 card, which a modal's 4x2 inset puts at a 38x10 area.
+    # `Layout.usable?` admits 40x8, so 40x8 and 40x9 are live-but-unrenderable: a body in that
+    # band gets esc → :stay, click-away → :stay, and the one
     # line that DOES draw advertises "esc to close", a key that never fires. Only ^C/^D
     # (quitting gori outright) or a resize got out. A refusal nobody can read is a lock,
     # not a guard, so it may only hold while the card that explains it is on screen.
-    band = Gori::Tui::Rect.new(0, 0, 40, 10)
+    band = Gori::Tui::Rect.new(0, 0, 40, 9)
     ov = DiscoverHeadersOverlay.new([] of {String, String})
     ov.overlay_box(band).should be_nil
     h = OverlayHarness.new(ov, area: band)

@@ -116,6 +116,41 @@ module Gori::Tui
   #   :commit → run `commit`; the shell closes the overlay iff `commit` returns true
   #   :cancel → close without committing
   abstract class Overlay
+    # The card geometry every ADD/EDIT-one-policy-rule form shares: Rewriter, Colormarker,
+    # Probe custom, extract, Scope, OAST provider. They are the same kind of thing reached from
+    # adjacent tabs, so opening two in a row must not resize the card under the operator — and
+    # it did: the six had settled on 72, 72, 62, 72, 52 and 56, with floors ranging from 28×8
+    # to 40×13, none of it derived from anything.
+    #
+    # 72 is the widest of them and the one three already used; it is what the Rewriter form
+    # needed once a fifth op pushed its option row past the old 66. The narrower cards were not
+    # narrower for a reason — a `pattern:` row holding a host glob or a regex wants the width
+    # as much as any of them.
+    #
+    # HEIGHT is not a constant, because it depends on how many rows a form has: each computes
+    # `rows + 4`, or `rows + 5` when it carries a preview band under the rows. That formula is
+    # the thing to keep, not a number — two forms had drifted off it (one hard-coded 11 for
+    # four rows, one asked for `+ 6`) and simply drew dead space above their own bottom edge.
+    RULE_FORM_W     = 72
+    RULE_FORM_MIN_W = 40
+    RULE_FORM_MIN_H = 10
+
+    # The card rect for one of those forms, centered in `area`. `rows` is the form's row count;
+    # `preview` adds the band some of them draw under the rows.
+    #
+    # The floor is `min(RULE_FORM_MIN_H, natural)`, not the constant — a card is never refused
+    # for being SHORTER than the form needs. Writing the constant straight into the guard is a
+    # mistake worth naming, because it fails silently in exactly one direction: the Scope form
+    # is four rows, so its natural height is 8, and a flat floor of 10 meant `overlay_box`
+    # returned nil at every terminal size and the form could not be opened at all.
+    def self.rule_form_box(area : Rect, rows : Int32, preview : Bool = false) : Rect?
+      natural = rows + (preview ? 5 : 4)
+      w = {area.w - 4, RULE_FORM_W}.min
+      h = {area.h - 2, natural}.min
+      return nil if w < RULE_FORM_MIN_W || h < {RULE_FORM_MIN_H, natural}.min
+      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+    end
+
     # Runs on a :commit outcome; returns true when the overlay should close (false keeps
     # it open — e.g. a validation error keeps the form up). Supplied at the open-site.
     property on_commit : Proc(Bool)?

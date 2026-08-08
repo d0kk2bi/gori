@@ -96,8 +96,8 @@ describe Gori::Tui::FuzzSetOverlay do
     spec = ov.build_spec.not_nil!
     spec.kind.should eq(:preset)
     Gori::Fuzz::Presets.names.should contain(spec.value) # a real preset name
-    ov.handle_key(okey(Termisu::Input::Key::Down))  # Type row → the Preset selector
-    ov.handle_key(okey(Termisu::Input::Key::Right)) # cycle to the next preset
+    ov.handle_key(okey(Termisu::Input::Key::Down))       # Type row → the Preset selector
+    ov.handle_key(okey(Termisu::Input::Key::Right))      # cycle to the next preset
     ov.build_spec.not_nil!.value.should_not eq(spec.value)
   end
 
@@ -241,11 +241,12 @@ describe Gori::Tui::FuzzSetOverlay do
   end
 
   it "hit-tests rows against the rect the shell passes (layout.body)" do
-    # Production hands an overlay `layout.body` — 6 rows shorter and offset from the screen,
+    # Production hands an overlay `layout.body` — shorter than the screen and offset from it,
     # so this 20-row card renders clipped to 14 and sits lower. Only CLICKS can tell the two
     # areas apart: handle_key never sees `area`, so driving keys through a smaller rect would
-    # be a byte-for-byte copy of the DEFAULT_AREA examples above.
-    body = Gori::Tui::Rect.new(2, 4, 76, 18)
+    # be a byte-for-byte copy of the DEFAULT_AREA examples above. A 16-row body is what yields
+    # the 14-row card now that every modal insets from its area by 2.
+    body = Gori::Tui::Rect.new(2, 4, 76, 16)
     ov = FuzzSetOverlay.for_list
     h = OverlayHarness.new(ov, area: body)
     box = h.box.not_nil!

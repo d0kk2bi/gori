@@ -377,11 +377,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      # 72, not 66: a fifth op pushed the option row past the card edge at the old width.
-      w = {area.w - 4, 72}.min
-      h = {area.h - 2, ROW_COUNT + 5}.min # title + rows + preview + hint + padding
-      return nil if w < 40 || h < 13
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, ROW_COUNT, preview: true)
     end
 
     def render(screen : Screen, area : Rect) : Nil

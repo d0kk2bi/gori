@@ -167,10 +167,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 52}.min
-      h = {area.h - 2, 11}.min # title + 4 rows + padding
-      return nil if w < 28 || h < 8
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      Overlay.rule_form_box(area, row_count)
     end
 
     def render(screen : Screen, area : Rect) : Nil

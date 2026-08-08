@@ -28,7 +28,7 @@ module Gori::Tui
   #
   # The refusal holds ONLY while the card that explains it is on screen. It used to hold
   # unconditionally, and that was a trap with no keyboard exit: `overlay_box` bails below
-  # w 34 / h 8 while `Layout.usable?` admits 40x8, so the whole 8–17-row band is
+  # a 34x8 card while `Layout.usable?` admits 40x8, so a band of short bodies is
   # live-but-unrenderable — the refusal was drawn on a branch that never ran, esc and
   # click-away both answered :stay, and the one line that DID draw advertised a dead key.
   # Only ^C/^D (quitting gori) or a resize got out. A refusal nobody can read is a lock,
@@ -172,8 +172,8 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 64}.min
-      h = {area.h - 4, 16}.min
+      w = {area.w - 4, 64}.min
+      h = {area.h - 2, 16}.min
       return nil if w < 34 || h < 8
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end

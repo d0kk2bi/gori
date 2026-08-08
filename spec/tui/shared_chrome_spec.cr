@@ -61,6 +61,56 @@ describe "shared card chrome" do
     offenders.should be_empty
   end
 
+  it "insets every modal from the body by the same margin" do
+    # Eight overlays sat `area.w - 6` / `area.h - 4` against everyone else's `- 4` / `- 2`, and
+    # the group was not a group: a one-line name prompt shared the wider margin with the export
+    # sheet. It showed most where it mattered least to have it — the Rewriter stub editor opens
+    # FROM the Rewriter rule form, so on any terminal narrower than 78 the card jumped in by a
+    # column on each side when you pressed ↵ on `response:`.
+    # Scoped to `overlay_box`, which is where a modal states its CARD geometry. The same
+    # `area.w - N` shape appears in three other places that are not that: a confirm dialog
+    # sized to its own text, a "terminal too small" degraded card, and a row-count fit — and
+    # holding those to a card's margin would be meaningless.
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      src = File.read(path)
+      next unless body = src[/def overlay_box.*?\n    end/m]?
+      # ConfirmDialog is the one modal that sizes to its CONTENT (`content + 6`) rather than
+      # filling out to a cap; its `area.w - 2` is the ceiling on that, not a margin from the
+      # body. A dialog three lines tall has no card edge to align with anything.
+      next if File.basename(path) == "confirm_dialog.cr"
+      body.each_line do |line|
+        next unless line.matches?(/\{area\.w - (?!4\b)\d+,|\{area\.h - (?!2\b)\d+,/)
+        offenders << "#{File.basename(path)} — #{line.strip}"
+      end
+    end
+    offenders.should be_empty
+  end
+
+  it "gives every add/edit-one-rule form the same card" do
+    # Six forms for one kind of task, reached from adjacent tabs. Opening two in a row must not
+    # resize the card under the operator, so all six take their width and floors from the
+    # `RULE_FORM_*` constants rather than a number typed into their own `overlay_box`.
+    forms = %w[
+      rewriter_rule_overlay colormarker_rule_overlay custom_rule_overlay
+      extract_rule_overlay scope_rule_overlay oast_provider_overlay
+    ]
+    offenders = [] of String
+    forms.each do |name|
+      src = File.read(File.join(root, "#{name}.cr"))
+      body = src[/def overlay_box.*?\n    end/m]? || ""
+      # Not "does it use the right constants" — the whole computation belongs to
+      # `Overlay.rule_form_box`, so the form should state only its ROW COUNT and whether it
+      # carries a preview band. A form that spells any of the arithmetic here has started its
+      # own copy, which is where the six drifted apart the first time.
+      unless body.matches?(/Overlay\.rule_form_box\(area, (ROW_COUNT|row_count)(, preview: true)?\)/)
+        offenders << "#{name}: overlay_box does not delegate to Overlay.rule_form_box"
+      end
+      offenders << "#{name}: re-derives card arithmetic" if body.includes?("area.w -") || body.includes?("area.h -")
+    end
+    offenders.should be_empty
+  end
+
   it "leaves the scroll affordance to Frame.scroll_gauge" do
     # The Settings theme list painted ▲ / ▼ / ↕ into its own last interior column — an
     # affordance no other list in gori had, which said "there is more" without saying how

@@ -107,8 +107,8 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 6, 72}.min
-      h = {area.h - 4, 20}.min
+      w = {area.w - 4, 72}.min
+      h = {area.h - 2, 20}.min
       return nil if w < 40 || h < 10
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end
