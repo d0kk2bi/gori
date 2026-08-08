@@ -46,6 +46,12 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     rewriter_controller.rules_sub?
   end
 
+  # The list is on screen AND has focus — what a rule CHORD has to mean. See the comment on
+  # `rewriter_rule_selected?` above for the `@sub` half of this; this is the `@focus` half.
+  def rewriter_rule_list_focused? : Bool
+    rewriter_controller.rule_list_focused?
+  end
+
   # The selected rule is a GLOBAL one — the gate for the two verbs that only mean something
   # for the library half (flip the default everywhere; the scope verb's label).
   def rewriter_global_rule_selected? : Bool
@@ -64,5 +70,4 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   def rewriter_preview_out? : Bool
     rewriter_controller.rewriter_preview_out_focused?
   end
-
 end

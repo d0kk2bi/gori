@@ -99,3 +99,73 @@ describe "hex and whitespace letters" do
     r["repeater.toggle-resp-hex"].menu_key.should eq('h')
   end
 end
+
+# Every multi-session tab's sub-tab strip supports rename and close — `Runner#renameable_subtabs?`
+# and `#subtab_close` list :miner and :sequencer alongside the rest. Only the VERBS were
+# missing, so Miner's `:subtab` menu group held Duplicate alone and the Sequencer had no
+# `:subtab` group at all, and neither key could be rebound in either.
+describe "sub-tab verbs" do
+  r = Gori::Verbs.registry
+
+  # {tab prefix, close verb id} — Decoder and JWT spell theirs `*.close` in `:common` while
+  # the rest use `*.close-subtab` in `:subtab`. NOT unified here on purpose: a verb id is what
+  # a saved keybinding stores, so renaming one silently drops the operator's binding. The
+  # split is a naming inconsistency worth its own migration, not a drive-by rename.
+  {
+    {"repeater", "repeater.close-subtab"},
+    {"fuzz", "fuzz.close-subtab"},
+    {"comparer", "comparer.close-subtab"},
+    {"decoder", "decoder.close"},
+    {"jwt", "jwt.close"},
+    {"mine", "mine.close-subtab"},
+    {"sequence", "sequence.close-subtab"},
+  }.each do |(prefix, close_id)|
+    it "gives #{prefix} both a rename and a close" do
+      r["#{prefix}.rename-subtab"]?.should_not be_nil
+      r["#{prefix}.rename-subtab"].menu_key.should_not be_nil
+      r[close_id]?.should_not be_nil
+      r[close_id].menu_key.should eq('w')
+    end
+  end
+
+  it "puts rename on `e` everywhere it can" do
+    # One letter across the family. JWT is the documented exception: `jwt.toggle-mode` owns
+    # 'e' in its COMMON group, and the menu shows COMMON plus the focused section.
+    {"repeater", "fuzz", "comparer", "decoder", "mine", "sequence"}.each do |prefix|
+      r["#{prefix}.rename-subtab"].menu_key.should eq('e')
+    end
+    r["jwt.rename-subtab"].menu_key.should eq('r')
+    r["jwt.toggle-mode"].menu_key.should eq('e')
+  end
+end
+
+# The Rewriter's rule list moved onto the keymap — with ONE key held back, for a structural
+# reason worth pinning so nobody "fixes" it later.
+describe "Rewriter rule keys" do
+  r = Gori::Verbs.registry
+
+  it "binds every rule action except toggle" do
+    plain = ->(k : String) { Gori::Verb::Chord.new(k) }
+    r["rewriter.add"].chords.should contain(plain.call("a"))
+    r["rewriter.edit"].chords.should contain(plain.call("e"))
+    r["rewriter.delete"].chords.should contain(plain.call("d"))
+    r["rewriter.scope"].chords.should contain(plain.call("s"))
+    r["rewriter.move-up"].chords.should contain(Gori::Verb::Chord.new("k", shift: true))
+    r["rewriter.toggle-default"].chords.should contain(Gori::Verb::Chord.new("x", shift: true))
+  end
+
+  it "leaves `x` to the controller, because the KEYMAP has no focus dimension" do
+    # `rewriter.select-line` binds bare `x` in this same SCOPE for the preview pane. Two
+    # `section:`s never render together so the space menu is fine with `x` meaning two
+    # things — but `Keymap#lookup` is keyed by scope alone and returns ONE id, so a chord on
+    # `rewriter.toggle` would shadow one of them. `RewriterController#handle_list_key` runs
+    # only when the LIST has focus, which is the disambiguation the keymap cannot express.
+    r["rewriter.toggle"].chords.should be_empty
+    r["rewriter.select-line"].chords.should contain(Gori::Verb::Chord.new("x"))
+    r["rewriter.toggle"].menu_key.should eq('x') # still the letter, in its own section
+    r["rewriter.select-line"].section.should eq(:preview)
+    r["rewriter.toggle"].section.should eq(:rules)
+    # Colormarker COULD take the chord: it has no read pane, so nothing else claims `x`.
+    r["colormarker.toggle"].chords.should contain(Gori::Verb::Chord.new("x"))
+  end
+end

@@ -629,6 +629,17 @@ module Gori
       r.register Verb::Definition.new(
         "mine.duplicate-subtab", "Duplicate subtab", "Open a new miner session with the same request and config",
         Verb::Scope::Miner, available: in_miner, mnemonic: 'd', section: :subtab) { |ctx| ctx.miner_duplicate_subtab; nil }
+      # The strip's `r` rename / ^W close, which `Runner#renameable_subtabs?` and
+      # `#subtab_close` have supported for :miner all along with no verbs to show for it —
+      # so this `:subtab` group held Duplicate alone while six other multi-session tabs
+      # (Repeater, Fuzzer, Comparer, Decoder, JWT, Notes) list all three. 'e'/'w' are free
+      # in COMMON ∪ :subtab here (COMMON: r/s/k/y/v/x/S/R; :subtab: d).
+      r.register Verb::Definition.new(
+        "mine.rename-subtab", "Rename subtab", "Rename the active miner session's sub-tab chip",
+        Verb::Scope::Miner, available: in_miner, mnemonic: 'e', section: :subtab) { |ctx| ctx.miner_rename_subtab; nil }
+      r.register Verb::Definition.new(
+        "mine.close-subtab", "Close subtab", "Close the active miner session",
+        Verb::Scope::Miner, available: in_miner, mnemonic: 'w', section: :subtab) { |ctx| ctx.miner_close_subtab; nil }
 
       # Sub-tab search + inline filter (issue #121), section :tab — brings Miner to full
       # sub-tab parity (it had neither). Both gate on ≥2 sessions. 'f'/'/' are free here.

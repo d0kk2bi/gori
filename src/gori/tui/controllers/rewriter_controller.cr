@@ -117,6 +117,16 @@ module Gori::Tui
       @sub == :rules
     end
 
+    # …and the FOCUS half of the same question. `rules_sub?` says the list is on screen;
+    # this says it is the thing the keyboard is pointed at. Both are needed now that the
+    # rule verbs carry real chords: the preview panes sit in the same body, and `d` there
+    # would otherwise delete the rule behind them. The menu was already safe by a different
+    # route (`command_section` answers :preview, and the verbs are `section: :rules`) — a
+    # chord has no section to hide behind.
+    def rule_list_focused? : Bool
+      @sub == :rules && @focus == :list
+    end
+
     # --- render ---
     def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
       body_focused = focus == :body
@@ -281,7 +291,21 @@ module Gori::Tui
       when key.up?, c == 'k'                   then move_up
       when key.down?, c == 'j'                 then list_down
       when key.escape?                         then @host.request_focus(:menu)
-      else                                          return handle_action_key(ev, c)
+      when c == 'x'
+        # The one action still dispatched here, and not an oversight: `rewriter.select-line`
+        # binds bare `x` in this same SCOPE for the preview pane, and `Keymap#lookup` is keyed
+        # by scope alone — a chord on `rewriter.toggle` would shadow one of the two. The
+        # keymap has no focus dimension; this method only runs when the LIST has focus, so it
+        # is the disambiguator. (Trade-off: `x` alone is not rebindable here.)
+        rewriter_toggle
+      else
+        # a/↵/e/d/⇧X/s/⇧J/⇧K defer to the central keymap, so the rule actions are
+        # REBINDABLE and dispatch through the same `available?` gate the space menu uses —
+        # which is now focus-aware (`rewriter_rule_list_focused?`), because a chord has no
+        # `section:` to keep it away from the preview panes the way the menu entries do.
+        # This list and the Colormarker's were the last two rule lists still hand-rolling
+        # their keys while the other four bound real chords.
+        return false
       end
       true
     end
@@ -304,22 +328,6 @@ module Gori::Tui
       else
         move_sel(-1)
       end
-    end
-
-    private def handle_action_key(ev : Termisu::Event::Key, c : Char?) : Bool
-      key = ev.key
-      case
-      when key.enter?, c == 'e' then rewriter_edit
-      when c == 'a'             then rewriter_add
-      when c == 'd'             then rewriter_delete
-      when c == 'x'             then rewriter_toggle
-      when c == 'X'             then rewriter_toggle_default
-      when c == 's'             then rewriter_scope_toggle
-      when c == 'J'             then rewriter_move(1)
-      when c == 'K'             then rewriter_move(-1)
-      else                           return false
-      end
-      true
     end
 
     # Everything below the three pane-crossing arms is `TextArea#handle_motion_key` — the ONE

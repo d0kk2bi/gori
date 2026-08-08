@@ -65,6 +65,17 @@ module Gori
         Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report,
         mnemonic: 'i') { |ctx| ctx.sequence_promote; nil }
 
+      # The strip's `r` rename / ^W close. `Runner#renameable_subtabs?` and `#subtab_close`
+      # have listed :sequencer all along, but with no verbs this tab had NO `:subtab` menu
+      # group at all — the only multi-session tab without one. 'e'/'w' are free in
+      # COMMON ∪ :subtab (COMMON: r/s/c/i/x/y/v/S/E/J).
+      in_seq = ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer }
+      r.register Verb::Definition.new(
+        "sequence.rename-subtab", "Rename subtab", "Rename the active sequencing session's sub-tab chip",
+        Verb::Scope::Sequencer, available: in_seq, mnemonic: 'e', section: :subtab) { |ctx| ctx.sequencer_rename_subtab; nil }
+      r.register Verb::Definition.new(
+        "sequence.close-subtab", "Close subtab", "Close the active sequencing session",
+        Verb::Scope::Sequencer, available: in_seq, mnemonic: 'w', section: :subtab) { |ctx| ctx.sequencer_close_subtab; nil }
       r.register Verb::Definition.new(
         "sequence.find-subtab", "Search sub-tabs", "Filter the open sequencing sessions and jump to one",
         Verb::Scope::Sequencer,

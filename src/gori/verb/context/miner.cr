@@ -7,6 +7,8 @@ abstract class Gori::Verb::ExecContext
   abstract def mine_run : Nil                 # re-run mining for the focused Miner session
   abstract def mine_stop : Nil                # stop the running mine
   abstract def miner_duplicate_subtab : Nil   # clone the active miner sub-tab's content into a new sibling
+  abstract def miner_rename_subtab : Nil      # open the rename prompt for the active sub-tab
+  abstract def miner_close_subtab : Nil       # close the active sub-tab (confirm-gated)
   abstract def miner_finding_selected? : Bool # a finding is selected in the focused miner session
   abstract def mine_repeater_selected : Nil   # send the selected miner finding to Repeater
   # The FINDING pane holds focus — the gate for its row select / copy verbs. A mined parameter's

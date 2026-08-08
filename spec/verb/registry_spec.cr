@@ -432,6 +432,22 @@ private class FakeContext < ExecContext
     false
   end
 
+  def miner_rename_subtab : Nil
+    @calls << :miner_rename_subtab
+  end
+
+  def miner_close_subtab : Nil
+    @calls << :miner_close_subtab
+  end
+
+  def sequencer_rename_subtab : Nil
+    @calls << :sequencer_rename_subtab
+  end
+
+  def sequencer_close_subtab : Nil
+    @calls << :sequencer_close_subtab
+  end
+
   def miner_duplicate_subtab : Nil
     @calls << :miner_duplicate_subtab
   end
@@ -1146,6 +1162,10 @@ private class FakeContext < ExecContext
   end
 
   def rewriter_rules_sub? : Bool
+    true
+  end
+
+  def rewriter_rule_list_focused? : Bool
     true
   end
 
