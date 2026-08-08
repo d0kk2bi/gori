@@ -135,12 +135,17 @@ module Gori::Tui
     end
 
     private def commit_and_persist : Nil
+      verb = @edit_index ? "updated" : "added"
       case commit_entry
       when :empty   then toast("host override: empty")
       when :invalid then toast(%(host override: need "IP host" — a valid IP + a hostname))
-      when :dup     then toast("host override: host already mapped")
+      when :dup     then toast("host override: host already mapped — edit it (e)")
       when :ok
-        toast(persist ? "host override saved — #{@items.size} total" : "host override applied — could not save to #{Settings.path}")
+        # `added` / `updated`, like the Project pane that edits the same list. `@edit_index`
+        # is non-nil exactly when this commit came from `e`, so the distinction was already
+        # in hand — the message simply never asked for it. Read before `commit_entry`
+        # clears it, which is why the verb is captured at the top of this method.
+        toast(persist ? "host override #{verb} — #{@items.size} total" : "host override applied — could not save to #{Settings.path}")
       end
     end
 

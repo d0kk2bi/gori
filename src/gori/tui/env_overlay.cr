@@ -150,12 +150,14 @@ module Gori::Tui
     end
 
     private def commit_and_persist : Nil
+      verb = @edit_index ? "updated" : "added"
       case commit_entry
       when :empty   then toast("env var: empty")
       when :invalid then toast(%(env var: need "KEY VALUE" or "KEY=value" — KEY is [A-Za-z_][A-Za-z0-9_]*))
-      when :dup     then toast("env var: KEY already defined")
+      when :dup     then toast("env var: KEY already defined — edit it (e)")
       when :ok
-        toast(persist ? "env var saved — #{@items.size} total" : "env var applied — could not save to #{Settings.path}")
+        # `added` / `updated` — see HostsOverlay#commit_and_persist, which this mirrors.
+        toast(persist ? "env var #{verb} — #{@items.size} total" : "env var applied — could not save to #{Settings.path}")
       end
     end
 

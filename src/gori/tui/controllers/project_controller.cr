@@ -757,9 +757,12 @@ module Gori::Tui
 
     private def commit_project_env : Nil
       case @project_view.env_commit
-      when :empty   then @host.status("env var: empty")
-      when :invalid then @host.status(%(env var: need "KEY VALUE" or "KEY=value"))
-      when :dup     then @host.status("env var: KEY already defined")
+      when :empty then @host.status("env var: empty")
+      when :invalid then @host.status( # The KEY rule spelled out, as the global editor's copy of this message already did — a
+      # rejected entry is usually a key with a dash or a leading digit, so naming the shape is
+      # the difference between one retry and three.
+%(env var: need "KEY VALUE" or "KEY=value" — KEY is [A-Za-z_][A-Za-z0-9_]*))
+      when :dup then @host.status("env var: KEY already defined")
       when :ok
         Env.save_project(@host.session.store, @project_view.env_vars)
         n = @project_view.env_vars.size

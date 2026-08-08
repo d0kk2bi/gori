@@ -714,7 +714,12 @@ module Gori::Tui
       @saved = ok
       @baseline = @values.dup if ok # the working copy IS the persisted state now → no longer dirty
       @status = ok ? "saved" : "save failed"
-      ok ? "settings saved" : "settings: save failed (could not write #{Settings.path})"
+      # `<thing> applied — could not save to <path>`, the shape the rest of the app uses and
+      # `Runner#toggle_pet` documents: every setter above ran BEFORE `Settings.save`, so on a
+      # failed write the change IS live in this session and only persistence is missing. The
+      # old `settings: save failed (…)` said the second half and left the operator to guess
+      # the first — on the highest-traffic save in the app.
+      ok ? "settings saved" : "settings applied — could not save to #{Settings.path}"
     end
 
     # The centred settings box for `area` — the exact Rect render draws into (so
