@@ -319,7 +319,7 @@ module Gori::Tui
       end
       return if rows <= 0
       if @items.empty?
-        screen.text(box.x + 3, y, "(no overrides — a to add)", Theme.muted) unless @adding
+        screen.text(box.x + 3, y, "no overrides — press a to add", Theme.muted, Theme.panel) unless @adding
         return
       end
       start = list_window(rows)

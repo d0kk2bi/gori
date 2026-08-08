@@ -111,6 +111,23 @@ describe "shared card chrome" do
     offenders.should be_empty
   end
 
+  it "phrases an add-me-something empty state one way" do
+    # Five spellings for one sentence, split by which file drew it: the Project panes wrote
+    # `(no vars — a to add)` in parentheses with a bare key, the tab views wrote
+    # `no rules — press a to add` without them. Same list, same absence, same instruction.
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      File.read(path).lines.each_with_index do |line, i|
+        # Keyed on the `a` KEY specifically: a settings opener row saying `↵ to add` is a
+        # different affordance, and "no flows left to add" is a toast, not an empty state.
+        next unless line.includes?("a to add")
+        next if line.includes?("press a to add")
+        offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"
+      end
+    end
+    offenders.should be_empty
+  end
+
   it "leaves the scroll affordance to Frame.scroll_gauge" do
     # The Settings theme list painted ▲ / ▼ / ↕ into its own last interior column — an
     # affordance no other list in gori had, which said "there is more" without saying how

@@ -1151,7 +1151,7 @@ module Gori::Tui
       return if rows <= 0
 
       if rules.empty?
-        screen.text(inner.x, y, "(no rules — a to add)", Theme.muted)
+        screen.text(inner.x, y, "no scope rules — press a to add", Theme.muted, Theme.bg)
         return
       end
 
@@ -1221,7 +1221,7 @@ module Gori::Tui
       return if rows <= 0
 
       if entries.empty?
-        screen.text(list.x, y, "(no overrides — a to add)", Theme.muted) unless @ov_adding
+        screen.text(list.x, y, "no overrides — press a to add", Theme.muted, Theme.bg) unless @ov_adding
         return
       end
 
@@ -1296,7 +1296,7 @@ module Gori::Tui
       end
       return if rows <= 0
       if @env_items.empty?
-        screen.text(list.x, y, "(no vars — a to add)", Theme.muted) unless @env_adding || @env_prefix_editing
+        screen.text(list.x, y, "no env vars — press a to add", Theme.muted, Theme.bg) unless @env_adding || @env_prefix_editing
         return
       end
       scroll = scroll_for(@env_sel, @env_items.size, rows)

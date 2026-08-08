@@ -91,7 +91,7 @@ module Gori::Tui
       mode = Hotkeys.binding_label(reg, "probe.mode", "m")
       filt = Hotkeys.binding_label(reg, "probe.filter", "/")
       if rules_tab?
-        return "↑/↓ move · ↵/x toggle · a add · e edit · d delete · space cmds · ↑ sub-tabs · esc tabs"
+        return "↑/↓ select · ↵/x on/off · a add · e edit · d delete · space cmds · ↑ sub-tabs · esc tabs"
       elsif @probe.detail_open?
         "↑/↓ URL · ⇧arrows select · y copy · o flow · r repeater · p promote · space cmds · ←/esc back"
       elsif @probe.querying?

@@ -50,16 +50,16 @@ module Gori::Tui
     def body_hint(focus : Symbol) : String
       case @project_view.pane
       when :scope
-        "↑/↓ move · a add · ↵/e edit · d del · space cmds · esc sub-tabs"
+        "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc sub-tabs"
       when :overrides
-        @project_view.ov_adding? ? "type \"IP host\" · ↵ save · esc cancel" : "↑/↓ move · a add · ↵/e edit · d del · space cmds · esc sub-tabs"
+        @project_view.ov_adding? ? "type \"IP host\" · ↵ save · esc cancel" : "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc sub-tabs"
       when :env
         if @project_view.env_prefix_editing?
           "type prefix · ↵ save · esc cancel"
         elsif @project_view.env_adding?
           "type \"KEY VALUE\" · ↵ save · esc cancel"
         else
-          "↑/↓ move · a add · ↵/e edit · d del · space cmds · esc sub-tabs"
+          "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc sub-tabs"
         end
       when :settings
         if @project_view.settings_text_row?

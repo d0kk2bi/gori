@@ -88,7 +88,7 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
-      "↑/↓ select · a add · e edit · x on/off · s scope · ⇧J/⇧K reorder · d delete"
+      "↑/↓ select · a add · ↵/e edit · x on/off · s scope · ⇧J/⇧K reorder · d delete"
     end
 
     # --- keys ---

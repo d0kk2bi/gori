@@ -370,7 +370,11 @@ module Gori::Tui
     private def draw_subheader(screen : Screen, content : Rect, title : String, y : Int32, dirty : Bool) : Nil
       return unless content.y <= y < content.bottom
       screen.fill(Rect.new(content.x, y, content.w, 1), Theme.panel)
-      screen.text(content.x, y, title.upcase, Theme.focus_gold, Theme.panel, Attribute::Bold, width: content.w)
+      # `Theme.accent`, not `focus_gold`. Gold is gori's FOCUS colour — a focused pane's
+      # outline, the strip above this one when it has the keys — so spending it on a static
+      # section heading makes two different things look like the same thing. The Probe rules
+      # list already headed its sections in accent; this is the other half of that pair.
+      screen.text(content.x, y, title.upcase, Theme.accent, Theme.panel, Attribute::Bold, width: content.w)
       screen.text(content.x + title.size + 1, y, "● unsaved", Theme.yellow, Theme.panel, width: {content.right - content.x - title.size - 1, 1}.max) if dirty
     end
 

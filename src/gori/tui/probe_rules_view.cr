@@ -17,7 +17,7 @@ module Gori::Tui
     # badge ("opt-in", "needs OAST") and `desc` the one-line description shown in the footer
     # when this row is selected.
     struct Row
-      getter kind : Symbol # :header | :builtin | :custom
+      getter kind : Symbol # :header | :empty | :builtin | :custom
       getter title : String
       getter meta : String
       getter? enabled : Bool
@@ -30,8 +30,11 @@ module Gori::Tui
                      @note = "", @desc = "")
       end
 
+      # An `:empty` placeholder is no more selectable than a header — it names an absence.
+      # It used to be built AS a header, which drew it accent+bold like a section title;
+      # it is its own kind now so it can read as the quiet prose it is.
       def selectable? : Bool
-        kind != :header
+        kind != :header && kind != :empty
       end
     end
 
@@ -61,7 +64,7 @@ module Gori::Tui
       rows << Row.new(:header, "CUSTOM RULES")
       custom = Probe.custom_rules(store)
       if custom.empty?
-        rows << Row.new(:header, "  (none — press a to add a custom rule)")
+        rows << Row.new(:empty, "  no custom rules — press a to add")
       else
         custom.each { |c| rows << custom_row(c) }
       end
@@ -210,6 +213,10 @@ module Gori::Tui
 
     private def draw_row(screen : Screen, rect : Rect, row : Row, idx : Int32, y : Int32, focused : Bool) : Nil
       return draw_header(screen, rect, row, y) if row.kind == :header
+      if row.kind == :empty
+        screen.text(rect.x + 1, y, row.title.strip, Theme.muted, Theme.bg, width: {rect.w - 2, 1}.max)
+        return
+      end
       sel = idx == @sel
       bg = sel ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
       screen.fill(Rect.new(rect.x, y, rect.w, 1), bg)
