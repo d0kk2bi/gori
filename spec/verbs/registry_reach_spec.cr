@@ -128,6 +128,29 @@ describe "sub-tab verbs" do
     end
   end
 
+  # WHERE close lands in the menu. `SpaceMenu#open` renders COMMON ∪ the focused pane's
+  # section, so a `:subtab` close is invisible from the body — an operator editing in a pane
+  # has to move focus to the strip first. Decoder and JWT fixed that for themselves ("Round 4",
+  # decoder_spec) and the rest inherited the old placement, which read as the majority.
+  it "files close under COMMON, so it is reachable from the body" do
+    {"decoder.close", "jwt.close", "comparer.close-subtab",
+     "mine.close-subtab", "sequence.close-subtab"}.each do |id|
+      r[id].section.should eq(:common)
+    end
+  end
+
+  it "leaves Repeater and Fuzzer out, because `w` is taken in their editor sections" do
+    # NOT drift: `repeater.mark-word` / `fuzz.mark-word` own 'w' in `:request` / `:template`,
+    # and a COMMON entry renders alongside them — `Registry#validate_menu_keys!` would raise
+    # at boot. `^W` still closes from anywhere; only the menu row is strip-only there.
+    r["repeater.close-subtab"].section.should eq(:subtab)
+    r["fuzz.close-subtab"].section.should eq(:subtab)
+    r["repeater.mark-word"].menu_key.should eq('w')
+    r["repeater.mark-word"].section.should eq(:request)
+    r["fuzz.mark-word"].menu_key.should eq('w')
+    r["fuzz.mark-word"].section.should eq(:template)
+  end
+
   it "puts rename on `e` everywhere it can" do
     # One letter across the family. JWT is the documented exception: `jwt.toggle-mode` owns
     # 'e' in its COMMON group, and the menu shows COMMON plus the focused section.

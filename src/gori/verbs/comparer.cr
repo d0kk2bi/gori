@@ -60,10 +60,16 @@ module Gori
         Verb::Scope::Comparer, available: in_comparer, mnemonic: 'e',
         section: :subtab) { |ctx| ctx.comparer_rename_subtab; nil }
 
+      # `:common`, not `:subtab` — the space menu renders COMMON ∪ the FOCUSED PANE's section,
+      # so a `:subtab` close is invisible from the body and reachable only after moving focus
+      # to the strip. Decoder and JWT fixed that for themselves; this is the same fix.
+      #
+      # Repeater and Fuzzer deliberately do NOT follow: `repeater.mark-word` / `fuzz.mark-word`
+      # own 'w' in their `:request` / `:template` sections, so a COMMON 'w' would collide there
+      # and `Registry#validate_menu_keys!` would raise at boot. Their close stays in :subtab.
       r.register Verb::Definition.new(
         "comparer.close-subtab", "Close comparison", "Close the active comparison sub-tab (keeps ≥1)",
-        Verb::Scope::Comparer, available: in_comparer, mnemonic: 'w',
-        section: :subtab) { |ctx| ctx.comparer_close_subtab; nil }
+        Verb::Scope::Comparer, available: in_comparer, mnemonic: 'w') { |ctx| ctx.comparer_close_subtab; nil }
 
       r.register Verb::Definition.new(
         "comparer.duplicate-subtab", "Duplicate comparison", "Clone the active A/B pair into a new sub-tab",

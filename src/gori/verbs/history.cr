@@ -642,9 +642,16 @@ module Gori
       r.register Verb::Definition.new(
         "mine.rename-subtab", "Rename subtab", "Rename the active miner session's sub-tab chip",
         Verb::Scope::Miner, available: in_miner, mnemonic: 'e', section: :subtab) { |ctx| ctx.miner_rename_subtab; nil }
+      # `:common`, not `:subtab` — the space menu renders COMMON ∪ the FOCUSED PANE's section,
+      # so a `:subtab` close is invisible from the body and reachable only after moving focus
+      # to the strip. Decoder and JWT fixed that for themselves; this is the same fix.
+      #
+      # Repeater and Fuzzer deliberately do NOT follow: `repeater.mark-word` / `fuzz.mark-word`
+      # own 'w' in their `:request` / `:template` sections, so a COMMON 'w' would collide there
+      # and `Registry#validate_menu_keys!` would raise at boot. Their close stays in :subtab.
       r.register Verb::Definition.new(
         "mine.close-subtab", "Close subtab", "Close the active miner session",
-        Verb::Scope::Miner, available: in_miner, mnemonic: 'w', section: :subtab) { |ctx| ctx.miner_close_subtab; nil }
+        Verb::Scope::Miner, available: in_miner, mnemonic: 'w') { |ctx| ctx.miner_close_subtab; nil }
 
       # Sub-tab search + inline filter (issue #121), section :tab — brings Miner to full
       # sub-tab parity (it had neither). Both gate on ≥2 sessions. 'f'/'/' are free here.

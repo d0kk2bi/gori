@@ -38,9 +38,13 @@ describe "Gori::Verbs.register_comparer" do
     end
   end
 
-  it "keeps New in :common and the chip actions on :subtab" do
+  it "keeps New and Close in :common, the chip-only actions on :subtab" do
+    # Close joined New in COMMON: the space menu renders COMMON ∪ the FOCUSED PANE's section,
+    # so a `:subtab` close is invisible from the body and reachable only after moving focus to
+    # the strip — the thing Decoder and JWT had already fixed for themselves.
     r["comparer.new"].section.should eq(:common)
-    %w[comparer.rename-subtab comparer.close-subtab comparer.duplicate-subtab].each do |id|
+    r["comparer.close-subtab"].section.should eq(:common)
+    %w[comparer.rename-subtab comparer.duplicate-subtab].each do |id|
       r[id].section.should eq(:subtab)
     end
   end
