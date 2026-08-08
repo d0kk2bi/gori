@@ -760,18 +760,18 @@ module Gori::Tui
         if s.input_mode == InputMode::Insert
           "type a JWT · esc read · ↓ decoded · ^E encode · ^L clear · ^N new · ↑ sub-tabs"
         else
-          "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓ decoded · ^E encode · ^N new · esc tabs"
+          "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓ decoded · ^E encode · ^N new · esc sub-tabs"
         end
       when :decoded
-        "↑/↓ scroll · #{y} copy · space cmds · ↑-top input · ↓ attacks · ^E encode · esc tabs"
+        "↑/↓ scroll · #{y} copy · space cmds · ↑-top input · ↓ attacks · ^E encode · esc sub-tabs"
       when :attacks
-        "↑/↓ pick · ↵/#{y} copy token · space cmds · ↑-top decoded · ^E encode · esc tabs"
+        "↑/↓ pick · ↵/#{y} copy token · space cmds · ↑-top decoded · ^E encode · esc sub-tabs"
       when :header, :payload
-        "type JSON · ↑/↓ move+cross · ^A alg · ^E decode · space cmds · esc tabs"
+        "type JSON · ↑/↓ move+cross · ^A alg · ^E decode · space cmds · esc sub-tabs"
       when :secret
-        "type secret · ^A alg (#{s.alg}) · ↑/↓ cross · ^E decode · space cmds · esc tabs"
+        "type secret · ^A alg (#{s.alg}) · ↑/↓ cross · ^E decode · space cmds · esc sub-tabs"
       when :output
-        "↑/↓ scroll · #{y} copy token · space cmds · ^A alg · ^E decode · esc tabs"
+        "↑/↓ scroll · #{y} copy token · space cmds · ^A alg · ^E decode · esc sub-tabs"
       else
         ""
       end

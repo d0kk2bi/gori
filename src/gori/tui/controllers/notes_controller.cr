@@ -111,9 +111,9 @@ module Gori::Tui
         else
           @notes.read_move(-1, 0, selecting: selecting)
         end
-      when key.down?  then @notes.read_move(1, 0, selecting: selecting)
-      when key.left?  then @notes.read_move(0, -1, selecting: selecting)
-      when key.right? then @notes.read_move(0, 1, selecting: selecting)
+      when key.down?                  then @notes.read_move(1, 0, selecting: selecting)
+      when key.left?                  then @notes.read_move(0, -1, selecting: selecting)
+      when key.right?                 then @notes.read_move(0, 1, selecting: selecting)
       when @notes.read_motion_key(ev) then nil # Page keys + ⇧Home/⇧End — the shared editor set
       when c && !ev.ctrl? && !ev.alt? && !c.control?
         return false
@@ -126,8 +126,8 @@ module Gori::Tui
       case
       when key.enter? then @notes.newline
       when ev.ctrl_z? then @notes.undo
-      # Tested BEFORE plain ⌫, which would otherwise swallow the modified form as a
-      # one-character delete on a terminal that reports ⌥⌫ as Backspace+Alt.
+        # Tested BEFORE plain ⌫, which would otherwise swallow the modified form as a
+        # one-character delete on a terminal that reports ⌥⌫ as Backspace+Alt.
       when @notes.word_delete_key?(ev) then @notes.motion_key(ev)
       when key.backspace?              then @notes.backspace
       when key.up?
@@ -140,8 +140,8 @@ module Gori::Tui
           @notes.motion_key(ev)
         end
       when key.delete? then @notes.delete
-      # ⇧arrows select, Page keys, ⌥←/→ by word — the same set every other editor has
-      # (TextArea#handle_motion_key).
+        # ⇧arrows select, Page keys, ⌥←/→ by word — the same set every other editor has
+        # (TextArea#handle_motion_key).
       when @notes.motion_key(ev) then nil
       else
         if c && !ev.ctrl? && !ev.alt?
@@ -272,7 +272,7 @@ module Gori::Tui
         "type to edit · esc read · ^N new · ^W close · ^G goto · ^F find · ^1-9 · ↑ sub-tabs"
       else
         y = Hotkeys.binding_label(@host.session.registry, "notes.copy", "y")
-        "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ^N new · ^W close · ^G goto · ^F find · esc tabs"
+        "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ^N new · ^W close · ^G goto · ^F find · esc sub-tabs"
       end
     end
 
@@ -319,7 +319,7 @@ module Gori::Tui
       @notes.new_note
       @notes.enter_insert!
       @host.focus_body
-      @host.status("new note (#{@notes.count}) — ^1-9 switch · ^W close · esc tabs")
+      @host.status("new note (#{@notes.count}) — ^1-9 switch · ^W close · esc sub-tabs")
     end
 
     # Create a blank note without focusing the Notes tab (link-picker "create +

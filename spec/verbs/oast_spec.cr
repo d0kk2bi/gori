@@ -32,12 +32,19 @@ describe "Gori::Verbs.register_oast" do
     }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
   end
 
-  it "escapes back to the tab menu from either sub-tab" do
-    %w[oast.callbacks-to-menu oast.providers-to-menu].each do |id|
-      ctx = FakeExecContext.new
-      r[id].call(ctx)
-      ctx.args_for(:focus_pane).should eq(["menu"])
-      r[id].hidden?.should be_true
+  # Escape belongs to the CONTROLLER on both sub-tabs (`handle_callbacks_key` /
+  # `handle_providers_key` claim it and return true), so a verb registration for it can never
+  # run. Two used to sit here saying `focus_pane(:menu)` while the live handler goes to
+  # `:subtabs` — a spec that asserted the dead path and passed, over a hint (`esc tabs`) that
+  # described the dead path too. What is worth pinning is that nothing re-registers it.
+  it "registers no escape verb on either sub-tab — the controller owns that key" do
+    [Gori::Verb::Scope::OastCallbacks, Gori::Verb::Scope::OastProviders].each do |scope|
+      escapes = [] of String
+      r.each do |v|
+        next unless v.scope == scope
+        escapes << v.id if v.chords.any? { |c| c.key == "escape" }
+      end
+      escapes.should be_empty
     end
   end
 

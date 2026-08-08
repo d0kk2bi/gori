@@ -208,7 +208,7 @@ module Gori::Tui
         return "type to filter · ↵ keep · esc clear" if @filter_editing
         "↑/↓ select · ‹/› provider · g payload · y copy · / filter · ^R listen · ^X stop · ↵ detail · space cmds"
       else
-        "↑/↓ select · a add · e edit · t toggle · d delete · space cmds · esc tabs"
+        "↑/↓ select · a add · e edit · t toggle · d delete · space cmds · esc sub-tabs"
       end
     end
 
@@ -1041,10 +1041,10 @@ module Gori::Tui
         end
       when c == 'g' then generate_payload
       when c == 'y' then copy_payload
-      # `r` (resume) and `a` (add issue) are NOT claimed here: both open an overlay, which a
-      # controller cannot do, so they stay verbs with plain chords and reach the keymap through
-      # the `return false` below — the same fall-through every unhandled key takes.
-      else               return false
+        # `r` (resume) and `a` (add issue) are NOT claimed here: both open an overlay, which a
+        # controller cannot do, so they stay verbs with plain chords and reach the keymap through
+        # the `return false` below — the same fall-through every unhandled key takes.
+      else return false
       end
       sync_scroll
       true

@@ -52,9 +52,11 @@ module Gori
         available: ->(ctx : Verb::ExecContext) { ctx.oast_callback_selected? },
         mnemonic: 'a', group: :triage) { |ctx| ctx.oast_issue_create; nil }
 
-      r.register Verb::Definition.new(
-        "oast.callbacks-to-menu", "Back to menu", "Move focus up to the tab menu",
-        Verb::Scope::OastCallbacks, [Verb::Chord.new("escape")], hidden: true) { |ctx| ctx.focus_pane(:menu); nil }
+      # No `escape` verb for either sub-tab. `OastController#handle_callbacks_key` /
+      # `#handle_providers_key` claim escape first and return true, so a registration here
+      # could never fire — and the two that used to sit here said `focus_pane(:menu)` while
+      # the live handler goes to `:subtabs`, which is where the tab's `esc tabs` hint came
+      # from. Escape is the controller's, and the hint now says `esc sub-tabs`.
 
       # --- Providers sub-tab (a/e/t/d handled in the controller body; menu-only here) ---
       r.register Verb::Definition.new(
@@ -72,10 +74,6 @@ module Gori
       r.register Verb::Definition.new(
         "oast.delete-provider", "Delete provider", "Delete the selected provider (keeps its callback history)",
         Verb::Scope::OastProviders, [] of Verb::Chord, mnemonic: 'd') { |ctx| ctx.oast_delete_provider; nil }
-
-      r.register Verb::Definition.new(
-        "oast.providers-to-menu", "Back to menu", "Move focus up to the tab menu",
-        Verb::Scope::OastProviders, [Verb::Chord.new("escape")], hidden: true) { |ctx| ctx.focus_pane(:menu); nil }
 
       # --- cross-tab: insert / copy a fresh OAST payload (gated on an active listener) ---
       insert_avail = ->(tab : Symbol) {
