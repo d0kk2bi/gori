@@ -324,6 +324,14 @@ private class FakeContext < ExecContext
     @calls << :fuzz_automark
   end
 
+  def fuzz_mark_word : Nil
+    @calls << :fuzz_mark_word
+  end
+
+  def fuzz_insert_marker : Nil
+    @calls << :fuzz_insert_marker
+  end
+
   def fuzz_attach_chain : Nil
     @calls << :fuzz_attach_chain
   end

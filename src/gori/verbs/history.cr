@@ -236,9 +236,13 @@ module Gori
       r.register Verb::Definition.new(
         "repeater.insert-marker", "Insert marker", "Drop a single § at the cursor to bracket a region by hand",
         Verb::Scope::Repeater, available: in_repeater, mnemonic: 'i', section: :request) { |ctx| ctx.repeater_insert_marker; nil }
+      # ^K, matching the Fuzzer's. The two panes are the same editor over the same template
+      # grammar, and this was the one marker action reachable in one and not the other —
+      # the Repeater had it on the space menu alone while the Fuzzer had it on a chord.
       r.register Verb::Definition.new(
         "repeater.mark-word", "Mark word", "Toggle a §…§ marker around the token at the cursor",
-        Verb::Scope::Repeater, available: in_repeater, mnemonic: 'w', section: :request) { |ctx| ctx.repeater_mark_word; nil }
+        Verb::Scope::Repeater, [Verb::Chord.new("k", ctrl: true)],
+        available: in_repeater, mnemonic: 'w', section: :request) { |ctx| ctx.repeater_mark_word; nil }
       r.register Verb::Definition.new(
         "repeater.auto-mark", "Auto-mark params", "Wrap every request parameter value in a §…§ marker",
         Verb::Scope::Repeater, [Verb::Chord.new("a", ctrl: true)],
@@ -512,6 +516,18 @@ module Gori
       r.register Verb::Definition.new(
         "fuzz.automark", "Auto-mark params", "Mark every request parameter value", Verb::Scope::Fuzzer,
         [Verb::Chord.new("a", ctrl: true)], available: in_fuzzer, mnemonic: 'm', section: :template) { |ctx| ctx.fuzz_automark; nil }
+      # ^K / ^T, the Repeater's twins by name and by mnemonic. They used to live in
+      # `FuzzerController#chord_action`, dispatched before the keymap ever saw them — which is
+      # why the two marker actions an operator reaches for MOST were the two missing from the
+      # Fuzzer's space menu, and the only ones in the family that could not be rebound.
+      r.register Verb::Definition.new(
+        "fuzz.mark-word", "Mark word", "Toggle a §…§ marker around the token at the cursor",
+        Verb::Scope::Fuzzer, [Verb::Chord.new("k", ctrl: true)],
+        available: in_fuzzer, mnemonic: 'w', section: :template) { |ctx| ctx.fuzz_mark_word; nil }
+      r.register Verb::Definition.new(
+        "fuzz.insert-marker", "Insert marker", "Drop a single § at the cursor to bracket a region by hand",
+        Verb::Scope::Fuzzer, [Verb::Chord.new("t", ctrl: true)],
+        available: in_fuzzer, mnemonic: 'i', section: :template) { |ctx| ctx.fuzz_insert_marker; nil }
       r.register Verb::Definition.new(
         "fuzz.attach-chain", "Edit decoder chain", "Focus the CHAIN pane to edit the encode/decode chain of the marker at the cursor (applied to each payload on send)",
         Verb::Scope::Fuzzer, [Verb::Chord.new("y", ctrl: true)],

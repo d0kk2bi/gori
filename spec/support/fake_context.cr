@@ -376,6 +376,14 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:fuzz_automark)
   end
 
+  def fuzz_mark_word : Nil
+    rec(:fuzz_mark_word)
+  end
+
+  def fuzz_insert_marker : Nil
+    rec(:fuzz_insert_marker)
+  end
+
   def fuzz_attach_chain : Nil
     rec(:fuzz_attach_chain)
   end

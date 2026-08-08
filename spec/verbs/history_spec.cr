@@ -284,10 +284,15 @@ describe "Gori::Verbs.register_history" do
 
     it "gates the Fuzzer-scope actions on the Fuzzer tab" do
       ctx = on(:fuzzer)
-      {"fuzz.run"             => :fuzz_run,
-       "fuzz.stop"            => :fuzz_stop,
-       "fuzz.new"             => :fuzz_new,
-       "fuzz.automark"        => :fuzz_automark,
+      {"fuzz.run"      => :fuzz_run,
+       "fuzz.stop"     => :fuzz_stop,
+       "fuzz.new"      => :fuzz_new,
+       "fuzz.automark" => :fuzz_automark,
+       # ^K / ^T. Verbs since the Fuzzer's `chord_action` stopped claiming them — which is
+       # what kept them off the space menu and out of the keymap while their four siblings
+       # were here all along.
+       "fuzz.mark-word"       => :fuzz_mark_word,
+       "fuzz.insert-marker"   => :fuzz_insert_marker,
        "fuzz.attach-chain"    => :fuzz_attach_chain,
        "fuzz.list-paste"      => :fuzz_list_paste,
        "fuzz.pretty-template" => :fuzz_pretty_template,

@@ -50,6 +50,16 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     (v = fuzzer_controller.current_view) && (@toast = v.auto_mark)
   end
 
+  # ^K / ^T. Delegators rather than `chord_action` arms, so both reach the keymap like every
+  # other marker action and show up in the space menu beside auto-mark and clear.
+  def fuzz_mark_word : Nil
+    (v = fuzzer_controller.current_view) && (@toast = v.mark_word)
+  end
+
+  def fuzz_insert_marker : Nil
+    (v = fuzzer_controller.current_view) && (@toast = v.insert_marker)
+  end
+
   # ^Y: jump focus DOWN into the visible CHAIN pane (the marker under the template
   # cursor). The controller gates on cursor-in-marker and toasts otherwise.
   def fuzz_attach_chain : Nil

@@ -232,6 +232,16 @@ module Gori::Tui
       sni = Hotkeys.binding_label(reg, "repeater.toggle-sni", "^S")
       diff = Hotkeys.binding_label(reg, "repeater.toggle-diff", "d")
       pretty = Hotkeys.binding_label(reg, "repeater.toggle-pretty", "p")
+      # The §-marker trio, named in both request footers. `^T` in particular was reachable
+      # only by already knowing it: the border badge advertises MARK, not the key that makes
+      # one, and the footer listed goto/find/hex while saying nothing about marking at all —
+      # on the pane whose whole reason to carry markers is that you are about to fuzz it.
+      # `toggle-decoded` IS the ^T verb; on a plain HTTP request it inserts a § at the cursor
+      # (a decode/WS tab has its own hint method, so the label can't mislead there).
+      params = Hotkeys.binding_label(reg, "repeater.auto-mark", "^A")
+      word = Hotkeys.binding_label(reg, "repeater.mark-word", "^K")
+      point = Hotkeys.binding_label(reg, "repeater.toggle-decoded", "^T")
+      marks = "#{params} params · #{word} word · #{point} point"
       # ^R send lives on the REQUEST border chip (` ^R:SEND `) — not re-listed in the
       # request-focus footer (discoverability is the border badge; keys still work).
       return "HEX: 0-9a-f overtype · Ins/Del/⌫ bytes · ←/→/↑/↓ move · #{hex}/esc exit" if v.request_hex?
@@ -262,12 +272,12 @@ module Gori::Tui
           # → `request_tab_insert`) — a header value is allowed to hold one, and this is the
           # only editor that can type it. The pane ring is Tab's job only in READ mode, and
           # the footer said otherwise for both.
-          "type to edit · ⇧arrows select · ^Z undo · ^G goto · ^F find · #{hex} hex · esc read · ↹ text"
+          "type to edit · ⇧arrows select · ^Z undo · #{marks} · ^G goto · ^F find · #{hex} hex · esc read · ↹ text"
         else
           # The way back on an overridden handshake tab: the MESSAGES pane is hidden there, so
           # `^T` — the key that would otherwise reveal it — is not drawn to point at it.
           back = v.ws_http_only? ? " · ^V websocket" : ""
-          "i/↵ edit · #{read_common} · ^G goto · ^F find · #{hex} hex#{back} · ↹ pane · esc tabs"
+          "i/↵ edit · #{read_common} · #{marks} · ^G goto · ^F find · #{hex} hex#{back} · ↹ pane · esc tabs"
         end
       else
         ""

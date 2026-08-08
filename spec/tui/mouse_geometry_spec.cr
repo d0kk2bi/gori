@@ -171,20 +171,83 @@ describe "Runner double-click dispatch" do
   end
 end
 
-# A key printed on a badge or in a hint must be a key that does something. The Repeater's
-# ` ^K:MARK ` badge and two hint strings advertised ctrl-K, which is bound nowhere in the app —
-# legacy from a marking flow that `^T` replaced. (The Fuzzer's `^K`/`^T` are live: that
-# controller handles them directly in `chord_action` rather than through the verb registry,
-# which is why a registry-only search reads them as dead.)
+# A key printed on a badge or in a hint must be a key that DOES something. The Repeater's
+# ` ^K:MARK ` badge and two hint strings advertised ctrl-K, which at the time was bound
+# nowhere in the app — legacy from a marking flow `^T` had replaced. Nothing failed; the key
+# simply did nothing, and only a hand audit would ever notice.
+#
+# So: every `^<letter>` this pane PRINTS must be reachable in it. The two panes answer that
+# question by different routes — the Repeater defers every ctrl chord to the keymap, the
+# Fuzzer claims a few directly in `chord_action` — so the check unions both.
 describe "advertised chords" do
-  it "leaves no ^K in the Repeater, which binds none" do
-    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "repeater_view.cr"))
-    src.should_not contain("^K")
+  registry = Gori::Verbs.registry
+
+  # Ctrl letters a scope can actually receive: registry bindings, plus the letters the
+  # controller intercepts itself before the keymap sees them.
+  reachable = ->(scope : Gori::Verb::Scope, controller : String) do
+    keys = Set(String).new
+    registry.each { |v| v.chords.each { |c| keys << c.key if c.ctrl && v.scope == scope } }
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "controllers", controller))
+    if body = src[/private def chord_action.*?\n    end/m]?
+      body.scan(/key\.lower_([a-z])\?/) { |m| keys << m[1] }
+    end
+    # Plus the shell's own — ^G goto, ^F find, ^B reveal and friends are dispatched in
+    # `Runner#handle_key` before any tab sees them, so a hint naming one is telling the truth.
+    # Derived, not listed: a hard-coded set would rot the moment the shell grew a chord.
+    shell = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "runner.cr"))
+    shell.scan(/ev\.ctrl\? && ev\.key\.lower_([a-z])\?/) { |m| keys << m[1] }
+    keys.concat(%w(p w z n)) # palette / close sub-tab / undo / new, claimed per-controller
+    keys
   end
 
-  it "still finds ctrl-K live in the Fuzzer, so the check above is about the Repeater alone" do
-    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui",
-      "controllers", "fuzzer_controller.cr"))
-    src[/private def chord_action.*?\n    end/m].not_nil!.should contain("lower_k?")
+  # Ctrl letters PRINTED by a file — badge labels and hint strings alike.
+  advertised = ->(file : String) do
+    out = Set(String).new
+    File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", file)).each_line do |line|
+      next if line.matches?(/^\s*#/) # prose, not a label
+      line.scan(/\^([A-Z])/) { |m| out << m[1].downcase }
+    end
+    out
+  end
+
+  {
+    {"repeater_view.cr", "repeater_controller.cr", Gori::Verb::Scope::Repeater},
+    {"fuzzer_view.cr", "fuzzer_controller.cr", Gori::Verb::Scope::Fuzzer},
+  }.each do |(view, controller, scope)|
+    it "prints only chords #{view.split('_').first} can actually receive" do
+      have = reachable.call(scope, controller)
+      # `^C`/`^D` are the terminal's, and the hex editors print `^X`-style prose about BYTES.
+      shown = advertised.call(view) - Set{"c", "d"}
+      (shown - have).should be_empty
+    end
+  end
+end
+
+describe "marker actions across the two template editors" do
+  registry = Gori::Verbs.registry
+
+  {"mark-word" => "k", "insert-marker" => "t"}.each do |action, chord|
+    it "binds ^#{chord.upcase} to #{action} in BOTH panes" do
+      # `repeater.insert-marker` is the exception the pair does not break: `^T` there is
+      # `repeater.toggle-decoded`, one context-sensitive key that switches envelope/decoded on
+      # a SAML/GraphQL/WS tab and inserts a § everywhere else. Same keystroke, same gesture.
+      fuzz = registry["fuzz.#{action}"]
+      fuzz.chords.any? { |c| c.key == chord && c.ctrl }.should be_true
+      next if action == "insert-marker"
+      rep = registry["repeater.#{action}"]
+      rep.chords.any? { |c| c.key == chord && c.ctrl }.should be_true
+    end
+  end
+
+  it "gives every marker action a space-menu entry in both panes" do
+    # `menu_key` nil ⇒ the verb is EXCLUDED from the space menu. That is what the Fuzzer's
+    # two `chord_action` arms amounted to: no verb, so nothing to list.
+    %w(mark-word insert-marker automark clear-marks).each do |a|
+      fuzz_id = a == "automark" ? "fuzz.automark" : "fuzz.#{a}"
+      registry[fuzz_id].menu_key.should_not be_nil
+    end
+    %w(mark-word insert-marker auto-mark clear-marks).each do |a|
+      registry["repeater.#{a}"].menu_key.should_not be_nil
+    end
   end
 end

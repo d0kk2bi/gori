@@ -5,13 +5,18 @@ abstract class Gori::Verb::ExecContext
   abstract def fuzz_toggle_http2 : Nil # flip the fuzz transport h1↔h2 (override seed protocol)
   abstract def fuzz_toggle_sni : Nil   # edit the TLS SNI the sweep presents (TARGET pane; dialed host unchanged)
 
-  # fuzzer workbench (run/stop/marking handled inline; these power the palette + cross-tab)
+  # fuzzer workbench (run/stop handled inline; these power the palette + cross-tab).
+  # Marking is NOT inline any more: ^K/^T used to be `chord_action` arms, which kept the two
+  # most-used marker actions out of the space menu and out of the keymap. They are verbs now,
+  # the same four the Repeater has had all along.
   abstract def fuzz_selected : Nil            # send History's selection to the Fuzzer tab
   abstract def fuzz_from_repeater : Nil       # turn the current Repeater request into a fuzz template
   abstract def fuzz_run : Nil                 # start the fuzz run
   abstract def fuzz_stop : Nil                # stop the running fuzz
   abstract def fuzz_new : Nil                 # open a blank fuzz session
   abstract def fuzz_automark : Nil            # auto-mark every request parameter
+  abstract def fuzz_mark_word : Nil           # toggle a marker around the token at the cursor
+  abstract def fuzz_insert_marker : Nil       # drop a single § at the cursor (bracket by hand)
   abstract def fuzz_attach_chain : Nil        # open the chain-edit prompt for the marker at the template cursor
   abstract def fuzz_list_paste : Nil          # open the payload-set editor pre-seeded to a List (multi-line, one value per line)
   abstract def fuzz_clear_marks : Nil         # strip all §…§ markers (and their chains) from the template
