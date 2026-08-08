@@ -912,7 +912,7 @@ module Gori::Tui
         return
       end
       if name.matches?(/[>|,¦§]/)
-        @host.status("chain name cannot contain > | , ¦ or §")
+        @host.status("chain name can't contain > | , ¦ or §")
         return
       end
       if (c = registry[name]?) && !c.category.saved?

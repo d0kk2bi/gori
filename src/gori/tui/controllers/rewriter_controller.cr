@@ -557,12 +557,12 @@ module Gori::Tui
       if rule = selected_rule
         @host.open_rewriter_rule_editor(rule)
       else
-        @host.status("no rule selected")
+        @host.status("no rewrite rule selected")
       end
     end
 
     def rewriter_delete : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       label = rule.name.empty? ? rule.pattern : rule.name
       # A global rule is deleted out of EVERY project, and the prompt has to say so — the row
       # looks the same as a project rule's apart from one badge, and the confirm is the last
@@ -575,7 +575,7 @@ module Gori::Tui
         # refuse to say that (`mcp/tools/rules.cr`, `cli/run/rewriter.cr`).
         ok = rules_engine.remove(rule.id, rule.scope)
         @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
-        @host.status(ok ? "rule deleted" : "rule NOT deleted (project busy) — it is still rewriting traffic")
+        @host.status(ok ? "rule deleted: #{label}" : "rule NOT deleted (project busy) — it is still rewriting traffic")
       end
     end
 
@@ -584,7 +584,7 @@ module Gori::Tui
     # the change lands — the same keypress means "off in this engagement", not "off everywhere"
     # (that is ⇧X / `rewriter_toggle_default`).
     def rewriter_toggle : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       unless rules_engine.toggle(rule.id, rule.scope)
         return @host.status("enable/disable NOT applied (project busy) — the rule is unchanged")
       end
@@ -594,7 +594,7 @@ module Gori::Tui
 
     # ⇧X: the global DEFAULT — what every project that has not overridden this rule follows.
     def rewriter_toggle_default : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       return @host.status("only a global rule has a default — this one is project-scoped") unless rule.global?
       unless rules_engine.toggle_default(rule.id)
         return @host.status("default NOT changed (settings not writable) — the rule is unchanged")
@@ -605,7 +605,7 @@ module Gori::Tui
     end
 
     def rewriter_move(dir : Int32) : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       # Only follow the rule when it actually moved: ⇧J on the last GLOBAL rule cannot push it
       # into the project block (that is a scope change, `s`), and walking the cursor there
       # anyway would read as a swap that never happened.
@@ -613,7 +613,7 @@ module Gori::Tui
     end
 
     def rewriter_duplicate : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       name = rule.name.empty? ? "" : "#{rule.name} copy"
       rules_engine.add(rule.target, rule.part, rule.pattern, rule.replacement,
         rule.op, rule.match_kind, name, rule.host, rule.body_file, scope: rule.scope)
@@ -623,7 +623,7 @@ module Gori::Tui
     # `s`: move the selected rule between the global library and this project. The rule keeps
     # its fields and the state it has HERE; what changes is who else sees it.
     def rewriter_scope_toggle : Nil
-      rule = selected_rule || return @host.status("no rule selected")
+      rule = selected_rule || return @host.status("no rewrite rule selected")
       to = rule.global? ? Store::RuleScope::Project : Store::RuleScope::Global
       unless rules_engine.set_scope(rule, to)
         return @host.status("scope NOT changed (project busy or settings not writable) — the rule is unchanged")

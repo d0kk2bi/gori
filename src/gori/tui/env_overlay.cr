@@ -161,7 +161,7 @@ module Gori::Tui
 
     private def delete_and_persist : Nil
       return unless key_name = delete_selected
-      toast(persist ? "removed env: #{key_name}" : "removed #{key_name} — could not save to #{Settings.path}")
+      toast(persist ? "env var deleted: #{key_name}" : "env var deleted: #{key_name} — could not save to #{Settings.path}")
     end
 
     private def persist : Bool

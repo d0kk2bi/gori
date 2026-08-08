@@ -329,7 +329,7 @@ module Gori::Tui
       # probe_generation reload can shift the selection in between — so both the suppress and
       # the delete must target THIS issue by id, not whatever happens to be selected at confirm.
       id, code, host, title = i.id, i.code, i.host, i.title
-      @host.confirm("DELETE ISSUE", "Delete \"#{title}\" on #{host}?", confirm_label: "delete", danger: true) do
+      @host.confirm("DELETE ISSUE", "Delete “#{title}” on #{host}?", confirm_label: "delete", danger: true) do
         # Suppress FIRST: delete's exec_task yields to the store writer, and an
         # in-flight Active/passive fiber can re-upsert the same (code, host) in
         # that window if suppress runs after delete.
@@ -378,7 +378,7 @@ module Gori::Tui
     def probe_dismiss_code : Nil
       return unless i = @probe.target_issue
       code = i.code
-      @host.confirm("DISMISS GROUP", "Dismiss all open \"#{code}\" issues?", confirm_label: "dismiss", danger: false) do
+      @host.confirm("DISMISS GROUP", "Dismiss all open “#{code}” issues?", confirm_label: "dismiss", danger: false) do
         n = ProbeController.dismiss_open_by_code(@host.session.store, @host.session.scope, code)
         @probe.reload(@host.session.store)
         @host.status("dismissed #{n} \"#{code}\" issue#{n == 1 ? "" : "s"}")
@@ -509,7 +509,7 @@ module Gori::Tui
         confirm_label: "delete", danger: true) do
         c.global? ? Settings.delete_scan_rule(c.id) : @host.session.store.delete_probe_custom_rule(c.id.to_i64)
         reload_rules
-        @host.status("deleted rule \"#{c.title}\"")
+        @host.status("probe rule deleted: #{c.title}")
       end
     end
 

@@ -3120,15 +3120,15 @@ module Gori::Tui
       # read as "your query is not in there".
       if n < 0
         return status("replace: this buffer holds bytes that are not valid UTF-8 — " \
-                      "search and replace cannot run over it (^F highlighting still works)")
+                      "search and replace can't run over it (^F highlighting still works)")
       end
       return if n == 0
       q, r = @search_buffer, @search_replace_buffer
       plural = n == 1 ? "" : "s"
       msg = if r.empty?
-              "Delete #{n} occurrence#{plural} of \"#{q}\"?"
+              "Delete #{n} occurrence#{plural} of “#{q}”?"
             else
-              "Replace #{n} occurrence#{plural} of \"#{q}\" with \"#{r}\"?"
+              "Replace #{n} occurrence#{plural} of “#{q}” with “#{r}”?"
             end
       confirm("REPLACE ALL", "#{msg}\nOne undo step — ^Z puts it back.",
         confirm_label: r.empty? ? "delete" : "replace", danger: true) do
@@ -3232,18 +3232,26 @@ module Gori::Tui
       end
     end
 
+    # Glyph prefixes for the status strip, matched against the message TEXT. That coupling is
+    # the thing to know about this method: it is the one place where changing a toast's wording
+    # silently changes its appearance. `fuzz error:` was renamed `fuzzer error:` (one noun per
+    # engine, across both its channels) and the ✗ quietly stopped appearing — nothing failed,
+    # the mark was simply gone. `ERROR_PREFIXES` now carries every engine so the next one
+    # inherits the mark instead of needing a line here.
+    ERROR_PREFIXES = [
+      "repeater error:", "ws repeater error:", "fuzz:",
+      "fuzzer error:", "discover error:", "miner error:", "sequencer error:", "probe error:",
+    ]
+    BUSY_PREFIXES = ["sending →", "ws sending →", "fuzzing ", "fuzz running", "stopping"]
+    DONE_PREFIXES = ["sent →", "ws sent:", "Fuzzer:"]
+
     private def format_status_message(message : String?) : String?
       return nil unless message
-      if message.starts_with?("sending →") || message.starts_with?("ws sending →") ||
-         message.starts_with?("fuzzing ") || message.starts_with?("fuzz running") ||
-         message.starts_with?("stopping")
+      if BUSY_PREFIXES.any? { |p| message.starts_with?(p) }
         "#{SPINNER[@spinner_frame % SPINNER.size]} #{message}"
-      elsif message.starts_with?("sent →") || message.starts_with?("ws sent:") ||
-            message.starts_with?("Fuzzer:")
+      elsif DONE_PREFIXES.any? { |p| message.starts_with?(p) }
         "✓ #{message}"
-      elsif message.starts_with?("repeater error:") || message.starts_with?("ws repeater error:") ||
-            message.starts_with?("fuzz error:") || message.starts_with?("fuzz:") ||
-            message.starts_with?("cannot run")
+      elsif ERROR_PREFIXES.any? { |p| message.starts_with?(p) }
         "✗ #{message}"
       else
         message
@@ -4922,7 +4930,7 @@ module Gori::Tui
 
     private def open_mine_config(seed : MineSeed?, extra : Array(MineSeed) = [] of MineSeed) : Nil
       unless seed
-        @toast = "cannot mine this request"
+        @toast = "can't mine this request"
         return
       end
       if seed.applicable.empty?
@@ -4973,7 +4981,7 @@ module Gori::Tui
 
     private def open_sequence_config(seed : SequenceSeed?) : Nil
       unless seed
-        @toast = "cannot sequence this request"
+        @toast = "can't sequence this request"
         return
       end
       ov = SequenceConfigOverlay.new(seed)
@@ -4996,7 +5004,7 @@ module Gori::Tui
     # --- Discover config popup (Sitemap/History → "Discover here") ---
     private def open_discover_config(seed : DiscoverSeed?) : Nil
       unless seed
-        @toast = "cannot discover from here"
+        @toast = "can't discover from here"
         return
       end
       ov = DiscoverConfigOverlay.new(seed)

@@ -347,7 +347,7 @@ module Gori::Tui
         do_notes_close
         return
       end
-      @host.confirm("CLOSE NOTE", "Close \"#{@notes.current_label}\"?\nIts text will be discarded.",
+      @host.confirm("CLOSE NOTE", "Close “#{@notes.current_label}”?\nIts text will be discarded.",
         confirm_label: "close", danger: true) { do_notes_close }
     end
 

@@ -306,7 +306,7 @@ describe "C5 · HostsOverlay on the Overlay seam" do
       mnemonic(h, 'd')
       ov.to_overrides.should eq([{"beta.test", "10.0.0.2"}])
       saves.size.should eq(1)
-      toasts.last.should eq("removed host override: acme.test")
+      toasts.last.should eq("host override deleted: acme.test")
     end
   end
 
@@ -487,7 +487,9 @@ describe "C5 · EnvOverlay on the Overlay seam" do
       mnemonic(h, 'd')
       ov.to_config[1].should eq([{"HOST", "a"}])
       saves.size.should eq(1)
-      toasts.last.should eq("removed env: TOKEN")
+      # `<noun> deleted: <name>` — the shape every delete-success toast uses now, so it reads
+      # in parallel with its own failure line.
+      toasts.last.should eq("env var deleted: TOKEN")
     end
   end
 

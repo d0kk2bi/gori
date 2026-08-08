@@ -495,7 +495,7 @@ module Gori::Tui
         # traffic, and reporting "removed" over one that still gates is the failure this
         # branch exists to prevent. Selection cannot have moved — the confirm is modal.
         if pat = @project_view.scope_delete
-          @host.status("removed scope rule: #{pat}#{scope_blackhole_note}")
+          @host.status("scope rule deleted: #{pat}#{scope_blackhole_note}")
         else
           @host.status("scope rule NOT removed (project busy) — it still gates traffic")
         end
@@ -656,7 +656,7 @@ module Gori::Tui
       @host.confirm("DELETE HOST OVERRIDE", "Delete the override for “#{host}”? This can't be undone.",
         confirm_label: "delete", danger: true) do
         if removed = @project_view.ov_delete
-          @host.status("removed host override: #{removed}")
+          @host.status("host override deleted: #{removed}")
         end
       end
     end
@@ -719,7 +719,7 @@ module Gori::Tui
         confirm_label: "delete", danger: true) do
         if removed = @project_view.env_delete
           Env.save_project(@host.session.store, @project_view.env_vars)
-          @host.status("removed env: #{removed}")
+          @host.status("env var deleted: #{removed}")
         end
       end
     end

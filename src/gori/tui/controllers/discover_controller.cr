@@ -288,7 +288,7 @@ module Gori::Tui
     private def start_run(run : DiscoverRun) : Nil
       engine, err = build_engine(run)
       unless engine
-        @host.status(err || "cannot start discovery")
+        @host.status(err || "can't start discovery")
         return
       end
       run.engine = engine

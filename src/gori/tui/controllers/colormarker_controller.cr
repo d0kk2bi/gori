@@ -191,7 +191,7 @@ module Gori::Tui
         # rewriting live traffic", which would be alarmist AND false for a display rule.
         ok = engine.remove(rule.id, rule.scope)
         @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
-        @host.status(ok ? "colour rule deleted" : "rule NOT deleted (project busy) — the row colour is unchanged")
+        @host.status(ok ? "colour rule deleted: #{label}" : "colour rule NOT deleted (project busy) — the row colour is unchanged")
       end
     end
 

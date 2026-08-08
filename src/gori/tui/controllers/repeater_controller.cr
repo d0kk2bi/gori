@@ -1394,7 +1394,7 @@ module Gori::Tui
     # are discarded. No-op when no repeater is open.
     def request_close : Nil
       return unless tab = current_repeater_tab
-      @host.confirm("CLOSE REPEATER", "Close repeater \"#{tab.view.summary}\"?\nThe edited request and response are discarded.",
+      @host.confirm("CLOSE REPEATER", "Close repeater “#{tab.view.summary}”?\nThe edited request and response are discarded.",
         confirm_label: "close", danger: true) { close_repeater_tab }
     end
 

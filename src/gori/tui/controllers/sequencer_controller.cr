@@ -603,7 +603,7 @@ module Gori::Tui
       engine, err = view.build_engine(!@host.session.config.insecure_upstream?, @host.session.scope,
         @host.session.host_overrides)
       unless engine
-        @host.status(err || "cannot collect")
+        @host.status(err || "can't collect")
         return
       end
       view.begin_run
@@ -732,7 +732,7 @@ module Gori::Tui
     # --- close / persist ---
     def request_close : Nil
       return unless tab = current_tab_obj
-      @host.confirm("CLOSE SEQUENCER", "Close sequencing session \"#{tab.view.summary}\"?\nIts config and collected tokens are discarded.",
+      @host.confirm("CLOSE SEQUENCER", "Close sequencing session “#{tab.view.summary}”?\nIts config and collected tokens are discarded.",
         confirm_label: "close", danger: true) { close_tab }
     end
 

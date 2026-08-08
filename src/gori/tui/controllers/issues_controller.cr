@@ -398,23 +398,26 @@ module Gori::Tui
       # Marks can outlive the visible list (a filter change, a peer delete), so a batch
       # confirm spells out the split: this dialog — not the list chip — is the last thing
       # read before data is destroyed.
-      label =
+      # Two labels — see HistoryController#delete_selected, which this mirrors: the confirm
+      # body quotes the name, the toast reports it after a colon.
+      name =
         if ids.size == 1
-          "\"#{@issues.issue_summary(ids.first)}\""
+          @issues.issue_summary(ids.first)
         else
           hidden = @issues.hidden_count(ids)
           "#{ids.size} issues#{hidden > 0 ? " (#{hidden} not visible)" : ""}"
         end
+      label = ids.size == 1 ? "“#{name}”" : name
       @host.confirm(ids.size == 1 ? "DELETE ISSUE" : "DELETE ISSUES",
         "Delete #{label}?\nThis can't be undone.", confirm_label: "delete", danger: true) do
         # A rolled-back write (cross-process SQLite busy/lock) leaves the issues AND the marks
         # in place — say so instead of reporting a delete that didn't happen, so the set is
         # still there to retry.
         unless @issues.delete_ids(@host.session.store, ids)
-          @host.status("delete failed — project busy, marks kept; try again")
+          @host.status("issue NOT deleted (project busy) — the marks are kept, try again")
           next
         end
-        @host.status("deleted #{label}")
+        @host.status("issue deleted: #{name}")
       end
     end
 

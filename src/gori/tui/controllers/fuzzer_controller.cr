@@ -1030,7 +1030,7 @@ module Gori::Tui
       engine, err = v.build_engine(!@host.session.config.insecure_upstream?,
         @host.session.scope, @host.session.host_overrides)
       unless engine
-        @host.status(err || "cannot run")
+        @host.status(err || "can't run")
         return
       end
       total = begin
@@ -1219,7 +1219,7 @@ module Gori::Tui
 
     def request_close : Nil
       return unless tab = current_tab_obj
-      @host.confirm("CLOSE FUZZER", "Close fuzz session \"#{tab.view.summary}\"?\nIts template/config and results are discarded.",
+      @host.confirm("CLOSE FUZZER", "Close fuzz session “#{tab.view.summary}”?\nIts template/config and results are discarded.",
         confirm_label: "close", danger: true) { close_tab }
     end
 

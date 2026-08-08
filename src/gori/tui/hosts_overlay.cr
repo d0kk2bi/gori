@@ -131,7 +131,7 @@ module Gori::Tui
 
     private def delete_and_persist : Nil
       return unless host = delete_selected
-      toast(persist ? "removed host override: #{host}" : "removed #{host} — could not save to #{Settings.path}")
+      toast(persist ? "host override deleted: #{host}" : "host override deleted: #{host} — could not save to #{Settings.path}")
     end
 
     private def commit_and_persist : Nil

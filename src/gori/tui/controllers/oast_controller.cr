@@ -628,7 +628,7 @@ module Gori::Tui
 
     def delete_provider : Nil
       return unless p = selected_provider
-      @host.confirm("DELETE PROVIDER", "Delete OAST provider \"#{p.name}\"?\nIts callback history is kept.",
+      @host.confirm("DELETE PROVIDER", "Delete OAST provider “#{p.name}”?\nIts callback history is kept.",
         confirm_label: "delete", danger: true) do
         if l = @listeners.find { |ls| ls.provider_key == p.key }
           stop_listener(l)
