@@ -30,3 +30,38 @@ describe "verb reachability" do
     end
   end
 end
+
+# A rule list's actions belong to the KEYMAP, not to a hand-rolled `case` in its controller.
+# Four of the six deferred (Scope, Env, Host overrides, Probe rules); Rewriter and Colormarker
+# hardcoded `a / ↵,e / d / x / ⇧X / s / ⇧J / ⇧K` and registered every verb with `[] of Chord`,
+# so those two lists alone could not be rebound and their keys never met the `available?` gate
+# the space menu uses.
+describe "rule-list keys" do
+  it "are real chords on the verbs, for every rule list" do
+    r = Gori::Verbs.registry
+    {
+      "scope.add-rule", "env.add-var", "hostoverride.add-entry", "probe-rules.add",
+      "colormarker.add",
+    }.each do |id|
+      r[id].chords.should_not be_empty
+    end
+  end
+
+  it "gives Colormarker the same key set its controller used to hardcode" do
+    r = Gori::Verbs.registry
+    plain = ->(k : String) { Gori::Verb::Chord.new(k) }
+    shift = ->(k : String) { Gori::Verb::Chord.new(k, shift: true) }
+    r["colormarker.add"].chords.should contain(plain.call("a"))
+    r["colormarker.edit"].chords.should contain(plain.call("e"))
+    r["colormarker.edit"].chords.should contain(plain.call("enter"))
+    r["colormarker.delete"].chords.should contain(plain.call("d"))
+    r["colormarker.toggle"].chords.should contain(plain.call("x"))
+    r["colormarker.scope"].chords.should contain(plain.call("s"))
+    r["colormarker.toggle-default"].chords.should contain(shift.call("x"))
+    r["colormarker.move-down"].chords.should contain(shift.call("j"))
+    r["colormarker.move-up"].chords.should contain(shift.call("k"))
+    # …and the menu letter now names the key. It was 'g', which matched neither the verb
+    # ("Enable/disable everywhere") nor its ⇧X binding.
+    r["colormarker.toggle-default"].menu_key.should eq('X')
+  end
+end

@@ -102,7 +102,13 @@ module Gori::Tui
       when key.up?, c == 'k'                   then move_up
       when key.down?, c == 'j'                 then move_sel(1)
       when key.escape?                         then @host.request_focus(:menu)
-      else                                          return handle_action_key(ev, c)
+      else
+        # Everything else — a/↵/e/d/x/⇧X/s/⇧J/⇧K — defers to the central keymap, so the rule
+        # actions are REBINDABLE and dispatch through the same `available?` gate the space
+        # menu uses. They were a hand-rolled `case` here while the four sibling rule lists
+        # (Scope, Env, Host overrides, Probe rules) all bound real chords and deferred; this
+        # list and the Rewriter's were the two that could not be rebound.
+        return false
       end
       true
     end
@@ -114,22 +120,6 @@ module Gori::Tui
       else
         move_sel(-1)
       end
-    end
-
-    private def handle_action_key(ev : Termisu::Event::Key, c : Char?) : Bool
-      key = ev.key
-      case
-      when key.enter?, c == 'e' then colormarker_edit
-      when c == 'a'             then colormarker_add
-      when c == 'd'             then colormarker_delete
-      when c == 'x'             then colormarker_toggle
-      when c == 'X'             then colormarker_toggle_default
-      when c == 's'             then colormarker_scope_toggle
-      when c == 'J'             then colormarker_move(1)
-      when c == 'K'             then colormarker_move(-1)
-      else                           return false
-      end
-      true
     end
 
     private def move_sel(d : Int32) : Nil

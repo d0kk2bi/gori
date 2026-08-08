@@ -20,26 +20,26 @@ module Gori
 
       r.register Verb::Definition.new(
         "colormarker.add", "Add rule", "Open the editor to add a History row-colour rule",
-        Verb::Scope::Colormarker, available: in_cm, mnemonic: 'a') { |ctx| ctx.colormarker_add; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("a")], available: in_cm, mnemonic: 'a') { |ctx| ctx.colormarker_add; nil }
       r.register Verb::Definition.new(
         "colormarker.edit", "Edit rule", "Edit the selected rule in the popup editor",
-        Verb::Scope::Colormarker, available: has_rule, mnemonic: 'e') { |ctx| ctx.colormarker_edit; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("enter"), Verb::Chord.new("e")], available: has_rule, mnemonic: 'e') { |ctx| ctx.colormarker_edit; nil }
       r.register Verb::Definition.new(
         "colormarker.toggle", "Enable/disable", "Toggle the selected rule on or off in THIS project",
-        Verb::Scope::Colormarker, available: has_rule, mnemonic: 'x') { |ctx| ctx.colormarker_toggle; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("x")], available: has_rule, mnemonic: 'x') { |ctx| ctx.colormarker_toggle; nil }
       r.register Verb::Definition.new(
         "colormarker.delete", "Delete rule", "Delete the selected rule (confirms first)",
-        Verb::Scope::Colormarker, available: has_rule, mnemonic: 'd') { |ctx| ctx.colormarker_delete; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("d")], available: has_rule, mnemonic: 'd') { |ctx| ctx.colormarker_delete; nil }
       # "Move up/down" reads like cosmetics on the Rewriter, where rules compose and order is a
       # tiebreak. Here the FIRST enabled match paints the row and the rest are never consulted,
       # so a move changes which rule wins — the descriptions say so rather than leaving an
       # operator to discover it.
       r.register Verb::Definition.new(
         "colormarker.move-up", "Move up", "Give the selected rule higher precedence (first match wins)",
-        Verb::Scope::Colormarker, available: has_rule, mnemonic: 'u') { |ctx| ctx.colormarker_move(-1); nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("k", shift: true)], available: has_rule, mnemonic: 'u') { |ctx| ctx.colormarker_move(-1); nil }
       r.register Verb::Definition.new(
         "colormarker.move-down", "Move down", "Give the selected rule lower precedence (first match wins)",
-        Verb::Scope::Colormarker, available: has_rule, mnemonic: 'n') { |ctx| ctx.colormarker_move(1); nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("j", shift: true)], available: has_rule, mnemonic: 'n') { |ctx| ctx.colormarker_move(1); nil }
       r.register Verb::Definition.new(
         "colormarker.duplicate", "Duplicate rule", "Copy the selected rule into a new one",
         Verb::Scope::Colormarker, available: has_rule, mnemonic: 'c') { |ctx| ctx.colormarker_duplicate; nil }
@@ -53,11 +53,12 @@ module Gori
       global_rule = ->(ctx : Verb::ExecContext) { ctx.current_tab == :colormarker && ctx.colormarker_global_rule_selected? }
       r.register Verb::Definition.new(
         "colormarker.scope", "Global/project", "Move the selected rule between this project and the global library",
-        Verb::Scope::Colormarker, available: has_rule, mnemonic: 's') { |ctx| ctx.colormarker_scope_toggle; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("s")], available: has_rule, mnemonic: 's') { |ctx| ctx.colormarker_scope_toggle; nil }
       r.register Verb::Definition.new(
         "colormarker.toggle-default", "Enable/disable everywhere",
         "Flip a GLOBAL rule's default — the state every project without an override follows",
-        Verb::Scope::Colormarker, available: global_rule, mnemonic: 'g') { |ctx| ctx.colormarker_toggle_default; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("x", shift: true)],
+        available: global_rule, mnemonic: 'X') { |ctx| ctx.colormarker_toggle_default; nil }
     end
   end
 end
