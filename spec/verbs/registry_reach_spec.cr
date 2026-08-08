@@ -65,3 +65,37 @@ describe "rule-list keys" do
     r["colormarker.toggle-default"].menu_key.should eq('X')
   end
 end
+
+# `b` is the whitespace letter across the app: the global reveal is ^B (`view.reveal-ws`) and
+# the History detail binds bare `b` to `detail.toggle-ws`. The Repeater's space menu spent it
+# on hex — one keystroke away from a pane where the same letter reveals whitespace — while its
+# own chord for hex was ^X all along.
+describe "hex and whitespace letters" do
+  r = Gori::Verbs.registry
+
+  it "never spends `b` on hex" do
+    r.each do |v|
+      next unless v.id.includes?("hex")
+      v.menu_key.should_not eq('b')
+    end
+  end
+
+  it "keeps hex on ^X wherever it has a chord at all" do
+    ctrl_x = Gori::Verb::Chord.new("x", ctrl: true)
+    r.each do |v|
+      next unless v.id.includes?("hex")
+      next if v.chords.empty? # the response-pane dump is menu-only; ^X reaches it pane-dispatched
+      v.chords.should contain(ctrl_x)
+    end
+  end
+
+  it "leaves the two that CANNOT take `x`, and says why" do
+    # Not drift — a real collision in each displayable view:
+    #   HistoryDetail   `x` is `detail.select-line`      → `detail.toggle-hex` stays 'e'
+    #   Repeater :response `x` is `repeater.select-line` → `repeater.toggle-resp-hex` stays 'h'
+    r["repeater.toggle-hex"].menu_key.should eq('x')
+    r["detail.toggle-hex"].menu_key.should eq('e')
+    r["detail.select-line"].menu_key.should eq('x')
+    r["repeater.toggle-resp-hex"].menu_key.should eq('h')
+  end
+end

@@ -267,10 +267,16 @@ module Gori
       # request bytes, switch its envelope/decoded split, pretty-print its body —
       # mnemonics added so they front the :request space-menu group (previously
       # ctrl-only, so menu_key was nil and they were invisible there).
+      # 'x', matching its own ^X. It was 'b', and `b` is the app's WHITESPACE letter: the
+      # global reveal is ^B (`view.reveal-ws`) and the History detail binds bare `b` to
+      # `detail.toggle-ws`. So the Repeater's menu read `b` as hex while the drill-in one
+      # keystroke away read it as whitespace. `x` was free in `common ∪ :request` — the
+      # response pane's is not (`repeater.select-line` owns `x` there), which is why
+      # `repeater.toggle-resp-hex` keeps 'h' and `detail.toggle-hex` keeps 'e'.
       r.register Verb::Definition.new(
         "repeater.toggle-hex", "Toggle hex edit", "Edit the request as raw bytes — sends exactly what you type",
         Verb::Scope::Repeater, [Verb::Chord.new("x", ctrl: true)],
-        available: in_repeater, mnemonic: 'b', section: :request) { |ctx| ctx.repeater_toggle_hex; nil }
+        available: in_repeater, mnemonic: 'x', section: :request) { |ctx| ctx.repeater_toggle_hex; nil }
       r.register Verb::Definition.new(
         "repeater.toggle-decoded", "Switch envelope/decoded", "SAML/GraphQL/WS flow: switch envelope/decoded · otherwise: insert a § marker at the cursor",
         Verb::Scope::Repeater, [Verb::Chord.new("t", ctrl: true)],
