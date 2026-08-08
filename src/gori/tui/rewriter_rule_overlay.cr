@@ -421,11 +421,11 @@ module Gori::Tui
       sc = short_circuit_op?
       case i
       when ROW_NAME   then draw_field(screen, box, py, bg, fg, sel, "name:", @fields[:name])
-      when ROW_SCOPE  then draw_cycle(screen, x, py, bg, fg, "scope:", SCOPE_LABELS, @scope_i, sel)
-      when ROW_TARGET then sc ? draw_na(screen, x, py, bg, "target:", "request (a stub answers a request)") : draw_cycle(screen, x, py, bg, fg, "target:", TARGETS, @target_i, sel)
-      when ROW_OP     then draw_cycle(screen, x, py, bg, fg, "op:", OP_LABELS, @op_i, sel)
-      when ROW_MATCH  then hop ? draw_na(screen, x, py, bg, "match:") : draw_cycle(screen, x, py, bg, fg, "match:", MATCHES, @match_i, sel)
-      when ROW_PART   then (hop || sc) ? draw_na(screen, x, py, bg, "part:", sc ? "head (matches the request head)" : nil) : draw_cycle(screen, x, py, bg, fg, "part:", PARTS, @part_i, sel)
+      when ROW_SCOPE  then Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPE_LABELS, @scope_i, sel)
+      when ROW_TARGET then sc ? draw_na(screen, x, py, bg, "target:", "request (a stub answers a request)") : Frame.option_cycle(screen, x, py, box.right - 2, bg, "target:", TARGETS, @target_i, sel)
+      when ROW_OP     then Frame.option_cycle(screen, x, py, box.right - 2, bg, "op:", OP_LABELS, @op_i, sel)
+      when ROW_MATCH  then hop ? draw_na(screen, x, py, bg, "match:") : Frame.option_cycle(screen, x, py, box.right - 2, bg, "match:", MATCHES, @match_i, sel)
+      when ROW_PART   then (hop || sc) ? draw_na(screen, x, py, bg, "part:", sc ? "head (matches the request head)" : nil) : Frame.option_cycle(screen, x, py, box.right - 2, bg, "part:", PARTS, @part_i, sel)
       when ROW_HOST   then draw_field(screen, box, py, bg, fg, sel, "host:", @fields[:host])
       when ROW_FIND   then draw_field(screen, box, py, bg, fg, sel, hop ? "header:" : "find:", @fields[:pattern])
       when ROW_VALUE
@@ -461,18 +461,6 @@ module Gori::Tui
     private def draw_na(screen : Screen, x : Int32, py : Int32, bg : Color, label : String, note : String? = nil) : Nil
       screen.text(x, py, label, Theme.muted, bg)
       screen.text(x + label.size + 1, py, note || "n/a (header op)", Theme.muted, bg)
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
-                           label : String, opts : Array(String), sel_i : Int32, row_sel : Bool) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      tx = x + label.size + 1
-      opts.each_with_index do |opt, oi|
-        lit = oi == sel_i
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx, py, " #{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
-      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,

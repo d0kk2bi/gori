@@ -284,7 +284,7 @@ module Gori::Tui
       when ROW_NAME then draw_field(screen, box, py, bg, fg, sel, "name: $", @fields[:name])
       when ROW_WHEN then draw_field(screen, box, py, bg, fg, sel, "when:", @fields[:filter])
       when ROW_HOST then draw_field(screen, box, py, bg, fg, sel, "host:", @fields[:host])
-      when ROW_KIND then draw_cycle(screen, x, py, bg, fg, "from:", KINDS.map(&.label), @kind_i, sel)
+      when ROW_KIND then Frame.option_cycle(screen, x, py, box.right - 2, bg, "from:", KINDS.map(&.label), @kind_i, sel)
       when ROW_SELECTOR
         draw_field(screen, box, py, bg, fg, sel, selector_label, @fields[:selector]) unless position?
       when ROW_RANGE
@@ -304,18 +304,6 @@ module Gori::Tui
       in Gori::ExtractKind::JsonPath then "path:"
       in Gori::ExtractKind::Position then "range:"
       end
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
-                           label : String, opts : Array(String), sel_i : Int32, row_sel : Bool) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      tx = x + label.size + 1
-      opts.each_with_index do |opt, oi|
-        lit = oi == sel_i
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx, py, " #{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
-      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,

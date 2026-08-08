@@ -200,18 +200,12 @@ module Gori::Tui
       fg = sel ? Theme.text_bright : Theme.text
       case i
       when 0
-        screen.text(x, py, "kind:", Theme.muted, bg)
-        screen.text(x + 6, py, "#{kind}  ‹/›", fg, bg)
+        # `kind:` used to print the current value ALONE — so a form whose whole first question
+        # is "include or exclude?" never showed that the other answer existed. Both rows are
+        # strips now, through the same renderer as every other cycler in gori.
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "kind:", Scope::KINDS, @kind_idx, sel)
       when 1
-        screen.text(x, py, "type:", Theme.muted, bg)
-        # Show all types; the current one is bold (and bright when the row is selected)
-        tx = x + 6
-        Scope::TYPES.each_with_index do |t, ti|
-          lit = ti == @type_idx
-          col = lit ? (sel ? Theme.text_bright : Theme.accent) : Theme.muted
-          tx = screen.text(tx, py, " #{t} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-        end
-        screen.text(tx, py, " ‹/›", Theme.muted, bg)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "type:", Scope::TYPES, @type_idx, sel)
       when 2
         screen.text(x, py, "pattern:", Theme.muted, bg)
         vx = x + 9

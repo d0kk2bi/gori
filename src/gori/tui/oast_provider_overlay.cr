@@ -253,23 +253,15 @@ module Gori::Tui
       case i
       when ROW_NAME then draw_field(screen, box, py, "name:", @name, sel, bg, fg)
       when ROW_SCOPE
-        draw_cycle(screen, x, py, bg, sel, "scope:", SCOPES, @scope_i)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPES, @scope_i, sel)
       when ROW_TYPE
-        draw_cycle(screen, x, py, bg, sel, "type:", KINDS.map(&.label), @kind_idx)
+        Frame.option_cycle(screen, x, py, box.right - 2, bg, "type:", KINDS.map(&.label), @kind_idx, sel)
       when ROW_HOST  then draw_field(screen, box, py, "host:", @host, sel, bg, fg)
       when ROW_TOKEN then draw_field(screen, box, py, "token:", @token, sel, bg, fg)
       else
         label = valid? ? "[ Save provider ]" : "[ name + host required ]"
         screen.text(x, py, label, valid? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
       end
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, row_sel : Bool,
-                           label : String, opts : Array(String), sel_i : Int32) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      col = row_sel ? Theme.text_bright : Theme.accent
-      tx = screen.text(x + label.size + 1, py, opts[sel_i], col, bg, Attribute::Bold)
-      screen.text(tx, py, "  ‹/›", Theme.muted, bg)
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, label : String,

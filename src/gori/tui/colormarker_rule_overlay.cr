@@ -325,9 +325,9 @@ module Gori::Tui
       fg = sel ? Theme.text_bright : Theme.text
       case i
       when ROW_NAME  then draw_field(screen, box, py, bg, fg, sel, "name:", @fields[:name])
-      when ROW_SCOPE then draw_cycle(screen, x, py, bg, fg, "scope:", SCOPE_LABELS, @scope_i, sel)
+      when ROW_SCOPE then Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPE_LABELS, @scope_i, sel)
       when ROW_COLOR then draw_color_cycle(screen, x, py, bg, sel)
-      when ROW_STYLE then draw_style_cycle(screen, x, py, bg, fg, sel)
+      when ROW_STYLE then draw_style_cycle(screen, box, x, py, bg, sel)
       when ROW_WHEN  then draw_field(screen, box, py, bg, fg, sel, "when:", @fields[:when])
       else
         ok = valid?
@@ -349,16 +349,23 @@ module Gori::Tui
         col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
         tx = screen.text(tx + 1, py, "#{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
       end
-      screen.text(tx, py, "‹/›", Theme.muted, bg) if row_sel
+      # ` ‹/›` with the leading space, matching `Frame.option_cycle` — this row keeps its own
+      # renderer because each option carries a swatch, but it must not read differently from
+      # the cyclers directly above and below it.
+      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     # The style row carries a live SAMPLE of what the choice does, drawn against `Theme.bg` —
     # NOT against the row's own `bg`. The focused row is filled with `accent_bg`, and previewing
     # a canvas tint on top of the selection band would be a lie about how History will look.
-    private def draw_style_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
+    private def draw_style_cycle(screen : Screen, box : Rect, x : Int32, py : Int32, bg : Color,
                                  row_sel : Bool) : Nil
-      draw_cycle(screen, x, py, bg, fg, "style:", STYLE_LABELS, @style_i, row_sel)
-      sx = x + 8 + STYLE_LABELS.sum { |s| Screen.draw_width(s) + 2 } + (row_sel ? 4 : 0) + 2
+      # The sample sits two cells past whatever the cycler drew. `option_cycle` returns that x,
+      # so the offset is READ rather than re-derived — the hand-rolled `x + 8 + sum + (sel ? 4
+      # : 0) + 2` restated the label width, the per-option padding and the cue width a second
+      # time, which is three chances to disagree with the row above it.
+      sx = Frame.option_cycle(screen, x, py, box.right - 2, bg,
+        "style:", STYLE_LABELS, @style_i, row_sel) + 2
       hue = Theme.mark_color(color.to_sym)
       if style.full?
         screen.text(sx, py, " sample row ", Theme.text_bright, Theme.row_tint(hue, Theme.bg))
@@ -366,18 +373,6 @@ module Gori::Tui
         screen.cell(sx, py, '█', hue, Theme.bg)
         screen.text(sx + 1, py, " sample row ", Theme.text, Theme.bg)
       end
-    end
-
-    private def draw_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, fg : Color,
-                           label : String, opts : Array(String), sel_i : Int32, row_sel : Bool) : Nil
-      screen.text(x, py, label, Theme.muted, bg)
-      tx = x + label.size + 1
-      opts.each_with_index do |opt, oi|
-        lit = oi == sel_i
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx, py, " #{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
-      screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
     private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,

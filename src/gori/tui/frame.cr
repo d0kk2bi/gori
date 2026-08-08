@@ -146,6 +146,55 @@ module Gori::Tui
       focused ? Theme.focus_gold : Theme.border
     end
 
+    # One `label: opt opt opt ‹/›` option row — the control every rule form and config popup
+    # uses for a choice the ←/→ keys walk. Returns the x past what it drew.
+    #
+    # Three dialects had grown for this. Four rule forms carried a byte-identical private copy
+    # (the strip below); the OAST provider form and the Scope form's `kind:` row drew ONLY the
+    # lit value, so an operator could not see that other choices existed; and the Miner and
+    # Sequencer configs drew the value with `‹/›` in the value's own colour, unconditionally.
+    #
+    # The rule this settles on is neither "always a strip" nor "always the value". A strip is
+    # how a choice advertises itself, so it wins WHEN IT FITS — but `MAX_REQ_CHOICES` is eight
+    # numbers plus `uncapped`, and forcing that into a 72-column card would push the row off
+    # its own edge. So: measure, draw the strip if there is room, otherwise fall back to the
+    # lit value alone. One renderer, one look wherever the width allows it, and the fallback is
+    # a width response rather than a per-file opinion.
+    #
+    # `right` is the exclusive right edge the row may use (a card's `box.right - 2`).
+    # The `‹/›` cue is drawn ONLY when the row has focus — it names keys that do nothing
+    # anywhere else, and several of these forms used to show it on every row at once.
+    # `value_x` pins the options to a fixed column instead of letting them follow the label.
+    # Only the Sequencer's config passes one: its rows share a value column with a text field,
+    # and dropping the alignment to gain the shared renderer would have been a trade in the
+    # wrong direction. Where a form has no such column — everywhere else — the options sit one
+    # cell past the label, as they always have.
+    def self.option_cycle(screen : Screen, x : Int32, y : Int32, right : Int32, bg : Color,
+                          label : String, options : Array(String), selected : Int32,
+                          focused : Bool, value_x : Int32? = nil,
+                          lit : Color? = nil) : Int32
+      after_label = screen.text(x, y, label, Theme.muted, bg) + 1
+      tx = value_x || after_label
+      cue = focused ? " ‹/›" : ""
+      cue_w = Screen.draw_width(cue)
+      strip_w = options.sum { |o| Screen.draw_width(o) + 2 }
+      # `lit` overrides the colour of the CHOSEN option. One caller needs it: the Probe active
+      # scan's `unsafe methods:` row, where the chosen state can put DELETE on the wire and has
+      # to shout in red. Passing the colour beats repainting the option afterwards, which would
+      # mean re-deriving the x this method already knows.
+      lit_col = lit || (focused ? Theme.text_bright : Theme.accent)
+      if tx + strip_w + cue_w <= right
+        options.each_with_index do |opt, i|
+          on = i == selected
+          tx = screen.text(tx, y, " #{opt} ", on ? lit_col : Theme.muted, bg,
+            on ? Attribute::Bold : Attribute::None)
+        end
+      elsif value = options[selected]?
+        tx = screen.text(tx, y, value, lit_col, bg, Attribute::Bold)
+      end
+      focused ? screen.text(tx, y, cue, Theme.muted, bg) : tx
+    end
+
     # A left-aligned mode/toggle chip at (x,y), returning the x past it. `lit` (active)
     # paints bright text on an accent fill; off is a muted, background-less label. Used
     # for keyed toggle chips on a pane's top border (e.g. Repeater's `d:diff`/`x:hex`).

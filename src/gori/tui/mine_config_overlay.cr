@@ -254,7 +254,7 @@ module Gori::Tui
         label = any_checked? ? "[ Start mining ]" : "[ select a location ]"
         screen.text(x, py, label, any_checked? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
       else
-        draw_cycler(screen, x, py, bg, sel, i)
+        draw_cycler(screen, x, py, box.right - 2, bg, sel, i)
       end
     end
 
@@ -266,19 +266,25 @@ module Gori::Tui
       screen.text(x + 4, py, label, sel ? Theme.text_bright : Theme.text, bg)
     end
 
-    # The three ←/›-cycled rows, split out of draw_row so adding a knob does not keep
+    # The three ←/→-cycled rows, split out of draw_row so adding a knob does not keep
     # growing one branch chain.
-    private def draw_cycler(screen : Screen, x : Int32, py : Int32, bg : Color, sel : Bool, i : Int32) : Nil
-      label, value =
+    #
+    # Through `Frame.option_cycle` like every other cycler in gori: the choices are drawn as a
+    # strip when the card is wide enough to hold one, and fall back to the lit value when it is
+    # not. That fallback is why this row used to be hand-rolled — `MAX_REQ_CHOICES` is eight
+    # numbers plus `uncapped` and does not always fit — but the helper decides that by
+    # measuring rather than by which file it lives in.
+    private def draw_cycler(screen : Screen, x : Int32, py : Int32, right : Int32, bg : Color,
+                            sel : Bool, i : Int32) : Nil
+      label, options, idx =
         if i == maxreq_row
-          {"max requests:", MAX_REQ_CHOICES[@maxreq_idx].try(&.to_s) || "uncapped"}
+          {"max requests:", MAX_REQ_CHOICES.map { |c| c.try(&.to_s) || "uncapped" }, @maxreq_idx}
         elsif i == conc_row
-          {"concurrency:", CONC_CHOICES[@conc_idx].to_s}
+          {"concurrency:", CONC_CHOICES.map(&.to_s), @conc_idx}
         else
-          {"notification:", NOTIFY_CHOICES[@notify_idx].label}
+          {"notification:", NOTIFY_CHOICES.map(&.label), @notify_idx}
         end
-      screen.text(x, py, label, Theme.muted, bg)
-      screen.text(x + label.size + 1, py, "#{value}  ‹/›", sel ? Theme.text_bright : Theme.text, bg)
+      Frame.option_cycle(screen, x, py, right, bg, label, options, idx, sel)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?

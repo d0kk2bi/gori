@@ -36,6 +36,31 @@ describe "shared card chrome" do
     offenders.should be_empty
   end
 
+  it "leaves the ‹/› cycler to Frame.option_cycle" do
+    # Three dialects had grown for one control: the full strip (four rule forms, byte-identical
+    # private copies), the lit value alone (OAST provider, the Scope form's `kind:` row), and a
+    # value with the cue in its own colour drawn on every row whether focused or not (Miner,
+    # Sequencer, Probe active, Compact, Discover). The middle one is the costly one — a form
+    # whose entire first question is "include or exclude?" showed only the current answer.
+    #
+    # Colormarker's colour row is the sole exception and draws its own: each option carries a
+    # hue swatch, which no generic renderer can place. It is required to spell the cue the
+    # same way, which is what this check enforces for it.
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      next if File.basename(path) == "frame.cr"
+      File.read(path).lines.each_with_index do |line, i|
+        next unless line.includes?("‹/›")
+        next unless line.includes?("screen.text")
+        # The one hand-drawn cue left, and it must match `option_cycle`'s exactly.
+        next if File.basename(path) == "colormarker_rule_overlay.cr" &&
+                line.includes?(%[" ‹/›", Theme.muted, bg) if row_sel])
+        offenders << "#{File.basename(path)}:#{i + 1}"
+      end
+    end
+    offenders.should be_empty
+  end
+
   it "leaves the scroll affordance to Frame.scroll_gauge" do
     # The Settings theme list painted ▲ / ▼ / ↕ into its own last interior column — an
     # affordance no other list in gori had, which said "there is more" without saying how
@@ -79,6 +104,66 @@ describe Gori::Tui::Frame do
       backend = MemoryBackend.new(40, 10)
       Frame.border_meta(Screen.new(backend), card, "SCOPE", "")
       backend.contains?("SCOPE").should be_false # nothing drawn at all — card() draws the title
+    end
+  end
+
+  describe ".option_cycle" do
+    it "draws the whole strip when there is room for it" do
+      # The point of a strip: the alternatives are visible without pressing anything.
+      backend = MemoryBackend.new(60, 4)
+      Frame.option_cycle(Screen.new(backend), 0, 0, 60, Theme.panel,
+        "kind:", ["include", "exclude"], 0, false)
+      backend.row(0).should contain("include")
+      backend.row(0).should contain("exclude")
+    end
+
+    it "falls back to the chosen value alone when the strip will not fit" do
+      # `MAX_REQ_CHOICES` is eight numbers plus `uncapped`; on a narrow card the strip would
+      # run off the row. The fallback is a WIDTH decision made here, which is what lets every
+      # caller use one renderer — the Miner and Sequencer configs used to hard-code it.
+      backend = MemoryBackend.new(30, 4)
+      opts = ["uncapped", "100", "250", "500", "1000", "2500", "5000", "10000"]
+      Frame.option_cycle(Screen.new(backend), 0, 0, 30, Theme.panel,
+        "max requests:", opts, 2, false)
+      backend.row(0).should contain("250")
+      backend.row(0).should_not contain("uncapped")
+      backend.row(0).should_not contain("10000")
+    end
+
+    it "shows the ‹/› cue only while the row has focus" do
+      # Several forms drew it on every row at once, which advertises keys that do nothing
+      # unless that row is the selected one.
+      focused = MemoryBackend.new(60, 4)
+      Frame.option_cycle(Screen.new(focused), 0, 0, 60, Theme.panel,
+        "kind:", ["include", "exclude"], 0, true)
+      focused.row(0).should contain("‹/›")
+
+      resting = MemoryBackend.new(60, 4)
+      Frame.option_cycle(Screen.new(resting), 0, 0, 60, Theme.panel,
+        "kind:", ["include", "exclude"], 0, false)
+      resting.row(0).should_not contain("‹/›")
+    end
+
+    it "reserves room for the cue, so focusing a row cannot push the strip off the edge" do
+      # A width that fits the strip but NOT the strip plus the cue must take the fallback,
+      # or selecting the row would silently truncate the last option.
+      opts = ["alpha", "bravo", "charlie"]
+      # label 5 + 1, strip = 7 + 7 + 9 = 23 → 29; the cue is 4 more.
+      backend = MemoryBackend.new(40, 4)
+      Frame.option_cycle(Screen.new(backend), 0, 0, 31, Theme.panel,
+        "kind:", opts, 1, true)
+      backend.row(0).should contain("bravo")
+      backend.row(0).should_not contain("charlie")
+    end
+
+    it "returns the x past what it drew, for a caller placing something after it" do
+      # The Colormarker style row puts a live sample two cells past the cycler and used to
+      # re-derive that x from the label width, the option padding and the cue width.
+      backend = MemoryBackend.new(60, 4)
+      stop = Frame.option_cycle(Screen.new(backend), 0, 0, 60, Theme.panel,
+        "style:", ["full row", "strip"], 0, false)
+      # "style:" (6) + 1 + " full row " (10) + " strip " (7) = 24
+      stop.should eq(24)
     end
   end
 end
