@@ -479,15 +479,23 @@ module Gori::Tui
       @host.open_scope_rule_editor(rule.id, rule.kind, rule.match_type, rule.pattern)
     end
 
+    # Deleting a scope rule CONFIRMS, the way deleting a rewrite, colour or probe rule already
+    # did. These three project lists were the only policy rules `d` removed outright — and of
+    # the four, a scope rule is the one whose loss changes what the proxy lets through, so an
+    # accidental keypress here is the most expensive of the set.
     def scope_delete_rule : Nil
-      # Read the selection BEFORE the delete so a refused write can be told apart from an
-      # empty list: `scope_delete` returns nil for both, and staying silent about the first
-      # leaves the rule on screen with no hint that the keypress did nothing.
-      selected = @project_view.selected_rule
-      if pat = @project_view.scope_delete
-        @host.status("removed scope rule: #{pat}#{scope_blackhole_note}")
-      elsif selected
-        @host.status("scope rule NOT removed (project busy) — it still gates traffic")
+      rule = @project_view.selected_rule || return @host.status("no scope rule selected")
+      label = "#{rule.include? ? "incl" : "excl"} #{rule.match_type} #{rule.pattern}"
+      @host.confirm("DELETE SCOPE RULE", "Delete “#{label}”? This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        # The store's answer, not an assumption: a rolled-back batch leaves the rule gating
+        # traffic, and reporting "removed" over one that still gates is the failure this
+        # branch exists to prevent. Selection cannot have moved — the confirm is modal.
+        if pat = @project_view.scope_delete
+          @host.status("removed scope rule: #{pat}#{scope_blackhole_note}")
+        else
+          @host.status("scope rule NOT removed (project busy) — it still gates traffic")
+        end
       end
     end
 
@@ -640,8 +648,12 @@ module Gori::Tui
     end
 
     def hostov_delete_entry : Nil
-      if host = @project_view.ov_delete
-        @host.status("removed host override: #{host}")
+      host = @project_view.selected_override_host || return @host.status("no host override selected")
+      @host.confirm("DELETE HOST OVERRIDE", "Delete the override for “#{host}”? This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        if removed = @project_view.ov_delete
+          @host.status("removed host override: #{removed}")
+        end
       end
     end
 
@@ -696,9 +708,14 @@ module Gori::Tui
     end
 
     def env_delete_var : Nil
-      if key_name = @project_view.env_delete
-        Env.save_project(@host.session.store, @project_view.env_vars)
-        @host.status("removed env: #{key_name}")
+      key = @project_view.selected_env_key || return @host.status("no env var selected")
+      # The KEY, never the value — a confirm is a modal an operator may be sharing a screen on.
+      @host.confirm("DELETE ENV VAR", "Delete “#{key}”? This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        if removed = @project_view.env_delete
+          Env.save_project(@host.session.store, @project_view.env_vars)
+          @host.status("removed env: #{removed}")
+        end
       end
     end
 

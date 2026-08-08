@@ -304,8 +304,8 @@ module Gori::Tui
           screen.text(box.x + 2, pv_y, band, Theme.muted, Theme.panel, width: box.w - 4)
         end
       end
-      hint_y = box.bottom - 1
-      screen.text(box.x + 2, hint_y, hint, Theme.muted, Theme.panel, width: box.w - 4) if hint_y > first
+      # No key hint on the bottom border — the shell draws `hint` in the status strip for the
+      # open modal (Runner#key_hints). See RewriterRuleOverlay#render for the whole argument.
     end
 
     private def completion_band : String

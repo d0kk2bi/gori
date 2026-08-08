@@ -82,7 +82,10 @@ module Gori::Tui
     end
 
     def hint : String
-      "one header per line · Host/Connection ignored · esc saves & closes"
+      # Keys only. The two format rules this editor enforces are stated on the card's own
+      # band, where the operator is already looking to type them — repeating them down here
+      # was the same sentence in two places, which is how the two spellings drifted.
+      "type headers · esc saves & closes"
     end
 
     # There is nothing to cancel INTO — the user is still inside the Discover popup — so a
@@ -205,7 +208,10 @@ module Gori::Tui
       if refused = @refused
         screen.text(box.x + 2, hintline, refused, Theme.red, Theme.bg, width: box.w - 4)
       else
-        screen.text(box.x + 2, hintline, "one per line · Host/Connection ignored · esc saves & closes", Theme.muted, Theme.bg, width: box.w - 4)
+        # The two rules this editor enforces, which nothing else states. The `esc saves &
+        # closes` tail came off — the shell draws `hint` in the status strip for the open
+        # modal, so spelling the key here was the same advice twice.
+        screen.text(box.x + 2, hintline, "one per line · Host/Connection ignored", Theme.muted, Theme.bg, width: box.w - 4)
       end
     end
 

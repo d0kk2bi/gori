@@ -568,8 +568,8 @@ module Gori::Tui
       # looks the same as a project rule's apart from one badge, and the confirm is the last
       # place to notice which of the two is about to go.
       note = rule.global? ? " It is a GLOBAL rule — this removes it from every project." : ""
-      @host.confirm("Delete rule", "Delete “#{label}”?#{note} This can't be undone.",
-        confirm_label: "Delete", danger: true) do
+      @host.confirm("DELETE RULE", "Delete “#{label}”?#{note} This can't be undone.",
+        confirm_label: "delete", danger: true) do
         # The store's answer, not an assumption: a rolled-back write left the rule rewriting
         # live traffic while this toasted "rule deleted". Both headless surfaces already
         # refuse to say that (`mcp/tools/rules.cr`, `cli/run/rewriter.cr`).
@@ -701,8 +701,8 @@ module Gori::Tui
 
     def extract_delete : Nil
       rule = selected_extract_rule || return @host.status("no extract rule selected")
-      @host.confirm("Delete extract rule", "Delete “$#{rule.name}”? Its binding is forgotten too.",
-        confirm_label: "Delete", danger: true) do
+      @host.confirm("DELETE EXTRACT RULE", "Delete “$#{rule.name}”? Its binding is forgotten too.",
+        confirm_label: "delete", danger: true) do
         ok = bindings.remove(rule.id)
         @sub_sel = @sub_sel.clamp(0, {extract_list.size - 1, 0}.max)
         @host.status(ok ? "extract rule deleted" : "extract rule NOT deleted (project busy) — it is still observing responses")

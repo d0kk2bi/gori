@@ -4865,8 +4865,11 @@ module Gori::Tui
       ov = active_overlay.as?(DiscoverConfigOverlay)
       names = hdrs.first(3).map { |n, _| n }.join(", ")
       names += ", …" if hdrs.size > 3
-      confirm("Use this flow's headers?",
-        "#{hdrs.size} header(s) from flow ##{id}: #{names}",
+      # The heading is the card's TITLE, so it takes the same shape as every other confirm
+      # (and every other card in gori): an uppercase noun for what this is about. The question
+      # itself belongs in the body, one line down, where the rest of them ask it.
+      confirm("USE FLOW HEADERS",
+        "Use this flow's headers? #{hdrs.size} header(s) from flow ##{id}: #{names}",
         confirm_label: "use", cancel_label: "start clean",
         danger: false, return_to: :discover_config) { ov.try(&.set_headers(hdrs)) }
     end

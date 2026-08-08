@@ -478,8 +478,11 @@ module Gori::Tui
 
     def rules_delete : Nil
       c = @rules.selected_row.try(&.custom) || return
-      @host.confirm("DELETE RULE",
-        "Delete custom rule \"#{c.title}\"?\nExisting findings from it are kept until cleared.",
+      # Sentence-case title, `Delete` button — the same dress every other policy-rule delete
+      # wears. This one shouted "DELETE RULE" over a lowercase `delete` button, so the one
+      # dialog an operator sees least often was also the one that looked unlike the rest.
+      @host.confirm("DELETE PROBE RULE",
+        "Delete custom rule “#{c.title}”? Existing findings from it are kept until cleared.",
         confirm_label: "delete", danger: true) do
         c.global? ? Settings.delete_scan_rule(c.id) : @host.session.store.delete_probe_custom_rule(c.id.to_i64)
         reload_rules

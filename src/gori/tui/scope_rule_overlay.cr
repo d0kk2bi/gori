@@ -68,7 +68,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · ←/→ kind·type · type pattern · ↵ save · esc cancel"
+      "↑/↓ field · ←/→ options · type pattern · ↵ save · esc cancel"
     end
 
     # Click a field row to select it; a click on Save commits; a click outside the card
@@ -187,12 +187,8 @@ module Gori::Tui
         break if py >= box.bottom - 1
         draw_row(screen, box, i, py)
       end
-      # Footer hint
-      hint_y = box.bottom - 1
-      if hint_y > first
-        screen.text(box.x + 2, hint_y, "↑/↓ field · ←/→ kind·type · ↵ save · esc cancel",
-          Theme.muted, Theme.panel, width: box.w - 4)
-      end
+      # No key hint on the bottom border — the shell draws `hint` in the status strip for the
+      # open modal (Runner#key_hints). See RewriterRuleOverlay#render for the whole argument.
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil

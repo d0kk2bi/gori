@@ -208,9 +208,13 @@ module Gori::Tui
       bg = sel ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
       screen.fill(Rect.new(rect.x, y, rect.w, 1), bg)
       screen.cell(rect.x, y, sel ? '▎' : ' ', Theme.accent, bg)
-      box = row.enabled? ? "[x]" : "[ ]"
-      screen.text(rect.x + 2, y, box, row.enabled? ? Theme.green : Theme.muted, bg)
-      namex = rect.x + 6
+      # `✓`/`·` in accent — the same mark the Rewriter and Colormarker lists use for the same
+      # question. This list used to answer it with a green `[x]`/`[ ]`, so three rule lists an
+      # operator moves between spelled one state three ways. The checkbox also cost two extra
+      # columns, which is why the name starts at +4 now rather than +6: same offsets as the
+      # siblings, so the three lists line up when you switch tabs.
+      screen.cell(rect.x + 2, y, row.enabled? ? '✓' : '·', row.enabled? ? Theme.accent : Theme.muted, bg)
+      namex = rect.x + 4
       name_fg = sel ? Theme.text_bright : (row.enabled? ? Theme.text : Theme.muted)
       # The right side (meta column + optional note badge) is laid out first, so the name gets
       # whatever width remains to its left.

@@ -77,7 +77,7 @@ module Gori::Tui
     end
 
     private def ensure_visible(inner : Rect, count : Int32) : Nil
-      lh = @view.row_capacity(inner)
+      lh = @view.row_capacity(inner, count)
       return if lh <= 0
       if @sel < @scroll
         @scroll = @sel
@@ -141,8 +141,10 @@ module Gori::Tui
       @host.focus_body
       inner = BodyChrome.frame_inner(rect)
       @last_body = inner
-      if idx = @view.row_at(inner, my, @scroll)
-        @sel = idx.clamp(0, {rule_list.size - 1, 0}.max) if idx < rule_list.size
+      # `row_at` already refuses the note row and anything past the last rule, so a hit is
+      # a real index — the clamp below is the belt to its braces, not the bounds check.
+      if idx = @view.row_at(inner, my, @scroll, rule_list.size)
+        @sel = idx.clamp(0, {rule_list.size - 1, 0}.max)
       end
       true
     end
@@ -155,9 +157,10 @@ module Gori::Tui
 
     def handle_wheel(step : Int32) : Bool
       return false if @last_body.empty?
-      lh = @view.row_capacity(@last_body)
+      count = rule_list.size
+      lh = @view.row_capacity(@last_body, count)
       return false if lh <= 0
-      @scroll = (@scroll + step).clamp(0, {rule_list.size - lh, 0}.max)
+      @scroll = (@scroll + step).clamp(0, {count - lh, 0}.max)
       true
     end
 
@@ -181,8 +184,8 @@ module Gori::Tui
       # A global rule is deleted out of EVERY project, and the prompt has to say so — the row
       # differs from a project rule's by one badge, and the confirm is the last place to notice.
       note = rule.global? ? " It is a GLOBAL rule — this removes it from every project." : ""
-      @host.confirm("Delete colour rule", "Delete “#{label}”?#{note} This can't be undone.",
-        confirm_label: "Delete", danger: true) do
+      @host.confirm("DELETE COLOUR RULE", "Delete “#{label}”?#{note} This can't be undone.",
+        confirm_label: "delete", danger: true) do
         # The store's answer, not an assumption. The failure text says what is actually still
         # true — the row keeps its colour — rather than borrowing the Rewriter's "still
         # rewriting live traffic", which would be alarmist AND false for a display rule.

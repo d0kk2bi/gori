@@ -164,7 +164,9 @@ module Gori::Tui
       sel = i == @selected
       bg = sel ? Theme.accent_bg : Theme.panel
       screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.yellow, bg)
+      # `Theme.accent` — the selection bar reads the same in every list. The yellow it used to
+      # carry said nothing this row does not: the pattern column below is already yellow.
+      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
 
       conns = "#{entry.connections} conn#{entry.connections == 1 ? "" : "s"}"
       stamp = ago(entry.first_seen)

@@ -42,9 +42,9 @@ module Gori::Tui
     SCOPES       = %w[project global]
     SCOPE_LABELS = ["this project", "global (every project)"]
     TARGETS      = %w[request response]
-    OPS       = %w[replace add_header set_header remove_header short_circuit]
-    OP_LABELS = ["replace", "add header", "set header", "remove header", "stub"]
-    MATCHES   = %w[literal regex]
+    OPS          = %w[replace add_header set_header remove_header short_circuit]
+    OP_LABELS    = ["replace", "add header", "set header", "remove header", "stub"]
+    MATCHES      = %w[literal regex]
     # `ws` rewrites a WebSocket MESSAGE on an upgraded (101) flow, with `target:` picking
     # the direction (request = client→server, response = server→client). It is its own part
     # rather than a flavour of `body` so that no existing body rule starts touching frames.
@@ -403,9 +403,11 @@ module Gori::Tui
         screen.fill(Rect.new(box.x + 1, pv_y, box.w - 2, 1), Theme.panel)
         screen.text(box.x + 2, pv_y, "▶ #{@preview}", Theme.muted, Theme.panel, width: box.w - 4)
       end
-      hint_y = box.bottom - 1
-      screen.text(box.x + 2, hint_y, "↑/↓ field · ←/→ options · ↵ save · esc cancel",
-        Theme.muted, Theme.panel, width: box.w - 4) if hint_y > first
+      # No key hint on the bottom border: the shell already draws `hint` in the status strip
+      # for whichever modal is open (Runner#key_hints), so a second copy here was the same
+      # advice twice — and the two had already drifted apart, this one having dropped the
+      # `type find/value` clause the method still carries. Per-row affordances stay where the
+      # key applies (the `‹/›` a cycler draws when it has focus).
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil

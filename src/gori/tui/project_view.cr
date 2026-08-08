@@ -721,6 +721,13 @@ module Gori::Tui
       end
     end
 
+    # The selected override's host, for the delete CONFIRM to name what it is about to remove.
+    # Read-only and separate from `ov_delete` because the confirm has to say the name BEFORE
+    # the row is gone, and `ov_delete` can only report it after.
+    def selected_override_host : String?
+      current_override.try(&.host)
+    end
+
     # Removes the selected override, returning its host (for the toast) or nil.
     def ov_delete : String?
       entry = current_override
@@ -855,6 +862,13 @@ module Gori::Tui
       cancel_env_add
       clamp_env_sel
       :ok
+    end
+
+    # The selected variable's KEY, for the delete confirm to name it before it is gone. Never
+    # the value: a confirm that echoed a secret would print it into a modal the operator may
+    # be screen-sharing, and the key alone identifies the row.
+    def selected_env_key : String?
+      @env_items[@env_sel]?.try { |(key, _)| key }
     end
 
     def env_delete : String?
@@ -1146,12 +1160,18 @@ module Gori::Tui
         idx = scroll + i
         rule = rules[idx]
         ry = y + i
-        selected = focused && idx == @sel
-        bg = selected ? Theme.accent_bg : Theme.bg
-        if selected
-          screen.fill(Rect.new(inner.x, ry, inner.w, 1), bg)
-          screen.cell(inner.x, ry, '▎', Theme.accent, bg)
-        end
+        # The selection SURVIVES a focus change, dimmed — every other list in gori does this
+        # (`Theme.selection_dim`, see RewriterView/ProbeRulesView/DiscoverView…). These three
+        # project cards were the only ones that gated the whole marker on `focused`, so moving
+        # focus to a sibling card erased any sign of where you were in this one, and coming
+        # back meant finding your row again by eye.
+        selected = idx == @sel
+        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(inner.x, ry, inner.w, 1), bg) if selected
+        # The marker column is written on EVERY row (a space when unselected), the way every
+        # other list writes it — so the column is owned here rather than left to whatever was
+        # on the canvas underneath.
+        screen.cell(inner.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_rule_row(screen, inner, ry, rule, selected, bg)
       end
     end
@@ -1210,12 +1230,12 @@ module Gori::Tui
         idx = scroll + i
         entry = entries[idx]
         ry = y + i
-        selected = focused && idx == @ov_sel && !@ov_adding
-        bg = selected ? Theme.accent_bg : Theme.bg
-        if selected
-          screen.fill(Rect.new(list.x, ry, list.w, 1), bg)
-          screen.cell(list.x, ry, '▎', Theme.accent, bg)
-        end
+        # Dimmed rather than erased when focus leaves — see the SCOPE list above. `@ov_adding`
+        # still clears it outright: while the add-row is open there is no selected ENTRY.
+        selected = idx == @ov_sel && !@ov_adding
+        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(list.x, ry, list.w, 1), bg) if selected
+        screen.cell(list.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_ov_row(screen, list, ry, entry, selected, bg)
       end
     end
@@ -1283,12 +1303,11 @@ module Gori::Tui
         idx = scroll + i
         key, val = @env_items[idx]
         ry = y + i
-        selected = focused && idx == @env_sel && !@env_adding
-        bg = selected ? Theme.accent_bg : Theme.bg
-        if selected
-          screen.fill(Rect.new(list.x, ry, list.w, 1), bg)
-          screen.cell(list.x, ry, '▎', Theme.accent, bg)
-        end
+        # Dimmed rather than erased when focus leaves — see the SCOPE list above.
+        selected = idx == @env_sel && !@env_adding
+        bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(list.x, ry, list.w, 1), bg) if selected
+        screen.cell(list.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_env_row(screen, list, ry, key, val, selected, bg)
       end
     end

@@ -111,7 +111,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · type to edit selector · ←/→ cycle · ↵ start · esc cancel"
+      "↑/↓ field · type to edit selector · ←/→ options · ↵ start · esc cancel"
     end
 
     # Own key handling (formerly Runner#handle_sequence_config_key). ↑/↓ move fields; the

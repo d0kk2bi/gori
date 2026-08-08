@@ -118,7 +118,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ field · ←/→ adjust · ␣ toggle · ↵ start · esc cancel"
+      "↑/↓ field · ←/→ options · ␣ toggle · ↵ start · esc cancel"
     end
 
     # Own key handling (formerly Runner#handle_mine_config_key): ↑/↓ move, ←/→ adjust

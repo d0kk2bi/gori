@@ -170,7 +170,13 @@ module Gori::Tui
       sel = i == @selected
       bg = sel ? Theme.accent_bg : Theme.panel
       screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', status_color(row), bg)
+      # `Theme.accent`, not this row's status colour. The glyph is only drawn when the row is
+      # SELECTED (unselected rows get a space, where a foreground colour renders nothing), so
+      # tinting it never coloured the list — it recoloured the one bar whose job is to say
+      # "you are here", making the selection indicator mean two things at once. The status is
+      # already stated in words on this row: the up/down tail below, or the error reason in
+      # the detail column.
+      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
 
       # A broken listener's status is the reason, shown in the detail column, so the right-hand
       # column is left empty rather than saying "down" as well — one fact, one place.
