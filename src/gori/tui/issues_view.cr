@@ -1020,11 +1020,15 @@ module Gori::Tui
     end
 
     private def status_color(s : Store::Status) : Color
+      # SEVERITY owns the colour ladder on these rows; triage status does not compete for it.
+      # The two were drawn five columns apart out of the SAME hues — `CRIT conf` was two reds
+      # meaning two different axes, `LOW open` two accents — on a list whose whole job is
+      # "scan for red". The four words (conf / fp / done / open) already tell the statuses
+      # apart, so what is left for colour here is the one distinction the WORDS do not make
+      # at a glance: still live, or already handled.
       case s
-      when .confirmed?      then Theme.red
-      when .false_positive? then Theme.muted
-      when .resolved?       then Theme.green
-      else                       Theme.accent # open
+      when .false_positive?, .resolved? then Theme.muted
+      else                                   Theme.text # open
       end
     end
 

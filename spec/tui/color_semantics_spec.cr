@@ -83,3 +83,69 @@ describe "state signals carry a word or a glyph" do
     offenders.should be_empty
   end
 end
+
+# Two axes, one ladder. Severity (CRIT/HIGH/MED/LOW/INFO) and triage status
+# (conf/fp/done/open) are drawn five columns apart on every row of the Issues and Probe
+# lists, and both used to draw from red/accent/muted — so `CRIT conf` was two reds meaning
+# two different things and `LOW open` two accents. On a list whose entire job is "scan for
+# red", three of five reds could be triage state.
+describe "severity and triage status" do
+  it "do not share a colour ladder" do
+    root = File.join(__DIR__, "..", "..", "src", "gori", "tui")
+    # The hues severity owns. A status branch reaching for any of them is the collision.
+    severity_hues = ["Theme.red", "Theme.orange", "Theme.yellow", "Theme.accent"]
+    offenders = [] of String
+    {"issues_view.cr", "probe_view.cr"}.each do |name|
+      src = File.read(File.join(root, name))
+      body = src[/def status_color\(s : Store::Status\).*?\n    end/m]?
+      body.should_not be_nil
+      severity_hues.each do |hue|
+        offenders << "#{name} — status_color uses #{hue}" if body.not_nil!.includes?(hue)
+      end
+    end
+    # The picker teaches what a status colour MEANS, so it must not contradict the lists.
+    picker = File.read(File.join(root, "choice_picker.cr"))
+    status_block = picker[/def self\.for_status.*?\n    end/m].not_nil!
+    severity_hues.each do |hue|
+      offenders << "choice_picker.cr — for_status uses #{hue}" if status_block.includes?(hue)
+    end
+    offenders.should be_empty
+  end
+end
+
+# `theme.cr` sanctions exactly two jobs for `focus_gold`: the brand mark, and the focus
+# outline. Everything else that reached for it made one of those two unreadable — the
+# Repeater's transport chip rides the same card border that goes gold on focus, and the
+# chain overlay borrowed it (through `marker_accent`) to mean provenance.
+describe "focus_gold" do
+  it "does not fill a chip that rides a focusable card's own border" do
+    # The Repeater's `^V:h2` transport chip fills when the operator has overridden transport
+    # auto-detection, and it sits ON the TARGET card's top border — the same border that goes
+    # `focus_gold` when the card has focus. Filling it gold put two golds on one edge and
+    # "gold means focus is here" stopped being readable. It is a bold ACCENT pill now: still
+    # the loudest thing on the band, no longer competing with the focus outline.
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "repeater_view.cr"))
+    chip = src[/if transport_badge_lit\?.*?end/m].not_nil!
+    chip.should_not contain("focus_gold")
+  end
+
+  it "does not stand in for provenance on the chain overlay" do
+    # `marker_accent` IS `focus_gold` under another name, documented for one job: the closing
+    # § of a marker that hides a ¦chain. The step list borrowed it to mean "this resolved to a
+    # SAVED library chain" — provenance, which is the question `env_known` already answers for
+    # a `$TOKEN` that resolved.
+    # Match the STEP-STATE line, not a guessed spelling of the expression: the first attempt
+    # asserted `category.saved? ? Theme.marker_accent` and the real code reads
+    # `try(&.category.saved?) ?`, so the control run reintroducing the bug passed.
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "chain_overlay.cr"))
+    step_line = src.lines.find(&.includes?("category.saved?")).not_nil!
+    step_line.should_not contain("marker_accent")
+  end
+
+  # NOT asserted here, and deliberately: `RepeaterView#pane_border` returns `accent` instead of
+  # `focus_gold` while a focused pane is in INSERT mode, so the most active pane in the app is
+  # the one that is not gold. That reads like the same defect — two axes (focus, mode) sharing
+  # one channel, with the mode already stated by the `↵:READ`/`INS` badge on the same border —
+  # but it is long-standing behaviour the Fuzzer copies, and changing it moves the most-used
+  # pane in gori. It wants its own decision, not a spec smuggled in beside two settled ones.
+end

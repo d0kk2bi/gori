@@ -102,7 +102,7 @@ describe "RepeaterView transport chip" do
       view.transport_badge_lit?.should be_false
     end
 
-    it "wears the gold while the handshake is going out as plain HTTP" do
+    it "fills with accent while the handshake is going out as plain HTTP" do
       view = RepeaterView.new
       view.restore("https://ws.test", ws_head, false, true,
         ws_messages: [Gori::Store::WsOutMessage.text("hello")])
@@ -115,7 +115,12 @@ describe "RepeaterView transport chip" do
       view.cycle_ws_transport
       b2 = render.call(view, rect)
       h1_col = b2.row(rect.y).index("^V:WS→h1").not_nil!
-      b2.bg_at(h1_col, rect.y).should eq(Theme.focus_gold) # an override interrupts the glance
+      # ACCENT, not `focus_gold`. An override still has to interrupt the glance — that part
+      # was right — but this chip rides the TARGET card's own top border, and that border IS
+      # `focus_gold` when the card has focus. Filling it gold put two golds on one edge, so
+      # "gold means focus is here" stopped being readable on exactly the card an operator is
+      # most often typing into. Gold is focus and the brand mark; nothing else.
+      b2.bg_at(h1_col, rect.y).should eq(Theme.accent)
     end
 
     it "hit-tests the chip in both WS and overridden-HTTP shapes" do

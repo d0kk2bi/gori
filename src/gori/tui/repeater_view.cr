@@ -4315,12 +4315,17 @@ module Gori::Tui
       # already drops its NOR/INS chip when a fifth badge is chained onto it.
       #
       # Two dresses, no third: a filled chip at rest (the NAME is the state, so muted grey
-      # would read as "disabled"), and the ^R:SEND gold when the operator has overridden
+      # would read as "disabled"), and a BOLD ACCENT pill when the operator has overridden
       # auto-detection — a handshake tab that will NOT speak WebSocket is the one thing on this
       # band worth interrupting a glance for.
+      #
+      # Accent, not the ^R:SEND gold it used to borrow. This chip rides the TARGET card's top
+      # border, and that border IS `focus_gold` when the card has focus — so an overridden
+      # transport on a focused card put two golds on one edge and "gold means focus is here"
+      # stopped being readable. Gold is focus and the brand mark; nothing else.
       if transport_switchable?
         fg, bg, attr = if transport_badge_lit?
-                         {Theme.ink_on(Theme.focus_gold), Theme.focus_gold, Attribute::Bold}
+                         {Theme.ink_on(Theme.accent), Theme.accent, Attribute::Bold}
                        else
                          {Theme.text_bright, Theme.accent_bg, Attribute::None}
                        end
