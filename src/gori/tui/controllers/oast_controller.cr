@@ -208,7 +208,9 @@ module Gori::Tui
         return "type to filter · ↵ keep · esc clear" if @filter_editing
         "↑/↓ select · ‹/› provider · g payload · y copy · / filter · ^R listen · ^X stop · ↵ detail · space cmds"
       else
-        "↑/↓ select · a add · e edit · t toggle · d delete · space cmds · esc sub-tabs"
+        # `x on/off` and `↵/e edit` — the vocabulary the three sibling rule lists use. Toggle was
+        # `t` here alone, and ↵ has always opened the editor without the hint saying so.
+        "↑/↓ select · a add · ↵/e edit · x on/off · d delete · space cmds · esc sub-tabs"
       end
     end
 
@@ -1077,7 +1079,7 @@ module Gori::Tui
       when key.down?, key.lower_j? then @prov_sel = {@prov_sel + 1, {@providers.size - 1, 0}.max}.min
       when key.enter?, c == 'e'    then open_edit_provider
       when c == 'a'                then open_add_provider
-      when c == 't'                then toggle_provider
+      when c == 'x'                then toggle_provider
       when c == 'd'                then delete_provider
       else                              return false
       end

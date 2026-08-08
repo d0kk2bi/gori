@@ -69,7 +69,7 @@ module Gori
 
       r.register Verb::Definition.new(
         "oast.toggle-provider", "Enable / disable", "Toggle the selected provider on or off",
-        Verb::Scope::OastProviders, [] of Verb::Chord, mnemonic: 't') { |ctx| ctx.oast_toggle_provider; nil }
+        Verb::Scope::OastProviders, [] of Verb::Chord, mnemonic: 'x') { |ctx| ctx.oast_toggle_provider; nil }
 
       r.register Verb::Definition.new(
         "oast.delete-provider", "Delete provider", "Delete the selected provider (keeps its callback history)",

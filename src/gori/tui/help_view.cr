@@ -42,6 +42,12 @@ module Gori::Tui
         Item.new("↹ / ⇧↹", "focus ring: tab bar ↔ panes"),
         Item.new("↵ / ↓", "enter the tab body"),
         Item.new("1-9", "jump to the Nth visible tab"),
+        # Seventeen surfaces bind j/k and no hint anywhere named them, so a whole navigation
+        # layer was reachable only by guessing. It belongs HERE rather than in each tab's
+        # hint: it is a global convention like ^P or ^D, the hints are already at the width
+        # the status strip gives them, and spending six cells per tab to repeat one rule
+        # would push a tab-specific key off the end.
+        Item.new("j / k", "move down / up — anywhere ↑/↓ moves (h/l where ←/→ do)"),
         Item.new("Settings: Tabs", "show/hide + reorder tabs"),
         Item.new("esc", "pop back to the tab bar"),
       ]},

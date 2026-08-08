@@ -38,7 +38,7 @@ module Gori::Tui
     end
 
     def hint : String
-      "↑/↓ select · space show/hide · K/J reorder · r reset · ↵ save · esc cancel"
+      "↑/↓ select · space show/hide · ⇧K/⇧J reorder · r reset · ↵ save · esc cancel"
     end
 
     # ↑/↓ move the selection and ⇧↑/⇧↓ reorder the selected tab; ↵ saves+applies, esc

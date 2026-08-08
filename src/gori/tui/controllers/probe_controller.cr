@@ -111,7 +111,7 @@ module Gori::Tui
       elsif @probe.preview_enabled?
         "↑/↓ move · ↵ open · ↹ preview · #{mode} mode · #{filt} filter · space cmds"
       else
-        "o flow · r repeater · p promote · c dismiss · d delete · #{mode} mode · #{filt} filter · space cmds"
+        "↑/↓ move · ↵ open · o flow · r repeater · p promote · c dismiss · d delete · #{mode} mode · #{filt} filter · space cmds"
       end
     end
 

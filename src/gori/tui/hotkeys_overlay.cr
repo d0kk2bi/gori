@@ -104,7 +104,7 @@ module Gori::Tui
 
     def hint : String
       return "press a key to bind · esc cancel" if capturing?
-      "↑/↓ select · e/␣ rebind · x unbind · r reset · ⇧R reset all · ←/→ profile · ↵ save · esc"
+      "↑/↓ select · e/␣ rebind · x/⌫ unbind · r reset · ⇧R reset all · ←/→ profile · ↵ save · esc cancel"
     end
 
     # In :capture the shell must route EVERY key here before its own pre-filter, so a

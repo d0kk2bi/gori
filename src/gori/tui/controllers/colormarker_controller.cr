@@ -88,7 +88,11 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
-      "↑/↓ select · a add · ↵/e edit · x on/off · s scope · ⇧J/⇧K reorder · d delete"
+      # Rewriter's shape, which this list is otherwise a twin of. It used to advertise `s scope`
+      # and `⇧K/⇧J reorder` — its two least-used keys — while naming neither `space cmds` nor
+      # `esc`, both of which it binds. That is backwards: the space menu is the one affordance
+      # that reveals every other key, including the two this line was spending its width on.
+      "↑/↓ select · a add · ↵/e edit · x on/off · d delete · space cmds · esc tabs"
     end
 
     # --- keys ---

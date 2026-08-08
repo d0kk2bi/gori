@@ -423,7 +423,7 @@ module Gori::Tui
       # successful one just because it came through the modal.
       note_fg = @status ? (@status_warn ? Theme.yellow : Theme.green) : Theme.muted
       screen.text(box.x + 2, note_y, note, note_fg, Theme.panel, width: iw)
-      hint = @on_strip ? "←/→ group · ↓/↵ enter · esc close" : "↑/↓ field · ←/→ edit · ↵ save · ^R reset · esc close"
+      hint = @on_strip ? "←/→ group · ↓/↵ enter · esc close" : "↑/↓ field · ←/→ edit · ↵ save/open · ^R reset · esc close"
       hx = {box.right - hint.size - 2, box.x + 2}.max
       screen.text(hx, hint_y, hint, Theme.muted, Theme.panel, width: {box.right - hx - 1, 0}.max)
     end

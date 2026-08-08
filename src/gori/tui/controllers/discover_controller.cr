@@ -55,7 +55,7 @@ module Gori::Tui
       if @view.focus == :runs
         "↑/↓ runs · ↵/tab findings · ^R run · ^X stop · p pause · d dismiss · space cmds · esc sub-tabs"
       else
-        "↑/↓ nav · ↵/o request+response · tab runs · [ / ] runs · ^R run · ^X stop · p pause · esc sub-tabs"
+        "↑/↓ nav · ↵/o request+response · tab runs · ^R run · ^X stop · p pause · space cmds · esc sub-tabs"
       end
     end
 

@@ -94,7 +94,9 @@ module Gori::Tui
       return "type query · ↹ complete · ↵ apply · esc clear" if @sitemap.querying?
       # Marks survive a filter change, so the `/` affordance stays up while they're set.
       return "↑/↓ move · / filter · t mark · ⇧T tag · space cmds · esc clears marks" if @sitemap.mark_count > 0
-      "↑/↓ move · / filter · t mark · ⇧T tag · g fold · ↵/→ expand · ← collapse · esc sub-tabs"
+      # `space cmds` on BOTH branches. The mark-set branch above named it and this one did not,
+      # so the same tab advertised the space menu only while marks happened to be set.
+      "↑/↓ move · / filter · t mark · g fold · ↵/→ expand · space cmds · esc sub-tabs"
     end
 
     # Live IME composition flows to whichever text field is open (the QL filter bar or
