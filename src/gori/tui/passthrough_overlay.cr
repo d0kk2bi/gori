@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./fmt"
 require "./frame"
 require "./overlay"
 require "../settings"
@@ -171,7 +172,7 @@ module Gori::Tui
       screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
 
       conns = "#{entry.connections} conn#{entry.connections == 1 ? "" : "s"}"
-      stamp = ago(entry.first_seen)
+      stamp = Fmt.ago(entry.first_seen)
       tail = "#{stamp}  #{conns}"
       tail_x = box.right - 1 - Screen.display_width(tail)
 
@@ -212,14 +213,5 @@ module Gori::Tui
     # Compact relative age: "3s" / "5m" / "2h" / "1d". Mirrors NotificationsOverlay#ago, but
     # over a wall-clock Time (the inventory is written by a proxy fiber and read much later,
     # so it records when the bypass happened, not a monotonic tick).
-    private def ago(t : Time) : String
-      secs = (Time.local - t).total_seconds.to_i
-      return "#{secs}s" if secs < 60
-      mins = secs // 60
-      return "#{mins}m" if mins < 60
-      hours = mins // 60
-      return "#{hours}h" if hours < 24
-      "#{hours // 24}d"
-    end
   end
 end

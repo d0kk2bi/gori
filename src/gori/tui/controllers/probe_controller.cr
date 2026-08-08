@@ -277,7 +277,7 @@ module Gori::Tui
           # into the notification center (#127). Still logged to the #124 event feed
           # (the AI firehose logs freely; only the human center suppresses it).
           @host.session.store.insert_event("probe", "error", "error", "Probe: #{ev.message}", goto_tab: "probe")
-          @host.status(ev.message)
+          @host.status("probe error: #{ev.message}")
         when Probe::CompleteEvent
           # A manual "Run active scan" in Always mode came back clean — the analyzer only emits
           # this when the operator asked to be told either way, so it always posts to the tray.
@@ -479,13 +479,28 @@ module Gori::Tui
       @host.open_custom_rule_editor(nil)
     end
 
+    # Both of these are reachable only from a selected CUSTOM rule, and both used to return
+    # in silence on anything else — so `e` and `d` on a built-in were dead keys with no word
+    # about why. The hint no longer promises them there (see `body_hint`), but a key can still
+    # be pressed on the strength of muscle memory, and a rule list that answers nothing is the
+    # same "did gori see that?" moment every sibling list avoids.
     def rules_edit : Nil
-      c = @rules.selected_row.try(&.custom) || return
+      c = selected_custom_rule || return
       @host.open_custom_rule_editor(c)
     end
 
+    # The selected CUSTOM rule, or nil with the reason on the strip. Built-ins live in code —
+    # there is nothing to open and nothing to remove — so the message names that rather than
+    # saying "nothing selected", which would be false: a row IS selected.
+    private def selected_custom_rule : Probe::CustomRule?
+      row = @rules.selected_row
+      return row.custom if row && row.custom
+      @host.status(row ? "built-in rules can't be edited or deleted — x turns one off" : "no rule selected")
+      nil
+    end
+
     def rules_delete : Nil
-      c = @rules.selected_row.try(&.custom) || return
+      c = selected_custom_rule || return
       # Sentence-case title, `Delete` button — the same dress every other policy-rule delete
       # wears. This one shouted "DELETE RULE" over a lowercase `delete` button, so the one
       # dialog an operator sees least often was also the one that looked unlike the rest.

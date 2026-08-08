@@ -4389,11 +4389,13 @@ module Gori::Tui
       end
       if result = @result
         meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
-        meta_x = rect.right - meta.size - 1
-        screen.text(meta_x, rect.y, meta, Theme.muted, Theme.bg) if meta_x > chips_end + 1
+        # `min_x:` because this border's left stop is the CHIP cluster, not the title.
+        meta_x = Frame.border_meta(screen, rect, "", meta, min_x: chips_end + 1)
         # A persistent amber marker when the response was cut short (the body the
-        # origin sent is incomplete) — the transient send toast scrolls away.
-        if result.incomplete?
+        # origin sent is incomplete) — the transient send toast scrolls away. Chained off
+        # where the meta actually landed; when the meta did not fit there is nothing to
+        # hang it on, and the row is already too tight to carry it.
+        if result.incomplete? && meta_x
           warn = "⚠ incomplete"
           warn_x = meta_x - warn.size - 2
           screen.text(warn_x, rect.y, warn, Theme.yellow, Theme.bg) if warn_x > chips_end + 1
@@ -4586,8 +4588,9 @@ module Gori::Tui
       Frame.card(screen, rect, "HANDSHAKE RESPONSE", bg: Theme.bg, border: pane_border(focused && active))
       if result = @result
         meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
-        meta_x = rect.right - meta.size - 1
-        screen.text(meta_x, rect.y, meta, Theme.muted, Theme.bg) if meta_x > rect.x + 22
+        # `rect.x + 22` used to stand in for "HANDSHAKE RESPONSE" — the title's width, copied
+        # by hand into a guard that would not follow it if the title ever changed.
+        Frame.border_meta(screen, rect, "HANDSHAKE RESPONSE", meta)
       end
       body = rect.inset(1, 1)
       rv = resp_view
@@ -4676,8 +4679,7 @@ module Gori::Tui
       Frame.card(screen, rect, title, bg: Theme.bg, border: pane_border(lit))
       if d = dur_us
         meta = Fmt.dur(d)
-        mx = rect.right - meta.size - 1
-        screen.text(mx, rect.y, meta, Theme.muted, Theme.bg) if mx > rect.x + title.size + 4
+        Frame.border_meta(screen, rect, title, meta)
       end
       body = rect.inset(1, 1)
       return if body.h <= 0

@@ -76,13 +76,23 @@ module Gori::Tui
     #
     # Draws nothing when the card is too narrow to hold the meta clear of the title, which is
     # what makes it safe to call unconditionally.
+    # `min_x` overrides the left stop for a card whose border carries more than a title —
+    # the Repeater's RESPONSE header runs a left-anchored `chip` cluster there, so the meta
+    # has to clear the chips rather than the (shorter) title. Callers pass the x their own
+    # chrome ended at; everyone else lets the title decide.
+    #
+    # Returns the x it drew at, or nil when it drew nothing — so a caller can CHAIN something
+    # further left (the Repeater hangs an `⚠ incomplete` marker off the meta it just placed)
+    # without re-deriving a position this method already computed.
     def self.border_meta(screen : Screen, rect : Rect, title : String, meta : String,
-                         bg : Color = Theme.bg, fg : Color = Theme.muted) : Nil
-      return if meta.empty? || rect.w < 4
-      title_end = rect.x + 2 + (title.empty? ? 0 : Screen.draw_width(title) + 2)
+                         bg : Color = Theme.bg, fg : Color = Theme.muted,
+                         min_x : Int32? = nil) : Int32?
+      return nil if meta.empty? || rect.w < 4
+      stop = min_x || (rect.x + 2 + (title.empty? ? 0 : Screen.draw_width(title) + 2))
       x = rect.right - Screen.draw_width(meta) - 2
-      return if x <= title_end
+      return nil if x <= stop
       screen.text(x, rect.y, meta, fg, bg)
+      x
     end
 
     # A slim vertical scroll gauge riding the right border of a framed content area.

@@ -472,9 +472,12 @@ module Gori::Tui
       @host.open_scope_rule_editor(nil, "include", "host", "")
     end
 
+    # Says what is missing, like `scope_delete_rule` below and like every rule list in gori.
+    # `e` on an empty list used to be a dead key: the guard was here, it just never spoke, so
+    # the pane answered a keypress with nothing at all while `d` two methods down explained
+    # itself. Three panes on this tab had the same split.
     def scope_edit_rule : Nil
-      rule = @project_view.selected_rule
-      return unless rule
+      rule = @project_view.selected_rule || return @host.status("no scope rule selected")
       @project_view.focus_pane(:scope)
       @host.open_scope_rule_editor(rule.id, rule.kind, rule.match_type, rule.pattern)
     end
@@ -643,6 +646,7 @@ module Gori::Tui
     end
 
     def hostov_edit_entry : Nil
+      return @host.status("no host override selected") unless @project_view.selected_override_host
       @host.focus_body
       @project_view.ov_edit_start
     end
@@ -703,6 +707,7 @@ module Gori::Tui
     end
 
     def env_edit_var : Nil
+      return @host.status("no env var selected") unless @project_view.selected_env_key
       @host.focus_body
       @project_view.env_edit_start
     end

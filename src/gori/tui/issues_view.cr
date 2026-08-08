@@ -924,12 +924,16 @@ module Gori::Tui
           res = @detail_resolved[idx]
           active = idx == @selected_link
           fg = res.stale? ? Theme.muted : (active ? Theme.text_bright : Theme.text)
-          row_x = rect.x + 1
-          if active
-            screen.cell(row_x, list_y + i, '▎', Theme.accent, Theme.bg)
-            row_x += 1
-          end
-          screen.text(row_x, list_y + i, res.line, fg, width: w - (row_x - rect.x - 1))
+          # The marker column is written on EVERY row and the band is filled behind the
+          # selected one — the shape every other list in gori uses. This list drew the bar
+          # ONLY when active and then pushed the row's text one column right to make room,
+          # so the selected link was both hard to see (no band at all) and visibly out of
+          # line with its neighbours.
+          y = list_y + i
+          bg = active ? Theme.accent_bg : Theme.bg
+          screen.fill(Rect.new(rect.x + 1, y, w, 1), bg) if active
+          screen.cell(rect.x + 1, y, active ? '▎' : ' ', Theme.accent, bg)
+          screen.text(rect.x + 2, y, res.line, fg, bg, width: {w - 1, 1}.max)
         end
       end
       # NOTES — a real Frame.card (like Decoder INPUT) so INS/READ borders are rounded

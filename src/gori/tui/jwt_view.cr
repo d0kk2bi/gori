@@ -156,9 +156,11 @@ module Gori::Tui
         idx = @atk_scroll + i
         a = attacks[idx]?
         break unless a
-        sel = focused && idx == @atk_sel
+        # Dimmed rather than erased when focus leaves this pane — the selection is still the
+        # attack ↵ applies, and with the marker gone there was nothing on screen saying which.
+        sel = idx == @atk_sel
         y = body.y + i
-        bg = sel ? Theme.accent_bg : Theme.bg
+        bg = sel ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
         screen.fill(Rect.new(body.x, y, body.w, 1), bg) if sel
         x = screen.text(body.x, y, sel ? "▎" : " ", Theme.accent, bg)
         x = screen.text(x, y, a.name, sel ? Theme.text_bright : Theme.text, bg, width: {body.w // 3, 8}.max)

@@ -281,7 +281,7 @@ module Gori::Tui
     PANES = [:desc, :scope, :overrides, :env, :settings]
     # Chip labels, in PANES order. Kept parallel rather than derived from the symbols so a
     # label can read well ("HOST OVERRIDES") without renaming the pane it addresses.
-    PANE_LABELS = ["DESCRIPTION", "SCOPE", "HOST OVERRIDES", "ENV", "PROJECT SETTINGS"]
+    PANE_LABELS = ["Description", "Scope", "Host overrides", "Env", "Project settings"]
     # One row for the sub-tab chips.
     STRIP_H = 1
 

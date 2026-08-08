@@ -234,3 +234,28 @@ describe Gori::Tui::Frame do
     end
   end
 end
+
+# The sub-tab strip is the same chrome on six tabs, and its labels are drawn VERBATIM
+# (`Chrome.render_tab_strip`), so three spellings reached the screen: Project shouted
+# `DESCRIPTION`/`SCOPE`, the Rewriter whispered `rules`/`extract`, and the other four used
+# Title Case. Moving between tabs, the same strip in the same place read three ways.
+describe "fixed sub-tab strip labels" do
+  it "are Title Case everywhere" do
+    root = File.join(__DIR__, "..", "..", "src", "gori")
+    offenders = [] of String
+    Dir.glob(File.join(root, "tui", "**", "*.cr")).sort.each do |path|
+      File.read(path).lines.each_with_index do |line, i|
+        next unless line.matches?(/^\s+(SUBTABS|SUB_LABELS|PANE_LABELS|PAGE_LABELS|SUBS)\s*=\s*\[/)
+        line.scan(/"([^"]+)"/) do |m|
+          label = m[1]
+          # First letter upper, and not SHOUTED — `Host overrides` is right, `HOST OVERRIDES`
+          # and `rules` are not. A one-word acronym label would be a fair exception; there is
+          # none today, so the rule stays simple until there is.
+          ok = label[0].uppercase? && label != label.upcase
+          offenders << "#{File.basename(path)}:#{i + 1} — #{label}" unless ok
+        end
+      end
+    end
+    offenders.should be_empty
+  end
+end

@@ -952,7 +952,7 @@ module Gori::Tui
         # feed (the AI firehose logs freely; only the human center suppresses it).
         @host.jobs.finish(v.job_id, :error, ev.message)
         log_event(v, :error, "Fuzzer: #{ev.message} on #{v.summary}")
-        @host.status("fuzz error: #{ev.message}")
+        @host.status("fuzzer error: #{ev.message}")
       end
     end
 

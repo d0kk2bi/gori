@@ -363,7 +363,10 @@ describe "ProjectView NETWORK pane" do
       b = MemoryBackend.new(120, 30)
       view.render(Screen.new(b), Rect.new(0, 0, 120, 30), focused: true)
       b.contains?("NETWORK").should be_true
-      b.contains?("ENV").should be_true # the chip strip still names every sub-tab
+      # The chip strip still names every sub-tab. Title Case since the strips were unified:
+      # four of the six in gori already read `Findings`/`Callbacks`/`Sitemap`, and this one
+      # shouted while the Rewriter's whispered — the renderer draws labels verbatim.
+      b.contains?("Env").should be_true
       b.contains?("Scope lens").should be_true
       b.contains?("Sandbox").should be_true
       b.contains?("Bind IP").should be_true

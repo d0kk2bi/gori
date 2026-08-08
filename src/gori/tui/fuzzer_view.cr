@@ -2087,6 +2087,7 @@ module Gori::Tui
     # so render_target and the click→caret mapping agree on the value base.
     TARGET_PREFIX = "›"
     SNI_PREFIX    = "SNI ›"
+    SNI_BADGE     = " SNI "
 
     private def field_base(rect : Rect, prefix : String) : Int32
       rect.x + 2 + prefix.size + 1
@@ -2099,10 +2100,14 @@ module Gori::Tui
       # The REAL mode, not `ins` — `target_chrome_hit` measures the bare `target_insert?`, and the
       # two labels are different widths. See `Frame.mode_badge`.
       Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 8, target_insert?)
-      unless @sni.strip.empty?
-        badge = " SNI "
-        bx = {rect.right - badge.size - 1, rect.x + 9}.max
-        screen.text(bx, rect.y, badge, Theme.text_bright, Theme.accent_bg)
+      # An at-a-glance SNI marker on the top border, CHAINED left of the mode chip rather
+      # than placed at `rect.right - size - 1` — which is inside the mode chip's own cells.
+      # Setting an override used to paint over the right of ` ↵:READ `, leaving `↵: SNI ` on
+      # the border, and `target_chrome_hit` still measured the full mode rect underneath, so
+      # clicking the visible SNI letters toggled insert. Repeater hit this first and fixed it
+      # the same way (`repeater_view.cr#target_chrome_chain`); this is that fix, ported.
+      if sni_x = target_sni_x(rect)
+        screen.text(sni_x, rect.y, SNI_BADGE, Theme.text_bright, Theme.accent_bg)
       end
       draw_target_row(screen, rect, rect.y + 1, TARGET_PREFIX, @target, @tcx,
         focused && @target_field == :url, ins)
@@ -2282,7 +2287,7 @@ module Gori::Tui
         @cfg_scroll = 0
         y = y0
         @sets.each_with_index do |s, i|
-          render_set_row(screen, inner, y, s, i, set_selected?(focused, i), pp)
+          render_set_row(screen, inner, y, s, i, set_selected?(i), focused, pp)
           y += 1
         end
         draw_add_row(screen, inner, y, focused, limit)
@@ -2299,7 +2304,7 @@ module Gori::Tui
         stop = {@cfg_scroll + visible, @sets.size}.min
         y = y0
         (@cfg_scroll...stop).each do |i|
-          render_set_row(screen, inner, y, @sets[i], i, set_selected?(focused, i), pp)
+          render_set_row(screen, inner, y, @sets[i], i, set_selected?(i), focused, pp)
           y += 1
         end
         above, below = @cfg_scroll, @sets.size - stop
@@ -2309,8 +2314,12 @@ module Gori::Tui
       end
     end
 
-    private def set_selected?(focused : Bool, i : Int32) : Bool
-      focused && config_row == :set && current_set_index == i
+    # Focus is NOT part of "is this row selected" — it decides how loudly the selection is
+    # drawn, which is `render_set_row`'s business. Folded in here it erased the CONFIG cursor
+    # outright whenever focus moved to a sibling pane, so coming back meant finding the row
+    # again by eye.
+    private def set_selected?(i : Int32) : Bool
+      config_row == :set && current_set_index == i
     end
 
     # `limit` is the tail's first row: the Add row PADS its width, so an unbounded one
@@ -2373,8 +2382,9 @@ module Gori::Tui
     # One Sets row. In per-position modes (pp) it carries a marker-coloured swatch + →N
     # chip tying it to template marker i (same tint marker i shows in the editor); the
     # chip draws AFTER the selection fill so it survives on the selected (accent_bg) row.
-    private def render_set_row(screen, inner : Rect, y : Int32, s : SetSpec, i : Int32, sel : Bool, pp : Bool) : Nil
-      bg = sel ? Theme.accent_bg : Theme.bg
+    private def render_set_row(screen, inner : Rect, y : Int32, s : SetSpec, i : Int32, sel : Bool,
+                               focused : Bool, pp : Bool) : Nil
+      bg = sel ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
       screen.fill(Rect.new(inner.x, y, inner.w, 1), bg) if sel
       fg = sel ? Theme.text_bright : Theme.text
       label = "#{i + 1} #{s.kind} #{s.value}"
@@ -3097,12 +3107,31 @@ module Gori::Tui
       Frame.mode_badge_hit(mx, my, left.y, mode_edge, min_x, template_insert? || @chain_focused) ? :mode : nil
     end
 
-    # Hit-test the TARGET border NOR/INS chip. Geometry matches render_target.
+    # `SNI` is a MARKER, not a control — nothing happens when it is clicked. It is hit-tested
+    # anyway so it can answer `nil` for itself: without this the mode chip's rect still covered
+    # those cells and a press on them flipped insert mode.
+    #
+    # Hit-test the TARGET border NOR/INS chip. Geometry matches render_target through the
+    # shared `target_sni_x`.
     def target_chrome_hit(rect : Rect, mx : Int32, my : Int32) : Symbol?
       return nil unless @loaded
       target_h = {rect.h, target_card_h}.min
       return nil if target_h < 2 || my != rect.y
+      if sni_x = target_sni_x(rect)
+        return nil if mx >= sni_x && mx < sni_x + SNI_BADGE.size
+      end
       Frame.mode_badge_hit(mx, my, rect.y, rect.right - 1, rect.x + 8, target_insert?) ? :mode : nil
+    end
+
+    # Where the SNI marker sits, or nil when there is no override or no room for one. The ONE
+    # place that geometry lives, so render and the hit-test cannot disagree about it.
+    private def target_sni_x(rect : Rect) : Int32?
+      return nil if @sni.strip.empty?
+      edge = rect.right - 1
+      mode = Frame.mode_badge_label(target_insert?)
+      edge -= mode.size if edge - mode.size >= rect.x + 8 # the mode chip's own stop
+      x = edge - SNI_BADGE.size
+      x >= rect.x + 9 ? x : nil # one column clear of the card title
     end
 
     def pane_at(rect : Rect, mx : Int32, my : Int32) : Symbol?

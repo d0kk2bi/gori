@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./fmt"
 require "./frame"
 require "./overlay"
 require "./notifications"
@@ -193,7 +194,7 @@ module Gori::Tui
       screen.cell(box.x + 3, py, g, gc, bg)
       bold = note.read ? Attribute::None : Attribute::Bold
       fg = sel ? Theme.text_bright : Theme.text
-      stamp = ago(note.created_at)
+      stamp = Fmt.ago(note.created_at)
       # Agent-originated notes (an MCP co-pilot acting in the loop) get a distinct "ai"
       # tag so the human can see at a glance which entries the AI produced. Other sources
       # already name themselves in the message ("Miner: …", "Probe: …"), so no tag.
@@ -242,14 +243,5 @@ module Gori::Tui
     end
 
     # Compact relative age: "3s" / "5m" / "2h" / "1d".
-    private def ago(t : Time::Instant) : String
-      secs = (Time.instant - t).total_seconds.to_i
-      return "#{secs}s" if secs < 60
-      mins = secs // 60
-      return "#{mins}m" if mins < 60
-      hours = mins // 60
-      return "#{hours}h" if hours < 24
-      "#{hours // 24}d"
-    end
   end
 end

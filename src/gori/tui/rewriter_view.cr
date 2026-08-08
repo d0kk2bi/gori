@@ -23,7 +23,7 @@ module Gori::Tui
     # that says whether the first one worked. Splitting them across the tab bar would have
     # hidden that they are one workflow.
     SUBS       = [:rules, :extract, :bindings]
-    SUB_LABELS = ["rules", "extract", "bindings"]
+    SUB_LABELS = ["Rules", "Extract", "Bindings"]
     SUB_H      = 1
 
     # The strip row and what is left for the sub-tab's own body.
