@@ -136,8 +136,13 @@ module Gori::Tui
         if row = @rules.gauge_row_at(content, mx, my)
           @rules.select_index(row)
         elsif idx = @rules.row_at(content, mx, my)
-          # Select first; a click on the already-selected row toggles it (whole row is the switch).
-          @rules.selected_index == idx ? rules_toggle_selected : @rules.select_index(idx)
+          # SELECT ONLY, like the Rewriter's and Colormarker's rule lists. A second click used
+          # to toggle — the exact reflex `probe-rules.toggle` gave up its `↵` for, and for the
+          # same reason: no other rule list flips a scanning rule off from a repeat gesture,
+          # and here the row that answered a double-click was often a BUILT-IN, where `↵`
+          # (now edit, gated to custom rules) does nothing at all. One row, two gestures, two
+          # answers. `x` toggles.
+          @rules.select_index(idx)
         end
         return true
       end

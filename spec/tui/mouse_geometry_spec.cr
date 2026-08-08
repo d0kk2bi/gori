@@ -280,3 +280,37 @@ describe "marker actions across the two template editors" do
     end
   end
 end
+
+# Review findings, each pinned so the fix is a rule rather than a patch.
+describe "code-review fixes" do
+  it "keeps the ^T:MARK badge off a decode split, where ^T means something else" do
+    # `repeater.toggle-decoded` is context-sensitive: on a SAML/GraphQL tab `^T` switches
+    # ENVELOPE ⇄ DECODED instead of inserting a §. `req_split?` routes those through the SAME
+    # `render_request`, so the badge was drawn — and clickable — reading `^T:MARK` while the
+    # key it names did something unrelated. Draw and hit are gated together.
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "repeater_view.cr"))
+    draw = src[/# …and NOT on a decode split.*?end/m].not_nil!
+    draw.should contain("!decode_mode?")
+    hit = src[/` \^T:MARK ` chains LEFT.*?return :mark/m].not_nil!
+    hit.should contain("!decode_mode?")
+  end
+
+  it "makes a rule-list click SELECT, never toggle, in all three lists" do
+    # `probe-rules.toggle` gave up its `↵` because "a reflex carried from any other rule list
+    # silently disabled a scanning rule here" — and the pointer path kept exactly that hazard,
+    # toggling on a second click while neither sibling does.
+    root = File.join(__DIR__, "..", "..", "src", "gori", "tui", "controllers")
+    {"probe_controller.cr", "rewriter_controller.cr", "colormarker_controller.cr"}.each do |f|
+      src = File.read(File.join(root, f))
+      body = src[/def handle_click.*?\n    end/m].not_nil!
+      body.should_not match(/selected_index == idx \? \w*toggle/)
+    end
+  end
+
+  it "snaps the Probe Rules gauge to a row that can actually take the selection" do
+    # `@rows` interleaves three `:header` rows and an `:empty` placeholder; `select_index`
+    # refuses them, so a raw proportional hit was a silent no-op on ~4 of ~40 track positions.
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "probe_rules_view.cr"))
+    src[/def gauge_row_at.*?\n    end/m].not_nil!.should contain("nearest_selectable")
+  end
+end

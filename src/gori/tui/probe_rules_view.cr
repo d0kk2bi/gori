@@ -167,8 +167,27 @@ module Gori::Tui
 
     # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
     # hairline; the window is derived from the selection, so this answers with a selection.
+    #
+    # SNAPPED to the nearest selectable row: `@rows` interleaves three `:header` rows and an
+    # `:empty` placeholder with the real ones, and `select_index` refuses those — so a raw
+    # proportional hit made ~4 of ~40 track positions silent no-ops, a thumb that moved
+    # nowhere. Every other gauge in this sweep resolves to a row the click can land on.
     def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
-      Frame.scroll_gauge_row(Rect.new(rect.x, rect.y, rect.w, list_h(rect)), @rows.size, mx, my)
+      idx = Frame.scroll_gauge_row(Rect.new(rect.x, rect.y, rect.w, list_h(rect)), @rows.size, mx, my)
+      return nil unless idx
+      nearest_selectable(idx)
+    end
+
+    # The selectable row closest to `idx`, searching outward. nil only when the list holds no
+    # selectable row at all (a filter that matched nothing).
+    private def nearest_selectable(idx : Int32) : Int32?
+      return idx if @rows[idx]?.try(&.selectable?)
+      (1...@rows.size).each do |d|
+        [idx - d, idx + d].each do |i|
+          return i if 0 <= i < @rows.size && @rows[i].selectable?
+        end
+      end
+      nil
     end
 
     private def selectable_indices : Array(Int32)

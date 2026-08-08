@@ -2815,7 +2815,8 @@ module Gori::Tui
           # ` ^T:MARK ` chains LEFT of the mode chip, under exactly the condition
           # render_request draws it: only when a `§` is in the buffer. It was the one badge on
           # this border missing from the hit list while its four neighbours all answered.
-          if !@grpc_mode && !ws_mode? && (literal_markers? || (@evidence && markers_active?))
+          if !@grpc_mode && !ws_mode? && !decode_mode? &&
+             (literal_markers? || (@evidence && markers_active?))
             mark_edge = Frame.mode_badge_edge(mode_edge, min_x, request_insert?)
             if Frame.right_badge_hit(mx, my, req_card.y, mark_edge, min_x,
                  [{:mark, "^T", "MARK"}] of {Symbol, String, String})
@@ -4492,7 +4493,12 @@ module Gori::Tui
       # Only when a `§` is actually in the buffer, so a request without one draws exactly the
       # border it drew before. Unlit = the capture's § are literal bytes (^T declares them);
       # lit = this buffer is a template and ^R renders them. See `markers_live?`.
-      if literal_markers? || (@evidence && markers_active?)
+      #
+      # …and NOT on a decode split. `repeater.toggle-decoded` is context-sensitive: on a
+      # SAML/GraphQL tab `^T` switches ENVELOPE ⇄ DECODED instead of inserting a §, so a badge
+      # reading `^T:MARK` there names a key that does something else entirely. Marking is still
+      # reachable from the space menu (`w` word / `i` point) and from ^K.
+      if !decode_mode? && (literal_markers? || (@evidence && markers_active?))
         Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^T", "MARK", markers_live?)
       end
       update_request_marker_tint
