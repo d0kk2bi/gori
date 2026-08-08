@@ -196,3 +196,34 @@ describe "JWT's lens switch" do
     end
   end
 end
+
+# A letter that changes meaning one `↵` into a drill-in is the sharpest kind of drift: the
+# list and its detail are the same workflow, and nothing on screen says the vocabulary moved.
+describe "list vs drill-in letters" do
+  r = Gori::Verbs.registry
+
+  it "keeps `O` meaning OAST payload, and only that" do
+    # Three scopes agree; HistoryDetail carries no OAST verb, so its `O` (Copy flow) was the
+    # letter re-pointing under the operator between the History list and its own detail.
+    %w(history.oast-copy repeater.oast-insert fuzzer.oast-insert).each do |id|
+      r[id].menu_key.should eq('O')
+    end
+    r.each do |v|
+      next if v.id.includes?("oast")
+      v.menu_key.should_not eq('O')
+    end
+  end
+
+  # NOT asserted, and deliberately — two more the audit surfaced where the KEYS already agree
+  # and only the menu letter differs, each with its reasoning already in the source:
+  #
+  #   `t`  Issues list = mark, Issues detail = edit title (issues.cr:73 — the detail is a modal
+  #        drill-in and `t` = mark is the cross-tab convention across four list tabs, so that
+  #        one wins; the detail's rename is reversible and marks are meaningless there).
+  #   `o`  Issues menu = open row, Probe menu = open EVIDENCE flow (probe.cr:18 — `probe.open`
+  #        keeps the family's enter/l/right chords, so the keys an operator presses agree;
+  #        only the menu letter moved, to 'v').
+  #
+  # Both are judgement calls that were made once with a written reason. Pinning them here
+  # would freeze the reason as a rule, which is not the same thing.
+end

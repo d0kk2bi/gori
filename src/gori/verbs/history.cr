@@ -417,9 +417,14 @@ module Gori
         "detail.copy-as", "Copy as…", "Pick a copy format for this pane (url/headers/body/cookies/curl/raw)",
         Verb::Scope::HistoryDetail, mnemonic: 'Y', group: :copy) { |ctx| ctx.copy_as_open; nil }
 
+      # 'F' for flow, not 'O': `O` is the OAST-payload letter in three scopes
+      # (`history.oast-copy` in this very list, `repeater.oast-insert`, `fuzzer.oast-insert`),
+      # and HistoryDetail carries no OAST verb — so one `↵` into the drill-in the same letter
+      # silently stopped meaning "OAST payload" and started meaning "copy the whole flow".
+      # `y` cannot take it here: in the detail that is `detail.copy`, the SELECTION copy.
       r.register Verb::Definition.new(
         "detail.copy-flow", "Copy flow", "Copy this flow's raw request to the clipboard",
-        Verb::Scope::HistoryDetail, mnemonic: 'O', group: :copy) { |ctx| ctx.copy_selection; nil }
+        Verb::Scope::HistoryDetail, mnemonic: 'F', group: :copy) { |ctx| ctx.copy_selection; nil }
 
       # Send the open flow to the Fuzzer (mirrors history.fuzz ⇧I/'z' from the list) —
       # close the detail first so it doesn't float over the Fuzzer tab.

@@ -104,7 +104,10 @@ module Gori::Tui
         Item.new("^N / ^W", "new / close a sub-tab"),
         Item.new("i / ↵", "enter INS (edit) on target/template · esc back to READ"),
         Item.new("space", "command menu (READ mode on target/template/results/detail)"),
-        Item.new("y · O", "copy selection/line · copy all pane (READ)"),
+        # NOT `y · O`. The `*.copy-all` verbs are gone — `Runner#read_copy` folds it into one
+        # key: `y` copies the selection if there is one, else the whole pane. The row was
+        # advertising an `O` that stopped existing when they merged.
+        Item.new("y", "copy the selection — or the whole pane when nothing is selected (READ)"),
         Item.new("⇧arrows", "select text (line or char)"),
         Item.new("^A · ^K · ^T", "auto-mark params · mark word · mark point (manual §)"),
         # NOT `^U clear §` — that was wrong twice over: ^U is fuzz.pretty-template (the tab's
