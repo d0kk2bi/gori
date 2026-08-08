@@ -169,3 +169,30 @@ describe "Rewriter rule keys" do
     r["colormarker.toggle"].chords.should contain(Gori::Verb::Chord.new("x"))
   end
 end
+
+# `^E` is `Hotkeys::CLAIMED_CTRL_LETTERS` — the shell's open-in-$EDITOR, claimed before any
+# tab sees it. JWT hardcoded it for its lens switch, which WORKED (the shell's ^E branch has
+# no `:jwt` arm and falls through) but could never be a registered chord: `keymap_spec`'s
+# "no rebindable default chord that is reserved" check refuses it, and did. So the key was
+# unbindable, and it spent the letter that would one day give this tab's INPUT pane an
+# external editor.
+#
+# That reserved rule lives in `keymap_spec` and is not repeated here — it already exempts the
+# four verbs that ARE the claimed handlers (`app.palette` ^P, `view.reveal-ws` ^B, the two
+# `*.new` ^N) via `Hotkeys.rebindable?`. This pins only where JWT landed.
+describe "JWT's lens switch" do
+  it "is on ^T, the Repeater's letter for the same gesture" do
+    r = Gori::Verbs.registry
+    ctrl_t = Gori::Verb::Chord.new("t", ctrl: true)
+    r["jwt.toggle-mode"].chords.should contain(ctrl_t)
+    # `repeater.toggle-decoded` is "switch which representation this pane shows" — the same
+    # question, and it has held ^T all along.
+    r["repeater.toggle-decoded"].chords.should contain(ctrl_t)
+  end
+
+  it "no longer claims a letter the shell reserves" do
+    Gori::Verbs.registry["jwt.toggle-mode"].chords.each do |c|
+      Gori::Hotkeys::CLAIMED_CTRL_LETTERS.should_not contain(c.key) if c.ctrl
+    end
+  end
+end

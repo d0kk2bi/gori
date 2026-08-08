@@ -136,7 +136,7 @@ module Gori::Tui
         Item.new("^N / ^W", "new / close a sub-tab"),
       ]},
       {"JWT", [
-        Item.new("^E", "switch decode ⟷ encode", "jwt.toggle-mode"),
+        Item.new("^T", "switch decode ⟷ encode", "jwt.toggle-mode"),
         Item.new("^A", "cycle the signing alg (alg=none included)", "jwt.cycle-alg"),
         Item.new("^L · ^Y", "clear the session · copy everything", "jwt.clear"),
         Item.new("↹", "cycle INPUT → DECODED → ATTACKS (decode) / HEADER → PAYLOAD → SECRET → OUTPUT (encode)"),

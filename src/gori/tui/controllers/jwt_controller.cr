@@ -71,7 +71,7 @@ module Gori::Tui
   # Body consumes every printable key (like Decoder/Notes), so command_scope is the JWT
   # scope and handle_body_key always returns true; the JWT verbs' mnemonics never collide
   # with literal text — they're reached from the space menu + palette. A runner-owned
-  # sub-tab strip appears from the first session (^N new · ^W close · ^E lens · ^A alg).
+  # sub-tab strip appears from the first session (^N new · ^W close · ^T lens · ^A alg).
   class JwtController < TabController
     DECODE_PANES = [:input, :decoded, :attacks]
     ENCODE_PANES = [:header, :payload, :secret, :output]
@@ -265,13 +265,6 @@ module Gori::Tui
         jwt_new
       elsif ev.ctrl? && key.lower_w?
         jwt_close
-      elsif ev.ctrl? && key.lower_e?
-        # ^E stays INLINE, alone among this tab's chords. It is in `Hotkeys::CLAIMED_CTRL_LETTERS`
-        # (the Runner's external-editor guard), so registering it on `jwt.toggle-mode` makes
-        # `keymap_spec`'s reserved-chord check fail — correctly. The shell's ^E branch has no
-        # `:jwt` arm and falls through, so the key works; it is simply not bindable, and this
-        # is the tab claiming a globally reserved letter rather than a defer that was missed.
-        toggle_mode
       elsif ev.ctrl? && key.lower_y?
         jwt_copy # copy-all; `jwt.copy` is the focused-pane copy on bare `y`
       elsif ev.ctrl_z? || editing_motion?(ev)
@@ -280,7 +273,7 @@ module Gori::Tui
       elsif ev.ctrl? || ev.alt?
         # Every OTHER modified chord defers to the central keymap, so it is rebindable — the
         # rule the Repeater and Fuzzer already follow. Without it the pane handlers below
-        # swallow it (`edit_json(...); true`), which is exactly why ^L/^A/^E had to be
+        # swallow it (`edit_json(...); true`), which is exactly why ^L/^A/^T had to be
         # hardcoded above: a verb chord would have been silently eaten before the keymap.
         return false
       elsif key.escape?
@@ -775,24 +768,33 @@ module Gori::Tui
 
     def body_hint(focus : Symbol) : String
       s = cur
-      y = Hotkeys.binding_label(@host.session.registry, "jwt.copy", "y")
+      reg = @host.session.registry
+      y = Hotkeys.binding_label(reg, "jwt.copy", "y")
+      # The lens switch was `^E` — a letter `Hotkeys::CLAIMED_CTRL_LETTERS` reserves for the
+      # shell's open-in-$EDITOR. It worked (the shell's ^E branch has no `:jwt` arm and falls
+      # through) but could never be a registered chord, so it was unbindable AND it spent the
+      # key that would one day give this tab's INPUT pane an external editor. `^T` is the
+      # Repeater's letter for the same gesture (`repeater.toggle-decoded`: switch which
+      # representation the pane is showing), and free here. Read from the keymap, so a rebind
+      # shows up in the footer instead of the footer lying about it.
+      lens = Hotkeys.binding_label(reg, "jwt.toggle-mode", "^T")
       case s.pane
       when :input
         if s.input_mode == InputMode::Insert
-          "type a JWT · esc read · ↓ decoded · ^E encode · ^L clear · ^N new · ↑ sub-tabs"
+          "type a JWT · esc read · ↓ decoded · #{lens} encode · ^L clear · ^N new · ↑ sub-tabs"
         else
-          "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓ decoded · ^E encode · ^N new · esc sub-tabs"
+          "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓ decoded · #{lens} encode · ^N new · esc sub-tabs"
         end
       when :decoded
-        "↑/↓ scroll · #{y} copy · space cmds · ↑-top input · ↓ attacks · ^E encode · esc sub-tabs"
+        "↑/↓ scroll · #{y} copy · space cmds · ↑-top input · ↓ attacks · #{lens} encode · esc sub-tabs"
       when :attacks
-        "↑/↓ pick · ↵/#{y} copy token · space cmds · ↑-top decoded · ^E encode · esc sub-tabs"
+        "↑/↓ pick · ↵/#{y} copy token · space cmds · ↑-top decoded · #{lens} encode · esc sub-tabs"
       when :header, :payload
-        "type JSON · ↑/↓ move+cross · ^A alg · ^E decode · space cmds · esc sub-tabs"
+        "type JSON · ↑/↓ move+cross · ^A alg · #{lens} decode · space cmds · esc sub-tabs"
       when :secret
-        "type secret · ^A alg (#{s.alg}) · ↑/↓ cross · ^E decode · space cmds · esc sub-tabs"
+        "type secret · ^A alg (#{s.alg}) · ↑/↓ cross · #{lens} decode · space cmds · esc sub-tabs"
       when :output
-        "↑/↓ scroll · #{y} copy token · space cmds · ^A alg · ^E decode · esc sub-tabs"
+        "↑/↓ scroll · #{y} copy token · space cmds · ^A alg · #{lens} decode · esc sub-tabs"
       else
         ""
       end

@@ -18,7 +18,8 @@ module Gori
         Verb::Scope::Jwt, available: in_jwt, mnemonic: 'w') { |ctx| ctx.jwt_close; nil }
       r.register Verb::Definition.new(
         "jwt.toggle-mode", "Toggle decode/encode", "Flip between the DECODE and ENCODE lenses",
-        Verb::Scope::Jwt, available: in_jwt, mnemonic: 'e') { |ctx| ctx.jwt_toggle_mode; nil }
+        Verb::Scope::Jwt, [Verb::Chord.new("t", ctrl: true)],
+        available: in_jwt, mnemonic: 'e') { |ctx| ctx.jwt_toggle_mode; nil }
       r.register Verb::Definition.new(
         "jwt.cycle-alg", "Cycle signing alg", "Cycle the signing algorithm: HS256 / HS384 / HS512 / none",
         Verb::Scope::Jwt, [Verb::Chord.new("a", ctrl: true)], available: in_jwt, mnemonic: 'a') { |ctx| ctx.jwt_cycle_alg; nil }
