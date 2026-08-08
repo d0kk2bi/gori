@@ -2067,11 +2067,6 @@ module Gori::Tui
       @show_dist ? "distribution shown" : "distribution hidden"
     end
 
-    private def pane_border(focused : Bool, insert : Bool = false) : Color
-      return Frame.pane_border(false) unless focused
-      insert ? Theme.accent : Theme.focus_gold
-    end
-
     # The TARGET card grows to a second content row (4 high vs 3) whenever an SNI override is
     # set OR is being edited, so the override is always visible and the input row only
     # appears once you reach for it (^S). Same rule and same numbers as RepeaterView.
@@ -2096,7 +2091,7 @@ module Gori::Tui
     private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.h < 2
       ins = focused && target_insert?
-      Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: pane_border(focused, insert: ins))
+      Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: Frame.pane_border(focused))
       # The REAL mode, not `ins` — `target_chrome_hit` measures the bare `target_insert?`, and the
       # two labels are different widths. See `Frame.mode_badge`.
       Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 8, target_insert?)
@@ -2153,7 +2148,7 @@ module Gori::Tui
       pc = spans.size
       label = @http2 ? "TEMPLATE (h2)" : "TEMPLATE"
       ins = focused && (template_insert? || @chain_focused)
-      Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused, insert: ins))
+      Frame.card(screen, rect, label, bg: Theme.bg, border: Frame.pane_border(focused))
       badge = " §#{pc} "
       min_x = rect.x + label.size + 4
       # ^R:RUN rides the TEMPLATE border as the primary action — rightmost, mirroring the
@@ -2696,7 +2691,7 @@ module Gori::Tui
         @focus = :results
         return
       end
-      Frame.card(screen, rect, "RESULT ##{r.index}", bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, "RESULT ##{r.index}", bg: Theme.bg, border: Frame.pane_border(focused))
       panes = detail_panes
       @detail_pane = :request unless panes.includes?(@detail_pane) # decode may have dropped a pane
       render_detail_chips(screen, rect, panes)

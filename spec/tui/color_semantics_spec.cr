@@ -149,3 +149,35 @@ describe "focus_gold" do
   # but it is long-standing behaviour the Fuzzer copies, and changing it moves the most-used
   # pane in gori. It wants its own decision, not a spec smuggled in beside two settled ones.
 end
+
+# A pane's border answers ONE question: does this pane have focus. The mode it is in — READ or
+# INS — is answered by the badge riding that same border, and putting both on the outline made
+# the most active pane in the app the one that was not gold.
+#
+# Three views carried a private `pane_border` with a third dress for "focused and typing"
+# (`insert ? Theme.accent : Theme.focus_gold`) while four insert-capable panes — Decoder, JWT,
+# Issues, Intercept — never had one. It cost legibility too: `accent` equals `text_bright` on
+# nine of the 28 palettes, so the pane being typed into outlined itself in the brightest colour
+# the theme has.
+describe "pane borders" do
+  it "are drawn by Frame.pane_border alone" do
+    # No local copy, not even a pass-through: a private `pane_border` that merely forwards is
+    # exactly the seam the third dress grew in, and four files had one.
+    root = File.join(__DIR__, "..", "..", "src", "gori", "tui")
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      next if File.basename(path) == "frame.cr"
+      File.read(path).lines.each_with_index do |line, i|
+        next unless line.matches?(/def [a-z_]*pane_border/)
+        offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"
+      end
+    end
+    offenders.should be_empty
+  end
+
+  it "take focus as their only input" do
+    Theme.apply("goridark")
+    Frame.pane_border(true).should eq(Theme.focus_gold)
+    Frame.pane_border(false).should eq(Theme.border)
+  end
+end

@@ -4262,7 +4262,7 @@ module Gori::Tui
               else
                 "DECODED · GraphQL"
               end
-      Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, label, bg: Theme.bg, border: Frame.pane_border(focused))
       if ws_mode?
         # The seeded frames this pane cannot render as a line. Without this the operator sees
         # an empty (or short) MESSAGES pane and has no way to know a PING, a CLOSE 1002 or an
@@ -4294,15 +4294,10 @@ module Gori::Tui
       paint_request_read_chrome(screen, inner, @decoded, focused && !ins)
     end
 
-    private def pane_border(focused : Bool, insert : Bool = false) : Color
-      return Frame.pane_border(false) unless focused
-      insert ? Theme.accent : Theme.focus_gold
-    end
-
     private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.h < 2
       ins = focused && target_insert?
-      Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: pane_border(focused, insert: ins))
+      Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: Frame.pane_border(focused))
       Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 8, target_insert?) # the REAL mode, not focused&&mode — see Frame.mode_badge
       sni_x, tr_edge = target_chrome_chain(rect)
       # An at-a-glance SNI marker on the top border (right of the title) whenever an
@@ -4431,7 +4426,7 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       label = render_request_label
       ins = focused && request_insert?
-      Frame.card(screen, rect, label, bg: Theme.bg, border: pane_border(focused, insert: ins))
+      Frame.card(screen, rect, label, bg: Theme.bg, border: Frame.pane_border(focused))
       min_x = rect.x + label.size + 4 # keep clear of the pane title on the top border
       right_edge = rect.right - 1     # leave the right border cell untouched
       # Primary action rides the REQUEST border (discoverable without the footer chord):
@@ -4590,7 +4585,7 @@ module Gori::Tui
     #     cursor coordinates address a different document.
     private def render_ws_handshake(screen : Screen, rect : Rect, focused : Bool, active : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "HANDSHAKE RESPONSE", bg: Theme.bg, border: pane_border(focused && active))
+      Frame.card(screen, rect, "HANDSHAKE RESPONSE", bg: Theme.bg, border: Frame.pane_border(focused && active))
       if result = @result
         meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
         # `rect.x + 22` used to stand in for "HANDSHAKE RESPONSE" — the title's width, copied
@@ -4653,7 +4648,7 @@ module Gori::Tui
         render_transcript(screen, rect, focused, "GROUP · #{g.size} req", group_transcript_lines, total)
         return
       end
-      Frame.card(screen, rect, "RESPONSE", bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, "RESPONSE", bg: Theme.bg, border: Frame.pane_border(focused))
       render_response_chrome(screen, rect)
       body = rect.inset(1, 1)
       if @resp_hex
@@ -4681,7 +4676,7 @@ module Gori::Tui
                                   title : String, lines : Array({String, Color}), dur_us : Int64?,
                                   active : Bool = true) : Nil
       lit = focused && active
-      Frame.card(screen, rect, title, bg: Theme.bg, border: pane_border(lit))
+      Frame.card(screen, rect, title, bg: Theme.bg, border: Frame.pane_border(lit))
       if d = dur_us
         meta = Fmt.dur(d)
         Frame.border_meta(screen, rect, title, meta)

@@ -1349,7 +1349,7 @@ module Gori::Tui
     private def render_desc_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
       ins = focused && desc_insert_mode?
-      border = desc_pane_border(focused, ins)
+      border = Frame.pane_border(focused)
       Frame.card(screen, rect, "DESCRIPTION", bg: Theme.bg, border: border)
       # The REAL mode, always drawn — `Frame.mode_badge`'s contract. `project_controller`
       # hit-tests the bare `desc_insert_mode?`, so gating the draw on focus left a live
@@ -1359,11 +1359,6 @@ module Gori::Tui
       @desc_area.render(screen, inner, cursor: ins,
         highlight: Settings.editor_markdown ? :markdown : nil, gauge: true, gauge_focused: focused)
       paint_desc_read_chrome(screen, inner, focused && !ins)
-    end
-
-    private def desc_pane_border(focused : Bool, insert : Bool) : Color
-      return Frame.pane_border(false) unless focused
-      insert ? Theme.accent : Frame.pane_border(true)
     end
 
     # The shared over-paint — see `TextReadState#paint_chrome`, which carries the reasoning

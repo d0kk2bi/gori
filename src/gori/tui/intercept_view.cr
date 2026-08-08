@@ -908,10 +908,6 @@ module Gori::Tui
       {label, @enabled ? Theme.accent : Theme.muted}
     end
 
-    private def pane_border(focused : Bool) : Color
-      Frame.pane_border(focused)
-    end
-
     # --- what a queue row IS ---------------------------------------------------
     # Every branch on `Interceptor::Kind` in this file (and `InterceptController`'s toast
     # label) is an exhaustive `case ... in`, deliberately. They were all `kind.request?`
@@ -979,7 +975,7 @@ module Gori::Tui
 
     private def render_list(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "QUEUE (#{@items.size})", bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, "QUEUE (#{@items.size})", bg: Theme.bg, border: Frame.pane_border(focused))
       inner = rect.inset(1, 1)
       ensure_visible(inner.h)
       (0...inner.h).each do |i|
@@ -1019,7 +1015,7 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       it = selected_item
       title = it.nil? ? "DETAIL" : detail_title(it)
-      Frame.card(screen, rect, title, bg: Theme.bg, border: pane_border(focused))
+      Frame.card(screen, rect, title, bg: Theme.bg, border: Frame.pane_border(focused))
       # `e` (or ↵) toggles editing the held bytes vs previewing them — lit while editing,
       # a muted hint while previewing, so the edit affordance rides the border. A binary WS
       # message says READ-ONLY there instead: the affordance must not advertise an edit the
