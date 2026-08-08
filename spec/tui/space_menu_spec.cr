@@ -485,7 +485,11 @@ describe Gori::Tui::SpaceMenu do
     ctx.miner_has_issue = true
     menu.open(Gori::Verb::Scope::Miner, :common, ctx)
     menu.entries.map(&.id).should contain("mine.repeater")
-    menu.verb_for('p').try(&.id).should eq("mine.repeater")
+    # 'R', not 'p': `fuzz.repeater` also had to move off `r` and its comment names 'R' as
+    # "the letter the other tabs use for Repeater" — the two tabs with the same collision had
+    # picked different answers.
+    menu.verb_for('R').try(&.id).should eq("mine.repeater")
+    Gori::Verbs.registry["fuzz.repeater"].menu_key.should eq('R')
   end
 
   it "hides the scope rule edit/delete entries when no rule is selected" do

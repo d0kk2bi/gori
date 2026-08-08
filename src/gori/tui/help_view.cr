@@ -83,6 +83,11 @@ module Gori::Tui
         Item.new("space", "command menu (READ mode on request/target/response)"),
         Item.new("y", "copy selection/line (READ)", "repeater.copy"),
         Item.new("x · ⇧arrows", "select the current line · extend selection"),
+        # The §…§ marker trio, same keys and same order as the FUZZER section below — the
+        # Repeater grew `^K`/`^T` to match and Help documented neither.
+        Item.new("^A · ^K · ^T", "auto-mark params · mark word · mark point (manual §)", "repeater.auto-mark"),
+        Item.new("space → c", "clear every § marker", "repeater.clear-marks"),
+        Item.new("^Y", "edit the decoder chain on the marker at the cursor", "repeater.attach-chain"),
         Item.new("^X", "hex-edit the request", "repeater.toggle-hex"),
         Item.new("^S", "SNI override (on the target)", "repeater.toggle-sni"),
         Item.new("^L", "toggle auto Content-Length", "repeater.toggle-auto-content-length"),
@@ -117,6 +122,34 @@ module Gori::Tui
         Item.new("o · m", "sort · matched-only"),
         Item.new("r", "rename the sub-tab (on the strip)"),
         Item.new("⇧←/→", "detail: scroll a long line sideways"),
+      ]},
+      # Miner, OAST and JWT had NO section at all, while Sequencer — also a default-hidden
+      # tab — has a full one, so "it's hidden" was never the rule being applied. Three tabs
+      # whose entire keyboard surface was undiscoverable from the one screen that exists to
+      # answer "what can I press here".
+      {"MINER", [
+        Item.new("Mine parameters", "from History/Repeater (space menu) — finds params the app accepts but never shows"),
+        Item.new("^R · ^X", "mine · stop", "mine.run"),
+        Item.new("↹", "summary ⟷ findings"),
+        Item.new("↑/↓ · ↵", "findings: select · open detail"),
+        Item.new("space → R", "send the selected finding to Repeater (param injected)", "mine.repeater"),
+        Item.new("^N / ^W", "new / close a sub-tab"),
+      ]},
+      {"JWT", [
+        Item.new("^E", "switch decode ⟷ encode", "jwt.toggle-mode"),
+        Item.new("^A", "cycle the signing alg (alg=none included)", "jwt.cycle-alg"),
+        Item.new("^L · ^Y", "clear the session · copy everything", "jwt.clear"),
+        Item.new("↹", "cycle INPUT → DECODED → ATTACKS (decode) / HEADER → PAYLOAD → SECRET → OUTPUT (encode)"),
+        Item.new("i / ↵", "enter INS on an editable pane · esc back to READ"),
+        Item.new("↑/↓ · ↵", "attacks: select · copy the selected payload"),
+        Item.new("^N / ^W", "new / close a sub-tab"),
+      ]},
+      {"OAST", [
+        Item.new("^R · ^X", "start listening · stop", "oast.listen"),
+        Item.new("↑/↓ · ↵", "callbacks: select · open detail"),
+        Item.new("space → p", "promote a callback to an Issue", "oast.promote"),
+        Item.new("space → a", "add a provider · e edit · x enable/disable"),
+        Item.new("payload", "insert an OAST payload into the focused editor (space → O)", "oast.insert-payload"),
       ]},
       {"SEQUENCER", [
         Item.new("Send to Sequencer", "from History/Repeater/Sitemap (space menu) — replay + analyze a token"),

@@ -6,8 +6,8 @@ include Gori::Tui
 describe Gori::Tui::HelpView do
   it "renders the grouped shortcut sections" do
     view = HelpView.new
-    backend = MemoryBackend.new(100, 120) # tall enough for every row (grows as tabs are added)
-    view.render(Screen.new(backend), Rect.new(0, 0, 100, 120))
+    backend = MemoryBackend.new(100, 240) # tall enough for every row (grows as tabs are added)
+    view.render(Screen.new(backend), Rect.new(0, 0, 100, 240))
 
     backend.contains?("GLOBAL").should be_true
     backend.contains?("command palette").should be_true
@@ -15,6 +15,19 @@ describe Gori::Tui::HelpView do
     backend.contains?("REPEATER").should be_true
     backend.contains?("rename").should be_true  # the new sub-tab rename shortcut is documented
     backend.contains?("DECODER").should be_true # the Decoder tab cheat-sheet
+  end
+
+  it "gives every workbench tab a section" do
+    # Miner, JWT and OAST had none, while Sequencer — also default-hidden — had a full one,
+    # so "it's a hidden tab" was never the rule. Three tabs whose whole keyboard surface was
+    # missing from the one screen that exists to answer "what can I press here".
+    #
+    # Title-matched rather than rendered, so a section that scrolls off a short terminal still
+    # counts: this is about the CONTENT existing, not about it fitting.
+    titles = HelpView::SECTIONS.map { |(t, _)| t }
+    %w(REPEATER FUZZER MINER SEQUENCER JWT OAST DECODER COMPARER REWRITER COLORMARKER).each do |tab|
+      titles.should contain(tab)
+    end
   end
 
   it "scrolls — the first section leaves and the last arrives" do

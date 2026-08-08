@@ -289,7 +289,7 @@ module Gori
       r.register Verb::Definition.new(
         "repeater.toggle-auto-content-length", "Toggle auto Content-Length", "Recompute Content-Length from the body on send",
         Verb::Scope::Repeater, [Verb::Chord.new("l", ctrl: true)],
-        available: in_repeater) { |ctx| ctx.repeater_toggle_auto_content_length; nil }
+        available: in_repeater, mnemonic: 'L', section: :request) { |ctx| ctx.repeater_toggle_auto_content_length; nil }
       r.register Verb::Definition.new(
         "repeater.toggle-http2", "Toggle HTTP/2 (h2)", "Send this request over HTTP/2 or HTTP/1.1, overriding the captured protocol",
         Verb::Scope::Repeater, [Verb::Chord.new("v", ctrl: true)],
@@ -609,13 +609,15 @@ module Gori
         "mine.stop", "Stop mining", "Stop the running mine", Verb::Scope::Miner,
         [Verb::Chord.new("x", ctrl: true)], available: in_miner, mnemonic: 's') { |ctx| ctx.mine_stop; nil }
       # Send the selected finding (injected into the session request) to Repeater. COMMON so
-      # it's reachable from summary/results/detail; gated on a selected finding. 'p' is free
-      # in COMMON ∪ :subtab (COMMON: r/s/k/u; :subtab: d).
+      # it's reachable from summary/results/detail; gated on a selected finding. 'R', not 'p':
+      # `fuzz.repeater` had to move off `r` too and its comment names 'R' as "the letter the
+      # other tabs use for Repeater" — the two tabs with the same problem picked different
+      # answers. 'R' is free in COMMON ∪ :subtab here (COMMON: r/s/k/u; :subtab: d).
       r.register Verb::Definition.new(
         "mine.repeater", "Send to Repeater", "Open the selected finding as a request in Repeater (param injected)",
         Verb::Scope::Miner,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :miner && ctx.miner_finding_selected? },
-        mnemonic: 'p') { |ctx| ctx.mine_repeater_selected; nil }
+        mnemonic: 'R') { |ctx| ctx.mine_repeater_selected; nil }
       # Content-only clone of the active miner session (request + config; no findings).
       # 'd' is free in COMMON ∪ :subtab (COMMON: r/s/k/u/p).
       r.register Verb::Definition.new(
