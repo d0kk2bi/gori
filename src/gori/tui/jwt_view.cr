@@ -92,7 +92,10 @@ module Gori::Tui
       unless out_c.empty?
         out_lines = output_ok ? output.split('\n') : ["✗ #{output}"]
         @out_lines = out_lines.size
-        title = "OUTPUT#{output_ok ? "" : "  ✗ invalid JSON"}"
+        # Just "OUTPUT". The failure is already the body's first line (`✗ <reason>`, in red,
+        # two lines below) — the title said a shorter version of the same thing, and a card
+        # title is what the card IS, not what state it is in.
+        title = "OUTPUT"
         @out_h, @out_scroll = draw_text_card(screen, out_c, title, out_lines, @out_scroll,
           focused && pane == :output, fg: output_ok ? Theme.text : Theme.red)
       end
@@ -140,7 +143,8 @@ module Gori::Tui
 
     # ---- ATTACKS list (one selectable row per generated payload) ----
     private def render_attacks(screen : Screen, card : Rect, attacks : Array(Jwt::Attack), focused : Bool) : Nil
-      Frame.card(screen, card, "ATTACKS · #{attacks.size}", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.card(screen, card, "ATTACKS", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.border_meta(screen, card, "ATTACKS", attacks.size.to_s)
       body = card.inset(1, 1)
       return if body.h <= 0
       if attacks.empty?

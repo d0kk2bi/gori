@@ -259,3 +259,62 @@ describe "fixed sub-tab strip labels" do
     offenders.should be_empty
   end
 end
+
+# The last of the hand-rolled chrome: a right-anchored run of bare text chips on a filter bar,
+# a count baked into a card TITLE, and the `▎` marker used as a trailing glyph.
+describe "the last hand-rolled chrome" do
+  root = File.join(__DIR__, "..", "..", "src", "gori", "tui")
+
+  it "leaves the filter bar's right cluster to Frame.right_text_chain" do
+    # Four views wrote this out — History (`count · ⇧S scope · f:follow · N marked`), Sitemap
+    # (`… g:fold …`), and the bare pair in Issues and Probe. The tell is the hand-rolled
+    # right-to-left cursor: `rx = rect.right - 1` followed by `rx -= …`. They had already
+    # drifted on the gap, stepping TWO columns after the count and ONE between the chips in
+    # the same method.
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      src = File.read(path)
+      # Filter BARS only. `probe_view` runs the same right-to-left cursor INSIDE a list row
+      # to right-align `status · host · ×N` — a per-row column layout, not a bar cluster, and
+      # no shared helper covers it.
+      next if File.basename(path) == "probe_view.cr"
+      src.lines.each_with_index do |line, i|
+        next unless line.matches?(/^\s+rx -= \w+\.size \+ \d/)
+        offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"
+      end
+    end
+    offenders.should be_empty
+  end
+
+  it "keeps counts out of card titles" do
+    # A count in the title makes the title's WIDTH a moving target, and two views derive a
+    # badge's `min_x` from exactly that width — so the chrome shifted as the number gained a
+    # digit. `Frame.border_meta` is the slot, right-aligned and independent of the title.
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      File.read(path).lines.each_with_index do |line, i|
+        next unless line.includes?("Frame.card(")
+        # A COUNT, specifically — `"FINDINGS (#{n})"`, `"ATTACKS · #{n}"`. A title that
+        # interpolates WHAT the card is showing is not the same thing and stays: `RESULT #3`,
+        # `SETTINGS · NETWORK`, `PICK FLOW REPEATER`, `IMPORT HAR · source path`. The tell is
+        # a bare size/count expression, not a name.
+        next unless line.matches?(/Frame\.card\([^,]+,\s*[^,]+,\s*"[^"]*#\{[^}]*\.size[^}]*\}/)
+        offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"
+      end
+    end
+    offenders.should be_empty
+  end
+
+  it "uses ▎ as a leading marker, never a trailing one" do
+    # Every list in gori writes `▎` in the row's marker column. History's preview titles were
+    # the one place it followed its label instead.
+    offenders = [] of String
+    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+      File.read(path).lines.each_with_index do |line, i|
+        next unless line.matches?(/"[^"]*\S\s*▎"/)
+        offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"
+      end
+    end
+    offenders.should be_empty
+  end
+end

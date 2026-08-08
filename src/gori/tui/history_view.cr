@@ -1895,8 +1895,11 @@ module Gori::Tui
       return if rect.empty?
       bg = active ? Theme.selection_dim : Theme.bg
       screen.fill(rect, bg) if active
-      label = active ? " #{title} ▎" : " #{title} "
-      screen.text(rect.x + 1, rect.y, label, active ? Theme.accent : Theme.muted, bg, attr: Attribute::Bold)
+      # `▎` in the marker column, not trailing the title — this was the one place in gori
+      # where the bar followed its label instead of leading the row. Written on both states so
+      # the title sits at the same column either way.
+      screen.cell(rect.x, rect.y, active ? '▎' : ' ', Theme.accent, bg)
+      screen.text(rect.x + 1, rect.y, " #{title} ", active ? Theme.accent : Theme.muted, bg, attr: Attribute::Bold)
       lines ||= ["(empty)"]
       content_y = rect.y + 1
       content_h = {rect.bottom - content_y, 0}.max
@@ -2247,27 +2250,20 @@ module Gori::Tui
       # Right cluster: a scope-lens chip (always shown so the ⇧S toggle is discoverable)
       # and, when filtering, the row count. The scope lens is a filter too, so it lives
       # on the filter bar next to the QL query.
-      scope_on = @scope.try(&.active?) == true
-      chip, chip_color = scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted}
-      rx = rect.right - 1
+      # One right-anchored chain, drawn by `Frame.right_text_chain` — rightmost first. The
+      # `f:follow` toggle shares the scope chip's accent/muted dress so the two read as one
+      # cluster, and the mark chip joins them rather than being placed by hand afterwards.
+      chips = [] of {String, Color}
       if filtering?
         # @rows is capped at PAGE by the search LIMIT; show "N+" at the cap so the count
         # isn't silently misread as the exact match total when more actually match.
-        count = @rows.size >= PAGE ? "#{PAGE}+" : @rows.size.to_s
-        screen.text({rx - count.size, rect.x}.max, rect.y, count, Theme.muted)
-        rx -= count.size + 2
+        chips << {@rows.size >= PAGE ? "#{PAGE}+" : @rows.size.to_s, Theme.muted}
       end
-      scope_x = {rx - chip.size, rect.x}.max
-      screen.text(scope_x, rect.y, chip, chip_color)
-      # The live-tail (follow) toggle, left of the scope chip — same fg accent/muted
-      # style so the two mode toggles read as one cluster, surfacing the `f` chord
-      # (today follow is only implicit in the selection sitting on the newest row).
-      fchip = "f:follow"
-      fx = scope_x - fchip.size - 1
-      follow_shown = fx > rect.x + 1
-      screen.text(fx, rect.y, fchip, @follow ? Theme.accent : Theme.muted) if follow_shown
-
-      lx = render_mark_chip(screen, rect, follow_shown ? fx : scope_x)
+      scope_on = @scope.try(&.active?) == true
+      chips << (scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted})
+      chips << {"f:follow", @follow ? Theme.accent : Theme.muted}
+      chips << {mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
+      lx = Frame.right_text_chain(screen, rect.right - 1, rect.y, rect.x + 2, chips)
 
       left_w = {lx - (rect.x + 1) - 1, 0}.max
       if !@query.blank?
@@ -2290,14 +2286,14 @@ module Gori::Tui
     # survive a tab switch, so this chip is what keeps the set from being invisible when you
     # come back. The hidden split covers marks the current filter/window doesn't show, so the
     # count never silently exceeds what's on screen.
-    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
-      return right_x if @marks.empty?
+    # The mark chip's TEXT, or nil when there is nothing marked. It used to place itself,
+    # which is why it needed a `right_x` and its own too-narrow guard; as a string it joins
+    # the same chain as its neighbours and `Frame.right_text_chain` drops it on a narrow bar
+    # for the same reason it drops any of them.
+    private def mark_chip_text : String?
+      return nil if @marks.empty?
       hidden = marked_hidden_count
-      chip = hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
-      x = right_x - chip.size - 1
-      return right_x unless x > rect.x + 1 # too narrow — the row count/scope chips win
-      screen.text(x, rect.y, chip, Theme.accent)
-      x
+      hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
     end
 
     private def render_suggestions(screen : Screen, rect : Rect, y : Int32) : Nil

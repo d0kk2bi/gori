@@ -840,13 +840,11 @@ module Gori::Tui
           colors: Highlight.filter_query(@query, Theme.text_bright, FilterAst::SEPS_FIELD))
         return
       end
-      rx = rect.right - 1
-      if filtering?
-        count = @issues.size.to_s
-        screen.text({rx - count.size, rect.x}.max, rect.y, count, Theme.muted)
-        rx -= count.size + 2
-      end
-      rx = render_mark_chip(screen, rect, rx)
+      # One right-anchored chain — see HistoryView#render_ql_bar.
+      chips = [] of {String, Color}
+      chips << {@issues.size.to_s, Theme.muted} if filtering?
+      chips << {mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
+      rx = Frame.right_text_chain(screen, rect.right - 1, rect.y, rect.x + 2, chips)
       left_w = {rx - (rect.x + 1), 0}.max
       if filtering?
         # The committed query stays highlighted — this readout is what you scan to
@@ -864,14 +862,11 @@ module Gori::Tui
     # switch, so this chip is what keeps the set from being invisible when you come back. The
     # hidden split covers marks the current filter doesn't show, so the count never silently
     # exceeds what's on screen.
-    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
-      return right_x if @marks.empty?
+    # The mark chip's TEXT, or nil when nothing is marked — see HistoryView#mark_chip_text.
+    private def mark_chip_text : String?
+      return nil if @marks.empty?
       hidden = marked_hidden_count
-      chip = hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
-      x = right_x - chip.size
-      return right_x unless x > rect.x + 1 # too narrow — the match count wins
-      screen.text(x, rect.y, chip, Theme.accent)
-      x - 2
+      hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
     end
 
     private def render_detail(screen : Screen, rect : Rect, focused : Bool) : Nil
@@ -889,8 +884,8 @@ module Gori::Tui
 
       # y1 — chips: a filled severity chip + a status chip.
       cx = rect.x + 1
-      cx = chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
-      chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
+      cx = Frame.tag_chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
+      Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
 
       # y2 — timestamps.
       meta = "created #{fmt_ts(issue.created_at)}"
@@ -986,10 +981,6 @@ module Gori::Tui
 
     # A filled "chip": ` LABEL ` painted with `color` as the background. Returns the
     # x just past it so chips lay out left-to-right.
-    private def chip(screen : Screen, x : Int32, y : Int32, label : String, color : Color) : Int32
-      screen.text(x, y, label, Theme.bg, color, Attribute::Bold)
-    end
-
     private def refresh_detail(store : Store) : Nil
       if issue = @detail
         @detail = store.get_issue(issue.id)

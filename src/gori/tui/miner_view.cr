@@ -536,7 +536,8 @@ module Gori::Tui
     end
 
     private def render_results(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "FINDINGS (#{@results.size})", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      Frame.card(screen, rect, "FINDINGS", border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "FINDINGS", @results.size.to_s)
       inner = rect.inset(1, 1)
       # A card under 3 rows has no interior — `inset` floors the height at 0 but keeps
       # `inner.y` one row down, so an unguarded placeholder lands OUTSIDE the pane.

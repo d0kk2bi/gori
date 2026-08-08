@@ -1042,25 +1042,17 @@ module Gori::Tui
       # Right cluster: the scope-lens chip (always shown so the ⇧S toggle is
       # discoverable — the Scope lens filters the tree too) and, when filtering, the
       # matching host count.
+      # One right-anchored chain — see HistoryView#render_ql_bar, which this mirrors. The
+      # `g:fold` toggle keeps the scope chip's accent/muted dress so the two lenses read as
+      # one cluster, and its `g` chord stays in view (folding on vs off renders identically
+      # when a tree has no ids to fold).
+      chips = [] of {String, Color}
+      chips << {"#{@hosts.size}h", Theme.muted} if filtering?
       scope_on = @scope.try(&.active?) == true
-      chip, chip_color = scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted}
-      rx = rect.right - 1
-      if filtering?
-        count = "#{@hosts.size}h"
-        screen.text({rx - count.size, rect.x}.max, rect.y, count, Theme.muted)
-        rx -= count.size + 2
-      end
-      scope_x = {rx - chip.size, rect.x}.max
-      screen.text(scope_x, rect.y, chip, chip_color)
-      # The id-folding toggle, left of the scope chip — same fg
-      # accent/muted style so the two lens toggles read as one cluster, and its `g`
-      # chord stays in view (folding-on vs -off renders identically without ids).
-      gchip = "g:fold"
-      gx = scope_x - gchip.size - 1
-      group_shown = gx > rect.x + 1
-      screen.text(gx, rect.y, gchip, @grouping ? Theme.accent : Theme.muted) if group_shown
-
-      lx = render_mark_chip(screen, rect, group_shown ? gx : scope_x)
+      chips << (scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted})
+      chips << {"g:fold", @grouping ? Theme.accent : Theme.muted}
+      chips << {mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
+      lx = Frame.right_text_chain(screen, rect.right - 1, rect.y, rect.x + 2, chips)
 
       left_w = {lx - (rect.x + 1) - 1, 0}.max
       if !@query.blank?
@@ -1083,14 +1075,11 @@ module Gori::Tui
     # sub-tab switch and a reload, so this chip is what keeps the set from being invisible when
     # you come back. The hidden split covers marks the current filter/expand state doesn't
     # show, so the count never silently exceeds what's on screen.
-    private def render_mark_chip(screen : Screen, rect : Rect, right_x : Int32) : Int32
-      return right_x if @marks.empty?
+    # The mark chip's TEXT, or nil when nothing is marked — see HistoryView#mark_chip_text.
+    private def mark_chip_text : String?
+      return nil if @marks.empty?
       hidden = marked_hidden_count
-      chip = hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
-      x = right_x - chip.size - 1
-      return right_x unless x > rect.x + 1 # too narrow — the host count/scope chips win
-      screen.text(x, rect.y, chip, Theme.accent)
-      x
+      hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
     end
 
     private def render_column_headers(screen : Screen, rect : Rect, hdr_y : Int32) : Nil

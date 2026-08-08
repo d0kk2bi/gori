@@ -872,7 +872,8 @@ module Gori::Tui
     end
 
     private def render_providers(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "PROVIDERS (#{@providers.size})", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      Frame.card(screen, rect, "PROVIDERS", border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "PROVIDERS", @providers.size.to_s)
       inner = rect.inset(1, 1)
       if @providers.empty?
         screen.text(inner.x + 1, inner.y, "no providers — press a to add one (interactsh is prefilled)", Theme.muted, Theme.bg, width: inner.w - 2)

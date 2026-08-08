@@ -47,7 +47,11 @@ describe Gori::Tui::InterceptView do
       view.reload(ic)
       backend = MemoryBackend.new(100, 12)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
-      backend.contains?("QUEUE (1)").should be_true # framed queue pane title
+      # The count left the TITLE for the border's right edge (`Frame.border_meta`), so it is
+      # no longer contiguous with the word — a count baked into a title makes the title's
+      # width a moving target for anything else riding that border.
+      queue_row = (0...backend.size[1]).find { |y| backend.row(y).includes?("QUEUE") }.not_nil!
+      backend.row(queue_row).should contain("1") # the count, right-aligned on the same border
       backend.contains?("REQ").should be_true
       backend.contains?("acme.test/login").should be_true
     end
@@ -634,12 +638,12 @@ describe "Intercept filter bar" do
 
       backend = MemoryBackend.new(100, 12)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
-      idle_row = (0...12).find { |y| backend.row(y).includes?("QUEUE (1)") }
+      idle_row = (0...12).find { |y| backend.row(y).includes?("QUEUE") }
 
       view.start_query
       backend = MemoryBackend.new(100, 12)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
-      query_row = (0...12).find { |y| backend.row(y).includes?("QUEUE (1)") }
+      query_row = (0...12).find { |y| backend.row(y).includes?("QUEUE") }
 
       idle_row.should_not be_nil
       query_row.should eq(idle_row.not_nil! + 1)
@@ -697,7 +701,7 @@ describe "Intercept filter bar" do
       backend = MemoryBackend.new(100, 12)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
       backend.row(0).includes?("c:ALL").should be_true # bar on the top row
-      backend.contains?("QUEUE (1)").should be_true    # queue card still drawn below
+      backend.contains?("QUEUE").should be_true        # queue card still drawn below
       backend.contains?("acme.test/login").should be_true
     end
   end

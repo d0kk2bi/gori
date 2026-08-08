@@ -205,6 +205,38 @@ module Gori::Tui
       focused ? screen.text(tx, y, cue, Theme.muted, bg) : tx
     end
 
+    # A right-anchored run of BARE text chips — no fill, one column of gap, each dropped
+    # whole when it would cross `min_x`. `chips` is right-to-left: the first entry is the
+    # rightmost, matching `right_badge_hit`'s convention. Returns the leftmost x actually
+    # drawn, or `right_edge + 1` when nothing fit, so the caller can size what sits left of it.
+    #
+    # This is the filter-bar cluster four views had each written out: History's
+    # `count · ⇧S scope · f:follow`, Sitemap's `count · ⇧S scope · g:fold`, and the bare
+    # `count · ⇧S scope` in Issues and Probe. Same shape, four copies, and they had already
+    # drifted on the gap — a TWO-column step after the count, a ONE-column step between the
+    # chips, in the same method. `toggle_badge` is not this: it fills a `" chord:NAME "` pill,
+    # where these are plain fg-coloured words on the bar.
+    def self.right_text_chain(screen : Screen, right_edge : Int32, y : Int32, min_x : Int32,
+                              chips : Array({String, Color}), bg : Color = Theme.bg) : Int32
+      x = right_edge + 1
+      chips.each do |(text, color)|
+        w = Screen.draw_width(text)
+        left = x - 1 - w
+        next if left < min_x # drop this one, keep trying the shorter ones further left
+        screen.text(left, y, text, color, bg)
+        x = left
+      end
+      x
+    end
+
+    # A filled severity/status pill: the label inked in the canvas colour ON `color`, bold.
+    # `Frame.chip`'s lit/muted pair cannot express this — the fill IS the datum here (a
+    # severity's own hue), not an on/off state — which is why Issues and Probe each grew a
+    # private `chip` for it. They were byte-identical.
+    def self.tag_chip(screen : Screen, x : Int32, y : Int32, label : String, color : Color) : Int32
+      screen.text(x, y, label, Theme.bg, color, Attribute::Bold)
+    end
+
     # A left-aligned mode/toggle chip at (x,y), returning the x past it. `lit` (active)
     # paints bright text on an accent fill; off is a muted, background-less label. Used
     # for keyed toggle chips on a pane's top border (e.g. Repeater's `d:diff`/`x:hex`).

@@ -581,7 +581,7 @@ module Gori::Tui
     # Row 0: a filled MODE chip (with its `m` cycle chord) + detected-tech summary + the
     # `a:CLOSED` lens toggle + right-aligned severity tallies.
     private def render_mode_band(screen : Screen, rect : Rect) : Nil
-      x = chip(screen, rect.x + 1, rect.y, " m:#{@mode.title} ", mode_color(@mode)) + 1
+      x = Frame.tag_chip(screen, rect.x + 1, rect.y, " m:#{@mode.title} ", mode_color(@mode)) + 1
       tallies_x = render_tallies(screen, rect, x + 1) # right-aligned, but never left of the mode chip
       # The CLOSED lens toggle chains left of the tallies; lit when showing closed/dismissed
       # issues, muted (its default open-only) otherwise — so the `a` chord stays in view.
@@ -626,16 +626,12 @@ module Gori::Tui
       end
       # Right cluster: a scope-lens chip (always shown so the ⇧S toggle is discoverable,
       # mirroring HistoryView/SitemapView) and, when filtering, the row count.
+      # One right-anchored chain — see HistoryView#render_ql_bar.
+      chips = [] of {String, Color}
+      chips << {@issues.size.to_s, Theme.muted} if filtering?
       scope_on = scope_active?
-      chip, chip_color = scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted}
-      rx = rect.right - 1
-      if filtering?
-        count = @issues.size.to_s
-        screen.text({rx - count.size, rect.x}.max, y, count, Theme.muted)
-        rx -= count.size + 2
-      end
-      scope_x = {rx - chip.size, rect.x}.max
-      screen.text(scope_x, y, chip, chip_color)
+      chips << (scope_on ? {"⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"⇧S scope:off", Theme.muted})
+      scope_x = Frame.right_text_chain(screen, rect.right - 1, y, rect.x + 2, chips)
       left_w = {scope_x - (rect.x + 1) - 1, 0}.max
       if filtering?
         label = @query.blank? ? "(in-scope only)" : ": #{@query}"
@@ -657,15 +653,15 @@ module Gori::Tui
       screen.text(rect.x + 3, rect.y, issue.title, Theme.text_bright, width: title_w, attr: Attribute::Bold)
 
       cx = rect.x + 1
-      cx = chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
-      cx = chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
-      cx = chip(screen, cx + 1, rect.y + 1, " #{issue.category} ", Theme.muted)
+      cx = Frame.tag_chip(screen, cx, rect.y + 1, " #{severity_badge(issue.severity)} ", severity_color(issue.severity))
+      cx = Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{issue.status.label} ", status_color(issue.status))
+      cx = Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{issue.category} ", Theme.muted)
       # CWE last, and only when the whole chip fits: `chip` draws through screen.text with no
       # width cap, so an unguarded one on a narrow pane would run past the pane's right edge and
       # paint over the neighbouring column. Dropping it is the right degradation — the id is also
       # on the preview meta line and in every export.
       if (id = Probe.cwe_id(issue.code)) && cx + 1 + id.size + 2 <= rect.right
-        chip(screen, cx + 1, rect.y + 1, " #{id} ", Theme.muted)
+        Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{id} ", Theme.muted)
       end
 
       hint = detail_hint(issue.code)
@@ -708,10 +704,6 @@ module Gori::Tui
       issue = @detail || return
       sync_affected(issue)
       yield
-    end
-
-    private def chip(screen : Screen, x : Int32, y : Int32, label : String, color : Color) : Int32
-      screen.text(x, y, label, Theme.bg, color, Attribute::Bold)
     end
 
     # Detail-pane one-liner: built-in remediation, or the custom rule's own description for a
