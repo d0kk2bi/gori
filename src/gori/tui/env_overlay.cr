@@ -2,6 +2,7 @@ require "./screen"
 require "./theme"
 require "./frame"
 require "./highlight"
+require "./text_field"
 require "./overlay"
 require "../settings"
 require "../env"
@@ -25,9 +26,12 @@ module Gori::Tui
       @adding = false
       @prefix_editing = false
       @edit_index = nil.as(Int32?)
-      @input = ""
-      @icx = 0
-      @preedit = ""
+      # One `TextField` shared by the two inline editors this overlay opens (the add/edit row
+      # and the prefix row) — they are never open at once, and both used to stand on the same
+      # hand-rolled `@input`/`@icx`/`@preedit` triple. A TextField remembers the geometry it
+      # was drawn at, which is what gives the row a caret on a press, drag-select and
+      # double-click-word; the triple gave it none of them.
+      @field = TextField.new
       reset
     end
 
@@ -105,15 +109,12 @@ module Gori::Tui
         cancel_prefix_edit
       elsif key.enter?
         commit_prefix_and_persist
-      elsif key.left?
-        move_cursor(-1)
-      elsif key.right?
-        move_cursor(1)
       elsif key.backspace?
+        # The empty check comes BEFORE the field sees the key: `TextField#backspace` on an
+        # empty value is a silent no-op, and ⌫ on an empty row means "I am done here".
         cancel_prefix_edit unless backspace
-      elsif c && !ev.ctrl? && !ev.alt?
-        input(c)
-        set_preedit("")
+      else
+        @field.handle_edit_key(ev)
       end
       :stay
     end
@@ -125,18 +126,17 @@ module Gori::Tui
         cancel_add
       elsif key.enter?
         commit_and_persist
-      elsif key.left?
-        move_cursor(-1)
-      elsif key.right?
-        move_cursor(1)
       elsif key.backspace?
         cancel_add unless backspace
       elsif key.tab?
-        input(' ') # Tab types the KEY/VALUE separator, not a focus jump
-        set_preedit("")
-      elsif c && !ev.ctrl? && !ev.alt?
-        input(c)
-        set_preedit("")
+        # ↹ types the KEY/VALUE separator rather than jumping focus. There is nowhere to jump
+        # to — this row is one field holding a pair, which `commit_entry` parses. Deliberate,
+        # and the same in the hostname editor next door.
+        @field.insert(' ')
+      else
+        # Caret motion, word jumps, ⌥⌫ and selection now come from the shared editor; this
+        # row used to answer arrows with `move_cursor(±1)` and nothing else.
+        @field.handle_edit_key(ev)
       end
       :stay
     end
@@ -197,6 +197,8 @@ module Gori::Tui
         end
         return :stay
       end
+      # A press inside an open inline editor is a CARET, not a row pick — the row is text.
+      return :stay if (@adding || @prefix_editing) && click_text_field(mx, my)
       if idx = row_at(box, mx, my)
         set_selected(idx)
       end
@@ -219,25 +221,19 @@ module Gori::Tui
     def prefix_edit_start : Nil
       cancel_add
       @prefix_editing = true
-      @input = @prefix
-      @icx = @input.size
-      @preedit = ""
+      @field.set(@prefix)
     end
 
     def cancel_prefix_edit : Nil
       @prefix_editing = false
-      @input = ""
-      @icx = 0
-      @preedit = ""
+      @field.set("")
     end
 
     def add_start : Nil
       cancel_prefix_edit
       @adding = true
       @edit_index = nil
-      @input = ""
-      @icx = 0
-      @preedit = ""
+      @field.set("")
     end
 
     def edit_start : Nil
@@ -246,42 +242,40 @@ module Gori::Tui
       cancel_prefix_edit
       @adding = true
       @edit_index = @selected
-      @input = "#{key} #{val}"
-      @icx = @input.size
-      @preedit = ""
+      @field.set("#{key} #{val}")
     end
 
     def cancel_add : Nil
       @adding = false
       @edit_index = nil
-      @input = ""
-      @icx = 0
-      @preedit = ""
+      @field.set("")
     end
 
     def input(ch : Char) : Nil
-      @input = "#{@input[0, @icx]}#{ch}#{@input[@icx..]}"
-      @icx += 1
-      @preedit = ""
+      @field.insert(ch)
     end
 
+    # Whether there was anything to delete — the callers read this to tell a ⌫ that edited
+    # the text from one on an empty row, which cancels the row.
     def backspace : Bool
-      return false if @icx == 0
-      @input = "#{@input[0, @icx - 1]}#{@input[@icx..]}"
-      @icx -= 1
+      return false if @field.value.empty?
+      @field.backspace
       true
     end
 
-    def move_cursor(d : Int32) : Nil
-      @icx = (@icx + d).clamp(0, @input.size)
+    def set_preedit(text : String) : Nil
+      @field.set_preedit(text)
     end
 
-    def set_preedit(text : String) : Nil
-      @preedit = text
+    # The pointer contract (see `Overlay#text_fields`) — listed only while one of the two
+    # inline editors is open, so a click on the list cannot place a caret in a field that is
+    # not on screen.
+    def text_fields : Array(TextField)
+      (@adding || @prefix_editing) ? [@field] : [] of TextField
     end
 
     def commit_prefix : Symbol
-      text = @input.strip
+      text = @field.value.strip
       return :empty if text.empty?
       @prefix = text
       cancel_prefix_edit
@@ -295,7 +289,7 @@ module Gori::Tui
     # landmine the moment one is added: the shell would run this field parser instead of the
     # closure and read its truthy Symbol as "close me". (`commit_prefix` does not collide.)
     def commit_entry : Symbol
-      text = @input.strip
+      text = @field.value.strip
       return :empty if text.empty?
       parsed = Env.parse_line(text)
       return :invalid unless parsed
@@ -380,7 +374,7 @@ module Gori::Tui
       if @prefix_editing
         x = screen.text(x, py, "prefix ", Theme.accent, bg)
         w = {box.right - 1 - x, 3}.max
-        screen.input_line(x, py, @input, @icx, @preedit, Theme.text_bright, bg, width: w)
+        @field.render(screen, x, py, w, true, Theme.text_bright, bg)
       else
         screen.text(x, py, "prefix ", Theme.muted, bg)
         screen.text(x + 7, py, @prefix, Theme.text_bright, bg, width: {box.right - x - 8, 1}.max)
@@ -412,10 +406,13 @@ module Gori::Tui
     private def draw_add_row(screen : Screen, box : Rect, py : Int32) : Nil
       bg = Theme.accent_bg
       screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
+      # The marker column every other row writes — the add-row used to skip it, so the one
+      # row that HAS the focus was the only one without the bar that says so.
+      screen.cell(box.x + 1, py, '▎', Theme.accent, bg)
       x = box.x + 3
       x = screen.text(x, py, @edit_index ? "edit " : "add ", Theme.accent, bg)
       w = {box.right - 1 - x, 3}.max
-      screen.input_line(x, py, @input, @icx, @preedit, Theme.text_bright, bg, width: w)
+      @field.render(screen, x, py, w, true, Theme.text_bright, bg)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?

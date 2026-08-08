@@ -1,6 +1,7 @@
 require "./screen"
 require "./theme"
 require "./frame"
+require "./text_field"
 require "./overlay"
 require "../settings"
 require "../host_overrides"
@@ -31,9 +32,12 @@ module Gori::Tui
       @selected = 0
       @adding = false
       @edit_index = nil.as(Int32?) # non-nil ⇒ editing that row
-      @input = ""                  # add-row text ("IP host")
-      @icx = 0
-      @preedit = ""
+      # The add/edit row is a real `TextField`, like every form row in gori. Hand-rolled
+      # `@input`/`@icx`/`@preedit` triple used to stand in for it, which meant the row was
+      # text the pointer could not reach: no caret on a press, no drag to select, no
+      # double-click for a word — all of which a TextField already answers, because it
+      # remembers the geometry it was last drawn at (`hit?`).
+      @field = TextField.new
       reset
     end
 
@@ -107,18 +111,20 @@ module Gori::Tui
         cancel_add
       elsif key.enter?
         commit_and_persist
-      elsif key.left?
-        move_cursor(-1)
-      elsif key.right?
-        move_cursor(1)
       elsif key.backspace?
+        # ⌫ on an already-empty row means "I am done here", so the empty check comes BEFORE
+        # the field sees the key — `TextField#backspace` on an empty value is a silent no-op
+        # and the row would sit there with no way out but esc.
         cancel_add unless backspace
       elsif key.tab?
-        input(' ') # Tab types the IP/host separator, not a focus jump
-        set_preedit("")
-      elsif c && !ev.ctrl? && !ev.alt?
-        input(c)
-        set_preedit("")
+        # ↹ types the IP/host separator rather than jumping focus. There is nowhere to jump
+        # to: this row is one field holding two values, and the pair is what `commit_entry`
+        # parses. Deliberate, and the same in the ENV editor next door.
+        @field.insert(' ')
+      else
+        # Everything else goes through the shared editor: caret motion, word jumps, ⌥⌫ and
+        # selection — the keys this row used to answer with `move_cursor(±1)` alone.
+        @field.handle_edit_key(ev)
       end
       :stay
     end
@@ -165,6 +171,8 @@ module Gori::Tui
         cancel_add
         return :stay
       end
+      # A press inside the open add/edit row is a CARET, not a row pick — the row is text.
+      return :stay if @adding && click_text_field(mx, my)
       if idx = row_at(box, mx, my)
         set_selected(idx)
       end
@@ -186,9 +194,7 @@ module Gori::Tui
     def add_start : Nil
       @adding = true
       @edit_index = nil
-      @input = ""
-      @icx = 0
-      @preedit = ""
+      @field.set("")
     end
 
     def edit_start : Nil
@@ -196,38 +202,36 @@ module Gori::Tui
       host, ip = @items[@selected]
       @adding = true
       @edit_index = @selected
-      @input = "#{ip} #{host}"
-      @icx = @input.size
-      @preedit = ""
+      @field.set("#{ip} #{host}")
     end
 
     def cancel_add : Nil
       @adding = false
       @edit_index = nil
-      @input = ""
-      @icx = 0
-      @preedit = ""
+      @field.set("")
     end
 
     def input(ch : Char) : Nil
-      @input = "#{@input[0, @icx]}#{ch}#{@input[@icx..]}"
-      @icx += 1
-      @preedit = ""
+      @field.insert(ch)
     end
 
+    # Whether there was anything to delete — `handle_add_key` reads this to tell a ⌫ that
+    # edited the text from one on an empty row, which cancels.
     def backspace : Bool
-      return false if @icx == 0
-      @input = "#{@input[0, @icx - 1]}#{@input[@icx..]}"
-      @icx -= 1
+      return false if @field.value.empty?
+      @field.backspace
       true
     end
 
-    def move_cursor(d : Int32) : Nil
-      @icx = (@icx + d).clamp(0, @input.size)
+    def set_preedit(text : String) : Nil
+      @field.set_preedit(text)
     end
 
-    def set_preedit(text : String) : Nil
-      @preedit = text
+    # The pointer contract (see `Overlay#text_fields`): listing the field is the whole opt-in
+    # for caret-on-press, drag-select and double-click-word. Only while the row is OPEN —
+    # otherwise a click on the list would place a caret in a field nobody is looking at.
+    def text_fields : Array(TextField)
+      @adding ? [@field] : [] of TextField
     end
 
     # Commit the add/edit row ("IP host", /etc/hosts order). Returns :ok|:empty|:invalid|
@@ -241,7 +245,7 @@ module Gori::Tui
     # landmine the moment one is added: the shell would run this field parser instead of the
     # closure and read its truthy Symbol as "close me".
     def commit_entry : Symbol
-      text = @input.strip
+      text = @field.value.strip
       return :empty if text.empty?
       parsed = HostOverrides.parse_line(text)
       return :invalid unless parsed
@@ -347,10 +351,15 @@ module Gori::Tui
     private def draw_add_row(screen : Screen, box : Rect, py : Int32) : Nil
       bg = Theme.accent_bg
       screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
+      # The marker column every other row in this list writes — the add-row used to skip it,
+      # so the one row that HAS the focus was the only one without the bar that says so.
+      screen.cell(box.x + 1, py, '▎', Theme.accent, bg)
       x = box.x + 3
       x = screen.text(x, py, @edit_index ? "edit " : "add ", Theme.accent, bg)
       w = {box.right - 1 - x, 3}.max
-      screen.input_line(x, py, @input, @icx, @preedit, Theme.text_bright, bg, width: w)
+      # `TextField#render` is what records the geometry `hit?` inverts, so drawing through it
+      # is what makes the pointer work — not merely tidier than `screen.input_line`.
+      @field.render(screen, x, py, w, true, Theme.text_bright, bg)
     end
 
     # Row index under (mx,my) — inverts render's windowed layout (add-row offset +
