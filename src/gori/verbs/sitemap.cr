@@ -66,13 +66,19 @@ module Gori
         available: ->(ctx : Verb::ExecContext) { ctx.sitemap_marked_count > 0 },
         mnemonic: 'N') { |ctx| ctx.sitemap_mark_clear; nil }
 
-      # ⇧T — tag the selected path (or every marked path) with a free-text memo; a group fold
-      # node toasts. The chord is Chord.new("t", shift: true), NOT Chord.new("T") —
-      # Keybind.from_event normalises a typed capital to shift+lowercase, so a "T" chord would
-      # never fire; menu_key skips shift chords, hence the explicit mnemonic.
+      # Tag the selected path (or every marked path) with a free-text memo; a group fold node
+      # toasts. MENU-ONLY, on 'T'.
+      #
+      # It used to hold the ⇧T chord, and that was the one letter whose MEANING changed
+      # between sibling list tabs: History, Issues and Intercept all read `t`/⇧T as
+      # "mark / mark all", so a hand that learnt the pair there opened a text prompt here.
+      # ⇧T is deliberately left UNBOUND in this scope rather than reassigned — see
+      # `sitemap.mark-toggle` above for why a tree has no useful "mark every row" today, and
+      # keep the letter free for the day one is worth having. Tagging loses nothing by being
+      # a space-menu entry: `sitemap.mark-clear` is menu-only for the same reason.
       r.register Verb::Definition.new(
         "sitemap.tag", "Tag path", "Pin a free-text memo to the selected — or every marked — path (filter with tag:)",
-        Verb::Scope::Sitemap, [Verb::Chord.new("t", shift: true)],
+        Verb::Scope::Sitemap,
         mnemonic: 'T', group: :triage) { |ctx| ctx.sitemap_tag; nil }
 
       # `g` — fold/unfold path-param ids (/users/<uuid> → {uuid}, /users/1,2,3… → [1, 2, 3 … +N]).

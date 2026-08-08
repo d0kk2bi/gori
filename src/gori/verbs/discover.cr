@@ -11,7 +11,7 @@ module Gori
 
       r.register Verb::Definition.new(
         "discover.stop", "Stop", "Stop the selected discovery run (in-flight requests finish)",
-        Verb::Scope::Discover, [Verb::Chord.new("x", ctrl: true)], mnemonic: 'x') { |ctx| ctx.discover_stop; nil }
+        Verb::Scope::Discover, [Verb::Chord.new("x", ctrl: true)], mnemonic: 's') { |ctx| ctx.discover_stop; nil }
 
       # Plain `p` toggles pause in the body (handled by the controller); the space menu
       # exposes it too. No ctrl-p — that's reserved for the command palette.

@@ -538,11 +538,6 @@ module Gori::Tui
     end
 
     # Every modified key the TEMPLATE editor owns rather than the keymap — see `handle_body_key`.
-    private def editing_motion?(ev : Termisu::Event::Key) : Bool
-      return false unless ev.ctrl? || ev.alt?
-      key = ev.key
-      key.left? || key.right? || key.home? || key.end? || word_delete?(ev)
-    end
 
     # A backspace/forward-delete of a marker delimiter (§/¦) would unbalance the marker and
     # expose its concealed ¦chain. Confirm first; on accept, strip the WHOLE marker down to

@@ -1054,7 +1054,7 @@ module Gori::Tui
       x = Frame.toggle_badge(screen, rect.right - 1, rect.y, min_x, "e", "EDIT", @editing)
       return unless @editing
       return if @loaded_ws # a WS payload has no head — the sync never runs on it
-      Frame.toggle_badge(screen, x, rect.y, min_x, "^l", "CL", @sync_content_length)
+      Frame.toggle_badge(screen, x, rect.y, min_x, "^L", "CL", @sync_content_length)
     end
 
     # Where `e`:EDIT would ride, for a message the editor must not open. Right-aligned with

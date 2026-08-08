@@ -2024,11 +2024,6 @@ module Gori::Tui
     # Every modified key the EDITOR owns rather than the keymap — see the `handle_body_key`
     # branch. Shared with the Fuzzer's controller in spirit, not in code: the two dispatchers
     # have different shapes, and one predicate each is cheaper than a mixin nobody else wants.
-    private def editing_motion?(ev : Termisu::Event::Key) : Bool
-      return false unless ev.ctrl? || ev.alt?
-      key = ev.key
-      key.left? || key.right? || key.home? || key.end? || word_delete?(ev)
-    end
 
     # A modified Home/End — the BUFFER's start/end rather than the line's.
     private def buffer_jump?(ev : Termisu::Event::Key) : Bool

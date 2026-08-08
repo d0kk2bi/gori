@@ -100,7 +100,9 @@ module Gori::Tui
       return "type a tag · ↵ save · esc cancel" if @sitemap.tagging?
       return "type query · ↹ complete · ↵ apply · esc clear" if @sitemap.querying?
       # Marks survive a filter change, so the `/` affordance stays up while they're set.
-      return "↑/↓ move · / filter · t mark · ⇧T tag · space cmds · esc clears marks" if @sitemap.mark_count > 0
+      # `space tag`, not `⇧T`: tagging is menu-only now — ⇧T meant "mark all" in every other
+      # marked list, so a hand that learnt `t`/⇧T there opened a text prompt here.
+      return "↑/↓ move · / filter · t mark · space tag · space cmds · esc clears marks" if @sitemap.mark_count > 0
       # `space cmds` on BOTH branches. The mark-set branch above named it and this one did not,
       # so the same tab advertised the space menu only while marks happened to be set.
       "↑/↓ move · / filter · t mark · g fold · ↵/→ expand · space cmds · esc sub-tabs"
@@ -184,7 +186,7 @@ module Gori::Tui
     end
 
     # --- tag editor (a text sub-mode; the shell routes its keys via handle_tag_key) ---
-    # ⇧T — open the tag editor over the target set (the marks if any, else the selected
+    # `space` → T — open the tag editor over the target set (the marks if any, else the selected
     # node). A synthetic group fold node has no real path, so it can't be tagged — toast
     # instead of opening an empty editor.
     def sitemap_tag : Nil

@@ -136,13 +136,20 @@ module Gori
       # across Body COMMON (lowercase 'x' is select-line). Mirrors probe.delete-selected.
       r.register Verb::Definition.new(
         "history.delete", "Delete flow", "Delete the selected flow from History (asks first)",
-        Verb::Scope::Body, available: history_targets, mnemonic: 'X', group: :danger) { |ctx| ctx.history_delete; nil }
+        Verb::Scope::Body, available: history_targets, mnemonic: 'D', group: :danger) { |ctx| ctx.history_delete; nil }
 
       # Wipe the project's entire History (confirm-gated). Menu-only; 'C' is free across
       # Body COMMON (lowercase 'c' is compare). Available whenever History has any rows.
+      # `X` wipes THIS TAB, `D` deletes the selected row — the pairing `probe.clear` (X) and
+      # `probe.delete-selected` (d) already had, and the one History inverted: it read `X` as
+      # delete-one and `C` as clear-all, so `X` meant "one flow" here and "every issue" one
+      # tab over, both in the danger group. `C` also collided with `Send to Comparer`, which
+      # is `C` in the Repeater and the Fuzzer — the Repeater→History move being the most
+      # travelled in the app, that letter went from "make a diff" to "wipe the capture".
+      # `d` cannot take delete here: it is `history.discover`, which fires outbound traffic.
       r.register Verb::Definition.new(
         "history.clear", "Clear history", "Delete ALL History flows for this project (asks first)",
-        Verb::Scope::Body, available: in_history, mnemonic: 'C', group: :danger) { |ctx| ctx.history_clear; nil }
+        Verb::Scope::Body, available: in_history, mnemonic: 'X', group: :danger) { |ctx| ctx.history_clear; nil }
 
       # --- repeater workbench (request editing is inline; these power the palette
       # and show their key hints — actual keys are handled directly by the TUI) ---
@@ -427,12 +434,13 @@ module Gori
         "detail.probe-active", "Run active scan", "Run the Probe active checks against this flow (shows the request count first)",
         Verb::Scope::HistoryDetail, mnemonic: 'A', group: :send) { |ctx| ctx.close_detail; ctx.probe_active_selected; nil }
 
-      # Delete the open flow (mirrors history.delete). Menu-only 'X' — free in HistoryDetail
-      # (lowercase 'x' is select-line). Confirm runs after the menu closes; the controller
-      # captures the id so a live reload can't retarget the delete.
+      # Delete the open flow (mirrors history.delete, and its letter): menu-only 'D', so the
+      # drill-in does not read `X` as "this one" while the list one keystroke away reads it as
+      # "all of them". Confirm runs after the menu closes; the controller captures the id so a
+      # live reload can't retarget the delete.
       r.register Verb::Definition.new(
         "detail.delete", "Delete flow", "Delete this flow from History (asks first)",
-        Verb::Scope::HistoryDetail, mnemonic: 'X', group: :danger) { |ctx| ctx.history_delete; nil }
+        Verb::Scope::HistoryDetail, mnemonic: 'D', group: :danger) { |ctx| ctx.history_delete; nil }
     end
 
     # Fuzzer/Intruder verbs: the cross-tab "send to Fuzzer" (⇧I from History, palette

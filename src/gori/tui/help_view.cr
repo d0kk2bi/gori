@@ -101,7 +101,11 @@ module Gori::Tui
         Item.new("space", "command menu (READ mode on target/template/results/detail)"),
         Item.new("y · O", "copy selection/line · copy all pane (READ)"),
         Item.new("⇧arrows", "select text (line or char)"),
-        Item.new("^A · ^K · ^T · ^U", "auto-mark params · mark word · mark point (manual §) · clear §"),
+        Item.new("^A · ^K · ^T", "auto-mark params · mark word · mark point (manual §)"),
+        # NOT `^U clear §` — that was wrong twice over: ^U is fuzz.pretty-template (the tab's
+        # own ` ^U:PRETTY ` badge says so), and clear-marks has no chord at all. The advertised
+        # key silently reflowed the template you had just finished marking by hand.
+        Item.new("^U", "pretty-print the template body (space → c clears §)"),
         Item.new("^V", "toggle transport HTTP/1.1 ↔ HTTP/2"),
         Item.new("^S", "SNI override (on the target)", "fuzz.toggle-sni"),
         Item.new("^O", "focus the config pane (payload sets · Mode · Advanced · Run)"),
@@ -138,7 +142,7 @@ module Gori::Tui
         Item.new("^B", "reveal whitespace"),
       ]},
       {"OTHER TABS", [
-        Item.new("Sitemap", "↑/↓ · / filter · ↵/→ expand · t mark · ⇧T tag · g fold · ⇧S scope"),
+        Item.new("Sitemap", "↑/↓ · / filter · ↵/→ expand · t mark · g fold · ⇧S scope · space → T tag"),
         Item.new("Issues", "list: t mark · ⇧T all · ⇧arrows range · notes: i/↵ edit · x line · y copy · space cmds"),
         Item.new("Probe", "↑/↓ ↵ open · m mode · c dismiss · a all · / filter · ⇧S scope · space cmds"),
         Item.new("Notes", "i/↵ edit · x line · ⇧arrows select · y copy · space cmds (Copy selected when highlighted)"),

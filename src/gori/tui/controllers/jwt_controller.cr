@@ -265,14 +265,24 @@ module Gori::Tui
         jwt_new
       elsif ev.ctrl? && key.lower_w?
         jwt_close
-      elsif ev.ctrl? && key.lower_l?
-        clear_all
       elsif ev.ctrl? && key.lower_e?
+        # ^E stays INLINE, alone among this tab's chords. It is in `Hotkeys::CLAIMED_CTRL_LETTERS`
+        # (the Runner's external-editor guard), so registering it on `jwt.toggle-mode` makes
+        # `keymap_spec`'s reserved-chord check fail — correctly. The shell's ^E branch has no
+        # `:jwt` arm and falls through, so the key works; it is simply not bindable, and this
+        # is the tab claiming a globally reserved letter rather than a defer that was missed.
         toggle_mode
-      elsif ev.ctrl? && key.lower_a?
-        cycle_alg
       elsif ev.ctrl? && key.lower_y?
-        jwt_copy
+        jwt_copy # copy-all; `jwt.copy` is the focused-pane copy on bare `y`
+      elsif ev.ctrl_z? || editing_motion?(ev)
+        # Undo and ⌥/⌃ word motion belong to the focused editor, not the keymap.
+        return route_pane(ev, c)
+      elsif ev.ctrl? || ev.alt?
+        # Every OTHER modified chord defers to the central keymap, so it is rebindable — the
+        # rule the Repeater and Fuzzer already follow. Without it the pane handlers below
+        # swallow it (`edit_json(...); true`), which is exactly why ^L/^A/^E had to be
+        # hardcoded above: a verb chord would have been silently eaten before the keymap.
+        return false
       elsif key.escape?
         handle_escape
       else

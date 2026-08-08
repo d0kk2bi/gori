@@ -101,7 +101,7 @@ describe "InterceptView Content-Length sync toggle" do
       view = def_edited.call(ic)
       backend = MemoryBackend.new(120, 14)
       view.render(Screen.new(backend), Rect.new(0, 0, 120, 14))
-      backend.contains?("^l:CL").should be_true
+      backend.contains?("^L:CL").should be_true # uppercase, like every other chord badge
     end
   end
 end
