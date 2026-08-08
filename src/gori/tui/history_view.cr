@@ -36,7 +36,7 @@ module Gori::Tui
     MAX_ROWS = 5000
     # Width the Colormarker `strip` column costs the fixed left block when armed: one colour
     # cell plus a one-column gap. See render_list_body.
-    STRIP_W    = 2
+    STRIP_W    =   2
     TRIM_SLACK = 512
     # Cap on h2 frames / WS messages loaded into a detail view. A long-lived WS
     # (100k+ messages) or a heavily-multiplexed h2 connection would otherwise
@@ -1839,6 +1839,11 @@ module Gori::Tui
         screen.text(size_x, y, fmt_size(row.response_size), Theme.muted, bg, width: 6) if show_size
         screen.text(dur_x, y, fmt_dur(row.duration_us), Theme.muted, bg, width: 6) if show_dur
       end
+      # The busiest list in gori, and it had no position feedback at all: a 12-row window over
+      # 400 flows looked exactly like a 12-row window over 12. `rect` is the framed interior,
+      # so `rect.right` is the frame's own hairline — where `scroll_gauge` draws.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, list_top, rect.w, list_h),
+        @rows.size, @scroll, focused)
     end
 
     # Bottom preview pane: REQUEST | RESPONSE for the selected flow (settings:layout).
@@ -1903,6 +1908,12 @@ module Gori::Tui
         break if li >= lines.size
         screen.text(rect.x + 1, content_y + i, lines[li], Theme.text, bg, width: w)
       end
+      # Both preview halves scroll independently and neither said so. `rect.right` is the
+      # frame's hairline for the stacked layout and the RIGHT half of the split one; for the
+      # LEFT half it is the vertical `│` this pane draws between them, which the gauge
+      # replaces in place — a vertical rule either way, now one that also says where you are.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, content_y, rect.w, content_h),
+        lines.size, sc, active, bg)
     end
 
     private def preview_text_lines(head : Bytes?, body : Bytes?) : Array(String)
@@ -2124,6 +2135,12 @@ module Gori::Tui
           Wrap.mark_search(screen, body.x + gw, y, text, vr.a, vr.b, @search_hl, body.x + gw + cw)
         end
       end
+      # The detail body scrolls (`@detail_scroll`) and had no gauge, while the Repeater's
+      # structurally identical response pane has had one all along. `total` is LINES, and
+      # `detail_rows` windows by wrapped ROWS, so the two disagree on a wrapped line — the
+      # gauge is a proportion, and lines are the number the operator's ↑/↓ and the gutter
+      # both count in, which makes it the honest one to show.
+      Frame.scroll_gauge(screen, body, total, @detail_scroll, focused)
     end
 
     # Windowed render of revealed (whitespace-visible) lines — mirrors the normal

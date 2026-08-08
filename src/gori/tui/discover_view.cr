@@ -490,6 +490,11 @@ module Gori::Tui
         break if idx >= r.findings.size
         draw_row(screen, inner, r.findings[idx], idx, inner.y + 1 + i, focused)
       end
+      # The RUNS card six rows above has had a gauge all along; this one had none. A
+      # difference like that INSIDE one view reads as breakage rather than as a gap. Rows
+      # start at `inner.y + 1` — `inner.y` is the header — so the gauge measures from there.
+      Frame.scroll_gauge(screen, Rect.new(inner.x, inner.y + 1, inner.w, cap),
+        r.findings.size, @scroll, focused)
     end
 
     private def header_row(screen : Screen, inner : Rect) : Nil

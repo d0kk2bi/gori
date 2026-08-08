@@ -432,7 +432,11 @@ module Gori::Tui
         Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 1, ins)
       end
       ed = current.area
-      ed.render(screen, area, cursor: ins,
+      # `gauge: true` like every other editor in the workbench — Decoder INPUT, JWT INPUT and
+      # DECODED, Issues NOTES, Repeater REQUEST, Fuzzer TEMPLATE, Intercept. `TextArea#render`
+      # defaults it OFF, and Notes was the one editor that never turned it on, so a long note
+      # scrolled with nothing on screen saying where in it you were.
+      ed.render(screen, area, cursor: ins, gauge: true, gauge_focused: focused,
         highlight: Settings.editor_markdown ? :markdown : nil)
       paint_read_chrome(screen, area, ed, focused && !insert_mode?) if !insert_mode?
     end

@@ -806,6 +806,11 @@ module Gori::Tui
         break if ri >= rows.size
         draw_row(screen, rect, rows[ri], rect.y + i, ri == @selected, focused)
       end
+      # `list_h`, not `rect.h`: while the tag prompt is open it owns the bottom row, and a
+      # gauge measured against the full height would report a viewport one row taller than
+      # the tree actually gets.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, rect.y, rect.w, list_h),
+        rows.size, @scroll, focused)
       render_tag_prompt(screen, rect) if @tagging
     end
 

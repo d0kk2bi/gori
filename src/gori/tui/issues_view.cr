@@ -755,6 +755,10 @@ module Gori::Tui
         tw = {right - title_x, 0}.max
         screen.text(title_x, y, ellipsize(f.title, tw), title_fg, bg, width: tw)
       end
+      # `ensure_visible`'s own comment already named what was missing here: without a gauge,
+      # 44 results silently read as the 3 that happen to be under the window.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, top, rect.w, list_h),
+        @issues.size, @scroll, focused)
     end
 
     # The cursor row keeps the accent band; a marked row gets the dim one; a row that is both
@@ -800,6 +804,7 @@ module Gori::Tui
         fg, text = lines[li]
         screen.text(body.x + 1, body.y + i, text, fg, bg, width: w)
       end
+      Frame.scroll_gauge(screen, body, lines.size, sc, false, bg)
     end
 
     private def issues_preview_lines(f : Store::Issue) : Array({Color, String})
@@ -935,6 +940,8 @@ module Gori::Tui
           screen.cell(rect.x + 1, y, active ? '▎' : ' ', Theme.accent, bg)
           screen.text(rect.x + 2, y, res.line, fg, bg, width: {w - 1, 1}.max)
         end
+        Frame.scroll_gauge(screen, Rect.new(rect.x, list_y, rect.w, list_h),
+          @detail_resolved.size, @links_scroll, focused)
       end
       # NOTES — a real Frame.card (like Decoder INPUT) so INS/READ borders are rounded
       # and the editor body is inset, never colliding with the outline.

@@ -463,6 +463,8 @@ module Gori::Tui
         break if idx >= @issues.size
         draw_row(screen, rect, @issues[idx], top + i, idx == @selected, focused)
       end
+      Frame.scroll_gauge(screen, Rect.new(rect.x, top, rect.w, list_h),
+        @issues.size, @scroll, focused)
     end
 
     # Bottom summary of the selected issue (settings:layout probe_preview).
@@ -493,6 +495,7 @@ module Gori::Tui
         fg, text = lines[li]
         screen.text(body.x + 1, body.y + i, text, fg, bg, width: w)
       end
+      Frame.scroll_gauge(screen, body, lines.size, sc, false, bg)
     end
 
     private def preview_lines(issue : Store::ProbeIssue) : Array({Color, String})
