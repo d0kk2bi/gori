@@ -4789,7 +4789,11 @@ module Gori::Tui
           rows << {"→ sent #{reqn} request message#{reqn == 1 ? "" : "s"} (#{grpc_send_body.size}b)", Theme.muted}
           rows << {"⚠ #{Proxy::H2::Grpc.framing_error(@grpc_req_residual)}", Theme.yellow} if @grpc_req_residual > 0
           st = result.response.try(&.status) || 0
-          rows << {"HTTP #{st}", st >= 400 ? Theme.red : Theme.text}
+          # `status_color`, not a local `>= 400 ? red`. This line painted a 404 RED while
+          # line ~4812 of this same file painted it yellow, and every other status cell in
+          # gori (flow_status, the Fuzzer results, Discover) reads the shared ladder. Red is
+          # 5xx; a 4xx that shows as red says "the server broke" about a 404.
+          rows << {"HTTP #{st}", Theme.status_color(st)}
           grpc_response_rows(result).each { |r| rows << r }
           rows << grpc_status_row(result)
         end
@@ -4809,7 +4813,9 @@ module Gori::Tui
         results = @group_results || [] of {String, Repeater::Result}
         results.each_with_index do |(label, res), i|
           st = res.response.try(&.status)
-          head_color = res.error ? Theme.red : ((st && st >= 400) ? Theme.yellow : Theme.green)
+          # Same ladder. The hand-rolled version also collapsed 3xx into green, where
+          # `status_color` gives it accent — a redirect is not a 2xx.
+          head_color = res.error ? Theme.red : Theme.status_color(st)
           rows << {"══ req #{i + 1} · #{label}", Theme.text_bright}
           summary = if res.error && !res.head.empty?
                       "HTTP #{st} · #{res.error}" # a partial response + a read error (e.g. a CL+TE desync)

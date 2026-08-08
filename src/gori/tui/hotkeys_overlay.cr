@@ -401,12 +401,18 @@ module Gori::Tui
     private def render_footer(screen : Screen, box : Rect) : Nil
       ry = box.bottom - 2
       if fb = @feedback
-        color = case @feedback_kind
-                when :error then Theme.yellow
-                when :ok    then Theme.green
-                else             Theme.muted
-                end
-        screen.text(box.x + 2, ry, "• #{fb}", color, Theme.panel, width: {box.w - 4, 1}.max)
+        # `✓` / `✗`, the vocabulary the notification centre already owns — and the glyph is the
+        # point, not the hue. Both outcomes used to print the same `•` and differ only by
+        # green-vs-yellow, which is the CLOSEST pair in several shipped palettes (GRUVBOX
+        # #b8bb26/#fabd2f, DRACULA #50fa7b/#f1fa8c, MATRIX #00ff41/#eaff4d): whether a rebind
+        # was accepted or rejected came down to a hue discrimination the theme may not offer.
+        # `:error` was yellow here and red everywhere else for the same symbol name, too.
+        mark, color = case @feedback_kind
+                      when :error then {'✗', Theme.red}
+                      when :ok    then {'✓', Theme.green}
+                      else             {'·', Theme.muted}
+                      end
+        screen.text(box.x + 2, ry, "#{mark} #{fb}", color, Theme.panel, width: {box.w - 4, 1}.max)
       elsif (r = @rows[@selected]?) && r.kind == :binding && (v = @registry[r.verb_id]?)
         # Retagged: a description may name a claimed chord (settings.editor's "opened by ^E"),
         # and this is the one surface that renders verb descriptions.
