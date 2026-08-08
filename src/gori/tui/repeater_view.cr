@@ -1679,7 +1679,7 @@ module Gori::Tui
       # …and provenance is all that arrives: the row holds the request TEXT and the flow id,
       # nothing that says which `§` in it the operator typed. Undeclared is the answer gori
       # can defend — see `markers_live?`. (A marked-up capture reopens with its markers inert
-      # and the border chip saying so; ^K re-declares.)
+      # and the border chip saying so; ^T re-declares.)
       @markers_declared = false
       apply_request_fields(target, request, http2, auto_cl, sni, ws_messages, ws_keep_key, ws_http_only)
 
@@ -2318,7 +2318,7 @@ module Gori::Tui
       # capture that carries one there is nothing to gain by declaring — and everything to
       # lose: the capture's own `§` would become live positions in exchange for zero new ones.
       # Name that instead of doing it silently.
-      return "the capture's own § would become markers and auto-mark adds none — ^K marks the token at the cursor" if literal_markers?
+      return "the capture's own § would become markers and auto-mark adds none — ^T marks at the cursor" if literal_markers?
       declare_markers
       @editor.set_text(Fuzz::Template.auto_mark(@editor.text))
       @dirty = true
@@ -2375,7 +2375,7 @@ module Gori::Tui
     # those bytes exactly; the TUI was the one surface that did not.
     #
     # So on an EVIDENCE tab markers start INERT and the operator declares them — by marking
-    # (^A / ^K / insert §), the same explicit act the Fuzzer's ⇧I → ^A workflow already is.
+    # (^A / ^T / insert §), the same explicit act the Fuzzer's ⇧I → ^A workflow already is.
     # Declaring is per-buffer and monotone: from then on every `§` in the buffer is a marker
     # (the status line says so when the capture carried one), which is the honest reading of
     # "this buffer is now a template".
@@ -2428,7 +2428,7 @@ module Gori::Tui
     end
 
     private def literal_marker_hint : String
-      "§ here is captured data, not a marker — ^K marks a token (the capture's § become markers too)"
+      "§ here is captured data, not a marker — ^T marks at the cursor (the capture's § become markers too)"
     end
 
     # Insert an OAST payload URL at the request-editor caret (cross-tab "Insert OAST
@@ -2763,11 +2763,15 @@ module Gori::Tui
       # RESPONSE: d:diff / x:hex / p:pretty (not drawn in WS/gRPC/group transcript modes)
       unless ws_mode? || @grpc_mode || group_mode?
         if right.w >= 2 && my == right.y
+          # `limit:` is render_response's own `rect.right - 1` stop. The draw breaks at the
+          # first chip that would cross the card's '╮'; without the same stop here the hit
+          # walked all three anyway, so on a half-width RESPONSE below ~88 columns hex and
+          # pretty answered clicks on the border and past it.
           if hit = Frame.left_chip_hit(mx, my, right.y, right.x + 12, [
                {:diff, " d:diff "},
                {:hex, " ^X:hex "},
                {:pretty, " p:pretty "},
-             ] of {Symbol, String})
+             ] of {Symbol, String}, limit: right.right - 1)
             return hit
           end
         end
@@ -2807,6 +2811,16 @@ module Gori::Tui
           mode_edge = Frame.right_badge_edge(right_edge, min_x, badges)
           if Frame.mode_badge_hit(mx, my, req_card.y, mode_edge, min_x, request_insert?)
             return :mode
+          end
+          # ` ^T:MARK ` chains LEFT of the mode chip, under exactly the condition
+          # render_request draws it: only when a `§` is in the buffer. It was the one badge on
+          # this border missing from the hit list while its four neighbours all answered.
+          if !@grpc_mode && !ws_mode? && (literal_markers? || (@evidence && markers_active?))
+            mark_edge = Frame.mode_badge_edge(mode_edge, min_x, request_insert?)
+            if Frame.right_badge_hit(mx, my, req_card.y, mark_edge, min_x,
+                 [{:mark, "^T", "MARK"}] of {Symbol, String, String})
+              return :mark
+            end
           end
         end
       end
@@ -4476,10 +4490,10 @@ module Gori::Tui
       mode_x = Frame.toggle_badge(screen, cl_x, rect.y, min_x, "^U", "PRETTY", false)
       mark_x = Frame.mode_badge(screen, mode_x, rect.y, min_x, request_insert?) # the REAL mode — see Frame.mode_badge
       # Only when a `§` is actually in the buffer, so a request without one draws exactly the
-      # border it drew before. Unlit = the capture's § are literal bytes (^K declares them);
+      # border it drew before. Unlit = the capture's § are literal bytes (^T declares them);
       # lit = this buffer is a template and ^R renders them. See `markers_live?`.
       if literal_markers? || (@evidence && markers_active?)
-        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^K", "MARK", markers_live?)
+        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^T", "MARK", markers_live?)
       end
       update_request_marker_tint
       render_plain_request_editor(screen, rect.inset(1, 1), focused, ins)

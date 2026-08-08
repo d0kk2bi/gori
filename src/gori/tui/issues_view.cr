@@ -133,6 +133,17 @@ module Gori::Tui
       idx < @issues.size ? idx : nil
     end
 
+    # The row a click on the list's scroll gauge asks for. The gauge rides the frame's right
+    # hairline — one column OUTSIDE the list rect, which is why `list_row_at` cannot answer it
+    # — and this list's `@scroll` is DERIVED from the selection by render's `ensure_visible`,
+    # so the answer is a selection, not an offset. See `Frame.scroll_gauge_row`.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      list_rect, _ = list_split(rect)
+      top = list_rect.y + 3 # same band list_row_at and the gauge draw measure
+      Frame.scroll_gauge_row(Rect.new(list_rect.x, top, list_rect.w, {list_rect.bottom - top, 0}.max),
+        @issues.size, mx, my)
+    end
+
     def preview_at?(rect : Rect, mx : Int32, my : Int32) : Bool
       _, prev = list_split(rect)
       !!prev.try(&.contains?(mx, my))

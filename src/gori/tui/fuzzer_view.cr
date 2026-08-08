@@ -3048,11 +3048,30 @@ module Gori::Tui
       ri < sorted_results.size ? ri : nil
     end
 
+    # The row a click on the scroll gauge asks for. The gauge rides the frame's right hairline,
+    # one column outside the list rect, so the row hit-test cannot answer it — and `@scroll`
+    # here is DERIVED from the selection, so the answer is a selection.
+    def results_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless pane = results_rect(rect)
+      inner = pane.inset(1, 1)
+      return nil if inner.h <= 1
+      # Rows region, below the header — the band the draw hands the gauge.
+      Frame.scroll_gauge_row(Rect.new(inner.x, inner.y + 1, inner.w, inner.h - 1),
+        sorted_results.size, mx, my)
+    end
+
     # The RESULTS pane rect within body `rect`, re-deriving render → render_bottom →
     # render_results' split (target band → 45%-tall top row → bottom minus the DIST
     # sidebar). nil when the layout leaves no room. Backs results_row_at hit-testing.
     private def results_rect(rect : Rect) : Rect?
       return nil unless @loaded
+      # render_bottom hands the whole band to RESULT DETAIL when `@focus == :detail`, so
+      # RESULTS is not on screen at all — and this rect backs `results_chrome_hit`, which
+      # `FuzzerController#handle_click` consults FIRST. Ungated, a click on the detail card's
+      # own top border in the badge zone toggled DIST/MATCH/sort *and* kicked the operator
+      # out of the detail via `focus_pane(:results)`. With `@show_dist` on, the two rects do
+      # not even share a right edge — this one is `dist_width` narrower than the card drawn.
+      return nil if @focus == :detail
       target_h = {rect.h, target_card_h}.min
       rest = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
       return nil if rest.h <= 0

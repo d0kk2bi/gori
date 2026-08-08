@@ -658,6 +658,14 @@ module Gori::Tui
         # invalidates. Moving focus here would yank the caret out of whatever pane was being
         # edited — the key (`^V`) doesn't, and the click should not differ.
         repeater_toggle_http2 # cycles WS→h1→h2 on a handshake tab, flips h1⇄h2 elsewhere
+      when :mark
+        # The chord the badge names, doing what the chord does. It used to read `^K` — a
+        # legacy key bound to nothing anywhere in the app, echoed by two hint strings — while
+        # the marker an operator actually places comes from `^T` (repeater.toggle-decoded,
+        # which on an ordinary request inserts a § at the cursor). A badge advertising a dead
+        # key is worse than a badge with no key on it.
+        view.focus_pane(:request)
+        repeater_toggle_decoded
       when :send
         view.focus_pane(:request)
         repeater_send

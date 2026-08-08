@@ -42,6 +42,16 @@ module Gori::Tui
       idx < count ? idx : nil
     end
 
+    # The row a click on the scroll gauge asks for. The gauge rides the frame's right hairline,
+    # one column outside the list rect, so `row_at` cannot answer it — and `@scroll` here is
+    # DERIVED from the selection, so the answer is a selection. See `Frame.scroll_gauge_row`.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32, count : Int32) : Int32?
+      inner = rect.inset(1, 1)
+      return nil if inner.empty?
+      Frame.scroll_gauge_row(Rect.new(inner.x, inner.y, inner.w, list_h(inner, count)),
+        count, mx, my)
+    end
+
     def render(screen : Screen, rect : Rect, rules : Array(Store::ColorRule),
                sel : Int32, scroll : Int32, enabled_count : Int32, focused : Bool) : Nil
       return if rect.w < 6 || rect.h < LIST_MIN_H

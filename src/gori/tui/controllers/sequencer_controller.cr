@@ -242,15 +242,50 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       body = body_rect_below_filter(rect)
       return true unless v = current_view
-      if pane = v.pane_at(body, mx, my)
-        v.focus_pane(pane) unless pane == :detail
+      # The SEQUENCER card's run control, before the pane it rides.
+      if v.config_chrome_hit(body, mx, my)
         @host.focus_body
-        # The ANALYSIS report takes a row cursor from the pointer; the other panes are lists and
-        # fields the click already selected.
-        v.analysis_click(v.analysis_body(body), mx, my) if pane == :analysis
-        v.detail_click(body, mx, my) if pane == :detail
+        v.focus_pane(:config)
+        v.running? ? sequence_stop : sequence_run
+        return true
+      end
+      # The SAMPLES gauge on the card hairline, which `pane_at`'s rects exclude.
+      if row = v.samples_gauge_row(body, mx, my)
+        @host.focus_body
+        v.focus_pane(:samples)
+        v.select_sample_row(row)
+        return true
+      end
+      if pane = v.pane_at(body, mx, my)
+        @host.focus_body
+        # SAMPLES defers its own `focus_pane` into `click_samples`: that test reads `v.focus`,
+        # so focusing first would make "already focused" always true and a first click on the
+        # selected row of an unfocused pane would open the detail outright.
+        if pane == :samples
+          click_samples(v, body, mx, my)
+        else
+          v.focus_pane(pane) unless pane == :detail
+          # The ANALYSIS report takes a row cursor from the pointer; CONFIG is a field list
+          # the click already selected in.
+          v.analysis_click(v.analysis_body(body), mx, my) if pane == :analysis
+          v.detail_click(body, mx, my) if pane == :detail
+        end
       end
       true
+    end
+
+    # Select the row under the cursor, or — a second click on the already-selected row while
+    # SAMPLES already holds focus — open its detail, so the mouse matches ↵. The same
+    # select-then-open every other list in the tree uses; this one took no row click at all.
+    private def click_samples(v : SequencerView, body : Rect, mx : Int32, my : Int32) : Nil
+      already = v.focus == :samples
+      row = v.samples_row_at(body, mx, my)
+      if row && already && row == v.samples_selected_index
+        v.open_detail
+      else
+        v.focus_pane(:samples)
+        v.select_sample_row(row) if row
+      end
     end
 
     # --- mouse drag + double-click (see TabController#supports_drag?) ---

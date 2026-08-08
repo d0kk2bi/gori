@@ -72,6 +72,13 @@ module Gori::Tui
     # below its sub-tab strip; the standalone path insets the frame itself).
     def handle_click_content(content : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
+      # The scroll gauge on the frame's right hairline — one column outside the tree rect, so
+      # `row_at` never sees it. A click there moves the cursor to the row it points at.
+      if row = @sitemap.gauge_row_at(content, mx, my)
+        end_range_gesture unless row == @sitemap.selected_index
+        @sitemap.select_index(row)
+        return true
+      end
       return true unless ri = @sitemap.row_at(content, mx, my)
       # A click that MOVES the cursor collapses the range, same as a plain arrow. A click on
       # the row already under the cursor doesn't: that reads as "expand this node" (the marker

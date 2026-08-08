@@ -428,9 +428,17 @@ module Gori::Tui
         return true
       end
       unless @sub == :rules
-        if idx = @view.sub_row_at(inner, mx, my, @sub_scroll, sub_count)
+        if row = @view.gauge_row_at(inner, mx, my, sub_count)
+          @sub_sel = row
+        elsif idx = @view.sub_row_at(inner, mx, my, @sub_scroll, sub_count)
           @sub_sel = idx
         end
+        return true
+      end
+      # The RULES list's scroll gauge rides the card's right hairline, which `row_at` excludes.
+      if row = @view.rules_gauge_row_at(inner, mx, my, rule_list.size, rules_engine.active?)
+        @focus = :list
+        @sel = row
         return true
       end
       case @view.pane_at(inner, mx, my)

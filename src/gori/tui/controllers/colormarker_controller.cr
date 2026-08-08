@@ -18,7 +18,6 @@ module Gori::Tui
       @view = ColormarkerView.new
       @sel = 0
       @scroll = 0
-      @last_body = Rect.new(0, 0, 0, 0) # last content rect — click/wheel geometry
     end
 
     def tab : Symbol
@@ -68,7 +67,6 @@ module Gori::Tui
       body_focused = focus == :body
       # multi_pane: false — one list, no second pane to hand focus to.
       BodyChrome.framed(screen, rect, BodyChrome.shell_focused(focus, multi_pane: false)) do |inner|
-        @last_body = inner
         list = rule_list
         @sel = @sel.clamp(0, {list.size - 1, 0}.max)
         ensure_visible(inner, list.size)
@@ -144,7 +142,11 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
       inner = BodyChrome.frame_inner(rect)
-      @last_body = inner
+      # The scroll gauge on the card's right hairline, which `row_at` excludes by construction.
+      if row = @view.gauge_row_at(inner, mx, my, rule_list.size)
+        @sel = row
+        return true
+      end
       # `row_at` already refuses the note row and anything past the last rule, so a hit is
       # a real index — the clamp below is the belt to its braces, not the bounds check.
       if idx = @view.row_at(inner, my, @scroll, rule_list.size)
@@ -159,12 +161,12 @@ module Gori::Tui
       true
     end
 
+    # The SELECTION, like the Rewriter twin and every other selection-carrying list in the
+    # tree — not the viewport. Scrolling `@scroll` alone left the cursor off screen, and
+    # `e`/`x`/`d` then acted on a rule the operator could not see. `render`'s `ensure_visible`
+    # brings the viewport along, which is how ↑/↓ has always worked here.
     def handle_wheel(step : Int32) : Bool
-      return false if @last_body.empty?
-      count = rule_list.size
-      lh = @view.row_capacity(@last_body, count)
-      return false if lh <= 0
-      @scroll = (@scroll + step).clamp(0, {count - lh, 0}.max)
+      move_sel(step)
       true
     end
 

@@ -1613,9 +1613,16 @@ module Gori::Tui
     # own precedence: `:detail` is a History body drill-in rather than a capturing modal, so a
     # press inside it reaches the tab — and so must the drag and the double-click that follow,
     # or the request/response text is the one place selection works by keyboard and not by mouse.
+    # The contexts that swallow a press without owning any geometry a pointer gesture could
+    # continue into — the space menu, the copy-as / send-to pickers, and the four bottom
+    # prompts. Shared by the drag and double-click tiers so the two can't drift apart.
+    private def pointer_capture_elsewhere? : Bool
+      @space_menu_open || copy_as_shown? || send_to_shown? ||
+        @goto_open || @search_open || @rename_open || @tag_edit_open
+    end
+
     private def drag_press_target?(layout : Layout, mx : Int32, my : Int32) : Bool
-      return false if @space_menu_open || copy_as_shown? || send_to_shown?
-      return false if @goto_open || @search_open || @rename_open || @tag_edit_open
+      return false if pointer_capture_elsewhere?
       # An overlay hit-tests its own card, so the shell asks only whether it opts in — it owns
       # no geometry inside the modal to test against.
       if ov = active_overlay
@@ -1638,8 +1645,25 @@ module Gori::Tui
       @tabs[@active_tab]?.try(&.handle_drag(layout.body, mx, my))
     end
 
+    # Whether a double-click can reach the thing under the pointer at all: the same context
+    # rejections as `drag_press_target?`, and NOT its two `supports_drag?` questions.
+    #
+    # Those are different questions, and gating on the drag one made a whole gesture silently
+    # dead: `ColormarkerController#handle_double_click` opens the rule editor, and Colormarker
+    # — a list, with no text to extend a selection over — answers `supports_drag?` false, so
+    # the shell never asked. A double-click there read as two selects. The default
+    # `handle_double_click` returns false and `press_left` then falls through to the ordinary
+    # click, so a tab that implements nothing is unaffected by being offered the pair.
+    private def double_click_target?(layout : Layout, mx : Int32, my : Int32) : Bool
+      return false if pointer_capture_elsewhere?
+      return true if active_overlay # hit-tests its own card; the shell owns no geometry inside
+      return false if modal_overlay?
+      return false unless @focus == :body
+      layout.body.contains?(mx, my)
+    end
+
     private def dispatch_double_click(layout : Layout, mx : Int32, my : Int32) : Bool
-      return false unless drag_press_target?(layout, mx, my)
+      return false unless double_click_target?(layout, mx, my)
       # The first press of the pair already placed the caret and focused the pane, so the
       # word selection lands where the operator is looking.
       if ov = active_overlay

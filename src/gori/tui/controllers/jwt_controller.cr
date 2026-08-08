@@ -567,7 +567,15 @@ module Gori::Tui
         elsif dec_c.contains?(mx, my)
           enter_pane(s, :decoded)
         elsif atk_c.contains?(mx, my)
+          # Select-only, not select-then-open: ↵ on this list COPIES the payload to the
+          # clipboard, and a second click quietly filling the clipboard is not what a click
+          # means anywhere else here.
           enter_pane(s, :attacks)
+          if row = s.view.attacks_gauge_row(atk_c, mx, my, s.attacks.size)
+            s.view.select_attack_row(row, s.attacks.size)
+          elsif row = s.view.attacks_row_at(atk_c, my, s.attacks.size)
+            s.view.select_attack_row(row, s.attacks.size)
+          end
         end
       else
         hdr_c, pay_c, sec_c, out_c = s.view.encode_layout(body)
@@ -579,6 +587,9 @@ module Gori::Tui
           s.payload.click_to_cursor(pay_c.inset(1, 1), mx, my)
         elsif sec_c.contains?(mx, my)
           enter_pane(s, :secret)
+          # The ` ^A:<alg> ` badge on the card's own border — the Decoder's identical
+          # ` ^X:<mode> ` chip has always been clickable, and this one was drawn and inert.
+          cycle_alg if s.view.secret_alg_hit(sec_c, mx, my, s.alg)
         elsif out_c.contains?(mx, my)
           enter_pane(s, :output)
         end

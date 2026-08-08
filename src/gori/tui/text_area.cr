@@ -891,6 +891,19 @@ module Gori::Tui
     # from the mouse instead of the keyboard.
     def click_to_cursor(rect : Rect, mx : Int32, my : Int32, selecting : Bool = false) : Nil
       return if rect.empty? || @lines.empty?
+      # The scroll gauge rides `rect.right` — render draws it there — so a click on that one
+      # column is a scroll request, not a caret placement. Answering it HERE covers every
+      # editor in the app at once, because every caller hands `click_to_cursor` the same rect
+      # it handed `render`. Routed through `scroll_view` rather than assigning `@scroll`, so
+      # the caret is dragged along (else render's `ensure_visible` snaps the view straight
+      # back) and wrap's `@scroll_sub` stays consistent. Under wrap the gauge is a proportion
+      # indicator rather than a coordinate — see the note on the draw — so this lands close
+      # rather than exactly, which is what the thumb was already saying.
+      # Not on a DRAG: a selection that has run past the right edge must keep extending.
+      if !selecting && (top = Frame.scroll_gauge_top(rect, @lines.size, mx, my))
+        scroll_view(top - @scroll)
+        return
+      end
       row = my - rect.y
       # A drag ABOVE the pane still means something — the pointer left the top edge while the
       # button was held — so it pins to the first visible row instead of being dropped. A

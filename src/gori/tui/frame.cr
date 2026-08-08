@@ -86,10 +86,13 @@ module Gori::Tui
     # without re-deriving a position this method already computed.
     def self.border_meta(screen : Screen, rect : Rect, title : String, meta : String,
                          bg : Color = Theme.bg, fg : Color = Theme.muted,
-                         min_x : Int32? = nil) : Int32?
+                         min_x : Int32? = nil, right_edge : Int32? = nil) : Int32?
       return nil if meta.empty? || rect.w < 4
       stop = min_x || (rect.x + 2 + (title.empty? ? 0 : Screen.draw_width(title) + 2))
-      x = rect.right - Screen.draw_width(meta) - 2
+      # `right_edge` (exclusive) for a border that ALREADY carries a badge: the meta right-aligns
+      # to the left of it instead of to the card's corner. Discover's RUNS card is the case —
+      # `border_meta` ran before the run badge and was simply overpainted by it.
+      x = (right_edge || (rect.right - 2)) - Screen.draw_width(meta)
       return nil if x <= stop
       screen.text(x, rect.y, meta, fg, bg)
       x
@@ -117,6 +120,41 @@ module Gori::Tui
         on = i >= off && i < off + thumb
         screen.cell(x, content.y + i, on ? '┃' : '│', on ? thumb_fg : track_fg, bg)
       end
+    end
+
+    # Inverse of `scroll_gauge`: the `top` a click on the gauge column asks for, or nil when
+    # the pointer is not on it — including when no gauge was drawn, since this refuses on the
+    # same `track < 2 || total <= track` test the draw does. A body that fits has no target.
+    #
+    # The clicked cell becomes the MIDDLE of the thumb, which is what a click on a scrollbar
+    # track means everywhere else: the row you point at is the row you want to be looking at,
+    # not the row that ends up at the top of the viewport.
+    def self.scroll_gauge_top(content : Rect, total : Int32, mx : Int32, my : Int32) : Int32?
+      track = content.h
+      return nil if track < 2 || total <= track
+      return nil if mx != content.right # the frame's right border column — where the draw puts it
+      i = my - content.y
+      return nil if i < 0 || i >= track
+      thumb = (track.to_i64 * track // total).to_i.clamp(1, track - 1)
+      span = track - thumb
+      return 0 if span <= 0
+      max_top = total - track
+      off = (i - thumb // 2).clamp(0, span)
+      (off.to_i64 * max_top // span).to_i.clamp(0, max_top)
+    end
+
+    # The ROW a click on the gauge points at, for a list whose scroll is DERIVED from its
+    # selection: those views run an `ensure_visible` on every render, so setting `top`
+    # directly would simply be undone on the next frame. Proportional — the top of the track
+    # is row 0, the bottom is the last row — which is also what an operator dragging a
+    # scrollbar to the end expects to land on.
+    def self.scroll_gauge_row(content : Rect, total : Int32, mx : Int32, my : Int32) : Int32?
+      track = content.h
+      return nil if track < 2 || total <= track
+      return nil if mx != content.right
+      i = my - content.y
+      return nil if i < 0 || i >= track
+      (i.to_i64 * (total - 1) // (track - 1)).to_i.clamp(0, total - 1)
     end
 
     # A `├───┤` divider across a card's interior at absolute row `y` — the seam
@@ -325,6 +363,14 @@ module Gori::Tui
       mx >= x && mx < x + text.size
     end
 
+    # Left edge after a `mode_badge` — the right_edge for whatever chains further left of it.
+    # Mirrors `mode_badge`'s own return, unchanged edge and all, so a hit-test can follow the
+    # chain past the mode chip the way the Repeater's ` ^K:MARK ` is drawn past it.
+    def self.mode_badge_edge(right_edge : Int32, min_x : Int32, insert : Bool) : Int32
+      x = right_edge - mode_badge_label(insert).size
+      x < min_x ? right_edge : x
+    end
+
     # Left edge after a right-chained `toggle_badge`/`action_badge` run — the right_edge
     # to pass the next (leftward) badge, including `mode_badge`. Same skip-past-min_x rule
     # as draw/hit. Pure geometry for chrome hit-tests that need to chain mode after others.
@@ -334,7 +380,7 @@ module Gori::Tui
       badges.each do |(_, chord, name)|
         text = " #{chord}:#{name} "
         x = edge - text.size
-        break if x < min_x
+        next if x < min_x # `next`, not `break` — see right_badge_hit
         edge = x
       end
       edge
@@ -364,11 +410,19 @@ module Gori::Tui
     # Hit-test for a left-to-right run of `Frame.chip` labels. `chips` is
     # `{id, label}` in draw order; each chip is followed by a 1-col gap (matching
     # the `+ 1` callers use after `Frame.chip`). Miss → nil. Pure geometry — no Screen.
+    #
+    # `limit` (exclusive) mirrors a caller that STOPS drawing at the first chip which would
+    # cross it. `Frame.chip` does not clip itself, so most runs have no limit and none is
+    # passed; the Repeater's RESPONSE cluster does, because that pane is half-width and the
+    # run used to spill through the card's own '╮'. Without this the hit walked all three
+    # chips regardless, so below ~88 columns ` ^X:hex ` and ` p:pretty ` kept 9 and 10 live
+    # cells on and past a border with nothing painted on them.
     def self.left_chip_hit(mx : Int32, my : Int32, y : Int32, start_x : Int32,
-                           chips : Array({Symbol, String})) : Symbol?
+                           chips : Array({Symbol, String}), limit : Int32? = nil) : Symbol?
       return nil if my != y
       x = start_x
       chips.each do |(id, label)|
+        break if limit && x + Screen.draw_width(label) > limit
         return id if mx >= x && mx < x + label.size
         x += label.size + 1
       end
@@ -380,6 +434,13 @@ module Gori::Tui
     # matching successive `toggle_badge` calls that pass the previous return as
     # the next right_edge). Labels are `" #{chord}:#{name} "`. A badge that
     # would sit left of `min_x` is skipped (same as draw). Miss → nil.
+    #
+    # `next`, not `break`, and that is the whole point: `toggle_badge` returns its
+    # `right_edge` UNCHANGED when it does not fit, so the chain keeps going and a shorter
+    # badge further along still draws at that same edge. This loop used to `break` while
+    # claiming "(same as draw)" in the line above — so on the Repeater's request border, at a
+    # width where ` ^R:SEND ` (9) does not fit but ` ^L:CL ` (7) does, CL was drawn and
+    # un-clickable, and every badge left of it hit-tested against an edge that never moved.
     def self.right_badge_hit(mx : Int32, my : Int32, y : Int32, right_edge : Int32, min_x : Int32,
                              badges : Array({Symbol, String, String})) : Symbol?
       return nil if my != y
@@ -387,7 +448,7 @@ module Gori::Tui
       badges.each do |(id, chord, name)|
         text = " #{chord}:#{name} "
         x = edge - text.size
-        break if x < min_x
+        next if x < min_x
         return id if mx >= x && mx < x + text.size
         edge = x
       end

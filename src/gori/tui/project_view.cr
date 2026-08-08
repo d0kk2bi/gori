@@ -419,6 +419,32 @@ module Gori::Tui
 
     # Shared row hit-test for the SCOPE/HOST-OVERRIDES list interiors: account for the
     # optional add-row offset and scroll_for's windowing. Mirrors render_*_list.
+    # The row a click on a card's scroll gauge asks for. All three lists window from a
+    # selection-derived `scroll_for`, so the answer is a selection. Same `y`/`rows` the draw
+    # and `row_at` use, which is why it takes `adding` too.
+    def scope_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless card = card_rect(rect, :scope)
+      gauge_row(card.inset(1, 1), mx, my, false, @scope.rules.size)
+    end
+
+    def ov_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless card = card_rect(rect, :overrides)
+      gauge_row(ov_list_inner(card.inset(1, 1)), mx, my, @ov_adding, @host_overrides.entries.size)
+    end
+
+    def env_gauge_row(rect : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless card = card_rect(rect, :env)
+      gauge_row(env_list_inner(card.inset(1, 1)), mx, my, @env_adding, @env_items.size)
+    end
+
+    private def gauge_row(inner : Rect, mx : Int32, my : Int32, adding : Bool, n : Int32) : Int32?
+      return nil if inner.h <= 0
+      y = adding ? inner.y + 1 : inner.y
+      rows = adding ? inner.h - 1 : inner.h
+      return nil if rows <= 0
+      Frame.scroll_gauge_row(Rect.new(inner.x, y, inner.w, rows), n, mx, my)
+    end
+
     private def row_at(inner : Rect, mx : Int32, my : Int32, adding : Bool, sel : Int32, n : Int32) : Int32?
       return nil if inner.h <= 0 || !inner.contains?(mx, my)
       y = adding ? inner.y + 1 : inner.y

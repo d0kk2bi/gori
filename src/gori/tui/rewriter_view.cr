@@ -222,6 +222,25 @@ module Gori::Tui
       idx < count ? idx : nil
     end
 
+    # The row a click on a list's scroll gauge asks for. Three lists here — the RULES list
+    # (its own `layout` card, note-aware) and the two flat sub-tab lists — all with a scroll
+    # DERIVED from their selection, so all three answer with a selection.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32, count : Int32) : Int32?
+      _, body = sub_layout(rect)
+      Frame.scroll_gauge_row(body.inset(1, 1), count, mx, my)
+    end
+
+    # The RULES list's own gauge: the card is `layout`'s first rect, and `live` steals its
+    # bottom row for the engine note exactly as `row_at` accounts for.
+    def rules_gauge_row_at(rect : Rect, mx : Int32, my : Int32, count : Int32, live : Bool) : Int32?
+      list_r, _, _ = layout(rect)
+      inner = list_r.inset(1, 1)
+      return nil if inner.empty?
+      list_h = inner.h
+      list_h -= 1 if live && list_h > 1
+      Frame.scroll_gauge_row(Rect.new(inner.x, inner.y, inner.w, list_h), count, mx, my)
+    end
+
     # The sub-tab whose strip label contains (mx,my), or nil.
     def sub_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
       strip, _ = sub_layout(rect)

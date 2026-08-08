@@ -178,6 +178,11 @@ module Gori::Tui
       end
       # A press inside the open add/edit row is a CARET, not a row pick — the row is text.
       return :stay if @adding && click_text_field(mx, my)
+      # The gauge on the card's right hairline, before `row_at` — which has no `mx` bound.
+      if row = gauge_row_at(box, mx, my)
+        set_selected(row)
+        return :stay
+      end
       if idx = row_at(box, mx, my)
         set_selected(idx)
       end
@@ -365,6 +370,17 @@ module Gori::Tui
       # `TextField#render` is what records the geometry `hit?` inverts, so drawing through it
       # is what makes the pointer work — not merely tidier than `screen.input_line`.
       @field.render(screen, x, py, w, true, Theme.text_bright, bg)
+    end
+
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    # `y`/`rows` mirror render exactly: the add-row, when open, takes the first interior line.
+    def gauge_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      cap = list_capacity(box)
+      y = box.y + 2 + (@adding ? 1 : 0)
+      rows = cap - (@adding ? 1 : 0)
+      return nil if rows <= 0
+      Frame.scroll_gauge_row(Rect.new(box.x + 1, y, box.w - 2, rows), @items.size, mx, my)
     end
 
     # Row index under (mx,my) — inverts render's windowed layout (add-row offset +

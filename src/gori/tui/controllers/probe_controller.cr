@@ -133,7 +133,9 @@ module Gori::Tui
       content = BodyChrome.content_rect(rect, strip: true) # inside the frame, below the sub-tab strip
       if rules_tab?
         @host.focus_body
-        if idx = @rules.row_at(content, mx, my)
+        if row = @rules.gauge_row_at(content, mx, my)
+          @rules.select_index(row)
+        elsif idx = @rules.row_at(content, mx, my)
           # Select first; a click on the already-selected row toggles it (whole row is the switch).
           @rules.selected_index == idx ? rules_toggle_selected : @rules.select_index(idx)
         end
@@ -151,6 +153,20 @@ module Gori::Tui
         return true
       end
       list_rect, _ = @probe.list_split(content)
+      # The list's scroll gauge on the frame's right hairline — `list_row_at` excludes that
+      # column, so it was the one part of the list a click could not reach.
+      if row = @probe.gauge_row_at(content, mx, my)
+        @probe.set_preview_focus(:list)
+        @probe.select_index(row)
+        return true
+      end
+      # Row 0 — the MODE band. Its chip and its `a:CLOSED` badge are drawn in the dresses this
+      # codebase uses for clickable chrome and were the only two that answered nothing.
+      if chip = @probe.mode_band_hit(list_rect, mx, my)
+        # `probe.set-mode` lives on the Runner (it raises a picker), unlike the lens toggle.
+        chip == :mode ? @host.probe_set_mode : probe_toggle_closed
+        return true
+      end
       if my == list_rect.y + 1 && !@probe.querying? # the filter-bar row (below the MODE band)
         @probe.start_query
         return true

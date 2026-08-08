@@ -122,6 +122,13 @@ module Gori::Tui
         return true
       end
       list_rect, _ = @issues.list_split(inner)
+      # The list's scroll gauge on the frame's right hairline: jump the cursor to the row it
+      # points at. Before the filter-bar arm, which has no `mx` bound of its own.
+      if row = @issues.gauge_row_at(inner, mx, my)
+        @issues.set_preview_focus(:list)
+        @issues.select_index(row)
+        return true
+      end
       if my == list_rect.y && !@issues.querying?
         @issues.start_query
         return true

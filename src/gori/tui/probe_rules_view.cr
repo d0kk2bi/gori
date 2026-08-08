@@ -148,10 +148,27 @@ module Gori::Tui
       @sel = idx if 0 <= idx < @rows.size && @rows[idx].selectable?
     end
 
+    # Rows the list actually windows, once the description footer has taken its share.
+    # `render`, `row_at` and `gauge_row_at` must all ask this the same way or they drift —
+    # `row_at` used to take the whole rect, so a click on the FOOTER (prose about the selected
+    # rule) resolved to the row one past the last visible one. Same shape as the Colormarker
+    # note row and the Sitemap tag prompt.
+    private def list_h(rect : Rect) : Int32
+      (footer_text && rect.h >= 3) ? rect.h - 1 : rect.h
+    end
+
     def row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless rect.contains?(mx, my)
-      idx = @scroll + (my - rect.y)
+      i = my - rect.y
+      return nil if i < 0 || i >= list_h(rect)
+      idx = @scroll + i
       (0 <= idx < @rows.size) ? idx : nil
+    end
+
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      Frame.scroll_gauge_row(Rect.new(rect.x, rect.y, rect.w, list_h(rect)), @rows.size, mx, my)
     end
 
     private def selectable_indices : Array(Int32)
@@ -169,7 +186,7 @@ module Gori::Tui
       # place the Rules tab explains what a rule DOES, so an operator toggling it isn't guessing
       # from the name. Falls away on a very short pane (the list keeps every line it can).
       footer = footer_text
-      list_h = (footer && rect.h >= 3) ? rect.h - 1 : rect.h
+      list_h = list_h(rect)
       ensure_visible(list_h)
       list_h.times do |i|
         idx = @scroll + i

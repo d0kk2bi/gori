@@ -215,14 +215,50 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       body = body_rect_below_filter(rect)
       return true unless v = current_view
-      if pane = v.pane_at(body, mx, my)
-        v.focus_pane(pane) unless pane == :detail
+      # The MINER card's run control, before the pane it rides.
+      if v.summary_chrome_hit(body, mx, my)
         @host.focus_body
-        # The FINDING pane takes a row cursor from the pointer; the other two are lists the click
-        # already selected in.
-        v.detail_click(body, mx, my) if pane == :detail
+        v.focus_pane(:summary)
+        v.running? ? mine_stop : mine_run
+        return true
+      end
+      # The FINDINGS gauge on the card hairline, which `pane_at`'s rects exclude.
+      if row = v.results_gauge_row(body, mx, my)
+        @host.focus_body
+        v.focus_pane(:results)
+        v.select_result_row(row)
+        return true
+      end
+      if pane = v.pane_at(body, mx, my)
+        @host.focus_body
+        # FINDINGS defers its own `focus_pane` into `click_results` — the select-then-open
+        # test reads `v.focus`, so focusing first would make "already focused" always true
+        # and a first click on row 0 of an unfocused pane would open the detail outright.
+        # (The Fuzzer orders it this way for the same reason.)
+        if pane == :detail
+          v.detail_click(body, mx, my) # the FINDING pane takes a row cursor from the pointer
+        elsif pane == :results
+          click_results(v, body, mx, my)
+        else
+          v.focus_pane(pane)
+        end
       end
       true
+    end
+
+    # Select the row under the cursor (grabbing focus from another pane on the first click),
+    # or — a second click on the already-selected row while FINDINGS already holds focus —
+    # open its detail, so the mouse matches ↵. History, Issues, Probe, OAST and the Fuzzer
+    # all read this way; this list had no row hit-test at all.
+    private def click_results(v : MinerView, body : Rect, mx : Int32, my : Int32) : Nil
+      already = v.focus == :results
+      row = v.results_row_at(body, mx, my)
+      if row && already && row == v.results_selected_index
+        v.open_detail
+      else
+        v.focus_pane(:results)
+        v.select_result_row(row) if row
+      end
     end
 
     # --- mouse drag + double-click (see TabController#supports_drag?) ---

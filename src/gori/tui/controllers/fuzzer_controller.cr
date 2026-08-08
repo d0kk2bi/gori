@@ -666,6 +666,15 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       body = body_rect_below_filter(rect)
       return true unless v = current_view
+      # The RESULTS gauge on the card hairline — `results_row_at` requires the pane rect,
+      # which excludes that column.
+      if row = v.results_gauge_row(body, mx, my)
+        save_current
+        @host.focus_body
+        v.focus_pane(:results)
+        v.select_result_row(row)
+        return true
+      end
       # RESULTS border badges (DIST / MATCH / sort) before row select.
       if chip = v.results_chrome_hit(body, mx, my)
         save_current

@@ -70,6 +70,13 @@ module Gori::Tui
 
     def handle_click_content(content : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
+      # The RUNS card's run control, before the pane it rides. The badge tracks the SELECTED
+      # run, so the click acts on the one it is describing — same as ^R/^X.
+      if @view.run_chrome_hit(content, mx, my)
+        @view.focus_pane(:runs)
+        @view.current.try(&.running?) ? discover_stop : discover_run
+        return true
+      end
       @view.click(content, mx, my)
       true
     end

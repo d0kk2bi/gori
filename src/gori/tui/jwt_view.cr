@@ -107,9 +107,12 @@ module Gori::Tui
       reading = active && mode == InputMode::Read
       insert = active && mode == InputMode::Insert
       Frame.card(screen, card, "INPUT", bg: Theme.bg, border: Frame.pane_border(active))
-      if active
-        Frame.mode_badge(screen, card.right - 1, card.y, card.x + 8, insert)
-      end
+      # `mode`, not `insert` — the badge states the pane's own mode, and `JwtController`
+      # hit-tests exactly that. Gating the draw on `active` (and passing the focus-folded
+      # `insert`) left a live 8-cell target on an unpainted border: with focus on DECODED,
+      # ATTACKS or SECRET, clicking the INPUT card's top-right corner toggled insert.
+      # See the same fix in notes_view / fuzzer_view; focus stays in the border colour.
+      Frame.mode_badge(screen, card.right - 1, card.y, card.x + 8, mode == InputMode::Insert)
       body = card.inset(1, 1)
       input.render(screen, body, cursor: insert, gauge: true, gauge_focused: active)
       paint_read_chrome(screen, body, input, read) if reading
@@ -251,6 +254,37 @@ module Gori::Tui
 
     def attacks_selected : Int32
       @atk_sel
+    end
+
+    # Mouse: the attack index under a click in the ATTACKS card, or nil (past the last row).
+    # Mirrors render_attacks' inset → @atk_scroll + i; the list has no header row. The pane
+    # drew a cursor and moved it with ↑/↓ and the wheel, and the pointer could not place it.
+    def attacks_row_at(card : Rect, my : Int32, count : Int32) : Int32?
+      return nil if count <= 0
+      body = card.inset(1, 1)
+      return nil if body.h <= 0
+      i = my - body.y
+      return nil if i < 0 || i >= body.h
+      idx = @atk_scroll + i
+      idx < count ? idx : nil
+    end
+
+    # The attack a click on the ATTACKS gauge asks for. `@atk_scroll` is derived from
+    # `@atk_sel` by render, so this answers with a selection. See `Frame.scroll_gauge_row`.
+    def attacks_gauge_row(card : Rect, mx : Int32, my : Int32, count : Int32) : Int32?
+      Frame.scroll_gauge_row(card.inset(1, 1), count, mx, my)
+    end
+
+    def select_attack_row(idx : Int32, count : Int32) : Nil
+      @atk_sel = idx.clamp(0, {count - 1, 0}.max)
+    end
+
+    # Hit-test the SECRET card's ` ^A:<alg> ` badge. Geometry mirrors render_secret. The
+    # Decoder's structurally identical ` ^X:<mode> ` on its OUTPUT card has always answered a
+    # click; this one, on the sibling tool tab, did not.
+    def secret_alg_hit(card : Rect, mx : Int32, my : Int32, alg : String) : Bool
+      !Frame.right_badge_hit(mx, my, card.y, card.right - 1, card.x + 9,
+        [{:alg, "^A", alg}] of {Symbol, String, String}).nil?
     end
 
     def decoded_at_top? : Bool

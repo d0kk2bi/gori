@@ -120,6 +120,12 @@ module Gori::Tui
     def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
       box = overlay_box(area)
       return :cancel if box.nil? || !box.contains?(mx, my)
+      # The gauge on the card's right hairline, before `row_at` — which has no `mx` bound.
+      # Selects without committing: a scrollbar drag is navigation, not "open this one".
+      if row = gauge_row_at(box, mx, my)
+        set_selected(row)
+        return :stay
+      end
       if idx = row_at(box, mx, my)
         set_selected(idx)
         return :commit
@@ -209,8 +215,16 @@ module Gori::Tui
       screen.text(box.right - 1 - stamp.size, py, stamp, Theme.muted, bg)
     end
 
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    def gauge_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      Frame.scroll_gauge_row(Rect.new(box.x + 1, box.y + 2, box.w - 2, list_capacity(box)),
+        notes.size, mx, my)
+    end
+
     # Row index under (mx,my) — inverts render's windowed layout so a click maps to the
     # same row that was drawn.
+
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless box.contains?(mx, my)
       cap = list_capacity(box)

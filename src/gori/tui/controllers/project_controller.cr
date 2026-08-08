@@ -171,17 +171,26 @@ module Gori::Tui
       case pane
       when :scope
         @project_view.focus_pane(:scope)
-        if idx = @project_view.scope_row_at(rect, mx, my)
+        # The card's scroll gauge rides its right hairline, which `scope_row_at` excludes.
+        if row = @project_view.scope_gauge_row(rect, mx, my)
+          @project_view.select_scope(row)
+        elsif idx = @project_view.scope_row_at(rect, mx, my)
           @project_view.select_scope(idx)
         end
       when :overrides
         @project_view.focus_pane(:overrides)
-        if idx = @project_view.ov_row_at(rect, mx, my)
+        # The card's scroll gauge rides its right hairline, which `ov_row_at` excludes.
+        if row = @project_view.ov_gauge_row(rect, mx, my)
+          @project_view.select_override(row)
+        elsif idx = @project_view.ov_row_at(rect, mx, my)
           @project_view.select_override(idx)
         end
       when :env
         @project_view.focus_pane(:env)
-        if idx = @project_view.env_row_at(rect, mx, my)
+        # The card's scroll gauge rides its right hairline, which `env_row_at` excludes.
+        if row = @project_view.env_gauge_row(rect, mx, my)
+          @project_view.select_env(row)
+        elsif idx = @project_view.env_row_at(rect, mx, my)
           @project_view.select_env(idx)
         end
       when :desc

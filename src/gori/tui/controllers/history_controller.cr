@@ -153,6 +153,15 @@ module Gori::Tui
         flush_query_reload
         @history.stop_query
       end
+      # The scroll gauge on the frame's right hairline: a click there jumps the cursor to the
+      # row it points at. Before the pane test — the gauge column is inside the preview split's
+      # rect too, and the gauge is what the pointer was aiming at.
+      if row = @history.gauge_row_at(inner, mx, my)
+        @history.set_preview_focus(:list)
+        end_range_gesture
+        @history.select_row(row)
+        return true
+      end
       # Preview pane click focuses that side (settings:layout).
       if pane = @history.preview_pane_at(inner, mx, my)
         @history.set_preview_focus(pane)

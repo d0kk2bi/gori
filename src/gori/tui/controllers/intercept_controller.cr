@@ -319,6 +319,15 @@ module Gori::Tui
         end
         return true
       end
+      # The queue's scroll gauge, before the pane test — it rides the card's right hairline,
+      # which `list_row_at` excludes.
+      if row = @intercept.gauge_row_at(inner, mx, my)
+        @host.focus_body
+        @intercept.focus_list
+        end_range_gesture unless row == @intercept.selected_index
+        @intercept.select_index(row)
+        return true
+      end
       return true unless pane = @intercept.pane_at(inner, mx, my)
       @host.focus_body
       if pane == :list

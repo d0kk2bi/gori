@@ -293,12 +293,17 @@ describe "the last hand-rolled chrome" do
     offenders = [] of String
     Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
-        next unless line.includes?("Frame.card(")
         # A COUNT, specifically — `"FINDINGS (#{n})"`, `"ATTACKS · #{n}"`. A title that
         # interpolates WHAT the card is showing is not the same thing and stays: `RESULT #3`,
         # `SETTINGS · NETWORK`, `PICK FLOW REPEATER`, `IMPORT HAR · source path`. The tell is
         # a bare size/count expression, not a name.
-        next unless line.matches?(/Frame\.card\([^,]+,\s*[^,]+,\s*"[^"]*#\{[^}]*\.size[^}]*\}/)
+        inline = line.includes?("Frame.card(") &&
+                 line.matches?(/Frame\.card\([^,]+,\s*[^,]+,\s*"[^"]*#\{[^}]*\.size[^}]*\}/)
+        # …and the same title BOUND FIRST and passed on the next line, which is the form this
+        # check originally missed: Discover built `title = "RUNS (#{@runs.size})"` a line above
+        # its `Frame.card`, so the inline pattern never saw it and the audit found it by hand.
+        bound = line.matches?(/^\s*\w*title\w* = "[^"]*#\{[^}]*\.size[^}]*\}/)
+        next unless inline || bound
         offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"
       end
     end
