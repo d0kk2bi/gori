@@ -91,7 +91,15 @@ module Gori::Tui
       mode = Hotkeys.binding_label(reg, "probe.mode", "m")
       filt = Hotkeys.binding_label(reg, "probe.filter", "/")
       if rules_tab?
-        return "↑/↓ select · ↵/x on/off · a add · e edit · d delete · space cmds · ↑ sub-tabs · esc tabs"
+        # `↵/e edit`, matching every other rule list — ↵ no longer toggles here (see
+        # verbs/probe.cr). Edit and delete are named ONLY when they can fire: both are gated
+        # to a selected CUSTOM rule, and built-ins are most of this list, so advertising them
+        # on a built-in row promised two keys that did nothing on most of the rows.
+        #
+        # `esc sub-tabs`, not `esc tabs`: escape goes to the strip (handle_body_key), and the
+        # strip is always shown here, so `focus_pane` never downgrades it to the tab bar.
+        edits = rules_custom_selected? ? " · ↵/e edit · d delete" : ""
+        return "↑/↓ select · x on/off · a add#{edits} · space cmds · ↑ sub-tabs · esc sub-tabs"
       elsif @probe.detail_open?
         "↑/↓ URL · ⇧arrows select · y copy · o flow · r repeater · p promote · space cmds · ←/esc back"
       elsif @probe.querying?
