@@ -124,20 +124,24 @@ module Gori::Tui
       end
       Frame.card(screen, box, "LISTENERS", border: Theme.border_focus)
       meta = "#{@rows.size} listener#{@rows.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 14}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "LISTENERS", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
       return if cap <= 0
+      start = list_window(cap)
       if @rows.empty?
         screen.text(box.x + 3, box.y + 2, "(no additional listeners configured)", Theme.muted, Theme.panel)
       else
-        start = list_window(cap)
         cap.times do |row|
           i = start + row
           break if i >= @rows.size
           draw_row(screen, box, i, box.y + 2 + row)
         end
       end
+      # A windowed list with no gauge gave an operator scrolling past row `cap` nothing that
+      # said there was more. `true` for focused: an open modal IS the focus.
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        @rows.size, start, true, Theme.panel)
       draw_footer(screen, box)
     end
 

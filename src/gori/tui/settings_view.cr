@@ -864,34 +864,28 @@ module Gori::Tui
       vp.times do |row|
         i = @theme_scroll + row
         break if i >= names.size
-        draw_theme_row(screen, box, names[i], i == sel, list_top + row,
-          up: row == 0 && @theme_scroll > 0,
-          down: row == vp - 1 && i < names.size - 1)
+        draw_theme_row(screen, box, names[i], i == sel, list_top + row)
       end
+      # The shared gauge on the card's own hairline, replacing the ▲/▼/↕ glyphs this list used
+      # to paint into its last interior column — an affordance that existed nowhere else in
+      # gori, said only "there is more" rather than how much, and cost a column the swatch
+      # now gets back.
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, list_top, box.w - 2, vp),
+        names.size, @theme_scroll, true, Theme.panel)
     end
 
-    private def draw_theme_row(screen : Screen, box : Rect, name : String, selected : Bool, ry : Int32, *, up : Bool, down : Bool) : Nil
+    private def draw_theme_row(screen : Screen, box : Rect, name : String, selected : Bool, ry : Int32) : Nil
       bg = selected ? Theme.accent_bg : Theme.panel
       screen.fill(Rect.new(box.x + 1, ry, box.w - 2, 1), bg)
       screen.cell(box.x + 1, ry, selected ? '▎' : ' ', Theme.accent, bg)
       screen.cell(box.x + 3, ry, selected ? '◉' : '◯', selected ? Theme.accent : Theme.muted, bg)
-      # Right edge, inside the card border (box.right-1): a scroll marker on the last
-      # interior column (box.right-2), then the swatch left of it with a 1-col gap.
-      mark_x = box.right - 2
+      # The swatch now runs to the last interior column (box.right-2) — the scroll marker that
+      # used to sit there moved onto the card's hairline as a gauge.
       swatch_w = 7
-      sx = mark_x - 1 - swatch_w
+      sx = box.right - 1 - swatch_w
       name_w = {sx - (box.x + 5) - 1, 1}.max
       screen.text(box.x + 5, ry, name, selected ? Theme.text_bright : Theme.text, bg, width: name_w)
       draw_swatch(screen, sx, ry, name)
-      # Scroll marker (one glyph): ↕ when this lone row can scroll both ways (a 1-row
-      # viewport on a tiny terminal), else ▲ for more-above / ▼ for more-below.
-      if up && down
-        screen.cell(mark_x, ry, '↕', Theme.muted, bg)
-      elsif up
-        screen.cell(mark_x, ry, '▲', Theme.muted, bg)
-      elsif down
-        screen.cell(mark_x, ry, '▼', Theme.muted, bg)
-      end
     end
 
     # A tiny preview strip in the theme's OWN palette (not the active one): its canvas

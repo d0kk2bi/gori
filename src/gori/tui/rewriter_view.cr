@@ -101,6 +101,7 @@ module Gori::Tui
         render_extract_row(screen, inner, rules[idx], bound.includes?(rules[idx].name),
           inner.y + i, idx == sel, body_focused)
       end
+      Frame.scroll_gauge(screen, inner, rules.size, scroll, body_focused)
     end
 
     # The `bindings` sub-tab: the debugging readout. Name, bound?, descriptor, host scope,
@@ -124,6 +125,7 @@ module Gori::Tui
         break if idx >= rows.size
         render_binding_row(screen, inner, rows[idx], inner.y + i, idx == sel, body_focused, now)
       end
+      Frame.scroll_gauge(screen, inner, rows.size, scroll, body_focused)
     end
 
     private def render_sub_strip(screen : Screen, rect : Rect, active : Symbol, focused : Bool) : Nil
@@ -245,9 +247,7 @@ module Gori::Tui
       globals = rules.count(&.global?)
       meta = "#{globals} global · #{meta}" if globals > 0
       # Count rides the top border (right of the title), not a list row.
-      if rect.w > meta.size + 20
-        screen.text({rect.right - meta.size - 2, rect.x + 18}.max, rect.y, meta, Theme.muted, Theme.bg)
-      end
+      Frame.border_meta(screen, rect, "MATCH & REPLACE", meta)
       inner = rect.inset(1, 1)
       return if inner.empty?
 
@@ -271,6 +271,10 @@ module Gori::Tui
         break if idx >= rules.size
         render_row(screen, inner, rules[idx], list_top + i, idx == sel, focused)
       end
+      # The gauge tracks the LIST viewport, not the whole interior — the live note below it
+      # is not a row you can scroll to. No-ops when everything fits.
+      Frame.scroll_gauge(screen, Rect.new(inner.x, list_top, inner.w, list_h),
+        rules.size, scroll, focused)
     end
 
     private def render_row(screen : Screen, rect : Rect, rule : Store::MatchRule, py : Int32,

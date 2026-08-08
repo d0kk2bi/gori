@@ -167,7 +167,7 @@ module Gori::Tui
       list = notes
       Frame.card(screen, box, "NOTIFICATIONS", border: Theme.border_focus)
       meta = "#{list.size} item#{list.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 16}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "NOTIFICATIONS", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
       if list.empty?
@@ -181,6 +181,8 @@ module Gori::Tui
         break if i >= list.size
         draw_row(screen, box, list[i], i == sel, box.y + 2 + row)
       end
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        list.size, start, true, Theme.panel)
     end
 
     private def draw_row(screen : Screen, box : Rect, note : Notifications::Note, sel : Bool, py : Int32) : Nil

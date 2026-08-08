@@ -346,7 +346,7 @@ module Gori::Tui
       end
       Frame.card(screen, box, "ENVIRONMENT", border: Theme.border_focus)
       meta = "#{@items.size} var#{@items.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 16}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "ENVIRONMENT", meta, bg: Theme.panel)
       draw_prefix_row(screen, box, box.y + 1)
       screen.text(box.x + 3, box.y + 2, "KEY VALUE · e.g. HOST api.example.com", Theme.muted, Theme.panel, width: {box.w - 5, 1}.max)
 
@@ -369,6 +369,8 @@ module Gori::Tui
         break if i >= @items.size
         draw_row(screen, box, i, y + row)
       end
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, y, box.w - 2, rows),
+        @items.size, start, true, Theme.panel)
     end
 
     private def draw_prefix_row(screen : Screen, box : Rect, py : Int32) : Nil

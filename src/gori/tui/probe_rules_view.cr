@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./frame"
 require "../probe"
 require "../store"
 
@@ -177,6 +178,11 @@ module Gori::Tui
         screen.fill(Rect.new(rect.x, y, rect.w, 1), Theme.bg)
         screen.text(rect.x + 1, y, footer, Theme.muted, Theme.bg, width: rect.w - 2)
       end
+      # This list runs to ~40 rows across three sections and had no scroll affordance at all,
+      # so an operator scrolled past the ACTIVE section with nothing on screen saying there
+      # was more. Tracks `list_h`, the rows actually windowed — not the footer under them.
+      Frame.scroll_gauge(screen, Rect.new(rect.x, rect.y, rect.w, list_h),
+        @rows.size, @scroll, focused)
     end
 
     # The selected selectable row's description, or nil (a header selected / no description).

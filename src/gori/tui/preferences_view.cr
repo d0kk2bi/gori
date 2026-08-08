@@ -297,7 +297,11 @@ module Gori::Tui
       Frame.card(screen, box, "PREFERENCES", border: Theme.border_focus)
       strip = Rect.new(box.x + 2, box.y + 2, box.w - 4, 1)
       @strip_start = Chrome.render_tab_strip(screen, strip, GROUP_LABELS, @group, @on_strip, @strip_start)
-      screen.hline(box.x + 1, box.y + 3, box.w - 2, fg: @on_strip ? Theme.focus_gold : Theme.border, bg: Theme.panel)
+      # `tee_divider`, not a bare hline: the seam now lands ├ and ┤ ON the card's side borders
+      # instead of butting `─` straight into `│`, which is the whole reason frame.cr grew the
+      # helper. Same focus tint as before.
+      Frame.tee_divider(screen, box, box.y + 3, Theme.panel,
+        @on_strip ? Theme.focus_gold : Theme.border)
       render_group(screen, content_rect(box), !@on_strip)
       render_footer(screen, box)
     end
@@ -353,6 +357,12 @@ module Gori::Tui
         end
         y += 1 # spacer between sections
       end
+      # This form scrolls (`ensure_scroll` exists for it) and had no indicator at all, so a
+      # group taller than the card gave no sign there was more below. `content` is inset TWO
+      # columns from the card, so widen by one to land the gauge on the frame's own hairline
+      # the way every other list does — `scroll_gauge` draws at `content.right`.
+      Frame.scroll_gauge(screen, Rect.new(content.x, content.y, content.w + 1, content.h),
+        group_height, @scroll, body_focused, Theme.panel)
     end
 
     # `dirty` appends a ● so an edited-but-unsaved section is visible while you are still in

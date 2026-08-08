@@ -301,7 +301,7 @@ module Gori::Tui
       end
       Frame.card(screen, box, "HOSTNAME OVERRIDES", border: Theme.border_focus)
       meta = "#{@items.size} entr#{@items.size == 1 ? "y" : "ies"}"
-      screen.text({box.right - meta.size - 2, box.x + 20}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "HOSTNAME OVERRIDES", meta, bg: Theme.panel)
       # A brief format example so the "IP HOSTNAME" entry shape is clear at a glance.
       screen.text(box.x + 3, box.y + 1, "IP HOSTNAME · e.g. 10.0.0.1 example.com", Theme.muted, Theme.panel, width: {box.w - 5, 1}.max)
 
@@ -324,6 +324,10 @@ module Gori::Tui
         break if i >= @items.size
         draw_row(screen, box, i, y + row)
       end
+      # `y`/`rows` are already past the add-row when one is open, so the gauge measures the
+      # entries actually windowed rather than the card interior.
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, y, box.w - 2, rows),
+        @items.size, start, true, Theme.panel)
     end
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil

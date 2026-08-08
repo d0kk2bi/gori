@@ -744,10 +744,12 @@ module Gori::Tui
       vp.times do |row|
         i = @theme_scroll + row
         break if i >= names.size
-        draw_theme_row(screen, box, list_w, names[i], i == sel, list_top + row,
-          up: row == 0 && @theme_scroll > 0,
-          down: row == vp - 1 && i < names.size - 1)
+        draw_theme_row(screen, box, list_w, names[i], i == sel, list_top + row)
       end
+      # The shared gauge on the list area's last column — where the per-row ▲/▼/↕ markers used
+      # to sit. Same replacement as the Settings theme list, which is a copy of this one.
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, list_top, list_w - 1, vp),
+        names.size, @theme_scroll, true, Theme.panel)
 
       if two_col
         px = box.x + 1 + list_w + PREVIEW_GAP
@@ -756,24 +758,19 @@ module Gori::Tui
     end
 
     private def draw_theme_row(screen : Screen, box : Rect, list_w : Int32, name : String,
-                               selected : Bool, ry : Int32, *, up : Bool, down : Bool) : Nil
+                               selected : Bool, ry : Int32) : Nil
       bg = selected ? Theme.accent_bg : Theme.panel
       screen.fill(Rect.new(box.x + 1, ry, list_w, 1), bg)
       screen.cell(box.x + 1, ry, selected ? '▎' : ' ', Theme.accent, bg)
       screen.cell(box.x + 3, ry, selected ? '◉' : '◯', selected ? Theme.accent : Theme.muted, bg)
-      mark_x = box.x + list_w # last column of the list area
+      # The list area's last column now carries the scroll gauge, so the swatch ends one cell
+      # short of it rather than leaving a gap for a per-row marker.
+      mark_x = box.x + list_w
       swatch_w = 7
-      sx = mark_x - 1 - swatch_w
+      sx = mark_x - swatch_w
       name_w = {sx - (box.x + 5) - 1, 1}.max
       screen.text(box.x + 5, ry, name, selected ? Theme.text_bright : Theme.text, bg, width: name_w)
       draw_swatch(screen, sx, ry, name)
-      if up && down
-        screen.cell(mark_x, ry, '↕', Theme.muted, bg)
-      elsif up
-        screen.cell(mark_x, ry, '▲', Theme.muted, bg)
-      elsif down
-        screen.cell(mark_x, ry, '▼', Theme.muted, bg)
-      end
     end
 
     # A 7-cell strip in the theme's OWN palette (Theme.palette, not the active one).

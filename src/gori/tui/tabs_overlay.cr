@@ -176,7 +176,7 @@ module Gori::Tui
       end
       Frame.card(screen, box, "TAB BAR", border: Theme.border_focus)
       meta = "#{visible_count}/#{@items.size} shown"
-      screen.text({box.right - meta.size - 2, box.x + 12}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "TAB BAR", meta, bg: Theme.panel)
 
       list_top = box.y + 2
       cap = list_capacity(box)

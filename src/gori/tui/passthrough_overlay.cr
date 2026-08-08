@@ -112,20 +112,22 @@ module Gori::Tui
       end
       Frame.card(screen, box, "TLS PASSTHROUGH", border: Theme.border_focus)
       meta = "#{@hosts.size} host#{@hosts.size == 1 ? "" : "s"}"
-      screen.text({box.right - meta.size - 2, box.x + 18}.max, box.y, meta, Theme.muted, Theme.panel)
+      Frame.border_meta(screen, box, "TLS PASSTHROUGH", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
       return if cap <= 0
+      start = list_window(cap)
       if @hosts.empty?
         screen.text(box.x + 3, box.y + 2, empty_message, Theme.muted, Theme.panel)
       else
-        start = list_window(cap)
         cap.times do |row|
           i = start + row
           break if i >= @hosts.size
           draw_row(screen, box, i, box.y + 2 + row)
         end
       end
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        @hosts.size, start, true, Theme.panel)
       draw_footer(screen, box)
     end
 

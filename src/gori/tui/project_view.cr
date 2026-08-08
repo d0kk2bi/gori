@@ -1135,9 +1135,10 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "SCOPE", bg: Theme.bg, border: Frame.pane_border(focused))
       n = @scope.rules.size
-      meta = " lens:#{@scope.enabled? ? "on" : "off"} · #{n} "
-      mx = {rect.right - meta.size - 1, rect.x + 8}.max
-      screen.text(mx, rect.y, meta, @scope.active? ? Theme.text_bright : Theme.muted, Theme.bg) if rect.w > meta.size + 10
+      # An ACTIVE lens is the one card meta that shouts — it changes what every other tab
+      # shows — so this one passes its own fg rather than taking `border_meta`'s muted default.
+      Frame.border_meta(screen, rect, "SCOPE", "lens:#{@scope.enabled? ? "on" : "off"} · #{n}",
+        fg: @scope.active? ? Theme.text_bright : Theme.muted)
       render_scope_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -1174,6 +1175,7 @@ module Gori::Tui
         screen.cell(inner.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_rule_row(screen, inner, ry, rule, selected, bg)
       end
+      Frame.scroll_gauge(screen, Rect.new(inner.x, y, inner.w, rows), rules.size, scroll, focused)
     end
 
     private def render_rule_row(screen : Screen, inner : Rect, y : Int32, rule : Scope::Rule, selected : Bool, bg : Color) : Nil
@@ -1192,9 +1194,8 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "HOST OVERRIDES", bg: Theme.bg, border: Frame.pane_border(focused))
       n = @host_overrides.size
-      meta = " #{n} "
-      mx = {rect.right - meta.size - 1, rect.x + 14}.max
-      screen.text(mx, rect.y, meta, n > 0 ? Theme.text_bright : Theme.muted, Theme.bg) if rect.w > meta.size + 16
+      Frame.border_meta(screen, rect, "HOST OVERRIDES", n.to_s,
+        fg: n > 0 ? Theme.text_bright : Theme.muted)
       render_overrides_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -1238,6 +1239,9 @@ module Gori::Tui
         screen.cell(list.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_ov_row(screen, list, ry, entry, selected, bg)
       end
+      # `y`/`rows` are already past the add-row when one is open, so the gauge measures the
+      # entries actually windowed rather than the card interior.
+      Frame.scroll_gauge(screen, Rect.new(list.x, y, list.w, rows), entries.size, scroll, focused)
     end
 
     # The HOST OVERRIDES list area: the card interior minus the top example-hint row. ONE
@@ -1270,9 +1274,7 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "ENVIRONMENT", bg: Theme.bg, border: Frame.pane_border(focused))
       n = @env_items.size
-      meta = "prefix #{Settings.env_prefix} · #{n}"
-      mx = {rect.right - meta.size - 1, rect.x + 14}.max
-      screen.text(mx, rect.y, meta, Theme.muted, Theme.bg, width: {rect.right - mx - 1, 1}.max) if rect.w > meta.size + 16
+      Frame.border_meta(screen, rect, "ENVIRONMENT", "prefix #{Settings.env_prefix} · #{n}")
       render_env_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -1310,6 +1312,7 @@ module Gori::Tui
         screen.cell(list.x, ry, selected ? '▎' : ' ', Theme.accent, bg)
         render_env_row(screen, list, ry, key, val, selected, bg)
       end
+      Frame.scroll_gauge(screen, Rect.new(list.x, y, list.w, rows), @env_items.size, scroll, focused)
     end
 
     private def env_list_inner(inner : Rect) : Rect

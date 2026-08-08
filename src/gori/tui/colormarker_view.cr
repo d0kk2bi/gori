@@ -52,9 +52,7 @@ module Gori::Tui
       # pay border width to be told "0 global".
       globals = rules.count(&.global?)
       meta = "#{globals} global · #{meta}" if globals > 0
-      if rect.w > meta.size + 18
-        screen.text({rect.right - meta.size - 2, rect.x + 16}.max, rect.y, meta, Theme.muted, Theme.bg)
-      end
+      Frame.border_meta(screen, rect, "COLORMARKER", meta)
       inner = rect.inset(1, 1)
       return if inner.empty?
 
@@ -82,6 +80,11 @@ module Gori::Tui
         break if idx >= rules.size
         render_row(screen, inner, rules[idx], list_top + i, idx == sel, focused)
       end
+      # Tracks the LIST viewport, not the interior — the note row below it is prose, not a
+      # row you can scroll to. `rows` is already the note-aware height, so the gauge and the
+      # hit-test read the same geometry.
+      Frame.scroll_gauge(screen, Rect.new(inner.x, list_top, inner.w, rows),
+        rules.size, scroll, focused)
     end
 
     private def render_row(screen : Screen, rect : Rect, rule : Store::ColorRule, py : Int32,

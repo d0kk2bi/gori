@@ -62,6 +62,29 @@ module Gori::Tui
       screen.text(inner.x + 1, y, " ‹ list ", Theme.accent, bg, Attribute::Bold)
     end
 
+    # A short right-aligned annotation riding a card's TOP border, right of the title —
+    # "2/2 enabled", "lens:off · 3", "4 entries". Rides the hairline the way `list_back_hint`
+    # does, so it costs no interior row.
+    #
+    # Every card that wanted one used to hand-roll this, and the copies had drifted into
+    # different magic numbers for the same layout: the Rewriter list guarded on
+    # `rect.w > meta.size + 20` and floored at `rect.x + 18`, its Colormarker twin at `+ 18`
+    # and `+ 16`, so the two lists dropped their count at different widths. Neither number
+    # was derived from anything — the title they were protecting is right there. `Frame.card`
+    # draws its title as ` TITLE ` from `rect.x + 2`, which is the only fact this needs, and
+    # it is now stated once.
+    #
+    # Draws nothing when the card is too narrow to hold the meta clear of the title, which is
+    # what makes it safe to call unconditionally.
+    def self.border_meta(screen : Screen, rect : Rect, title : String, meta : String,
+                         bg : Color = Theme.bg, fg : Color = Theme.muted) : Nil
+      return if meta.empty? || rect.w < 4
+      title_end = rect.x + 2 + (title.empty? ? 0 : Screen.draw_width(title) + 2)
+      x = rect.right - Screen.draw_width(meta) - 2
+      return if x <= title_end
+      screen.text(x, rect.y, meta, fg, bg)
+    end
+
     # A slim vertical scroll gauge riding the right border of a framed content area.
     # The thumb's height is proportional to how much of the content is on screen, so a
     # glance reads as "roughly how big is this", and its position tracks the scroll
@@ -88,11 +111,15 @@ module Gori::Tui
 
     # A `├───┤` divider across a card's interior at absolute row `y` — the seam
     # between an input/header band and the list below it.
-    def self.tee_divider(screen : Screen, rect : Rect, y : Int32, bg : Color = Theme.panel) : Nil
+    # `border` matches the enclosing card's outline, so a seam under a FOCUSED strip can light
+    # with it instead of staying a stray grey hairline — the same reason `inner_divider` takes
+    # one. Defaults to the resting hairline, so every existing caller is unchanged.
+    def self.tee_divider(screen : Screen, rect : Rect, y : Int32, bg : Color = Theme.panel,
+                         border : Color = Theme.border) : Nil
       return if rect.w < 2 || y <= rect.y || y >= rect.bottom - 1
-      screen.cell(rect.x, y, TEE_L, Theme.border, bg)
-      screen.hline(rect.x + 1, y, rect.w - 2, fg: Theme.border, bg: bg)
-      screen.cell(rect.right - 1, y, TEE_R, Theme.border, bg)
+      screen.cell(rect.x, y, TEE_L, border, bg)
+      screen.hline(rect.x + 1, y, rect.w - 2, fg: border, bg: bg)
+      screen.cell(rect.right - 1, y, TEE_R, border, bg)
     end
 
     # A tee-connected section divider for content rendered INSIDE a frame, where
