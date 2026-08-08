@@ -950,14 +950,14 @@ module Gori::Tui
       notes_active = focused && notes_focused?
       ins = focused && notes_insert_mode?
       Frame.card(screen, card, "NOTES", bg: Theme.bg, border: Frame.pane_border(notes_active || ins))
-      if notes_active || ins
-        Frame.mode_badge(screen, card.right - 1, card.y, card.x + 7, ins)
-      elsif !notes_insert_mode?
-        # Unfocused NOTES still hints how to enter insert (same ↵ cue as the mode badge).
-        edit_hint = " ↵ "
-        bx = card.right - edit_hint.size - 1
-        screen.text(bx, card.y, edit_hint, Theme.muted, Theme.bg) if bx >= card.x + 7
-      end
+      # The REAL mode, always drawn — `Frame.mode_badge`'s contract, and this call broke it
+      # in the worst of the three possible ways. In insert-but-unfocused neither branch below
+      # ran, so NOTHING was painted on the border while `issues_controller` went on hit-testing
+      # the bare `notes_insert_mode?`: five blank cells that toggled insert when clicked. The
+      # `elsif` was a third geometry on top of that — a 3-cell ` ↵ ` the hit-test never knew
+      # about. `mode_badge` already draws its READ label muted on the canvas, which is the
+      # same quiet ↵ cue that branch existed to provide.
+      Frame.mode_badge(screen, card.right - 1, card.y, card.x + 7, notes_insert_mode?)
       body = card.inset(1, 1)
       return if body.empty?
       @notes.render(screen, body, cursor: ins, gauge: true, gauge_focused: notes_active)

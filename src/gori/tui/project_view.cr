@@ -1351,9 +1351,10 @@ module Gori::Tui
       ins = focused && desc_insert_mode?
       border = desc_pane_border(focused, ins)
       Frame.card(screen, rect, "DESCRIPTION", bg: Theme.bg, border: border)
-      if focused
-        Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 14, ins)
-      end
+      # The REAL mode, always drawn — `Frame.mode_badge`'s contract. `project_controller`
+      # hit-tests the bare `desc_insert_mode?`, so gating the draw on focus left a live
+      # target on a border with nothing on it. Focus is carried by the border colour above.
+      Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 14, desc_insert_mode?)
       inner = rect.inset(1, 1)
       @desc_area.render(screen, inner, cursor: ins,
         highlight: Settings.editor_markdown ? :markdown : nil, gauge: true, gauge_focused: focused)
