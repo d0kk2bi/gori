@@ -186,6 +186,21 @@ describe Gori::Tui::FuzzerView do
     grid2.should_not contain("§x¦rot13§")
   end
 
+  it "points a chain-less position at BOTH halves of its setup (^Y and the CONFIG pane)" do
+    # A marked position is only half a Fuzzer run: with no payload set in CONFIG the sweep
+    # produces nothing, and the two halves live in different panes. The tooltip used to open
+    # only for a marker that already HAD a `¦chain` — i.e. never on a freshly auto-marked
+    # template, which is every position an operator meets first.
+    view = FuzzerView.new
+    view.load_request("https://h", "§x§ HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
+    view.focus_pane(:template) # cursor at offset 0 → inside §x§, which carries no chain
+    b = MemoryBackend.new(120, 30)
+    view.render(Screen.new(b), Rect.new(0, 0, 120, 30))
+    grid = (0...30).map { |y| b.row(y) }.join("\n")
+    grid.should contain("no chain yet")
+    grid.should contain("^Y edit · ^O sets")
+  end
+
   # `template_scroll_view` used to bail on `template_insert?`, so the wheel died the moment `i`
   # was pressed — the same `unless insert?` the Repeater request pane shed, in the one other
   # pane that had it. `chain_pane_active?` still bails: the ^Y sub-pane owns the wheel then.

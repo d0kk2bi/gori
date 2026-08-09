@@ -1269,6 +1269,135 @@ describe Gori::Tui::RepeaterView do
     grid.should_not contain("PREVIEW") # the ^Y modal is NOT auto-shown
   end
 
+  it "draws ^T:MARK only while the capture's § are INERT, never once they are live" do
+    # The badge is a WARNING with an escape hatch — "these § are the origin's bytes and go out
+    # verbatim; ^T declares them markers" — which nothing else on screen says. Once they ARE
+    # markers the editor tints them and `§N` rides the border, so the lit half of the badge
+    # reported no state and only re-named a key the status strip already carries.
+    grid = ->(v : RepeaterView) do
+      b = MemoryBackend.new(120, 24)
+      v.render(Screen.new(b), Rect.new(0, 0, 120, 24))
+      (0...24).map { |y| b.row(y) }.join("\n")
+    end
+
+    ev = RepeaterView.new
+    ev.restore("https://a.test", "GET /?q=§v§ HTTP/1.1\nHost: a.test\n\n", false, false, evidence: true)
+    ev.focus_pane(:request)
+    ev.literal_markers?.should be_true
+    grid.call(ev).should contain("^T:MARK") # inert → the warning stands
+
+    ev.insert_marker # declares the buffer a template
+    ev.literal_markers?.should be_false
+    grid.call(ev).should_not contain("^T:MARK")
+
+    draft = RepeaterView.new # a draft's § were always live — it never carried the badge
+    draft.restore("https://a.test", "GET /?q=§v§ HTTP/1.1\nHost: a.test\n\n", false, false)
+    draft.focus_pane(:request)
+    grid.call(draft).should_not contain("^T:MARK")
+  end
+
+  describe "#adopt_capture_markers (provenance across a reopen)" do
+    # A reopened evidence tab lands undeclared: the repeater ROW carries the request text and a
+    # flow_id, nothing saying which `§` the operator typed. But the CAPTURE is still in the
+    # store and answers it — a `§` the origin never sent can only have been typed here. Without
+    # this, a tab the operator marked by hand came back with its markers inert, `^T:MARK` on the
+    # border, and a `^R` that would put `§…§` on the wire as literal bytes.
+    marked = "GET /?q=§hello§ HTTP/1.1\nHost: a.test\n\n"
+
+    it "declares the operator's markers when the capture carried none" do
+      view = RepeaterView.new
+      view.restore("http://a.test", marked, false, false, evidence: true)
+      view.literal_markers?.should be_true # restore's conservative landing
+
+      view.adopt_capture_markers("GET /?q=hello HTTP/1.1\r\nHost: a.test\r\n\r\n".to_slice, nil)
+      view.literal_markers?.should be_false # …corrected from the capture
+      view.markers_active?.should be_true   # and the markers render again on send
+    end
+
+    it "stays inert when the capture carried a § of its own — gori cannot tell them apart" do
+      view = RepeaterView.new
+      view.restore("http://a.test", marked, false, false, evidence: true)
+      view.adopt_capture_markers("GET /?q=§ HTTP/1.1\r\nHost: a.test\r\n\r\n".to_slice, nil)
+      view.literal_markers?.should be_true
+    end
+
+    it "reads the capture's BODY too, not just its head" do
+      view = RepeaterView.new
+      view.restore("http://a.test", "POST / HTTP/1.1\nHost: a.test\n\n§v§", false, false, evidence: true)
+      view.adopt_capture_markers("POST / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_slice, "a§b".to_slice)
+      view.literal_markers?.should be_true
+    end
+
+    it "stays inert with no capture to read, and leaves a draft alone" do
+      view = RepeaterView.new
+      view.restore("http://a.test", marked, false, false, evidence: true)
+      view.adopt_capture_markers(nil, nil) # flow deleted / seed lost → the honest answer is inert
+      view.literal_markers?.should be_true
+
+      draft = RepeaterView.new # never evidence → nothing to re-derive, and nothing to break
+      draft.restore("http://a.test", marked, false, false)
+      draft.adopt_capture_markers("GET / HTTP/1.1\r\n\r\n".to_slice, nil)
+      draft.literal_markers?.should be_false
+    end
+  end
+
+  it "offers ^Y over a marker that has NO chain — the state with nothing else on screen" do
+    # The tooltip used to open only for a marker that ALREADY had a `¦chain`, i.e. it explained
+    # the case the operator had already solved and stayed silent on the one they hadn't. ^Y is
+    # the sole way into the chain editor and appears on no border, so an unchained marker had
+    # no path out of itself.
+    view = RepeaterView.new
+    view.restore("https://a.test", "§v§ HTTP/1.1\nHost: a.test\n\n", false, false)
+    view.focus_pane(:request) # caret at offset 0 → inside §v§, which carries no chain
+    b = MemoryBackend.new(120, 24)
+    view.render(Screen.new(b), Rect.new(0, 0, 120, 24))
+    grid = (0...24).map { |y| b.row(y) }.join("\n")
+    grid.should contain("no chain yet")
+    grid.should contain("^Y edit")
+    grid.should_not contain("^O sets") # the Fuzzer's extra half — a Repeater marker is complete alone
+  end
+
+  it "keeps the tooltip off the caret when it sits outside every marker" do
+    view = RepeaterView.new
+    view.restore("https://a.test", "GET /x HTTP/1.1\nHost: a.test\n\n", false, false)
+    view.focus_pane(:request)
+    b = MemoryBackend.new(120, 24)
+    view.render(Screen.new(b), Rect.new(0, 0, 120, 24))
+    grid = (0...24).map { |y| b.row(y) }.join("\n")
+    grid.should_not contain("no chain yet")
+    grid.should_not contain("^Y edit")
+  end
+
+  it "yields the hint-only tooltip to the $KEY peek, but never a real chain" do
+    # `§$HOST§` is an ordinary marker whose value is an env var. The empty-chain tooltip is a
+    # standing reminder; the resolved value is a datum nothing else shows — so the reminder
+    # steps aside. A marker that HAS a chain still wins: only this tooltip can reveal bytes
+    # that are concealed in the buffer.
+    saved = Gori::Settings.env_vars
+    Gori::Settings.env_vars = [{"PEEKHOST", "peekval"}]
+    begin
+      view = RepeaterView.new
+      view.restore("https://a.test", "§$PEEKHOST§ HTTP/1.1\nHost: a.test\n\n", false, false)
+      view.focus_pane(:request)
+      view.edit_move(0, 5) # into the $PEEKHOST run — both overlays now want this caret
+      b = MemoryBackend.new(120, 24)
+      view.render(Screen.new(b), Rect.new(0, 0, 120, 24))
+      grid = (0...24).map { |y| b.row(y) }.join("\n")
+      grid.should_not contain("no chain yet")
+      grid.should contain("peekval") # …and the peek it stepped aside for is the thing on screen
+
+      chained = RepeaterView.new
+      chained.restore("https://a.test", "§$PEEKHOST¦md5§ HTTP/1.1\nHost: a.test\n\n", false, false)
+      chained.focus_pane(:request)
+      chained.edit_move(0, 5) # the SAME caret — a real chain outranks the peek
+      b2 = MemoryBackend.new(120, 24)
+      chained.render(Screen.new(b2), Rect.new(0, 0, 120, 24))
+      (0...24).map { |y| b2.row(y) }.join("\n").should contain("^Y edit")
+    ensure
+      Gori::Settings.env_vars = saved
+    end
+  end
+
   it "opens the CHAIN modal (with a transform preview) only after ^Y" do
     view = RepeaterView.new
     view.restore("https://a.test", "§v¦md5§ HTTP/1.1\nHost: a.test\n\n", false, false)

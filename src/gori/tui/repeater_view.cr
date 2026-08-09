@@ -2413,6 +2413,38 @@ module Gori::Tui
       invalidate_marker_caches
     end
 
+    # Re-derive provenance for a REOPENED evidence tab from the flow it was seeded off.
+    #
+    # `restore`/`apply_peer_request` land undeclared because the repeater row says nothing
+    # about which `§` in its text the operator typed. That is true of the ROW — and it made a
+    # tab the operator had marked by hand come back with its own markers inert, `^T:MARK` on
+    # the border, and a `^R` that would put `§…§` on the wire as literal bytes. The operator
+    # marked it; gori just forgot between two runs.
+    #
+    # But the row is not the only evidence. The CAPTURE is still in the store, and it answers
+    # the question directly: a `§` that is in this buffer and was NOT in the origin's bytes can
+    # only have been typed here. So:
+    #
+    #   * capture had NO `§` → every `§` in the buffer is the operator's → declare.
+    #   * capture HAD a `§` → gori genuinely cannot tell one from the other, so the markers
+    #     stay inert and the border chip says so. That is the case `markers_live?` exists for,
+    #     and it keeps its guard.
+    #   * no capture to read (flow deleted, seed lost) → inert, for the same reason.
+    #
+    # Idempotent, and never UNdeclares: the operator's own act outranks a re-derivation.
+    #
+    # Head AND body, because a `§` in either is one gori cannot attribute — and the seed read
+    # the same stored bytes this reads, truncation included, so the two sides are comparable
+    # even for a capture whose body was cut at the cap.
+    def adopt_capture_markers(capture_head : Bytes?, capture_body : Bytes?) : Nil
+      return if !@evidence || @markers_declared
+      return unless capture_head
+      return if Fuzz::Template.marker_bytes_in?(capture_head)
+      return if (b = capture_body) && Fuzz::Template.marker_bytes_in?(b)
+      return unless Fuzz::Template.marker_bytes_in?(@editor.text.to_slice)
+      declare_markers
+    end
+
     # The caches key on `@editor.edits`, which a pure state flip does not bump.
     private def invalidate_marker_caches : Nil
       @marker_regions_rev = -1
@@ -2813,10 +2845,10 @@ module Gori::Tui
             return :mode
           end
           # ` ^T:MARK ` chains LEFT of the mode chip, under exactly the condition
-          # render_request draws it: only when a `§` is in the buffer. It was the one badge on
-          # this border missing from the hit list while its four neighbours all answered.
-          if !@grpc_mode && !ws_mode? && !decode_mode? &&
-             (literal_markers? || (@evidence && markers_active?))
+          # render_request draws it: only while the buffer's `§` are still INERT capture bytes.
+          # It was the one badge on this border missing from the hit list while its four
+          # neighbours all answered.
+          if !@grpc_mode && !ws_mode? && !decode_mode? && literal_markers?
             mark_edge = Frame.mode_badge_edge(mode_edge, min_x, request_insert?)
             if Frame.right_badge_hit(mx, my, req_card.y, mark_edge, min_x,
                  [{:mark, "^T", "MARK"}] of {Symbol, String, String})
@@ -4490,16 +4522,21 @@ module Gori::Tui
       cl_x = Frame.toggle_badge(screen, send_edge, rect.y, min_x, "^L", "CL", @auto_content_length)
       mode_x = Frame.toggle_badge(screen, cl_x, rect.y, min_x, "^U", "PRETTY", false)
       mark_x = Frame.mode_badge(screen, mode_x, rect.y, min_x, request_insert?) # the REAL mode — see Frame.mode_badge
-      # Only when a `§` is actually in the buffer, so a request without one draws exactly the
-      # border it drew before. Unlit = the capture's § are literal bytes (^T declares them);
-      # lit = this buffer is a template and ^R renders them. See `markers_live?`.
+      # The INERT half only. `literal_markers?` is a state nothing else on screen shows: the
+      # `§` in this buffer are the capture's own bytes, they will go out verbatim, and `^T`
+      # is what declares them markers instead — a warning with its own escape hatch, which is
+      # what a border chip is for.
       #
-      # …and NOT on a decode split. `repeater.toggle-decoded` is context-sensitive: on a
+      # The LIT half is gone. Once the markers ARE live they are tinted in the editor, `§N`
+      # rides the border, and the chip added nothing but a second name for a key the status
+      # strip already advertises — so `^T` on an unmarked request grew a badge that reported
+      # no state, which is how it read.
+      #
+      # NOT on a decode split either. `repeater.toggle-decoded` is context-sensitive: on a
       # SAML/GraphQL tab `^T` switches ENVELOPE ⇄ DECODED instead of inserting a §, so a badge
-      # reading `^T:MARK` there names a key that does something else entirely. Marking is still
-      # reachable from the space menu (`w` word / `i` point) and from ^K.
-      if !decode_mode? && (literal_markers? || (@evidence && markers_active?))
-        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^T", "MARK", markers_live?)
+      # reading `^T:MARK` there names a key that does something else entirely.
+      if !decode_mode? && literal_markers?
+        Frame.toggle_badge(screen, mark_x, rect.y, min_x, "^T", "MARK", false)
       end
       update_request_marker_tint
       render_plain_request_editor(screen, rect.inset(1, 1), focused, ins)
@@ -4568,8 +4605,12 @@ module Gori::Tui
       end
       @editor.bg_regions = bg
       @editor.conceal_spans = conceal
-      chain = chain_under_cursor
-      @editor.chain_peek_text = (chain && !chain.empty?) ? chain : nil # tooltip only for a concealed (non-empty) chain
+      # A marker WITHOUT a chain gets the tooltip too (`""` → "no chain yet · ^Y edit"). The
+      # chain pane is reachable by exactly one key that appears nowhere on this pane, so the
+      # state with no chain — the one where the operator has nothing on screen to work from —
+      # was the state that said nothing at all, while a marker that already had one explained
+      # itself. nil (caret outside every marker) still draws nothing.
+      @editor.chain_peek_text = chain_under_cursor
     end
 
     # {open, sep, close} marker regions cached on the editor revision — update_request_marker_tint

@@ -289,7 +289,7 @@ describe "code-review fixes" do
     # `render_request`, so the badge was drawn — and clickable — reading `^T:MARK` while the
     # key it names did something unrelated. Draw and hit are gated together.
     src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "repeater_view.cr"))
-    draw = src[/# …and NOT on a decode split.*?end/m].not_nil!
+    draw = src[/# NOT on a decode split either\..*?end/m].not_nil!
     draw.should contain("!decode_mode?")
     hit = src[/` \^T:MARK ` chains LEFT.*?return :mark/m].not_nil!
     hit.should contain("!decode_mode?")
