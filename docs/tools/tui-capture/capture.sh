@@ -32,6 +32,10 @@ OUT="$TUI_ROOT"
 # 132 columns reads as a real full-width terminal in the docs; at the old 104
 # the SVGs scaled up chunky ("zoomed-in screenshot" feel) in the content column.
 COLS=132 ROWS=26 PORT=8091
+# The jwt.io sample token, typed into the JWT scene's INPUT (see shoot_all). A literal,
+# not a capture: that tab is pure local compute and the guide's shot has always used the
+# token every reader recognises.
+JWT_SAMPLE="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
 ONLY="${ONLY:-scenes themes readme}"
 want() { case " $ONLY " in *" $1 "*) return 0;; *) return 1;; esac; }
 
@@ -164,6 +168,12 @@ shoot_all() {
   run_scene decoder      26 "gori · Decoder"                   7 SLEEP1.2
   run_scene repeater     26 "gori · Repeater"                  3 SLEEP0.6 Enter SLEEP0.4 C-r SLEEP1.2 C-r SLEEP3
   run_scene fuzzer       34 "gori · Fuzzer"                    3 SLEEP0.6 Enter SLEEP0.3 Down SLEEP0.3 I SLEEP1 C-a SLEEP0.6 C-l SLEEP0.8 admin Enter root SLEEP0.5 Escape SLEEP0.7 C-r SLEEP5
+  # JWT ships HIDDEN, so this reveals it the way the guide tells a reader to (palette →
+  # Go to JWT) rather than by a positional jump, then types the sample token and sends the
+  # caret Home so INPUT shows where the token STARTS — typing leaves the view on its tail,
+  # which reads as a truncated blob. The guide has carried a jwt.svg since the tab shipped
+  # and this list never had the scene that makes it, so the shot went stale in place.
+  run_scene jwt          26 "gori · JWT"                       C-p SLEEP0.8 jwt SLEEP0.5 Enter SLEEP1.2 Enter SLEEP0.3 "$JWT_SAMPLE" SLEEP1 Home SLEEP0.3 Escape SLEEP0.6
   run_tour  tutorial     26 "gori · Guided tour"               SLEEP1.5
 }
 
