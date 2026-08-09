@@ -18,11 +18,11 @@ module Gori::Tui
     # rings read as a simplified silhouette rather than a traced outline, and the
     # gate drops to 27 rows / 26 cols — see ProjectPicker.art_shown?.
     #
-    # Solid blocks, not scattered glyphs. The strokes are one or two cells thick,
-    # so any mix of glyph weights reads as broken lines rather than arcs, and `█`
-    # is the one glyph whose ink and advance are identical in every font — which
-    # also keeps this the same mark as the SVG/favicon everywhere else. The noise
-    # belongs in the picker's entrance instead (see ART_NOISE there).
+    # The figure is two rings — a big tilted ellipse and a flat one lying across
+    # the bottom, its tips curling up either side — and at this size they only
+    # read as two if they differ. So the ART glyph carries ring membership: `█`
+    # is the near ring, `▒` the far one. `ink` turns that into what actually gets
+    # painted; nothing draws ART's characters directly.
     #
     # Every glyph must measure one cell (see spec/tui/brand_art_spec.cr): the
     # draw places glyph N of a line at column N, so a two-cell grapheme would
@@ -33,11 +33,15 @@ module Gori::Tui
       "   ███    ███  ███",
       "  ███    ██    ███",
       "  ███         ███",
-      " █ ████     ████  █",
-      "██  █████ █████   ██",
-      " ██   ████████  ███",
-      "  █████████████████",
+      " ▒ ████     ████  ▒",
+      "▒▒  █████ █████   ▒▒",
+      " ▒▒   ████████  ▒▒▒",
+      "  ██████████▒▒▒▒▒▒▒",
     ]
+
+    # The far ring's marker, and how far its colour sits toward the canvas.
+    FAR_RING     = '▒'
+    FAR_RING_MIX = 0.58
 
     ART_H     = ART.size
     ART_LEFT  = ART.min_of { |line| line.size - line.lstrip.size }
@@ -52,6 +56,24 @@ module Gori::Tui
     BYLINE  = "made by #{AUTHOR}"
     TAGLINE = "Hack from the terminal."
 
+    # What an ART cell paints: both rings are solid blocks, the far one dimmed
+    # toward the canvas so the interlock reads as depth rather than as one blob.
+    #
+    # The dim is COLOUR, not a lighter glyph. Painting `▒` literally renders it
+    # as a dither pattern (a checkerboard in Menlo), and on a stroke one or two
+    # cells thick that reads as texture rather than distance — the same reason
+    # the mark is solid `█` and the scatter lives in the picker's entrance
+    # instead (see ART_NOISE there). The pattern is font-dependent too, where a
+    # blend of the palette's own colours is not.
+    #
+    # Every draw resolves its cells here, so the picker hero and Help → About
+    # cannot disagree about the figure — which is exactly how the picker once
+    # ended up painting ART as a plain silhouette while About drew the mark.
+    def self.ink(ch : Char, fg : Color) : {Char, Color}
+      return {'█', Theme.blend(fg, Theme.bg, FAR_RING_MIX)} if ch == FAR_RING
+      {ch, fg}
+    end
+
     # Static gilded art (no entrance animation). Defaults to the theme's gold
     # (focus_gold: logo-sampled champagne gold on dark, deepened logo gold on
     # light), so the mark reads as the real brand gold in every palette.
@@ -62,7 +84,8 @@ module Gori::Tui
       ART.each_with_index do |line, i|
         line.each_char_with_index do |ch, col|
           next if ch == ' '
-          screen.cell(origin_x + col, y + i, ch, fg, Theme.bg, attr: Attribute::Bold)
+          glyph, colour = ink(ch, fg)
+          screen.cell(origin_x + col, y + i, glyph, colour, Theme.bg, attr: Attribute::Bold)
         end
       end
     end
