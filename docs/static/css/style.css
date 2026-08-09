@@ -27,6 +27,12 @@
      (highlight #f1e1b1 → body #d9c28b) so the nav matches downloadable brand assets. */
   --grad-logo: linear-gradient(135deg, #f1e1b1 0%, #eedca5 40%, #d9c28b 100%);
   --selection: rgb(var(--accent-rgb) / 0.26);
+  /* Band each hero ribbon lays down to cut the ones it crosses. It runs over
+     the disc art as well as the page, so it is a translucent dark rather
+     than the page colour. */
+  --knot-cut: rgb(4 6 12 / 0.72);
+  /* The colour a hero ribbon reaches at the back of its turn. */
+  --knot-far: color-mix(in srgb, var(--accent) 26%, var(--bg));
   --shadow: 0 24px 80px rgb(2 3 9 / 0.62);
   --shadow-soft: 0 14px 44px rgb(2 3 9 / 0.5);
   --header-bg: rgb(9 11 18 / 0.82);
@@ -76,6 +82,14 @@
   --grad-gold-leaf: linear-gradient(135deg, #8a5d0a 0%, #c39a3c 26%, #a8791f 52%, #6f4e12 76%, #cba43e 100%);
   --grad-logo: linear-gradient(135deg, #c5a45a 0%, #b08d3f 55%, #8a6a28 100%);
   --selection: rgb(var(--accent-rgb) / 0.2);
+  /* On paper the band is a warm shadow, not a cut: at a dark-theme alpha it
+     would print as a black outline, and it would grey out the pale far arcs
+     it sits under. The tone difference between near and far carries the
+     crossings instead. */
+  --knot-cut: rgb(72 54 22 / 0.24);
+  /* Deeper than the dark theme's: mixing toward cream washes out fast, and
+     past this the far arcs stop reading as gold at all. */
+  --knot-far: color-mix(in srgb, var(--accent) 54%, var(--bg));
   --shadow: 0 22px 70px rgb(60 50 30 / 0.16);
   --shadow-soft: 0 12px 34px rgb(60 50 30 / 0.12);
   --header-bg: rgb(250 249 247 / 0.82);
@@ -833,93 +847,116 @@ kbd {
   display: block;
 }
 
-/* The disc lives in its own element so it can clip the drifting image, while
-   .hero-art stays unclipped and carries the two orbits around it. The width
-   stays under 100% of the column so those orbits never reach the page edge. */
+/* The hero mark: the same three-ring weave the logo carries, drawn around a
+   disc of the official art. Geometry and the over/under order are generated
+   (see partials/hero-knot.html); everything below is only paint and motion.
+   The rings reach the edge of the box, so the box stays under 100% of the
+   column, which .home-main would otherwise clip. */
 .hero-art {
-  position: relative;
   justify-self: center;
-  /* Under 100% of the column so the orbits below never reach the page edge,
-     which .home-main would clip. */
-  width: min(84%, 36rem);
+  width: min(94%, 44rem);
   aspect-ratio: 1;
+  margin: 0;
 }
 
-/* Two concentric orbits: the border draws the inner one, the outline the
-   outer. An outline follows border-radius and ignores the element's own
-   overflow, which is why it can sit outside without a third element. */
-.hero-art::before {
-  content: "";
-  position: absolute;
-  inset: -1.7rem;
-  border: 1px solid rgb(var(--accent-rgb) / 0.24);
-  border-radius: 50%;
-  outline: 1px solid rgb(var(--accent-rgb) / 0.1);
-  outline-offset: 1.6rem;
-  pointer-events: none;
-}
-
-/* Two request nodes riding the orbits, one per circle, opposite directions:
-   traffic circling the loop. The spin lives in the motion block below; with
-   motion off they park at the base rotations here, two nodes at rest. */
-.hero-orbit {
-  position: absolute;
-  inset: -1.7rem;
-  border-radius: 50%;
-  pointer-events: none;
-  transform: rotate(230deg);
-}
-
-.hero-orbit-out {
-  inset: -3.3rem;
-  transform: rotate(115deg);
-}
-
-.hero-orbit::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 50%;
-  width: 8px;
-  height: 8px;
-  margin: -4px;
-  border-radius: 50%;
-  background: var(--accent-strong);
-  box-shadow: 0 0 10px rgb(var(--accent-rgb) / 0.9), 0 0 0 3px rgb(var(--accent-rgb) / 0.16);
-}
-
-.hero-orbit-out::before {
-  width: 6px;
-  height: 6px;
-  margin: -3px;
-}
-
-.hero-disc {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  border-radius: 50%;
-  background: #0a0a0b;
-  box-shadow: var(--shadow);
-}
-
-.hero-disc::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  border: 1px solid rgb(var(--accent-rgb) / 0.26);
-  border-radius: 50%;
-  background: linear-gradient(115deg, rgb(var(--scrim-rgb) / 0.2), transparent 40%, rgb(var(--accent-rgb) / 0.1));
-}
-
-/* Warm the monochrome wave capture into gold leaf on indigo, so the disc reads
-   like the official art rather than a cold render. */
-.hero-disc img {
+.hero-knot {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  /* Inherited by the ribbons, so they still land in gold if the depth mix
+     below ever fails to compute. */
+  stroke: var(--accent);
+}
+
+/* The whole weave turns as one rigid piece. Rotating in the picture plane is
+   the only motion that leaves the painted depth order still correct, so the
+   knot can move without the crossings ever going wrong. */
+.knot-spin {
+  transform-box: view-box;
+  transform-origin: 50% 50%;
+}
+
+/* Each ribbon carries a dark band under it that cuts whatever it crosses —
+   the strokes are opaque gold, so without this a crossing would just merge.
+   Translucent rather than the page colour, because these bands also run over
+   the disc art, where they have to read as the ribbon's own shadow.
+   Butt, not round: a round cap would overshoot the piece and lay a dark tick
+   across the neighbouring piece of its own ring at every seam. */
+.knot-cut {
+  fill: none;
+  stroke: var(--knot-cut);
+  stroke-linecap: butt;
+}
+
+/* --d is the piece's depth, generated with the arcs as a percentage: 0% at
+   the far side of a ring, 100% at the near. It drives colour rather than
+   stroke-opacity because the pieces meet with round caps, and translucent
+   caps would composite over one another and bead at every seam. Mixing
+   toward the page instead reads as the same distance and stays flat. */
+.knot-arc {
+  fill: none;
+  stroke: color-mix(in srgb, var(--accent-strong) var(--d), var(--knot-far));
+  stroke-linecap: round;
+}
+
+.knot-s0 {
+  stop-color: rgb(var(--scrim-rgb));
+  stop-opacity: 0.28;
+}
+
+.knot-s1 {
+  stop-color: rgb(var(--scrim-rgb));
+  stop-opacity: 0;
+}
+
+.knot-s2 {
+  stop-color: rgb(var(--accent-rgb));
+  stop-opacity: 0.12;
+}
+
+/* Filter lengths are user units here, not CSS pixels: the viewBox is 240
+   wide, so 13 is roughly the 40px lift the rest of the page uses. */
+.knot-core {
+  filter: drop-shadow(0 5px 13px rgb(2 3 9 / 0.6));
+}
+
+.knot-core-rim {
+  fill: none;
+  stroke: rgb(var(--accent-rgb) / 0.28);
+  stroke-width: 0.8;
+}
+
+/* Three request nodes riding the rings, one each: traffic circling the loop.
+   They are placed by offset-path alone, so they only exist where that is
+   supported — otherwise they would pile up at the origin. */
+.knot-node {
+  display: none;
+  fill: var(--accent-strong);
+  filter: drop-shadow(0 0 2.6px rgb(var(--accent-rgb) / 0.95));
+}
+
+@supports (offset-path: path("M0 0L1 1")) {
+  .knot-node {
+    display: block;
+    /* fill-box, so the anchor riding the path is the dot's own centre and
+       not the middle of the viewBox. */
+    transform-box: fill-box;
+    transform-origin: 50% 50%;
+    offset-rotate: 0deg;
+  }
+
+  /* Generated with the arcs: the full ellipse of each ring. */
+  .knot-node-0 {
+    offset-path: path("M233 120A113 64.81 0 0 1 7 120A113 64.81 0 0 1 233 120");
+  }
+
+  .knot-node-1 {
+    offset-path: path("M176.5 217.86A113 64.81 60 0 1 63.5 22.14A113 64.81 60 0 1 176.5 217.86");
+  }
+
+  .knot-node-2 {
+    offset-path: path("M63.5 217.86A113 64.81 120 0 1 176.5 22.14A113 64.81 120 0 1 63.5 217.86");
+  }
 }
 
 /* --- Showcase: a real terminal capture floating under the hero --------- */
@@ -2768,21 +2805,34 @@ html.search-lock body {
     animation: hero-rise 760ms cubic-bezier(0.16, 1, 0.3, 1) 160ms backwards;
   }
 
-  .hero-disc img {
+  .knot-core-art {
     animation: quiet-drift 16s cubic-bezier(0.16, 1, 0.3, 1) infinite alternate;
+    transform-box: fill-box;
     transform-origin: 74% 45%;
   }
 
-  /* The negative delay puts the outer node mid-lap from the first frame, so
-     the two never read as starting from the same spot. */
-  .hero-orbit {
-    animation: orbit-spin 34s linear infinite;
+  /* One slow turn of the whole weave. Three-fold symmetry means it reads as
+     repeating every third of a lap, so the lap itself can be long. */
+  .knot-spin {
+    animation: knot-turn 66s linear infinite;
   }
 
-  .hero-orbit-out {
-    animation-duration: 56s;
+  /* Each node rides its own ring and dims on the far side, so the traffic
+     passes behind the disc instead of skating over it. The negative delays
+     keep the three from ever setting off together. */
+  .knot-node {
+    animation: knot-ride 21s linear infinite, knot-depth 21s ease-in-out infinite;
+  }
+
+  .knot-node-1 {
+    animation-duration: 29s;
+    animation-delay: -11s;
+  }
+
+  .knot-node-2 {
+    animation-duration: 37s;
+    animation-delay: -25s;
     animation-direction: reverse;
-    animation-delay: -21s;
   }
 
   .path-ring:hover::before,
@@ -3014,21 +3064,52 @@ html.search-lock body {
   }
 }
 
+/* Lengths here are SVG user units, not CSS pixels: the viewBox is 240 across.
+   The art box already overhangs its clip circle (see the generator), and the
+   scale opens up more slack still, so the drift can never pull an edge of the
+   image into the disc. */
 @keyframes quiet-drift {
   from {
     transform: scale(1);
   }
   to {
-    transform: scale(1.035) translateX(-0.8rem);
+    transform: scale(1.075) translate(-3.4px, 1.2px);
   }
 }
 
-@keyframes orbit-spin {
+@keyframes knot-turn {
   from {
     transform: rotate(0deg);
   }
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes knot-ride {
+  from {
+    offset-distance: 0%;
+  }
+  to {
+    offset-distance: 100%;
+  }
+}
+
+/* The ride starts at a ring's near horizon, so the first half of the lap is
+   the half in front of the disc and the second half is the one behind it. */
+@keyframes knot-depth {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  25% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+  75% {
+    opacity: 0.1;
   }
 }
 
@@ -3075,7 +3156,7 @@ html.search-lock body {
   }
 
   .hero-art {
-    width: min(88%, 30rem);
+    width: min(88%, 36rem);
   }
 
   .home-structure {
@@ -3131,21 +3212,7 @@ html.search-lock body {
   }
 
   .hero-art {
-    width: min(84%, 24rem);
-  }
-
-  .hero-art::before {
-    inset: -1.1rem;
-    outline-offset: 1rem;
-  }
-
-  /* The orbit nodes track the tightened circles above. */
-  .hero-orbit {
-    inset: -1.1rem;
-  }
-
-  .hero-orbit-out {
-    inset: -2.1rem;
+    width: min(92%, 29rem);
   }
 
   .structure-art {
