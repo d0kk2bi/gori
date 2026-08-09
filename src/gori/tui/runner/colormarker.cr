@@ -29,12 +29,14 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     colormarker_controller.colormarker_reload
   end
 
-  # No sub-tab half here, unlike `rewriter_rule_selected?`. That predicate has to ask
-  # `rules_sub?` because the Rewriter tab renders three different lists in one body and the
-  # space menu would otherwise act on a row that is not on screen. Colormarker's body is one
-  # list, always the one `selected_rule` names, so there is nothing further to gate on.
   def colormarker_rule_selected? : Bool
     colormarker_controller.rule_selected?
+  end
+
+  # The POLICY pane is the focused one. Gates the rule chords so `x`/`s`/⇧J cannot act on a rule
+  # while the CUSTOM COLORS pane is up — a chord has no `section:` to keep it away.
+  def colormarker_rule_list_focused? : Bool
+    colormarker_controller.rule_list_focused?
   end
 
   # The selected rule is a GLOBAL one — the gate for the verb that only means something for
@@ -49,5 +51,26 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
 
   def colormarker_toggle_default : Nil
     colormarker_controller.colormarker_toggle_default
+  end
+
+  # --- CUSTOM COLORS pane ---
+  def colormarker_colors_focused? : Bool
+    colormarker_controller.colors_focused?
+  end
+
+  def colormarker_color_selected? : Bool
+    colormarker_controller.color_selected?
+  end
+
+  def colormarker_color_add : Nil
+    colormarker_controller.customcolor_add
+  end
+
+  def colormarker_color_edit : Nil
+    colormarker_controller.customcolor_edit
+  end
+
+  def colormarker_color_delete : Nil
+    colormarker_controller.customcolor_delete
   end
 end

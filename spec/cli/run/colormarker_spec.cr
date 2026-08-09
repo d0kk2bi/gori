@@ -5,7 +5,7 @@ require "json"
 # and cannot be exercised from a spec, so what is pinned here is what an operator (or a script
 # parsing `--format=json`) actually reads.
 private def rule(id : Int64 = 1_i64, enabled = true, filter = "status:>=500",
-                 color = Gori::Store::MarkerColor::Red,
+                 color = "red",
                  style = Gori::Store::MarkerStyle::Full, name = "",
                  scope = Gori::Store::RuleScope::Project, overridden = false)
   Gori::Store::ColorRule.new(id, enabled, filter, color, style, name,
@@ -43,9 +43,9 @@ describe "gori run colormarker — text rows" do
 
   it "aligns the style and colour columns so the conditions line up down the list" do
     a = Gori::CLI::Run.colormarker_rule_row(rule(filter: "host:a",
-      color: Gori::Store::MarkerColor::Red, style: Gori::Store::MarkerStyle::Full))
+      color: "red", style: Gori::Store::MarkerStyle::Full))
     b = Gori::CLI::Run.colormarker_rule_row(rule(filter: "host:b",
-      color: Gori::Store::MarkerColor::Orange, style: Gori::Store::MarkerStyle::Strip))
+      color: "orange", style: Gori::Store::MarkerStyle::Strip))
     a.index("host:a").should eq(b.index("host:b"))
   end
 end

@@ -40,6 +40,7 @@ require "./project_view"
 require "./intercept_view"
 require "./rewriter_rule_overlay"
 require "./colormarker_rule_overlay"
+require "./custom_color_overlay"
 require "./extract_rule_overlay"
 require "./rewriter_stub_overlay"
 require "./confirm_dialog"
@@ -133,6 +134,12 @@ module Gori::Tui
       # Miner is hidden by default). Settings is loaded (cli.cr) before Runner.new.
       vis = Chrome.visible_tabs(Settings.tab_prefs).map(&.first)
       @active_tab = vis.includes?(:project) ? :project : vis.first
+      # Custom Colormarker colours are absolute hexes (unlike the theme-relative built-ins), so
+      # the render-side resolver keeps its own name→hue map. Prime it from settings now, and
+      # re-sync it whenever the colour set changes (the data-version poll below, keyed on the
+      # Colormarker revision). Settings is loaded before Runner.new (see above).
+      Theme.set_custom_marks(Settings.colormarker_color_map)
+      @custom_marks_rev = @session.colormarker.revision
       # Which modal (if any) is up. The value set is OverlayKind (see overlay.cr) — it was a
       # bare Symbol until Phase 0 of #355, where a mistyped state was a silent no-op.
       @overlay = OverlayKind::None
@@ -950,6 +957,13 @@ module Gori::Tui
       # regardless — `Colormarker#refresh` bails out on an unchanged rule set, so the common
       # tick recompiles nothing and does not bump the revision History memoises against.
       @session.colormarker.reload
+      # Re-prime the render-side custom-mark map only when the colour set actually moved — the
+      # revision bumps on a rule OR a custom-colour change, so a hex edit repaints History
+      # without this running every tick.
+      if (rev = @session.colormarker.revision) != @custom_marks_rev
+        Theme.set_custom_marks(Settings.colormarker_color_map)
+        @custom_marks_rev = rev
+      end
       # Reload a store-backed view only when it's the ACTIVE tab (others reload on
       # tab entry via on_enter_tab) — avoids re-querying History's page ~1.3×/sec
       # while the user is elsewhere. Own-session captures also arrive via flow_events.
@@ -5153,6 +5167,15 @@ module Gori::Tui
       ov.on_preview = ->colormarker_preview_text(Store::ColorRule)
       ov.on_hosts = ->(prefix : String) { @session.store.distinct_hosts(prefix: prefix, limit: 16) }
       ov.on_commit = -> { colormarker_controller.apply_color_rule(ov) }
+      open_overlay(ov)
+    end
+
+    # Host: open the custom-colour editor (nil colour = add; else edit). The commit is injected
+    # so the form stays settings-free — the controller persists through the settings registry,
+    # which is the only place a duplicate name can be caught.
+    def open_colormarker_color_editor(color : Settings::ColormarkerColor?) : Nil
+      ov = color ? CustomColorOverlay.editing(color) : CustomColorOverlay.adding
+      ov.on_commit = -> { colormarker_controller.apply_custom_color(ov) }
       open_overlay(ov)
     end
 

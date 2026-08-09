@@ -31,7 +31,7 @@ private EXPECTED_OVERLAY_SYMS = {
   :comparer_pick, :repeater_subtab, :links, :link_pick, :preferences,
   :settings, :tabs, :hosts, :env, :hotkeys, :notifications, :passthrough, :listeners, :probe_active,
   :discover_config, :discover_headers, :fuzz_set, :fuzz_advanced, :oast_provider, :oast_session,
-  :probe_rule, :rewriter_rule, :colormarker_rule, :extract_rule, :rewriter_stub, :ca_import, :import, :export, :scope_rule, :sequence_config,
+  :probe_rule, :rewriter_rule, :colormarker_rule, :colormarker_color, :extract_rule, :rewriter_stub, :ca_import, :import, :export, :scope_rule, :sequence_config,
   :mine_config, :name_prompt, :library_pick, :copy_as, :send_to,
 }
 
@@ -49,6 +49,8 @@ private MIGRATED_KINDS = [
   OverlayKind::RewriterRule,
   # Colormarker's rule form — born on the seam (it never had a legacy gate to delete from).
   OverlayKind::ColormarkerRule,
+  # Colormarker's custom-colour form — likewise born on the seam.
+  OverlayKind::ColormarkerColor,
   # #511 — the short-circuit stub sub-editor, born on the seam
   OverlayKind::RewriterStub,
   OverlayKind::CaImport,

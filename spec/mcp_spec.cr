@@ -1081,6 +1081,38 @@ describe Gori::MCP::Server do
       end
     end
 
+    it "manages custom colours, which a rule can then reference on any surface" do
+      before = Gori::Settings.colormarker_colors
+      begin
+        Gori::Settings.colormarker_colors = [] of Gori::Settings::ColormarkerColor
+        with_store do |store|
+          create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_custom_color","arguments":{"name":"Coral","hex":"ff6b6b"}}})
+          payload = tool_payload(drive(store, create)[0])
+          payload["name"].as_s.should eq("coral") # name + hex normalised
+          payload["hex"].as_s.should eq("#ff6b6b")
+
+          listed = tool_payload(drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_custom_colors"}}))[0])
+          listed["count"].as_i64.should eq(1)
+          listed["colors"][0]["name"].as_s.should eq("coral")
+
+          # A rule may now paint with the custom name — validation accepts it where it once
+          # refused any non-built-in word.
+          rule = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_color_rule","arguments":{"when":"host:h.test","color":"coral"}}})
+          tool_payload(drive(store, rule)[0])["color"].as_s.should eq("coral")
+
+          # A built-in word and a duplicate are both refused, said out loud.
+          drive(store, %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_custom_color","arguments":{"name":"red","hex":"#000000"}}}))[0]["result"]["isError"].as_bool.should be_true
+          drive(store, %({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"create_custom_color","arguments":{"name":"coral","hex":"#000000"}}}))[0]["result"]["isError"].as_bool.should be_true
+
+          del = %({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_custom_color","arguments":{"name":"coral"}}})
+          tool_payload(drive(store, del)[0])["deleted"].as_bool.should be_true
+          Gori::Settings.colormarker_colors.should be_empty
+        end
+      ensure
+        Gori::Settings.colormarker_colors = before
+      end
+    end
+
     it "previews without creating, and separates what MATCHES from what would be PAINTED" do
       with_store do |store|
         drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_color_rule","arguments":{"when":"host:h.test","color":"blue"}}}))

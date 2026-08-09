@@ -68,9 +68,17 @@ module Gori::Tui
         when: TextField.new(match_filter),
       }
       @scope_i = idx(SCOPES, scope)
-      @color_i = idx(COLORS, color)
+      @color_i = idx(color_options, color)
       @style_i = idx(STYLES, style)
       @sel = 0
+    end
+
+    # The picker's colour vocabulary: the six built-in words FIRST, then every user-defined
+    # custom colour's name (read live from settings, so a colour added in the pane below appears
+    # here without a reload). Read through this everywhere the colour row cycles or renders, so
+    # the constant `COLORS` stays the built-in list the CLI/MCP also validate against.
+    def color_options : Array(String)
+      COLORS + Settings.colormarker_colors.map(&.name)
     end
 
     def self.adding : ColormarkerRuleOverlay
@@ -78,7 +86,7 @@ module Gori::Tui
     end
 
     def self.editing(rule : Store::ColorRule) : ColormarkerRuleOverlay
-      new(name: rule.name, match_filter: rule.match_filter, color: rule.color.label,
+      new(name: rule.name, match_filter: rule.match_filter, color: rule.color,
         style: rule.style.label, scope: rule.scope.label, edit_id: rule.id,
         edit_scope: rule.scope)
     end
@@ -99,8 +107,11 @@ module Gori::Tui
       @fields[:when].value
     end
 
-    def color : Store::MarkerColor
-      Store::MarkerColor.from_label(COLORS[@color_i])
+    # The selected colour LABEL — a built-in word or a custom colour's name. A rule stores this
+    # string verbatim; `Theme.mark_color` resolves it to a hue at render.
+    def color : String
+      opts = color_options
+      opts[@color_i]? || opts.first? || "yellow"
     end
 
     def style : Store::MarkerStyle
@@ -152,7 +163,7 @@ module Gori::Tui
     def adjust(d : Int32) : Nil
       case @sel
       when ROW_SCOPE then @scope_i = (@scope_i + d) % SCOPES.size
-      when ROW_COLOR then @color_i = (@color_i + d) % COLORS.size
+      when ROW_COLOR then @color_i = (@color_i + d) % color_options.size
       when ROW_STYLE then @style_i = (@style_i + d) % STYLES.size
       end
     end
@@ -333,22 +344,23 @@ module Gori::Tui
       end
     end
 
-    # Each option is drawn as its own swatch plus a label. The swatch keeps its true hue whether
-    # or not the option is lit — the row is then a legible palette strip, and the selection is
-    # carried by the LABEL's weight. Dimming unlit swatches would make the one row whose job is
-    # "show me the colours" the row that shows them wrong.
+    # The colour row shows the SELECTED option only — a swatch in its true hue plus the name,
+    # then the ` ‹/›` cue — rather than the whole palette laid out inline. The old strip drew
+    # every option on the row, which was legible for exactly six built-ins but overflows the form
+    # the moment a custom colour is added (the picker's vocabulary is now unbounded). A single
+    # selected swatch reads the same as the scope/style cyclers directly above and below it and
+    # can never run past the box edge; the swatch keeps its true hue so the row still answers
+    # "what colour is this".
     private def draw_color_cycle(screen : Screen, x : Int32, py : Int32, bg : Color, row_sel : Bool) : Nil
       screen.text(x, py, "colour:", Theme.muted, bg)
       tx = x + 8
-      COLORS.each_with_index do |opt, oi|
-        lit = oi == @color_i
-        screen.cell(tx, py, '█', Theme.mark_color(Store::MarkerColor.from_label(opt).to_sym), bg)
-        col = lit ? (row_sel ? Theme.text_bright : Theme.accent) : Theme.muted
-        tx = screen.text(tx + 1, py, "#{opt} ", col, bg, lit ? Attribute::Bold : Attribute::None)
-      end
+      name = color
+      screen.cell(tx, py, '█', Theme.mark_color(name), bg)
+      col = row_sel ? Theme.text_bright : Theme.text
+      tx = screen.text(tx + 2, py, name, col, bg, row_sel ? Attribute::Bold : Attribute::None)
       # ` ‹/›` with the leading space, matching `Frame.option_cycle` — this row keeps its own
-      # renderer because each option carries a swatch, but it must not read differently from
-      # the cyclers directly above and below it.
+      # renderer because it carries a swatch, but it must not read differently from the cyclers
+      # directly above and below it.
       screen.text(tx, py, " ‹/›", Theme.muted, bg) if row_sel
     end
 
@@ -363,7 +375,7 @@ module Gori::Tui
       # time, which is three chances to disagree with the row above it.
       sx = Frame.option_cycle(screen, x, py, box.right - 2, bg,
         "style:", STYLE_LABELS, @style_i, row_sel) + 2
-      hue = Theme.mark_color(color.to_sym)
+      hue = Theme.mark_color(color)
       if style.full?
         screen.text(sx, py, " sample row ", Theme.text_bright, Theme.row_tint(hue, Theme.bg))
       else

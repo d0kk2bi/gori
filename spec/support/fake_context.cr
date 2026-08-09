@@ -1249,6 +1249,16 @@ class FakeExecContext < Gori::Verb::ExecContext
     @colormarker_rule_selected
   end
 
+  # Focus gate: settable so the focus-aware `on_rule`/`in_cm` predicates can be exercised. Both
+  # default true so the existing policy-verb tests read as "policy pane focused".
+  property colormarker_rule_list_focused : Bool = true
+  property colormarker_colors_focused : Bool = false
+  property colormarker_color_selected : Bool = false
+
+  def colormarker_rule_list_focused? : Bool
+    @colormarker_rule_list_focused
+  end
+
   def colormarker_global_rule_selected? : Bool
     @colormarker_global_rule
   end
@@ -1259,6 +1269,26 @@ class FakeExecContext < Gori::Verb::ExecContext
 
   def colormarker_toggle_default : Nil
     rec(:colormarker_toggle_default)
+  end
+
+  def colormarker_colors_focused? : Bool
+    @colormarker_colors_focused
+  end
+
+  def colormarker_color_selected? : Bool
+    @colormarker_color_selected
+  end
+
+  def colormarker_color_add : Nil
+    rec(:colormarker_color_add)
+  end
+
+  def colormarker_color_edit : Nil
+    rec(:colormarker_color_edit)
+  end
+
+  def colormarker_color_delete : Nil
+    rec(:colormarker_color_delete)
   end
 
   def comparer_diff_shown? : Bool

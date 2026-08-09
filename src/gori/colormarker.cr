@@ -56,10 +56,15 @@ module Gori
     @compiled : Array(Compiled)
     @active : Bool
     @strip_active : Bool
+    # A snapshot of the global custom-colour registry, so `refresh` can notice a hex edit that
+    # changes NO rule (a rule references a colour by name) and still bump `revision` — otherwise
+    # a recoloured custom would leave History painting the stale hex until the next rule edit.
+    @custom_colors : Array(Settings::ColormarkerColor)
 
     def initialize(@store : Store, rules : Array(Store::ColorRule))
       @mutex = Mutex.new
       @rules = rules
+      @custom_colors = Settings.colormarker_colors
       @compiled = compile(rules)
       @active = !@compiled.empty?
       @strip_active = @compiled.any?(&.rule.style.strip?)
@@ -139,12 +144,12 @@ module Gori
 
     # `scope` picks the STORE the new rule lands in. Refuses a condition that would paint every
     # row — see `unusable_reason`. Returns whether anything was written.
-    def add(match_filter : String, color : Store::MarkerColor = Store::MarkerColor::Yellow,
+    def add(match_filter : String, color : String = "yellow",
             style : Store::MarkerStyle = Store::MarkerStyle::Full, name : String = "",
             scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true) : Bool
       return false if Colormarker.unusable_reason(match_filter)
       if scope.global?
-        Settings.add_colormarker_rule(match_filter, color.label, style.label, name, enabled)
+        Settings.add_colormarker_rule(match_filter, color, style.label, name, enabled)
       else
         @store.insert_color_rule(match_filter, color, style, name, enabled)
       end
@@ -152,12 +157,12 @@ module Gori
       true
     end
 
-    def update(id : Int64, match_filter : String, color : Store::MarkerColor,
+    def update(id : Int64, match_filter : String, color : String,
                style : Store::MarkerStyle, name : String = "",
                scope : Store::RuleScope = Store::RuleScope::Project) : Bool
       return false if Colormarker.unusable_reason(match_filter)
       if scope.global?
-        Settings.update_colormarker_rule(id, match_filter, color.label, style.label, name)
+        Settings.update_colormarker_rule(id, match_filter, color, style.label, name)
       else
         @store.update_color_rule(id, match_filter, color, style, name)
       end
@@ -179,7 +184,7 @@ module Gori
       return false if rule.scope == to
       copy_id =
         if to.global?
-          Settings.add_colormarker_rule(rule.match_filter, rule.color.label, rule.style.label,
+          Settings.add_colormarker_rule(rule.match_filter, rule.color, rule.style.label,
             rule.name, rule.enabled?)
         else
           @store.insert_color_rule(rule.match_filter, rule.color, rule.style, rule.name, rule.enabled?)
@@ -401,19 +406,23 @@ module Gori
     # prompt and the row it acts on cannot disagree about what a rule says.
     def self.summary(rule : Store::ColorRule) : String
       label = rule.name.blank? ? rule.match_filter : "#{rule.name} — #{rule.match_filter}"
-      "#{rule.color.label} #{rule.style.label}: #{label}"
+      "#{rule.color} #{rule.style.label}: #{label}"
     end
 
     private def refresh : Nil
       fresh = Colormarker.merged(@store)
-      # Struct value equality. This matters: `reload` rides the TUI's data_version poll, which
-      # fires roughly once a second during capture, and the common case is that nothing changed.
-      # Without the bail-out every tick would recompile every filter AND bump `revision`,
-      # throwing away History's per-row memo on a frame where nothing moved.
-      return if fresh == @rules
+      fresh_custom = Settings.colormarker_colors
+      # Struct value equality, on BOTH the rules and the custom-colour registry. This matters:
+      # `reload` rides the TUI's data_version poll, which fires roughly once a second during
+      # capture, and the common case is that nothing changed. Without the bail-out every tick
+      # would recompile every filter AND bump `revision`, throwing away History's per-row memo on
+      # a frame where nothing moved. The custom-colour half is what makes a hex edit — which
+      # touches no rule, since a rule names its colour — still repaint the list.
+      return if fresh == @rules && fresh_custom == @custom_colors
       compiled = compile(fresh)
       @mutex.synchronize do
         @rules = fresh
+        @custom_colors = fresh_custom
         @compiled = compiled
         @active = !compiled.empty?
         @strip_active = compiled.any?(&.rule.style.strip?)

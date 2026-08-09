@@ -9,10 +9,11 @@ module Gori
         when "rm", "delete" then cmd_colormarker_rm(args[1..])
         when "enable"       then cmd_colormarker_set_enabled(true, args[1..])
         when "disable"      then cmd_colormarker_set_enabled(false, args[1..])
-        when "move"         then cmd_colormarker_move(args[1..])
-        when "preview"      then cmd_colormarker_preview(args[1..])
-        when "list"         then cmd_colormarker_list(args[1..])
-        when nil            then cmd_colormarker_list(args)
+        when "move"           then cmd_colormarker_move(args[1..])
+        when "preview"        then cmd_colormarker_preview(args[1..])
+        when "color", "colors" then cmd_colormarker_color(args[1..])
+        when "list"           then cmd_colormarker_list(args[1..])
+        when nil              then cmd_colormarker_list(args)
         else
           if (s = sub) && s.starts_with?('-')
             cmd_colormarker_list(args)
@@ -20,9 +21,91 @@ module Gori
             STDERR.puts "gori run colormarker: unknown subcommand '#{sub}'"
             STDERR.puts "Usage: gori run colormarker [list options] | add | rm|delete <id> | enable <id> | disable <id>"
             STDERR.puts "       gori run colormarker move <id> --up|--down | preview --when=FILTER"
+            STDERR.puts "       gori run colormarker color list | add --name=NAME --hex=#rrggbb | rm <name>"
             exit 1
           end
         end
+      end
+
+      # `gori run colormarker color …` — the GLOBAL custom-colour palette (settings.json), the
+      # colours the picker offers in every project on top of the six built-ins. Display-time
+      # only, like the rules: a colour paints a row that is already captured.
+      private def self.cmd_colormarker_color(args : Array(String)) : Nil
+        case sub = args.first?
+        when "add"          then cmd_colormarker_color_add(args[1..])
+        when "rm", "delete" then cmd_colormarker_color_rm(args[1..])
+        when "list", nil    then cmd_colormarker_color_list(sub.nil? ? args : args[1..])
+        else
+          if (s = sub) && s.starts_with?('-')
+            cmd_colormarker_color_list(args)
+          else
+            abort "gori run colormarker color: unknown subcommand '#{sub}' (list | add | rm)"
+          end
+        end
+      end
+
+      private def self.cmd_colormarker_color_list(args : Array(String)) : Nil
+        format = :text
+        parser = OptionParser.new do |p|
+          p.banner = "Usage: gori run colormarker color list [--format=text|json]\n\n" \
+                     "The GLOBAL custom colours, offered in every project's picker alongside the\n" \
+                     "six built-ins. A built-in tracks the active theme; a custom is an absolute hex."
+          p.on("--format=FMT", "text (default) | json") { |v| format = v == "json" ? :json : :text }
+          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.invalid_option { |f| abort "gori run colormarker color list: unknown option: #{f}\n#{p}" }
+        end
+        parser.parse(args)
+        colors = Settings.colormarker_colors
+        if format == :json
+          puts(JSON.build do |j|
+            j.array { colors.each { |c| j.object { j.field "name", c.name; j.field "hex", c.hex } } }
+          end)
+        elsif colors.empty?
+          puts "No custom colours configured."
+        else
+          colors.each { |c| puts "#{c.name.ljust(16)} #{c.hex}" }
+        end
+      end
+
+      private def self.cmd_colormarker_color_add(args : Array(String)) : Nil
+        name = ""
+        hex = ""
+        parser = OptionParser.new do |p|
+          p.banner = "Usage: gori run colormarker color add --name=NAME --hex=#rrggbb\n\n" \
+                     "Defines a global custom colour. The name is what a rule's --color references\n" \
+                     "and what the picker shows; it must not be blank or one of the built-in words."
+          p.on("--name=NAME", "The colour's name (the picker label + a rule's --color)") { |v| name = v }
+          p.on("--hex=HEX", "The colour, as #rrggbb (or #rgb)") { |v| hex = v }
+          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.invalid_option { |f| abort "gori run colormarker color add: unknown option: #{f}\n#{p}" }
+          p.missing_option { |f| abort "gori run colormarker color add: missing value for #{f}" }
+        end
+        parser.parse(args)
+        abort "gori run colormarker color add: --name is required" if name.strip.empty?
+        abort "gori run colormarker color add: --hex is required" if hex.strip.empty?
+        if err = Settings.add_colormarker_color(name, hex)
+          abort "gori run colormarker color add: #{err}"
+        end
+        puts "Custom colour “#{name.strip.downcase}” added — it is offered in every project's picker."
+      end
+
+      private def self.cmd_colormarker_color_rm(args : Array(String)) : Nil
+        positional = [] of String
+        parser = OptionParser.new do |p|
+          p.banner = "Usage: gori run colormarker color rm <name>"
+          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.invalid_option { |f| abort "gori run colormarker color rm: unknown option: #{f}\n#{p}" }
+        end
+        parser.unknown_args { |before, after| positional = before + after }
+        parser.parse(args)
+        abort "gori run colormarker color rm: missing <name>" if positional.empty?
+        abort "gori run colormarker color rm: too many arguments (expected one <name>)" if positional.size > 1
+        name = positional[0].strip.downcase
+        abort "gori run colormarker color rm: no custom colour named '#{name}'" unless Settings.colormarker_colors.any? { |c| c.name == name }
+        abort "gori run colormarker color rm: settings not writable (nothing was deleted)" unless Settings.delete_colormarker_color(name)
+        # A rule that still names it is left inert — it falls back to a visible default rather
+        # than this surface reaching into every project's DB to rewrite the rules.
+        puts "Custom colour “#{name}” deleted."
       end
 
       # One text row: `G*#2 [ ] strip  yellow  [name]  status:401 OR status:403`.
@@ -38,7 +121,7 @@ module Gori
         name = r.name.empty? ? "" : " [#{r.name}]"
         scope = "#{r.scope.badge}#{r.overridden? ? "*" : ""}"
         cond = r.match_filter.empty? ? "(every flow)" : r.match_filter
-        "#{scope}##{r.id} [#{mark}] #{r.style.label.ljust(5)} #{r.color.label.ljust(6)}#{name}  #{cond}"
+        "#{scope}##{r.id} [#{mark}] #{r.style.label.ljust(5)} #{r.color.ljust(6)}#{name}  #{cond}"
       end
 
       # `--scope` on every rule subcommand: WHICH store the id names (or, on list, which half
@@ -52,11 +135,19 @@ module Gori
         end
       end
 
-      private def self.parse_marker_color(s : String) : Store::MarkerColor
-        unless Settings::COLORMARKER_COLORS.includes?(s.downcase)
-          abort "gori run colormarker: invalid --color '#{s}' (#{Settings::COLORMARKER_COLORS.join("|")})"
-        end
-        Store::MarkerColor.from_label(s)
+      # A colour LABEL: one of the six built-in words, or the name of a user-defined custom
+      # colour (settings.json `colormarker.colors`). Aborts rather than clamping — silently
+      # reading an unknown colour as yellow would paint rows the operator did not ask to.
+      private def self.parse_marker_color(s : String) : String
+        key = s.downcase
+        return key if Settings::COLORMARKER_COLORS.includes?(key)
+        return key if Settings.colormarker_colors.any? { |c| c.name == key }
+        abort "gori run colormarker: invalid --color '#{s}' (#{marker_color_choices})"
+      end
+
+      # The colour vocabulary this install offers: built-ins first, then any custom colours.
+      def self.marker_color_choices : String
+        (Settings::COLORMARKER_COLORS + Settings.colormarker_colors.map(&.name)).join("|")
       end
 
       private def self.parse_marker_style(s : String) : Store::MarkerStyle
@@ -89,7 +180,7 @@ module Gori
           # "when", the same key settings.json writes and the MCP tools accept — one vocabulary
           # across all three surfaces.
           j.field "when", r.match_filter
-          j.field "color", r.color.label
+          j.field "color", r.color
           j.field "style", r.style.label
         end
       end
@@ -161,7 +252,7 @@ module Gori
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
           p.on("-wFILTER", "--when=FILTER", "Condition the flow must match (required)") { |v| filter = v }
-          p.on("--color=NAME", "#{Settings::COLORMARKER_COLORS.join("|")} (default yellow)") { |v| color_s = v }
+          p.on("--color=NAME", "#{marker_color_choices} (default yellow)") { |v| color_s = v }
           p.on("--style=STYLE", "full (tint the whole row) | strip (one colour cell) — default full") { |v| style_s = v }
           p.on("--scope=SCOPE", "project (default) | global — a global rule applies in EVERY project") { |v| scope = parse_color_scope(v) }
           p.on("--name=NAME", "Optional rule label") { |v| name = v }
@@ -183,7 +274,7 @@ module Gori
         # A global rule needs no project at all — it lives in settings.json — but resolving one
         # anyway keeps `--project` meaningful on every subcommand.
         if scope.global?
-          id = Settings.add_colormarker_rule(f, color.label, style.label, name, !disabled)
+          id = Settings.add_colormarker_rule(f, color, style.label, name, !disabled)
           abort "gori run colormarker add: failed to persist rule (settings not writable)" if id == 0
           puts "Global colour rule ##{id} added — it applies in every project."
           print_color_advice(f)

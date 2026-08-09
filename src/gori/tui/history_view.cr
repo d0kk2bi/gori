@@ -1796,7 +1796,7 @@ module Gori::Tui
         # AND gains the hue, and a marked one keeps the dim band plus its fuller ▌ bar.
         # Replacing the band would make "this is the cursor row" invisible on every coloured
         # row — the one state the operator navigates by.
-        bg = (m = mark) && m.style.full? ? Theme.row_tint(Theme.mark_color(m.color.to_sym), base) : base
+        bg = (m = mark) && m.style.full? ? Theme.row_tint(Theme.mark_color(m.color), base) : base
         fg = selected || marked ? Theme.text_bright : Theme.text
 
         # The fill guard covers a TINTED row too, not just a selected/marked one: without it the
@@ -1810,7 +1810,7 @@ module Gori::Tui
         # own bg (not a space with a coloured background) composes correctly over a `full` tint
         # and never punches a hole in the selection band.
         if sw > 0 && (m = mark) && m.style.strip?
-          screen.cell(strip_x, y, '█', Theme.mark_color(m.color.to_sym), bg)
+          screen.cell(strip_x, y, '█', Theme.mark_color(m.color), bg)
         end
         screen.text(time_x, y, fmt_time(row.created_at), Theme.muted, bg)
         # METHOD is a FIXED 8-column cell (method_x .. proto_x), so it needs its own clamp —
