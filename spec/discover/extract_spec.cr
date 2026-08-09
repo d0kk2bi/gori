@@ -192,6 +192,28 @@ describe Gori::Discover::Extract do
     E.from_text(body).size.should eq(E::MAX_LINKS)
   end
 
+  # The cap is per BODY, so every pass `from_html` runs has to honour it — the meta-refresh
+  # loop appends to the same accumulator the attribute loop filled.
+  it "caps a body whose links arrive through more than one pass" do
+    body = String.build do |s|
+      (0..E::MAX_LINKS).each { |i| s << %(<a href="/a#{i}">x</a>) }
+      (0..200).each { |i| s << %(<meta http-equiv="refresh" content="0;url=/m#{i}">) }
+    end.to_slice
+    E.from_html(body).size.should eq(E::MAX_LINKS)
+  end
+
+  # An un-quoted `http://` in a minified bundle: the URL branch's class ends at whitespace and
+  # quotes and at nothing else, so an unbounded `+` let one match run to the end of the scanned
+  # body (up to MAX_SCAN, 2 MiB) and carried that whole string through resolve/parse/@seen.
+  it "bounds a single URL match instead of letting it run to the end of the body" do
+    body = ("http://t/a" + ("x" * 9000) + " end").to_slice
+    urls = E.from_text(body)
+    urls.size.should eq(1)
+    # 2048 bounds the class AFTER the scheme, so the whole match is `http://` + 2048.
+    urls.first.bytesize.should eq("http://".bytesize + 2048)
+    urls.first.should start_with("http://t/a")
+  end
+
   # ── from_html: inline script + the wider attribute set ─────────────────────────────────
   it "extracts endpoints out of an inline script as well as out of attributes" do
     body = %(<a href="/about">a</a><script>fetch("/api/v2/session");</script>).to_slice

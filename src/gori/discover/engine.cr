@@ -1433,7 +1433,19 @@ module Gori::Discover
       # What a well-known document DECLARES is a guess too — the origin's word for it, at a
       # path gori chose — so it inherits the source that keeps it behind the soft-404 gate
       # (`well_known?`). Everything else a page points at is an ordinary crawl link.
-      src = task.source.well_known? ? Source::WellKnown : Source::Crawled
+      #
+      # `task.kind.fetch?` bounds that inheritance to ONE HOP, the same way the robots branch
+      # above does, and it is load-bearing rather than tidy. Only `enqueue_well_known` queues a
+      # Fetch; every link this method yields is enqueued as a Crawl. Without the guard the
+      # source propagated down the WHOLE subtree — an `<a href>` on a page an OIDC document
+      # named came back `WellKnown`, and so did its children — which routes an ordinary crawled
+      # page through `resolve_seed_finding` and judges it against the SEED ORIGIN ROOT's
+      # soft-404 baseline. That is not a stricter gate, it is the wrong question: measured, a
+      # linked `/deep/page` answering 401 on an origin that 401s unknown paths cleared nothing
+      # and was dropped into `calibrated_out`, while the identical page reached by a link from
+      # `/` was recorded at 0.85. A guess deserves the baseline; a link the target itself
+      # published does not.
+      src = task.kind.fetch? && task.source.well_known? ? Source::WellKnown : Source::Crawled
       if Extract.sitemap_body?(body)
         return Extract.from_sitemap(body).map { |h| RawLink.new(h, Source::Sitemap) }
       end

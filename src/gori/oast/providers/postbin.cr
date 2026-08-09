@@ -26,7 +26,24 @@ module Gori::Oast
     def poll(http : Http, session : Session) : Array(Interaction)
       out = [] of Interaction
       SHIFT_CAP.times do
-        resp = http.request("GET", "#{base_url}/api/bin/#{session.correlation_id}/req/shift")
+        # The REQUEST is guarded for the same reason the parse below is, and the guard cannot be
+        # a bare rescue. A transport failure mid-drain — a reset connection, a TLS error, the
+        # MAX_BODY refusal `HttpClient` raises on an over-large body — would otherwise unwind out
+        # of this loop and take `out` with it, discarding interactions the bin has ALREADY handed
+        # over and no longer holds. But swallowing it outright is the other half of the same bug:
+        # the poller would read an empty batch as "nothing arrived" and the operator would never
+        # learn the provider is unreachable.
+        #
+        # So: re-raise when there is nothing to protect, break when there is. A cycle that
+        # collected something returns it and reports the failure on the NEXT cycle (the condition
+        # that caused it does not heal inside this loop), and a cycle that collected nothing
+        # surfaces the error immediately, exactly as it did before.
+        resp = begin
+          http.request("GET", "#{base_url}/api/bin/#{session.correlation_id}/req/shift")
+        rescue ex
+          raise ex if out.empty?
+          break
+        end
         break if resp.status == 404 # bin drained
         break unless resp.status == 200
         # Each shift has ALREADY removed this request from the bin server-side, so a raise on a

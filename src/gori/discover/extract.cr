@@ -41,7 +41,15 @@ module Gori::Discover
     # The closing quote is NOT required — an interpolated or concatenated path has none, and
     # the character class already terminates the run. `{1,256}` bounds it: a path longer than
     # that is not a path.
-    ENDPOINT = /https?:\/\/[^\s"'`<>\\,;)\]}]{3,}|["'`](\/[A-Za-z0-9_\-.~%\/]{1,256})/i
+    #
+    # The URL branch is bounded for the same reason and needs it MORE, because its class ends
+    # at whitespace and quotes and at nothing else. `+` meant one un-quoted `http://` in a
+    # minified bundle could run to the end of the scanned body, and `MAX_SCAN` is 2 MiB: that
+    # one "URL" then went through `Url.resolve`, `URI.parse`, `visit_key` and `template_key`
+    # and was held in `@seen` for the rest of the run. `{3,2048}` is far past any URL a server
+    # will route (nginx defaults to 8 KB for the whole request line, IIS to 2 KB for the path)
+    # and turns an unbounded run into a truncated one, which is a candidate that simply 404s.
+    ENDPOINT = /https?:\/\/[^\s"'`<>\\,;)\]}]{3,2048}|["'`](\/[A-Za-z0-9_\-.~%\/]{1,256})/i
 
     def self.from_html(body : Bytes) : Array(String)
       # `acc`, not `out`: `out` is a Crystal keyword in ARGUMENT position, so a local named
@@ -55,6 +63,10 @@ module Gori::Discover
         acc << v if v && !v.empty? && seen.add?(v)
       end
       text.scan(META) do |m|
+        # The cap is per BODY, not per pass — this loop appends to the same `acc` the one above
+        # filled, so without the guard a page could leave here over MAX_LINKS and hand the
+        # orchestrator the excess anyway.
+        break if acc.size >= MAX_LINKS
         v = m[1]?
         acc << v if v && !v.empty? && seen.add?(v)
       end

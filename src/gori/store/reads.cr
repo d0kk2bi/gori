@@ -126,10 +126,19 @@ module Gori
       nil
     end
 
-    # How many same-(host, target) rows the URL lookup below will consider. A URL polled every
-    # few seconds leaves tens of thousands of them, and this runs inline on the TUI's render
-    # fiber (AGENTS.md §3) — the ordering puts the answer at the head, so the tail is rows that
-    # would lose the ranking anyway.
+    # How many same-(host, target) rows the URL lookup below RETURNS. A URL polled every few
+    # seconds leaves tens of thousands of them, and this runs inline on the TUI's fiber
+    # (AGENTS.md §3) — the ordering puts the answer at the head, so the tail is rows that would
+    # lose the ranking anyway.
+    #
+    # It bounds what crosses into Crystal, NOT what SQLite touches: `LIMIT` is applied after
+    # `ORDER BY`, and the ranking is over expressions no index covers, so the engine still sorts
+    # every matching row before handing back the first 256. What keeps THAT set small is the
+    # WHERE clause — `host` rides `idx_flows_sitemap`'s leading column and the `target` equality
+    # narrows it to one endpoint — plus the fact that this fires on a keypress, not on a frame.
+    # Making the cap cover the scan would mean `LIMIT`ing before the sort and doing the ranking
+    # in Crystal over an arbitrary 256 rows, which is exactly what the ORDER BY exists to
+    # prevent (see the method note below on why the method is the first key).
     URL_LOOKUP_SCAN_CAP = 256
 
     # The captured flow an absolute URL came from — a REVERSE match against `FlowRow#url`, for

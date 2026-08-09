@@ -1149,8 +1149,9 @@ describe Gori::Settings do
       Gori::Settings.load
       Gori::Settings.colormarker_rules.size.should eq(2)
 
-      # Malformed rules tolerated: an unknown colour/style label is CLAMPED rather than raised,
-      # and a duplicated id is renumbered so every by-id mutation stays unambiguous.
+      # Malformed rules tolerated: an unknown style label is CLAMPED rather than raised, an
+      # unknown colour label is KEPT (see below), and a duplicated id is renumbered so every
+      # by-id mutation stays unambiguous.
       #
       # The two entries below pin the DELIBERATE departures from parse_rewriter_rules:
       #   * a missing `enabled` reads as TRUE here (a colour rule touches no traffic, so the
@@ -1166,9 +1167,12 @@ describe Gori::Settings do
       Gori::Settings.colormarker_rules.size.should eq(3)
       kept = Gori::Settings.colormarker_rules.first
       kept.name.should eq("ok")
-      kept.color.should eq("yellow")
+      # The colour label is NOT clamped: this parser cannot tell an unknown word from a custom
+      # colour's name, and clamping destroyed the latter (see the round trip below). It is kept
+      # verbatim; `Theme.mark_color` resolves anything it does not know to a visible yellow.
+      kept.color.should eq("chartreuse")
       kept.style.should eq("full")
-      kept.to_rule.color.should eq("yellow") # the clamped labels really rebuild a rule
+      kept.to_rule.color.should eq("chartreuse") # the parsed labels really rebuild a rule
       dup = Gori::Settings.colormarker_rules[1]
       dup.id.should_not eq(7_i64)
       dup.enabled.should be_true # no "enabled" key => ON, unlike a rewriter rule
@@ -1230,6 +1234,32 @@ describe Gori::Settings do
 
       Gori::Settings.delete_colormarker_color("teal").should be_true
       Gori::Settings.colormarker_colors.should be_empty
+
+      # A GLOBAL rule painted with a custom colour survives the round trip. The rule parser used
+      # to clamp `color` to the six built-in words, so the name came back "yellow" — and because
+      # every later mutation re-serialises what is in memory, the next `save` wrote that loss to
+      # disk permanently. The reference has to outlive a load, including one where the colour
+      # itself is momentarily absent (deleted, or defined further down the file).
+      Gori::Settings.add_colormarker_color("hotpink", "#ff69b4").should be_nil
+      rid = Gori::Settings.add_colormarker_rule("host:acme.test", "hotpink", "full", "mine")
+      rid.should_not eq(0_i64)
+      Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+      Gori::Settings.colormarker_colors = [] of Gori::Settings::ColormarkerColor
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.first.color.should eq("hotpink")
+      Gori::Settings.colormarker_rules.first.to_rule.color.should eq("hotpink")
+
+      # …and it is still there after a save/load cycle driven by an unrelated mutation, which is
+      # the step that made the old clamp permanent rather than merely wrong on screen.
+      Gori::Settings.set_colormarker_rule_enabled(rid, false).should be_true
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.first.color.should eq("hotpink")
+
+      # Deleting the colour leaves the REFERENCE intact — the resolver falls back to a visible
+      # default rather than the deletion cascading into a rewrite of the rule.
+      Gori::Settings.delete_colormarker_color("hotpink").should be_true
+      Gori::Settings.load
+      Gori::Settings.colormarker_rules.first.color.should eq("hotpink")
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)

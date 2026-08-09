@@ -421,8 +421,15 @@ module Gori::Tui
       c = selected_color || return @host.status("no custom colour selected")
       # A colour still named by a rule is NOT cascaded away — those rows fall back to a visible
       # default. The prompt says how many, so the deletion is not a surprise.
+      #
+      # `engine.rules` is THIS project's merged list (global library + project rules), and the
+      # colour being deleted is global, so rules in OTHER projects can name it and are not
+      # counted — reaching them would mean opening every project DB from a confirm prompt. The
+      # wording says "in this project" rather than implying a total, and the tail is
+      # unconditional so a count of zero still does not read as "nothing references this".
       in_use = engine.rules.count { |r| r.color == c.name }
-      note = in_use > 0 ? " #{in_use} rule#{in_use == 1 ? "" : "s"} still name it — those rows fall back to a default colour." : ""
+      note = in_use > 0 ? " #{in_use} rule#{in_use == 1 ? "" : "s"} in this project still name it;" : " No rule in this project names it, but"
+      note += " rules in other projects may too — those rows fall back to a default colour."
       @host.confirm("DELETE CUSTOM COLOUR", "Delete “#{c.name}”?#{note} This can't be undone.",
         confirm_label: "delete", danger: true) do
         if Settings.delete_colormarker_color(c.name)
