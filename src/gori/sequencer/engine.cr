@@ -2,6 +2,7 @@ require "./types"
 require "./extract"
 require "../fuzz/engine"
 require "../fuzz/matcher"
+require "../pacing"
 
 module Gori::Sequencer
   # Collects tokens into an Event stream. LIVE REPLAY sends the ONE fixed @request
@@ -16,6 +17,9 @@ module Gori::Sequencer
   # Single-threaded fiber scheduler (no -Dpreview_mt): plain ivar increments never yield
   # mid-op, so the shared counters across dispatcher/worker fibers need no locks.
   class Engine
+    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    include Gori::Pacing
+
     MAX_CONCURRENCY = 50
 
     enum State : UInt8
@@ -255,26 +259,6 @@ module Gori::Sequencer
       when @events.send(ev)
       else
       end
-    end
-
-    private def pace_interval : Time::Span?
-      if (rps = @config.rps) && rps > 0
-        (1.0 / rps).seconds
-      elsif (t = @config.throttle_ms) && t > 0
-        t.milliseconds
-      else
-        nil
-      end
-    end
-
-    private def pace(interval : Time::Span?) : Nil
-      if interval
-        now = Time.instant
-        target = @last_dispatch + interval
-        sleep(target - now) if now < target
-        @last_dispatch = Time.instant
-      end
-      sleep(rand(@config.jitter_ms).milliseconds) if @config.jitter_ms > 0
     end
 
     private def park_if_paused : Nil

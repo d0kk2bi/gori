@@ -14,6 +14,7 @@ require "./flow_status"
 require "./read_cursor"
 require "./wrap"
 require "./copy_menu"
+require "./preview_split"
 require "../store"
 require "../repeater/flow_request"
 require "../ql"
@@ -27,6 +28,9 @@ module Gori::Tui
   # (no queue/ranking, P8). A QL bar (`/`) filters the list; analysis is by query
   # (pull), with field/value suggestions while typing. Also owns the detail view.
   class HistoryView
+    # `list_split` only — the focus half (PreviewPane) is two-way and this preview is not.
+    include PreviewSplit
+
     PAGE = 1000
     # Hard cap on rows held in memory. The initial load is PAGE; live capture
     # then appends, but never past MAX_ROWS — the oldest are dropped from the
@@ -239,14 +243,9 @@ module Gori::Tui
       end
     end
 
-    # Split geometry for the list page when preview is on. Returns {list_rect, preview_rect?}.
-    def list_split(rect : Rect) : {Rect, Rect?}
-      return {rect, nil} unless preview_enabled? && rect.h >= 12
-      list_h = (rect.h * 55 // 100).clamp(6, rect.h - 5)
-      list = Rect.new(rect.x, rect.y, rect.w, list_h)
-      prev = Rect.new(rect.x, rect.y + list_h, rect.w, rect.h - list_h)
-      {list, prev}
-    end
+    # `list_split` — the split geometry — comes from PreviewSplit, shared with Issues/Probe.
+    # The focus vocabulary above is NOT shared: this preview holds two panes (request and
+    # response), so its ⇥ cycles three ways where theirs cycles two.
 
     # head (styled, bounded) ++ body (raw, styled lazily per visible line) ++
     # trailer (styled notes). For the WS/frames/grpc panes the whole content is in
@@ -340,7 +339,7 @@ module Gori::Tui
       @rows =
         begin
           store.search(combined, PAGE, raise_on_error: true)
-        rescue ex
+        rescue
           # A VALID QL parse that SQLite still can't run (a huge OR chain past the
           # expression-tree-depth limit, a pathological FTS phrase). Degrade to empty like
           # before, but SAY why via the note so it doesn't read as a genuine "no flows match"

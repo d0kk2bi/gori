@@ -95,13 +95,20 @@ describe "severity and triage status" do
     # The hues severity owns. A status branch reaching for any of them is the collision.
     severity_hues = ["Theme.red", "Theme.orange", "Theme.yellow", "Theme.accent"]
     offenders = [] of String
+    # Both ladders live in ONE module now (IssuePresentation), included by the Issues and
+    # Probe tabs — so this reads the single home rather than two copies of it.
+    shared = File.read(File.join(root, "issue_presentation.cr"))
+    body = shared[/def status_color\(s : Store::Status\).*?\n    end/m]?
+    body.should_not be_nil
+    severity_hues.each do |hue|
+      offenders << "issue_presentation.cr — status_color uses #{hue}" if body.not_nil!.includes?(hue)
+    end
+    # A tab that re-declares its own `status_color` shadows the shared one, which is how the
+    # two ladders collided in the first place. Having one home only helps if nobody reopens
+    # a second, so the guard checks for that too.
     {"issues_view.cr", "probe_view.cr"}.each do |name|
       src = File.read(File.join(root, name))
-      body = src[/def status_color\(s : Store::Status\).*?\n    end/m]?
-      body.should_not be_nil
-      severity_hues.each do |hue|
-        offenders << "#{name} — status_color uses #{hue}" if body.not_nil!.includes?(hue)
-      end
+      offenders << "#{name} — re-declares status_color instead of using IssuePresentation" if src.includes?("def status_color")
     end
     # The picker teaches what a status colour MEANS, so it must not contradict the lists.
     picker = File.read(File.join(root, "choice_picker.cr"))

@@ -9,6 +9,7 @@ require "../repeater/h2_engine"
 require "../repeater/conn_pool"
 require "../env"
 require "../proxy/codec/content_decode"
+require "../pacing"
 
 module Gori::Discover
   # Injected scope policy — keeps the engine Store-free. `allowed?` is the excludes/sandbox
@@ -406,6 +407,9 @@ module Gori::Discover
   # with zero locks; N worker fibers only do network I/O + CPU (decode/extract/fingerprint)
   # and feed Outcomes back over a channel. Mirrors the Fuzz/Miner lifecycle shape.
   class Engine
+    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    include Gori::Pacing
+
     EVENT_BUFFER    = 256
     MAX_CONCURRENCY = 500
     MAX_BODY        = 2 * 1024 * 1024 # decoded body cap (matches Extract::MAX_SCAN)
@@ -1687,27 +1691,7 @@ module Gori::Discover
       Random::Secure.hex(8)
     end
 
-    # ── pacing / lifecycle (orchestrator-local clock → no cross-fiber race) ──────────
-
-    private def pace_interval : Time::Span?
-      if (rps = @config.rps) && rps > 0
-        (1.0 / rps).seconds
-      elsif (t = @config.throttle_ms) && t > 0
-        t.milliseconds
-      else
-        nil
-      end
-    end
-
-    private def pace(interval : Time::Span?) : Nil
-      if interval
-        now = Time.instant
-        target = @last_dispatch + interval
-        sleep(target - now) if now < target
-        @last_dispatch = Time.instant
-      end
-      sleep(rand(@config.jitter_ms).milliseconds) if @config.jitter_ms > 0
-    end
+    # ── lifecycle (pause / wake) ────────────────────────────────────────────────────
 
     private def park_if_paused : Nil
       while @state == State::Paused
