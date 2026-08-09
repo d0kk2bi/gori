@@ -7,12 +7,16 @@ module Gori::Tui
   # optical centering so the visible shape — not its leading spaces — is centred.
   module Brand
     # The interlocked rings of the gori logo (docs/static/images/gori.svg), hand
-    # drawn at 32 cells over 16 rows. A terminal cell is about half as wide as it
+    # drawn at 20 cells over 9 rows. A terminal cell is about half as wide as it
     # is tall, so that reads as a roughly square figure — the mark's own artwork is
     # 1365×1193 (1.14:1), close enough that it reads as the logo rather than a
-    # stretched copy. It is deliberately big: at the ~20×9 the mark was drawn at
-    # before, the two rings collapsed into a blob and stopped reading as rings.
-    # The size is what costs the height gate — see ProjectPicker.art_shown?.
+    # stretched copy.
+    #
+    # This is the small cut. A 32×16 version was drawn first and resolved more of
+    # the rings' overlap, but it dominated the picker and pushed the height gate to
+    # 34 rows, so anything shorter fell back to the bare wordmark. At this size the
+    # rings read as a simplified silhouette rather than a traced outline, and the
+    # gate drops to 27 rows / 26 cols — see ProjectPicker.art_shown?.
     #
     # Solid blocks, not scattered glyphs. The strokes are one or two cells thick,
     # so any mix of glyph weights reads as broken lines rather than arcs, and `█`
@@ -24,22 +28,15 @@ module Gori::Tui
     # draw places glyph N of a line at column N, so a two-cell grapheme would
     # shear its row and pull the rings apart.
     ART = [
-      "                    █████",
-      "               ██████ ██████",
-      "            ███          █████",
-      "         ███████          ████",
-      "      ████       █████    █████",
-      "     ███               █ ██████",
-      "    ████           ██   ██████",
-      "    █████              ██████",
-      "  █ ██████            ██████  █",
-      " ██  ██████         ███████   ███",
-      " ██   ████████    ████████  █  ██",
-      " ██     ████████████████       ██",
-      " ████     ████████████      █████",
-      "  █████████████████  ███████████",
-      "   █████████████  █████████████",
-      "                       ████",
+      "          ██████",
+      "       █       ███",
+      "   ███    ███  ███",
+      "  ███    ██    ███",
+      "  ███         ███",
+      " █ ████     ████  █",
+      "██  █████ █████   ██",
+      " ██   ████████  ███",
+      "  █████████████████",
     ]
 
     ART_H     = ART.size

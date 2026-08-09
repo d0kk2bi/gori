@@ -1049,8 +1049,8 @@ module Gori::Tui
     TAGLINE = Brand::TAGLINE
 
     # The art is a nicety, not load-bearing — only show it when the terminal is
-    # tall enough to keep a usable project list beneath this taller logo and wide
-    # enough to fit the block without clipping; otherwise fall back to the wordmark.
+    # tall enough to keep a usable project list beneath the logo and wide enough
+    # to fit the block without clipping; otherwise fall back to the wordmark.
     #
     # Both bounds derive from the figure, because it gets redrawn and a literal
     # stops matching it. Height: `card_metrics` spends `ART_H + 4` rows on the
