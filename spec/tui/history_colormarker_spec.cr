@@ -44,7 +44,7 @@ private def with_globals(&)
   end
 end
 
-private RED   = Gori::Store::MarkerColor::Red
+private RED   = "red" # a rule's colour is a label string now, not the MarkerColor enum
 private FULL  = Gori::Store::MarkerStyle::Full
 private STRIP = Gori::Store::MarkerStyle::Strip
 
@@ -98,6 +98,32 @@ describe "History — Colormarker row marks" do
         backend.fg_grid[row_y][1].should eq(Theme.mark_color(:red))
         # The swatch column is its own cell: TIME still starts at +3, not over the block.
         backend.grid[row_y][2].should eq(' ')
+      end
+    end
+  end
+
+  # The cross-layer loop: a rule whose colour is a user-defined CUSTOM name paints the row with
+  # that colour's absolute hex, resolved through the render-side mark map.
+  it "paints a row with a custom colour's absolute hex" do
+    with_globals do
+      begin
+        Theme.set_custom_marks({"coral" => "#ff6b6b"})
+        tmp_store do |store|
+          add_flow(store)
+          cm = Gori::Colormarker.load(store)
+          cm.add("host:h.test", "coral", STRIP) # a custom name, not a built-in word
+          view = HistoryView.new
+          view.set_colormarker(cm)
+          view.reload(store)
+          backend = MemoryBackend.new(80, 12)
+          view.render_list(Screen.new(backend), Rect.new(0, 0, 80, 12))
+
+          row_y = 3
+          backend.grid[row_y][1].should eq('█')
+          backend.fg_grid[row_y][1].should eq(Gori::Tui::Color.from_hex("#ff6b6b"))
+        end
+      ensure
+        Theme.set_custom_marks({} of String => String)
       end
     end
   end

@@ -1,12 +1,22 @@
 require "../spec_helper"
 require "../support/fake_context"
 
-# src/gori/verbs/colormarker.cr — the Colormarker (History row-colour) tab's rule list.
+# src/gori/verbs/colormarker.cr — the Colormarker (History row-colour) tab's two lists.
 private def in_colormarker(rule : Bool = false, global : Bool = false) : FakeExecContext
   ctx = FakeExecContext.new
   ctx.current_tab = :colormarker
   ctx.colormarker_rule_selected = rule
   ctx.colormarker_global_rule = global
+  ctx # colormarker_rule_list_focused defaults true — the policy pane is the focused one
+end
+
+# The CUSTOM COLORS pane is the focused one (policy pane is not).
+private def in_colors(color : Bool = false) : FakeExecContext
+  ctx = FakeExecContext.new
+  ctx.current_tab = :colormarker
+  ctx.colormarker_rule_list_focused = false
+  ctx.colormarker_colors_focused = true
+  ctx.colormarker_color_selected = color
   ctx
 end
 
@@ -30,6 +40,27 @@ describe "Gori::Verbs.register_colormarker" do
     # A project rule has no default to disagree with — `x` IS its state.
     r["colormarker.toggle-default"].available?(in_colormarker(rule: true)).should be_false
     r["colormarker.toggle-default"].available?(in_colormarker(rule: true, global: true)).should be_true
+  end
+
+  it "withholds the policy chords while the CUSTOM COLORS pane is focused" do
+    # A chord has no `section:` to hide behind, so the rule verbs are gated on the policy pane
+    # being the focused one — otherwise `x`/`s`/⇧J would act on the rule behind the colours pane.
+    colors = in_colors(color: true)
+    %w[colormarker.edit colormarker.toggle colormarker.delete colormarker.scope].each do |id|
+      r[id].available?(colors).should be_false
+    end
+  end
+
+  it "gates the custom-colour actions on the colours pane, with delete/edit needing a selection" do
+    empty = in_colors
+    picked = in_colors(color: true)
+    r["colormarker.color-add"].available?(empty).should be_true
+    r["colormarker.color-edit"].available?(empty).should be_false
+    r["colormarker.color-delete"].available?(empty).should be_false
+    r["colormarker.color-edit"].available?(picked).should be_true
+    r["colormarker.color-delete"].available?(picked).should be_true
+    # ...and never while the POLICY pane is the focused one.
+    r["colormarker.color-add"].available?(in_colormarker).should be_false
   end
 
   it "still requires the Colormarker tab even with a rule selected" do
@@ -67,15 +98,29 @@ describe "Gori::Verbs.register_colormarker" do
     }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
   end
 
-  # The boot-time guarantee. Unlike the Rewriter's, these verbs need no named `section:` —
-  # there is one focus area, so a displayable view here is `common ∪ {}` and the ten letters
-  # only have to be distinct among themselves. If a future verb collides,
-  # `Registry#validate_menu_keys!` raises while BUILDING the registry above, so this file
-  # would not even reach an example.
-  it "derives ten distinct space-menu keys inside one displayable view" do
-    keys = [] of Char
-    r.each { |v| v.menu_key.try { |k| keys << k } if v.scope.colormarker? }
-    keys.size.should eq(10)
-    keys.uniq.size.should eq(10)
+  it "routes the custom-colour actions to their own intents" do
+    {"colormarker.color-add"    => :colormarker_color_add,
+     "colormarker.color-edit"   => :colormarker_color_edit,
+     "colormarker.color-delete" => :colormarker_color_delete,
+    }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
+  end
+
+  # The boot-time guarantee. Like the Rewriter's, these verbs are now partitioned into two
+  # `section:`s (the two panes never render together), so a/e/d may repeat ACROSS them but must
+  # be distinct WITHIN each — that is what `Registry#validate_menu_keys!` checks while BUILDING
+  # the registry above, so a collision would raise before this file reached an example.
+  it "derives distinct space-menu keys within each of its two focus sections" do
+    rules_keys = [] of Char
+    colors_keys = [] of Char
+    r.each do |v|
+      next unless v.scope.colormarker?
+      v.menu_key.try do |k|
+        v.section == :colors ? (colors_keys << k) : (rules_keys << k)
+      end
+    end
+    rules_keys.size.should eq(10)
+    rules_keys.uniq.size.should eq(10)
+    colors_keys.size.should eq(3)
+    colors_keys.uniq.size.should eq(3)
   end
 end

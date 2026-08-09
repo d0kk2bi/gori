@@ -118,6 +118,7 @@ module Gori
         "minimize_repeater",
         "create_rule", "update_rule", "delete_rule", "set_rule_enabled",
         "create_color_rule", "update_color_rule", "delete_color_rule", "set_color_rule_enabled", "move_color_rule",
+        "create_custom_color", "delete_custom_color",
         "create_extract_rule", "update_extract_rule", "delete_extract_rule", "set_extract_rule_enabled",
         "create_note", "update_note", "delete_note",
         "create_repeater", "update_repeater", "delete_repeater",
@@ -900,6 +901,13 @@ module Gori
             s.field "limit", intprop("recent flows to scan (default 500)")
           end
 
+          tool j, "list_custom_colors",
+            "List the GLOBAL custom colours — user-defined names the Colormarker picker offers " \
+            "in every project on top of the six built-ins. Each is a name (what a rule's `color` " \
+            "references) and an absolute hex. Unlike a built-in, a custom does NOT track the " \
+            "active theme. Display only." do |_s|
+          end
+
           tool j, "list_extract_rules",
             "List the project's EXTRACT rules — the read half of a session binding. Each one " \
             "observes a response and binds one named value ($SESSION) in memory, which a Match & " \
@@ -1154,7 +1162,7 @@ module Gori
               "rest are never consulted, so precedence matters — use move_color_rule to change " \
               "it. Display only — a colour rule never modifies traffic." do |s|
               s.field "when", strprop("the condition, in the same boolean grammar the conditional-intercept bar uses: host: path: method: scheme: status: proto:, plus AND/OR/NOT, -negation and (grouping). Evaluated against the captured flow row. CAVEATS, each of which otherwise fails silently: `body:` NEVER matches here (a row carries no payload); `host:` is a SUBSTRING, not a DNS-label glob, so host:alpha.test also matches xalpha.test; a flow with no response yet has no status; and there is no header:/size:/dur:/url:/stub: — those are History QL fields that need a query, and this is evaluated on the render path"), required: true
-              s.field "color", strprop("red | orange | yellow | green | blue | purple (default yellow). Resolved through the active theme, so it reads correctly on light and dark alike")
+              s.field "color", strprop("red | orange | yellow | green | blue | purple (default yellow) — resolved through the active theme, so it reads correctly on light and dark alike — OR the name of a custom colour (list_custom_colors / create_custom_color), which carries an absolute hex")
               s.field "style", strprop("full (tint the whole History row) | strip (one colour cell in a narrow column ahead of TIME) — default full")
               s.field "name", strprop("optional label for the rule")
               s.field "scope", strprop("project (default) | global — a global rule lives in settings.json and applies in EVERY project")
@@ -1169,7 +1177,7 @@ module Gori
               s.field "id", intprop("rule id from list_color_rules"), required: true
               s.field "scope", strprop("which id: project (default) | global")
               s.field "when", strprop("new condition (see create_color_rule for the grammar and its caveats)")
-              s.field "color", strprop("red | orange | yellow | green | blue | purple")
+              s.field "color", strprop("a built-in (red | orange | yellow | green | blue | purple) or a custom colour's name")
               s.field "style", strprop("full | strip")
               s.field "name", strprop("rule label")
             end
@@ -1201,6 +1209,22 @@ module Gori
               "project, and takes this project's override of it along." do |s|
               s.field "id", intprop("rule id from list_color_rules"), required: true
               s.field "scope", strprop("which id: project (default) | global")
+            end
+
+            tool j, "create_custom_color",
+              "Define a GLOBAL custom colour the Colormarker picker offers in every project on " \
+              "top of the six built-ins. The name is what a rule's `color` references (and must " \
+              "not be blank or a built-in word); the hex is an absolute #rrggbb, which does NOT " \
+              "track the active theme. Display only — colours never modify traffic." do |s|
+              s.field "name", strprop("the colour's name — a rule's `color` value and the picker label; unique, not a built-in word"), required: true
+              s.field "hex", strprop("the colour as #rrggbb (or #rgb)"), required: true
+            end
+
+            tool j, "delete_custom_color",
+              "Delete a global custom colour by name. A colour rule that still names it is left " \
+              "inert — its rows fall back to a visible default rather than the deletion cascading " \
+              "into every project's rules." do |s|
+              s.field "name", strprop("the custom colour's name (from list_custom_colors)"), required: true
             end
 
             tool j, "create_extract_rule",
@@ -1960,6 +1984,7 @@ module Gori
         when "list_rules"              then list_rules(h)
         when "list_color_rules"        then list_color_rules(h)
         when "preview_color_rule"      then preview_color_rule(h)
+        when "list_custom_colors"      then list_custom_colors
         when "list_extract_rules"      then list_extract_rules
         when "list_projects"           then list_projects
         when "ql_explain"              then ql_explain(h)
@@ -2052,6 +2077,8 @@ module Gori
         when "set_color_rule_enabled"    then gated { set_color_rule_enabled(h) }
         when "move_color_rule"           then gated { move_color_rule(h) }
         when "delete_color_rule"         then gated { delete_color_rule(h) }
+        when "create_custom_color"       then gated { create_custom_color(h) }
+        when "delete_custom_color"       then gated { delete_custom_color(h) }
           # switch is always available (selecting a DB is not a data mutation).
         when "switch_project" then switch_project(h)
           # create when unbound even under --read-only; once bound, actions-gated.

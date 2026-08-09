@@ -50,6 +50,7 @@ module Gori::Tui
     ProbeRule
     RewriterRule
     ColormarkerRule
+    ColormarkerColor
     ExtractRule
     RewriterStub
     CaImport

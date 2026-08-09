@@ -214,6 +214,8 @@ module Gori::Tui
         Item.new("⇧J / ⇧K", "reorder — the FIRST enabled match paints the row, the rest are skipped"),
         Item.new("style", "full = tint the whole row · strip = one colour cell ahead of TIME"),
         Item.new("when:", "host: path: method: scheme: status: proto: — ↹ completes · no header:/size:/dur:"),
+        Item.new("↹ · ↓ past list", "CUSTOM COLORS pane — a add · ↵/e edit · d delete (name + #hex)"),
+        Item.new("custom colour", "a global name the picker offers everywhere; its hex is absolute, not theme-relative"),
         Item.new("hidden by default", "settings:tabs shows it, next to Rewriter"),
       ]},
       {"OVERLAYS", [

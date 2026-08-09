@@ -44,7 +44,7 @@ module Gori
                     end
                     j.field "name", r.name
                     j.field "when", r.match_filter
-                    j.field "color", r.color.label
+                    j.field "color", r.color
                     j.field "style", r.style.label
                   end
                 end
@@ -67,15 +67,18 @@ module Gori
         end
       end
 
-      # `Store::MarkerColor.from_label` is deliberately TOLERANT — it has to be, because it also
-      # reads a hand-edited settings.json where a raise would take every other section down with
-      # it. An argument an agent just typed is the opposite case and gets told it was wrong.
-      private def marker_color(h, dft : Store::MarkerColor) : Store::MarkerColor | Result
+      # A colour LABEL: one of the six built-in words, or the name of a user-defined custom
+      # colour (settings.json `colormarker.colors`). An argument an agent just typed gets told it
+      # was wrong, rather than clamped — the same refusal the CLI makes and the opposite of the
+      # tolerant file parse.
+      private def marker_color(h, dft : String) : String | Result
         s = str(h, "color")
         return dft if s.nil? || s.empty?
-        return err("invalid 'color' (expected #{Settings::COLORMARKER_COLORS.join("|")})",
-          "INVALID_ARGUMENT", field: "color") unless Settings::COLORMARKER_COLORS.includes?(s.downcase)
-        Store::MarkerColor.from_label(s)
+        key = s.downcase
+        return key if Settings::COLORMARKER_COLORS.includes?(key)
+        return key if Settings.colormarker_colors.any? { |c| c.name == key }
+        err("invalid 'color' (expected #{(Settings::COLORMARKER_COLORS + Settings.colormarker_colors.map(&.name)).join("|")})",
+          "INVALID_ARGUMENT", field: "color")
       end
 
       private def marker_style(h, dft : Store::MarkerStyle) : Store::MarkerStyle | Result
@@ -96,7 +99,7 @@ module Gori
         end
         scope = color_rule_scope(h)
         return scope if scope.is_a?(Result)
-        color = marker_color(h, Store::MarkerColor::Yellow)
+        color = marker_color(h, "yellow")
         return color if color.is_a?(Result)
         style = marker_style(h, Store::MarkerStyle::Full)
         return style if style.is_a?(Result)
@@ -106,7 +109,7 @@ module Gori
         enabled = bool_arg(h, "enabled", true)
         id =
           if scope.global?
-            Settings.add_colormarker_rule(filter, color.label, style.label, name, enabled)
+            Settings.add_colormarker_rule(filter, color, style.label, name, enabled)
           else
             store.insert_color_rule(filter, color, style, name, enabled)
           end
@@ -117,7 +120,7 @@ module Gori
           j.object do
             j.field "id", id
             j.field "scope", scope.label
-            j.field "color", color.label
+            j.field "color", color
             j.field "style", style.label
             j.field "enabled", enabled
             # The advisory channel. `InterceptFilter` cannot fail to compile, so a condition
@@ -153,7 +156,7 @@ module Gori
         name = str(h, "name") || existing.name
         ok =
           if scope.global?
-            Settings.update_colormarker_rule(id, filter, color.label, style.label, name)
+            Settings.update_colormarker_rule(id, filter, color, style.label, name)
           else
             store.update_color_rule(id, filter, color, style, name)
           end
@@ -163,7 +166,7 @@ module Gori
             j.field "id", id
             j.field "scope", scope.label
             j.field "when", filter
-            j.field "color", color.label
+            j.field "color", color
             j.field "style", style.label
             color_rule_notes(j, filter)
           end
@@ -288,6 +291,54 @@ module Gori
             color_rule_notes(j, filter)
           end
         end)
+      end
+
+      # --- custom colours (the global picker palette) ----------------------------------
+      # A custom colour is a name + an absolute hex, offered in every project's picker on top of
+      # the six built-ins. Keyed by name (no numeric id), the same identity the picker and a
+      # rule's `color` use.
+
+      private def list_custom_colors : Result
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "count", Settings.colormarker_colors.size
+            j.field "colors" do
+              j.array do
+                Settings.colormarker_colors.each do |c|
+                  j.object { j.field "name", c.name; j.field "hex", c.hex }
+                end
+              end
+            end
+          end
+        end)
+      end
+
+      private def create_custom_color(h) : Result
+        name = str(h, "name")
+        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        hex = str(h, "hex")
+        return err("missing required 'hex'", "INVALID_ARGUMENT", field: "hex") if hex.nil?
+        # The settings registry is the arbiter of name/hex legality and uniqueness — a non-nil
+        # message means it refused, said the same way the CLI and TUI say it.
+        if msg = Settings.add_colormarker_color(name, hex)
+          return err(msg, "INVALID_ARGUMENT", field: "name")
+        end
+        norm = Settings.colormarker_colors.find { |c| c.name == name.strip.downcase }
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "name", norm.try(&.name) || name.strip.downcase
+            j.field "hex", norm.try(&.hex) || hex
+          end
+        end)
+      end
+
+      private def delete_custom_color(h) : Result
+        name = str(h, "name")
+        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        key = name.strip.downcase
+        return not_found("no custom colour named '#{key}'") unless Settings.colormarker_colors.any? { |c| c.name == key }
+        return busy("custom colour NOT deleted (settings not writable)") unless Settings.delete_colormarker_color(key)
+        Result.new(JSON.build { |j| j.object { j.field "name", key; j.field "deleted", true } })
       end
 
       # Whether a colour rule id exists IN THAT SCOPE. A full read (neither store has a

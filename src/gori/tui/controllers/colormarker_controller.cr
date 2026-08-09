@@ -1,23 +1,34 @@
 require "../tab_controller"
 require "../colormarker_view"
+require "../custom_colors_view"
 require "../../store"
+require "../../settings"
 require "../../colormarker"
 
 module Gori::Tui
-  # The Colormarker tab: manage this project's History row-colour rules (the shared Colormarker
-  # engine History's row loop reads live). Add/edit opens ColormarkerRuleOverlay, modal, wired
-  # in the runner like the Rewriter rule editor.
+  # The Colormarker tab: two stacked panes. The POLICY list on top manages this project's
+  # History row-colour rules (the shared Colormarker engine History's row loop reads live);
+  # the CUSTOM COLORS list below manages the global palette of user-defined colours those rules
+  # can paint with. Add/edit on either pane opens a modal (ColormarkerRuleOverlay /
+  # CustomColorOverlay), wired in the runner like the Rewriter rule editor.
   #
-  # Deliberately smaller than RewriterController: one list, no sub-tabs, no text buffer, no read
-  # pane. That is why this controller does NOT join the runner's `flush_active_tab_edits` /
-  # subtab / read-pane ladders — there is no buffer to flush and no caret to select with, and a
-  # no-op `commit` here would be dead code asserting a buffer exists.
+  # Multi-pane like the Rewriter, and for the same reasons: `@focus` names the pane the keyboard
+  # points at, the rule verbs' chords are gated on the policy pane being focused (a chord has no
+  # `section:` to hide behind), and the colours pane's a/e/d are handled HERE rather than as
+  # verbs — the two panes share `Verb::Scope::Colormarker`, and the keymap holds one verb per
+  # chord per scope, so a/e/d could not bind twice.
   class ColormarkerController < TabController
     def initialize(host : Host)
       super(host)
       @view = ColormarkerView.new
+      @colors_view = CustomColorsView.new
       @sel = 0
       @scroll = 0
+      @color_sel = 0
+      @color_scroll = 0
+      @focus = :rules       # :rules | :colors
+      @colors_shown = false # whether the body is tall enough to host the colours pane
+      @last_body = Rect.new(0, 0, 0, 0)
     end
 
     def tab : Symbol
@@ -28,9 +39,12 @@ module Gori::Tui
       Verb::Scope::Colormarker
     end
 
-    # `command_section` is deliberately NOT overridden. Rewriter needs one because it has a
-    # second focus area whose read verbs reuse this list's letters; here there is one view, so
-    # the default `:common` is the whole story and nothing can collide inside it.
+    # The space menu's CONTEXT section: the pane the keyboard points at. `:rules` shows the
+    # policy actions, `:colors` the custom-colour ones — two `section:`s that never render
+    # together, so each may reuse a/e/d without `validate_menu_keys!` seeing them twice.
+    def command_section : Symbol
+      @focus == :colors ? :colors : :rules
+    end
 
     private def engine : Colormarker
       @host.session.colormarker
@@ -38,6 +52,10 @@ module Gori::Tui
 
     private def rule_list : Array(Store::ColorRule)
       engine.rules
+    end
+
+    private def custom_colors : Array(Settings::ColormarkerColor)
+      Settings.colormarker_colors
     end
 
     def selected_rule : Store::ColorRule?
@@ -48,14 +66,34 @@ module Gori::Tui
       !selected_rule.nil?
     end
 
+    # The FOCUS half of the rule-verb gate: the policy list is the thing the keyboard points at.
+    # Both `rule_selected?` and this are needed, exactly as on the Rewriter — the colours pane
+    # sits in the same body and a bare `x`/`s`/⇧J there would otherwise act on the rule behind it.
+    def rule_list_focused? : Bool
+      @focus == :rules
+    end
+
     def global_rule_selected? : Bool
       selected_rule.try(&.global?) == true
+    end
+
+    def selected_color : Settings::ColormarkerColor?
+      custom_colors[@color_sel]?
+    end
+
+    def color_selected? : Bool
+      !selected_color.nil?
+    end
+
+    def colors_focused? : Bool
+      @focus == :colors
     end
 
     # Pull external (MCP / CLI / other-instance) rule edits when the tab becomes active.
     def on_enter : Nil
       engine.reload
       @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
+      @color_sel = @color_sel.clamp(0, {custom_colors.size - 1, 0}.max)
     end
 
     def on_external_change : Nil
@@ -65,17 +103,31 @@ module Gori::Tui
     # --- render ---
     def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
       body_focused = focus == :body
-      # multi_pane: false — one list, no second pane to hand focus to.
-      BodyChrome.framed(screen, rect, BodyChrome.shell_focused(focus, multi_pane: false)) do |inner|
-        list = rule_list
-        @sel = @sel.clamp(0, {list.size - 1, 0}.max)
-        ensure_visible(inner, list.size)
-        @view.render(screen, inner, list, @sel, @scroll, engine.enabled_count, body_focused)
+      # multi_pane: true — each pane gilds its own border, the outer shell stays a hairline.
+      BodyChrome.framed(screen, rect, BodyChrome.shell_focused(focus, multi_pane: true)) do |inner|
+        @last_body = inner
+        rules_r, colors_r = @view.pane_rects(inner)
+        @colors_shown = !colors_r.empty?
+        @focus = :rules unless @colors_shown # can't rest on a pane that is not drawn
+
+        rlist = rule_list
+        @sel = @sel.clamp(0, {rlist.size - 1, 0}.max)
+        ensure_visible(rules_r, rlist.size)
+        @view.render(screen, rules_r, rlist, @sel, @scroll, engine.enabled_count,
+          body_focused && @focus == :rules)
+
+        if @colors_shown
+          clist = custom_colors
+          @color_sel = @color_sel.clamp(0, {clist.size - 1, 0}.max)
+          ensure_color_visible(colors_r, clist.size)
+          @colors_view.render(screen, colors_r, clist, @color_sel, @color_scroll,
+            body_focused && @focus == :colors)
+        end
       end
     end
 
-    private def ensure_visible(inner : Rect, count : Int32) : Nil
-      lh = @view.row_capacity(inner, count)
+    private def ensure_visible(rect : Rect, count : Int32) : Nil
+      lh = @view.row_capacity(rect, count)
       return if lh <= 0
       if @sel < @scroll
         @scroll = @sel
@@ -85,41 +137,108 @@ module Gori::Tui
       @scroll = @scroll.clamp(0, {count - lh, 0}.max)
     end
 
+    private def ensure_color_visible(rect : Rect, count : Int32) : Nil
+      lh = @colors_view.row_capacity(rect, count)
+      return if lh <= 0
+      if @color_sel < @color_scroll
+        @color_scroll = @color_sel
+      elsif @color_sel >= @color_scroll + lh
+        @color_scroll = @color_sel - lh + 1
+      end
+      @color_scroll = @color_scroll.clamp(0, {count - lh, 0}.max)
+    end
+
     def body_hint(focus : Symbol) : String
-      # Rewriter's shape, which this list is otherwise a twin of. It used to advertise `s scope`
-      # and `⇧K/⇧J reorder` — its two least-used keys — while naming neither `space cmds` nor
-      # `esc`, both of which it binds. That is backwards: the space menu is the one affordance
-      # that reveals every other key, including the two this line was spending its width on.
-      "↑/↓ select · a add · ↵/e edit · x on/off · d delete · space cmds · esc tabs"
+      if @focus == :colors
+        "↑/↓ select · a add · ↵/e edit · d delete · space cmds · esc tabs"
+      else
+        "↑/↓ select · a add · ↵/e edit · x on/off · d delete · space cmds · ↹ colours"
+      end
+    end
+
+    # --- focus ring (Tab/Shift-Tab) ---
+    def pane_advance(dir : Int32) : Bool
+      order = @colors_shown ? [:rules, :colors] : [:rules]
+      idx = order.index(@focus) || 0
+      nidx = idx + dir
+      return false unless 0 <= nidx < order.size
+      @focus = order[nidx]
+      true
+    end
+
+    def focus_first : Nil
+      @focus = :rules
+    end
+
+    def focus_last : Nil
+      @focus = @colors_shown ? :colors : :rules
     end
 
     # --- keys ---
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       key = ev.key
+      if key.space? && !ev.ctrl? && !ev.alt?
+        @host.open_space_menu
+        return true
+      end
+      @focus == :colors ? handle_colors_key(ev, key) : handle_rules_key(ev, key)
+    end
+
+    private def handle_rules_key(ev : Termisu::Event::Key, key) : Bool
       c = ev.char || key.to_char
       case
-      when key.space? && !ev.ctrl? && !ev.alt? then @host.open_space_menu
-      when key.up?, c == 'k'                   then move_up
-      when key.down?, c == 'j'                 then move_sel(1)
-      when key.escape?                         then @host.request_focus(:menu)
+      when key.escape?         then @host.request_focus(:menu)
+      when key.up?, c == 'k'   then rules_up
+      when key.down?, c == 'j' then rules_down
       else
-        # Everything else — a/↵/e/d/x/⇧X/s/⇧J/⇧K — defers to the central keymap, so the rule
-        # actions are REBINDABLE and dispatch through the same `available?` gate the space
-        # menu uses. They were a hand-rolled `case` here while the four sibling rule lists
-        # (Scope, Env, Host overrides, Probe rules) all bound real chords and deferred; this
-        # list and the Rewriter's were the two that could not be rebound.
+        # a/↵/e/d/x/⇧X/s/⇧J/⇧K defer to the central keymap — the rule actions are REBINDABLE and
+        # dispatch through the same `available?` gate the menu uses, now focus-aware
+        # (`rule_list_focused?`) so `x`/`s` here can never fire while the colours pane is up.
         return false
       end
       true
     end
 
-    # ↑/k at the top of the list releases focus back to the tab bar, like the Rewriter's.
-    private def move_up : Nil
-      if @sel <= 0
-        @host.request_focus(:menu)
+    private def handle_colors_key(ev : Termisu::Event::Key, key) : Bool
+      c = ev.char || key.to_char
+      case
+      when key.escape?          then @focus = :rules
+      when key.up?, c == 'k'    then colors_up
+      when key.down?, c == 'j'  then colors_down
+      when key.enter?, c == 'e' then customcolor_edit
+      when c == 'a'             then customcolor_add
+      when c == 'd'             then customcolor_delete
       else
-        move_sel(-1)
+        # Defer everything else to the keymap. A rule chord (x/s/⇧J/…) resolves to a verb whose
+        # `available?` is gated on the POLICY pane being focused, so it is a no-op here rather
+        # than acting on the list behind this pane — and deferring (not consuming) is what keeps
+        # global chords (^R/^P/quit) working while this pane holds focus.
+        return false
       end
+      true
+    end
+
+    # ↑/k at the top of the policy list releases focus back to the tab bar.
+    private def rules_up : Nil
+      @sel <= 0 ? @host.request_focus(:menu) : move_sel(-1)
+    end
+
+    # ↓/j past the last rule (or on an empty list) drops into the colours pane when it is shown.
+    private def rules_down : Nil
+      n = rule_list.size
+      if (n == 0 || @sel >= n - 1) && @colors_shown
+        @focus = :colors
+      else
+        move_sel(1)
+      end
+    end
+
+    private def colors_up : Nil
+      @color_sel <= 0 ? (@focus = :rules) : move_color_sel(-1)
+    end
+
+    private def colors_down : Nil
+      move_color_sel(1)
     end
 
     private def move_sel(d : Int32) : Nil
@@ -128,18 +247,35 @@ module Gori::Tui
       @sel = (@sel + d).clamp(0, n - 1)
     end
 
+    private def move_color_sel(d : Int32) : Nil
+      n = custom_colors.size
+      return if n == 0
+      @color_sel = (@color_sel + d).clamp(0, n - 1)
+    end
+
     # --- mouse ---
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
       inner = BodyChrome.frame_inner(rect)
+      @last_body = inner
+      rules_r, colors_r = @view.pane_rects(inner)
+      if !colors_r.empty? && colors_r.contains?(mx, my)
+        @focus = :colors
+        n = custom_colors.size
+        if row = @colors_view.gauge_row_at(colors_r, mx, my, n)
+          @color_sel = row
+        elsif idx = @colors_view.row_at(colors_r, my, @color_scroll, n)
+          @color_sel = idx.clamp(0, {n - 1, 0}.max)
+        end
+        return true
+      end
+      @focus = :rules
       # The scroll gauge on the card's right hairline, which `row_at` excludes by construction.
-      if row = @view.gauge_row_at(inner, mx, my, rule_list.size)
+      if row = @view.gauge_row_at(rules_r, mx, my, rule_list.size)
         @sel = row
         return true
       end
-      # `row_at` already refuses the note row and anything past the last rule, so a hit is
-      # a real index — the clamp below is the belt to its braces, not the bounds check.
-      if idx = @view.row_at(inner, my, @scroll, rule_list.size)
+      if idx = @view.row_at(rules_r, my, @scroll, rule_list.size)
         @sel = idx.clamp(0, {rule_list.size - 1, 0}.max)
       end
       true
@@ -147,20 +283,18 @@ module Gori::Tui
 
     def handle_double_click(rect : Rect, mx : Int32, my : Int32) : Bool
       handle_click(rect, mx, my)
-      colormarker_edit
+      @focus == :colors ? customcolor_edit : colormarker_edit
       true
     end
 
-    # The SELECTION, like the Rewriter twin and every other selection-carrying list in the
-    # tree — not the viewport. Scrolling `@scroll` alone left the cursor off screen, and
-    # `e`/`x`/`d` then acted on a rule the operator could not see. `render`'s `ensure_visible`
-    # brings the viewport along, which is how ↑/↓ has always worked here.
+    # The SELECTION, like every other selection-carrying list in the tree — render's
+    # ensure_visible brings the viewport along.
     def handle_wheel(step : Int32) : Bool
-      move_sel(step)
+      @focus == :colors ? move_color_sel(step) : move_sel(step)
       true
     end
 
-    # --- actions (also the ExecContext verbs) ---
+    # --- policy actions (also the ExecContext verbs) ---
 
     def colormarker_add : Nil
       @host.open_colormarker_rule_editor(nil)
@@ -182,9 +316,6 @@ module Gori::Tui
       note = rule.global? ? " It is a GLOBAL rule — this removes it from every project." : ""
       @host.confirm("DELETE COLOUR RULE", "Delete “#{label}”?#{note} This can't be undone.",
         confirm_label: "delete", danger: true) do
-        # The store's answer, not an assumption. The failure text says what is actually still
-        # true — the row keeps its colour — rather than borrowing the Rewriter's "still
-        # rewriting live traffic", which would be alarmist AND false for a display rule.
         ok = engine.remove(rule.id, rule.scope)
         @sel = @sel.clamp(0, {rule_list.size - 1, 0}.max)
         @host.status(ok ? "colour rule deleted: #{label}" : "colour rule NOT deleted (project busy) — the row colour is unchanged")
@@ -193,8 +324,7 @@ module Gori::Tui
 
     # `x` toggles the rule HERE. For a project rule that is the row itself; for a global one it
     # is this project's override of the library's default, which is why the toast says where the
-    # change lands — the same keypress means "not in this engagement", not "not anywhere"
-    # (that is ⇧X).
+    # change lands.
     def colormarker_toggle : Nil
       rule = selected_rule || return @host.status("no colour rule selected")
       unless engine.toggle(rule.id, rule.scope)
@@ -220,8 +350,6 @@ module Gori::Tui
     # says that rather than leaving an operator to infer it from a list that merely shuffled.
     def colormarker_move(dir : Int32) : Nil
       rule = selected_rule || return @host.status("no colour rule selected")
-      # Only follow the rule when it actually moved: ⇧J on the last GLOBAL rule cannot push it
-      # into the project block (that is a scope change, `s`).
       if engine.move(rule.id, dir, rule.scope)
         move_sel(dir)
         @host.status("precedence changed — the first enabled match paints the row")
@@ -235,17 +363,13 @@ module Gori::Tui
       @host.status(rule.global? ? "global colour rule duplicated" : "colour rule duplicated")
     end
 
-    # `s`: move the selected rule between the global library and this project. The rule keeps
-    # its fields and the state it has HERE; what changes is who else sees it.
+    # `s`: move the selected rule between the global library and this project.
     def colormarker_scope_toggle : Nil
       rule = selected_rule || return @host.status("no colour rule selected")
       to = rule.global? ? Store::RuleScope::Project : Store::RuleScope::Global
       unless engine.set_scope(rule, to)
         return @host.status("scope NOT changed (project busy or settings not writable) — the rule is unchanged")
       end
-      # The rule moved between the two blocks, so its row moved too. It lands at the END of the
-      # destination block (both stores append), which is an exact answer where matching on the
-      # fields would pick the wrong twin among duplicates.
       @sel = last_index_of_scope(to)
       @host.status(to.global? ? "colour rule is now GLOBAL — it applies in every project" : "colour rule is now project-scoped")
     end
@@ -255,10 +379,7 @@ module Gori::Tui
       @host.status("colour rules reloaded")
     end
 
-    # Commit the editor overlay: add a new rule or update the edited one, then re-select it.
-    # The form's `scope:` row is part of the edit — changing it on an existing rule MOVES the
-    # rule between the two stores (fields first, then the re-home, so a refused move leaves the
-    # edit applied rather than silently dropping both halves).
+    # Commit the rule editor overlay: add a new rule or update the edited one, then re-select it.
     def apply_color_rule(ov : ColormarkerRuleOverlay) : Bool
       return false unless ov.valid?
       if id = ov.edit_id
@@ -272,7 +393,6 @@ module Gori::Tui
         end
       else
         engine.add(ov.condition, ov.color, ov.style, ov.name, scope: ov.scope)
-        # A global rule lands at the end of the GLOBAL block, which is not the end of the list.
         @sel = last_index_of_scope(ov.scope)
       end
       true
@@ -281,6 +401,67 @@ module Gori::Tui
     private def last_index_of_scope(scope : Store::RuleScope) : Int32
       idx = rule_list.rindex { |r| r.scope == scope }
       idx || {rule_list.size - 1, 0}.max
+    end
+
+    # --- custom-colour actions (colours pane) ---
+
+    def customcolor_add : Nil
+      @host.open_colormarker_color_editor(nil)
+    end
+
+    def customcolor_edit : Nil
+      if c = selected_color
+        @host.open_colormarker_color_editor(c)
+      else
+        @host.status("no custom colour selected")
+      end
+    end
+
+    def customcolor_delete : Nil
+      c = selected_color || return @host.status("no custom colour selected")
+      # A colour still named by a rule is NOT cascaded away — those rows fall back to a visible
+      # default. The prompt says how many, so the deletion is not a surprise.
+      in_use = engine.rules.count { |r| r.color == c.name }
+      note = in_use > 0 ? " #{in_use} rule#{in_use == 1 ? "" : "s"} still name it — those rows fall back to a default colour." : ""
+      @host.confirm("DELETE CUSTOM COLOUR", "Delete “#{c.name}”?#{note} This can't be undone.",
+        confirm_label: "delete", danger: true) do
+        if Settings.delete_colormarker_color(c.name)
+          sync_custom_marks
+          @color_sel = @color_sel.clamp(0, {custom_colors.size - 1, 0}.max)
+          @host.status("custom colour deleted: #{c.name}")
+        else
+          @host.status("custom colour NOT deleted (settings not writable)")
+        end
+      end
+    end
+
+    # Commit the custom-colour editor. The settings registry is the arbiter of uniqueness and hex
+    # validity — a non-nil message means it refused, and the form stays open showing it.
+    def apply_custom_color(ov : CustomColorOverlay) : Bool
+      err =
+        if orig = ov.original_name
+          Settings.update_colormarker_color(orig, ov.name, ov.hex)
+        else
+          Settings.add_colormarker_color(ov.name, ov.hex)
+        end
+      if err
+        @host.status(err)
+        return false
+      end
+      sync_custom_marks
+      if idx = custom_colors.index { |c| c.name == ov.name.strip.downcase }
+        @focus = :colors if @colors_shown
+        @color_sel = idx
+      end
+      true
+    end
+
+    # Re-prime the render-side custom-mark map and bump the Colormarker revision so History
+    # repaints — a custom-colour edit changes no rule, so `Colormarker#reload` is what carries
+    # the change (its refresh compares the registry too).
+    private def sync_custom_marks : Nil
+      Theme.set_custom_marks(Settings.colormarker_color_map)
+      engine.reload
     end
   end
 end

@@ -11,6 +11,29 @@ module Gori::Tui
   class ColormarkerView
     LIST_MIN_H = 3
 
+    # The two stacked panes the Colormarker tab body splits into: the row-colour POLICY list on
+    # top, the CUSTOM COLORS registry below. Floors like the Rewriter's preview split — a body
+    # too short to host both usable panes keeps the whole interior for the policy list and the
+    # colours pane is not shown (empty rect). Render AND click hit-tests both call this, so the
+    # two never draw one pane and route a click to the other.
+    RULES_MIN_H  = 3
+    COLORS_MIN_H = 3
+
+    # {policy_rect, colors_rect}. `colors_rect` is empty when the body cannot host both panes.
+    def pane_rects(inner : Rect) : {Rect, Rect}
+      empty = Rect.new(inner.x, inner.y, 0, 0)
+      return {inner, empty} if inner.h < RULES_MIN_H + COLORS_MIN_H
+      colors_h = {inner.h * 35 // 100, COLORS_MIN_H}.max
+      colors_h = {colors_h, inner.h - RULES_MIN_H}.min
+      rules_h = inner.h - colors_h
+      {Rect.new(inner.x, inner.y, inner.w, rules_h),
+       Rect.new(inner.x, inner.y + rules_h, inner.w, colors_h)}
+    end
+
+    def colors_pane_shown?(inner : Rect) : Bool
+      !pane_rects(inner)[1].empty?
+    end
+
     # Whether `render` steals the interior's bottom row for the resolution-rule note.
     # Capacity and hit-testing MUST ask this the same way render does, or the two drift:
     # a capacity that counts the note's row scrolls the last rule underneath it, and a
@@ -111,7 +134,7 @@ module Gori::Tui
       # colour this rule IS, and dimming it would make a disabled red and a disabled orange
       # indistinguishable in exactly the list where you go to tell them apart. The ✓/· two
       # columns left already carries the on/off answer.
-      hue = Theme.mark_color(rule.color.to_sym)
+      hue = Theme.mark_color(rule.color)
       # A `full` rule shows a two-cell BAND, a `strip` rule the one-cell block it actually
       # paints — so the row previews its own effect rather than naming it twice.
       if rule.style.full?

@@ -1122,7 +1122,7 @@ describe Gori::Settings do
       r.style.should eq("full")
       r.enabled.should be_true
       r.to_rule.scope.global?.should be_true
-      r.to_rule.color.red?.should be_true
+      r.to_rule.color.should eq("red")
       r.to_rule.style.full?.should be_true
 
       # The default is the rule's own; a project's disagreement lives in the project DB.
@@ -1168,7 +1168,7 @@ describe Gori::Settings do
       kept.name.should eq("ok")
       kept.color.should eq("yellow")
       kept.style.should eq("full")
-      kept.to_rule.color.yellow?.should be_true # the clamped labels really rebuild a rule
+      kept.to_rule.color.should eq("yellow") # the clamped labels really rebuild a rule
       dup = Gori::Settings.colormarker_rules[1]
       dup.id.should_not eq(7_i64)
       dup.enabled.should be_true # no "enabled" key => ON, unlike a rewriter rule
@@ -1180,6 +1180,60 @@ describe Gori::Settings do
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
+      Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+      Gori::Settings.colormarker_next_rule_id = 1_i64
+    end
+  end
+
+  # The GLOBAL custom-colour palette (settings.json `colormarker.colors`) — the names the picker
+  # offers in every project on top of the six built-ins.
+  it "round-trips, validates and tolerantly parses the Colormarker custom colours" do
+    dir = File.tempname("gori-settings-cmcolors")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
+      Gori::Settings.colormarker_colors = [] of Gori::Settings::ColormarkerColor
+      Gori::Settings.colormarker_next_rule_id = 1_i64
+
+      # CRUD + validation: a good add, then the three refusals, said out loud.
+      Gori::Settings.add_colormarker_color("Coral", "ff6b6b").should be_nil # normalises name + hex
+      Gori::Settings.colormarker_colors.first.name.should eq("coral")
+      Gori::Settings.colormarker_colors.first.hex.should eq("#ff6b6b")
+      Gori::Settings.add_colormarker_color("coral", "#000000").should_not be_nil # duplicate
+      Gori::Settings.add_colormarker_color("red", "#000000").should_not be_nil  # built-in word
+      Gori::Settings.add_colormarker_color("bad", "nothex").should_not be_nil   # unparseable hex
+      Gori::Settings.colormarker_colors.size.should eq(1)
+
+      # A colours-only config still writes the section (the guard is not rules-only).
+      Gori::Settings.save.should be_true
+      File.read(Gori::Settings.path).should contain("colors")
+
+      # Reload from disk.
+      Gori::Settings.colormarker_colors = [] of Gori::Settings::ColormarkerColor
+      Gori::Settings.load
+      Gori::Settings.colormarker_colors.map(&.name).should eq(["coral"])
+
+      # Update in place, and the name→hex map the resolver consults.
+      Gori::Settings.update_colormarker_color("coral", "coral", "#00ff00").should be_nil
+      Gori::Settings.colormarker_color_map.should eq({"coral" => "#00ff00"})
+
+      # Tolerant parse: a blank name, a built-in collision and a bad hex are DROPPED, not raised.
+      File.write(Gori::Settings.path, %({"colormarker":{"colors":[\
+{"name":"teal","hex":"#008080"},\
+{"name":"","hex":"#111111"},\
+{"name":"blue","hex":"#0000ff"},\
+{"name":"bad","hex":"zzz"}]}}))
+      Gori::Settings.load
+      Gori::Settings.colormarker_colors.map(&.name).should eq(["teal"])
+
+      Gori::Settings.delete_colormarker_color("teal").should be_true
+      Gori::Settings.colormarker_colors.should be_empty
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.colormarker_colors = [] of Gori::Settings::ColormarkerColor
       Gori::Settings.colormarker_rules = [] of Gori::Settings::ColormarkerRule
       Gori::Settings.colormarker_next_rule_id = 1_i64
     end

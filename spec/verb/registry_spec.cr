@@ -1205,6 +1205,10 @@ private class FakeContext < ExecContext
     true
   end
 
+  def colormarker_rule_list_focused? : Bool
+    true
+  end
+
   def colormarker_global_rule_selected? : Bool
     true
   end
@@ -1215,6 +1219,26 @@ private class FakeContext < ExecContext
 
   def colormarker_toggle_default : Nil
     @calls << :colormarker_toggle_default
+  end
+
+  def colormarker_colors_focused? : Bool
+    false
+  end
+
+  def colormarker_color_selected? : Bool
+    true
+  end
+
+  def colormarker_color_add : Nil
+    @calls << :colormarker_color_add
+  end
+
+  def colormarker_color_edit : Nil
+    @calls << :colormarker_color_edit
+  end
+
+  def colormarker_color_delete : Nil
+    @calls << :colormarker_color_delete
   end
 
   def comparer_diff_shown? : Bool

@@ -747,15 +747,18 @@ module Gori
       end
     end
 
-    # The colour a Colormarker rule paints a History row with. Six hues, and NOT an arbitrary
-    # set: they are exactly the ones `Tui::Theme.marker_hue` already vets as "maximally
-    # separated and present in every palette" (built-in and custom, which inherit a base), so
-    # a rule reads the same on a dark theme and a light one without storing a single hex value.
+    # The six BUILT-IN colours a Colormarker rule can name. No longer the type of
+    # `ColorRule#color` (that is a plain label string now, so a user-defined custom colour's name
+    # can flow through it too) — this stays as the built-in vocabulary: the words the pickers
+    # offer, the labels the CLI/MCP validate against, and the `to_sym` handshake `Theme.mark_color`
+    # resolves. NOT an arbitrary set: they are exactly the ones `Tui::Theme.marker_hue` already
+    # vets as "maximally separated and present in every palette" (built-in and custom themes,
+    # which inherit a base), so a built-in rule reads the same on a dark theme and a light one
+    # without storing a single hex value. A CUSTOM colour, by contrast, carries an absolute hex
+    # (`Settings::ColormarkerColor`) and does not track the theme — that is the trade an operator
+    # makes by defining their own.
     #
     # No grey: a `Theme.muted` block on the canvas reads as chrome, not as a mark.
-    #
-    # Stored as the `label` string, like every other rule enum here, so a hand-edited
-    # settings.json reads the way `gori run colormarker` prints.
     enum MarkerColor
       Red
       Orange
@@ -863,14 +866,20 @@ module Gori
       getter? enabled : Bool
       getter name : String
       getter match_filter : String
-      getter color : MarkerColor
+      # The colour LABEL, not the `MarkerColor` enum: it is one of the six built-in words
+      # (which resolve through the active theme, `Tui::Theme.mark_color`) OR the name of a
+      # user-defined custom colour (which carries an absolute hex in `Settings::ColormarkerColor`).
+      # Stored as a string on both sides of the scope boundary already — settings.json `color`
+      # and the `color_rules.color` TEXT column — so the in-memory type now matches the wire type,
+      # and a name the built-in enum could not hold (a custom's) survives a round trip.
+      getter color : String
       getter style : MarkerStyle
       getter scope : RuleScope
       # Whether THIS project overrides the global default of `enabled`. Always false for a
       # project rule. See `Store#colormarker_overrides`.
       getter? overridden : Bool
 
-      def initialize(@id, @enabled, @match_filter, @color = MarkerColor::Yellow,
+      def initialize(@id, @enabled, @match_filter, @color = "yellow",
                      @style = MarkerStyle::Full, @name = "",
                      @scope = RuleScope::Project, @overridden = false)
       end

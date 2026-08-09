@@ -20,7 +20,7 @@ module Gori
         rs.each do
           list << ColorRule.new(
             rs.read(Int64), rs.read(Int32) != 0, rs.read(String),
-            MarkerColor.from_label(rs.read(String)), MarkerStyle.from_label(rs.read(String)),
+            rs.read(String), MarkerStyle.from_label(rs.read(String)),
             rs.read(String))
         end
       end
@@ -31,13 +31,13 @@ module Gori
     # distinct slots to swap. Returns the new id, or 0 when the write did not commit — the
     # same contract `insert_rule` has, and the reason `Settings.colormarker_next_rule_id`
     # counts from 1 on the other side of the scope boundary.
-    def insert_color_rule(match_filter : String, color : MarkerColor = MarkerColor::Yellow,
+    def insert_color_rule(match_filter : String, color : String = "yellow",
                           style : MarkerStyle = MarkerStyle::Full, name : String = "",
                           enabled : Bool = true) : Int64
       exec_task ->(c : DB::Connection) {
         pos = c.query_one("SELECT COALESCE(MAX(position), -1) + 1 FROM color_rules", as: Int64)
         c.exec("INSERT INTO color_rules (enabled, name, match_filter, color, style, position) VALUES (?, ?, ?, ?, ?, ?)",
-          enabled ? 1 : 0, name, match_filter, color.label, style.label, pos)
+          enabled ? 1 : 0, name, match_filter, color, style.label, pos)
         nil
       }
     end
@@ -50,11 +50,11 @@ module Gori
 
     # Update a rule's fields in place (enabled/position unchanged). No-op on an unknown id.
     # Returns whether the write committed.
-    def update_color_rule(id : Int64, match_filter : String, color : MarkerColor,
+    def update_color_rule(id : Int64, match_filter : String, color : String,
                           style : MarkerStyle, name : String = "") : Bool
       exec_task_ok ->(c : DB::Connection) {
         c.exec("UPDATE color_rules SET name = ?, match_filter = ?, color = ?, style = ? WHERE id = ?",
-          name, match_filter, color.label, style.label, id)
+          name, match_filter, color, style.label, id)
         nil
       }
     end

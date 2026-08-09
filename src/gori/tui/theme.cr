@@ -862,6 +862,12 @@ module Gori::Tui
     @@active_name : String = DEFAULT_THEME
     @@revision : UInt32 = 0_u32
 
+    # User-defined Colormarker colours: name (lowercase) → its absolute hue. Populated from
+    # `Settings.colormarker_color_map` by the Tui layer (see `set_custom_marks`), so the render
+    # path resolves a custom colour with a Hash lookup rather than parsing a hex per row. Unlike
+    # a theme swatch these do NOT track the active palette — a custom colour is an absolute hex.
+    @@custom_marks : Hash(String, Color) = {} of String => Color
+
     # The names of the available themes (selectable in settings:theme), in display
     # order: the built-ins first, then user themes in filename order.
     def self.available : Array(String)
@@ -1053,6 +1059,46 @@ module Gori::Tui
       when :blue   then syn_header
       when :purple then syn_literal
       else              muted
+      end
+    end
+
+    # Replace the custom-colour map (name → hex, from `Settings.colormarker_color_map`). Parses
+    # each hex ONCE here, dropping any that will not parse, so `mark_color(String)` stays a pure
+    # Hash lookup on the render path. Idempotent — the Tui layer calls it whenever the registry
+    # may have changed (startup, an edit, a peer-process reload).
+    def self.set_custom_marks(map : Hash(String, String)) : Nil
+      marks = {} of String => Color
+      map.each do |name, hex|
+        begin
+          marks[name.downcase] = Color.from_hex(hex)
+        rescue
+          # A hex the parser rejects is simply absent, resolving to the fallback below — the
+          # registry's own `normalize_hex` should have caught it, this is belt and braces.
+        end
+      end
+      @@custom_marks = marks
+    end
+
+    # Resolve a Colormarker rule's colour LABEL to a hue. A custom colour (matched first, so an
+    # operator's own name wins) resolves to its stored hex; a built-in word (and the tolerant
+    # aliases `MarkerColor.from_label` accepts) resolves through the ACTIVE palette; anything
+    # else — a dangling reference to a custom colour that has since been deleted — falls back to
+    # a VISIBLE `yellow`, not `muted`: the rule is still enabled, so its row must not read as
+    # unmarked chrome. Kept string-keyed and Store-free, the same decoupling `mark_color(Symbol)`
+    # documents.
+    def self.mark_color(label : String) : Color
+      key = label.downcase
+      if c = @@custom_marks[key]?
+        return c
+      end
+      case key
+      when "red"                         then red
+      when "orange"                      then orange
+      when "yellow"                      then yellow
+      when "green"                       then green
+      when "blue", "cyan"                then syn_header
+      when "purple", "magenta", "violet" then syn_literal
+      else                                    yellow
       end
     end
 

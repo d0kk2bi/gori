@@ -15,7 +15,7 @@ end
 describe ColormarkerRuleOverlay do
   it "defaults a new rule to yellow, full-row, this project" do
     ov = ColormarkerRuleOverlay.adding
-    ov.color.yellow?.should be_true
+    ov.color.should eq("yellow")
     ov.style.full?.should be_true # creation offers full even though PARSING falls back to strip
     ov.scope.project?.should be_true
     ov.condition.should be_empty
@@ -25,12 +25,12 @@ describe ColormarkerRuleOverlay do
 
   it "seeds from an existing rule and remembers the scope it was opened at" do
     rule = Gori::Store::ColorRule.new(7_i64, true, "status:5xx",
-      Gori::Store::MarkerColor::Red, Gori::Store::MarkerStyle::Strip, "prod",
+      "red", Gori::Store::MarkerStyle::Strip, "prod",
       scope: Gori::Store::RuleScope::Global)
     ov = ColormarkerRuleOverlay.editing(rule)
     ov.name.should eq("prod")
     ov.condition.should eq("status:5xx")
-    ov.color.red?.should be_true
+    ov.color.should eq("red")
     ov.style.strip?.should be_true
     ov.scope.global?.should be_true
     ov.edit_id.should eq(7_i64)
@@ -42,9 +42,9 @@ describe ColormarkerRuleOverlay do
     ov = ColormarkerRuleOverlay.adding
     2.times { ov.handle_key(key(Termisu::Input::Key::Down)) } # name → scope → colour
     ov.handle_key(key(Termisu::Input::Key::Right))
-    ov.color.green?.should be_true # yellow → green
+    ov.color.should eq("green") # yellow → green
     ov.handle_key(key(Termisu::Input::Key::Left))
-    ov.color.yellow?.should be_true
+    ov.color.should eq("yellow")
     ov.handle_key(key(Termisu::Input::Key::Down)) # → style
     ov.handle_key(key(Termisu::Input::Key::Right))
     ov.style.strip?.should be_true
@@ -115,7 +115,7 @@ describe ColormarkerRuleOverlay do
     cand = ov.candidate_rule
     cand.name.should eq("n")
     cand.match_filter.should eq("host:a.test")
-    cand.color.blue?.should be_true
+    cand.color.should eq("blue")
     cand.style.strip?.should be_true
     cand.scope.global?.should be_true
     cand.enabled?.should be_true # the preview asks "what WOULD this paint"
@@ -158,7 +158,7 @@ describe ColormarkerRuleOverlay do
     # the colour row is the third (name, scope, colour)
     ov.handle_click(area, box.x + 5, box.y + 2 + ColormarkerRuleOverlay::ROW_COLOR).should eq(:stay)
     ov.handle_key(key(Termisu::Input::Key::Right))
-    ov.color.green?.should be_true
+    ov.color.should eq("green")
     # a click on the Save row commits
     ov.handle_click(area, box.x + 5, box.y + 2 + ColormarkerRuleOverlay::ROW_SAVE).should eq(:commit)
   end

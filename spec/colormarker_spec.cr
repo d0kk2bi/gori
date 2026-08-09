@@ -35,9 +35,11 @@ private def row(id : Int64 = 1_i64, method : String = "GET", host : String = "ac
     Gori::Store::FlowState::Complete, content_type: content_type)
 end
 
-private RED    = Gori::Store::MarkerColor::Red
-private BLUE   = Gori::Store::MarkerColor::Blue
-private YELLOW = Gori::Store::MarkerColor::Yellow
+# A rule's colour is a LABEL string now (a built-in word or a custom colour's name), so these
+# are the strings the engine stores and `mark_color` resolves — not the `MarkerColor` enum.
+private RED    = "red"
+private BLUE   = "blue"
+private YELLOW = "yellow"
 private FULL   = Gori::Store::MarkerStyle::Full
 private STRIP  = Gori::Store::MarkerStyle::Strip
 private GLOBAL = Gori::Store::RuleScope::Global

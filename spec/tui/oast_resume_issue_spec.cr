@@ -89,6 +89,9 @@ private class FakeHost
   def open_colormarker_rule_editor(rule : Gori::Store::ColorRule?) : Nil
   end
 
+  def open_colormarker_color_editor(color : Gori::Settings::ColormarkerColor?) : Nil
+  end
+
   def open_extract_rule_editor(rule : Gori::Store::ExtractRule?) : Nil
   end
 

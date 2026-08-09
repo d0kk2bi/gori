@@ -17,7 +17,7 @@ module Gori::Settings
     enabled : Bool,        # the DEFAULT across projects; a project may override it
     name : String,         # the operator-facing label ("" = unnamed)
     match_filter : String, # an InterceptFilter source string
-    color : String,        # Store::MarkerColor label
+    color : String,        # a built-in MarkerColor label OR a custom colour's name (see colormarker_colors)
     style : String do      # Store::MarkerStyle label — "full" | "strip"
     # The rule as History sees it in one project: `enabled` is the EFFECTIVE state there (this
     # rule's default unless the project overrode it) and `overridden` says which of the two it
@@ -26,9 +26,45 @@ module Gori::Settings
     # Both `from_label`s are tolerant, so this is total for any string that reaches memory.
     def to_rule(enabled : Bool = @enabled, overridden : Bool = false) : Store::ColorRule
       Store::ColorRule.new(id, enabled, match_filter,
-        Store::MarkerColor.from_label(color), Store::MarkerStyle.from_label(style),
+        color, Store::MarkerStyle.from_label(style),
         name, scope: Store::RuleScope::Global, overridden: overridden)
     end
+  end
+
+  # A user-defined colour that lives in settings.json (`colormarker.colors`) and so is offered
+  # in EVERY project's colour picker. It is the counterpart to the six built-ins in
+  # `Store::MarkerColor`, with one deliberate difference: a built-in resolves through the active
+  # THEME (so a rule reads the same on a dark and a light palette) while a custom carries an
+  # ABSOLUTE `hex` and does not track the theme. That is the trade an operator makes for a hue
+  # the palette does not provide.
+  #
+  # `name` is the identity: it is what a rule's `color` field stores and what the picker shows,
+  # lowercased and unique against both the built-in words and the other customs. `hex` is
+  # normalised to "#rrggbb" on the way in (`normalize_hex`), so the render-side resolver
+  # (`Tui::Theme.mark_color`) parses one known shape.
+  record ColormarkerColor,
+    name : String,
+    hex : String
+
+  class_property colormarker_colors : Array(ColormarkerColor) = [] of ColormarkerColor
+
+  # Normalise a user-typed hex to "#rrggbb" lowercase, or nil if it is not a 3- or 6-digit hex
+  # colour. Kept HERE rather than leaning on `Color.from_hex` so Settings stays free of the
+  # Tui/Termisu layer — the resolver on the render side parses the same normalised form.
+  def self.normalize_hex(s : String) : String?
+    h = s.strip.lchop('#').downcase
+    h = h.chars.join { |c| "#{c}#{c}" } if h.size == 3 && h.each_char.all?(&.hex?)
+    return nil unless h.size == 6 && h.each_char.all?(&.hex?)
+    "##{h}"
+  end
+
+  # Lowercase, whitespace-trimmed identity for a custom colour name. A blank name, or one that
+  # collides with a built-in word, is not a legal custom name — the two would be ambiguous in a
+  # rule's `color` field and in the picker.
+  def self.normalize_color_name(s : String) : String?
+    n = s.strip.downcase
+    return nil if n.empty? || COLORMARKER_COLORS.includes?(n)
+    n
   end
 
   class_property colormarker_rules : Array(ColormarkerRule) = [] of ColormarkerRule
@@ -47,9 +83,32 @@ module Gori::Settings
 
   private def self.parse_colormarker(node : JSON::Any) : Nil
     self.colormarker_rules = parse_colormarker_rules(node["rules"]?)
+    self.colormarker_colors = parse_colormarker_colors(node["colors"]?)
     stored = node["next_rule_id"]?.try(&.as_i64?) || 0_i64
     # Never go BACKWARDS from the ids actually present, whatever the file says.
     self.colormarker_next_rule_id = {stored, (colormarker_rules.max_of?(&.id) || 0_i64) + 1, 1_i64}.max
+  end
+
+  # Tolerant custom-colour parse, same spirit as the rule parser: a non-array (or absent) node
+  # keeps the current value, and an entry with a blank/colliding name or an unparseable hex is
+  # DROPPED rather than raised on — a typo in a hand-edited `colors` array cannot take the whole
+  # file down through `load`'s blanket rescue, and the good entries still load. The first name
+  # wins on a duplicate, so a hand-authored dupe is deterministic.
+  private def self.parse_colormarker_colors(node : JSON::Any?) : Array(ColormarkerColor)
+    arr = node.try(&.as_a?)
+    return colormarker_colors unless arr
+    list = [] of ColormarkerColor
+    seen = Set(String).new
+    arr.each do |e|
+      next unless o = e.as_h?
+      name = normalize_color_name(o["name"]?.try(&.as_s?) || "")
+      next if name.nil? || seen.includes?(name)
+      hex = normalize_hex(o["hex"]?.try(&.as_s?) || "")
+      next unless hex
+      seen << name
+      list << ColormarkerColor.new(name, hex)
+    end
+    list
   end
 
   # Tolerant global-rule parse: a non-array (or absent) node keeps the current value; the two
@@ -148,11 +207,67 @@ module Gori::Settings
     save
   end
 
+  # --- custom colour CRUD ----------------------------------------------------------------
+  # The name is the identity (no numeric id): a rule references a colour by the same name the
+  # picker shows, so a stable, human-typed key is what the wire format wants. Each mutation
+  # persists via `save`; the boolean answer is "did the write reach disk", the contract every
+  # mutator here shares.
+
+  # The reason `name`/`hex` were rejected, or nil when the colour was written. A non-nil string
+  # is a message a surface can show verbatim (the CLI aborts with it, MCP returns it, the TUI
+  # overlay renders it). Refuses a blank/built-in/duplicate name and an unparseable hex — the
+  # same three the tolerant parser silently drops, said out loud here because the caller just
+  # typed the value.
+  def self.add_colormarker_color(name : String, hex : String) : String?
+    n = normalize_color_name(name)
+    return "name can't be blank or a built-in colour (#{COLORMARKER_COLORS.join(", ")})" unless n
+    return "a colour named “#{n}” already exists" if colormarker_colors.any? { |c| c.name == n }
+    h = normalize_hex(hex)
+    return "invalid hex — use #rrggbb" unless h
+    self.colormarker_colors = colormarker_colors + [ColormarkerColor.new(n, h)]
+    save ? nil : "settings not writable"
+  end
+
+  # Edit a custom colour in place, keyed by its OLD name (which may be unchanged). A rename to a
+  # name another colour holds is refused; a rename leaves any rule still naming the old colour
+  # dangling — the resolver falls back rather than the rename cascading, the same way a delete
+  # does. Returns nil on success or a message on refusal.
+  def self.update_colormarker_color(old_name : String, name : String, hex : String) : String?
+    old = old_name.strip.downcase
+    return "no colour named “#{old}”" unless colormarker_colors.any? { |c| c.name == old }
+    n = normalize_color_name(name)
+    return "name can't be blank or a built-in colour (#{COLORMARKER_COLORS.join(", ")})" unless n
+    return "a colour named “#{n}” already exists" if n != old && colormarker_colors.any? { |c| c.name == n }
+    h = normalize_hex(hex)
+    return "invalid hex — use #rrggbb" unless h
+    self.colormarker_colors = colormarker_colors.map { |c| c.name == old ? ColormarkerColor.new(n, h) : c }
+    save ? nil : "settings not writable"
+  end
+
+  # Delete a custom colour by name. Returns whether the write committed; a rule that still names
+  # it is left alone (the resolver falls back to a visible default), because this surface cannot
+  # reach every project's DB to rewrite the rules that reference it.
+  def self.delete_colormarker_color(name : String) : Bool
+    n = name.strip.downcase
+    kept = colormarker_colors.reject { |c| c.name == n }
+    return false if kept.size == colormarker_colors.size
+    self.colormarker_colors = kept
+    save
+  end
+
+  # The name → hex map the render-side resolver consults (`Tui::Theme.set_custom_marks`). Built
+  # here so the Tui layer never has to know the shape of a `ColormarkerColor`.
+  def self.colormarker_color_map : Hash(String, String)
+    colormarker_colors.to_h { |c| {c.name, c.hex} }
+  end
+
   # Omit the whole block when there is nothing to say, so an untouched install never writes a
-  # "colormarker" section. The counter is written even with an empty list — it is what keeps a
-  # deleted rule's id from being handed out again after the last rule is removed.
+  # "colormarker" section. The counter is written even with an empty rule list — it is what keeps
+  # a deleted rule's id from being handed out again after the last rule is removed. Custom
+  # colours count as "something to say" too: a config with only custom colours (no rules) still
+  # writes the section.
   private def self.serialize_colormarker(j : JSON::Builder) : Nil
-    return if colormarker_rules.empty? && colormarker_next_rule_id <= 1
+    return if colormarker_rules.empty? && colormarker_colors.empty? && colormarker_next_rule_id <= 1
     j.field "colormarker" do
       j.object do
         j.field "next_rule_id", colormarker_next_rule_id
@@ -168,6 +283,20 @@ module Gori::Settings
                 j.field "when", r.match_filter
                 j.field "color", r.color
                 j.field "style", r.style
+              end
+            end
+          end
+        end
+        # Only when there ARE custom colours — an install with rules but no customs should not
+        # start writing an empty "colors" array it never had.
+        unless colormarker_colors.empty?
+          j.field "colors" do
+            j.array do
+              colormarker_colors.each do |c|
+                j.object do
+                  j.field "name", c.name
+                  j.field "hex", c.hex
+                end
               end
             end
           end
