@@ -12,13 +12,18 @@ module Gori::Tui
   class ChainPeek
     getter? open : Bool = false
     @chain = ""
+    @hint = DEFAULT_HINT
 
-    HINT = "^Y edit"
+    # What `^Y` opens is the same everywhere, so this is the floor — but the marker under the
+    # caret means different things per surface, and the Fuzzer chains `^O` onto it (a position
+    # with no payload set produces nothing, which the chain alone never says). Owner-fed.
+    DEFAULT_HINT = "^Y edit"
 
     # Show the chain of the marker under the caret (opens the peek). An empty chain still
     # opens — the marker is concealment-eligible, the hint invites attaching a chain.
-    def set(chain : String) : Nil
+    def set(chain : String, hint : String = DEFAULT_HINT) : Nil
       @chain = chain
+      @hint = hint
       @open = true
     end
 
@@ -47,7 +52,7 @@ module Gori::Tui
 
     # Box width = ▸ + chain + the right-aligned hint, floored so short chains still read.
     private def box_width(bounds : Rect) : Int32
-      ({Screen.display_width(shown) + HINT.size + 6, 16}.max).clamp(1, bounds.w)
+      ({Screen.display_width(shown) + Screen.display_width(@hint) + 6, 16}.max).clamp(1, bounds.w)
     end
 
     # One tooltip row: a fill band, the accent ▸ chain glyph, the chain spec, then the
@@ -57,10 +62,10 @@ module Gori::Tui
       bg = Theme.elevated
       screen.fill(Rect.new(x, y, w, 1), bg)
       cx = screen.text(x + 1, y, "▸ ", Theme.marker_accent, bg, width: {w - 1, 1}.max)
-      hint_x = x + w - HINT.size - 1
+      hint_x = x + w - Screen.display_width(@hint) - 1
       chain_room = {hint_x - 1 - cx, 0}.max
       cx = screen.text(cx, y, shown, @chain.empty? ? Theme.muted : Theme.text_bright, bg, width: chain_room)
-      screen.text(hint_x, y, HINT, Theme.muted, bg) if hint_x > cx
+      screen.text(hint_x, y, @hint, Theme.muted, bg) if hint_x > cx
     end
   end
 end

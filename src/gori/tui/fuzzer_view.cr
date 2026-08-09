@@ -98,7 +98,12 @@ module Gori::Tui
       @editor.wrap = true
       @editor.env_complete = true # `$KEY` autocomplete against the registered env vars (expanded on send)
       @editor.chain_peek = true   # tooltip revealing the concealed ¦chain of the §…§ marker under the caret
-      @last_synced_config = ""    # last store config blob applied (reconcile equality)
+      # …and here it carries `^O` as well. A marked position in the Fuzzer is only half a
+      # setup: with no payload set in the CONFIG pane the run produces nothing, and the two
+      # halves sit in different panes, so the tooltip over the position names the pane that
+      # completes it. (In the Repeater a marker IS complete on its own — hence the default.)
+      @editor.chain_peek_hint = "^Y edit · ^O sets"
+      @last_synced_config = "" # last store config blob applied (reconcile equality)
       @config = Fuzz::Config.new(keep_bodies: :matched)
       @sets = [] of SetSpec
       @matcher = Fuzz::Matcher.new(keep_bodies: :matched)
@@ -2183,8 +2188,11 @@ module Gori::Tui
       end
       @editor.bg_regions = bg
       @editor.conceal_spans = conceal
-      chain = chain_under_cursor
-      @editor.chain_peek_text = (chain && !chain.empty?) ? chain : nil # tooltip only for a concealed (non-empty) chain
+      # A marker WITHOUT a chain gets the tooltip too (`""` → "no chain yet · ^Y edit · ^O
+      # sets"). That is the state a freshly auto-marked template is in for every one of its
+      # positions, i.e. the one an operator meets first and the one that used to say nothing.
+      # nil (caret outside every marker) still draws nothing.
+      @editor.chain_peek_text = chain_under_cursor
       inner = rect.inset(1, 1)
       read_active = focused && !ins
       @editor.render(screen, inner, cursor: ins, highlight: :request, peek: focused, gauge: true, gauge_focused: focused)

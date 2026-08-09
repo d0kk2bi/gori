@@ -132,9 +132,10 @@ module Gori::Tui
       @env_peek = nil.as(EnvPeek?)
       # Opt-in chain tooltip (nil = disabled). Paired with @conceal_spans on the request
       # editors: reveals the hidden ¦chain of the §…§ marker under the caret. @chain_peek_text
-      # is fed by the owner each frame (nil = caret not in a chained marker → no tooltip).
+      # is fed by the owner each frame (nil = caret not in a marker → no tooltip).
       @chain_peek = nil.as(ChainPeek?)
       @chain_peek_text = nil.as(String?)
+      @chain_peek_hint = ChainPeek::DEFAULT_HINT
       set_text(text)
     end
 
@@ -1602,7 +1603,8 @@ module Gori::Tui
       if cursor && (cc = caret_cell) && ec
         ec.render(screen, cc[0], cc[1], rect)
       end
-      # Chain tooltip takes precedence over the env peek (a §…§ marker is never also a $KEY).
+      # Chain tooltip takes precedence over the env peek — but only when it has a chain to
+      # reveal; `render_chain_peek` owns that tie-break (a `§$KEY§` marker is a real shape).
       return if render_chain_peek(screen, caret_cell, rect, cursor, peek, ec)
       ep = @env_peek
       return unless ep
@@ -1618,7 +1620,7 @@ module Gori::Tui
       end
     end
 
-    # The chain tooltip pass: when the caret sits in a chained §…§ marker (owner-fed via
+    # The chain tooltip pass: when the caret sits in a §…§ marker (owner-fed via
     # @chain_peek_text) and the editor is focused, reveal the concealed chain at the caret
     # and suppress the env peek. Returns true when it took over (the caller then skips the
     # env peek). No-op (false) when the tooltip is disabled or the caret isn't in a marker.
@@ -1627,8 +1629,14 @@ module Gori::Tui
       cp = @chain_peek
       return false unless cp
       chain = @chain_peek_text
-      if chain && (cursor || peek) && (cc = caret_cell) && !(cursor && ec && ec.open?)
-        cp.set(chain)
+      # An EMPTY chain draws the affordance only ("no chain yet · ^Y edit"), so it YIELDS to a
+      # `$KEY` peek under the same caret: `§$HOST§` is an ordinary marker, and the resolved
+      # value is a datum nothing else on screen shows, where the hint is a standing reminder
+      # that will be there on the next keystroke too. A non-empty chain still wins — it reveals
+      # bytes concealed in the buffer, which is the one thing only this tooltip can do.
+      if chain && (cursor || peek) && (cc = caret_cell) && !(cursor && ec && ec.open?) &&
+         !(chain.empty? && @env_peek && env_token_at_cursor)
+        cp.set(chain, @chain_peek_hint)
         cp.render(screen, cc[0], cc[1], rect)
         @env_peek.try(&.close)
         return true
@@ -2139,9 +2147,18 @@ module Gori::Tui
     end
 
     # Per-frame feed: the chain of the §…§ marker under the caret, or nil when the caret
-    # isn't in a chained marker. The owner resolves it (it knows the §-marker layout).
+    # isn't in a marker at all. `""` is a marker WITHOUT a chain and still opens the tooltip
+    # (as "no chain yet" + the hint) — that is the case where the operator has the least to
+    # go on, so it is the one that most needs the affordance. The owner resolves it (it
+    # knows the §-marker layout).
     def chain_peek_text=(chain : String?) : Nil
       @chain_peek_text = chain
+    end
+
+    # The right-aligned affordance on the chain tooltip's row. Per-surface: see
+    # `ChainPeek::DEFAULT_HINT`.
+    def chain_peek_hint=(hint : String) : Nil
+      @chain_peek_hint = hint
     end
 
     def env_completing? : Bool

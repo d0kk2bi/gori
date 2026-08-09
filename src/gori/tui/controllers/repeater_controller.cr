@@ -1923,6 +1923,12 @@ module Gori::Tui
       return unless flow_id
       return unless detail = @host.session.store.get_flow(flow_id)
       view.seed_original(detail.response_head, detail.response_body)
+      # The REQUEST half of the same row, which nothing read before: it is what lets a
+      # reopened evidence tab tell its own `§` from the origin's instead of assuming the
+      # worst about both. Every path that lands a tab undeclared — first open, a peer's
+      # reconcile, a row appearing mid-session — comes through here right after, so this is
+      # the one call site. See `RepeaterView#adopt_capture_markers`.
+      view.adopt_capture_markers(detail.request_head, detail.request_body)
     end
 
     private def edit_repeater_request(ev : Termisu::Event::Key, view : RepeaterView) : Bool
