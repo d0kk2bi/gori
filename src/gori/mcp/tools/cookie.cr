@@ -135,6 +135,56 @@ module Gori
         end
       end
 
+      # The tools/list schemas for the cookie-workbench tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_cookie_tools(j : JSON::Builder) : Nil
+        tool j, "cookie_decode",
+          "Parse a framework signed session cookie — Flask (itsdangerous), Rack (Ruby), or " \
+          "Django (django.core.signing) — into its structured parts (payload, timestamp, " \
+          "signature). Auto-detects the format from the cookie's punctuation. Pure transform: " \
+          "no network, no signature verification. Returns {format, payload, timestamp, signature, …}." do |s|
+          s.field "cookie", strprop("the raw cookie value (URL-decoded)"), required: true
+          s.field "format", strprop("force a format instead of auto-detect: flask | rack | django")
+        end
+
+        tool j, "cookie_verify",
+          "Verify a signed session cookie against a candidate secret — the offline check that " \
+          "confirms a guessed/cracked signing key. Returns {valid, format}." do |s|
+          s.field "cookie", strprop("the raw cookie value"), required: true
+          s.field "secret", strprop("the candidate signing secret"), required: true
+          s.field "format", strprop("force a format: flask | rack | django (default auto-detect)")
+          s.field "salt", strprop("Flask/Django signing salt (Flask default 'cookie-session', Django 'django.core.signing')")
+          s.field "algorithm", strprop("Django HMAC algorithm: sha256 (default) | sha1")
+        end
+
+        tool j, "cookie_crack",
+          "Brute-force a session cookie's signing secret over a wordlist and report the first " \
+          "match — the classic weak-SECRET_KEY move. Supply candidates inline via 'secrets' " \
+          "and/or a 'wordlist' file path. Pure offline compute: no network. Returns {found, secret, format}." do |s|
+          s.field "cookie", strprop("the raw cookie value"), required: true
+          s.field "secrets", strarrprop("inline candidate secrets to try (in order)")
+          s.field "wordlist", strprop("path to a newline-delimited wordlist file")
+          s.field "format", strprop("force a format: flask | rack | django (default auto-detect)")
+          s.field "salt", strprop("Flask/Django signing salt")
+          s.field "algorithm", strprop("Django HMAC algorithm: sha256 (default) | sha1")
+        end
+
+        tool j, "cookie_forge",
+          "Re-sign a (possibly edited) payload with a known/cracked secret and emit a valid " \
+          "session cookie — forge an admin session once the key is known. Flask/Django take a " \
+          "'payload' JSON; Rack takes the opaque base64 'value'. Returns {cookie, format}." do |s|
+          s.field "format", strprop("flask | rack | django"), required: true
+          s.field "secret", strprop("the signing secret"), required: true
+          s.field "payload", strprop("session JSON to sign (Flask/Django)")
+          s.field "value", strprop("the base64 Marshal cookie value (Rack — opaque bytes)")
+          s.field "timestamp", intprop("unix second to stamp (Flask/Django; defaults to now)")
+          s.field "salt", strprop("Flask/Django signing salt")
+          s.field "algorithm", strprop("Django HMAC algorithm: sha256 (default) | sha1")
+        end
+      end
+
       # `str_list` lives in tools.cr now: `secrets` and `tokens` had two near-identical readers
       # that BOTH dropped a non-string entry, and one grammar gets one behaviour.
     end

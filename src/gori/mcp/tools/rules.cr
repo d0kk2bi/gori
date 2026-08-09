@@ -570,6 +570,139 @@ module Gori
         return busy("extract rule NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_extract_rule(id)
         Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
       end
+
+      # The tools/list schemas for the Match & Replace / extract rule tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_rules_tools(j : JSON::Builder) : Nil
+        tool j, "list_rules",
+          "List the Match & Replace rules applied to this project (the Rewriter tab — literal/regex " \
+          "replace or add/set/remove header, applied to in-flight request/response HEAD or BODY), in " \
+          "apply order: GLOBAL rules (settings.json, shared by every project) first, then the " \
+          "project's own. `id` is unique only within a scope, so pass both to the mutation tools. " \
+          "For a global rule, `enabled` is the state in THIS project and `default_enabled` the " \
+          "library's own; `overridden` says the two were made to differ here." do |s|
+          s.field "scope", strprop("show only project | global rules (default: both)")
+        end
+
+        tool j, "list_extract_rules",
+          "List the project's EXTRACT rules — the read half of a session binding. Each one " \
+          "observes a response and binds one named value ($SESSION) in memory, which a Match & " \
+          "Replace rule injects with replacement \"$SESSION\". Values are never persisted and are " \
+          "not readable here. Unordered: an extract rule produces no bytes, so two cannot compose." { }
+
+        return unless @allow_actions
+
+        tool j, "create_rule",
+          "Add a Match & Replace rule (the Rewriter tab) applied to in-flight traffic. " \
+          "Persisted to the project, or to the global library shared by every project when " \
+          "scope=global. Note: a gori TUI already running applies it only after its " \
+          "rules reload (reopen the Rewriter tab or restart); `gori run` and newly opened TUIs " \
+          "pick it up immediately." do |s|
+          s.field "scope", strprop("project (default) | global — a global rule lives in settings.json and applies in EVERY project")
+          s.field "pattern", strprop("for replace: the substring/regex to match; for a header op: the HEADER NAME; for short_circuit: the substring/regex matched against the REQUEST head"), required: true
+          s.field "replacement", strprop("for replace: the replacement (empty = delete; supports $1 capture refs when match=regex); for add/set header: the header VALUE (default empty); for short_circuit: the canned RESPONSE — a status line such as '200 OK', then header lines, then a blank line and the body")
+          s.field "target", strprop("request|response (default request; short_circuit is always request)")
+          s.field "part", strprop("head|body|ws — head = request/status line + headers, body = entity body, ws = a WebSocket MESSAGE on an upgraded (101) flow with target picking the direction (request = client→server, response = server→client). Default head; ignored by header ops and short_circuit, which are head-only, and rejected for those ops when set to ws")
+          s.field "op", strprop("short_circuit | replace | add_header | set_header | remove_header (default replace). short_circuit ANSWERS the request from the rule and never dials the origin — nothing is sent upstream; use it to stub a response that does not exist")
+          s.field "body_file", strprop("short_circuit only: serve this file's bytes as the response BODY instead of the inline one (re-read when the file changes). Empty = inline")
+          s.field "match", strprop("for replace: literal | regex (default literal). Regex supports $1/\\1 capture groups")
+          s.field "name", strprop("optional label for the rule")
+          s.field "host", strprop("optional host glob scoping the rule (e.g. 'example.com' substring, '*.example.com' wildcard; empty = all hosts)")
+          s.field "enabled", boolprop("create the rule already enabled (default true); pass false for an atomic disabled creation (no live window before you can preview/adjust it)")
+        end
+
+        tool j, "update_rule",
+          "Update an existing Match & Replace rule by id. Omitted fields are left unchanged. " \
+          "For a global rule, `enabled` changes the state in THIS project (an override), not " \
+          "the library's default — use set_rule_enabled with everywhere=true for that." do |s|
+          s.field "id", intprop("rule id from list_rules"), required: true
+          s.field "scope", strprop("which id: project (default) | global")
+          s.field "pattern", strprop("new match substring/regex, or header name")
+          s.field "replacement", strprop("new replacement / header value / canned response")
+          s.field "target", strprop("request|response")
+          s.field "part", strprop("head|body|ws (ws = a WebSocket message; replace only)")
+          s.field "op", strprop("short_circuit | replace | add_header | set_header | remove_header")
+          s.field "body_file", strprop("short_circuit only: file served as the response body ('' = inline)")
+          s.field "match", strprop("literal | regex")
+          s.field "name", strprop("rule label")
+          s.field "host", strprop("host glob ('' = all hosts)")
+          s.field "enabled", boolprop("enable/disable the rule")
+        end
+
+        tool j, "preview_rule",
+          "Estimate how many captured flows a rule WOULD affect (by replaying the same transform " \
+          "over recent flows) WITHOUT creating it. Use before create_rule to size a rule. " \
+          "Approximate: response bodies are scanned as stored wire bytes." do |s|
+          s.field "pattern", strprop("the substring/regex to match, or header name"), required: true
+          s.field "replacement", strprop("replacement / header value (matters for header ops, which change the head regardless of match)")
+          s.field "target", strprop("request|response (default request)")
+          s.field "part", strprop("head|body|ws (default head; ws counts captured WebSocket messages, replace only)")
+          s.field "op", strprop("short_circuit | replace | add_header | set_header | remove_header (default replace). For short_circuit this counts the flows the rule WOULD have answered instead of sending")
+          s.field "match", strprop("literal | regex (default literal)")
+          s.field "host", strprop("host glob ('' = all hosts)")
+        end
+
+        tool j, "set_rule_enabled",
+          "Enable or disable a Match & Replace rule by id. For a GLOBAL rule this writes THIS " \
+          "project's override by default; everywhere=true changes the rule's own default, which " \
+          "every project that has not overridden it follows." do |s|
+          s.field "id", intprop("rule id from list_rules"), required: true
+          s.field "enabled", boolprop("true to enable, false to disable"), required: true
+          s.field "scope", strprop("which id: project (default) | global")
+          s.field "everywhere", boolprop("global rules only: change the default for every project instead of this one")
+        end
+
+        tool j, "delete_rule",
+          "Delete a Match & Replace rule by id. Deleting a GLOBAL rule removes it from every " \
+          "project." do |s|
+          s.field "id", intprop("rule id from list_rules"), required: true
+          s.field "scope", strprop("which id: project (default) | global")
+        end
+
+        tool j, "create_extract_rule",
+          "Add an EXTRACT rule: observe a response and bind one named value ($NAME) in memory " \
+          "for a Match & Replace rule to inject with replacement \"$NAME\". Only a DELIBERATE " \
+          "single send (Repeater / send_request) feeds extraction — sweeps deliberately do not, " \
+          "because a response echoing an attacker-shaped payload back could otherwise rebind the " \
+          "operator's session to it. One name, one writer: a duplicate name is refused." do |s|
+          s.field "name", strprop("the binding name, without the $ (letters, digits and _, not starting with a digit)"), required: true
+          s.field "kind", strprop("cookie | header | regex | position | jsonpath (default cookie). regex/position/jsonpath read the DECODED body; cookie/header read the parsed head")
+          s.field "selector", strprop("cookie name, header name, regex source, or JSON path ($.a.b[0]) — required for every kind except position")
+          s.field "when", strprop("which messages to read, in intercept-filter syntax (host:/path:/method:/scheme:/status:, AND/OR/NOT, '' = any). status: matches responses only")
+          s.field "host", strprop("optional host glob scoping the rule ('example.com' substring, '*.example.com' wildcard; empty = all hosts)")
+          s.field "pos_start", intprop("kind=position only: start byte offset into the decoded body")
+          s.field "pos_end", intprop("kind=position only: end byte offset (exclusive); must exceed pos_start")
+          s.field "enabled", boolprop("create the rule already enabled (default true)")
+        end
+
+        tool j, "update_extract_rule",
+          "Update an existing extract rule by id. Omitted fields are left unchanged. Renaming " \
+          "drops the old name's bound value rather than re-labelling it." do |s|
+          s.field "id", intprop("extract rule id from list_extract_rules"), required: true
+          s.field "name", strprop("new binding name (without the $)")
+          s.field "kind", strprop("cookie | header | regex | position | jsonpath")
+          s.field "selector", strprop("cookie/header name, regex source, or JSON path")
+          s.field "when", strprop("intercept-filter condition ('' = any message)")
+          s.field "host", strprop("host glob ('' = all hosts)")
+          s.field "pos_start", intprop("kind=position only: start byte offset")
+          s.field "pos_end", intprop("kind=position only: end byte offset (exclusive)")
+          s.field "enabled", boolprop("enable/disable the rule")
+        end
+
+        tool j, "set_extract_rule_enabled",
+          "Enable or disable an extract rule by id. Disabling also UN-DECLARES its name, so a " \
+          "Match & Replace rule injecting it goes back to refusing rather than sending a value " \
+          "nothing is refreshing." do |s|
+          s.field "id", intprop("extract rule id from list_extract_rules"), required: true
+          s.field "enabled", boolprop("true to enable, false to disable"), required: true
+        end
+
+        tool j, "delete_extract_rule", "Delete an extract rule by id (its bound value is forgotten too)." do |s|
+          s.field "id", intprop("extract rule id from list_extract_rules"), required: true
+        end
+      end
     end
   end
 end

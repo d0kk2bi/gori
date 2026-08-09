@@ -127,6 +127,45 @@ module Gori
           end
         end)
       end
+
+      # The tools/list schemas for the sitemap tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_sitemap_tools(j : JSON::Builder) : Nil
+        tool j, "list_sitemap",
+          "Distinct endpoints discovered in capture, keyed by TRANSPORT " \
+          "(scheme, host, port, http_version, method, target) so the same path over " \
+          "http vs https vs HTTP/2 stays separate — each with its observed status set, " \
+          "success/error counts, and first/last-seen. An entry also carries a `tag` field " \
+          "when the operator pinned a memo on that path (see set_sitemap_tag). Pass " \
+          "collapse_transport:true for the legacy host/method/target-only view. " \
+          "Optional QL `query` filter." do |s|
+          s.field "query", strprop("gori QL filter")
+          s.field "limit", intprop("max entries (default 200, max 5000)")
+          s.field "collapse_transport", boolprop("collapse to distinct host/method/target only (legacy shape), dropping scheme/port/version + counts (default false)")
+          s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false)")
+        end
+
+        tool j, "list_sitemap_tags",
+          "List the free-text memos the operator pinned onto sitemap paths, as " \
+          "[{host, path, tag}]. These are the same tags list_sitemap stamps onto its entries." do |s|
+          s.field "host", strprop("only list tags on this host")
+        end
+
+        return unless @allow_actions
+
+        tool j, "set_sitemap_tag",
+          "Pin a free-text memo onto one sitemap endpoint, or clear it with an empty/absent " \
+          "`tag`. Keyed by the node path exactly as the Sitemap tree stamps it — which " \
+          "INCLUDES any query string, so /search?q=1 is a different node from /search. " \
+          "Pass the `target` you saw in list_sitemap verbatim; a tag filed under a path no " \
+          "node has is silently invisible in both list_sitemap and the TUI." do |s|
+          s.field "host", strprop("host the path belongs to"), required: true
+          s.field "path", strprop("node path as list_sitemap shows it, e.g. /api/users or /search?q=1"), required: true
+          s.field "tag", strprop("the memo; empty or absent CLEARS the tag")
+        end
+      end
     end
   end
 end

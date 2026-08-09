@@ -229,6 +229,49 @@ module Gori
       rescue
         {nil, nil}
       end
+
+      # The tools/list schemas for the project tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_projects_tools(j : JSON::Builder) : Nil
+        tool j, "list_projects",
+          "List gori projects on this host (name, slug, db_path, db_size, last_modified, " \
+          "workspace binding) and which one this server is currently serving (current:true). " \
+          "Use switch_project to change the active project. When the server started unbound " \
+          "(no project), call list_projects then create_project or switch_project before " \
+          "traffic tools." { }
+
+        tool j, "switch_project",
+          "Point this server at a different project for all subsequent tools. Always available " \
+          "(including --read-only and when the server started unbound). Refused while a " \
+          "fuzz/mine job is running. Verify with project_info afterwards." do |s|
+          s.field "project", strprop("target project display name or directory slug"), required: true
+        end
+
+        if @allow_actions || unbound?
+          tool j, "create_project",
+            "Create a new gori project (or reopen an existing one with the same name). " \
+            "When the server is unbound, create auto-binds to the new project; when already " \
+            "bound, call switch_project to make it active." do |s|
+            s.field "name", strprop("project display name (slugified for its directory)"), required: true
+            s.field "description", strprop("optional description stored in the project settings")
+          end
+        end
+
+        return unless @allow_actions
+
+        tool j, "delete_project",
+          "Delete a project's data from disk. TWO-STEP + destructive: first call with " \
+          "dry_run:true (default) to get object counts, disk size, capture-lock status, and a " \
+          "short-lived confirmation_token; then call again with dry_run:false and that token. " \
+          "Refuses the currently-served project (switch away first) and any project locked by a " \
+          "live capture." do |s|
+          s.field "project", strprop("target project display name or directory slug"), required: true
+          s.field "dry_run", boolprop("true (default) previews and issues a confirmation_token; false performs the delete")
+          s.field "confirmation_token", strprop("the token from a dry_run:true call (required when dry_run:false)")
+        end
+      end
     end
   end
 end

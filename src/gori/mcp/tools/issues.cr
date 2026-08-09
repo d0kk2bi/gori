@@ -143,6 +143,48 @@ module Gori
         return busy("issue NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_issue(id)
         Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
       end
+
+      # The tools/list schemas for the issue tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_issues_tools(j : JSON::Builder) : Nil
+        tool j, "list_issues",
+          "List triage issues (severity + status), newest/most-severe first. " \
+          "Returns an object {issues, returned, offset, total} — not a bare array." do |s|
+          s.field "limit", intprop("max rows (default 100, max 500)")
+          s.field "offset", intprop("start row (default 0)")
+        end
+
+        tool j, "get_issue", "Get one issue by id." do |s|
+          s.field "id", intprop("issue id"), required: true
+        end
+
+        return unless @allow_actions
+
+        tool j, "create_issue", "Record a new issue in the project." do |s|
+          s.field "title", strprop("issue title"), required: true
+          s.field "severity", strprop("info|low|medium|high|critical (default info)")
+          s.field "host", strprop("optional host the issue concerns")
+          s.field "flow_id", intprop("optional flow id this issue links to")
+          s.field "repeater_id", intprop("optional repeater id this issue links to")
+        end
+
+        tool j, "update_issue", "Update an existing issue's fields." do |s|
+          s.field "id", intprop("issue id"), required: true
+          s.field "title", strprop("new title")
+          s.field "severity", strprop("info|low|medium|high|critical")
+          s.field "notes", strprop("free-form notes (replaces existing)")
+          s.field "status", strprop("open|confirmed|false-positive|resolved")
+          s.field "repeater_id", intprop("optional repeater id to link to the issue")
+        end
+
+        tool j, "delete_issue",
+          "Delete an issue outright, along with its entity links. Distinct from setting " \
+          "status resolved/false-positive, which KEEPS it in the report." do |s|
+          s.field "id", intprop("issue id"), required: true
+        end
+      end
     end
   end
 end

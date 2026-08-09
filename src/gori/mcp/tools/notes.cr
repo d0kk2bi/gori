@@ -109,6 +109,33 @@ module Gori
           end
         end)
       end
+
+      # The tools/list schemas for the note tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_notes_tools(j : JSON::Builder) : Nil
+        tool j, "list_notes", "List all project notes (markdown/text documents) with metadata like title and line count." { }
+
+        tool j, "get_note", "Get the full text and metadata of a specific note by its database ID." do |s|
+          s.field "id", intprop("database note ID"), required: true
+        end
+
+        return unless @allow_actions
+
+        tool j, "create_note", "Create a new note with optional text content." do |s|
+          s.field "text", strprop("initial text content for the new note")
+        end
+
+        tool j, "update_note", "Update the text content of an existing note by its database ID." do |s|
+          s.field "id", intprop("database note ID to update"), required: true
+          s.field "text", strprop("new text content for the note"), required: true
+        end
+
+        tool j, "delete_note", "Delete a note by its database ID." do |s|
+          s.field "id", intprop("database note ID to delete"), required: true
+        end
+      end
     end
   end
 end

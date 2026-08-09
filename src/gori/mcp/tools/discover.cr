@@ -313,6 +313,62 @@ module Gori
         return not_found("no discover job #{id}") unless job
         job_project_mismatch(job) || job
       end
+
+      # The tools/list schemas for the Discover tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_discover_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "discover_start",
+          "Spider a target and brute-force unlinked directories/paths (like Burp's crawl + " \
+          "content discovery / ZAP's spider + forced browse). Follows links AND probes a " \
+          "built-in path wordlist, with per-directory soft-404 calibration to keep false " \
+          "positives down. Discovered endpoints are written into the project so list_sitemap / " \
+          "get_flow see them. Returns a job_id immediately (poll with discover_status / " \
+          "discover_results; end with discover_stop). ACTIVE: sends many real outbound requests. " \
+          "Capped at #{DISCOVER_MAX_REQUESTS} requests / #{DISCOVER_MAX_CONCURRENCY} concurrency." do |s|
+          s.field "url", strprop("seed URL (scheme+host, optionally a path subtree to confine to)"), required: true
+          s.field "spider", boolprop("follow links (default true)")
+          s.field "bruteforce", boolprop("brute-force directory/path names (default true)")
+          s.field "max_depth", intprop("spider depth from the seed (default 4, max #{DISCOVER_MAX_DEPTH})")
+          s.field "wordlist", strprop("path to an extra path wordlist (merged with the built-in list)")
+          s.field "extensions", strprop("comma list of extensions to also probe (e.g. php,json,bak)")
+          s.field "headers", objprop("custom request-header name->value map added to every probe (e.g. Authorization/Cookie); overrides Accept/User-Agent, Host/Connection are ignored")
+          s.field "containment", strprop("boundary: same-origin | scope-aware (default) | host+subdomains")
+          s.field "concurrency", intprop("parallel requests (default 20, max #{DISCOVER_MAX_CONCURRENCY})")
+          s.field "rate", intprop("requests/sec cap (0 = unlimited)")
+          s.field "timeout_ms", intprop("per-request connect + idle timeout in milliseconds")
+          s.field "retries", intprop("retries per request on a network error")
+          s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+          s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni). The crawler owns its own Host header, so this is the only way to sweep a name-based vhost by IP.")
+          s.field "http2", boolprop("send over HTTP/2 (TLS+ALPN h2, or h2c prior-knowledge on http://) instead of HTTP/1.1 (default false, mirrors CLI --http2)")
+          s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+          s.field "max_requests", intprop("caller cap on total requests")
+          s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection per origin across many probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is the largest cost of a brute-force pass. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")
+          s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED for an out-of-scope target, or when no scope is configured")
+        end
+
+        tool j, "discover_status", "Counts + state of a discover job (running|done|budget_exhausted|stopped|error), " \
+                                   "including the FP/FN figures (calibrated_out / *_suppressed). " \
+                                   "budget_exhausted means max_requests halted the run with tasks still queued — a " \
+                                   "partial sweep, NOT an exhaustive one; see incomplete_reason and queued." do |s|
+          s.field "job_id", strprop("id from discover_start"), required: true
+        end
+
+        tool j, "discover_results",
+          "Paged discovered endpoints for a discover job (url, method, status, length, content_type, source, depth, confidence). " \
+          "has_more is about THIS page; incomplete_reason says whether the RUN covered everything it queued." do |s|
+          s.field "job_id", strprop("id from discover_start"), required: true
+          s.field "offset", intprop("start row (default 0)")
+          s.field "limit", intprop("max rows (default 100, max 1000)")
+        end
+
+        tool j, "discover_stop", "Stop a running discover job (in-flight requests finish)." do |s|
+          s.field "job_id", strprop("id from discover_start"), required: true
+        end
+      end
     end
   end
 end

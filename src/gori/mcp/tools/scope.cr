@@ -138,6 +138,50 @@ module Gori
           end
         end)
       end
+
+      # The tools/list schemas for the scope & sandbox tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_scope_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "add_scope_rule",
+          "Add a scope include/exclude rule (the Target/Sitemap ⇧S lens, and the intercept " \
+          "gate). Deduped on the kind/match_type/pattern triple." do |s|
+          s.field "kind", strprop("include | exclude (default include)")
+          s.field "match_type", strprop("host | string | regex (default host)")
+          s.field "pattern", strprop("host: exact/subdomain/'*' glob; string: substring of scheme://host/target; regex: over the same (case-sensitive; use (?i) to opt out)"), required: true
+        end
+
+        tool j, "delete_scope_rule", "Delete a scope rule by id (see list_scope)." do |s|
+          s.field "id", intprop("scope rule id"), required: true
+        end
+
+        tool j, "set_scope_enabled",
+          "Turn the scope lens/gate on or off (the rules themselves are untouched)." do |s|
+          s.field "enabled", boolprop("true = filter to in-scope; false = show/allow everything"), required: true
+        end
+
+        tool j, "set_sandbox",
+          "Turn the HARD-CONTAINMENT sandbox gate on or off — the headless equivalent of the " \
+          "TUI Project NETWORK pane toggle. When ON, the capture proxy forwards ONLY requests " \
+          "the scope allows and BLOCKS everything else; with NO include rule it blocks ALL " \
+          "captured traffic (reported as blocks_all). Distinct from set_scope_enabled, which is " \
+          "only the display lens. See list_scope for the current state." do |s|
+          s.field "enabled", boolprop("true = block every request the scope does not allow; false = stop blocking"), required: true
+        end
+
+        tool j, "update_scope_rule",
+          "Edit an existing scope rule in place (ids from list_scope). Every field defaults " \
+          "to the rule's current value, so you can change just the pattern. Prefer this over " \
+          "delete + re-add, which changes the id and briefly drops the rule from the gate." do |s|
+          s.field "id", intprop("scope rule id"), required: true
+          s.field "kind", strprop("include|exclude (default: unchanged)")
+          s.field "match_type", strprop("host|string|regex (default: unchanged)")
+          s.field "pattern", strprop("new pattern (default: unchanged)")
+        end
+      end
     end
   end
 end

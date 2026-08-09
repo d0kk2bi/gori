@@ -44,6 +44,25 @@ module Gori
       rescue ex : Gori::Error
         err(ex.message || "import failed", "INVALID_ARGUMENT")
       end
+
+      # The tools/list schemas for the import tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_import_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "import_flows",
+          "Bulk-import flows into the project's History from a HAR export, a URL list, an " \
+          "OpenAPI/Swagger spec, a Postman Collection v2 or Insomnia v4 export, or a Burp Suite " \
+          "item export — the MCP equivalent of `gori run import`. `path` is read from " \
+          "the MCP SERVER's local filesystem (this process runs locally, same trust boundary as " \
+          "send_request). Only `har` and `burp` carry responses; the rest import request " \
+          "templates with no response." do |s|
+          s.field "kind", strprop("har | urls | oas | postman | insomnia | burp"), required: true
+          s.field "path", strprop("filesystem path to the source file"), required: true
+        end
+      end
     end
   end
 end

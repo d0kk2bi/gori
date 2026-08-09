@@ -273,6 +273,91 @@ module Gori
       private def emit_extra(j : JSON::Builder, extra : Hash(String, JSON::Any)?) : Nil
         extra.try &.each { |k, v| j.field k, v }
       end
+
+      # The tools/list schemas for the live-intercept tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_intercept_tools(j : JSON::Builder) : Nil
+        tool j, "intercept_list",
+          "List HTTP messages currently HELD by the live intercept queue of the capturing " \
+          "gori instance, plus intercept state (enabled/direction/filter) and a liveness " \
+          "heartbeat. This is how an agent 'sits in the loop' alongside the human — inspect " \
+          "held requests/responses, then forward/drop/edit them (see intercept_forward etc). " \
+          "available:false when no bridge has ever been published; capturing:false (with a " \
+          "growing heartbeat_age_seconds) when the last capturing instance is no longer live, " \
+          "in which case mutating verbs refuse. Header values redacted unless " \
+          "include_sensitive:true." do |s|
+          s.field "include_sensitive", boolprop("show Authorization/Cookie/etc header values instead of [REDACTED] (default false)")
+        end
+
+        tool j, "intercept_get",
+          "Full detail for ONE held intercept item (redacted head + body size). Pass " \
+          "include_sensitive:true to ALSO get the full raw message base64 (unredacted; edit it " \
+          "and send it back as intercept_forward_edit's raw_base64 for a byte-exact round " \
+          "trip) — otherwise raw is withheld " \
+          "(raw_redacted:true) since base64 is not redaction. NOT_FOUND if the item was " \
+          "already forwarded/dropped or never held. Header values redacted unless " \
+          "include_sensitive:true." do |s|
+          s.field "item_id", intprop("held item id from intercept_list"), required: true
+          s.field "include_sensitive", boolprop("show sensitive header values instead of [REDACTED] (default false)")
+        end
+
+        return unless @allow_actions
+
+        tool j, "intercept_forward",
+          "Forward a currently-held intercept item (from intercept_list) byte-exact, letting " \
+          "the request/response continue. The action is applied by the capturing gori instance " \
+          "and surfaced as a visible notification to the human operator. Returns the outcome " \
+          "(forwarded | no_such_item if it was already released | not_confirmed to retry)." do |s|
+          s.field "item_id", intprop("held item id from intercept_list"), required: true
+        end
+
+        tool j, "intercept_drop",
+          "Drop a currently-held intercept item: the proxy answers the client a canned 502 and " \
+          "the message never reaches its destination. Applied by the capturing instance and " \
+          "surfaced to the human. Returns dropped | no_such_item | not_confirmed." do |s|
+          s.field "item_id", intprop("held item id from intercept_list"), required: true
+        end
+
+        tool j, "intercept_forward_edit",
+          "Forward a held intercept item with EDITED bytes. Supply the full replacement wire " \
+          "message in EITHER `raw_base64` (byte-exact; the round trip for the bytes " \
+          "intercept_get returns as raw_base64, and the only channel a binary body survives) " \
+          "OR `raw` (plain text, for an ordinary edit). Content-Length is recomputed to match " \
+          "the body by default; pass update_content_length:false to forward your framing " \
+          "headers untouched (a CL/TE desync). Otherwise the bytes are forwarded byte-exact " \
+          "(NO variable expansion — a " \
+          "security tool forwards exactly what you send). In `raw`, a lone LF in the HEADER " \
+          "block becomes CRLF so a hand-typed message still frames; the BODY is untouched. " \
+          "Applied by the capturing instance + surfaced to the human. Returns " \
+          "forwarded (edited:true, content_length_synced) | no_such_item | not_confirmed." do |s|
+          s.field "item_id", intprop("held item id from intercept_list"), required: true
+          s.field "raw", strprop("the full edited HTTP wire message as text (request/status line + headers + body)")
+          s.field "raw_base64", strprop("the full edited wire message, base64 — byte-exact; use this for a binary body")
+          s.field "update_content_length", boolprop("recompute Content-Length to match the edited body (default true). Set FALSE to hold your own value — a Content-Length shorter or longer than the body, or Content-Length alongside Transfer-Encoding, is the canonical request-smuggling primitive and the reason to hold a request at all. With it false, `raw_base64` really is byte-exact end to end.")
+        end
+
+        tool j, "intercept_toggle",
+          "Enable or disable the live intercept catch (desired state — idempotent). NOTE: " \
+          "enabling only affects NEW connections; an already-established HTTP/2 connection " \
+          "stays un-held. Applied by the capturing instance. Returns toggled | busy." do |s|
+          s.field "enable", boolprop("true = start holding matching traffic; false = stop (auto-forwards anything currently held)"), required: true
+        end
+
+        tool j, "intercept_set_filter",
+          "Set the conditional-intercept filter — a gori-QL-like query that NARROWS which " \
+          "in-flight messages are held (e.g. 'host:api.example.com method:POST'). Empty " \
+          "clears it (hold everything in scope). Applied by the capturing instance." do |s|
+          s.field "query", strprop("filter query; empty string clears the filter"), required: true
+        end
+
+        tool j, "intercept_set_direction",
+          "Set which leg(s) intercept holds: both | request | response. Applied by the " \
+          "capturing instance." do |s|
+          s.field "direction", strprop("both | request | response"), required: true
+        end
+      end
     end
   end
 end
