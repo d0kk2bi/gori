@@ -10,7 +10,7 @@ group = "워크벤치"
 **JWT** 탭은 JSON Web Token을 위한 워크벤치입니다. 토큰을 디코드하고, claim을 편집해 재서명하며, 서버를 상대로 테스트할 고전적인 공격 페이로드를 생성합니다. 파트를 보여주기만 하는 [Decoder](/ko/guide/decoder/)의 읽기 전용 `jwt-decode` 컨버터보다 한 걸음 더 나아갑니다.
 
 <figure class="tui-shot">
-  <img src="/images/tui/jwt.svg" alt="디코드된 HS256 토큰을 보여주는 gori JWT 탭: INPUT 토큰, 디코드된 header JSON, 그리고 alg=none 대소문자 변형과 signature 제거를 포함한 23개 공격 페이로드의 ATTACKS 목록">
+  <img src="/images/tui/jwt.svg" alt="디코드된 HS256 토큰을 보여주는 gori JWT 탭: ^T:→ENCODE 렌즈 칩이 달린 INPUT 토큰, 디코드된 header JSON, 그리고 alg=none 대소문자 변형과 signature 제거를 포함한 23개 공격 페이로드의 ATTACKS 목록">
   <figcaption><strong>JWT</strong> 탭은 토큰을 실시간으로 디코드하고(header, payload, signature), 바로 보낼 수 있는 공격 페이로드(alg:none, weak-secret, header injection)를 나열합니다.</figcaption>
 </figure>
 
@@ -18,7 +18,7 @@ group = "워크벤치"
 
 ## 두 개의 렌즈 {#two-lenses}
 
-하나의 세션, 두 개의 뷰이며 `Ctrl-E`로 전환합니다:
+하나의 세션, 두 개의 뷰이며 `Ctrl-T`로 전환합니다. 각 렌즈의 최상위 카드 테두리에 전환 칩이 있습니다 — INPUT에는 ` ^T:→ENCODE `, HEADER에는 ` ^T:→DECODE ` — 클릭해도 키와 똑같이 동작합니다:
 
 - **Decode**: INPUT에 토큰을 붙여 넣으면 header, payload, signature가 실시간으로 디코드됩니다. 그 아래에는 생성된 **공격 페이로드**를 고를 수 있는 목록이 있습니다.
 - **Encode**: HEADER와 PAYLOAD를 JSON으로 편집하고, 알고리즘을 선택하며(`Ctrl-A`로 `HS256` / `HS384` / `HS512` / `none` 순환), SECRET을 설정하면 재서명된 토큰이 OUTPUT에 실시간으로 나타납니다.
