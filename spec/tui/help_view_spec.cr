@@ -54,7 +54,9 @@ describe Gori::Tui::HelpView do
     backend.contains?("hahwul").should be_true
     backend.contains?("Hwan Lee").should be_true
     backend.contains?(Gori::REPOSITORY_URL).should be_true
-    # Same ink as the project-picker brand mark (a few solid blocks).
-    backend.contains?("█").should be_true
+    # Same ink as the project-picker brand mark. Asserted against Brand::ART itself
+    # so restyling the mark can't quietly stop it being drawn: the bottom arc is one
+    # unbroken run of glyphs, so it lands in the grid as a single contiguous string.
+    backend.contains?(Brand::ART.last.lstrip).should be_true
   end
 end

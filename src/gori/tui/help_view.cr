@@ -308,7 +308,7 @@ module Gori::Tui
       return if rect.empty?
       # Text stack under the art: wordmark · version · blank · byline · github
       text_h = 5
-      show_art = rect.h >= Brand::ART_H + ART_GAP + text_h + 1 && rect.w >= 32
+      show_art = rect.h >= Brand::ART_H + ART_GAP + text_h + 1 && rect.w >= Brand::ART_MIN_W + 6
       block_h = show_art ? Brand::ART_H + ART_GAP + text_h : text_h
       top = rect.y + {(rect.h - block_h) // 2, 0}.max
 

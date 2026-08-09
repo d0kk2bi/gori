@@ -1004,8 +1004,8 @@ module Gori::Tui
 
     # Entrance effect — three phases on one frame clock (~50 ms/frame, the idle poll):
     #   1. Wave reveal: a diagonal front (top-left → bottom-right) materialises the
-    #      art; each cell ramps ░▒▓ while its colour fades from near-canvas up to
-    #      the gold, then locks to a solid block.
+    #      art; each cell scrambles through ART_NOISE while its colour fades from
+    #      near-canvas up to the gold, then settles on the mark's own block.
     #   2. Glint: a narrow bright band sweeps the same diagonal once — light
     #      catching the finished gold mark.
     #   3. The wordmark, then the tagline, fade in beneath it (see render_list).
@@ -1013,11 +1013,22 @@ module Gori::Tui
     # the entrance. ART_ANIM_DONE is the frame at which everything has resolved —
     # the run loop freezes @art_frame there, and past it the same code paints the
     # identical static logo (band swept out, full gold, text at full strength).
-    ART_SHADES    = {'░', '▒', '▓'}
+    #
+    # ART_NOISE is where the mark's personality lives: the resting figure is plain
+    # blocks (legible, font-proof, same as the SVG — see Brand::ART), so the
+    # scatter goes into the one second it takes to arrive. One band per reveal
+    # stage, ordered light → heavy, so the cell still reads as ink accumulating
+    # the way the old ░▒▓ ramp did while looking like noise resolving into a ring.
+    # ASCII only: these land in real cells, so a two-cell glyph would smear the row.
+    ART_NOISE = {
+      {'.', ':', '\'', '`', ',', ';', '-'},
+      {'+', '=', '*', '?', '/', '\\', '|', '<', '>'},
+      {'#', '%', '&', '@', '8', '$', 'W', 'M'},
+    }
     ART_ROW_SLOPE = 2 # diagonal metric d = col + row * SLOPE — the front's tilt
     ART_STAGGER   = 4 # d-units the wave front advances per frame
     ART_MAX_D     = BRAND_ART.map_with_index { |line, row| line.rstrip.size - 1 + row * ART_ROW_SLOPE }.max
-    REVEAL_DONE   = ART_MAX_D // ART_STAGGER + ART_SHADES.size + 1
+    REVEAL_DONE   = ART_MAX_D // ART_STAGGER + ART_NOISE.size + 1
     GLINT_BAND    = 6 # width of the light band, in d-units
     GLINT_SPEED   = 7 # d-units the band advances per frame
     GLINT_DONE    = REVEAL_DONE + (ART_MAX_D + GLINT_BAND) // GLINT_SPEED + 1
@@ -1040,8 +1051,18 @@ module Gori::Tui
     # The art is a nicety, not load-bearing — only show it when the terminal is
     # tall enough to keep a usable project list beneath this taller logo and wide
     # enough to fit the block without clipping; otherwise fall back to the wordmark.
+    #
+    # Both bounds derive from the figure, because it gets redrawn and a literal
+    # stops matching it. Height: `card_metrics` spends `ART_H + 4` rows on the
+    # brand block and 10 more on the card's chrome and margins, so `ART_H + 18`
+    # is the shortest terminal that still leaves 4 project rows — go lower and the
+    # card slides under the hint row. Width: ART_MIN_W plus a little air, so the
+    # figure never sits flush against both edges.
+    ART_MIN_H = Brand::ART_H + 18
+    ART_MIN_W = Brand::ART_MIN_W + 6
+
     def self.art_shown?(w : Int32, h : Int32) : Bool
-      h >= 26 && w >= 32
+      h >= ART_MIN_H && w >= ART_MIN_W
     end
 
     # Rows reserved above the picker card for the brand block. With the art the
@@ -1541,10 +1562,11 @@ module Gori::Tui
     # colour so it reads as a logo mark distinct from the wordmark beneath it.
     #
     # `frame` drives the entrance (see the timeline constants above): the diagonal
-    # wave front reveals cells by their d-coordinate, each ramping ░▒▓ and fading
-    # up to the gold before locking solid; the glint band then sweeps the same
-    # diagonal once. Past ART_ANIM_DONE every cell is solid gold, so the same
-    # call renders the final static logo.
+    # wave front reveals cells by their d-coordinate, each scrambling through
+    # ART_NOISE and fading up to the gold before settling on the figure's own
+    # glyph; the glint band then sweeps the same diagonal once. Past ART_ANIM_DONE
+    # every cell has settled, so the same call renders the final static logo — the
+    # one Help → About draws.
     private def draw_brand_art(screen : Screen, y : Int32, w : Int32, frame : Int32) : Nil
       x = {(w - ART_INK_W) // 2 - ART_LEFT, 0}.max
       BRAND_ART.each_with_index do |line, i|
@@ -1553,19 +1575,33 @@ module Gori::Tui
           d = col + i * ART_ROW_SLOPE
           prog = frame - d // ART_STAGGER
           next if prog <= 0 # not yet reached by the wave front
-          glyph, fg = art_cell(prog)
-          fg = glint_tint(d, frame, fg) if glyph == '█'
+          settled = prog > ART_NOISE.size
+          glyph, fg = art_cell(prog, ch, col, i, frame)
+          fg = glint_tint(d, frame, fg) if settled
           screen.cell(x + col, y + i, glyph, fg, Theme.bg, attr: Attribute::Bold)
         end
       end
     end
 
-    # Shade + colour for a cell `prog` frames after the wave front reached it:
-    # ░▒▓ ramping from a dim gold up toward full strength, then a solid block.
-    private def art_cell(prog : Int32) : {Char, Color}
-      return {'█', Theme.focus_gold} if prog > ART_SHADES.size
-      t = 0.35 + 0.65 * prog / (ART_SHADES.size + 1)
-      {ART_SHADES[prog - 1], Theme.blend(Theme.focus_gold, Theme.bg, t)}
+    # Glyph + colour for a cell `prog` frames after the wave front reached it: a
+    # scrambled ART_NOISE glyph from the band matching the stage, colour ramping
+    # from a dim gold up toward full strength, then the art's own glyph `ch`.
+    private def art_cell(prog : Int32, ch : Char, col : Int32, row : Int32, frame : Int32) : {Char, Color}
+      return {ch, Theme.focus_gold} if prog > ART_NOISE.size
+      t = 0.35 + 0.65 * prog / (ART_NOISE.size + 1)
+      {noise_glyph(col, row, frame, prog - 1), Theme.blend(Theme.focus_gold, Theme.bg, t)}
+    end
+
+    # A cell's scramble glyph. A pure hash of (col, row, frame, band) the way
+    # star_hash is of (x, y): the reveal repaints several times per frame on a
+    # resize or an overlay redraw, and a stored/random pick would make the same
+    # frame render differently each time.
+    private def noise_glyph(col : Int32, row : Int32, frame : Int32, band : Int32) : Char
+      h = (col.to_u32! &* 0x9E3779B1_u32) ^ (row.to_u32! &* 0x85EBCA77_u32) ^ (frame.to_u32! &* 0xC2B2AE3D_u32)
+      h ^= h >> 15
+      h &*= 0x27D4EB2F_u32
+      set = ART_NOISE[band]
+      set[((h ^ (h >> 13)) % set.size.to_u32)]
     end
 
     # 0..1 progress of a text fade that starts at frame `start` and spans TEXT_FADE.

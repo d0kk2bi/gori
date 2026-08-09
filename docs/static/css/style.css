@@ -260,7 +260,9 @@ img {
    --grad-gold-leaf used elsewhere. --logo-src is set inline in the template to
    carry base_url. */
 .logo-mark {
-  width: 2.75rem;
+  /* Square: the mark ships on a square canvas, so a wider box would just pad it
+     with dead space. */
+  width: 2.5rem;
   height: 2.5rem;
   background: var(--grad-logo);
   -webkit-mask: var(--logo-src) center / contain no-repeat;

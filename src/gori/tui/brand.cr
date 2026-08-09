@@ -6,22 +6,50 @@ module Gori::Tui
   # fixed multi-line figure; ink extent (leftmost stroke, inked width) drives
   # optical centering so the visible shape — not its leading spaces — is centred.
   module Brand
+    # The interlocked rings of the gori logo (docs/static/images/gori.svg), hand
+    # drawn at 32 cells over 16 rows. A terminal cell is about half as wide as it
+    # is tall, so that reads as a roughly square figure — the mark's own artwork is
+    # 1365×1193 (1.14:1), close enough that it reads as the logo rather than a
+    # stretched copy. It is deliberately big: at the ~20×9 the mark was drawn at
+    # before, the two rings collapsed into a blob and stopped reading as rings.
+    # The size is what costs the height gate — see ProjectPicker.art_shown?.
+    #
+    # Solid blocks, not scattered glyphs. The strokes are one or two cells thick,
+    # so any mix of glyph weights reads as broken lines rather than arcs, and `█`
+    # is the one glyph whose ink and advance are identical in every font — which
+    # also keeps this the same mark as the SVG/favicon everywhere else. The noise
+    # belongs in the picker's entrance instead (see ART_NOISE there).
+    #
+    # Every glyph must measure one cell (see spec/tui/brand_art_spec.cr): the
+    # draw places glyph N of a line at column N, so a two-cell grapheme would
+    # shear its row and pull the rings apart.
     ART = [
-      "            ██    █",
-      "           █     █        █",
-      "            ████     ███████",
-      "         ██    ███        █",
-      "       █    ██          ██ █",
-      "      █  ██           ██  █",
-      "     █  █               █",
-      "     ██         █",
-      "      █ ████      ██ █",
-      "       ████████ █   ██",
+      "                    █████",
+      "               ██████ ██████",
+      "            ███          █████",
+      "         ███████          ████",
+      "      ████       █████    █████",
+      "     ███               █ ██████",
+      "    ████           ██   ██████",
+      "    █████              ██████",
+      "  █ ██████            ██████  █",
+      " ██  ██████         ███████   ███",
+      " ██   ████████    ████████  █  ██",
+      " ██     ████████████████       ██",
+      " ████     ████████████      █████",
+      "  █████████████████  ███████████",
+      "   █████████████  █████████████",
+      "                       ████",
     ]
 
     ART_H     = ART.size
     ART_LEFT  = ART.min_of { |line| line.size - line.lstrip.size }
     ART_INK_W = ART.max_of(&.rstrip.size) - ART_LEFT
+    # Narrowest width that still seats the figure. Below it `art_origin_x` clamps
+    # to 0 and the block's right edge runs off the pane, so this is the floor
+    # every surface gates on — derived, because the figure gets redrawn and a
+    # hardcoded column count silently stops matching it.
+    ART_MIN_W = ART_INK_W + 2 * ART_LEFT
 
     AUTHOR  = "hahwul (Hwan Lee)"
     BYLINE  = "made by #{AUTHOR}"
