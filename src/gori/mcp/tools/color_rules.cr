@@ -264,7 +264,7 @@ module Gori
         if scope.global?
           return busy("colour rule NOT moved (settings not writable)") unless Settings.move_colormarker_rule(id, dir)
         else
-          store.move_color_rule(id, dir)
+          return busy("colour rule NOT moved (project busy) — the precedence order is unchanged") unless store.move_color_rule(id, dir)
         end
         Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "scope", scope.label; j.field "moved", dir_s } })
       end
@@ -328,6 +328,38 @@ module Gori
           j.object do
             j.field "name", norm.try(&.name) || name.strip.downcase
             j.field "hex", norm.try(&.hex) || hex
+          end
+        end)
+      end
+
+      # Edit a custom colour in place. Present because `Settings.update_colormarker_color` had
+      # exactly one caller — the TUI's colour editor — so an agent could add and delete a colour
+      # but never recolour one, and delete + re-add is NOT the same action: between the two every
+      # rule naming the colour, in this project and in every other one, paints a fallback hue.
+      #
+      # Both editable fields default to the current value, so `hex` alone recolours and
+      # `new_name` alone renames. The registry is the arbiter of legality and uniqueness.
+      private def update_custom_color(h) : Result
+        name = str(h, "name")
+        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        key = name.strip.downcase
+        current = Settings.colormarker_colors.find { |c| c.name == key }
+        return not_found("no custom colour named '#{key}'") unless current
+        new_name = str(h, "new_name")
+        hex = str(h, "hex")
+        if new_name.nil? && hex.nil?
+          return err("pass 'new_name' and/or 'hex' — there is nothing else to change",
+            "INVALID_ARGUMENT", field: "hex")
+        end
+        if msg = Settings.update_colormarker_color(key, new_name || current.name, hex || current.hex)
+          return err(msg, "INVALID_ARGUMENT", field: new_name ? "new_name" : "hex")
+        end
+        after = Settings.colormarker_colors.find { |c| c.name == (new_name || current.name).strip.downcase }
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "name", after.try(&.name) || key
+            j.field "hex", after.try(&.hex) || current.hex
+            j.field "renamed_from", key if after && after.name != key
           end
         end)
       end

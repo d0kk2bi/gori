@@ -353,7 +353,21 @@ module Gori::Tui
       if engine.move(rule.id, dir, rule.scope)
         move_sel(dir)
         @host.status("precedence changed — the first enabled match paints the row")
+      elsif !at_scope_edge?(rule, dir)
+        # Not an edge, so the reorder was refused by the store / settings write. Say so: a
+        # silent no-op here reads exactly like "the rule is already at the top".
+        @host.status("precedence NOT changed (project busy or settings not writable)")
       end
+    end
+
+    # Whether the rule already sits at the first/last slot of its own scope block, where `move`
+    # legitimately answers false without attempting a write.
+    private def at_scope_edge?(rule : Store::ColorRule, dir : Int32) : Bool
+      scoped = rule_list.select { |r| r.scope == rule.scope }
+      i = scoped.index { |r| r.id == rule.id }
+      return true unless i
+      j = i + (dir < 0 ? -1 : 1)
+      j < 0 || j >= scoped.size
     end
 
     def colormarker_duplicate : Nil

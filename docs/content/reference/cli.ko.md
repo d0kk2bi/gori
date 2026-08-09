@@ -72,7 +72,7 @@ gori run <subcommand> [options]
 | `issues` · `create` · `update` | 이슈 목록 / 내보내기, 또는 이슈 작성 |
 | `links` · `add` · `delete` | 이슈나 노트에서 플로우, Repeater 세션, 잡으로 이어지는 증거 포인터 |
 | `rewriter` · `add` · `rm` · `enable` · `disable` · `preview` | Match & Replace 규칙 관리 |
-| `colormarker` · `add` · `rm` · `enable` · `disable` · `move` · `preview` | History 행 색상 규칙 관리 |
+| `colormarker` · `add` · `rm` · `enable` · `disable` · `move` · `preview` · `color` | History 행 색상 규칙 관리 |
 | `project [list]` | 알려진 프로젝트 목록 |
 | `project create <name>` | 이름으로 프로젝트 생성 (같은 이름이면 다시 열기) |
 | `project delete <name>` | 프로젝트와 그 안에 캡처된 모든 것 삭제 (`--yes`로 확인) |
@@ -519,6 +519,23 @@ gori run colormarker rm 3
 `preview`는 조건이 최근 flow 중 몇 개에 **매칭**되는지와, 실제로 몇 개를 **칠하게** 되는지를 함께 보고합니다. 앞선 활성 규칙이 이미 그 행을 차지했다면 두 숫자가 달라집니다. `rm`(`delete`), `enable`, `disable`, `move`는 목록의 규칙 id와 `--scope`를 받습니다. 두 저장소가 서로 독립적으로 번호를 매기므로 id만으로는 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 스코프를 `G`/`P` 접두사로 출력합니다(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻).
 
 탭은 **기본적으로 숨겨져 있습니다.** `settings:tabs`에서 Rewriter 옆에 표시할 수 있습니다. 대화형 편집기는 [프록시 & History](/ko/guide/proxy/)를 참고하세요.
+
+#### colormarker color {#run-colormarker-color}
+
+**사용자 색상 팔레트**입니다. 내장 6색 위에 얹어 모든 프로젝트의 색상 선택기에 함께 제공되는 이름 있는 색상입니다. 내장 색은 활성 테마를 거쳐 해석되므로 밝은 팔레트와 어두운 팔레트 양쪽에서 제대로 읽히지만, 사용자 색상은 절대 hex 값을 그대로 지니며 테마를 따라가지 않습니다. 팔레트가 주지 않는 색조를 얻는 대신 치르는 대가입니다. 색상은 `settings.json`(`colormarker.colors`)에 저장되므로 태생적으로 전역입니다.
+
+```bash
+gori run colormarker color list
+gori run colormarker color add --name hotpink --hex '#ff69b4'
+gori run colormarker color update hotpink --hex '#e0559b'   # 이름은 두고 색만 변경
+gori run colormarker color update hotpink --name fuchsia    # 색은 두고 이름만 변경
+gori run colormarker color rm fuchsia
+gori run colormarker add --when 'method:DELETE' --color hotpink
+```
+
+이름이 곧 식별자입니다. 규칙의 `--color`에 저장되는 값이자 선택기에 보이는 값이므로 소문자로 정규화되고, 중복될 수 없으며, 내장 색 이름과 같을 수 없습니다. `update`는 두 옵션 중 하나만 줘도 됩니다.
+
+색상을 지우거나 **이름을 바꿔도** 그 색을 쓰던 규칙은 의도적으로 고쳐 쓰지 않습니다. 규칙은 옛 이름을 그대로 들고 있다가 눈에 띄는 기본색으로 대체되어 그려지므로, 같은 이름으로 색을 다시 추가하면 원래대로 돌아옵니다. 이 명령에서 모든 프로젝트의 데이터베이스에 손을 뻗을 수는 없고, 절반만 적용된 연쇄 수정은 이름 하나가 붕 뜨는 것보다 나쁩니다. 색상 값만 바꾸는 경우는 다릅니다. 규칙은 색을 이름으로 참조하므로 어디서든 새 hex를 그대로 따라갑니다.
 
 ### run project {#run-project}
 

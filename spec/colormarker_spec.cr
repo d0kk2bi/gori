@@ -305,6 +305,24 @@ describe Gori::Colormarker do
       end
     end
 
+    # `Store#move_color_rule` returned Nil, so `gori run colormarker move` and MCP
+    # `move_color_rule` printed a successful reorder for a rolled-back write while their GLOBAL
+    # branches reported PROJECT_BUSY — i.e. told the operator a different rule paints the row
+    # than actually does. It answers whether the write COMMITTED now, and false also covers
+    # "nothing moved", which is what both surfaces already had to distinguish.
+    it "answers whether the project reorder actually landed" do
+      with_store do |store|
+        a = store.insert_color_rule("host:a", "red", FULL, "a")
+        b = store.insert_color_rule("host:b", "blue", FULL, "b")
+        store.move_color_rule(b, -1).should be_true
+        store.color_rules.map(&.name).should eq(["b", "a"])
+        # an edge of the list and an id that is not there both mean "nothing moved"
+        store.move_color_rule(b, -1).should be_false
+        store.move_color_rule(a, 1).should be_false
+        store.move_color_rule(a + b + 99, -1).should be_false
+      end
+    end
+
     it "never reorders across the scope boundary" do
       with_globals do
         with_store do |store|

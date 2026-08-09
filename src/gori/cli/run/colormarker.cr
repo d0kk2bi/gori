@@ -5,15 +5,15 @@ module Gori
     module Run
       private def self.cmd_colormarker(args : Array(String)) : Nil
         case sub = args.first?
-        when "add"          then cmd_colormarker_add(args[1..])
-        when "rm", "delete" then cmd_colormarker_rm(args[1..])
-        when "enable"       then cmd_colormarker_set_enabled(true, args[1..])
-        when "disable"      then cmd_colormarker_set_enabled(false, args[1..])
-        when "move"           then cmd_colormarker_move(args[1..])
-        when "preview"        then cmd_colormarker_preview(args[1..])
+        when "add"             then cmd_colormarker_add(args[1..])
+        when "rm", "delete"    then cmd_colormarker_rm(args[1..])
+        when "enable"          then cmd_colormarker_set_enabled(true, args[1..])
+        when "disable"         then cmd_colormarker_set_enabled(false, args[1..])
+        when "move"            then cmd_colormarker_move(args[1..])
+        when "preview"         then cmd_colormarker_preview(args[1..])
         when "color", "colors" then cmd_colormarker_color(args[1..])
-        when "list"           then cmd_colormarker_list(args[1..])
-        when nil              then cmd_colormarker_list(args)
+        when "list"            then cmd_colormarker_list(args[1..])
+        when nil               then cmd_colormarker_list(args)
         else
           if (s = sub) && s.starts_with?('-')
             cmd_colormarker_list(args)
@@ -21,7 +21,7 @@ module Gori
             STDERR.puts "gori run colormarker: unknown subcommand '#{sub}'"
             STDERR.puts "Usage: gori run colormarker [list options] | add | rm|delete <id> | enable <id> | disable <id>"
             STDERR.puts "       gori run colormarker move <id> --up|--down | preview --when=FILTER"
-            STDERR.puts "       gori run colormarker color list | add --name=NAME --hex=#rrggbb | rm <name>"
+            STDERR.puts "       gori run colormarker color list | add --name=NAME --hex=#rrggbb | update <name> | rm <name>"
             exit 1
           end
         end
@@ -32,14 +32,15 @@ module Gori
       # only, like the rules: a colour paints a row that is already captured.
       private def self.cmd_colormarker_color(args : Array(String)) : Nil
         case sub = args.first?
-        when "add"          then cmd_colormarker_color_add(args[1..])
-        when "rm", "delete" then cmd_colormarker_color_rm(args[1..])
-        when "list", nil    then cmd_colormarker_color_list(sub.nil? ? args : args[1..])
+        when "add"            then cmd_colormarker_color_add(args[1..])
+        when "update", "edit" then cmd_colormarker_color_update(args[1..])
+        when "rm", "delete"   then cmd_colormarker_color_rm(args[1..])
+        when "list", nil      then cmd_colormarker_color_list(sub.nil? ? args : args[1..])
         else
           if (s = sub) && s.starts_with?('-')
             cmd_colormarker_color_list(args)
           else
-            abort "gori run colormarker color: unknown subcommand '#{sub}' (list | add | rm)"
+            abort "gori run colormarker color: unknown subcommand '#{sub}' (list | add | update | rm)"
           end
         end
       end
@@ -87,6 +88,57 @@ module Gori
           abort "gori run colormarker color add: #{err}"
         end
         puts "Custom colour “#{name.strip.downcase}” added — it is offered in every project's picker."
+      end
+
+      # Edit a custom colour in place, keyed by its CURRENT name. Present here (and on MCP)
+      # because `Settings.update_colormarker_color` existed with exactly one caller — the TUI's
+      # colour editor — so a headless operator could add and delete a colour but never recolour
+      # one, and had to delete + re-add instead. That is not the same action: a delete leaves
+      # every rule naming the colour dangling on a fallback hue until the re-add lands, in this
+      # project and in every other one.
+      #
+      # Both fields are optional and default to the colour's current value, so `--hex` alone is
+      # a recolour and `--name` alone is a rename. A rename deliberately does NOT rewrite the
+      # rules that name the old colour — same as a delete, and for the same reason: this surface
+      # cannot reach every project's DB.
+      private def self.cmd_colormarker_color_update(args : Array(String)) : Nil
+        new_name : String? = nil
+        hex : String? = nil
+        positional = [] of String
+        parser = OptionParser.new do |p|
+          p.banner = "Usage: gori run colormarker color update <name> [--name=NEW] [--hex=#rrggbb]\n\n" \
+                     "Edits a global custom colour in place. Rules that name it follow the change;\n" \
+                     "a RENAME leaves them naming the old colour, which then falls back to a visible\n" \
+                     "default (the same trade a delete makes)."
+          p.on("--name=NAME", "Rename the colour (default: unchanged)") { |v| new_name = v }
+          p.on("--hex=HEX", "Recolour it, as #rrggbb (or #rgb) (default: unchanged)") { |v| hex = v }
+          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.invalid_option { |f| abort "gori run colormarker color update: unknown option: #{f}\n#{p}" }
+          p.missing_option { |f| abort "gori run colormarker color update: missing value for #{f}" }
+        end
+        parser.unknown_args { |before, after| positional = before + after }
+        parser.parse(args)
+        abort "gori run colormarker color update: missing <name>" if positional.empty?
+        abort "gori run colormarker color update: too many arguments (expected one <name>)" if positional.size > 1
+        old = positional[0].strip.downcase
+        current = Settings.colormarker_colors.find { |c| c.name == old }
+        abort "gori run colormarker color update: no custom colour named '#{old}'" unless current
+        # Copied out of the OptionParser closure before use: Crystal will not narrow a variable
+        # a block assigns to, so `new_name || …` would stay `String?` at the call below.
+        want_name = new_name
+        want_hex = hex
+        if want_name.nil? && want_hex.nil?
+          abort "gori run colormarker color update: pass --name and/or --hex — there is nothing else to change"
+        end
+        final_name = want_name || current.name
+        if err = Settings.update_colormarker_color(old, final_name, want_hex || current.hex)
+          abort "gori run colormarker color update: #{err}"
+        end
+        after = Settings.colormarker_colors.find { |c| c.name == final_name.strip.downcase }
+        puts "Custom colour “#{after.try(&.name) || old}” updated (#{after.try(&.hex) || current.hex})."
+        if after && after.name != old
+          puts "note: rules still naming “#{old}” keep that reference and fall back to a default colour."
+        end
       end
 
       private def self.cmd_colormarker_color_rm(args : Array(String)) : Nil
@@ -477,7 +529,10 @@ module Gori
             store.close
             abort "gori run colormarker move: rule ##{id} is already at the #{dir < 0 ? "top" : "bottom"} of the project block"
           end
-          store.move_color_rule(id, dir)
+          unless store.move_color_rule(id, dir)
+            store.close
+            abort "gori run colormarker move: project is busy (write did not commit) — the precedence order is unchanged"
+          end
           puts "Colour rule ##{id} moved #{dir < 0 ? "up" : "down"}."
         ensure
           store.close
