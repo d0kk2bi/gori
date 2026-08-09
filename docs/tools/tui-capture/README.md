@@ -67,7 +67,7 @@ caption — it stands for the tool, not for one screen. Decorative glyphs say
 nothing out loud, so the shot passes `SHOT_ARIA` and `ansi2svg.py` writes that
 as the SVG's `aria-label` instead of the title.
 
-It is also the only shot with Miss Ring on (`write_settings <theme> pet`); she
+It is also the only shot with Miss Ring on (`write_settings <theme> companion`); she
 ships off, and the doc scenes document the default install. Her corner is why
 `seed_readme_extra` stops at ten: the flow list has to end a few rows short of
 the bottom or she covers live SIZE/DUR cells.

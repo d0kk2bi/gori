@@ -50,16 +50,16 @@ trap 'tmux kill-session -t goricap 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
 # A minimal settings.json so the first-run wizard is skipped. The theme is
 # rewritten before each palette pass; the seed run below doesn't care which.
-# write_settings <theme> [pet] — pass "pet" to wake Miss Ring in the body's
+# write_settings <theme> [companion] — pass "companion" to wake Miss Ring in the body's
 # bottom-right corner. She ships OFF, so only the hero shot asks for her; the
 # doc scenes document the default install.
 write_settings() {
-  local pet=""
-  if [ "${2:-}" = pet ]; then
-    pet='"pet":{"enabled":true,"placement":"body","motion":"lively","notices":true},'
+  local companion=""
+  if [ "${2:-}" = companion ]; then
+    companion='"companion":{"enabled":true,"placement":"body","motion":"lively","notices":true},'
   fi
   cat > "$GORI_HOME/settings.json" <<JSON
-{"theme":"$1","mouse":true,"pretty_bodies":true,$pet
+{"theme":"$1","mouse":true,"pretty_bodies":true,$companion
  "network":{"bind_host":"127.0.0.1","bind_port":8070,"upstream_proxy":""}}
 JSON
 }
@@ -274,7 +274,7 @@ readme_seeded=0
 shoot_readme() {
   local theme="$1" out="$2"
   OUT="$out"; mkdir -p "$OUT"
-  write_settings "$theme" pet
+  write_settings "$theme" companion
   # Top up once, not once per palette: a second pass would double every extra
   # flow and the light hero would no longer match the dark one.
   if [ "$readme_seeded" = 0 ]; then
@@ -286,11 +286,11 @@ shoot_readme() {
     readme_seeded=1
   fi
   # Keys land fast on purpose: Miss Ring greets on the frame she first appears on and
-  # holds it for Pet::GREET_TTL (8s) from TUI start, and _shoot has already slept 3s
+  # holds it for Companion::GREET_TTL (8s) from TUI start, and _shoot has already slept 3s
   # waiting for the pane. Pad these and the hero loses the speech bubble.
   #
   # AND THE SHOT MUST NOT GO THROUGH THE PROJECT PICKER. The hello is once per PROCESS
-  # (Pet.@@greeted) and she now stands on the picker too, so a preamble=1 run would have
+  # (Companion.@@greeted) and she now stands on the picker too, so a preamble=1 run would have
   # her say it THERE and reach History already greeted — a silent hero, with nothing in
   # the capture to say why. run_scene opens the db directly (`--db`, preamble 0), which
   # is the only reason this still works; keep it that way.

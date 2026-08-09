@@ -67,7 +67,7 @@ require "./palette"
 require "./space_menu"
 require "./jobs"
 require "./notifications"
-require "./pet"
+require "./companion"
 require "./notifications_overlay"
 require "./passthrough_overlay"
 require "./listeners_overlay"
@@ -230,9 +230,9 @@ module Gori::Tui
       # Far-right status-bar readout of gori's own CPU/RSS (settings:display → Resource meter).
       # Samples nothing while disabled; see ResourceMeter for the idle-repaint discipline.
       @resource = ResourceMeter.new
-      # Miss Ring (settings:pet). Off by default; while off she is the same zero-cost
+      # Miss Ring (settings:companion). Off by default; while off she is the same zero-cost
       # no-op the resource meter is, and she stops ticking entirely once she dozes.
-      @pet = Pet.new(@notifications)
+      @companion = Companion.new(@notifications)
       @spinner_frame = 0
       # The Miner config popup (History/Repeater → space → "Mine parameters") rides the
       # Overlay seam (@active_overlay); built fresh each open with an injected commit.
@@ -251,7 +251,7 @@ module Gori::Tui
       @toast = nil.as(String?)         # transient action feedback; nil → show key hints
       # When the toast was set. The status row has ONE text slot and Miss Ring's bar
       # placement also writes to it, so the two are resolved by recency rather than by a
-      # fixed precedence — see #pet_notice for why a fixed one is wrong.
+      # fixed precedence — see #companion_notice for why a fixed one is wrong.
       @toast_at = nil.as(Time::Instant?)
       @outcome = :running # :running | :quit | :back
       # {configured port, port we actually got} when the bind fell back at startup because the
@@ -405,7 +405,7 @@ module Gori::Tui
         # RECORDED, never written back into a config layer. This used to assign the fallback
         # into `Settings.project_bind_port` (a project override, which `apply_project_network`
         # then persists into the project DB) or into `Settings.bind_port` (the GLOBAL
-        # class_property, which any later `Settings.save` — the pet toggle, tabs, hotkeys, env
+        # class_property, which any later `Settings.save` — the companion toggle, tabs, hotkeys, env
         # — flushes into settings.json for the NEXT project to inherit). Either way a
         # transient environmental accident overwrote the port the operator deliberately
         # pinned. See `Runner.port_fallback` for the full invariant.
@@ -455,7 +455,7 @@ module Gori::Tui
             # scrolling tracks the input. Bounded so an infinitely-held key can't
             # starve the render / async-channel drains below.
             keys_drained = drain_burst
-            @pet.wake_on_input # any key/click re-arms Miss Ring's idle clock
+            @companion.wake_on_input # any key/click re-arms Miss Ring's idle clock
             # Tell the stall guard how DENSE this tick was: only a burst means the paste is
             # still streaming. Key events only — see `PasteStall#saw`.
             @paste_stall.saw(Time.instant, keys_drained)
@@ -549,24 +549,24 @@ module Gori::Tui
           # only reports true when the RENDERED string changes, so a parked gori doesn't
           # repaint on a timer just to redraw the same "CPU 0%".
           dirty = true if @resource.tick(now)
-          # TLS passthrough: announce hosts bypassed since the last tick. Before the Pet, so
+          # TLS passthrough: announce hosts bypassed since the last tick. Before the Companion, so
           # a bypass notice reaches her on the same frame it is pushed.
           dirty = true if drain_passthrough_notices
           # Miss Ring: advance the animation beat and pick up new notifications. Like the
           # resource meter above she reports dirty ONLY when the drawn sprite/bubble
-          # changes, and stops reporting at all once she dozes off (Pet::SLEEP_AFTER).
+          # changes, and stops reporting at all once she dozes off (Companion::SLEEP_AFTER).
           # Placed after every controller drain, so a note pushed this tick is announced
           # on THIS frame rather than the next.
           #
           # TICKED UNCONDITIONALLY, but her dirty is gated on her actually being ON SCREEN.
-          # #render_pet drops her outright under any overlay, the space menu and a body
-          # editor (see #pet_visible?), and Pet.place drops her again on a terminal too
+          # #render_companion drops her outright under any overlay, the space menu and a body
+          # editor (see #companion_visible?), and Companion.place drops her again on a terminal too
           # short for her — in every one of those states her `changed` verdict would buy a
           # full frame rebuild that paints not one different cell. Left ungated that is ~1
           # wasted render/second for as long as a modal is up, and for as long as you keep
           # typing in an editor (every keystroke pokes her, so she never dozes there). The
           # tick itself still has to run or the frame she comes back with would be stale.
-          dirty = true if @pet.tick(now) && pet_on_screen?
+          dirty = true if @companion.tick(now) && companion_on_screen?
           # Debounced QL filter: fire the deferred search once typing has paused.
           dirty = true if history_controller.flush_query_reload_if_due(now)
           dirty = true if sitemap_controller.flush_query_reload_if_due(now)
@@ -3368,14 +3368,14 @@ module Gori::Tui
         tabs: vis_tabs, intercept_count: @session.interceptor.pending_count,
         hidden_count: hid_tabs.size, more_focused: @focus == :menu && @menu_more)
       render_body(screen, layout.body)
-      render_pet(screen, layout.body)
+      render_companion(screen, layout.body)
       # One retag for the whole status row: key_hints already funnels the Runner's own
       # hint literals, every overlay/prompt hint AND every controller body_hint, and the
       # toast branch covers the "(^P)" pointers in messages like the bind-failure notice.
       Chrome.render_status(screen, layout.status, focus: focus_label,
         hints: Hotkeys.retag(status_line || key_hints),
         activity: activity_chip, resource: @resource.label, time: clock_label,
-        pet: pet_bar_frame)
+        companion: companion_bar_frame)
       Chrome.render_statusline(screen, layout.statusline, @statusline.segments) unless layout.statusline.empty?
       @palette.render(screen, layout.body) if @overlay.palette?
       @more_menu.try(&.render(screen, more_anchor_rect(layout), layout.body)) if @overlay.tabs_more?
@@ -3592,20 +3592,20 @@ module Gori::Tui
     # prompts) would clip her box and leave an orphaned corner poking out — exactly the
     # failure TrafficEmptyState.suppressed exists to prevent. So the gate hides her
     # outright rather than relying on z-order.
-    private def render_pet(screen : Screen, body : Rect) : Nil
-      return if Settings.pet_in_bar? # she rides the status row instead
-      return unless frame = @pet.frame
-      return unless pet_visible?
-      Pet.draw(screen, body, frame)
+    private def render_companion(screen : Screen, body : Rect) : Nil
+      return if Settings.companion_in_bar? # she rides the status row instead
+      return unless frame = @companion.frame
+      return unless companion_visible?
+      Companion.draw(screen, body, frame)
     end
 
     # The status-bar placement. Nil unless she is both enabled and set to `bar`, which is
     # what keeps the chip out of the run entirely rather than reserving an empty slot.
     # Unlike the body form this needs no visibility gate: the status row is drawn after the
     # body and nothing but the ^F/^G prompts is ever laid over it.
-    private def pet_bar_frame : Mascot::Frame?
-      return nil unless Settings.pet_in_bar?
-      @pet.frame
+    private def companion_bar_frame : Mascot::Frame?
+      return nil unless Settings.companion_in_bar?
+      @companion.frame
     end
 
     # In BAR placement she has no bubble to speak in, so her line goes through the status
@@ -3625,26 +3625,26 @@ module Gori::Tui
     # opposite case right — fresh action feedback while an older notice is still up.
     private def status_line : String?
       toast = @toast
-      notice = Settings.pet_in_bar? ? @pet.frame.try(&.bubble) : nil
+      notice = Settings.companion_in_bar? ? @companion.frame.try(&.bubble) : nil
       return format_status_message(toast) unless notice
       return notice unless toast && (at = @toast_at)
-      @pet.bubble_at.try { |b| b > at } ? notice : format_status_message(toast)
+      @companion.bubble_at.try { |b| b > at } ? notice : format_status_message(toast)
     end
 
     # Will she paint anything at all this frame? This is the gate the run loop puts in front
     # of her `dirty` — see the #tick call site for why her verdict alone is not enough.
     #
-    # Mirrors #render_pet: the bar chip is drawn unconditionally, so it is always on screen;
-    # the body sprite needs the visibility gate below AND a body tall enough for Pet.place to
-    # seat her. Height is the only Pet.place term that can fail from a real Layout — the
-    # narrowest body it produces is 36, comfortably over Pet::MIN_W — and @body_h being one
+    # Mirrors #render_companion: the bar chip is drawn unconditionally, so it is always on screen;
+    # the body sprite needs the visibility gate below AND a body tall enough for Companion.place to
+    # seat her. Height is the only Companion.place term that can fail from a real Layout — the
+    # narrowest body it produces is 36, comfortably over Companion::MIN_W — and @body_h being one
     # frame stale is harmless, since the resize that changed it is itself an event.
-    private def pet_on_screen? : Bool
-      return true if Settings.pet_in_bar?
-      pet_visible? && @body_h >= Pet::MIN_H
+    private def companion_on_screen? : Bool
+      return true if Settings.companion_in_bar?
+      companion_visible? && @body_h >= Companion::MIN_H
     end
 
-    private def pet_visible? : Bool
+    private def companion_visible? : Bool
       return false unless @overlay.none? # palette / detail / tabs_more / every modal
       return false if @space_menu_open || copy_as_shown? || send_to_shown?
       return false if @goto_open || @search_open || @rename_open || @tag_edit_open
@@ -3919,14 +3919,14 @@ module Gori::Tui
       status("screen refreshed")
     end
 
-    def toggle_pet : Nil
-      Settings.pet = !Settings.pet?
+    def toggle_companion : Nil
+      Settings.companion = !Settings.companion?
       saved = Settings.save
-      @pet.wake_on_input
+      @companion.wake_on_input
       # The toggle has ALREADY applied in memory either way, so a failed save must still
       # report the new state — "could not save" alone reads as though nothing happened.
       # Same shape as the tabs/hotkeys/env/hosts toasts.
-      shown = Settings.pet? ? "Miss Ring is here" : "Miss Ring hidden"
+      shown = Settings.companion? ? "Miss Ring is here" : "Miss Ring hidden"
       status(saved ? shown : "#{shown} — could not save to #{Settings.path}")
     end
 
@@ -4078,7 +4078,7 @@ module Gori::Tui
     # Announce hosts newly added to the session-global passthrough inventory
     # (Settings.passthrough_hosts) as notifications. The inventory is written by PROXY fibers
     # and Notifications#push is main-fiber-only by contract, so this is a per-tick diff of a
-    # cheap monotonic marker — the same shape the Pet uses against `latest_id` — not a direct
+    # cheap monotonic marker — the same shape the Companion uses against `latest_id` — not a direct
     # call from the proxy.
     #
     # The high-water mark starts at whatever the inventory already holds (see the initializer),
@@ -5770,7 +5770,7 @@ module Gori::Tui
     # to the modal) would behave differently.
     private def open_settings_section(section : Symbol, back : PreferencesOverlay?) : Nil
       case section
-      when :network, :editor, :keys, :layout, :statusline, :display, :pet, :notifications, :general
+      when :network, :editor, :keys, :layout, :statusline, :display, :companion, :notifications, :general
         open_preferences(section)                       # the unified grouped modal, positioned at this section
       when :theme   then open_overlay(theme_card(back)) # theme keeps its dedicated swatch-list card
       when :tabs    then open_overlay(tabs_editor(back))
@@ -5900,13 +5900,13 @@ module Gori::Tui
     # :theme/:layout/:display refresh live; the mouse + pretty-print toggles always re-sync.
     def apply_settings_saved(section : Symbol, msg : String) : String
       toast = case section
-              when :network then apply_settings(msg).tap { @session.set_verify_upstream(Settings.verify_upstream?); @session.set_serve_landing(Settings.serve_landing?); project_controller.refresh_network }
-              when :theme   then apply_theme(msg)
-              when :layout  then apply_layout(msg)
-              when :display then apply_display(msg)
-              when :pet     then apply_pet(msg)
-              when :keys    then apply_keys(msg)
-              else               msg
+              when :network   then apply_settings(msg).tap { @session.set_verify_upstream(Settings.verify_upstream?); @session.set_serve_landing(Settings.serve_landing?); project_controller.refresh_network }
+              when :theme     then apply_theme(msg)
+              when :layout    then apply_layout(msg)
+              when :display   then apply_display(msg)
+              when :companion then apply_companion(msg)
+              when :keys      then apply_keys(msg)
+              else                 msg
               end
       @theme_restore = Settings.theme if section == :theme # saved → don't revert this on esc
       reconcile_mouse                                      # the EDITOR section holds the Mouse toggle — apply it live
@@ -5945,9 +5945,9 @@ module Gori::Tui
     end
 
     # Enable/disable and the motion change land on the SAME frame as the save rather than
-    # up to one BEAT later; Pet#tick self-gates on Settings.pet? for the rest.
-    private def apply_pet(save_msg : String) : String
-      @pet.wake_on_input
+    # up to one BEAT later; Companion#tick self-gates on Settings.companion? for the rest.
+    private def apply_companion(save_msg : String) : String
+      @companion.wake_on_input
       save_msg
     end
 

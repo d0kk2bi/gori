@@ -1,12 +1,12 @@
-# Pet.draw micro-benchmark. She is drawn on EVERY frame the Runner paints — not just on
+# Companion.draw micro-benchmark. She is drawn on EVERY frame the Runner paints — not just on
 # the ~1/second where her sprite actually changes — so anything expensive in the draw path
 # is paid per keystroke, per scroll step, per job-spinner tick. This measures the two costs
 # that are recomputed from scratch each call: resolving the mood palette (Theme.paper/soot
 # plus ~7 blends, each converting colours to RGB components) and assembling the three art
 # rows (three String allocations).
 #
-# Build: crystal build bench/pet_draw_bench.cr -o bin/pet_draw_bench --release
-# Run:   bin/pet_draw_bench
+# Build: crystal build bench/companion_draw_bench.cr -o bin/companion_draw_bench --release
+# Run:   bin/companion_draw_bench
 require "benchmark"
 require "../src/gori/tui"
 require "../spec/support/memory_backend"
@@ -23,8 +23,8 @@ puts "per frame:"
 Benchmark.ips do |x|
   x.report("Mascot.palette (mood -> full ramp)") { Mascot.palette(:info, Theme.bg) }
   x.report("Mascot.rows (3 String.build)") { Mascot.rows(IDLE) }
-  x.report("Pet.draw idle (no bubble)") { Pet.draw(SCREEN, BODY, IDLE) }
-  x.report("Pet.draw with bubble") { Pet.draw(SCREEN, BODY, TALK) }
+  x.report("Companion.draw idle (no bubble)") { Companion.draw(SCREEN, BODY, IDLE) }
+  x.report("Companion.draw with bubble") { Companion.draw(SCREEN, BODY, TALK) }
 end
 
 # For scale: what the rest of a frame costs, so the numbers above can be read as a

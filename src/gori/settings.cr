@@ -9,7 +9,7 @@ require "./settings/env"
 require "./settings/scan_rules"
 require "./settings/oast_providers"
 require "./settings/display"
-require "./settings/pet"
+require "./settings/companion"
 require "./settings/tabs"
 require "./settings/keymap"
 require "./settings/decoder"
@@ -99,6 +99,18 @@ module Gori
       # Re-base on our OWN serialization of what we just read, the same rule `save` applies
       # to `mine`. See `@@loaded_raw` for why the raw text cannot be the base.
       @@loaded_raw = serialize
+      # Renamed sections, read here and NOT in `apply_sections`, so an import keeps telling the
+      # truth: `import_document` drops a key outside SECTION_KEYS before it ever reaches the
+      # parsers, and a legacy name accepted there would be reported "unrecognised … ignored"
+      # and then applied anyway — the exact failure SECTION_KEYS exists to prevent. A file on
+      # disk has no such contract: it is this install's own older state, so it migrates.
+      #
+      # AFTER the re-base, deliberately. The base is what DISK says, and disk says it under the
+      # old name; migrating first would leave the migrated section identical to the base, the
+      # merge would read that as "this process did not touch it" and take disk's — which has no
+      # such key — so the value the migration just recovered would be dropped by the very next
+      # save. Migrating after makes it a genuine change, which is what it is.
+      migrate_legacy_sections(root)
     rescue
       # a malformed individual section — keep whatever loaded so far
     end
@@ -197,11 +209,32 @@ module Gori
       parse_layout(root["layout"]?)
       parse_statusline(root["statusline"]?)
       parse_display(root["display"]?)
-      parse_pet(root["pet"]?)
+      parse_companion(root["companion"]?)
       parse_notifications(root["notifications"]?)
       parse_general(root["general"]?)
       parse_update(root["update"]?)
       Env.bump_highlight_rev
+    end
+
+    # Top-level keys written by an OLDER gori, mapped to the key that replaced them. Read on
+    # load (see `migrate_legacy_sections`) and dropped from the file by the next `save`, so a
+    # rename costs the operator nothing and leaves nothing behind.
+    LEGACY_SECTION_KEYS = {
+      # v0.1.x wrote the Miss Ring prefs under "pet".
+      "pet" => "companion",
+    }
+
+    # Apply a legacy section ONLY when the current name is absent — an install that has already
+    # been through one save carries both keys for the moment between the migration and that
+    # save, and the new one is the one that was last written.
+    private def self.migrate_legacy_sections(root : JSON::Any) : Nil
+      LEGACY_SECTION_KEYS.each do |old, new|
+        next if root[new]?
+        next unless node = object_section(root, old)
+        case old
+        when "pet" then parse_companion(node)
+        end
+      end
     end
 
     # Read the settings file; nil on missing/unreadable (a first run keeps defaults).
@@ -372,7 +405,11 @@ module Gori
       base_h = (JSON.parse(base).as_h? rescue nil)
       disk_h = (JSON.parse(disk).as_h? rescue nil)
       return current unless cur_h && base_h && disk_h
-      keys = (cur_h.keys + disk_h.keys).uniq!
+      # Retired names are subtracted here: one is never in `cur_h` (nothing serializes it), so
+      # the rule below would read it as "I did not change this section" and copy disk's block
+      # forward for good. `load` has already folded its value into the section that replaced
+      # it, so this is the one place the old block can actually be cleared.
+      keys = (cur_h.keys + disk_h.keys).uniq! - LEGACY_SECTION_KEYS.keys
       JSON.build(indent: "  ") do |j|
         j.object do
           keys.each do |k|
@@ -437,7 +474,7 @@ module Gori
     # The `document_keys - SECTION_KEYS` guard in spec/settings_profile_spec.cr catches a
     # rename, and catches an addition as soon as any example populates the new section.
     SECTION_KEYS = %w(
-      theme mouse pretty_bodies layout statusline display pet notifications general update
+      theme mouse pretty_bodies layout statusline display companion notifications general update
       network upstream_rules outbound_tls retention listeners editor tabs hostname_overrides
       env scan_rules oast_providers hotkeys mine fuzzer probe discover decoder rewriter
       colormarker
@@ -577,7 +614,7 @@ module Gori
           serialize_layout(j)
           serialize_statusline(j)
           serialize_display(j)
-          serialize_pet(j)
+          serialize_companion(j)
           serialize_notifications(j)
           serialize_general(j)
           serialize_update(j)

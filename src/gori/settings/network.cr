@@ -314,7 +314,7 @@ module Gori::Settings
   # A `-l` / `-p` (`gori tui`, `gori run capture`) override for THIS PROCESS only, nil when the
   # flag wasn't given. Its own layer rather than an assignment into `bind_host`/`bind_port`,
   # because those two ARE the persisted global: writing a flag there meant any later
-  # `Settings.save` in the session flushed it to settings.json — the pet toggle, tab prefs, the
+  # `Settings.save` in the session flushed it to settings.json — the companion toggle, tab prefs, the
   # update-check stamp, the first-run wizard's own commit — silently promoting a one-run
   # override into the permanent default that every future project then inherits. Which is
   # precisely the invariant `Runner.port_fallback` spells out for the startup port fallback;

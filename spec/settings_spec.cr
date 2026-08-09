@@ -403,53 +403,117 @@ describe Gori::Settings do
     end
   end
 
-  it "persists and reloads pet prefs; omits the section at factory defaults (false survives)" do
-    dir = File.tempname("gori-settings-pet")
+  it "persists and reloads companion prefs; omits the section at factory defaults (false survives)" do
+    dir = File.tempname("gori-settings-companion")
     Dir.mkdir_p(dir)
     prev = ENV["GORI_HOME"]?
-    prev_pet = {Gori::Settings.pet?, Gori::Settings.pet_placement,
-                Gori::Settings.pet_motion, Gori::Settings.pet_notices?}
+    prev_companion = {Gori::Settings.companion?, Gori::Settings.companion_placement,
+                      Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
     begin
       ENV["GORI_HOME"] = dir
-      Gori::Settings.pet = true
-      Gori::Settings.pet_placement = "bar"
-      Gori::Settings.pet_motion = "calm"
-      Gori::Settings.pet_notices = false
+      Gori::Settings.companion = true
+      Gori::Settings.companion_placement = "bar"
+      Gori::Settings.companion_motion = "calm"
+      Gori::Settings.companion_notices = false
       Gori::Settings.save.should be_true
-      File.read(Gori::Settings.path).should contain(%("pet"))
+      File.read(Gori::Settings.path).should contain(%("companion"))
 
-      Gori::Settings.pet = false
-      Gori::Settings.pet_placement = "body"
-      Gori::Settings.pet_motion = "lively"
-      Gori::Settings.pet_notices = true
+      Gori::Settings.companion = false
+      Gori::Settings.companion_placement = "body"
+      Gori::Settings.companion_motion = "lively"
+      Gori::Settings.companion_notices = true
       Gori::Settings.load
-      Gori::Settings.pet?.should be_true
-      Gori::Settings.pet_placement.should eq("bar")
-      Gori::Settings.pet_motion.should eq("calm")
-      Gori::Settings.pet_notices?.should be_false # a stored false survives the reload
+      Gori::Settings.companion?.should be_true
+      Gori::Settings.companion_placement.should eq("bar")
+      Gori::Settings.companion_motion.should eq("calm")
+      Gori::Settings.companion_notices?.should be_false # a stored false survives the reload
 
       # A hand-edited motion outside the known set falls back to the default.
-      File.write(Gori::Settings.path, %({"pet":{"enabled":true,"motion":"bogus"}}))
+      File.write(Gori::Settings.path, %({"companion":{"enabled":true,"motion":"bogus"}}))
       Gori::Settings.load
-      Gori::Settings.pet_motion.should eq(Gori::Settings::DEFAULT_PET_MOTION)
+      Gori::Settings.companion_motion.should eq(Gori::Settings::DEFAULT_COMPANION_MOTION)
 
       # A hand-edited placement outside the known set falls back too.
-      File.write(Gori::Settings.path, %({"pet":{"enabled":true,"placement":"corner"}}))
+      File.write(Gori::Settings.path, %({"companion":{"enabled":true,"placement":"corner"}}))
       Gori::Settings.load
-      Gori::Settings.pet_placement.should eq(Gori::Settings::DEFAULT_PET_PLACEMENT)
+      Gori::Settings.companion_placement.should eq(Gori::Settings::DEFAULT_COMPANION_PLACEMENT)
 
       # Back to defaults → section omitted, so a default install's file stays quiet
-      Gori::Settings.pet = Gori::Settings::DEFAULT_PET
-      Gori::Settings.pet_placement = Gori::Settings::DEFAULT_PET_PLACEMENT
-      Gori::Settings.pet_motion = Gori::Settings::DEFAULT_PET_MOTION
-      Gori::Settings.pet_notices = Gori::Settings::DEFAULT_PET_NOTICES
+      Gori::Settings.companion = Gori::Settings::DEFAULT_COMPANION
+      Gori::Settings.companion_placement = Gori::Settings::DEFAULT_COMPANION_PLACEMENT
+      Gori::Settings.companion_motion = Gori::Settings::DEFAULT_COMPANION_MOTION
+      Gori::Settings.companion_notices = Gori::Settings::DEFAULT_COMPANION_NOTICES
       Gori::Settings.save
-      File.read(Gori::Settings.path).should_not contain(%("pet"))
+      File.read(Gori::Settings.path).should_not contain(%("companion"))
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
-      Gori::Settings.pet, Gori::Settings.pet_placement = prev_pet[0], prev_pet[1]
-      Gori::Settings.pet_motion, Gori::Settings.pet_notices = prev_pet[2], prev_pet[3]
+      Gori::Settings.companion, Gori::Settings.companion_placement = prev_companion[0], prev_companion[1]
+      Gori::Settings.companion_motion, Gori::Settings.companion_notices = prev_companion[2], prev_companion[3]
+    end
+  end
+
+  it "migrates the retired \"pet\" section to \"companion\" and drops it from the file" do
+    dir = File.tempname("gori-settings-companion-legacy")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    prev_companion = {Gori::Settings.companion?, Gori::Settings.companion_placement,
+                      Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
+    begin
+      ENV["GORI_HOME"] = dir
+      # What a v0.1.x install left on disk.
+      File.write(Gori::Settings.path,
+        %({"pet":{"enabled":true,"placement":"bar","motion":"calm","notices":false}}))
+      Gori::Settings.load
+      Gori::Settings.companion?.should be_true
+      Gori::Settings.companion_placement.should eq("bar")
+      Gori::Settings.companion_motion.should eq("calm")
+      Gori::Settings.companion_notices?.should be_false
+
+      # The next save writes the new name and clears the old one — without the explicit drop
+      # the 3-way merge reads "pet" as a section this process never touched and keeps disk's.
+      Gori::Settings.save.should be_true
+      saved = File.read(Gori::Settings.path)
+      saved.should contain(%("companion"))
+      saved.should_not contain(%("pet"))
+
+      # Both names present = the file has already been migrated once; the current one wins.
+      File.write(Gori::Settings.path,
+        %({"pet":{"enabled":false},"companion":{"enabled":true,"motion":"calm"}}))
+      Gori::Settings.load
+      Gori::Settings.companion?.should be_true
+      Gori::Settings.companion_motion.should eq("calm")
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.companion, Gori::Settings.companion_placement = prev_companion[0], prev_companion[1]
+      Gori::Settings.companion_motion, Gori::Settings.companion_notices = prev_companion[2], prev_companion[3]
+    end
+  end
+
+  it "rewrites a retired verb id in stored hotkey bindings" do
+    dir = File.tempname("gori-settings-verb-rename")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    prev_overrides = Gori::Settings.keymap_overrides.dup
+    begin
+      ENV["GORI_HOME"] = dir
+      File.write(Gori::Settings.path,
+        %({"hotkeys":{"os":"auto","bindings":{"pet.toggle":["shift-r"],"settings.pet":["shift-g"]}}}))
+      Gori::Settings.load
+      Gori::Settings.keymap_overrides["companion.toggle"]?.should eq(["shift-r"])
+      Gori::Settings.keymap_overrides["settings.companion"]?.should eq(["shift-g"])
+      Gori::Settings.keymap_overrides.has_key?("pet.toggle").should be_false
+
+      # A file carrying both keeps the current id's binding, not the legacy one.
+      File.write(Gori::Settings.path,
+        %({"hotkeys":{"os":"auto","bindings":{"pet.toggle":["shift-r"],"companion.toggle":["shift-y"]}}}))
+      Gori::Settings.load
+      Gori::Settings.keymap_overrides["companion.toggle"]?.should eq(["shift-y"])
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.keymap_overrides = prev_overrides
     end
   end
 

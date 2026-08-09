@@ -2,7 +2,7 @@ require "../spec_helper"
 
 include Gori::Tui
 
-# Miss Ring's stand on the PROJECT PICKER (ProjectPicker.pet_place). The picker paints her
+# Miss Ring's stand on the PROJECT PICKER (ProjectPicker.companion_place). The picker paints her
 # last, over the starfield and the card, so placement is the whole contract: anything she
 # is allowed to occupy, she occupies opaquely. These sweep the rule over terminal sizes
 # rather than a couple of hand-picked ones — the picker card is centred and its height
@@ -13,7 +13,7 @@ describe Gori::Tui::ProjectPicker do
   it "keeps clear of the footer rows at every size she appears at" do
     (20..60).each do |h|
       (60..200).each do |w|
-        next unless rect = ProjectPicker.pet_place(w, h)
+        next unless rect = ProjectPicker.companion_place(w, h)
         rect.bottom.should be <= h - 3
       end
     end
@@ -26,9 +26,9 @@ describe Gori::Tui::ProjectPicker do
   it "never overlaps the picker card" do
     (20..60).each do |h|
       (60..200).each do |w|
-        next unless rect = ProjectPicker.pet_place(w, h)
+        next unless rect = ProjectPicker.companion_place(w, h)
         box, _ = ProjectPicker.card_metrics(w, h)
-        # Her plate claims a column either side of the sprite (Pet.draw), so the box that
+        # Her plate claims a column either side of the sprite (Companion.draw), so the box that
         # actually gets painted is one wider on each side than `rect`.
         cols = (rect.x - 1) < box.right && (rect.right + 1) > box.x
         rows = rect.y < box.bottom && rect.bottom > box.y
@@ -40,7 +40,7 @@ describe Gori::Tui::ProjectPicker do
   it "stays inside the terminal" do
     (20..60).each do |h|
       (60..200).each do |w|
-        next unless rect = ProjectPicker.pet_place(w, h)
+        next unless rect = ProjectPicker.companion_place(w, h)
         (rect.x - 1).should be >= 0
         (rect.right + 1).should be <= w
         rect.y.should be >= 0
@@ -52,10 +52,10 @@ describe Gori::Tui::ProjectPicker do
   # paint over it, she simply doesn't appear when the terminal can't seat her beside it.
   # 80 columns is the floor that matters — the conventional terminal has room for her.
   it "seats her beside the card on a conventional terminal, and drops her on a narrow one" do
-    ProjectPicker.pet_place(80, 24).should_not be_nil
-    ProjectPicker.pet_place(120, 40).should_not be_nil
-    ProjectPicker.pet_place(60, 24).should be_nil
-    ProjectPicker.pet_place(40, 12).should be_nil
+    ProjectPicker.companion_place(80, 24).should_not be_nil
+    ProjectPicker.companion_place(120, 40).should_not be_nil
+    ProjectPicker.companion_place(60, 24).should be_nil
+    ProjectPicker.companion_place(40, 12).should be_nil
   end
 
   # The bubble is allowed over the card, so the card can't bound it — the terminal has to.
@@ -65,9 +65,9 @@ describe Gori::Tui::ProjectPicker do
     long = "heads up: v10.20.30 is out · run: gori update" * 3
     (20..60).each do |h|
       (60..200).each do |w|
-        next unless rect = ProjectPicker.pet_place(w, h)
-        stage = ProjectPicker.pet_stage(w, h)
-        next unless box = Pet.bubble_box(stage, rect, long)
+        next unless rect = ProjectPicker.companion_place(w, h)
+        stage = ProjectPicker.companion_stage(w, h)
+        next unless box = Companion.bubble_box(stage, rect, long)
         box.x.should be >= 0
         box.right.should be <= w
         box.y.should be >= 0
@@ -76,12 +76,12 @@ describe Gori::Tui::ProjectPicker do
     end
   end
 
-  # `pet_place` measures from `pet_stage` and the picker hands that SAME rect to Pet.draw,
+  # `companion_place` measures from `companion_stage` and the picker hands that SAME rect to Companion.draw,
   # so what these specs assert is what gets painted. Guards the pair from drifting apart.
   it "places from the stage the picker actually draws her on" do
     [{80, 24}, {120, 40}, {200, 60}].each do |(w, h)|
-      next unless rect = ProjectPicker.pet_place(w, h)
-      Pet.place(ProjectPicker.pet_stage(w, h)).should eq(rect)
+      next unless rect = ProjectPicker.companion_place(w, h)
+      Companion.place(ProjectPicker.companion_stage(w, h)).should eq(rect)
     end
   end
 end

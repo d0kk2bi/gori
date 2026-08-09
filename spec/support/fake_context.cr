@@ -78,8 +78,8 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:refresh_screen)
   end
 
-  def toggle_pet : Nil
-    rec(:toggle_pet)
+  def toggle_companion : Nil
+    rec(:toggle_companion)
   end
 
   def focus_pane(pane : Symbol) : Nil

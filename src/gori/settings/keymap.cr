@@ -43,12 +43,25 @@ module Gori::Settings
     {"ctrl", "alt"}.includes?(s) ? s : DEFAULT_COMMAND_MODIFIER
   end
 
+  # Verb ids that were RENAMED, old → new. A stored override is keyed by verb id, so a rename
+  # would otherwise silently unbind whatever the operator had bound — the binding survives in
+  # the file, matches no verb, and the key just stops working with nothing to see. Rewritten on
+  # read, so the next save persists the new id and the entry retires itself.
+  RENAMED_VERB_IDS = {
+    # v0.1.x called the Miss Ring verbs "pet".
+    "pet.toggle"   => "companion.toggle",
+    "settings.pet" => "settings.companion",
+  }
+
   private def self.parse_keymap_bindings(node : JSON::Any?) : Hash(String, Array(String))
     obj = node.try(&.as_h?)
     return keymap_overrides unless obj # non-object / absent → keep current
     out = {} of String => Array(String)
-    obj.each do |id, v|
-      next if id.empty?
+    obj.each do |raw_id, v|
+      next if raw_id.empty?
+      id = RENAMED_VERB_IDS[raw_id]? || raw_id
+      # A file carrying BOTH names keeps the current one — the legacy entry is the older write.
+      next if id != raw_id && obj.has_key?(id)
       arr = v.as_a?
       next unless arr # a non-array entry is dropped (tolerant)
       # Keep only labels that parse to a real chord (round-trip safe); a list that

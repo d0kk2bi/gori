@@ -17,7 +17,7 @@ include Gori::Tui
 # `ProjectController#commit_project_network` writes all six network fields whenever any ONE of
 # them is dirty — so editing the idle timeout silently re-pinned the fallback port. Via the
 # GLOBAL layer, because `Settings.bind_port` is what `Settings.save` serializes into
-# settings.json on every unrelated save (the pet toggle, tabs, hotkeys, env), which the NEXT
+# settings.json on every unrelated save (the companion toggle, tabs, hotkeys, env), which the NEXT
 # project then inherits: a cross-project write.
 #
 # `Runner.port_fallback` is the seam that reaction now runs through, so the examples below
@@ -100,7 +100,7 @@ describe "startup port fallback" do
     Gori::Settings.project_bind_port.should be_nil # nothing pinned → the global is effective
     Runner.port_fallback(8070, 8071).should eq({8070, 8071})
     # `Settings.save` serializes `bind_port` into settings.json, and every unrelated save path
-    # reaches it (pet toggle, tabs, hotkeys, env). A fallback landing here outlives the process.
+    # reaches it (companion toggle, tabs, hotkeys, env). A fallback landing here outlives the process.
     Gori::Settings.bind_port.should eq(8070)
     Gori::Settings.effective_bind_port.should eq(8070)
   ensure

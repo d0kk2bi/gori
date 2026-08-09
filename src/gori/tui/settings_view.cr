@@ -124,19 +124,19 @@ module Gori::Tui
         "what gori writes into the terminal window title — off leaves it to your shell/tmux — ←/→ cycles",
         choices: DISPLAY_TITLE_CHOICES),
     ]
-    # Pet: Miss Ring, the mascot in the body's bottom-right corner.
-    PET_MOTION_CHOICES    = ["lively", "calm"]
-    PET_PLACEMENT_CHOICES = ["body", "bar"]
-    PET_FIELDS            = [
-      Field.new("Pet (Miss Ring)",
+    # Companion: Miss Ring, the mascot in the body's bottom-right corner.
+    COMPANION_MOTION_CHOICES    = ["lively", "calm"]
+    COMPANION_PLACEMENT_CHOICES = ["body", "bar"]
+    COMPANION_FIELDS            = [
+      Field.new("Companion (Miss Ring)",
         "show the mascot in the body's bottom-right corner — she covers three rows and repaints about once a second while you're at the keyboard — ←/→/space toggles",
         bool: true),
       Field.new("Placement",
         "body = an 8x3 sprite in the tab body's bottom-right corner; bar = a one-row chip in the status row beside CPU/MEM, which covers nothing and drops the speech bubble — ←/→ cycles",
-        choices: PET_PLACEMENT_CHOICES),
+        choices: COMPANION_PLACEMENT_CHOICES),
       Field.new("Motion",
         "lively = blinks, winks, a glint sweep and the odd wave; calm halves the blink rate and drops the rest (SSH/battery) — ←/→ cycles",
-        choices: PET_MOTION_CHOICES),
+        choices: COMPANION_MOTION_CHOICES),
       Field.new("Notices",
         "announce new background results in a speech bubble, and react to them — independent of the bottom-bar toast — ←/→/space toggles",
         bool: true),
@@ -174,7 +174,7 @@ module Gori::Tui
       :layout        => LAYOUT_FIELDS,
       :statusline    => STATUSLINE_FIELDS,
       :display       => DISPLAY_FIELDS,
-      :pet           => PET_FIELDS,
+      :companion     => COMPANION_FIELDS,
       :notifications => NOTIFICATIONS_FIELDS,
       :general       => GENERAL_FIELDS,
     }
@@ -213,7 +213,7 @@ module Gori::Tui
                 when :layout        then layout_values
                 when :statusline    then [Settings.statusline_enabled? ? "on" : "off", Settings.statusline_command, Settings.statusline_interval.to_s]
                 when :display       then display_values
-                when :pet           then pet_values
+                when :companion     then companion_values
                 when :notifications then [Settings.notify_bell? ? "on" : "off", Settings.notify_toast? ? "on" : "off", Settings.notify_retention.to_s]
                 when :general       then general_values
                 else                     network_values
@@ -268,11 +268,11 @@ module Gori::Tui
                   Settings::DEFAULT_RESOURCE_METER ? "on" : "off",
                   title_label(Settings::DEFAULT_TERMINAL_TITLE),
                 ]
-                when :pet then [
-                  Settings::DEFAULT_PET ? "on" : "off",
-                  Settings::DEFAULT_PET_PLACEMENT,
-                  Settings::DEFAULT_PET_MOTION,
-                  Settings::DEFAULT_PET_NOTICES ? "on" : "off",
+                when :companion then [
+                  Settings::DEFAULT_COMPANION ? "on" : "off",
+                  Settings::DEFAULT_COMPANION_PLACEMENT,
+                  Settings::DEFAULT_COMPANION_MOTION,
+                  Settings::DEFAULT_COMPANION_NOTICES ? "on" : "off",
                 ]
                 when :notifications then [
                   Settings::DEFAULT_NOTIFY_BELL ? "on" : "off",
@@ -410,13 +410,13 @@ module Gori::Tui
     end
 
     # Positional, like every other *_values reader: a literal at each call site would drift
-    # from PET_FIELDS the moment a row is inserted.
-    private def pet_values : Array(String)
+    # from COMPANION_FIELDS the moment a row is inserted.
+    private def companion_values : Array(String)
       [
-        Settings.pet? ? "on" : "off",
-        Settings.pet_placement,
-        Settings.pet_motion,
-        Settings.pet_notices? ? "on" : "off",
+        Settings.companion? ? "on" : "off",
+        Settings.companion_placement,
+        Settings.companion_motion,
+        Settings.companion_notices? ? "on" : "off",
       ]
     end
 
@@ -617,12 +617,12 @@ module Gori::Tui
         @values = display_values
         return persist
       end
-      if @section == :pet
-        Settings.pet = @values[0] == "on"
-        Settings.pet_placement = Settings.normalize_pet_placement(@values[1])
-        Settings.pet_motion = Settings.normalize_pet_motion(@values[2])
-        Settings.pet_notices = @values[3] == "on"
-        @values = pet_values
+      if @section == :companion
+        Settings.companion = @values[0] == "on"
+        Settings.companion_placement = Settings.normalize_companion_placement(@values[1])
+        Settings.companion_motion = Settings.normalize_companion_motion(@values[2])
+        Settings.companion_notices = @values[3] == "on"
+        @values = companion_values
         return persist
       end
       if @section == :notifications
@@ -715,7 +715,7 @@ module Gori::Tui
       @baseline = @values.dup if ok # the working copy IS the persisted state now → no longer dirty
       @status = ok ? "saved" : "save failed"
       # `<thing> applied — could not save to <path>`, the shape the rest of the app uses and
-      # `Runner#toggle_pet` documents: every setter above ran BEFORE `Settings.save`, so on a
+      # `Runner#toggle_companion` documents: every setter above ran BEFORE `Settings.save`, so on a
       # failed write the change IS live in this session and only persistence is missing. The
       # old `settings: save failed (…)` said the second half and left the operator to guess
       # the first — on the highest-traffic save in the app.
