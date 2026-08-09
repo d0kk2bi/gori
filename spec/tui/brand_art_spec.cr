@@ -11,9 +11,34 @@ describe "Brand::ART" do
   it "is drawn entirely in single-cell glyphs" do
     Brand::ART.each_with_index do |line, row|
       line.each_char_with_index do |ch, col|
-        Screen.draw_width(ch.to_s).should eq(1), "row #{row} col #{col}: #{ch.inspect} is not one cell"
+        glyph, _ = Brand.ink(ch, Theme.focus_gold)
+        Screen.draw_width(glyph.to_s).should eq(1), "row #{row} col #{col}: #{glyph.inspect} is not one cell"
       end
     end
+  end
+
+  # ART carries ring membership, not glyphs — `ink` is what turns a cell into
+  # something paintable. A glyph it doesn't know gets painted verbatim, so a new
+  # marker added to the figure without a matching branch would silently ship as
+  # whatever character the author happened to type.
+  it "paints every ART glyph through a known ink" do
+    known = {' ', '█', Brand::FAR_RING}
+    Brand::ART.each_with_index do |line, row|
+      line.each_char_with_index do |ch, col|
+        known.includes?(ch).should be_true, "row #{row} col #{col}: #{ch.inspect} has no ink"
+      end
+    end
+  end
+
+  # The two rings only read as two because the far one is dimmer. Assert the
+  # separation itself — a mix ratio edited to 0 would leave a flat blob and no
+  # other spec would notice.
+  it "sinks the far ring toward the canvas, still as a solid block" do
+    glyph, far = Brand.ink(Brand::FAR_RING, Theme.focus_gold)
+    glyph.should eq('█')
+    near = Brand.ink('█', Theme.focus_gold)[1]
+    far.should_not eq(near)
+    (Theme.luma(near) - Theme.luma(far)).abs.should be > 0.1 # luma is 0..1
   end
 
   it "scrambles the entrance through single-cell glyphs too" do

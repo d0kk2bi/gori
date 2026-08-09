@@ -7,40 +7,51 @@ module Gori::Tui
   # optical centering so the visible shape — not its leading spaces — is centred.
   module Brand
     # The interlocked rings of the gori logo (docs/static/images/gori.svg), hand
-    # drawn at 32 cells over 16 rows. A terminal cell is about half as wide as it
+    # drawn at 24 cells over 11 rows. A terminal cell is about half as wide as it
     # is tall, so that reads as a roughly square figure — the mark's own artwork is
     # 1365×1193 (1.14:1), close enough that it reads as the logo rather than a
-    # stretched copy. It is deliberately big: at the ~20×9 the mark was drawn at
-    # before, the two rings collapsed into a blob and stopped reading as rings.
-    # The size is what costs the height gate — see ProjectPicker.art_shown?.
+    # stretched copy.
     #
-    # Solid blocks, not scattered glyphs. The strokes are one or two cells thick,
-    # so any mix of glyph weights reads as broken lines rather than arcs, and `█`
-    # is the one glyph whose ink and advance are identical in every font — which
-    # also keeps this the same mark as the SVG/favicon everywhere else. The noise
-    # belongs in the picker's entrance instead (see ART_NOISE there).
+    # Size is set by the top arc, not by overall detail. What makes this read as a
+    # ring is that its outer contour closes: a 20×9 cut fit in more terminals but
+    # left the upper-left arc a lone floating cell with gaps either side, and a
+    # broken arc reads as debris, not as a loop. 24 columns is the narrowest the
+    # arc stays connected at. The interior is left empty for the same reason the
+    # contour matters: the logo's inner highlights are thinner than a cell here,
+    # so drawing them puts loose specks inside the ring and weakens the loop.
+    #
+    # Going wider costs more than it buys — a 30×15 version does resolve those
+    # highlights, but only barely, and `art_shown?` is a cliff rather than a slope:
+    # its floor would rise to 33 rows, above a default 80×24 or any split pane, so
+    # those terminals lose the mark entirely instead of getting a smaller one.
+    # Here the gate is 29 rows / 30 cols — see ProjectPicker.art_shown?.
+    #
+    # The figure is two rings — a big tilted ellipse and a flat one lying across
+    # the bottom, its tips curling up either side — and at this size they only
+    # read as two if they differ. So the ART glyph carries ring membership: `█`
+    # is the near ring, `▒` the far one. `ink` turns that into what actually gets
+    # painted; nothing draws ART's characters directly.
     #
     # Every glyph must measure one cell (see spec/tui/brand_art_spec.cr): the
     # draw places glyph N of a line at column N, so a two-cell grapheme would
     # shear its row and pull the rings apart.
     ART = [
-      "                    █████",
-      "               ██████ ██████",
-      "            ███          █████",
-      "         ███████          ████",
-      "      ████       █████    █████",
-      "     ███               █ ██████",
-      "    ████           ██   ██████",
-      "    █████              ██████",
-      "  █ ██████            ██████  █",
-      " ██  ██████         ███████   ███",
-      " ██   ████████    ████████  █  ██",
-      " ██     ████████████████       ██",
-      " ████     ████████████      █████",
-      "  █████████████████  ███████████",
-      "   █████████████  █████████████",
-      "                       ████",
+      "            ███████",
+      "         ██       ███",
+      "     ████████     ████",
+      "   ███            ████",
+      "   ███           ████",
+      "   ███          ████ ▒",
+      " ▒ █████      █████  ▒▒",
+      "▒▒  ██████  ██████    ▒▒",
+      " ▒▒▒  ██████████    ▒▒▒",
+      " █████████████ ▒▒▒▒▒▒▒▒",
+      "   ███████   ▒▒▒▒▒▒▒▒",
     ]
+
+    # The far ring's marker, and how far its colour sits toward the canvas.
+    FAR_RING     = '▒'
+    FAR_RING_MIX = 0.58
 
     ART_H     = ART.size
     ART_LEFT  = ART.min_of { |line| line.size - line.lstrip.size }
@@ -55,6 +66,24 @@ module Gori::Tui
     BYLINE  = "made by #{AUTHOR}"
     TAGLINE = "Hack from the terminal."
 
+    # What an ART cell paints: both rings are solid blocks, the far one dimmed
+    # toward the canvas so the interlock reads as depth rather than as one blob.
+    #
+    # The dim is COLOUR, not a lighter glyph. Painting `▒` literally renders it
+    # as a dither pattern (a checkerboard in Menlo), and on a stroke one or two
+    # cells thick that reads as texture rather than distance — the same reason
+    # the mark is solid `█` and the scatter lives in the picker's entrance
+    # instead (see ART_NOISE there). The pattern is font-dependent too, where a
+    # blend of the palette's own colours is not.
+    #
+    # Every draw resolves its cells here, so the picker hero and Help → About
+    # cannot disagree about the figure — which is exactly how the picker once
+    # ended up painting ART as a plain silhouette while About drew the mark.
+    def self.ink(ch : Char, fg : Color) : {Char, Color}
+      return {'█', Theme.blend(fg, Theme.bg, FAR_RING_MIX)} if ch == FAR_RING
+      {ch, fg}
+    end
+
     # Static gilded art (no entrance animation). Defaults to the theme's gold
     # (focus_gold: logo-sampled champagne gold on dark, deepened logo gold on
     # light), so the mark reads as the real brand gold in every palette.
@@ -65,7 +94,8 @@ module Gori::Tui
       ART.each_with_index do |line, i|
         line.each_char_with_index do |ch, col|
           next if ch == ' '
-          screen.cell(origin_x + col, y + i, ch, fg, Theme.bg, attr: Attribute::Bold)
+          glyph, colour = ink(ch, fg)
+          screen.cell(origin_x + col, y + i, glyph, colour, Theme.bg, attr: Attribute::Bold)
         end
       end
     end

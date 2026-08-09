@@ -57,6 +57,10 @@ describe Gori::Tui::HelpView do
     # Same ink as the project-picker brand mark. Asserted against Brand::ART itself
     # so restyling the mark can't quietly stop it being drawn: the bottom arc is one
     # unbroken run of glyphs, so it lands in the grid as a single contiguous string.
-    backend.contains?(Brand::ART.last.lstrip).should be_true
+    # Through `ink`, because ART stores ring membership rather than glyphs — the
+    # far ring's marker is painted as a solid block in a dimmer gold, and the
+    # backend records glyphs.
+    bottom = Brand::ART.last.lstrip.chars.map { |ch| Brand.ink(ch, Theme.focus_gold)[0] }.join
+    backend.contains?(bottom).should be_true
   end
 end

@@ -1049,8 +1049,8 @@ module Gori::Tui
     TAGLINE = Brand::TAGLINE
 
     # The art is a nicety, not load-bearing — only show it when the terminal is
-    # tall enough to keep a usable project list beneath this taller logo and wide
-    # enough to fit the block without clipping; otherwise fall back to the wordmark.
+    # tall enough to keep a usable project list beneath the logo and wide enough
+    # to fit the block without clipping; otherwise fall back to the wordmark.
     #
     # Both bounds derive from the figure, because it gets redrawn and a literal
     # stops matching it. Height: `card_metrics` spends `ART_H + 4` rows on the
@@ -1585,11 +1585,17 @@ module Gori::Tui
 
     # Glyph + colour for a cell `prog` frames after the wave front reached it: a
     # scrambled ART_NOISE glyph from the band matching the stage, colour ramping
-    # from a dim gold up toward full strength, then the art's own glyph `ch`.
+    # up toward full strength, then the cell's settled ink.
+    #
+    # `Brand.ink` resolves that settled pair — which for a far-ring cell is a
+    # dimmed gold — and the ramp aims at it rather than at focus_gold, so the far
+    # ring arrives at its own shade instead of reaching full gold and dropping
+    # back a frame later.
     private def art_cell(prog : Int32, ch : Char, col : Int32, row : Int32, frame : Int32) : {Char, Color}
-      return {ch, Theme.focus_gold} if prog > ART_NOISE.size
+      glyph, settled_fg = Brand.ink(ch, Theme.focus_gold)
+      return {glyph, settled_fg} if prog > ART_NOISE.size
       t = 0.35 + 0.65 * prog / (ART_NOISE.size + 1)
-      {noise_glyph(col, row, frame, prog - 1), Theme.blend(Theme.focus_gold, Theme.bg, t)}
+      {noise_glyph(col, row, frame, prog - 1), Theme.blend(settled_fg, Theme.bg, t)}
     end
 
     # A cell's scramble glyph. A pure hash of (col, row, frame, band) the way
