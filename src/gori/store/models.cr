@@ -163,7 +163,16 @@ module Gori
       # port and bracketing an IPv6 literal (mirrors FlowRequest.build_target). Prevents the
       # doubled "http://hosthttp://host/path" a naive "#{scheme}://#{host}#{target}" produced.
       def url : String
-        return target if FlowRow.absolute_form?(target)
+        FlowRow.url_of(scheme, host, port, target)
+      end
+
+      # `#url` from the four addressing columns alone, for a caller that has them without a
+      # row to hand. `Store#flow_id_for_url` is the reason: it resolves a URL STRING back to
+      # the flow it came from and has to compare against exactly what `#url` produces, so the
+      # rule stays in one place rather than being spelled a second time in SQL — where the
+      # default-port and IPv6-bracket cases are precisely what a re-derivation gets wrong.
+      def self.url_of(scheme : String, host : String, port : Int32, target : String) : String
+        return target if absolute_form?(target)
         h = host.includes?(':') && !host.starts_with?('[') ? "[#{host}]" : host
         default = scheme == "https" ? 443 : 80
         port == default ? "#{scheme}://#{h}#{target}" : "#{scheme}://#{h}:#{port}#{target}"

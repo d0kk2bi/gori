@@ -902,6 +902,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:probe_open_flow)
   end
 
+  def probe_open_affected : Nil
+    rec(:probe_open_affected)
+  end
+
   def probe_repeater_flow : Nil
     rec(:probe_repeater_flow)
   end

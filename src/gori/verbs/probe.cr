@@ -103,6 +103,25 @@ module Gori
         "probe.close", "Back to list", "Return to the issue list", Verb::Scope::ProbeDetail,
         [Verb::Chord.new("escape"), Verb::Chord.new("left"), Verb::Chord.new("h")], hidden: true) { |ctx| ctx.probe_close; nil }
 
+      # ↵ over the AFFECTED URLS list: the caret's OWN url, which is not what `o` opens — that
+      # is the group's one sample flow, so before this every other row of a group of up to 50
+      # was a dead line in the pane listing it. The Issues detail's related-links list has
+      # answered ↵ since it was built (`issue.open-link`), and this is that gesture.
+      #
+      # ↵/l/→ — the same trio `probe.open` uses one scope up, and the mirror of `probe.close`'s
+      # esc/h/← here: in the detail, ← goes back to the list and → goes deeper, into the flow
+      # the highlighted URL was captured on. The aliases also keep this off the REBINDABLE
+      # surface (Hotkeys.rebindable? is single-chord only), which a lone `enter` — a structurally
+      # reserved key — must stay off; see spec/verb/keymap_spec.cr.
+      #
+      # `u` as the menu key: the chord-derived one would be the unintuitive `l` (probe.open's
+      # reason for 'v'), and `o` is taken one line down by the sample flow — the two have to
+      # stay tellable apart in the one place both are listed.
+      r.register Verb::Definition.new(
+        "probe.open-affected", "Open affected URL", "Open the flow the highlighted affected URL was captured on",
+        Verb::Scope::ProbeDetail, [Verb::Chord.new("enter"), Verb::Chord.new("l"), Verb::Chord.new("right")],
+        mnemonic: 'u') { |ctx| ctx.probe_open_affected; nil }
+
       r.register Verb::Definition.new(
         "probe.open-flow", "Open evidence", "Open the sample flow's request/response in History",
         Verb::Scope::ProbeDetail, [Verb::Chord.new("o")]) { |ctx| ctx.probe_open_flow; nil }

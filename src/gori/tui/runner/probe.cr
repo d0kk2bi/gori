@@ -67,6 +67,38 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     @toast = "this issue has no sample evidence"
   end
 
+  # ↵ on the AFFECTED URLS list: open the flow THAT url was captured on, which for a group of
+  # 50 is 50 different exchanges — `o` can only ever reach the one sample. CROSS-TAB mediator:
+  # reads the Probe controller, drives the History controller + overlay (issue_open_flow's shape).
+  #
+  # The list holds bare strings — `upsert_probe_issue` accumulates `Detection#url` and keeps no
+  # per-URL flow id — so the row is resolved through the store by URL, narrowed by the issue's
+  # own host (the group is keyed by (code, host), so every URL on the list is on it).
+  def probe_open_affected : Nil
+    return (@toast = "open an issue first") unless issue = probe_controller.view.detail_issue
+    return (@toast = "no affected URL selected") unless url = probe_controller.probe_affected_url
+    # The sample flow's METHOD, so a group that fired on `GET /v1/me` cannot open the `POST`
+    # to the same URL — see Store#flow_id_for_url, which ranks on it first.
+    method = probe_controller.view.detail_flow.try(&.method)
+    unless fid = @session.store.flow_id_for_url(url, issue.host, method)
+      # A Repeater-sourced finding (Probe::FromRepeater) has no `flows` row for its URL AT ALL
+      # — the send never went through capture — so "no captured flow" would be true and
+      # useless: `o`, one key away, navigates to the session that holds it. Say that instead.
+      return (@toast = "this URL came from a Repeater send — o opens it") if issue.sample_repeater_id
+      # NOT "pruned" either: a finding can be older than the capture it names — a `gori run
+      # probe` sweep, an issue that outlived a compact — and telling the operator a flow was
+      # deleted when it was never in this project sends them looking for a retention setting.
+      return (@toast = "no captured flow for that URL")
+    end
+    if history_controller.view.open_detail_id(fid, @session.store)
+      @active_tab = :history
+      @focus = :body
+      @overlay = OverlayKind::Detail
+    else
+      @toast = "evidence no longer captured (pruned)"
+    end
+  end
+
   # Send an issue's sample flow to Repeater to re-test it (mirrors issue_repeater_flow).
   # When the only evidence is a Repeater tab, jump there instead of re-spawning.
   def probe_repeater_flow : Nil

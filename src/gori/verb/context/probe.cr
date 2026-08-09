@@ -21,6 +21,7 @@ abstract class Gori::Verb::ExecContext
   abstract def probe_dismiss_code : Nil  # bulk-dismiss every open issue with the target's code
   abstract def probe_dismiss_host : Nil  # bulk-dismiss every open issue on the target's host
   abstract def probe_open_flow : Nil     # open the issue's sample flow in History
+  abstract def probe_open_affected : Nil # open the AFFECTED URL under the caret in History
   abstract def probe_repeater_flow : Nil # send the issue's sample flow to Repeater
   abstract def probe_promote : Nil       # create a Issue from the open issue
 

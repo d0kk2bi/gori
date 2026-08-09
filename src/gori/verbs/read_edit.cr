@@ -211,8 +211,11 @@ module Gori
         Verb::Scope::OastCallbacks,
         available: in_oast_detail, mnemonic: 'y', section: :detail) { |ctx| ctx.read_copy; nil }
 
-      # A Probe issue's AFFECTED URLS. `Verb::Scope::ProbeDetail` carries no mnemonics of its own,
-      # so `x`/`v`/`S`/`y` land in `:common` with nothing to collide with.
+      # A Probe issue's AFFECTED URLS. `Verb::Scope::ProbeDetail` carries one mnemonic of its
+      # own — `u` on `probe.open-affected`, the ↵ that opens the highlighted URL's flow — so
+      # `x`/`v`/`S`/`y` still land in `:common` with nothing to collide with, but a new key
+      # here does have to be checked against it (and against the scope's plain chords o/r/p/c/d,
+      # which `menu_key` derives menu entries from).
       in_probe_detail = ->(ctx : Verb::ExecContext) { ctx.probe_detail_readable? }
       r.register Verb::Definition.new(
         "probe.select-line", "Select URL", "Select the affected URL under the cursor",
