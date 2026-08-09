@@ -265,12 +265,24 @@ module Gori::Discover
     end
 
     # A candidate that reaches the request line as itself: no octet `encode_unsafe` repairs or
-    # `Headers.safe_url?` refuses (both are the `<= 0x20 || 0x7F` class), and neither of the
-    # two delimiters `URI.parse` acts on. A wordlist entry outside this set — a query, a
-    # traversal, an IIS trailing-space bypass — is not rejected, it just takes `parse`.
+    # `Headers.safe_url?` refuses (both are the `<= 0x20 || 0x7F` class), neither of the two
+    # delimiters `URI.parse` acts on, and nothing outside ASCII. A wordlist entry outside this
+    # set — a query, a traversal, an IIS trailing-space bypass, a non-ASCII name — is not
+    # rejected, it just takes `parse`.
+    #
+    # ASCII is a deliberate condition, not tidiness. `URI.parse` RSTRIPS its path with
+    # `Char#whitespace?`, which is Unicode-aware and reaches well past this method's byte class:
+    # a candidate ending in U+00A0, U+3000 or U+2028 comes back from `parse` with the character
+    # GONE while the concatenation here keeps it — one wordlist entry, two different URLs, and
+    # `probe` is documented as an optimization that may never be a second opinion. Copy-pasted
+    # and HTML-scraped wordlists carry trailing NBSP routinely. A per-byte test cannot answer a
+    # per-CHARACTER Unicode predicate that the stdlib is free to widen, so the guard is drawn
+    # where the two derivations are provably identical instead: the whole built-in wordlist is
+    # ASCII and keeps the fast path, and a non-ASCII entry pays one `URI.parse` it was always
+    # paying before this optimization existed.
     private def self.plain_bytes?(s : String) : Bool
       s.each_byte do |b|
-        return false if b <= 0x20_u8 || b == 0x7f_u8
+        return false if b <= 0x20_u8 || b >= 0x7f_u8
         return false if b == 0x3f_u8 || b == 0x23_u8 # '?' '#'
       end
       true

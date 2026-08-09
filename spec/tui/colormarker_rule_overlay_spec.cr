@@ -178,4 +178,42 @@ describe ColormarkerRuleOverlay do
   it "cancels on esc" do
     ColormarkerRuleOverlay.adding.handle_key(key(Termisu::Input::Key::Escape)).should eq(:cancel)
   end
+
+  # Deleting a custom colour deliberately does NOT rewrite the rules that name it — they keep
+  # the reference and fall back to a visible default, so re-adding the colour restores them.
+  # The editor has to honour that: `idx` answers 0 for a value it cannot find, so a rule with a
+  # dangling colour used to open showing `red`, and saving it after touching only the NAME or
+  # the CONDITION wrote `red` to the store — the cascade the delete had just promised not to do,
+  # triggered by an unrelated edit.
+  describe "a colour the picker does not offer" do
+    it "survives opening and committing the form untouched" do
+      prev = Gori::Settings.colormarker_colors
+      begin
+        Gori::Settings.colormarker_colors = [] of Gori::Settings::ColormarkerColor
+        rule = Gori::Store::ColorRule.new(1_i64, true, "host:acme.test", "hotpink",
+          Gori::Store::MarkerStyle::Full, "mine")
+        ov = ColormarkerRuleOverlay.editing(rule)
+        ov.color.should eq("hotpink")
+        # …and it is a real option, so cycling off it can come back rather than stranding the
+        # operator on a vocabulary that no longer contains what they had.
+        ov.color_options.should contain("hotpink")
+      ensure
+        Gori::Settings.colormarker_colors = prev
+      end
+    end
+
+    it "offers a registered custom colour without duplicating it" do
+      prev = Gori::Settings.colormarker_colors
+      begin
+        Gori::Settings.colormarker_colors = [Gori::Settings::ColormarkerColor.new("hotpink", "#ff69b4")]
+        rule = Gori::Store::ColorRule.new(1_i64, true, "host:acme.test", "hotpink",
+          Gori::Store::MarkerStyle::Full, "mine")
+        ov = ColormarkerRuleOverlay.editing(rule)
+        ov.color.should eq("hotpink")
+        ov.color_options.count("hotpink").should eq(1)
+      ensure
+        Gori::Settings.colormarker_colors = prev
+      end
+    end
+  end
 end

@@ -54,6 +54,9 @@ module Gori::Tui
 
     @scope_i : Int32
     @color_i : Int32
+    # The colour the form was opened with, kept so `color_options` can still offer it after the
+    # registry stops doing so — see the note there.
+    @opened_color : String
     @style_i : Int32
     @sel : Int32
     @preview : String = ""
@@ -67,6 +70,7 @@ module Gori::Tui
         name: TextField.new(name),
         when: TextField.new(match_filter),
       }
+      @opened_color = color
       @scope_i = idx(SCOPES, scope)
       @color_i = idx(color_options, color)
       @style_i = idx(STYLES, style)
@@ -75,10 +79,21 @@ module Gori::Tui
 
     # The picker's colour vocabulary: the six built-in words FIRST, then every user-defined
     # custom colour's name (read live from settings, so a colour added in the pane below appears
-    # here without a reload). Read through this everywhere the colour row cycles or renders, so
-    # the constant `COLORS` stays the built-in list the CLI/MCP also validate against.
+    # here without a reload), and finally the colour THIS RULE ARRIVED WITH when the two lists
+    # above do not already offer it. Read through this everywhere the colour row cycles or
+    # renders, so the constant `COLORS` stays the built-in list the CLI/MCP also validate against.
+    #
+    # That last entry is what makes the form lossless. Deleting a custom colour deliberately does
+    # NOT rewrite the rules that name it — they keep the reference and fall back to a visible
+    # default at render, so re-adding the colour restores them. But `idx` answers 0 for a value
+    # it cannot find, so without this the editor opened on such a rule silently showed `red`, and
+    # saving after touching only the NAME or the CONDITION wrote `red` to the store — the cascade
+    # the delete had just promised not to do, triggered by an unrelated edit. Offering the
+    # dangling name keeps the round trip exact and lets the operator see what the rule actually
+    # says; the swatch beside it draws the fallback hue, which is what the row already paints.
     def color_options : Array(String)
-      COLORS + Settings.colormarker_colors.map(&.name)
+      opts = COLORS + Settings.colormarker_colors.map(&.name)
+      opts.includes?(@opened_color) ? opts : opts + [@opened_color]
     end
 
     def self.adding : ColormarkerRuleOverlay
