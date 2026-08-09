@@ -58,7 +58,7 @@ module Gori::Tui
     end
 
     # The newest note's id, or 0 when empty. O(1) and ALLOCATION-FREE — a per-tick
-    # watcher (the Pet) diffs this, never `all`, which materialises a reversed copy
+    # watcher (the Companion) diffs this, never `all`, which materialises a reversed copy
     # of the whole ring 20x/second. push trims with shift, so the tail is always the
     # newest; after `clear` this drops to 0, which a `id > seen` guard reads as "nothing
     # new" rather than re-announcing.

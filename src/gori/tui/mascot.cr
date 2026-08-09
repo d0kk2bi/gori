@@ -8,7 +8,7 @@ module Gori::Tui
   # the live palette's brand gold.
   #
   # Pure and stateless: art tables, an ink (role) layer, a palette resolver and a draw
-  # loop. Everything about WHEN she moves lives in Pet; everything about HOW she looks
+  # loop. Everything about WHEN she moves lives in Companion; everything about HOW she looks
   # lives here.
   #
   # WHY THE SILHOUETTE IS ROUND AND NOT OVAL. A terminal row is about twice as tall as a
@@ -126,9 +126,9 @@ module Gori::Tui
     # crown. Indices into this are what Frame#glint holds; -1 is "no specular".
     GLINT_PATH = { {0, 1}, {1, 0}, {2, 0}, {3, 0}, {4, 0} }
 
-    # EVERYTHING drawn on one frame — the sprite and the speech bubble both, so Pet#tick
+    # EVERYTHING drawn on one frame — the sprite and the speech bubble both, so Companion#tick
     # can answer "did the drawn thing change" with a single field-wise compare instead of
-    # re-deriving anything. Mascot.draw consumes the sprite fields; Pet.draw adds the
+    # re-deriving anything. Mascot.draw consumes the sprite fields; Companion.draw adds the
     # bubble and the shake offset around it.
     record Frame,
       pose : Symbol = :idle,
@@ -298,7 +298,7 @@ module Gori::Tui
     # Paint the sprite with col 0 at `x`.
     #
     # The plate and hole roles still write an OPAQUE background space rather than skipping
-    # the cell: the pet occludes body content, so the whole box has to be claimed or the
+    # the cell: the companion occludes body content, so the whole box has to be claimed or the
     # tab's text bleeds through the hole and the hoop's corners. The hole reads as a hole
     # because it is painted the plate colour, not because it is left unpainted. On a still
     # beat the diff renderer forwards none of it.

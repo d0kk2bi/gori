@@ -73,7 +73,7 @@ describe "state signals carry a word or a glyph" do
     Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         # Colour branches only. `:error` is also a key in the mascot's FACE table and the
-        # pet's mood map, where it selects a glyph and an animation — different channels,
+        # companion's mood map, where it selects a glyph and an animation — different channels,
         # and neither names a colour.
         next unless line.matches?(/when :error\s+then.*Theme\./)
         next if line.includes?("Theme.red")

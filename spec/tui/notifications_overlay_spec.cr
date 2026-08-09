@@ -14,7 +14,7 @@ end
 # closure of its own state — ↵ hands the selected note to the shell's jump, and `c`
 # empties the store it was handed. Driven through OverlayHarness, which replays the
 # Runner's generic dispatch (see spec/support/overlay_harness.cr).
-# The O(1) accessors the Pet polls every tick. It must never call `all`, which
+# The O(1) accessors the Companion polls every tick. It must never call `all`, which
 # materialises a reversed copy of the whole ring 20x/second.
 describe Gori::Tui::Notifications do
   it "reports 0 for latest_id on an empty buffer" do

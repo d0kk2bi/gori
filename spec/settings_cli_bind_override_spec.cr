@@ -5,7 +5,7 @@ require "file_utils"
 # `gori tui --help`, by `gori wizard --help`, and on screen by the wizard's own NETWORK step
 # ("-l/-p one run"). They used to be assigned straight into `Settings.bind_host` /
 # `bind_port`, which ARE the persisted global, so any `Settings.save` the session happened to
-# make — the update-check stamp, tab prefs, the pet toggle, the first-run wizard's own commit —
+# make — the update-check stamp, tab prefs, the companion toggle, the first-run wizard's own commit —
 # flushed the flag to settings.json and every future launch inherited it. `gori tui -l 0.0.0.0`
 # on a fresh install left the proxy bound to every interface for good.
 #

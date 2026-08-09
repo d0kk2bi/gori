@@ -4,57 +4,57 @@ require "../support/memory_backend"
 include Gori::Tui
 
 # Runs `block` with Miss Ring forced on/off (and a motion mode), restoring both.
-private def with_pet(enabled : Bool, motion : String = "lively", notices : Bool = true, &)
-  prev = {Gori::Settings.pet?, Gori::Settings.pet_motion, Gori::Settings.pet_notices?}
-  Gori::Settings.pet = enabled
-  Gori::Settings.pet_motion = motion
-  Gori::Settings.pet_notices = notices
+private def with_companion(enabled : Bool, motion : String = "lively", notices : Bool = true, &)
+  prev = {Gori::Settings.companion?, Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
+  Gori::Settings.companion = enabled
+  Gori::Settings.companion_motion = motion
+  Gori::Settings.companion_notices = notices
   begin
     yield
   ensure
-    Gori::Settings.pet = prev[0]
-    Gori::Settings.pet_motion = prev[1]
-    Gori::Settings.pet_notices = prev[2]
+    Gori::Settings.companion = prev[0]
+    Gori::Settings.companion_motion = prev[1]
+    Gori::Settings.companion_notices = prev[2]
   end
 end
 
-# Step the pet forward `n` beats from `t0`, returning how many of those ticks reported a
+# Step the companion forward `n` beats from `t0`, returning how many of those ticks reported a
 # change. Beats are stepped one at a time because #advance re-bases on `now`, not on
 # last + BEAT — a single jump would collapse the whole span into one beat.
-private def beats(pet : Pet, t0 : Time::Instant, n : Int32) : Int32
-  (1..n).count { |i| pet.tick(t0 + Pet::BEAT * i) }
+private def beats(companion : Companion, t0 : Time::Instant, n : Int32) : Int32
+  (1..n).count { |i| companion.tick(t0 + Companion::BEAT * i) }
 end
 
-describe Gori::Tui::Pet do
-  # The hello is once per PROCESS, not once per Pet (Pet.@@greeted) — so without this
+describe Gori::Tui::Companion do
+  # The hello is once per PROCESS, not once per Companion (Companion.@@greeted) — so without this
   # every example after the first would inherit "already greeted" from whichever ran
   # before it, and the greeting assertions would pass or fail on spec ordering.
-  before_each { Pet.forget_greeting! }
+  before_each { Companion.forget_greeting! }
 
   # --- the tick contract (idle-zero-CPU) ------------------------------------
 
   it "does nothing while disabled" do
-    with_pet(false) do
-      pet = Pet.new(Notifications.new)
-      pet.tick(Time.instant).should be_false
-      pet.frame.should be_nil
+    with_companion(false) do
+      companion = Companion.new(Notifications.new)
+      companion.tick(Time.instant).should be_false
+      companion.frame.should be_nil
     end
   end
 
   it "produces an idle frame on the first tick" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
-      pet.tick(Time.instant).should be_true
-      pet.frame.not_nil!.pose.should eq(:idle)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
+      companion.tick(Time.instant).should be_true
+      companion.frame.not_nil!.pose.should eq(:idle)
     end
   end
 
   it "does not re-compose before a beat elapses" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0).should be_true
-      pet.tick(t0 + Pet::BEAT - 1.millisecond).should be_false
+      companion.tick(t0).should be_true
+      companion.tick(t0 + Companion::BEAT - 1.millisecond).should be_false
     end
   end
 
@@ -62,12 +62,12 @@ describe Gori::Tui::Pet do
   # frame only a handful of times per minute — NOT once per beat. Asserted as a rate so
   # retuning the schedule constants doesn't require editing a hardcoded count.
   it "changes the drawn frame far less often than it beats" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      n = (Pet::SLEEP_AFTER.total_milliseconds / Pet::BEAT.total_milliseconds).to_i - 1
-      changed = beats(pet, t0, n)
+      companion.tick(t0)
+      n = (Companion::SLEEP_AFTER.total_milliseconds / Companion::BEAT.total_milliseconds).to_i - 1
+      changed = beats(companion, t0, n)
       changed.should be > 0                 # she is not frozen
       changed.should be < (n * 3 / 10).to_i # …but well under a third of the beats
     end
@@ -76,40 +76,40 @@ describe Gori::Tui::Pet do
   # THE idle-zero-CPU test. After SLEEP_AFTER with no poke she must transition to :doze
   # exactly once and then report nothing, forever.
   it "dozes off and then stops reporting entirely" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      pet.tick(t0 + Pet::SLEEP_AFTER).should be_true
-      pet.frame.not_nil!.pose.should eq(:doze)
-      pet.frame.not_nil!.badge.should eq('z') # reads as asleep, not as a hang
-      pet.tick(t0 + Pet::SLEEP_AFTER + Pet::BEAT).should be_false
-      pet.tick(t0 + 1.hour).should be_false
+      companion.tick(t0)
+      companion.tick(t0 + Companion::SLEEP_AFTER).should be_true
+      companion.frame.not_nil!.pose.should eq(:doze)
+      companion.frame.not_nil!.badge.should eq('z') # reads as asleep, not as a hang
+      companion.tick(t0 + Companion::SLEEP_AFTER + Companion::BEAT).should be_false
+      companion.tick(t0 + 1.hour).should be_false
     end
   end
 
   it "wakes from a doze on input and settles back to idle" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      pet.tick(t0 + Pet::SLEEP_AFTER)
-      woke = t0 + Pet::SLEEP_AFTER + 1.second
-      pet.poke(woke)
-      pet.tick(woke + Pet::BEAT).should be_true
-      pet.frame.not_nil!.pose.should eq(:alert) # startled
-      beats(pet, woke, Pet::WAKE_BEATS + 2)
-      pet.frame.not_nil!.pose.should_not eq(:doze)
+      companion.tick(t0)
+      companion.tick(t0 + Companion::SLEEP_AFTER)
+      woke = t0 + Companion::SLEEP_AFTER + 1.second
+      companion.poke(woke)
+      companion.tick(woke + Companion::BEAT).should be_true
+      companion.frame.not_nil!.pose.should eq(:alert) # startled
+      beats(companion, woke, Companion::WAKE_BEATS + 2)
+      companion.frame.not_nil!.pose.should_not eq(:doze)
     end
   end
 
   it "drops the frame once on the disable edge, then stays quiet" do
-    pet = Pet.new(Notifications.new)
-    with_pet(true) { pet.tick(Time.instant).should be_true }
-    with_pet(false) do
-      pet.tick(Time.instant).should be_true
-      pet.frame.should be_nil
-      pet.tick(Time.instant).should be_false
+    companion = Companion.new(Notifications.new)
+    with_companion(true) { companion.tick(Time.instant).should be_true }
+    with_companion(false) do
+      companion.tick(Time.instant).should be_true
+      companion.frame.should be_nil
+      companion.tick(Time.instant).should be_false
     end
   end
 
@@ -117,51 +117,51 @@ describe Gori::Tui::Pet do
   # replays whatever landed in the meantime as if it just happened.
   it "does not announce a backlog accumulated while she was off" do
     notes = Notifications.new
-    pet = Pet.new(notes)
+    companion = Companion.new(notes)
     t0 = Time.instant
-    with_pet(false) { pet.tick(t0) }
+    with_companion(false) { companion.tick(t0) }
     notes.push(:error, "probe: boom") # arrives while she is hidden
-    with_pet(true) do
-      pet.tick(t0 + Pet::BEAT)
-      f = pet.frame.not_nil!
-      f.bubble.should eq(Pet::GREETING) # her own hello, not the note that landed while she was off
+    with_companion(true) do
+      companion.tick(t0 + Companion::BEAT)
+      f = companion.frame.not_nil!
+      f.bubble.should eq(Companion::GREETING) # her own hello, not the note that landed while she was off
       f.mood.should eq(:info)
     end
   end
 
-  # "a re-enable starts a fresh idle window" (Pet#tick) has to hold for the beat-derived
+  # "a re-enable starts a fresh idle window" (Companion#tick) has to hold for the beat-derived
   # state too — otherwise toggling her off mid-startle and back on resumes the startle.
   it "starts a fresh idle window on re-enable, not mid-schedule" do
-    pet = Pet.new(Notifications.new)
+    companion = Companion.new(Notifications.new)
     t0 = Time.instant
-    with_pet(true) do
-      pet.tick(t0)
-      pet.tick(t0 + Pet::SLEEP_AFTER) # doze off
-      woke = t0 + Pet::SLEEP_AFTER + 1.second
-      pet.poke(woke) # …and arm the startle
-      pet.tick(woke + Pet::BEAT)
-      pet.frame.not_nil!.pose.should eq(:alert)
+    with_companion(true) do
+      companion.tick(t0)
+      companion.tick(t0 + Companion::SLEEP_AFTER) # doze off
+      woke = t0 + Companion::SLEEP_AFTER + 1.second
+      companion.poke(woke) # …and arm the startle
+      companion.tick(woke + Companion::BEAT)
+      companion.frame.not_nil!.pose.should eq(:alert)
     end
-    off = t0 + Pet::SLEEP_AFTER + 2.seconds
-    with_pet(false) { pet.tick(off) } # disabled mid-startle
-    with_pet(true) do
-      pet.tick(off + 1.second)
-      pet.frame.not_nil!.pose.should_not eq(:alert)
+    off = t0 + Companion::SLEEP_AFTER + 2.seconds
+    with_companion(false) { companion.tick(off) } # disabled mid-startle
+    with_companion(true) do
+      companion.tick(off + 1.second)
+      companion.frame.not_nil!.pose.should_not eq(:alert)
     end
   end
 
   it "blinks less often on calm than on lively" do
     t0 = Time.instant
     n = 300
-    lively = with_pet(true, "lively") do
-      pet = Pet.new(Notifications.new)
-      pet.tick(t0)
-      beats(pet, t0, n)
+    lively = with_companion(true, "lively") do
+      companion = Companion.new(Notifications.new)
+      companion.tick(t0)
+      beats(companion, t0, n)
     end
-    calm = with_pet(true, "calm") do
-      pet = Pet.new(Notifications.new)
-      pet.tick(t0)
-      beats(pet, t0, n)
+    calm = with_companion(true, "calm") do
+      companion = Companion.new(Notifications.new)
+      companion.tick(t0)
+      beats(companion, t0, n)
     end
     calm.should be < lively
   end
@@ -169,74 +169,74 @@ describe Gori::Tui::Pet do
   # --- the greeting ---------------------------------------------------------
 
   it "says hello on the frame she first appears on" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      f = pet.frame.not_nil!
-      f.bubble.should eq(Pet::GREETING)
+      companion.tick(t0)
+      f = companion.frame.not_nil!
+      f.bubble.should eq(Companion::GREETING)
       f.mood.should eq(:info) # a hello is not a reaction — the face stays idle
       f.pose.should eq(:idle)
     end
   end
 
   it "holds the greeting longer than a note, then drops it" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       # Past a note's TTL (3.5s) but still inside the greeting's.
-      pet.tick(t0 + 5.seconds)
-      pet.frame.not_nil!.bubble.should eq(Pet::GREETING)
-      pet.tick(t0 + Pet::GREET_TTL + Pet::BEAT)
-      pet.frame.not_nil!.bubble.should be_nil
+      companion.tick(t0 + 5.seconds)
+      companion.frame.not_nil!.bubble.should eq(Companion::GREETING)
+      companion.tick(t0 + Companion::GREET_TTL + Companion::BEAT)
+      companion.frame.not_nil!.bubble.should be_nil
     end
   end
 
-  # Once per Pet, not once per enable edge: someone toggling her in the settings view to
+  # Once per Companion, not once per enable edge: someone toggling her in the settings view to
   # see what she looks like is not asking to be greeted again each time.
   it "greets once, not on every re-enable" do
-    pet = Pet.new(Notifications.new)
+    companion = Companion.new(Notifications.new)
     t0 = Time.instant
-    with_pet(true) { pet.tick(t0) }
-    pet.frame.not_nil!.bubble.should eq(Pet::GREETING)
-    with_pet(false) { pet.tick(t0 + Pet::BEAT) } # disable edge drops the frame and the bubble
-    with_pet(true) do
-      pet.tick(t0 + Pet::BEAT * 2)
-      pet.frame.not_nil!.bubble.should be_nil
+    with_companion(true) { companion.tick(t0) }
+    companion.frame.not_nil!.bubble.should eq(Companion::GREETING)
+    with_companion(false) { companion.tick(t0 + Companion::BEAT) } # disable edge drops the frame and the bubble
+    with_companion(true) do
+      companion.tick(t0 + Companion::BEAT * 2)
+      companion.frame.not_nil!.bubble.should be_nil
     end
   end
 
   it "does not greet while notices are off" do
-    with_pet(true, notices: false) do
-      pet = Pet.new(Notifications.new)
-      pet.tick(Time.instant)
-      pet.frame.not_nil!.bubble.should be_nil
+    with_companion(true, notices: false) do
+      companion = Companion.new(Notifications.new)
+      companion.tick(Time.instant)
+      companion.frame.not_nil!.bubble.should be_nil
     end
   end
 
   # The flag burns whether or not she was allowed to speak, so turning notices on an hour
   # into the session does not produce a stale hello.
   it "does not greet late when notices are turned on afterwards" do
-    pet = Pet.new(Notifications.new)
+    companion = Companion.new(Notifications.new)
     t0 = Time.instant
-    with_pet(true, notices: false) { pet.tick(t0) }
-    with_pet(true, notices: true) do
-      beats(pet, t0, 3)
-      pet.frame.not_nil!.bubble.should be_nil
+    with_companion(true, notices: false) { companion.tick(t0) }
+    with_companion(true, notices: true) do
+      beats(companion, t0, 3)
+      companion.frame.not_nil!.bubble.should be_nil
     end
   end
 
-  # The picker builds one Pet and the session it opens builds another, seconds apart —
+  # The picker builds one Companion and the session it opens builds another, seconds apart —
   # one hello covers both, or the operator is greeted twice for one launch of gori.
-  it "greets once per process, not once per Pet" do
-    with_pet(true) do
+  it "greets once per process, not once per Companion" do
+    with_companion(true) do
       t0 = Time.instant
-      first = Pet.new(Notifications.new)
+      first = Companion.new(Notifications.new)
       first.tick(t0)
-      first.frame.not_nil!.bubble.should eq(Pet::GREETING)
+      first.frame.not_nil!.bubble.should eq(Companion::GREETING)
 
-      second = Pet.new(Notifications.new) # the session's, after a project is chosen
+      second = Companion.new(Notifications.new) # the session's, after a project is chosen
       second.tick(t0 + 5.seconds)
       second.frame.not_nil!.bubble.should be_nil
     end
@@ -245,57 +245,57 @@ describe Gori::Tui::Pet do
   # --- say (a line with no notification behind it) --------------------------
 
   it "says a line handed to it directly, with the level's mood" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      pet.say("heads up: v9.9.9 is out", t0 + 1.second, :warn)
-      pet.tick(t0 + 1.second + Pet::BEAT)
-      f = pet.frame.not_nil!
+      companion.tick(t0)
+      companion.say("heads up: v9.9.9 is out", t0 + 1.second, :warn)
+      companion.tick(t0 + 1.second + Companion::BEAT)
+      f = companion.frame.not_nil!
       f.bubble.should eq("heads up: v9.9.9 is out") # replaces the hello it interrupts
       f.mood.should eq(:warn)
-      pet.bubble_at.should eq(t0 + 1.second)
+      companion.bubble_at.should eq(t0 + 1.second)
     end
   end
 
   # Same gate as the ring: Notices off means she does not speak, whoever is asking.
   it "stays silent on say while notices are off" do
-    with_pet(true, notices: false) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true, notices: false) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      pet.say("heads up: v9.9.9 is out", t0, :warn)
-      pet.tick(t0 + Pet::BEAT)
-      pet.frame.not_nil!.bubble.should be_nil
-      pet.frame.not_nil!.mood.should eq(:info)
+      companion.tick(t0)
+      companion.say("heads up: v9.9.9 is out", t0, :warn)
+      companion.tick(t0 + Companion::BEAT)
+      companion.frame.not_nil!.bubble.should be_nil
+      companion.frame.not_nil!.mood.should eq(:info)
     end
   end
 
   it "wakes her from a doze to say it" do
-    with_pet(true) do
-      pet = Pet.new(Notifications.new)
+    with_companion(true) do
+      companion = Companion.new(Notifications.new)
       t0 = Time.instant
-      pet.tick(t0)
-      pet.tick(t0 + Pet::SLEEP_AFTER)
-      pet.frame.not_nil!.pose.should eq(:doze)
-      woke = t0 + Pet::SLEEP_AFTER + 1.second
-      pet.say("heads up: v9.9.9 is out", woke, :warn)
-      pet.tick(woke + Pet::BEAT)
-      pet.frame.not_nil!.pose.should_not eq(:doze)
+      companion.tick(t0)
+      companion.tick(t0 + Companion::SLEEP_AFTER)
+      companion.frame.not_nil!.pose.should eq(:doze)
+      woke = t0 + Companion::SLEEP_AFTER + 1.second
+      companion.say("heads up: v9.9.9 is out", woke, :warn)
+      companion.tick(woke + Companion::BEAT)
+      companion.frame.not_nil!.pose.should_not eq(:doze)
     end
   end
 
   # --- notifications --------------------------------------------------------
 
   it "announces a new note in a bubble and takes on its mood" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:success, "fuzzer: 3 hits on id")
-      pet.tick(t0 + Pet::BEAT).should be_true
-      f = pet.frame.not_nil!
+      companion.tick(t0 + Companion::BEAT).should be_true
+      f = companion.frame.not_nil!
       f.bubble.not_nil!.should contain("fuzzer")
       f.mood.should eq(:happy)
       f.pose.should eq(:happy)
@@ -303,74 +303,74 @@ describe Gori::Tui::Pet do
   end
 
   it "announces a note only once" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:info, "scan complete")
-      pet.tick(t0 + Pet::BEAT).should be_true
-      before = pet.frame
-      pet.tick(t0 + Pet::BEAT + 1.millisecond).should be_false
-      pet.frame.should eq(before)
+      companion.tick(t0 + Companion::BEAT).should be_true
+      before = companion.frame
+      companion.tick(t0 + Companion::BEAT + 1.millisecond).should be_false
+      companion.frame.should eq(before)
     end
   end
 
   # :warning is pushed by repeater_controller and sequencer_controller even though the
   # documented level set is :warn — she must read both, not fall through to :info.
   it "maps the live :warning typo to the warn mood" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:warning, "repeater: aborted")
-      pet.tick(t0 + Pet::BEAT)
-      pet.frame.not_nil!.mood.should eq(:warn)
+      companion.tick(t0 + Companion::BEAT)
+      companion.frame.not_nil!.mood.should eq(:warn)
     end
   end
 
   it "does not re-announce after the ring buffer is cleared" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:info, "one")
-      pet.tick(t0 + Pet::BEAT)
+      companion.tick(t0 + Companion::BEAT)
       notes.clear
       # latest_id drops to 0; the `id > seen` guard must read that as "nothing new".
-      pet.tick(t0 + Pet::BEAT * 2)
-      pet.frame.not_nil!.bubble.not_nil!.should eq("one")
+      companion.tick(t0 + Companion::BEAT * 2)
+      companion.frame.not_nil!.bubble.not_nil!.should eq("one")
     end
   end
 
   it "stays silent while notices are off" do
-    with_pet(true, notices: false) do
+    with_companion(true, notices: false) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:error, "probe: boom")
-      beats(pet, t0, 3)
-      pet.frame.not_nil!.bubble.should be_nil
-      pet.frame.not_nil!.mood.should eq(:info)
+      beats(companion, t0, 3)
+      companion.frame.not_nil!.bubble.should be_nil
+      companion.frame.not_nil!.mood.should eq(:info)
     end
   end
 
   # A burst of :info must not downgrade a live error reaction's FACE, but the newest
   # message still has to be the one on screen.
   it "keeps the higher-ranked face while replacing the bubble text" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:error, "probe: boom")
-      pet.tick(t0 + Pet::BEAT)
+      companion.tick(t0 + Companion::BEAT)
       notes.push(:info, "history: 12 flows")
-      pet.tick(t0 + Pet::BEAT * 2)
-      f = pet.frame.not_nil!
+      companion.tick(t0 + Companion::BEAT * 2)
+      f = companion.frame.not_nil!
       f.mood.should eq(:alarm)
       f.badge.should eq('×')
       f.bubble.not_nil!.should contain("history")
@@ -378,46 +378,46 @@ describe Gori::Tui::Pet do
   end
 
   it "expires the bubble" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:info, "scan complete")
-      pet.tick(t0 + Pet::BEAT)
-      pet.frame.not_nil!.bubble.should_not be_nil
-      beats(pet, t0, 60) # well past every bubble TTL
-      pet.frame.not_nil!.bubble.should be_nil
+      companion.tick(t0 + Companion::BEAT)
+      companion.frame.not_nil!.bubble.should_not be_nil
+      beats(companion, t0, 60) # well past every bubble TTL
+      companion.frame.not_nil!.bubble.should be_nil
     end
   end
 
   # The bar placement shares the status row's single text slot with the toast, and Runner
   # picks between them by recency — which needs a timestamp on her side of the comparison.
   it "stamps when the bubble was set, and clears it with the bubble" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
-      pet.bubble_at.should eq(t0) # the greeting takes the bubble on the first frame
+      companion.tick(t0)
+      companion.bubble_at.should eq(t0) # the greeting takes the bubble on the first frame
       notes.push(:info, "scan complete")
-      pet.tick(t0 + Pet::BEAT)
-      pet.bubble_at.should eq(t0 + Pet::BEAT)
-      beats(pet, t0, 60) # past every TTL
-      pet.frame.not_nil!.bubble.should be_nil
-      pet.bubble_at.should be_nil
+      companion.tick(t0 + Companion::BEAT)
+      companion.bubble_at.should eq(t0 + Companion::BEAT)
+      beats(companion, t0, 60) # past every TTL
+      companion.frame.not_nil!.bubble.should be_nil
+      companion.bubble_at.should be_nil
     end
   end
 
   it "condenses a multi-line message to one line" do
-    with_pet(true) do
+    with_companion(true) do
       notes = Notifications.new
-      pet = Pet.new(notes)
+      companion = Companion.new(notes)
       t0 = Time.instant
-      pet.tick(t0)
+      companion.tick(t0)
       notes.push(:info, "first   line\there\nsecond line")
-      pet.tick(t0 + Pet::BEAT)
-      bubble = pet.frame.not_nil!.bubble.not_nil!
+      companion.tick(t0 + Companion::BEAT)
+      bubble = companion.frame.not_nil!.bubble.not_nil!
       bubble.should eq("first line here")
     end
   end
@@ -575,11 +575,11 @@ describe Gori::Tui::Pet do
 
     it "lands in the bottom-right of the body and paints nothing outside it" do
       backend = MemoryBackend.new(80, 24)
-      Pet.draw(Screen.new(backend), body, Mascot::Frame.new)
-      rect = Pet.place(body).not_nil!
+      Companion.draw(Screen.new(backend), body, Mascot::Frame.new)
+      rect = Companion.place(body).not_nil!
       # One clear row at the bottom: most tab bodies are a card whose bottom rule runs
       # along body.bottom - 1, and sitting on it cut the border in half.
-      rect.bottom.should eq(body.bottom - Pet::BOTTOM_MARGIN)
+      rect.bottom.should eq(body.bottom - Companion::BOTTOM_MARGIN)
       # The rows below and above her plate are untouched, and so is everything left of
       # the plate's padding.
       (rect.bottom..body.bottom).each { |y| backend.row(y).strip.should be_empty }
@@ -589,7 +589,7 @@ describe Gori::Tui::Pet do
       end
     end
 
-    # The bug this reproduces: the gutter was sized for the SPRITE, but Pet.draw claims a
+    # The bug this reproduces: the gutter was sized for the SPRITE, but Companion.draw claims a
     # column of plate either side of it, so the right strip landed on the nested pane rule
     # and Repeater's Response pane lost its right border for her three rows. The outer
     # card's border one column further out survived, which is what made it read as a
@@ -601,7 +601,7 @@ describe Gori::Tui::Pet do
     # SWEPT OVER THE SHAKE, because a still frame was not enough the second time either. The
     # gutter is sized for where she STANDS, and the :error reaction moves her — a frame with
     # shake: 1 put the right plate strip straight back on the nested rule, reopening the
-    # exact bug below for the 200ms of that beat. Every offset Pet#shake_for can emit has to
+    # exact bug below for the 200ms of that beat. Every offset Companion#shake_for can emit has to
     # hold the same invariant a still frame does.
     it "leaves both stacked pane rules intact, on the right and at the bottom" do
       (-1..1).each do |shake|
@@ -613,8 +613,8 @@ describe Gori::Tui::Pet do
           (body.y...body.bottom).each { |y| screen.cell(body.right - inset, y, '│', Theme.text, Theme.bg) }
           (body.x...body.right).each { |x| screen.cell(x, body.bottom - inset, '─', Theme.text, Theme.bg) }
         end
-        Pet.draw(screen, body, Mascot::Frame.new(mood: :alarm, shake: shake))
-        rect = Pet.place(body).not_nil!
+        Companion.draw(screen, body, Mascot::Frame.new(mood: :alarm, shake: shake))
+        rect = Companion.place(body).not_nil!
         Mascot::H.times do |i|
           row = backend.row(rect.y + i)
           row[body.right - 1].should eq('│') # the outer card's rule
@@ -633,15 +633,15 @@ describe Gori::Tui::Pet do
     # paints identical cells. Asserting on the emitted values (not on the painted grid) is
     # what pins that — the grid assertion above passes either way once .draw clamps.
     it "never asks to travel into the gutter it reserved" do
-      with_pet(true) do
+      with_companion(true) do
         notes = Notifications.new
-        pet = Pet.new(notes)
+        companion = Companion.new(notes)
         t0 = Time.instant
-        pet.tick(t0)
+        companion.tick(t0)
         notes.push(:error, "upstream refused the connection")
         seen = (1..10).map do |i|
-          pet.tick(t0 + Pet::BEAT * i)
-          pet.frame.not_nil!.shake
+          companion.tick(t0 + Companion::BEAT * i)
+          companion.frame.not_nil!.shake
         end
         seen.min.should be >= -1 # she stays inside the body
         seen.max.should eq(0)    # …and never travels toward the reserved right edge
@@ -655,9 +655,9 @@ describe Gori::Tui::Pet do
       backend = MemoryBackend.new(80, 24)
       screen = Screen.new(backend)
       Mascot::POSES.each do |pose|
-        Pet.draw(screen, body, Mascot::Frame.new(pose: pose, badge: '!'))
+        Companion.draw(screen, body, Mascot::Frame.new(pose: pose, badge: '!'))
       end
-      rect = Pet.place(body).not_nil!
+      rect = Companion.place(body).not_nil!
       (Mascot::H).times do |i|
         (0...80).each { |x| backend.cont_grid[rect.y + i][x].should be_false }
       end
@@ -669,12 +669,12 @@ describe Gori::Tui::Pet do
     # ceiling, and never crossing the body.
     it "widens the bubble cap with the body, between its floor and its ceiling" do
       caps = [40, 60, 80, 100, 120, 160, 220].map do |cols|
-        Pet.bubble_cap(Layout.compute(cols, 24).body.w)
+        Companion.bubble_cap(Layout.compute(cols, 24).body.w)
       end
-      caps.should eq(caps.sort)                         # never narrower on a wider terminal
-      caps.first.should eq(Pet::BUBBLE_BASE_W)          # the narrow end keeps today's width
-      caps.last.should eq(Pet::BUBBLE_MAX_W)            # …and a huge terminal stops at the ceiling
-      Pet.bubble_cap(76).should be > Pet::BUBBLE_BASE_W # 80 cols, where she is actually read
+      caps.should eq(caps.sort)                                     # never narrower on a wider terminal
+      caps.first.should eq(Companion::BUBBLE_BASE_W)                # the narrow end keeps today's width
+      caps.last.should eq(Companion::BUBBLE_MAX_W)                  # …and a huge terminal stops at the ceiling
+      Companion.bubble_cap(76).should be > Companion::BUBBLE_BASE_W # 80 cols, where she is actually read
     end
 
     # The fluid cap must not outgrow the narrow bodies the floor is above: at 40x24 the body
@@ -684,20 +684,20 @@ describe Gori::Tui::Pet do
         # NOT `body` — an `it` block closes over the describe-level local, and assigning to
         # it here would hand every later example a 200-column body on an 80x24 backend.
         wide = Layout.compute(cols, 24).body
-        plate = Pet.place(wide).not_nil!
-        box = Pet.bubble_box(wide, plate, "probe " * 60).not_nil!
+        plate = Companion.place(wide).not_nil!
+        box = Companion.bubble_box(wide, plate, "probe " * 60).not_nil!
         box.x.should be >= wide.x
         box.right.should be <= wide.right
-        box.w.should be <= Pet.bubble_cap(wide.w)
+        box.w.should be <= Companion.bubble_cap(wide.w)
       end
     end
 
     it "truncates a long bubble inside the body" do
       backend = MemoryBackend.new(80, 24)
       long = "probe " * 60
-      Pet.draw(Screen.new(backend), body, Mascot::Frame.new(bubble: long))
-      rect = Pet.place(body).not_nil!
-      text_row = rect.y - Pet::BUBBLE_H + 1
+      Companion.draw(Screen.new(backend), body, Mascot::Frame.new(bubble: long))
+      rect = Companion.place(body).not_nil!
+      text_row = rect.y - Companion::BUBBLE_H + 1
       backend.row(text_row).should contain("…")
       (0...24).each do |y|
         Screen.draw_width(backend.row(y).rstrip).should be <= body.right
@@ -711,22 +711,22 @@ describe Gori::Tui::Pet do
     it "fits the narrowest body a real Layout can hand it" do
       floor = Layout.compute(40, 24).body
       floor.w.should eq(36)
-      Pet::MIN_W.should be < floor.w
-      rect = Pet.place(floor).not_nil!
+      Companion::MIN_W.should be < floor.w
+      rect = Companion.place(floor).not_nil!
       rect.w.should eq(Mascot::W)
-      rect.right.should be <= floor.right - Pet::GUTTER
+      rect.right.should be <= floor.right - Companion::GUTTER
     end
 
     # Height is the live guard: body.h is height - 6 (or - 7 with the statusline).
     it "hides on a short terminal" do
-      Pet.place(Layout.compute(120, 10).body).should be_nil
-      Pet.place(Layout.compute(120, 24).body).should_not be_nil
+      Companion.place(Layout.compute(120, 10).body).should be_nil
+      Companion.place(Layout.compute(120, 24).body).should_not be_nil
     end
 
     it "paints nothing at all when the body is too small" do
       backend = MemoryBackend.new(80, 24)
-      Pet.place(Rect.new(0, 0, Pet::MIN_W - 1, 10)).should be_nil
-      Pet.draw(Screen.new(backend), Rect.new(0, 0, 20, 4), Mascot::Frame.new)
+      Companion.place(Rect.new(0, 0, Companion::MIN_W - 1, 10)).should be_nil
+      Companion.draw(Screen.new(backend), Rect.new(0, 0, 20, 4), Mascot::Frame.new)
       backend.grid.each(&.all?(&.== ' ').should be_true)
     end
   end

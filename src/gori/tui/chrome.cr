@@ -622,24 +622,24 @@ module Gori::Tui
     # toggle, not a status chip.)
     def self.render_status(screen : Screen, rect : Rect, *, focus : String, hints : String,
                            activity : {String, Color}? = nil, resource : String? = nil,
-                           time : String? = nil, pet : Mascot::Frame? = nil) : Nil
+                           time : String? = nil, companion : Mascot::Frame? = nil) : Nil
       screen.fill(rect, Theme.panel)
       badge = " #{focus} "
       screen.text(rect.x, rect.y, badge, Theme.text_bright, Theme.elevated, Attribute::Bold)
       hint_x = rect.x + badge.size + 1
 
-      chips = status_chips(activity: activity, resource: resource, time: time, pet: pet)
+      chips = status_chips(activity: activity, resource: resource, time: time, companion: companion)
       hint_w = {rect.right - hint_x - chips_width(chips) - 2, 1}.max
       screen.text(hint_x, rect.y, hints, Theme.muted, Theme.panel, width: hint_w)
       # Floor the chips at the hint start so they can never overwrite the badge.
       render_chips(screen, rect, chips, min_x: hint_x)
-      # The pet chip is the one chip that is not a single colour — its rim, lashes, pupils
+      # The companion chip is the one chip that is not a single colour — its rim, lashes, pupils
       # and mouth carry different tones. render_chips has already laid it out (and reserved
       # its width) as a flat label; overdraw those same cells from the SAME layout pass, so
       # the two can't disagree about where it sits. Her plate is Theme.panel, not the
       # canvas — the bar is a lifted band.
-      if frame = pet
-        idx = chips.index { |c| c.tag == :pet }
+      if frame = companion
+        idx = chips.index { |c| c.tag == :companion }
         if idx && (box = chip_layout(rect, chips, hint_x)[idx]?) && box.right <= rect.right
           Mascot.draw_row(screen, box.x, box.y, frame, Mascot.palette(frame.mood, Theme.panel))
         end
@@ -672,7 +672,7 @@ module Gori::Tui
     # anchor; it sits left of the clock. Activity and resource render in `muted`: passive
     # readouts, not states the operator must act on.
     private def self.status_chips(*, activity : {String, Color}?, resource : String? = nil,
-                                  time : String? = nil, pet : Mascot::Frame? = nil) : Array(Chip)
+                                  time : String? = nil, companion : Mascot::Frame? = nil) : Array(Chip)
       chips = [] of Chip
       chips << Chip.new(:activity, activity[0], activity[1]) if activity
       chips << Chip.new(:resource, resource, Theme.muted) if resource
@@ -686,7 +686,7 @@ module Gori::Tui
       # and face repertoire) — a chip that breathed out here would drag the entire row with
       # it on every blink. The colour is a placeholder: render_status overdraws these cells
       # per-role once the layout is known.
-      chips << Chip.new(:pet, Mascot.bar_label(pet), Theme.focus_gold) if pet
+      chips << Chip.new(:companion, Mascot.bar_label(companion), Theme.focus_gold) if companion
       chips
     end
 

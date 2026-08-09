@@ -463,10 +463,10 @@ describe Gori::Tui::Chrome do
   # that only because she is the one animated thing here that never changes width; if she
   # ever did, she would drag the clock and the readout left on every blink. So the width
   # claim is asserted the way it is actually relied on — as the clock not moving.
-  it "seats the pet chip at the far right, past the clock, without moving it" do
+  it "seats the companion chip at the far right, past the clock, without moving it" do
     # The resource readout varies too: it is the one chip here that genuinely breathes
     # (`CPU 9%` → `CPU 12%`), and it sits LEFT of the clock, so in a right-aligned run its
-    # width must not reach the clock or the pet either.
+    # width must not reach the clock or the companion either.
     xs = [] of Int32
     ["CPU 9% MEM 48M", "CPU 12% MEM 48M", "CPU 100% MEM 1.4G"].each do |resource|
       Mascot::POSES.each do |pose|
@@ -474,7 +474,7 @@ describe Gori::Tui::Chrome do
         frame = Mascot::Frame.new(pose: pose)
         Chrome.render_status(Screen.new(backend), Rect.new(0, 0, 90, 1),
           focus: "BODY", hints: "↹ pane · esc tabs",
-          resource: resource, time: "01:37 PM", pet: frame)
+          resource: resource, time: "01:37 PM", companion: frame)
         row = backend.row(0)
         label = Mascot.bar_label(frame)
         px = row.index(label).not_nil!

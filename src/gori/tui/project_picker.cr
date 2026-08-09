@@ -11,7 +11,7 @@ require "./theme"
 require "./frame"
 require "./confirm_dialog"
 require "./notifications"
-require "./pet"
+require "./companion"
 require "./settings_view"
 require "./preferences_view"
 require "./compact_overlay"
@@ -111,14 +111,14 @@ module Gori::Tui
       @update_notice = nil.as(String?) # the one-line notice text, once a fresh update is available
       @update_notice_version = ""      # the version the notice is for (persisted as the read-once marker)
       @notice_persisted = false        # guard: write the read-once marker after the notice's first real paint
-      # Miss Ring (settings:pet), same widget the session runs — off by default, and the
+      # Miss Ring (settings:companion), same widget the session runs — off by default, and the
       # same zero-cost no-op while off. She has no notification ring to watch here (the
       # picker exists before any project), so the one thing she has to say beyond her
-      # hello is handed to her directly — see announce_update / Pet#say.
-      @pet = Pet.new(Notifications.new)
-      @pet_started_at = nil.as(Time::Instant?) # when she first ticked — the hello's t0
-      @update_line = nil.as(String?)           # her form of the update notice, until she says it
-      @update_spoken = false                   # she has said it → her line counts as the notice's paint
+      # hello is handed to her directly — see announce_update / Companion#say.
+      @companion = Companion.new(Notifications.new)
+      @companion_started_at = nil.as(Time::Instant?) # when she first ticked — the hello's t0
+      @update_line = nil.as(String?)                 # her form of the update notice, until she says it
+      @update_spoken = false                         # she has said it → her line counts as the notice's paint
     end
 
     # Once-a-day cache window: skip the network probe when the last successful check
@@ -129,7 +129,7 @@ module Gori::Tui
       start_update_check
       loop do
         reconcile_update_check
-        tick_pet
+        tick_companion
         render
         # Drive the entrance animation off the idle poll cadence (~50 ms/frame):
         # the loop re-renders whenever poll_event times out, so bumping the clock
@@ -145,7 +145,7 @@ module Gori::Tui
           @backend.resize(ev.width, ev.height)
           @resized = true
         when Termisu::Event::Key
-          @pet.wake_on_input # any key re-arms Miss Ring's idle clock (self-gated while off)
+          @companion.wake_on_input # any key re-arms Miss Ring's idle clock (self-gated while off)
           result = case @mode
                    when :new      then handle_new(ev)
                    when :confirm  then handle_confirm(ev)
@@ -161,7 +161,7 @@ module Gori::Tui
           when :quit   then return nil
           end
         when Termisu::Event::Mouse
-          @pet.wake_on_input
+          @companion.wake_on_input
           result = handle_picker_mouse(ev)
           case result
           when Project then return result
@@ -236,10 +236,10 @@ module Gori::Tui
     # something, which is the whole point of routing it through her.
     #
     # @update_notice stays set either way. She is off by default and needs room the card
-    # doesn't always leave (see #pet_rect), so the row is still the notice's home — she
+    # doesn't always leave (see #companion_rect), so the row is still the notice's home — she
     # takes the row while she is talking and hands it back when she stops.
     private def announce_update(version : String) : Nil
-      return unless Settings.pet? && Settings.pet_notices?
+      return unless Settings.companion? && Settings.companion_notices?
       @update_line = "heads up: v#{version} is out · run: gori update"
     end
 
@@ -247,7 +247,7 @@ module Gori::Tui
 
     # Beat between her hello and the update line. Long enough that "hi!" reads as a
     # greeting rather than as a header on the notice, short enough to land while the
-    # operator is still on this screen (her hello holds for Pet::GREET_TTL = 8s).
+    # operator is still on this screen (her hello holds for Companion::GREET_TTL = 8s).
     UPDATE_SPEAK_AFTER = 3.seconds
 
     # Held back until the entrance animation has resolved, so the hero lands first and she
@@ -256,21 +256,21 @@ module Gori::Tui
     #
     # No dirty-tracking around the tick (unlike the Runner's): this loop already repaints
     # every poll, so her `changed` verdict has nothing here to gate.
-    private def tick_pet : Nil
+    private def tick_companion : Nil
       return if @art_frame < ART_ANIM_DONE
       now = Time.instant
-      @pet_started_at ||= now
-      @pet.tick(now)
+      @companion_started_at ||= now
+      @companion.tick(now)
       speak_update(now)
     end
 
     private def speak_update(now : Time::Instant) : Nil
       return unless line = @update_line
-      return unless started = @pet_started_at
+      return unless started = @companion_started_at
       return if now - started < UPDATE_SPEAK_AFTER
       @update_line = nil
       @update_spoken = true
-      @pet.say(line, now, :warn)
+      @companion.say(line, now, :warn)
     end
 
     # Where Miss Ring stands, or nil when she has no room. Her stage is the canvas down to
@@ -289,31 +289,31 @@ module Gori::Tui
     # of her talking, it carries its own border rather than eating the card's, and a bubble
     # narrowed to a 20-column margin would truncate every line she has to say — which is
     # the one thing a speech bubble may not do.
-    private def pet_rect(w : Int32, h : Int32) : Rect?
-      return nil unless Settings.pet?
-      ProjectPicker.pet_place(w, h)
+    private def companion_rect(w : Int32, h : Int32) : Rect?
+      return nil unless Settings.companion?
+      ProjectPicker.companion_place(w, h)
     end
 
     # The placement rule itself, free of Settings and of any picker instance so a spec can
     # sweep it over terminal sizes — the one thing about her here that geometry can get
-    # wrong. `pet_stage` is the rect Pet.place measures from; the caller hands the SAME
-    # rect to Pet.draw, so what is tested is what is painted.
-    def self.pet_stage(w : Int32, h : Int32) : Rect
+    # wrong. `companion_stage` is the rect Companion.place measures from; the caller hands the SAME
+    # rect to Companion.draw, so what is tested is what is painted.
+    def self.companion_stage(w : Int32, h : Int32) : Rect
       Rect.new(0, 0, w, h - 1)
     end
 
-    def self.pet_place(w : Int32, h : Int32) : Rect?
-      return nil unless rect = Pet.place(pet_stage(w, h))
+    def self.companion_place(w : Int32, h : Int32) : Rect?
+      return nil unless rect = Companion.place(companion_stage(w, h))
       box, _ = card_metrics(w, h)
-      # rect.x - 1: Pet.draw claims a column of plate either side of the sprite.
+      # rect.x - 1: Companion.draw claims a column of plate either side of the sprite.
       return nil if rect.x - 1 < box.right && rect.y < box.bottom
       rect
     end
 
     # Whether she is mid-sentence. Not the text — nothing here paints her line, she says it
     # in her own bubble — only whether the notice row must stand down while she does.
-    private def pet_speaking? : Bool
-      !@pet.frame.try(&.bubble).nil?
+    private def companion_speaking? : Bool
+      !@companion.frame.try(&.bubble).nil?
     end
 
     # --- input ---------------------------------------------------------------
@@ -1247,8 +1247,8 @@ module Gori::Tui
         end
       end
 
-      pet = draw_pet(screen, w, h)
-      render_notice_row(screen, pet, w, h)
+      companion = draw_companion(screen, w, h)
+      render_notice_row(screen, companion, w, h)
 
       if tokens = list_hint_tokens
         render_hint(screen, tokens, h - 2, w)
@@ -1272,13 +1272,13 @@ module Gori::Tui
     #
     # Returns her SPOT on this screen, which the notice row turns on — non-nil from the
     # frame she has room to stand on, not from the frame she first paints on. The gap is
-    # the second the entrance animation holds her back for (see #tick_pet): the row must
+    # the second the entrance animation holds her back for (see #tick_companion): the row must
     # already know she is coming, or it flashes the update notice she is about to deliver.
-    private def draw_pet(screen : Screen, w : Int32, h : Int32) : Rect?
+    private def draw_companion(screen : Screen, w : Int32, h : Int32) : Rect?
       return nil unless @mode == :list
-      return nil unless rect = pet_rect(w, h)
-      if frame = @pet.frame
-        Pet.draw(screen, ProjectPicker.pet_stage(w, h), frame)
+      return nil unless rect = companion_rect(w, h)
+      if frame = @companion.frame
+        Companion.draw(screen, ProjectPicker.companion_stage(w, h), frame)
       end
       rect
     end
@@ -1295,14 +1295,14 @@ module Gori::Tui
     # saying it (and while she still owes it), because for those seconds her bubble IS the
     # notice — the row would otherwise carry the same news a second time, in a second
     # wording, three rows below the bubble carrying it.
-    private def render_notice_row(screen : Screen, pet : Rect?, w : Int32, h : Int32) : Nil
+    private def render_notice_row(screen : Screen, companion : Rect?, w : Int32, h : Int32) : Nil
       if flash = @flash
         centered(screen, h - 3, flash, @flash_ok ? Theme.green : Theme.red, w)
       elsif open_error = @open_error
         # Capped rather than left to run off the edge: a db path makes this the one notice
         # of unbounded length. The leading words carry the meaning, and gori.log has it all.
         centered(screen, h - 3, open_error, Theme.red, w, width: w - 2)
-      elsif pet && (@update_line || pet_speaking?)
+      elsif companion && (@update_line || companion_speaking?)
         # Her saying it IS the notice reaching the screen — the marker must burn here too,
         # or the row's own paint (seconds later, and only if the operator is still on this
         # screen) would be the sole path that ever records it.

@@ -26,8 +26,8 @@ module Gori::Tui
   # SINGLE FIBER, NO LOCKS — the same invariant Notifications documents. #tick runs on
   # the render loop, #poke on the input handler, .draw on render; all the main fiber. The
   # engines push notes from their own fibers into channels that the MAIN fiber drains, so
-  # a controller worker must never touch a Pet.
-  class Pet
+  # a controller worker must never touch a Companion.
+  class Companion
     # Evaluation cadence. NOT the redraw cadence — see #advance.
     BEAT = 200.milliseconds
 
@@ -50,7 +50,7 @@ module Gori::Tui
     # someone else raised.
     GREETING = "hi! ready when you are"
     # Has she said hello in THIS PROCESS yet? The hello is a SESSION event, not a widget
-    # one: the project picker builds one Pet and the session it opens builds another, so
+    # one: the project picker builds one Companion and the session it opens builds another, so
     # a per-instance flag greets twice inside the ten seconds it takes to choose a
     # project — which reads as a glitch rather than as a character. The flag it replaced
     # was per-instance for exactly this reason at a smaller scale ("not once per enable
@@ -74,7 +74,7 @@ module Gori::Tui
     # (a pane hairline at body.right - 1 and a nested Frame.card's at body.right - 2, which
     # doubles as Frame.scroll_gauge's thumb column), PLUS ONE for the plate strip.
     #
-    # That last column is the whole reason this is 3 and not 2. Pet.draw claims a column of
+    # That last column is the whole reason this is 3 and not 2. Companion.draw claims a column of
     # plate either side of the sprite, so the box it actually paints is Mascot::W + 2 wide,
     # not Mascot::W — and a gutter sized for the sprite alone put the right strip exactly on
     # the nested rule. It showed up as Repeater's Response pane losing its right border for
@@ -107,7 +107,7 @@ module Gori::Tui
 
     getter frame : Mascot::Frame?
     # When the live bubble was set. The bar placement shares the status row's single text
-    # slot with the toast, and the two are resolved by recency (Runner#pet_notice).
+    # slot with the toast, and the two are resolved by recency (Runner#companion_notice).
     getter bubble_at : Time::Instant?
 
     def initialize(@notes : Notifications)
@@ -131,7 +131,7 @@ module Gori::Tui
     # changed. Same contract as ResourceMeter#tick and the top-bar clock: a beat that lands
     # on an identical frame is silent, so the run loop never repaints on a bare timer.
     def tick(now : Time::Instant) : Bool
-      unless Settings.pet?
+      unless Settings.companion?
         # Disable edge, as in ResourceMeter#tick: drop the frame ONCE, then stay silent.
         # Clearing the timers also means a re-enable starts a fresh idle window rather
         # than waking up mid-schedule.
@@ -168,11 +168,11 @@ module Gori::Tui
     # Wake hook for the input path. Self-gated so a keystroke costs nothing at all while
     # she's disabled — the run loop calls this on every key and click.
     def wake_on_input : Nil
-      return unless Settings.pet?
+      return unless Settings.companion?
       poke(Time.instant)
     end
 
-    # Back to the state a freshly-constructed Pet is in. The BEAT-DERIVED deadlines have to
+    # Back to the state a freshly-constructed Companion is in. The BEAT-DERIVED deadlines have to
     # go too, not just the timers: @wake_until_beat and @settle_beat are compared against
     # @beat, which reset does not rewind, so leaving them set means disabling her mid-startle
     # (or on the settle beat after a reaction) and switching back on resumes that pose
@@ -298,13 +298,13 @@ module Gori::Tui
 
     private def window(shift : Int32, salt : UInt32) : {UInt32, Int32}
       win = @beat >> shift
-      {Pet.beat_hash(win, salt), @beat & ((1 << shift) - 1)}
+      {Companion.beat_hash(win, salt), @beat & ((1 << shift) - 1)}
     end
 
     # One blink per window at a hashed offset, plus a double-blink in one window in four.
     # On "calm" the window doubles, so she blinks half as often.
     private def blink? : Bool
-      shift = Settings.pet_lively? ? BLINK_SHIFT : BLINK_SHIFT + 1
+      shift = Settings.companion_lively? ? BLINK_SHIFT : BLINK_SHIFT + 1
       h, off = window(shift, 1_u32)
       at = (h % 13).to_i
       return true if off == at
@@ -315,7 +315,7 @@ module Gori::Tui
     # replaced a gaze slide: the lashes occupy the outer face cells, so the eye pair has
     # nowhere left to slide — and a wink suits her better anyway.
     private def wink_for : Symbol
-      return :none unless Settings.pet_lively?
+      return :none unless Settings.companion_lively?
       h, off = window(WINK_SHIFT, 2_u32)
       return :none unless h % 3 == 0
       at = ((h >> 6) % 56).to_i
@@ -327,7 +327,7 @@ module Gori::Tui
     # light. Two cells change, which is why this and not a vertical bob: a bob would
     # rewrite the whole plate every beat and visibly jitter against the body text.
     private def glint_for : Int32
-      return -1 unless Settings.pet_lively?
+      return -1 unless Settings.companion_lively?
       h, off = window(GLINT_SHIFT, 3_u32)
       at = ((h >> 4) % 116).to_i
       d = off - at
@@ -338,7 +338,7 @@ module Gori::Tui
     # --- notifications -------------------------------------------------------
 
     # Say hello the first time she appears. ONCE PER PROCESS (see @@greeted), not once per
-    # enable edge and not once per Pet: someone flipping her on and off in the settings
+    # enable edge and not once per Companion: someone flipping her on and off in the settings
     # view to see what she looks like is not asking to be greeted each time, and neither
     # is someone crossing from the project picker into the session it opens.
     #
@@ -349,7 +349,7 @@ module Gori::Tui
     private def greet(now : Time::Instant) : Nil
       return if @@greeted
       @@greeted = true
-      return unless Settings.pet_notices?
+      return unless Settings.companion_notices?
       @bubble = GREETING
       @bubble_at = now
       @bubble_until = now + GREET_TTL
@@ -371,7 +371,7 @@ module Gori::Tui
     # Not a way to bypass her Notices setting: the same gate that silences the ring
     # silences this.
     def say(message : String, now : Time::Instant, level : Symbol = :info) : Nil
-      return unless Settings.pet_notices?
+      return unless Settings.companion_notices?
       mood = mood_of(level)
       @bubble = condense(message)
       @bubble_at = now
@@ -385,7 +385,7 @@ module Gori::Tui
       return false if id <= @seen_id # empty, unchanged, or post-clear
       @seen_id = id
       return false unless note = @notes.latest
-      return false unless Settings.pet_notices?
+      return false unless Settings.companion_notices?
       @bubble = condense(note.message)
       @bubble_at = now
       @bubble_until = now + bubble_ttl(mood_of(note.level))

@@ -46,7 +46,7 @@ private MAXIMAL_PROFILE = <<-JSON
     "layout": { "history_preview": true, "history_list_order": "oldest" },
     "statusline": { "command": "echo hi" },
     "display": { "history_time_format": "relative" },
-    "pet": { "enabled": true, "notices": false },
+    "companion": { "enabled": true, "notices": false },
     "notifications": { "bell": true, "toast": false },
     "general": { "confirm_quit": false, "clipboard_osc52": false },
     "update": { "notified_version": "9.9.9" },
@@ -83,8 +83,8 @@ private def with_every_section_populated(&)
   hist_order = Gori::Settings.history_list_order
   statusline = Gori::Settings.statusline_command
   time_format = Gori::Settings.history_time_format
-  pet = Gori::Settings.pet?
-  pet_notices = Gori::Settings.pet_notices?
+  companion = Gori::Settings.companion?
+  companion_notices = Gori::Settings.companion_notices?
   bell = Gori::Settings.notify_bell?
   toast = Gori::Settings.notify_toast?
   osc52 = Gori::Settings.clipboard_osc52?
@@ -122,8 +122,8 @@ private def with_every_section_populated(&)
     Gori::Settings.history_list_order = hist_order
     Gori::Settings.statusline_command = statusline
     Gori::Settings.history_time_format = time_format
-    Gori::Settings.pet = pet
-    Gori::Settings.pet_notices = pet_notices
+    Gori::Settings.companion = companion
+    Gori::Settings.companion_notices = companion_notices
     Gori::Settings.notify_bell = bell
     Gori::Settings.notify_toast = toast
     Gori::Settings.clipboard_osc52 = osc52

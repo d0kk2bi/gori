@@ -2,7 +2,7 @@ require "../spec_helper"
 
 include Gori::Tui
 
-# Miss Ring's stand on the TUTORIAL (Tutorial.pet_place / .pet_band / .step_card).
+# Miss Ring's stand on the TUTORIAL (Tutorial.companion_place / .companion_band / .step_card).
 #
 # Unlike the picker — which centres a 50-column card and drops her when she doesn't fit
 # beside it — the tour NARROWS its card to make room, because copying the picker's rule to
@@ -14,16 +14,16 @@ describe Gori::Tui::Tutorial do
   # own "too small" message names 80 as its floor — a guide mascot absent on exactly the
   # terminals new users run would have missed the point.
   it "seats her from 80 columns" do
-    Tutorial.pet_place(80, 24).should_not be_nil
-    Tutorial.pet_place(80, 16).should_not be_nil
-    Tutorial.pet_place(120, 40).should_not be_nil
+    Tutorial.companion_place(80, 24).should_not be_nil
+    Tutorial.companion_place(80, 16).should_not be_nil
+    Tutorial.companion_place(120, 40).should_not be_nil
   end
 
   # Below ~52 columns step_card's 40-column floor wins and the card grows back over her
   # stand, so she stands down rather than painting over the mock.
   it "stands down when the card floor leaves her no room" do
-    Tutorial.pet_place(50, 24).should be_nil
-    Tutorial.pet_place(44, 24).should be_nil
+    Tutorial.companion_place(50, 24).should be_nil
+    Tutorial.companion_place(44, 24).should be_nil
   end
 
   # The sprite may never touch the card: she stands there for the whole tour, and the mock
@@ -31,17 +31,17 @@ describe Gori::Tui::Tutorial do
   # floats over the card for the few seconds she is talking, exactly as it does over the
   # picker's card and a tab body in the session.)
   #
-  # Measured against the rect PET.DRAW would paint, NOT against pet_place's return value.
+  # Measured against the rect COMPANION.DRAW would paint, NOT against companion_place's return value.
   # Those are the same rect when she is seated, but sourcing it from the draw path is what
-  # keeps this from being a restatement of pet_place's own guard — see the render-path
-  # test below, which is the one that fails if render_pet stops consulting the gate.
+  # keeps this from being a restatement of companion_place's own guard — see the render-path
+  # test below, which is the one that fails if render_companion stops consulting the gate.
   it "never overlaps the card at any size she appears at" do
     (16..60).each do |h|
       (40..200).each do |w|
-        next unless Tutorial.pet_place(w, h) # the gate render_pet applies
-        rect = Pet.place(Tutorial.pet_stage(w, h)).should_not be_nil
-        box = Tutorial.step_card(w, h, Tutorial.pet_band(w, h))
-        # Her plate claims a column either side of the sprite (Pet.draw), so the box that
+        next unless Tutorial.companion_place(w, h) # the gate render_companion applies
+        rect = Companion.place(Tutorial.companion_stage(w, h)).should_not be_nil
+        box = Tutorial.step_card(w, h, Tutorial.companion_band(w, h))
+        # Her plate claims a column either side of the sprite (Companion.draw), so the box that
         # actually gets painted is one wider on each side than `rect`.
         cols = (rect.x - 1) < box.right && (rect.right + 1) > box.x
         rows = rect.y < box.bottom && rect.bottom > box.y
@@ -52,24 +52,24 @@ describe Gori::Tui::Tutorial do
 
   # THE RENDER-PATH DRIFT GUARD, and the reason the tour needs one the picker does not.
   #
-  # Tutorial.pet_place is deliberately stricter than Pet.place: it stands her down at sizes
-  # Pet.place will happily seat her at. Pet.draw only knows Pet.place, so render_pet has to
+  # Tutorial.companion_place is deliberately stricter than Companion.place: it stands her down at sizes
+  # Companion.place will happily seat her at. Companion.draw only knows Companion.place, so render_companion has to
   # apply the stricter rule itself — and when it did not, she painted over the mock tab bar
   # across the whole 40..51-column band while every other example here still passed.
   #
   # This asserts the two rules disagree EXACTLY where the card would be hit: seated sizes
   # clear the narrowed card, stood-down sizes are precisely the ones that would not have.
   # That makes the gate load-bearing rather than decorative.
-  it "stands down precisely at the sizes Pet.draw would paint over the card" do
+  it "stands down precisely at the sizes Companion.draw would paint over the card" do
     stood_down = 0
     (16..60).each do |h|
       (40..200).each do |w|
-        next unless drawn = Pet.place(Tutorial.pet_stage(w, h)) # else Pet.draw paints nothing
-        if Tutorial.pet_place(w, h)
-          # Seated: the card was narrowed for her, so what Pet.draw paints clears it.
-          Tutorial.step_card(w, h, Tutorial::PET_BAND).right.should be <= drawn.x - 1
+        next unless drawn = Companion.place(Tutorial.companion_stage(w, h)) # else Companion.draw paints nothing
+        if Tutorial.companion_place(w, h)
+          # Seated: the card was narrowed for her, so what Companion.draw paints clears it.
+          Tutorial.step_card(w, h, Tutorial::COMPANION_BAND).right.should be <= drawn.x - 1
         else
-          # Stood down: had render_pet not gated, Pet.draw would have hit the card.
+          # Stood down: had render_companion not gated, Companion.draw would have hit the card.
           stood_down += 1
           Tutorial.step_card(w, h, 0).right.should be > drawn.x - 1
         end
@@ -79,20 +79,20 @@ describe Gori::Tui::Tutorial do
     stood_down.should be > 0
   end
 
-  # …and the render path itself. render_pet hands Pet.draw whatever pet_draw_stage returns,
-  # so asserting on that rect IS asserting on what gets painted: nil means Pet.draw is
-  # never reached, and non-nil means the sprite Pet.draw derives from it clears the card.
-  # This is the example that fails if the gate is dropped from render_pet.
-  it "hands Pet.draw a stage only when the sprite it derives will clear the card" do
+  # …and the render path itself. render_companion hands Companion.draw whatever companion_draw_stage returns,
+  # so asserting on that rect IS asserting on what gets painted: nil means Companion.draw is
+  # never reached, and non-nil means the sprite Companion.draw derives from it clears the card.
+  # This is the example that fails if the gate is dropped from render_companion.
+  it "hands Companion.draw a stage only when the sprite it derives will clear the card" do
     (16..60).each do |h|
       (40..200).each do |w|
-        stage = Tutorial.pet_draw_stage(w, h)
+        stage = Tutorial.companion_draw_stage(w, h)
         if stage.nil?
-          Tutorial.pet_place(w, h).should be_nil # nothing is drawn at all
+          Tutorial.companion_place(w, h).should be_nil # nothing is drawn at all
           next
         end
-        rect = Pet.place(stage).should_not be_nil # exactly what Pet.draw will paint
-        box = Tutorial.step_card(w, h, Tutorial.pet_band(w, h))
+        rect = Companion.place(stage).should_not be_nil # exactly what Companion.draw will paint
+        box = Tutorial.step_card(w, h, Tutorial.companion_band(w, h))
         (rect.x - 1).should be >= box.right
         (rect.right + 1).should be <= w
       end
@@ -102,7 +102,7 @@ describe Gori::Tui::Tutorial do
   it "stays inside the terminal" do
     (16..60).each do |h|
       (40..200).each do |w|
-        next unless rect = Tutorial.pet_place(w, h)
+        next unless rect = Tutorial.companion_place(w, h)
         (rect.x - 1).should be >= 0
         (rect.right + 1).should be <= w
         rect.y.should be >= 0
@@ -115,7 +115,7 @@ describe Gori::Tui::Tutorial do
   it "keeps clear of the footer rows" do
     (16..60).each do |h|
       (40..200).each do |w|
-        next unless rect = Tutorial.pet_place(w, h)
+        next unless rect = Tutorial.companion_place(w, h)
         rect.bottom.should be <= h - Tutorial::FOOTER_ROWS
       end
     end
@@ -140,13 +140,13 @@ describe Gori::Tui::Tutorial do
   it "narrows the card by her band and no further" do
     (16..60).each do |h|
       (40..200).each do |w|
-        band = Tutorial.pet_band(w, h)
+        band = Tutorial.companion_band(w, h)
         next if band.zero?
         box = Tutorial.step_card(w, h, band)
         plain = Tutorial.step_card(w, h, 0)
         box.w.should be <= plain.w
         box.w.should be >= 40
-        box.w.should be >= plain.w - Tutorial::PET_BAND
+        box.w.should be >= plain.w - Tutorial::COMPANION_BAND
       end
     end
   end
@@ -156,7 +156,7 @@ describe Gori::Tui::Tutorial do
   it "never changes the card's height or vertical seat" do
     (16..60).each do |h|
       (40..200).each do |w|
-        banded = Tutorial.step_card(w, h, Tutorial.pet_band(w, h))
+        banded = Tutorial.step_card(w, h, Tutorial.companion_band(w, h))
         plain = Tutorial.step_card(w, h, 0)
         banded.h.should eq(plain.h)
         banded.y.should eq(plain.y)
