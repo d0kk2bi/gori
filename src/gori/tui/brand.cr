@@ -16,9 +16,12 @@ module Gori::Tui
     # ring is that its outer contour closes: a 20×9 cut fit in more terminals but
     # left the upper-left arc a lone floating cell with gaps either side, and a
     # broken arc reads as debris, not as a loop. 24 columns is the narrowest the
-    # arc stays connected at. Going the other way costs more than it buys — a
-    # 30×15 version resolves the logo's inner highlights, but they land as 1-cell
-    # specks at terminal scale, and `art_shown?` is a cliff rather than a slope:
+    # arc stays connected at. The interior is left empty for the same reason the
+    # contour matters: the logo's inner highlights are thinner than a cell here,
+    # so drawing them puts loose specks inside the ring and weakens the loop.
+    #
+    # Going wider costs more than it buys — a 30×15 version does resolve those
+    # highlights, but only barely, and `art_shown?` is a cliff rather than a slope:
     # its floor would rise to 33 rows, above a default 80×24 or any split pane, so
     # those terminals lose the mark entirely instead of getting a smaller one.
     # Here the gate is 29 rows / 30 cols — see ProjectPicker.art_shown?.
@@ -36,8 +39,8 @@ module Gori::Tui
       "            ███████",
       "         ██       ███",
       "     ████████     ████",
-      "   ███         ██ ████",
-      "   ███        █  ████",
+      "   ███            ████",
+      "   ███           ████",
       "   ███          ████ ▒",
       " ▒ █████      █████  ▒▒",
       "▒▒  ██████  ██████    ▒▒",
