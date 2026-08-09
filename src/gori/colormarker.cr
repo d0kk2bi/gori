@@ -280,16 +280,20 @@ module Gori
     # project one, so "past the end of the global block" means "become a project rule", which is
     # `set_scope`'s job and a different decision.
     #
-    # This changes WHICH rule paints a row, not merely the order two effects apply in.
+    # This changes WHICH rule paints a row, not merely the order two effects apply in — so
+    # false means the order is UNCHANGED, whether because the rule was already at the edge of
+    # its block or because the write did not commit. `Rules#move` cannot draw that second
+    # distinction (`Store#move_rule` returns Nil); this one can, and a caller that reports a
+    # reorder it did not get tells the operator the wrong rule paints the row.
     def move(id : Int64, dir : Int32, scope : Store::RuleScope = Store::RuleScope::Project) : Bool
       scoped = rules.select { |r| r.scope == scope }
       i = scoped.index { |r| r.id == id }
       return false unless i
       j = i + (dir < 0 ? -1 : 1)
       return false if j < 0 || j >= scoped.size
-      scope.global? ? Settings.move_colormarker_rule(id, dir) : @store.move_color_rule(id, dir)
+      ok = scope.global? ? Settings.move_colormarker_rule(id, dir) : @store.move_color_rule(id, dir)
       refresh
-      true
+      ok
     end
 
     # Re-read the snapshot (e.g. after an external MCP / other-instance edit). Same reach

@@ -118,7 +118,7 @@ module Gori
         "minimize_repeater",
         "create_rule", "update_rule", "delete_rule", "set_rule_enabled",
         "create_color_rule", "update_color_rule", "delete_color_rule", "set_color_rule_enabled", "move_color_rule",
-        "create_custom_color", "delete_custom_color",
+        "create_custom_color", "update_custom_color", "delete_custom_color",
         "create_extract_rule", "update_extract_rule", "delete_extract_rule", "set_extract_rule_enabled",
         "create_note", "update_note", "delete_note",
         "create_repeater", "update_repeater", "delete_repeater",
@@ -1220,6 +1220,17 @@ module Gori
               s.field "hex", strprop("the colour as #rrggbb (or #rgb)"), required: true
             end
 
+            tool j, "update_custom_color",
+              "Edit a global custom colour in place, keyed by its CURRENT name. Both `new_name` " \
+              "and `hex` are optional and default to the colour's current value, so `hex` alone " \
+              "recolours it and `new_name` alone renames it. A RENAME leaves colour rules naming " \
+              "the old colour dangling on a visible default (the same trade delete_custom_color " \
+              "makes) — recolouring does not, since a rule references a colour by name." do |s|
+              s.field "name", strprop("the colour's current name (from list_custom_colors)"), required: true
+              s.field "new_name", strprop("rename it to this (default: unchanged); unique, not a built-in word")
+              s.field "hex", strprop("recolour it to this #rrggbb (or #rgb) (default: unchanged)")
+            end
+
             tool j, "delete_custom_color",
               "Delete a global custom colour by name. A colour rule that still names it is left " \
               "inert — its rows fall back to a visible default rather than the deletion cascading " \
@@ -2078,6 +2089,7 @@ module Gori
         when "move_color_rule"           then gated { move_color_rule(h) }
         when "delete_color_rule"         then gated { delete_color_rule(h) }
         when "create_custom_color"       then gated { create_custom_color(h) }
+        when "update_custom_color"       then gated { update_custom_color(h) }
         when "delete_custom_color"       then gated { delete_custom_color(h) }
           # switch is always available (selecting a DB is not a data mutation).
         when "switch_project" then switch_project(h)

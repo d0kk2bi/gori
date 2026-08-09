@@ -61,19 +61,28 @@ module Gori
 
     # Move a rule one slot up (dir < 0) or down (dir > 0). Full renumber afterwards, like
     # `move_rule` — the table is tiny and tie-free positions are worth more than the saved
-    # writes. No-op at an edge / unknown id.
+    # writes.
     #
     # Reordering here changes WHICH rule paints a row, not merely the order two effects are
-    # applied in: the first enabled match wins.
-    def move_color_rule(id : Int64, dir : Int32) : Nil
+    # applied in: the first enabled match wins — which is why this answers whether the write
+    # COMMITTED rather than returning Nil the way `move_rule` does. `move_rule` is TUI-only
+    # (there is no `gori run rewriter move`), but this one is reachable from `gori run
+    # colormarker move` and MCP `move_color_rule`, and both of those already report
+    # PROJECT_BUSY on their GLOBAL branch. Without an answer here the PROJECT branch reported
+    # a successful reorder for a rolled-back write — i.e. told the operator a different rule
+    # paints the row than actually does.
+    #
+    # False also covers "nothing moved" (an edge of the block, or an unknown id), same
+    # contract `Rules#move` states.
+    def move_color_rule(id : Int64, dir : Int32) : Bool
       ids = [] of Int64
       @db.query("SELECT id FROM color_rules ORDER BY position, id") { |rs| rs.each { ids << rs.read(Int64) } }
       i = ids.index(id)
-      return unless i
+      return false unless i
       j = i + (dir < 0 ? -1 : 1)
-      return unless 0 <= j < ids.size
+      return false unless 0 <= j < ids.size
       ids.swap(i, j)
-      exec_task ->(c : DB::Connection) {
+      exec_task_ok ->(c : DB::Connection) {
         ids.each_with_index { |rid, pos| c.exec("UPDATE color_rules SET position = ? WHERE id = ?", pos, rid) }
         nil
       }

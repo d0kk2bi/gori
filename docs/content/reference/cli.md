@@ -72,7 +72,7 @@ gori run <subcommand> [options]
 | `issues` · `create` · `update` | List / export issues, or write issues |
 | `links` · `add` · `delete` | Evidence pointers from an issue or note to a flow, Repeater session, or job |
 | `rewriter` · `add` · `rm` · `enable` · `disable` · `preview` | Manage Match & Replace rules |
-| `colormarker` · `add` · `rm` · `enable` · `disable` · `move` · `preview` | Manage History row-colour rules |
+| `colormarker` · `add` · `rm` · `enable` · `disable` · `move` · `preview` · `color` | Manage History row-colour rules |
 | `project [list]` | List known projects |
 | `project create <name>` | Create (or reopen) a project by name |
 | `project delete <name>` | Delete a project and everything captured in it (`--yes` to confirm) |
@@ -538,6 +538,23 @@ A condition that matches *every* flow (empty, or a half-typed `host:`) is refuse
 `preview` reports how many recent flows the condition **matches** and how many it would actually **paint** — the two differ whenever an earlier enabled rule already claims the row. `rm` (`delete`), `enable`, `disable` and `move` take a rule id from the list, and `--scope`, because the two stores number their rules independently, so an id alone names two different rules. The list prints the scope as a `G`/`P` prefix (`G*` = this project overrides that global rule's default).
 
 The tab is **hidden by default** — show it from `settings:tabs`, next to Rewriter. See [Proxy & History](/guide/proxy/) for the interactive editor.
+
+#### colormarker color
+
+The **custom colour palette**: named colours the picker offers in every project on top of the six built-ins. A built-in resolves through the active theme, so it reads correctly on light and dark alike; a custom carries an absolute hex and does not track the theme. That is the trade for a hue the palette does not provide. Colours live in `settings.json` (`colormarker.colors`), so they are global by construction.
+
+```bash
+gori run colormarker color list
+gori run colormarker color add --name hotpink --hex '#ff69b4'
+gori run colormarker color update hotpink --hex '#e0559b'   # recolour, keep the name
+gori run colormarker color update hotpink --name fuchsia    # rename, keep the hex
+gori run colormarker color rm fuchsia
+gori run colormarker add --when 'method:DELETE' --color hotpink
+```
+
+The name is the identity — it is what a rule's `--color` stores and what the picker shows — so it is lowercased, must be unique, and may not be one of the built-in words. `update` takes either half alone.
+
+Deleting or **renaming** a colour deliberately does **not** rewrite the rules that name it: they keep the reference and fall back to a visible default, so re-adding the colour restores them. gori cannot reach every project's database from here, and a half-applied cascade would be worse than a dangling name. Recolouring is different — a rule references a colour by name, so it follows the new hex everywhere.
 
 ### run project
 

@@ -1104,7 +1104,28 @@ describe Gori::MCP::Server do
           drive(store, %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_custom_color","arguments":{"name":"red","hex":"#000000"}}}))[0]["result"]["isError"].as_bool.should be_true
           drive(store, %({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"create_custom_color","arguments":{"name":"coral","hex":"#000000"}}}))[0]["result"]["isError"].as_bool.should be_true
 
-          del = %({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_custom_color","arguments":{"name":"coral"}}})
+          # Editing in place. `Settings.update_colormarker_color` had exactly one caller (the
+          # TUI's colour editor), so an agent could only delete + re-add — which is a different
+          # action: between the two, every rule naming the colour paints a fallback hue.
+          recolour = %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"update_custom_color","arguments":{"name":"coral","hex":"#123456"}}})
+          recoloured = tool_payload(drive(store, recolour)[0])
+          recoloured["name"].as_s.should eq("coral") # a hex-only edit does not rename
+          recoloured["hex"].as_s.should eq("#123456")
+          recoloured["renamed_from"]?.should be_nil
+
+          rename = %({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"update_custom_color","arguments":{"name":"coral","new_name":"Salmon"}}})
+          renamed = tool_payload(drive(store, rename)[0])
+          renamed["name"].as_s.should eq("salmon")
+          renamed["hex"].as_s.should eq("#123456") # the unnamed half is carried over, not reset
+          renamed["renamed_from"].as_s.should eq("coral")
+
+          # An unknown colour, a no-op call and a built-in name are all refused rather than
+          # silently doing nothing.
+          drive(store, %({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"update_custom_color","arguments":{"name":"nope","hex":"#000000"}}}))[0]["result"]["isError"].as_bool.should be_true
+          drive(store, %({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"update_custom_color","arguments":{"name":"salmon"}}}))[0]["result"]["isError"].as_bool.should be_true
+          drive(store, %({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"update_custom_color","arguments":{"name":"salmon","new_name":"green"}}}))[0]["result"]["isError"].as_bool.should be_true
+
+          del = %({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"delete_custom_color","arguments":{"name":"salmon"}}})
           tool_payload(drive(store, del)[0])["deleted"].as_bool.should be_true
           Gori::Settings.colormarker_colors.should be_empty
         end
