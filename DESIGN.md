@@ -821,6 +821,120 @@ line or this header, which is what makes Host-header testing possible at all
 CR/LF/NUL in any header, and `request_head` now applies the same check to the `host` it is
 handed, since that field reaches the start of the head and could forge a boundary there.
 
+### 2026-08-09: a crawler that will not read JavaScript cannot find a modern app
+
+Refines: [P4](#p4).
+
+Discover's two techniques both derive their targets from links, and both stopped at the same
+wall. `Engine#extract_links` chose its parser from the response: robots.txt by role, a
+`<loc>`-bearing body as a sitemap, an html-like content type as HTML — and **everything else as
+`EMPTY_LINKS`**. The spider follows `<script src>` like any other link, so a run spent a real
+request on the bundle, decoded it, fingerprinted it, and then discarded every route in it. On
+anything SPA-shaped that is the whole application: an API route reachable only from JS is by
+construction unlinked, so it was invisible to the spider *and* absent from any wordlist. The
+same silence covered every JSON response.
+
+Three changes, all inside the engine's existing gates:
+
+- **`Extract.from_text`** takes the `else` branch. It looks for two shapes — an absolute
+  http(s) URL, and a root-relative path *opening a quoted string* — because those are spelled
+  identically in JS, JSON, YAML and plain text. The quote is the whole false-positive filter: a
+  regex literal (`/foo/g`), a MIME type (`application/json`) and a date all fail it. It runs
+  over inline `<script>` in HTML too, and `Engine#text_like?` keeps it off binary bodies, which
+  a crawl following `<img src>` and `<link href>` meets constantly and which would each cost a
+  full `String#scrub` to feed a regex no image can match.
+- **`Engine::WELL_KNOWN`** replaces the hard-coded robots.txt/sitemap.xml pair with the
+  registry: `sitemap_index.xml` (the Yoast spelling, and the majority of what `sitemap.xml`
+  misses) and the `.well-known/` set, of which OIDC Discovery / RFC 8414 / RFC 9728 are the
+  highest-yield documents gori fetches at all — one 200 names authorize, token, userinfo, jwks,
+  revocation, introspection and registration as absolute URLs. `.well-known` and
+  `.well-known/security.txt` *were* in the wordlist already, which is not the same thing: that
+  probes them once per calibrated **directory**, never at the origin on a path-confined run,
+  and reads nothing they say.
+- **`Source::WellKnown`** carries them, and `Engine#well_known?` is the one predicate deciding
+  both the routing and the confidence anchor. The 2026-07-26 entry above reasoned about
+  "the seed and its two derived well-known paths"; nothing in that reasoning was about the
+  number two. All of these are origin-anchored guesses at a fixed path, so all of them waive
+  Layer 1 and the path confine, none of them waives Layer 2, and all of them are graded against
+  the origin's soft-404 baseline rather than `record_page`'s raw-status trust — a wildcard-200
+  origin answers 200 to `/.well-known/openid-configuration` exactly as readily as to
+  `/robots.txt`.
+
+Widening what one response yields makes the **orchestrator** the thing to watch, since
+`consider_link` runs there and so does `enqueue_probes`, and that fiber is also the only one
+dispatching jobs. Both were paid for in the same change: `Extract` de-duplicates within a body
+and caps it at `MAX_LINKS`, and `Url.probe` derives a brute-force candidate by concatenation —
+one string serving as both the frontier entry and the `seen` key, which are the same string for
+any query-less URL. It is an optimization and never a second opinion: it declines every
+candidate `Url.parse` would have rewritten, split or refused, and the caller falls back.
+`bench/discover_extract_bench.cr` measures the directory loop at 546µs/805kB before and
+233µs/251kB after, and `url_spec` pins `probe == parse` across the whole built-in list.
+
+### 2026-08-09: a soft-404 baseline is a snapshot, and origins change their mind
+
+Refines: [P4](#p4).
+
+`Calibrate` recognises the four shapes of "not found" it was built for, and measuring it
+against an origin serving all four confirms that: a custom-designed error page on a real 404,
+a 200-everything soft-404, one that quotes the requested path back, and a 302-everything login
+funnel each yielded the planted endpoint and nothing else. Two things it does *not* recognise
+turned up in the same measurement, and they pull in opposite directions.
+
+**A stale baseline reports the whole wordlist.** A `DirBaseline` is measured once, before a
+directory's ~315 probes, and never revisited. When the origin's rate limiter tripped on the
+8th request, every remaining probe diverged from that snapshot in status *and* length *and*
+content — 0.50 + 0.25 + 0.35, clamped — so the run ended `320 found`, of which **310 were the
+limiter, every one at confidence 1.0**. This is the ordinary case on a real engagement, not an
+exotic one, and it is the worst failure the tool has: not a missed endpoint but a confident
+lie, repeated 310 times.
+
+A status guard (`429`/`503` are not evidence of existence) was considered and rejected as the
+whole answer: the new uniform response is as often a 200 block page or a 403 as it is a 429,
+so the shape to detect is *uniformity*, not a status class. `DirState` now carries the run of
+consecutive cleared-and-alike outcomes, and `DRIFT_RUN` of them means the baseline no longer
+describes the origin — re-measure the directory, and swap the new baseline into the `DirState`
+every queued probe already holds a reference to. Three details are load-bearing:
+
+- **The first member of a run is emitted; the rest are held.** At the moment it arrives, one
+  diverging response is indistinguishable from a real finding, so it is reported. The second
+  and later are held until the run either breaks (released — an ordinary directory pays only
+  the latency of one more outcome) or reaches `DRIFT_RUN` (dropped). That bound is why
+  `DRIFT_RUN` can be generous: raising it spends a few more requests, it does not leak more
+  false positives, so 12 sits far above a real cluster of same-shell routes.
+- **`drifted` is not enough; the baseline needs a GENERATION.** The flag covers the window
+  between declaring drift and the re-measurement landing — and is cleared by the very swap
+  that strands the probes still in flight, which were scored against the discarded snapshot.
+  Caught in testing as a second false positive surviving the guard. A probe now reads the
+  baseline and the generation together and carries the pair back; a mismatch means the verdict
+  is evidence about nothing.
+- **Re-calibration is capped** (`MAX_RECALIBRATIONS`). A limiter that relents and trips again
+  would otherwise re-measure forever. Past the cap the directory stops producing findings and
+  says so in `RunStats#drift_suppressed`, which all three surfaces now render.
+
+**And the same measurement found the opposite error.** `WildcardOk` required
+`fp_novel && length_div`, and the length band is proportional — `max(16, max // 20)`, 5% of the
+page. A real page sharing the error page's template, which is what a CMS or SPA soft-404 always
+is, lands inside that 5%: a 524-byte `/soft/admin` against a 545-byte soft-404 sat inside
+`[518, 572]` and was never reported, however different its content.
+
+Relaxing it to `fp_novel` alone produced **15,013 findings in one directory** against the
+path-echoing origin — because there, content divergence *is* the echo. So the conjunction is
+now conditional on a measured property rather than assumed, and the measurement is a byte
+search, not an inference: each calibration probe looks for its OWN name in its OWN body. It
+has to be direct, and the reason is the good kind of subtle. `Fingerprint.dynamic?` skips
+all-hex runs of 12 or more so that ids and hashes cannot move a hash, and `bogus_name` is
+exactly 16 hex characters — the reflected name is invisible to the very hash the reflection
+would show up in. Inferring the echo from an out-of-cluster fingerprint fails too, and fails in
+the direction that matters: one extra token in an 80-token page moves a simhash by fewer bits
+than `simhash_distance`, while `swagger/v1/swagger.json` contributes four and clears it, so the
+inferred test is *less* sensitive than the thing it predicts. The byte search costs no extra
+request, and `DirBaseline#label` reports `wildcard-200 (echoes path)` so an operator can see
+which of the two they got.
+
+Net, on the five-variant origin: 320 findings with 310 false positives became 12 with 1 — the
+single unavoidable one — while `/soft/admin`, which no configuration could previously surface,
+is now found.
+
 ---
 
 *Keep this document honest against the code. When you change a subsystem it describes, update
