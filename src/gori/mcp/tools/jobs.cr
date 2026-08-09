@@ -142,6 +142,33 @@ module Gori
       private def job_stop_requested(job : FuzzJob | MineJob | DiscoverJob | SequenceJob) : Int64?
         job.stop_requested_at_ms
       end
+
+      # The tools/list schemas for the job-control tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_jobs_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "list_jobs",
+          "List all fuzz, mine, discover, and sequence jobs this session started (job_id, " \
+          "kind, status, counts, target) — one call to see everything in flight." { }
+
+        tool j, "get_job",
+          "Full status of a fuzz, mine, discover, or sequence job by id (dispatches by the " \
+          "id prefix), so you can poll any job with one tool." do |s|
+          s.field "job_id", strprop("a fuzz (fz_*), mine (mn_*), discover (ds_*), or sequence (sq_*) job id"), required: true
+        end
+
+        tool j, "stop_job",
+          "Stop a fuzz, mine, discover, or sequence job. With wait:true, block until it reaches a terminal " \
+          "state (or wait_timeout_ms elapses) and report the final status + stopped_at, " \
+          "so stop-and-confirm is one call. Without wait, returns immediately (stop is async)." do |s|
+          s.field "job_id", strprop("a fuzz (fz_*), mine (mn_*), discover (ds_*), or sequence (sq_*) job id"), required: true
+          s.field "wait", boolprop("block until the job actually stops (default false)")
+          s.field "wait_timeout_ms", intprop("max ms to wait when wait:true (default 10000, max 60000)")
+        end
+      end
     end
   end
 end

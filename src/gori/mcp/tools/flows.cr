@@ -209,6 +209,87 @@ module Gori
           Result.new("pass exactly one of flow_id or repeater_id", is_error: true)
         end
       end
+
+      # The tools/list schemas for the captured-flow tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_flows_tools(j : JSON::Builder) : Nil
+        tool j, "list_history",
+          "List captured HTTP flows, newest first. Optional gori QL `query` " \
+          "filters (e.g. 'host:example.com status:>=500 size:>10000 dur:>500', " \
+          "'header:set-cookie', 'body~secret\\d+' — `~` is regex, dur is ms); " \
+          "empty query returns the most recent. Returns light rows (no bodies); " \
+          "use get_flow for full detail. Paginate by passing the oldest id seen as " \
+          "`before_id` (rows are newest-first); a page shorter than `limit` means no older rows. " \
+          "To TAIL new flows instead, pass `since` (the largest id you've seen): rows come back " \
+          "OLDEST-first; tail by passing the last id as the next `since`; an empty page means no " \
+          "new flows (keep your cursor). `since` and `before_id` are mutually exclusive. " \
+          "Call ql_reference for full QL syntax." do |s|
+          s.field "query", strprop("gori QL filter; empty = most recent")
+          s.field "limit", intprop("max rows (default 50, max 500)")
+          s.field "before_id", intprop("cursor: page OLDER — only flows with id < this (newest-first; works with query too)")
+          s.field "since", intprop("forward cursor: tail NEWER — only flows with id > this, oldest-first (mutually exclusive with before_id)")
+          s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false; use ql_explain to see which terms would drop)")
+        end
+
+        tool j, "list_events",
+          "Tail the AI event feed: an append-only log of job lifecycle (miner/fuzzer/probe) and " \
+          "agent actions, forward-cursored so you never see the same event twice. This is the " \
+          "AI-facing firehose complement to list_history (which tails captured flows). Pass " \
+          "`since` = the last cursor you saw (0 or omitted starts from the oldest); the response " \
+          "carries `next_cursor` — pass it as the next `since`. `next_cursor` never moves backward " \
+          "and echoes your input on an empty page, so a poll that returns no events keeps your place. " \
+          "Optional `source`/`kind` filters do NOT affect `next_cursor` (it is the max SCANNED id)." do |s|
+          s.field "since", intprop("forward cursor: only events with id > this (default 0 = from oldest). Pass back the response's next_cursor to tail.")
+          s.field "limit", intprop("max events scanned (default 100, max 500)")
+          s.field "source", strprop("filter to one source: miner | fuzzer | probe | agent")
+          s.field "kind", strprop("filter to one kind (e.g. job_done, agent_action)")
+        end
+
+        tool j, "get_flow",
+          "Full request+response for one flow id (heads + decoded bodies). " \
+          "Bodies are de-chunked/decompressed and summarised: inline text when " \
+          "UTF-8 (capped 64KB), else a base64 sample. Use get_response_body_chunk " \
+          "with the same flow id to retrieve exact continuation bytes. " \
+          "Authorization/Cookie/Set-Cookie/API-key header values are [REDACTED] " \
+          "unless include_sensitive=true." do |s|
+          s.field "id", intprop("flow id from list_history"), required: true
+          s.field "include_sensitive", boolprop("return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED] (default false)")
+          s.field "body_mode", strprop("none | preview | full (default full) — none returns body shape only (encoding/size, omitted:true); preview inlines a small head; page more with get_response_body_chunk")
+          s.field "max_body_bytes", intprop("cap inlined body bytes (clamped to 65536; page the rest with get_response_body_chunk)")
+        end
+
+        tool j, "get_response_body_chunk",
+          "Read a byte range from a stored message when get_flow / send_request / " \
+          "get_repeater_context reports truncation. Pass exactly one of flow_id or repeater_id, " \
+          "and part=\"response\" (default) or part=\"request\". Content encoding is decoded by " \
+          "default so offsets continue the inline view; raw=true pages stored wire bytes, and a " \
+          "request part is always the exact stored bytes. Returns UTF-8 text " \
+          "or base64 plus next_offset/complete. An offset past the end is clamped and flagged " \
+          "(requested_offset, offset_out_of_range, warning) rather than silently returning empty." do |s|
+          s.field "flow_id", intprop("History flow id")
+          s.field "repeater_id", intprop("Repeater workbench database id")
+          s.field "part", strprop("response (default) | request — \"request\" pages the stored REQUEST bytes: for a repeater that is the exact head+body blob send_request(repeater_id) replays, which is the only way to read past get_repeater_context's inline cap")
+          s.field "offset", intprop("zero-based byte offset (default 0)")
+          s.field "limit", intprop("bytes to return (default 65536, max 262144)")
+          s.field "raw", boolprop("page stored response bytes without content decoding (default false)")
+        end
+
+        return unless @allow_actions
+
+        tool j, "delete_flow",
+          "Hard-delete one captured flow from History. This cannot be undone." do |s|
+          s.field "id", intprop("flow id"), required: true
+        end
+
+        tool j, "clear_history",
+          "Delete EVERY captured flow in the project. Requires confirm:true — without it " \
+          "the call is refused and reports how many flows it would have destroyed. " \
+          "This cannot be undone." do |s|
+          s.field "confirm", boolprop("must be true to actually delete; anything else refuses"), required: true
+        end
+      end
     end
   end
 end

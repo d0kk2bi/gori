@@ -157,11 +157,11 @@ describe Gori::Oast do
   describe "Provider#payload_token" do
     it "extracts a nonce that is a substring of the minted payload, per provider" do
       cases = {
-        O::Interactsh.new("https://oast.pro") => O::Session.new(1_i64, O::ProviderKind::Interactsh, "https://oast.pro", "corr20charsabcdef012", "sec"),
+        O::Interactsh.new("https://oast.pro")            => O::Session.new(1_i64, O::ProviderKind::Interactsh, "https://oast.pro", "corr20charsabcdef012", "sec"),
         O::CustomHttp.new("https://my.oast.example/log") => O::Session.new(1_i64, O::ProviderKind::CustomHttp, "https://my.oast.example/log", "cid", ""),
-        O::WebhookSite.new("https://webhook.site") => O::Session.new(1_i64, O::ProviderKind::WebhookSite, "https://webhook.site", "uuid-1234", ""),
-        O::Boast.new("https://boast.example", "secret") => O::Session.new(1_i64, O::ProviderKind::Boast, "https://boast.example", "boastid", "secret", token: "secret"),
-        O::Postbin.new("https://postb.in") => O::Session.new(1_i64, O::ProviderKind::Postbin, "https://postb.in", "binid", "", token: "binid"),
+        O::WebhookSite.new("https://webhook.site")       => O::Session.new(1_i64, O::ProviderKind::WebhookSite, "https://webhook.site", "uuid-1234", ""),
+        O::Boast.new("https://boast.example", "secret")  => O::Session.new(1_i64, O::ProviderKind::Boast, "https://boast.example", "boastid", "secret", token: "secret"),
+        O::Postbin.new("https://postb.in")               => O::Session.new(1_i64, O::ProviderKind::Postbin, "https://postb.in", "binid", "", token: "binid"),
       }
       cases.each do |provider, session|
         payload = provider.generate_payload(session)

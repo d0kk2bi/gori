@@ -195,6 +195,27 @@ module Gori
           "SCOPE_BLOCKED", field: "repeater_id",
           details: JSON.parse({"scope_decision" => "unscoped", "host" => host}.to_json))
       end
+
+      # The tools/list schemas for the request-minimizer tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_minimize_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "minimize_repeater",
+          "Strip cosmetic headers, tracking-cookie crumbs, and unused query/body params " \
+          "from a saved repeater request while keeping the response within tolerance of a " \
+          "calibrated baseline (Caido-\"squash\"-style). ACTIVE: sends MANY real outbound " \
+          "requests (capped at 250) and is scope-gated. Returns the trimmed request plus " \
+          "what was removed; pass apply:true to also save it back to the session." do |s|
+          s.field "repeater_id", intprop("repeater database id (`id` is accepted as an alias — the sibling repeater tools spell it that way)"), required: true
+          s.field "id", intprop("alias for repeater_id")
+          s.field "apply", boolprop("write the minimized request back into the session (default false)")
+          s.field "verbatim", boolprop("search with the stored bytes EXACTLY, as send_request/--verbatim would send them: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync (so body params stop being removal candidates). Use it for a session seeded from a capture, where an unresolved $filter/$top/$where is stored evidence rather than a typo — without it such a session is either refused by name or minimized against substituted bytes. Default false")
+          s.field "allow_unscoped", boolprop("minimize even when the target host is outside — or without — a configured scope (default false)")
+        end
+      end
     end
   end
 end

@@ -10,12 +10,20 @@ require "../settings"
 require "../store"
 require "../issues_query"
 require "../links"
+require "./preview_split"
+require "./issue_presentation"
 
 module Gori::Tui
   # The Issues tab (DESIGN.md §6: the final output — human-confirmed vulns). A
   # severity-sorted list + a detail with inline-editable notes and a severity
   # control. Created from a flow (History `F`) or blank (`n`).
   class IssuesView
+    # The list-over-preview layout and the severity/status vocabulary, both shared with
+    # the sibling tab that lists the same records through the other lens.
+    include PreviewSplit
+    include PreviewPane
+    include IssuePresentation
+
     QUERY_FIELDS = %w(severity: status: host: title:)
 
     def initialize
@@ -62,30 +70,6 @@ module Gori::Tui
 
     def preview_enabled? : Bool
       Settings.issues_preview
-    end
-
-    getter preview_focus : Symbol
-
-    def set_preview_focus(f : Symbol) : Nil
-      @preview_focus = f if {:list, :preview}.includes?(f)
-    end
-
-    def cycle_preview_focus : Nil
-      return unless preview_enabled?
-      @preview_focus = @preview_focus == :list ? :preview : :list
-    end
-
-    def scroll_preview(delta : Int32) : Nil
-      return unless @preview_focus == :preview
-      @preview_scroll = {@preview_scroll + delta, 0}.max
-    end
-
-    def list_split(rect : Rect) : {Rect, Rect?}
-      return {rect, nil} unless preview_enabled? && rect.h >= 12
-      list_h = (rect.h * 55 // 100).clamp(6, rect.h - 5)
-      list = Rect.new(rect.x, rect.y, rect.w, list_h)
-      prev = Rect.new(rect.x, rect.y + list_h, rect.w, rect.h - list_h)
-      {list, prev}
     end
 
     def reload(store : Store) : Nil
@@ -1012,34 +996,6 @@ module Gori::Tui
       LINKS_VISIBLE
     end
 
-    private def status_tag(s : Store::Status) : String
-      case s
-      when .confirmed?      then "conf"
-      when .false_positive? then "fp"
-      when .resolved?       then "done"
-      else                       "open"
-      end
-    end
-
-    private def status_color(s : Store::Status) : Color
-      # SEVERITY owns the colour ladder on these rows; triage status does not compete for it.
-      # The two were drawn five columns apart out of the SAME hues — `CRIT conf` was two reds
-      # meaning two different axes, `LOW open` two accents — on a list whose whole job is
-      # "scan for red". The four words (conf / fp / done / open) already tell the statuses
-      # apart, so what is left for colour here is the one distinction the WORDS do not make
-      # at a glance: still live, or already handled.
-      case s
-      when .false_positive?, .resolved? then Theme.muted
-      else                                   Theme.text # open
-      end
-    end
-
-    # An absolute-form target ("GET http://h/p") already carries the host, so don't
-    # prepend it again; origin-form ("/p") gets the host prefixed.
-    private def flow_location(f : Store::FlowRow) : String
-      f.target.starts_with?("http") ? f.target : "#{f.host}#{f.target}"
-    end
-
     private def ellipsize(s : String, w : Int32) : String
       return "" if w <= 0
       return s if s.size <= w
@@ -1050,26 +1006,6 @@ module Gori::Tui
     # for Time.unix, like Project/History formatting.
     private def fmt_ts(us : Int64) : String
       Time.unix(us // 1_000_000).to_local.to_s("%Y-%m-%d %H:%M")
-    end
-
-    private def severity_badge(s : Store::Severity) : String
-      case s
-      when .critical? then "CRIT"
-      when .high?     then "HIGH"
-      when .medium?   then "MED"
-      when .low?      then "LOW"
-      else                 "INFO"
-      end
-    end
-
-    private def severity_color(s : Store::Severity) : Color
-      case s
-      when .critical? then Theme.red
-      when .high?     then Theme.orange
-      when .medium?   then Theme.yellow
-      when .low?      then Theme.accent
-      else                 Theme.muted
-      end
     end
 
     private def ensure_visible(h : Int32) : Nil

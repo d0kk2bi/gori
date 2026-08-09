@@ -1206,8 +1206,8 @@ describe Gori::Settings do
       Gori::Settings.colormarker_colors.first.name.should eq("coral")
       Gori::Settings.colormarker_colors.first.hex.should eq("#ff6b6b")
       Gori::Settings.add_colormarker_color("coral", "#000000").should_not be_nil # duplicate
-      Gori::Settings.add_colormarker_color("red", "#000000").should_not be_nil  # built-in word
-      Gori::Settings.add_colormarker_color("bad", "nothex").should_not be_nil   # unparseable hex
+      Gori::Settings.add_colormarker_color("red", "#000000").should_not be_nil   # built-in word
+      Gori::Settings.add_colormarker_color("bad", "nothex").should_not be_nil    # unparseable hex
       Gori::Settings.colormarker_colors.size.should eq(1)
 
       # A colours-only config still writes the section (the guard is not rules-only).

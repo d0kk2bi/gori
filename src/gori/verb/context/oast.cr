@@ -2,15 +2,15 @@
 # the full facade and the class-reopening convention this mirrors store/compact.cr).
 abstract class Gori::Verb::ExecContext
   # OAST tab actions
-  abstract def oast_listen : Nil          # start listening with the picked provider (register)
-  abstract def oast_stop : Nil            # stop listening with the picked provider
-  abstract def oast_generate : Nil        # get + copy a payload URL from the picked provider
-  abstract def oast_copy : Nil            # copy the last generated payload URL
-  abstract def oast_filter : Nil          # open the Callbacks filter bar
-  abstract def oast_sessions : Nil        # open RESUME LISTENER over the persisted sessions
+  abstract def oast_listen : Nil   # start listening with the picked provider (register)
+  abstract def oast_stop : Nil     # stop listening with the picked provider
+  abstract def oast_generate : Nil # get + copy a payload URL from the picked provider
+  abstract def oast_copy : Nil     # copy the last generated payload URL
+  abstract def oast_filter : Nil   # open the Callbacks filter bar
+  abstract def oast_sessions : Nil # open RESUME LISTENER over the persisted sessions
   # A callback row is selected — the gate for promoting it to an Issue.
   abstract def oast_callback_selected? : Bool
-  abstract def oast_issue_create : Nil # file the selected callback as an Issue (raw = evidence)
+  abstract def oast_issue_create : Nil    # file the selected callback as an Issue (raw = evidence)
   abstract def oast_add_provider : Nil    # open the add-provider popup
   abstract def oast_edit_provider : Nil   # open the edit-provider popup for the selection
   abstract def oast_toggle_provider : Nil # enable/disable the selected provider

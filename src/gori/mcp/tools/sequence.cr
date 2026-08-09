@@ -232,6 +232,69 @@ module Gori
         bi = b.to_i? || raise FuzzArgError.new("'position' must be A:B byte offsets")
         Sequencer::TokenLoc.new(Sequencer::ExtractKind::Position, "", ai, bi)
       end
+
+      # The tools/list schemas for the Sequencer tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_sequence_tools(j : JSON::Builder) : Nil
+        tool j, "sequence_analyze",
+          "Analyze the randomness/predictability of a set of security tokens (session IDs, " \
+          "CSRF tokens, reset tokens, API keys) — the same math as Burp/Caido Sequencer. " \
+          "Pure compute, no network: pass a `tokens` array (collect them yourself, or use " \
+          "sequence_start to replay a request). Returns a report with an overall rating " \
+          "(SECURE/MODERATE/WEAK/CRITICAL), effective + Shannon entropy, character-set, " \
+          "uniqueness/duplicate + sequential detection, and FIPS-style bit tests." do |s|
+          s.field "tokens", strarrprop("the tokens to analyze (one per array element; ≥20 recommended)"), required: true
+        end
+
+        return unless @allow_actions
+
+        tool j, "sequence_start",
+          "Collect security tokens by replaying ONE request many times, then analyze their " \
+          "randomness (Burp/Caido \"Sequencer\"). Each response's token is extracted via the " \
+          "chosen location (cookie/header/regex/position/jsonpath). Returns a job_id immediately " \
+          "(poll with sequence_status; get the report with sequence_results; end with " \
+          "sequence_stop). To analyze tokens you already have, use sequence_analyze instead. " \
+          "ACTIVE: sends many real requests. Capped at #{SEQUENCE_MAX_REQUESTS} requests / " \
+          "#{SEQUENCE_MAX_CONCURRENCY} concurrency. Provide exactly ONE token location." do |s|
+          s.field "template", strprop("raw HTTP request to replay")
+          s.field "flow_id", intprop("seed the request from a captured flow id (instead of template)")
+          s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
+          s.field "cookie", strprop("token location: a Set-Cookie value by name")
+          s.field "header", strprop("token location: a response header value by name")
+          s.field "regex", strprop("token location: capture group 1 of this regex over the body")
+          s.field "position", strprop("token location: a fixed body byte range 'A:B'")
+          s.field "jsonpath", strprop("token location: a JSON body path ($.a.b[0])")
+          s.field "count", intprop("target tokens to collect (default 500, max #{SEQUENCE_MAX_GOAL})")
+          s.field "concurrency", intprop("parallel requests (default 1 — session tokens are often stateful; max #{SEQUENCE_MAX_CONCURRENCY})")
+          s.field "rate", intprop("requests/sec cap (0 = unlimited)")
+          s.field "timeout_ms", intprop("per-request connect + idle timeout in milliseconds")
+          s.field "retries", intprop("retries per request on a network error")
+          s.field "http2", boolprop("use real HTTP/2 (default false)")
+          s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+          s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+          s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni)")
+          s.field "max_requests", intprop("caller cap on total requests")
+          s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
+        end
+
+        tool j, "sequence_status", "Counts + state of a sequence job (running|done|stopped|error): " \
+                                   "goal, collected, sent, errors, tokens_stored." do |s|
+          s.field "job_id", strprop("id from sequence_start"), required: true
+        end
+
+        tool j, "sequence_results",
+          "The randomness REPORT over a sequence job's collected tokens (rating, effective + " \
+          "Shannon entropy, character-set, uniqueness/sequential, per-test verdicts). The raw " \
+          "tokens are never returned (they are secrets)." do |s|
+          s.field "job_id", strprop("id from sequence_start"), required: true
+        end
+
+        tool j, "sequence_stop", "Stop a running sequence job (in-flight requests finish)." do |s|
+          s.field "job_id", strprop("id from sequence_start"), required: true
+        end
+      end
     end
   end
 end

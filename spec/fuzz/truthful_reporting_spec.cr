@@ -182,7 +182,7 @@ describe "Fuzz engine — B3 blocked counts payloads, not attempts/hops" do
     _, done = drain(F::Engine.new(gen, F::Matcher.new, backend, cfg))
     p = done.not_nil!.progress
 
-    p.blocked.should eq(2)   # payload-unit — NOT 6 (2 refused × 3 attempts under the old bug)
+    p.blocked.should eq(2) # payload-unit — NOT 6 (2 refused × 3 attempts under the old bug)
     p.sent.should eq(3)
     backend.calls.should eq(3) # each refused payload sent ONCE; no wasted retries of a stable gate
     # A refused payload is still one error (the refusal produces an errored Result); NOT three.

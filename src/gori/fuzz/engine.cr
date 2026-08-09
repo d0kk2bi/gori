@@ -6,6 +6,7 @@ require "../outbound"
 require "../env"
 require "../scope"
 require "../repeater/conn_pool"
+require "../pacing"
 
 module Gori::Fuzz
   # The keep-alive pool moved to `Repeater::ConnPool` when Discover became its second caller
@@ -421,6 +422,9 @@ module Gori::Fuzz
   #   coordinator fiber — waits for all workers to finish, emits Done, closes @events.
   # Progress events are droppable (latest wins); Result/Done/Error are not.
   class Engine
+    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    include Gori::Pacing
+
     EVENT_BUFFER    =  256
     MAX_CONCURRENCY = 1000 # hard ceiling on worker fibers / channel capacity
     # Synthetic baseline requests sent before the sweep when auto-calibration is on (see
@@ -799,29 +803,7 @@ module Gori::Fuzz
       uri.query ? "#{p}?#{uri.query}" : p
     end
 
-    # ── rate limiting (dispatcher-local clock → no cross-fiber race) ─────────────
-
-    private def pace_interval : Time::Span?
-      if (rps = @config.rps) && rps > 0
-        (1.0 / rps).seconds
-      elsif (t = @config.throttle_ms) && t > 0
-        t.milliseconds
-      else
-        nil
-      end
-    end
-
-    private def pace(interval : Time::Span?) : Nil
-      if interval
-        now = Time.instant
-        target = @last_dispatch + interval
-        sleep(target - now) if now < target
-        @last_dispatch = Time.instant
-      end
-      # Jitter applies on its own — don't gate it behind a base rate, which silently
-      # dropped jitter unless rps/throttle was also set.
-      sleep(rand(@config.jitter_ms).milliseconds) if @config.jitter_ms > 0
-    end
+    # ── lifecycle (pause / wake) ─────────────────────────────────────────────────
 
     private def park_if_paused : Nil
       while @state == State::Paused

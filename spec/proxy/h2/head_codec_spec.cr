@@ -188,7 +188,7 @@ describe Gori::Proxy::H2::HeadCodec do
     # projected head, with the real trailers sandwiched in between.
     it "renames an incoming field that collides with the trailer marker" do
       fields = tuples([f(":status", "200"), f("X-Gori-Trailers", "grpc-status, grpc-message"),
-                        f("grpc-status", "0"), f("grpc-message", "all good")])
+                       f("grpc-status", "0"), f("grpc-message", "all good")])
       head = String.new(HeadCodec.synth_response(fields, ["grpc-status", "grpc-message"]))
       # The peer's bytes are not thrown away (P7)…
       head.should contain("X-Peer-X-Gori-Trailers: grpc-status, grpc-message")

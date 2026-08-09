@@ -158,7 +158,7 @@ describe Gori::Probe::Active::RequestSmuggling do
       tecl = plan.followups[3]
       s = String.new(tecl)
       s.should contain("Content-Length: 6") # one greater than the 5 body bytes sent
-      s.should contain("0\r\n\r\n")          # terminating chunk only
+      s.should contain("0\r\n\r\n")         # terminating chunk only
       framing_raises?(tecl).should be_true
     end
 
@@ -218,11 +218,11 @@ describe Gori::Probe::Active::RequestSmuggling do
 
     it "dedup_key is nil in EXACTLY the cases plan is (equivalence invariant, incl. gated-out)" do
       cases = [
-        {frontended_detail, UNSAFE},                                                # eligible
-        {frontended_detail, AGGRESSIVE},                                            # eligible + armed
-        {frontended_detail, P::Active::Options::DEFAULT},                           # no allow_unsafe
-        {frontended_detail(http_version: "HTTP/2"), UNSAFE},                        # h2
-        {frontended_detail(resp_head: "HTTP/1.1 200 OK\r\n\r\n"), UNSAFE},          # no front-end hint
+        {frontended_detail, UNSAFE},                                       # eligible
+        {frontended_detail, AGGRESSIVE},                                   # eligible + armed
+        {frontended_detail, P::Active::Options::DEFAULT},                  # no allow_unsafe
+        {frontended_detail(http_version: "HTTP/2"), UNSAFE},               # h2
+        {frontended_detail(resp_head: "HTTP/1.1 200 OK\r\n\r\n"), UNSAFE}, # no front-end hint
       ]
       cases.each do |(d, o)|
         rule.dedup_key(d, o).should eq(rule.plan(d, o).try(&.dedup_key))

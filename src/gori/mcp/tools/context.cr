@@ -369,6 +369,41 @@ module Gori
           end
         end
       end
+
+      # The tools/list schemas for the session-context tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_context_tools(j : JSON::Builder) : Nil
+        tool j, "list_scope", "List the project's scope include/exclude rules, plus whether the scope lens/gate and the hard-containment sandbox are enabled." { }
+
+        tool j, "project_info",
+          "Project totals: flow count, issue count, captured bytes, earliest capture time, " \
+          "plus which project/db is being served and how it was selected. When unbound " \
+          "(bound:false), call list_projects / create_project / switch_project first. " \
+          "Always verify this before reading or mutating security-test data." { }
+
+        tool j, "get_current_context",
+          "What the user is currently viewing in the gori TUI: active tab, focused pane, the " \
+          "History-selected flow id (only when on the History tab), and sub-tab index — so you " \
+          "can act on \"what I'm looking at right now\" without the user pasting ids. Reflects an " \
+          "open (or last-open) gori TUI for THIS project. `age_seconds` shows how long since the " \
+          "TUI last recorded focus (there is no live-TUI heartbeat) — use it to judge freshness; " \
+          "`available:false` means the TUI never ran against this project." { }
+
+        tool j, "get_repeater_context",
+          "The Repeater workbench state. Defaults to metadata only so request headers, WebSocket " \
+          "payloads, response headers, and the live TUI editor snapshot are not copied into the " \
+          "model context. Set include_content=true only when those bytes are necessary. Supports " \
+          "single-id lookup, pagination, and query filtering." do |s|
+          s.field "id", intprop("return one repeater database id")
+          s.field "limit", intprop("max rows to return (default 50, max 500)")
+          s.field "offset", intprop("start row (default 0)")
+          s.field "query", strprop("filter repeaters by name or target URL (case-insensitive substring match)")
+          s.field "include_content", boolprop("include request text, WebSocket payloads, response head, and live TUI repeater snapshot (default false; may expose secrets)")
+          s.field "include_sensitive", boolprop("with include_content, return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED] (default false)")
+        end
+      end
     end
   end
 end

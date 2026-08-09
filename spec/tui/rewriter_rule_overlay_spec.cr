@@ -109,7 +109,7 @@ describe Gori::Tui::RewriterRuleOverlay do
     ov.edit_scope.should eq(Gori::Store::RuleScope::Global)
     down(ov, 1)
     ov.handle_key(skey(Termisu::Input::Key::Right))
-    ov.scope.project?.should be_true          # what the operator now wants
+    ov.scope.project?.should be_true                        # what the operator now wants
     ov.edit_scope.should eq(Gori::Store::RuleScope::Global) # where it still lives
   end
 

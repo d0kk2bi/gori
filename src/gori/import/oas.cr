@@ -41,14 +41,16 @@ module Gori
         now = Time.utc.to_unix * 1_000_000
         pairs = [] of Builder::FlowPair
         skipped = 0
-        paths_h.each do |path, item|
+        # `url_path`, not `path`: the enclosing method's `path` is the SPEC FILE on disk, and a
+        # block parameter named `path` shadows it for the whole loop body.
+        paths_h.each do |url_path, item|
           HTTP_METHODS.each do |m|
             # A path item / operation that isn't shaped as expected (null, string, array)
             # skips rather than aborting the whole spec import with a raw type-check error.
             op = item[m]? rescue nil
             next unless op
             begin
-              pairs << operation_to_flow(now, base, path.to_s, m, op, item, schemes, root_security)
+              pairs << operation_to_flow(now, base, url_path.to_s, m, op, item, schemes, root_security)
             rescue
               skipped += 1
             end

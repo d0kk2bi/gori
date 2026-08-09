@@ -1798,15 +1798,6 @@ module Gori::Tui
       true
     end
 
-    # THE shared editor keymap over the template — see `TextArea#handle_motion_key`. Dirties
-    # only on a real buffer change (⌥⌫ is the one mutation in the set).
-    def template_motion_key(ev : Termisu::Event::Key) : Bool
-      before = @editor.edits
-      return false unless @editor.handle_motion_key(ev)
-      @dirty = true if @editor.edits != before
-      true
-    end
-
     # ⌃/⌥ + ←/→ — one word instead of one character. Pure motion.
     def template_word_move(dir : Int32, selecting : Bool = false) : Nil
       dir < 0 ? @editor.word_left(selecting) : @editor.word_right(selecting)

@@ -278,27 +278,6 @@ module Gori::Tui
       end
     end
 
-    private def draw_field(screen : Screen, box : Rect, py : Int32, bg : Color, fg : Color,
-                           sel : Bool, label : String, field : TextField) : Nil
-      x = box.x + 3
-      screen.text(x, py, label, Theme.muted, bg)
-      vx = x + label.size + 1
-      vw = {box.right - 2 - vx, 3}.max
-      val = field.value
-      pre = field.preedit
-      shown = pre.empty? ? val : "#{val[0, field.caret]}#{pre}#{val[field.caret..]}"
-      screen.text(vx, py, shown, fg, bg, width: vw)
-      if sel && pre.empty?
-        cx = field.caret.clamp(0, val.size)
-        px = vx + Screen.draw_width(val[0, cx])
-        if px < box.right - 2
-          ch = cx < val.size ? val[cx] : ' '
-          screen.cell(px, py, ch, Theme.bg, Theme.accent_bg)
-          screen.cursor(px, py)
-        end
-      end
-    end
-
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless box.contains?(mx, my)
       i = my - (box.y + 2)

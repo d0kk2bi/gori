@@ -252,11 +252,11 @@ describe Gori::Export::Har do
         "version" => "1.2", "creator" => {"name" => "some-browser", "version" => "1"},
         "entries" => [{
           "startedDateTime" => "2026-07-31T00:00:00.000Z", "time" => 1.0,
-          "request"  => {"method" => "POST", "url" => "https://a.test/x", "httpVersion" => "HTTP/1.1",
-                         "headers"  => [{"name" => "Transfer-Encoding", "value" => "chunked"}],
-                         "postData" => {"mimeType" => "application/json", "text" => %({"a":1})},
-                         "queryString" => [] of String, "cookies" => [] of String,
-                         "headersSize" => -1, "bodySize" => -1},
+          "request" => {"method" => "POST", "url" => "https://a.test/x", "httpVersion" => "HTTP/1.1",
+                        "headers" => [{"name" => "Transfer-Encoding", "value" => "chunked"}],
+                        "postData" => {"mimeType" => "application/json", "text" => %({"a":1})},
+                        "queryString" => [] of String, "cookies" => [] of String,
+                        "headersSize" => -1, "bodySize" => -1},
           "response" => {"status" => 200, "statusText" => "OK", "httpVersion" => "HTTP/1.1",
                          "headers" => [{"name" => "Transfer-Encoding", "value" => "chunked"}],
                          "content" => {"size" => 11, "mimeType" => "text/plain", "text" => "hello world"},
@@ -278,7 +278,6 @@ describe Gori::Export::Har do
     req.should contain("Content-Length: 7")
     resp.should contain("Content-Length: 11")
   end
-
 
   it "writes the WIRE body, not the decompressed view, so it stays in sync with Content-Encoding" do
     # Chrome writes the decoded text here. That is fine for a debugging view and wrong for a

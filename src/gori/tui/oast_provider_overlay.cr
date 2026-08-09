@@ -248,37 +248,16 @@ module Gori::Tui
       x = box.x + 3
       fg = sel ? Theme.text_bright : Theme.text
       case i
-      when ROW_NAME then draw_field(screen, box, py, "name:", @name, sel, bg, fg)
+      when ROW_NAME then draw_field(screen, box, py, bg, fg, sel, "name:", @name)
       when ROW_SCOPE
         Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", SCOPES, @scope_i, sel)
       when ROW_TYPE
         Frame.option_cycle(screen, x, py, box.right - 2, bg, "type:", KINDS.map(&.label), @kind_idx, sel)
-      when ROW_HOST  then draw_field(screen, box, py, "host:", @host, sel, bg, fg)
-      when ROW_TOKEN then draw_field(screen, box, py, "token:", @token, sel, bg, fg)
+      when ROW_HOST  then draw_field(screen, box, py, bg, fg, sel, "host:", @host)
+      when ROW_TOKEN then draw_field(screen, box, py, bg, fg, sel, "token:", @token)
       else
         label = valid? ? "[ Save provider ]" : "[ name + host required ]"
         screen.text(x, py, label, valid? ? Theme.accent : Theme.muted, bg, Attribute::Bold)
-      end
-    end
-
-    private def draw_field(screen : Screen, box : Rect, py : Int32, label : String,
-                           field : TextField, sel : Bool, bg : Color, fg : Color) : Nil
-      x = box.x + 3
-      screen.text(x, py, label, Theme.muted, bg)
-      vx = x + label.size + 1
-      vw = {box.right - 2 - vx, 3}.max
-      val = field.value
-      pre = field.preedit
-      shown = pre.empty? ? val : "#{val[0, field.caret]}#{pre}#{val[field.caret..]}"
-      screen.text(vx, py, shown, fg, bg, width: vw)
-      if sel && pre.empty?
-        cx = field.caret.clamp(0, val.size)
-        px = vx + Screen.draw_width(val[0, cx])
-        if px < box.right - 2
-          ch = cx < val.size ? val[cx] : ' '
-          screen.cell(px, py, ch, Theme.bg, Theme.accent_bg)
-          screen.cursor(px, py)
-        end
       end
     end
 

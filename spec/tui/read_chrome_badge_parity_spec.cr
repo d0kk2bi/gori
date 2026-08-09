@@ -41,7 +41,7 @@ describe "READ-mode chrome + border badge parity" do
       row.should contain("↵:READ")
       row.should contain("§2")
       row.index("§2").not_nil!.should be < row.index("↵:READ").not_nil! # count chains LEFT
-      row.should_not contain("↵: §")                                   # the overlap's signature
+      row.should_not contain("↵: §")                                    # the overlap's signature
     end
 
     it "keeps the mode chip clickable with the count beside it" do

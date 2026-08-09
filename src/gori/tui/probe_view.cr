@@ -8,6 +8,8 @@ require "../store"
 require "../scope"
 require "../probe"
 require "../probe_query"
+require "./preview_split"
+require "./issue_presentation"
 
 module Gori::Tui
   # The Probe tab: a passive/active scan-issue list (already grouped by code+host at the
@@ -16,6 +18,12 @@ module Gori::Tui
   # IssuesView structurally; the issues ARE the groups (the DB upserts one row per
   # (code, host)), so there's no in-view folding.
   class ProbeView
+    # The list-over-preview layout and the severity/status vocabulary, both shared with
+    # the sibling tab that lists the same records through the other lens.
+    include PreviewSplit
+    include PreviewPane
+    include IssuePresentation
+
     QUERY_FIELDS = Probe::Filter::FIELDS
 
     getter query : String
@@ -55,30 +63,6 @@ module Gori::Tui
 
     def preview_enabled? : Bool
       Settings.probe_preview
-    end
-
-    getter preview_focus : Symbol
-
-    def set_preview_focus(f : Symbol) : Nil
-      @preview_focus = f if {:list, :preview}.includes?(f)
-    end
-
-    def cycle_preview_focus : Nil
-      return unless preview_enabled?
-      @preview_focus = @preview_focus == :list ? :preview : :list
-    end
-
-    def scroll_preview(delta : Int32) : Nil
-      return unless @preview_focus == :preview
-      @preview_scroll = {@preview_scroll + delta, 0}.max
-    end
-
-    def list_split(rect : Rect) : {Rect, Rect?}
-      return {rect, nil} unless preview_enabled? && rect.h >= 12
-      list_h = (rect.h * 55 // 100).clamp(6, rect.h - 5)
-      list = Rect.new(rect.x, rect.y, rect.w, list_h)
-      prev = Rect.new(rect.x, rect.y + list_h, rect.w, rect.h - list_h)
-      {list, prev}
     end
 
     # Wires the shared session Scope in (mirrors HistoryView/SitemapView) so the ⇧S
@@ -816,52 +800,6 @@ module Gori::Tui
       in Probe::Mode::Passive    then Theme.accent
       in Probe::Mode::Active     then Theme.orange
       in Probe::Mode::Aggressive then Theme.red
-      end
-    end
-
-    private def flow_location(f : Store::FlowRow) : String
-      f.target.starts_with?("http") ? f.target : "#{f.host}#{f.target}"
-    end
-
-    private def status_tag(s : Store::Status) : String
-      case s
-      when .confirmed?      then "conf"
-      when .false_positive? then "fp"
-      when .resolved?       then "done"
-      else                       "open"
-      end
-    end
-
-    private def status_color(s : Store::Status) : Color
-      # SEVERITY owns the colour ladder on these rows; triage status does not compete for it.
-      # The two were drawn five columns apart out of the SAME hues — `CRIT conf` was two reds
-      # meaning two different axes, `LOW open` two accents — on a list whose whole job is
-      # "scan for red". The four words (conf / fp / done / open) already tell the statuses
-      # apart, so what is left for colour here is the one distinction the WORDS do not make
-      # at a glance: still live, or already handled.
-      case s
-      when .false_positive?, .resolved? then Theme.muted
-      else                                   Theme.text
-      end
-    end
-
-    private def severity_badge(s : Store::Severity) : String
-      case s
-      when .critical? then "CRIT"
-      when .high?     then "HIGH"
-      when .medium?   then "MED"
-      when .low?      then "LOW"
-      else                 "INFO"
-      end
-    end
-
-    private def severity_color(s : Store::Severity) : Color
-      case s
-      when .critical? then Theme.red
-      when .high?     then Theme.orange
-      when .medium?   then Theme.yellow
-      when .low?      then Theme.accent
-      else                 Theme.muted
       end
     end
 

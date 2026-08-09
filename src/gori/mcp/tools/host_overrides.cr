@@ -81,6 +81,36 @@ module Gori
         return busy("host override NOT deleted (store busy or unwritable); it is unchanged") unless ov.remove(id)
         Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
       end
+
+      # The tools/list schemas for the host-override tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_host_overrides_tools(j : JSON::Builder) : Nil
+        tool j, "list_host_overrides",
+          "List the project's host overrides (/etc/hosts-style: dial a specific IP for a hostname; " \
+          "SNI/Host header unchanged). Project overrides win over the global Settings ones on a " \
+          "collision." { }
+
+        return unless @allow_actions
+
+        tool j, "add_host_override",
+          "Add a host override (dial a specific IP for a hostname; SNI/Host header unchanged) — " \
+          "used by send_request/send_websocket/repeater and the live proxy." do |s|
+          s.field "host", strprop("hostname to override (case-insensitive)"), required: true
+          s.field "ip", strprop("IPv4/IPv6 literal to dial, optionally IP:PORT (or [v6]:PORT) to move the port too"), required: true
+        end
+
+        tool j, "update_host_override", "Update an existing host override by id." do |s|
+          s.field "id", intprop("host override id (see list_host_overrides)"), required: true
+          s.field "host", strprop("new hostname"), required: true
+          s.field "ip", strprop("new IPv4/IPv6 literal, optionally IP:PORT (or [v6]:PORT)"), required: true
+        end
+
+        tool j, "delete_host_override", "Delete a host override by id." do |s|
+          s.field "id", intprop("host override id (see list_host_overrides)"), required: true
+        end
+      end
     end
   end
 end

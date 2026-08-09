@@ -80,8 +80,8 @@ describe Gori::Cookie do
       # of raising CookieError and refusing the whole cookie.
       seg = FLASK.split('.')[1]
       Gori::Cookie.b64_to_int?(seg).should eq(Gori::Cookie.b64_to_int(seg)) # a real ts still decodes
-      Gori::Cookie.b64_to_int?("@@@bad@@@").should be_nil                    # not valid base64
-      Gori::Cookie.b64_to_int?("AAAAAAAAAAAAAAAA").should be_nil             # decodes to > 8 bytes
+      Gori::Cookie.b64_to_int?("@@@bad@@@").should be_nil                   # not valid base64
+      Gori::Cookie.b64_to_int?("AAAAAAAAAAAAAAAA").should be_nil            # decodes to > 8 bytes
     end
 
     it "secure_compare is length- and content-exact" do

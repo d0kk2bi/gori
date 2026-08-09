@@ -448,7 +448,7 @@ module Gori::Tui
       any["concurrency"]?.try(&.as_i?).try { |n| @config.concurrency = n }
       # Absent (an older row) reads as nil ⇒ uncapped, which is what those runs were.
       @config.max_requests = any["max_requests"]?.try(&.as_i64?)
-      any["notify"]?.try(&.as_s?).try { |s| Miner::NotifyMode.parse?(s) }.try { |m| @config.notify = m }
+      any["notify"]?.try(&.as_s?).try { |mode| Miner::NotifyMode.parse?(mode) }.try { |m| @config.notify = m }
       # `!= false`, not `|| false`: a session persisted before this key existed has no
       # `keep_alive` field at all, and reading a missing key as "off" would silently opt an
       # old session out of the default the overlay shows it as having.

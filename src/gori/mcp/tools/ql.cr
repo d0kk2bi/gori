@@ -78,6 +78,24 @@ module Gori
           "(call ql_reference; e.g. host:example.com status:>=500 method:POST)",
           "QUERY_SYNTAX", field: "query")
       end
+
+      # The tools/list schemas for the QL reference tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_ql_tools(j : JSON::Builder) : Nil
+        tool j, "ql_reference",
+          "Return the gori QL (query language) syntax reference for filtering flows " \
+          "(list_history, list_sitemap). Call this before writing complex queries." { }
+
+        tool j, "ql_explain",
+          "Diagnose a gori QL query WITHOUT running it: which terms were applied, which " \
+          "were silently dropped (broadening results), which regex terms are invalid " \
+          "(match nothing), the compiled SQL, and warnings. Use to debug a query that " \
+          "returns too many or zero rows." do |s|
+          s.field "query", strprop("the gori QL query to analyze"), required: true
+        end
+      end
     end
   end
 end

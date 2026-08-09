@@ -115,6 +115,53 @@ module Gori
         return Result.new("not a decodable JWT — no payloads generated", is_error: true) if attacks.empty?
         Result.new(Jwt.attacks_json(attacks))
       end
+
+      # The tools/list schemas for the decoder / JWT tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_decode_tools(j : JSON::Builder) : Nil
+        tool j, "decode",
+          "Run a gori Decoder chain (encode/decode/hash/compress) over `input` and return the " \
+          "result — the same engine as the TUI Decoder tab. Pure transform: no network, no state. " \
+          "`spec` is converter tokens separated by '>', '|' or ',' applied left-to-right, e.g. " \
+          "'base64-decode > gunzip', 'url-encode', 'sha256'. Common converters: base64, " \
+          "base64-decode, url-encode, url-encode-all, url-decode, hex, hex-decode, gzip, gunzip, " \
+          "deflate, inflate, raw-deflate, raw-inflate, jwt-decode, html-encode, md5, sha256, crc32, " \
+          "decimal, binary, rot47, quoted-printable, punycode-encode, punycode-decode, base36, " \
+          "base62, xml-escape, shell-escape, powershell-escape, c-string-escape, homoglyph, typo. " \
+          "An unknown token returns the full list." do |s|
+          s.field "input", strprop("the value to transform (UTF-8 text unless input_base64 is set)"), required: true
+          s.field "spec", strprop("converter chain, e.g. 'base64-decode > gunzip'"), required: true
+          s.field "input_base64", boolprop("treat `input` as base64 and decode it to raw bytes first (for binary input)")
+        end
+
+        tool j, "jwt_decode",
+          "Decode a JWT into its header + payload JSON and signature — the same engine as the " \
+          "TUI JWT tab. Pure transform: no network, no state, no signature verification. Returns " \
+          "{alg, header, payload, signature, signed}." do |s|
+          s.field "token", strprop("the JWT (header.payload[.signature])"), required: true
+        end
+
+        tool j, "jwt_encode",
+          "Re-sign a JWT with a chosen algorithm + secret — the classic testing move (swap alg to " \
+          "none, or re-sign with a guessed HS secret). Takes the header + payload from `token` " \
+          "(or the explicit `header`/`payload` JSON overrides), FORCES `alg` into the header, and " \
+          "HMAC-signs with `secret` (HS256/384/512) or leaves it unsigned (none). Returns {token, alg}." do |s|
+          s.field "token", strprop("a JWT to take the header + payload from (optional if header+payload are given)")
+          s.field "header", strprop("header JSON object (overrides the token's header)")
+          s.field "payload", strprop("payload JSON (overrides the token's payload)")
+          s.field "alg", strprop("HS256 (default) | HS384 | HS512 | none")
+          s.field "secret", strprop("HMAC secret for an HS algorithm")
+        end
+
+        tool j, "jwt_attacks",
+          "Generate testing payloads from a JWT: alg:none variants + signature strip, weak-secret " \
+          "HS256 re-signs, and header-parameter injection (kid path-traversal/SQLi, jku/x5u/jwk). " \
+          "Pure transform: no network. Returns an array of {name, category, note, token}." do |s|
+          s.field "token", strprop("the JWT to derive testing payloads from"), required: true
+        end
+      end
     end
   end
 end

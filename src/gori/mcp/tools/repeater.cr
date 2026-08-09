@@ -522,6 +522,50 @@ module Gori
         return busy("repeater NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_repeater(id)
         Result.new(JSON.build { |j| j.object { j.field "success", true } })
       end
+
+      # The tools/list schemas for the Repeater tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_repeater_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "create_repeater", "Create a new repeater tab/session in the database. Provide either ('target' and 'request') OR ('flow_id') OR ('issue_id')." do |s|
+          s.field "target", strprop("absolute target URL (scheme+host+optional port), e.g. https://api.example.com")
+          s.field "request", strprop("verbatim raw HTTP request bytes/text")
+          s.field "request_base64", strprop("the raw HTTP request as base64 — the byte-exact form; use it when the request carries an octet a JSON string cannot (0x00, 0x80-0xFF, invalid UTF-8, a binary body). Overrides 'request'")
+          s.field "http2", boolprop("use HTTP/2 (default false)")
+          s.field "auto_content_length", boolprop("auto-calculate Content-Length header (default true)")
+          s.field "flow_id", intprop("optional original flow id this repeater stems from")
+          s.field "keep_request_line", boolprop("flow_id/issue_id seeding only: store the captured request line as-is instead of rewriting an absolute-form line (GET http://h/p) to origin-form (GET /p). Default false. The rewrite is PERMANENT once stored — not even send_request --verbatim can recover the line — so pass true when the absolute form is the payload. `request_line_rewritten:true` comes back whenever it fired")
+          s.field "issue_id", intprop("optional issue id to populate target/request/messages from")
+          s.field "position", intprop("tab position order index (optional, defaults to appending at end)")
+          s.field "sni", strprop("optional TLS Server Name Indication override")
+          s.field "name", strprop("optional custom name for the repeater tab")
+          s.field "ws_out_messages", ws_out_messages_prop
+          s.field "ws_keep_key", boolprop("WebSocket: send this session's own Sec-WebSocket-Key instead of a fresh one (default false)")
+          s.field "ws_http_only", boolprop("WebSocket: treat this session as plain HTTP — `gori run repeater send` and the TUI send the upgrade handshake as an ordinary request and read the 101 as a response, instead of performing the framed exchange. The bytes are unchanged and the session's messages are kept (default false)")
+        end
+
+        tool j, "update_repeater", "Update an existing repeater tab's properties by database id." do |s|
+          s.field "id", intprop("repeater database id"), required: true
+          s.field "target", strprop("absolute target URL")
+          s.field "request", strprop("verbatim raw HTTP request")
+          s.field "request_base64", strprop("the raw HTTP request as base64 — the byte-exact form (see create_repeater). Overrides 'request'")
+          s.field "http2", boolprop("use HTTP/2")
+          s.field "auto_content_length", boolprop("auto-calculate Content-Length")
+          s.field "sni", strprop("TLS SNI override")
+          s.field "name", strprop("custom name for the repeater tab")
+          s.field "tags", strprop("free-text tags for grouping tabs (the TUI subtab label); empty string clears them")
+          s.field "ws_out_messages", ws_out_messages_prop
+          s.field "ws_keep_key", boolprop("WebSocket: send this session's own Sec-WebSocket-Key instead of a fresh one")
+          s.field "ws_http_only", boolprop("WebSocket: treat this session as plain HTTP — the handshake is sent as an ordinary request and the 101 read as a response. The bytes are unchanged and the session's messages are kept")
+        end
+
+        tool j, "delete_repeater", "Delete a repeater tab by database id." do |s|
+          s.field "id", intprop("repeater database id"), required: true
+        end
+      end
     end
   end
 end

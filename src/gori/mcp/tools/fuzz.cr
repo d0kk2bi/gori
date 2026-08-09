@@ -717,6 +717,72 @@ module Gori
         cfg.update_content_length = bool_arg(h, "update_content_length", cfg.update_content_length?)
         cfg
       end
+
+      # The tools/list schemas for the Fuzzer tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_fuzz_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "fuzz_start",
+          "Start a fuzz/intruder run against an origin and return a job_id " \
+          "immediately (poll with fuzz_status / fuzz_results; end with fuzz_stop). " \
+          "ACTIVE: sends many real outbound requests from this host. Mark payload " \
+          "positions with §…§ in `template`, via `marks` (literal token wrap, like " \
+          "CLI --mark), or pass `flow_id` + auto:true, then provide payload sets via " \
+          "`payloads`. Capped " \
+          "at #{FUZZ_MAX_REQUESTS} requests / #{FUZZ_MAX_CONCURRENCY} concurrency." do |s|
+          s.field "template", strprop("raw HTTP request with §…§ position markers")
+          s.field "flow_id", intprop("seed the template from a captured flow id (instead of template)")
+          s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
+          s.field "auto", boolprop("auto-mark every query/cookie/body param when the template has no § markers")
+          s.field "marks", strarrprop("literal tokens to mark as §…§ positions (each occurrence, mirrors CLI --mark); alternative to embedding §…§ in template")
+          s.field "mode", strprop("sniper (default) | batteringram | pitchfork | clusterbomb")
+          s.field "payloads", arrprop(%(array of payload sets, e.g. [{"list":["a","b"]},{"list_base64":["gA==","/w=="]},{"preset":"sqli"},{"numbers":"1-100"},{"wordlist":"/p.txt"},{"null":5},{"brute":"abc:1-3"}] — JSON array, NOT a string. "preset" is a built-in curated set — one of #{Fuzz::Presets.names.join(", ")} — for a fast start with no file; add "file":"/extra.txt" to merge a user file into it (built-in first, de-duped). "list_base64" is the byte-exact list: use it for payloads a JSON string cannot carry (0x00, 0x80-0xFF, invalid/overlong UTF-8), since "list" entries go on the wire as their UTF-8 encoding. numbers/brute also accept a structured object: {"numbers":{"from":1,"to":100,"step":2}}, {"brute":{"charset":"abc","min":1,"max":3}}))
+          s.field "processors", arrprop(%(ordered pipeline applied to EVERY payload before it's spliced in (mirrors CLI --prefix/--suffix/--encode/--case/--hash/--regex-replace) — e.g. [{"type":"encode","kind":"url"}]. A payload containing a raw space, CRLF, or other characters unsafe in the position it's marking (a query/body param value has no encoding applied by default — auto-mark finds the position but does NOT encode for it) will otherwise corrupt the request line/framing instead of reaching the app. Entries: {"type":"prefix","text":".."} {"type":"suffix","text":".."} {"type":"encode","kind":"url|urlall|base64|hex"} {"type":"case","kind":"upper|lower"} {"type":"hash","algo":"md5|sha1|sha256"} {"type":"regex_replace","pattern":"..","replacement":".."}))
+          s.field "match", jsonprop(%(keep only responses matching, e.g. {"status":"200,500-599","size":">1000","regex":"err"} — object or JSON string. "grpc" matches the grpc-status TRAILER (e.g. "7", ">0", "1-16"): for a gRPC target the HTTP status is 200 on every response, granted or denied, so "status" cannot separate them — every result row also carries grpc_status/grpc_status_name/grpc_message))
+          s.field "filter", jsonprop(%(drop responses matching, same shape as match — object or JSON string))
+          s.field "extract", strprop("regex; grep a value (capture group 1) from each response")
+          s.field "concurrency", intprop("parallel requests (default 20, max #{FUZZ_MAX_CONCURRENCY})")
+          s.field "rate", intprop("requests/sec cap (0 = unlimited)")
+          s.field "timeout_ms", intprop("per-request connect + idle (read/write) timeout in milliseconds")
+          s.field "retries", intprop("retries per request on a network error")
+          s.field "follow_redirects", boolprop("follow 3xx responses (default false). Matters more than it sounds: against an endpoint that 302s, every status/size/words/lines/regex match otherwise runs against the redirect STUB, so a run reports uniform \"no differences\" while the interesting response is one hop away. Mirrors CLI --follow.")
+          s.field "max_redirects", intprop("hop limit when follow_redirects is on")
+          s.field "auto_calibrate", boolprop("drop responses identical to the baseline, so only what a payload CHANGED is reported (mirrors CLI --ac)")
+          s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+          s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test")
+          s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection across many requests (default true) — one TCP/TLS handshake per worker instead of per request. Set false to dial a fresh connection per request, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection) or when keep-alive handling is itself what you are probing.")
+          s.field "http2", boolprop("use real HTTP/2 (default false)")
+          s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+          s.field "max_requests", intprop("caller cap on total requests")
+          s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
+          s.field "record_history", strprop("none (default) | matched | all — record each sent request+response as a History flow for audit/evidence; matched results carry the flow_id in fuzz_results (fetch full detail with get_flow). 'all' is capped at #{FUZZ_HISTORY_MAX} flows. Booleans are accepted as aliases (true = all, false = none) because send_request spells this argument as a boolean; any OTHER value is refused by name rather than silently recording nothing.")
+          s.field "update_content_length", boolprop("recompute Content-Length after each payload is spliced into the body (default true). Set FALSE to send your template's declared value verbatim — a Content-Length shorter or longer than the body, or Content-Length alongside Transfer-Encoding, is the canonical request-smuggling primitive, and with the default on every payload is silently re-framed to fit before it leaves. Mirrors CLI `gori run fuzz --verbatim` and intercept_forward_edit{update_content_length:false}.")
+        end
+
+        tool j, "fuzz_status", "Counts + state of a fuzz job (running|done|budget_exhausted|stopped|error). " \
+                               "budget_exhausted means max_requests halted the run before every candidate was checked — " \
+                               "a partial result, NOT an exhaustive one; see incomplete_reason and candidates_remaining." do |s|
+          s.field "job_id", strprop("id from fuzz_start"), required: true
+        end
+
+        tool j, "fuzz_results",
+          "Paged matched results for a fuzz job (status/length/words/lines/duration/" \
+          "extracted, plus a per-result flow_id when the run used record_history). No raw " \
+          "bodies are inlined: fetch a hit's full request+response with get_flow(flow_id), " \
+          "or re-issue it with send_request by substituting the payload into your template." do |s|
+          s.field "job_id", strprop("id from fuzz_start"), required: true
+          s.field "offset", intprop("start row (default 0)")
+          s.field "limit", intprop("max rows (default 100, max 1000)")
+          s.field "matched_only", boolprop("no-op: fuzz results are stored matched-only, so this never changes the page")
+        end
+
+        tool j, "fuzz_stop", "Stop a running fuzz job (in-flight requests finish)." do |s|
+          s.field "job_id", strprop("id from fuzz_start"), required: true
+        end
+      end
     end
   end
 end

@@ -271,6 +271,59 @@ module Gori
       private def mine_bucket(h) : Int32?
         int(h, "bucket").try(&.clamp(Int32::MIN.to_i64, Int32::MAX.to_i64).to_i) # avoid Int64->Int32 overflow
       end
+
+      # The tools/list schemas for the Miner tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_mine_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "mine_start",
+          "Discover hidden/unlinked parameters a server accepts (Burp \"Param Miner\"). " \
+          "Stuffs a built-in wordlist of names into the request and bisects to isolate " \
+          "the ones that change the response. Returns a job_id immediately (poll with " \
+          "mine_status / mine_results; end with mine_stop). ACTIVE: sends many real " \
+          "outbound requests. Capped at #{MINE_MAX_REQUESTS} requests / #{MINE_MAX_CONCURRENCY} concurrency." do |s|
+          s.field "template", strprop("raw HTTP request to mine")
+          s.field "flow_id", intprop("seed the request from a captured flow id (instead of template)")
+          s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
+          s.field "locations", strprop("comma list of where to mine: query,form,multipart,json,headers,cookies (default: auto-detect; multipart is applicable but off by default — pass it explicitly)")
+          s.field "wordlist", strprop("path to an extra param-name wordlist (merged with the built-in list)")
+          s.field "bucket", intprop("names stuffed per request before bisection (per location)")
+          s.field "concurrency", intprop("parallel requests (default 10, max #{MINE_MAX_CONCURRENCY})")
+          s.field "rate", intprop("requests/sec cap (0 = unlimited)")
+          s.field "timeout_ms", intprop("per-request connect + idle timeout in milliseconds")
+          s.field "retries", intprop("retries per request on a network error")
+          s.field "http2", boolprop("use real HTTP/2 (default false)")
+          s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+          s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+          s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni)")
+          s.field "max_requests", intprop("caller cap on total requests")
+          s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection across the mine's probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is most of a mine's wall clock. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")
+          s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
+        end
+
+        tool j, "mine_status", "Counts + state of a mine job (running|done|budget_exhausted|stopped|error). " \
+                               "budget_exhausted means max_requests halted the run before every name was tried; see incomplete_reason. " \
+                               "`skipped` lists wordlist names a location cannot carry (a header/cookie name must be an RFC 7230 " \
+                               "token, and framing headers are never injected) against `candidate_names`, the wordlist's own size — " \
+                               "names_total counts only the names that survived that filter, so without `skipped` an incomplete " \
+                               "sweep reads as a clean one." do |s|
+          s.field "job_id", strprop("id from mine_start"), required: true
+        end
+
+        tool j, "mine_results",
+          "Paged discovered parameters for a mine job (name, location, evidence, confidence, canary, status, delta)." do |s|
+          s.field "job_id", strprop("id from mine_start"), required: true
+          s.field "offset", intprop("start row (default 0)")
+          s.field "limit", intprop("max rows (default 100, max 1000)")
+        end
+
+        tool j, "mine_stop", "Stop a running mine job (in-flight requests finish)." do |s|
+          s.field "job_id", strprop("id from mine_start"), required: true
+        end
+      end
     end
   end
 end

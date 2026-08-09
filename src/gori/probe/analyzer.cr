@@ -38,12 +38,12 @@ module Gori
       # its Fuzz::Sender, so the next probe picks up the change.
       property? verify_upstream : Bool
 
-      @disabled : Set(String)     # RuleInfo#id of built-ins the operator turned off (Rules sub-tab)
-      @disabled_degraded : Bool   # the disabled-list could not be READ — fail closed on active
-      @custom : Array(CustomRule)      # merged global+project user match rules
-      @warned_degraded : Bool          # one-shot: the "active skipped, list unreadable" warning
-      @oob : OutOfBand::Minter?        # OAST payload minter — nil until this project registers one
-      @oob_watermark : Int64 = 0_i64   # highest oast_callbacks id already swept
+      @disabled : Set(String)        # RuleInfo#id of built-ins the operator turned off (Rules sub-tab)
+      @disabled_degraded : Bool      # the disabled-list could not be READ — fail closed on active
+      @custom : Array(CustomRule)    # merged global+project user match rules
+      @warned_degraded : Bool        # one-shot: the "active skipped, list unreadable" warning
+      @oob : OutOfBand::Minter?      # OAST payload minter — nil until this project registers one
+      @oob_watermark : Int64 = 0_i64 # highest oast_callbacks id already swept
 
       # One enabled active rule that WOULD run against a given flow, plus the request count it
       # sends. `active_estimate` returns these (empty when nothing applies) so the manual "Run

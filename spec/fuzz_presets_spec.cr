@@ -24,8 +24,8 @@ describe Gori::Fuzz::Presets do
     F::Presets.names.each do |name|
       values = F::Presets.load(name)
       values.should_not be_empty
-      values.uniq.size.should eq(values.size) # already de-duped
-      values.none?(&.empty?).should be_true   # blanks dropped
+      values.uniq.size.should eq(values.size)          # already de-duped
+      values.none?(&.empty?).should be_true            # blanks dropped
       values.none?(&.starts_with?('#')).should be_true # comments dropped
     end
   end

@@ -5,6 +5,7 @@ require "./fingerprint"
 require "./baseline"
 require "../fuzz/engine"
 require "../fuzz/matcher"
+require "../pacing"
 
 module Gori::Miner
   # The hard-cap wrapper (baseline calibration + bucket probes + confirmation rounds all
@@ -20,6 +21,9 @@ module Gori::Miner
   # Single-threaded fiber scheduler (no -Dpreview_mt): plain ivar increments and array
   # appends never yield mid-op, so the counters and per-round outcome array need no locks.
   class Engine
+    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    include Gori::Pacing
+
     MAX_CONCURRENCY = 100
 
     # Per-request growth ceiling for the Json location. A JSON candidate is injected into EVERY
@@ -523,26 +527,6 @@ module Gori::Miner
       err == Fuzz::CappedBackend::CAP_ERROR ||
         err == Gori::Outbound::SANDBOX_SWEEP_ERROR ||
         err == Gori::Outbound::EXCLUDE_SWEEP_ERROR
-    end
-
-    private def pace_interval : Time::Span?
-      if (rps = @config.rps) && rps > 0
-        (1.0 / rps).seconds
-      elsif (t = @config.throttle_ms) && t > 0
-        t.milliseconds
-      else
-        nil
-      end
-    end
-
-    private def pace(interval : Time::Span?) : Nil
-      if interval
-        now = Time.instant
-        target = @last_dispatch + interval
-        sleep(target - now) if now < target
-        @last_dispatch = Time.instant
-      end
-      sleep(rand(@config.jitter_ms).milliseconds) if @config.jitter_ms > 0
     end
 
     private def park_if_paused : Nil

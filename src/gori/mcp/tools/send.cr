@@ -1188,6 +1188,77 @@ module Gori
       rescue
         # Probe must never break send_request
       end
+
+      # The tools/list schemas for the active-send tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_send_tools(j : JSON::Builder) : Nil
+        return unless @allow_actions
+
+        tool j, "send_request",
+          "Send/resend an HTTP request to its origin and return the response. " \
+          "ACTIVE: makes a real outbound request from this host. Either pass " \
+          "`flow_id` to resend a captured flow byte-exact, `repeater_id` to execute " \
+          "a saved HTTP repeater (use send_websocket for WS repeaters), OR give an " \
+          "absolute `url` with optional method/headers/body, or a verbatim `raw` request. " \
+          "When `flow_id` or `repeater_id` is set, url/method/headers/body/raw are ignored (and " \
+          "reported in `ignored_fields` with a precedence_warning). The result " \
+          "always includes `effective_request` (the scheme/host/port/method/target/" \
+          "http_version actually sent). " \
+          "Host + Content-Length are auto-added when omitted on the url path. " \
+          "Match & Replace rules are NOT applied unless apply_rules:true. " \
+          "On a failed send, branch on `retryable`: PROTOCOL_ERROR (gori proved the message " \
+          "malformed) and REQUEST_TRUNCATED (the origin answered — status/head/body are all " \
+          "here — before the request body finished, which RFC 9113 §8.1 permits) are both " \
+          "final; re-sending a truncated body puts the whole body back on the wire." do |s|
+          s.field "flow_id", intprop("resend a captured flow by id (no url needed; like the TUI Repeater)")
+          s.field "keep_request_line", boolprop("flow_id only: send the STORED request line as captured instead of rewriting an absolute-form line (GET http://h/p) to origin-form (GET /p). Default false, because a proxy capture's absolute form is a proxy artifact — but on a flow recorded from a direct send it is the routing / cache-poisoning / SSRF payload. `request_line_rewritten:true` comes back whenever the rewrite fired")
+          s.field "repeater_id", intprop("execute a saved HTTP repeater by id (no url needed; respects its target/http2/sni/auto-Content-Length)")
+          s.field "url", strprop("absolute URL incl. scheme+host, e.g. https://api.example.com/v1/x (required unless flow_id/repeater_id is given)")
+          s.field "method", strprop("HTTP method (default GET)")
+          s.field "headers", objprop("header name->value map")
+          s.field "body", strprop("request body, sent as-is")
+          s.field "body_base64", strprop("request body as base64 — the byte-exact form, and it works on BOTH the url/HTTP1.1 path and the h2_fields path. Use it whenever the body is not UTF-8 (binary, protobuf/gRPC, gzip, a multipart upload, an overlong-UTF-8 traversal payload) or carries an octet a JSON string cannot (0x00, 0x80-0xFF, invalid UTF-8) — 'body' is sent as its UTF-8 encoding. Wins over 'body' and is NOT $VAR-expanded")
+          s.field "raw", strprop("verbatim raw HTTP/1.1 request; overrides method/headers/body (scheme/host/port still come from url)")
+          s.field "raw_base64", strprop("the whole raw HTTP/1.1 request as base64 — the byte-exact form, and the only way to send a latin-1/invalid-UTF-8 header value or a binary body (a JSON string is sent as its UTF-8 encoding, so 'é' goes out as 2 bytes). Implies verbatim: no $VAR expansion, no bare-LF promotion")
+          s.field "verbatim", boolprop("send 'raw' EXACTLY as given: no $VAR expansion and no bare-LF→CRLF promotion in the head (default false). Use for desync/smuggling tests where a bare LF header terminator IS the payload")
+          s.field "h2_fields", h2fieldsprop
+          s.field "http2", boolprop("use real HTTP/2; defaults to the flow's version when flow_id is set)")
+          s.field "timeout_ms", intprop("per-operation connect + idle (read/write) timeout in milliseconds; a timeout surfaces as a network-error result with error_kind (1-600000)")
+          s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni). OVERRIDES the SNI a flow_id/repeater_id source carries, the way `gori run repeater <flow-id> --sni` does; omit to keep the stored one.")
+          s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+          s.field "apply_rules", boolprop("apply the project's enabled Match & Replace rules (REQUEST side only) to the outgoing request before sending, matching the live proxy; default false — direct sends are byte-exact")
+          s.field "record_history", boolprop("record the outbound request and response in History for audit/evidence (default true)")
+          s.field "save_as_repeater", boolprop("save this request and its response to the Repeater workbench (default false)")
+          s.field "include_sensitive_headers", boolprop("return Cookie/Set-Cookie/Authorization/API-key response values instead of [REDACTED] (default false)")
+          s.field "body_mode", strprop("none | preview | full (default full) — control how much response body is inlined")
+          s.field "max_body_bytes", intprop("cap inlined response-body bytes (clamped to 65536)")
+          s.field "allow_unscoped", boolprop("send even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
+          s.field "name", strprop("optional custom name for the saved repeater tab (only when save_as_repeater=true)")
+          s.field "issue_id", intprop("optional issue to link to the saved repeater; requires save_as_repeater=true")
+        end
+
+        tool j, "send_websocket",
+          "Execute a persisted WebSocket repeater: perform a fresh RFC 6455 handshake, send the " \
+          "repeater's outbound messages (or a supplied override), and return inbound frames. " \
+          "ACTIVE: makes a real outbound connection. The handshake response is persisted on " \
+          "the repeater, while the outbound message template is left unchanged." do |s|
+          s.field "repeater_id", intprop("WebSocket repeater database id"), required: true
+          s.field "messages", ws_out_messages_prop("optional outbound message override; stored repeater messages are used when absent")
+          s.field "keep_sec_websocket_key", boolprop("send the repeater request's OWN Sec-WebSocket-Key instead of a fresh one, so an absent/short/duplicate/non-base64 key can be tested (default: the repeater's stored setting, itself false)")
+          s.field "idle_ms", intprop("server-silence timeout after the first inbound frame (100-60000 ms; default 3000)")
+          s.field "insecure", boolprop("skip upstream TLS verification (default false)")
+          s.field "allow_unscoped", boolprop("connect even when the target host is outside (or without) a configured scope (default false)")
+          s.field "issue_id", intprop("optional issue to link to this repeater before sending")
+          # Parity with `gori run repeater send --verbatim`. Without it a `messages`
+          # payload carrying a literal `$where`/`$IFS`/`$user.name` — a NoSQL, shell or
+          # SSTI probe — could not be expressed from MCP at all: the token was either
+          # substituted or the call was refused. (Stored frames of a flow-seeded session
+          # are evidence and are already sent byte-exact without this flag.)
+          s.field "verbatim", boolprop("send the bytes EXACTLY: no $VAR expansion in the handshake head or in a 'messages' payload, no bare-LF→CRLF promotion, no Content-Length resync. Use it when a literal $NAME is the payload (default false)")
+        end
+      end
     end
   end
 end

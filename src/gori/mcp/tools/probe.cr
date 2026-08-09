@@ -415,6 +415,137 @@ module Gori
           end
         end
       end
+
+      # The tools/list schemas for the Probe tools, kept beside the handlers that
+      # implement them. `Tools#list` composes every one of these; the action gate is applied
+      # here rather than around one long block, so a new write tool cannot be added on the
+      # wrong side of it by landing in the wrong place in a 1,300-line method.
+      private def list_probe_tools(j : JSON::Builder) : Nil
+        tool j, "probe_scan",
+          "Scan captured History flows (optional QL filter) + Repeater tabs for issues — the " \
+          "MCP equivalent of `gori run probe`. PASSIVE by default (zero outbound requests). " \
+          "active:true also runs light-touch active checks that SEND requests (reflected " \
+          "params, CORS/host-header reflection, open redirect, CRLF injection, 403/path/header " \
+          "access-control bypass, nginx & parameter traversal, GraphQL introspection, SSTI) — " \
+          "requires write access and is scope-gated (per-flow scope include + a Sandbox/exclude " \
+          "hard-block). Returns " \
+          "{flows_scanned, repeaters_scanned, issue_count, issues:[{code, category, host, " \
+          "title, severity, hit_count, affected, affected_count, evidence, sample_flow_id, " \
+          "sample_repeater_id, remediation, cwe, cwe_name}]}, highest-severity first. " \
+          "`cwe`/`cwe_name` are OMITTED for a code with no meaningful CWE — a technology " \
+          "fingerprint, an informational jwt_in_* note, or a custom rule. Writes nothing." do |s|
+          s.field "query", strprop("gori QL filter applied to History flows only; empty scans all (Repeater tabs are always scanned)")
+          s.field "active", boolprop("also run active checks that SEND probe requests (default false = passive, request-free); requires write access + a configured scope")
+          s.field "severity", strprop("only return issues at/above this level (info|low|medium|high|critical)")
+          s.field "category", strprop("only return issues in this category (#{Probe::FILTER_CATEGORIES.join("|")})")
+          s.field "allow_unscoped", boolprop("with active:true, run even when a target host is outside — or without — a configured scope (default false)")
+          s.field "unsafe", boolprop("with active:true, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data (default false)")
+          s.field "aggressive", boolprop("with active:true, raise per-rule caps + use wider bypass sets (implies unsafe) — authorized targets only (default false)")
+          s.field "insecure", boolprop("with active:true, skip upstream TLS verification (default false) — mirrors `gori run probe -k`, for a lab/staging origin with a self-signed certificate")
+          s.field "limit", intprop("max issue groups to return (default 200, max 2000)")
+        end
+
+        tool j, "probe_issues",
+          "List PERSISTED probe findings — the rows the live scanner accumulated (what the TUI " \
+          "Probe tab shows), each with a stable `id` the probe_dismiss/probe_promote/probe_delete " \
+          "tools act on. This is triage state, unlike probe_scan's stateless rescan. Defaults to " \
+          "OPEN findings only, mirroring the TUI's default lens. Returns " \
+          "{issues, returned, offset, total, has_more} — not a bare array." do |s|
+          s.field "include_closed", boolprop("also return dismissed/confirmed/resolved findings (default false = open only)")
+          s.field "severity", strprop("only return findings at/above this level (info|low|medium|high|critical)")
+          s.field "category", strprop("only return findings in this category (#{Probe::FILTER_CATEGORIES.join("|")})")
+          s.field "host", strprop("only return findings for this exact host")
+          s.field "limit", intprop("max rows (default 100, max 500)")
+          s.field "offset", intprop("start row (default 0)")
+        end
+
+        tool j, "list_probe_rules",
+          "List every scan rule — built-in passive, built-in active, and custom match rules — " \
+          "with whether the operator has each enabled, plus the project's current scan `mode`. " \
+          "The `id` of each row is what set_probe_rule_enabled / update_probe_rule / " \
+          "delete_probe_rule take. Both a scan here and one in the TUI honour this config." do |s|
+          s.field "kind", strprop("only list rules of this kind (passive|active|custom)")
+        end
+
+        return unless @allow_actions
+
+        tool j, "probe_dismiss",
+          "Mute probe findings (ids come from probe_issues). Pass exactly ONE selector: `id` " \
+          "toggles a single finding dismissed ⇄ open; `code` or `host` bulk-mutes every OPEN " \
+          "finding sharing it. Reversible — a dismissed finding still appears under " \
+          "probe_issues include_closed:true." do |s|
+          s.field "id", intprop("probe finding id to toggle")
+          s.field "code", strprop("bulk-dismiss every open finding with this check code")
+          s.field "host", strprop("bulk-dismiss every open finding on this host")
+        end
+
+        tool j, "probe_promote",
+          "Promote a probe finding (id from probe_issues) to a human-confirmed Issue in the " \
+          "Issues report, carrying its severity/host/sample evidence over. Marks the source " \
+          "finding Confirmed so a repeat call cannot mint a duplicate — a second call returns " \
+          "{promoted: false} rather than erroring." do |s|
+          s.field "id", intprop("probe finding id"), required: true
+        end
+
+        tool j, "probe_delete",
+          "Hard-delete probe findings (ids from probe_issues). Deleting ONE also SUPPRESSES " \
+          "that (code, host) pair so the next scan does not immediately re-add it — prefer " \
+          "probe_dismiss when you only want it out of the default lens. all:true is the " \
+          "OPPOSITE: it wipes every finding AND every suppression, so a rescan re-discovers " \
+          "everything; it needs confirm:true and cannot be combined with `id`." do |s|
+          s.field "id", intprop("probe finding id to delete")
+          s.field "all", boolprop("delete EVERY probe finding AND every suppression (default false)")
+          s.field "confirm", boolprop("required with all:true; without it the call is refused")
+        end
+
+        tool j, "set_probe_rule_enabled",
+          "Turn one scan rule on or off for this project (ids from list_probe_rules). " \
+          "Disabling a built-in stops NEW detections; findings it already produced stay. " \
+          "A GLOBAL custom rule lives in the user's settings.json and cannot be toggled here." do |s|
+          s.field "id", strprop("rule id from list_probe_rules"), required: true
+          s.field "enabled", boolprop("true to enable, false to disable"), required: true
+        end
+
+        tool j, "create_probe_rule",
+          "Add a PROJECT custom match rule — a string or regex tested against one region of " \
+          "each captured flow, emitting a finding on a hit. A regex PCRE rejects is refused " \
+          "rather than silently never matching." do |s|
+          s.field "title", strprop("short rule name (shown as the finding title)"), required: true
+          s.field "pattern", strprop("the string to look for, or a regex when match_kind=regex"), required: true
+          s.field "description", strprop("what the rule is for (default empty)")
+          s.field "side", strprop("request|response (default response)")
+          s.field "region", strprop("whole|header|body (default body)")
+          s.field "match_kind", strprop("string|regex (default string)")
+          s.field "severity", strprop("info|low|medium|high|critical (default info)")
+        end
+
+        tool j, "update_probe_rule",
+          "Replace a project custom rule's fields (same shape as create_probe_rule). " \
+          "Built-ins are not editable — disable them with set_probe_rule_enabled instead." do |s|
+          s.field "id", strprop("custom rule id from list_probe_rules (custom_p_…)"), required: true
+          s.field "title", strprop("short rule name"), required: true
+          s.field "pattern", strprop("the string or regex to match"), required: true
+          s.field "description", strprop("what the rule is for")
+          s.field "side", strprop("request|response (default response)")
+          s.field "region", strprop("whole|header|body (default body)")
+          s.field "match_kind", strprop("string|regex (default string)")
+          s.field "severity", strprop("info|low|medium|high|critical (default info)")
+        end
+
+        tool j, "delete_probe_rule",
+          "Delete a project custom rule. A built-in can only be DISABLED, never deleted." do |s|
+          s.field "id", strprop("custom rule id from list_probe_rules (custom_p_…)"), required: true
+        end
+
+        tool j, "set_probe_mode",
+          "Set the project's scan mode. off = no analysis; passive = zero-request checks on " \
+          "captured traffic (default); active = passive plus light-touch probes that SEND " \
+          "requests to scope-included targets; aggressive = active with raised caps, wider " \
+          "bypass sets, and UNSAFE methods (POST/PUT/PATCH/DELETE) — authorized targets only. " \
+          "This arms the AUTOMATIC pipeline for live captures, not just one scan." do |s|
+          s.field "mode", strprop("off|passive|active|aggressive"), required: true
+        end
+      end
     end
   end
 end

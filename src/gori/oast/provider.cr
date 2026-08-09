@@ -87,7 +87,7 @@ module Gori::Oast
     # Parse a response body as JSON, or raise a clean engine error with a short snippet.
     protected def parse_json(body : String) : JSON::Any
       JSON.parse(body)
-    rescue ex : JSON::ParseException
+    rescue JSON::ParseException
       raise Gori::Error.new("OAST #{kind.label}: bad JSON response (#{snippet(body)})")
     end
 
