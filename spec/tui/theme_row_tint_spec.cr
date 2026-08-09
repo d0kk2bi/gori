@@ -9,7 +9,7 @@ require "../spec_helper"
 # semantic foregrounds stay valid on it. That bound is `Theme::ROW_TINT_LUMA`, and this file is
 # the only thing holding it across all 30 built-in palettes in both polarities.
 describe "Theme.row_tint" do
-  colors = [:red, :orange, :yellow, :green, :blue, :purple]
+  colors = %w[red orange yellow green blue purple]
   # The three bands a History row can already have: canvas, marked, selected+focused.
   bands = ->{ {"bg" => Gori::Tui::Theme.bg,
                "selection_dim" => Gori::Tui::Theme.selection_dim,
@@ -64,22 +64,34 @@ describe "Theme.row_tint" do
     end
   end
 
-  # Every named colour must resolve to a real palette field on every theme — the reason the set
-  # is these six and not an arbitrary eight. `muted` is `mark_color`'s fallback, so a name that
-  # silently fell through would render as chrome rather than as a mark.
-  it "resolves every MarkerColor to a distinct, non-fallback palette hue" do
+  # Every built-in name must resolve to the palette field it NAMES, on every theme — the reason
+  # the set is these six and not an arbitrary eight.
+  #
+  # Asserted against the field rather than against the fallback, which is what a "did it fall
+  # through" test needs now that there is one string-keyed resolver: its fallback is `yellow`,
+  # and `yellow` is itself one of the six. "None of them equals the fallback" could no longer
+  # tell a correct `yellow` from a `blue` that silently fell through to it — the exact
+  # regression this case exists to catch. Naming the expected field per label is exact, and it
+  # also pins WHICH field each word borrows (`blue`/`purple` take the two syntax hues, which is
+  # where the palette keeps them).
+  it "resolves every built-in MarkerColor to the palette field it names" do
     before = Gori::Tui::Theme.active_name
     begin
       Gori::Tui::Theme::BUILTIN_THEMES.each_key do |theme|
         Gori::Tui::Theme.apply(theme)
-        resolved = Gori::Store::MarkerColor.values.map { |c| Gori::Tui::Theme.mark_color(c.to_sym) }
-        resolved.size.should eq(6)
-        # MATRIX and the other monochrome palettes legitimately collapse some hues onto one
-        # another, so distinctness is not assertable — but nothing may land on the fallback.
-        resolved.each_with_index do |c, i|
-          if c == Gori::Tui::Theme.muted
-            fail "#{theme}: #{Gori::Store::MarkerColor.values[i].label} fell through to muted"
-          end
+        expected = {
+          "red"    => Gori::Tui::Theme.red,
+          "orange" => Gori::Tui::Theme.orange,
+          "yellow" => Gori::Tui::Theme.yellow,
+          "green"  => Gori::Tui::Theme.green,
+          "blue"   => Gori::Tui::Theme.syn_header,
+          "purple" => Gori::Tui::Theme.syn_literal,
+        }
+        # The enum is the vocabulary, so the table above must cover it exactly — a seventh
+        # member added without a hue here fails rather than going unchecked.
+        Gori::Store::MarkerColor.values.map(&.label).sort!.should eq(expected.keys.sort!)
+        expected.each do |label, hue|
+          Gori::Tui::Theme.mark_color(label).should eq(hue), "#{theme}: #{label}"
         end
       end
     ensure

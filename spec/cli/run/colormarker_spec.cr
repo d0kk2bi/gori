@@ -48,6 +48,25 @@ describe "gori run colormarker — text rows" do
       color: "orange", style: Gori::Store::MarkerStyle::Strip))
     a.index("host:a").should eq(b.index("host:b"))
   end
+
+  # A custom colour is an operator-typed name of any length, so the column cannot be a literal
+  # width that happens to fit the longest built-in word. One `hotpink` used to shift the name and
+  # condition columns on every OTHER row of the listing.
+  it "widens the colour column to the longest name in the listing, and only then" do
+    rules = [rule(filter: "host:a", color: "red"),
+             rule(id: 2_i64, filter: "host:b", color: "electric-lavender")]
+    w = Gori::CLI::Run.colormarker_color_width(rules)
+    rows = rules.map { |r| Gori::CLI::Run.colormarker_rule_row(r, w) }
+    rows[0].index("host:a").should eq(rows[1].index("host:b"))
+    rows[0].should contain("red               ") # padded out to the long name's width
+
+    # A listing of built-ins keeps the width it has always had, so the common output is byte
+    # identical to before.
+    builtin = [rule(color: "red"), rule(id: 2_i64, color: "orange")]
+    Gori::CLI::Run.colormarker_color_width(builtin).should eq(6)
+    Gori::CLI::Run.colormarker_rule_row(builtin[0], 6)
+      .should eq(Gori::CLI::Run.colormarker_rule_row(builtin[0]))
+  end
 end
 
 describe "gori run colormarker — JSON" do

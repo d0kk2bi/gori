@@ -162,8 +162,8 @@ module Gori::Settings
   #
   # Passing the label through costs nothing, because the RESOLVER is already total and already
   # tolerant: `Tui::Theme.mark_color` answers a custom name from the registry, a built-in word
-  # (and `MarkerColor.from_label`'s aliases) through the active palette, and anything else — a
-  # typo, a dangling reference — with a visible yellow. Same forgiving outcome on screen, minus
+  # (and its `cyan`/`magenta`/`violet` aliases) through the active palette, and anything else —
+  # a typo, a dangling reference — with a visible yellow. Same forgiving outcome on screen, minus
   # the write-back that made it permanent. Blank/absent still reads as "yellow" so the field is
   # never empty.
   private def self.parse_color_label(s : String?) : String
