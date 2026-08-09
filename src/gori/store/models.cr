@@ -756,14 +756,18 @@ module Gori
       end
     end
 
-    # The six BUILT-IN colours a Colormarker rule can name. No longer the type of
-    # `ColorRule#color` (that is a plain label string now, so a user-defined custom colour's name
-    # can flow through it too) — this stays as the built-in vocabulary: the words the pickers
-    # offer, the labels the CLI/MCP validate against, and the `to_sym` handshake `Theme.mark_color`
-    # resolves. NOT an arbitrary set: they are exactly the ones `Tui::Theme.marker_hue` already
-    # vets as "maximally separated and present in every palette" (built-in and custom themes,
-    # which inherit a base), so a built-in rule reads the same on a dark theme and a light one
-    # without storing a single hex value. A CUSTOM colour, by contrast, carries an absolute hex
+    # The six BUILT-IN colours a Colormarker rule can name — a VOCABULARY, and nothing else.
+    #
+    # It is not the type of `ColorRule#color` (that is a plain label string, so a user-defined
+    # custom colour's name can flow through it too) and it PARSES nothing: `Tui::Theme.mark_color`
+    # takes the label directly and is the one resolver. What this enum still supplies is the list
+    # of words — the ones the pickers offer and the CLI/MCP validate an argument against, via
+    # `Settings::COLORMARKER_COLORS`.
+    #
+    # NOT an arbitrary set: they are exactly the ones `Tui::Theme.marker_hue` already vets as
+    # "maximally separated and present in every palette" (built-in and custom themes, which
+    # inherit a base), so a built-in rule reads the same on a dark theme and a light one without
+    # storing a single hex value. A CUSTOM colour, by contrast, carries an absolute hex
     # (`Settings::ColormarkerColor`) and does not track the theme — that is the trade an operator
     # makes by defining their own.
     #
@@ -778,42 +782,6 @@ module Gori
 
       def label : String
         to_s.downcase
-      end
-
-      # Tolerant, and deliberately so: this is fed by a hand-edited settings.json and a
-      # hand-edited SQLite row, and `Settings.load`'s blanket rescue would turn one raise into
-      # a factory reset of every OTHER section. The MCP and CLI boundaries refuse an unknown
-      # label instead — an argument someone just typed gets told it was wrong (see
-      # `Mcp::Tools#marker_color`), a file already on disk gets read as best it can be.
-      #
-      # `cyan`/`magenta`/`grey` are accepted as spellings of the nearest member so the words
-      # an operator reaches for parse, even though the palette has no field for them.
-      # Unknown → Yellow, not Red: an unreadable colour must not present itself as the
-      # highest-alarm one.
-      def self.from_label(s : String) : MarkerColor
-        case s.downcase
-        when "red"              then Red
-        when "orange"           then Orange
-        when "yellow"           then Yellow
-        when "green"            then Green
-        when "blue", "cyan"     then Blue
-        when "purple", "magenta", "violet" then Purple
-        else                         Yellow
-        end
-      end
-
-      # The symbol `Tui::Theme.mark_color` resolves against the active palette. Theme takes a
-      # plain Symbol so it stays decoupled from Store (same reason `Theme.status_color` takes
-      # an Int) — this is the one place the two vocabularies meet.
-      def to_sym : Symbol
-        case self
-        in .red?    then :red
-        in .orange? then :orange
-        in .yellow? then :yellow
-        in .green?  then :green
-        in .blue?   then :blue
-        in .purple? then :purple
-        end
       end
     end
 

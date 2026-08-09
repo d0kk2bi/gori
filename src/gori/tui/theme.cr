@@ -1102,25 +1102,6 @@ module Gori::Tui
     end
 
     # ── Colormarker row marks ────────────────────────────────────────────────────
-    # The six colours a History row-colour rule can name, resolved through the ACTIVE palette
-    # so a rule reads the same on GORIDARK and GORIDAY (and on any custom theme, which inherits
-    # a base). Same six hues `marker_hue` above already vets as "maximally separated and present
-    # in every palette" — `blue` and `purple` borrow the two syntax hues, which is where the
-    # palette keeps them.
-    #
-    # Takes a plain Symbol so Theme stays decoupled from Store, exactly as `status_color` takes
-    # a plain Int. `Store::MarkerColor#to_sym` is the other half of the handshake.
-    def self.mark_color(name : Symbol) : Color
-      case name
-      when :red    then red
-      when :orange then orange
-      when :yellow then yellow
-      when :green  then green
-      when :blue   then syn_header
-      when :purple then syn_literal
-      else              muted
-      end
-    end
 
     # Replace the custom-colour map (name → hex, from `Settings.colormarker_color_map`). Parses
     # each hex ONCE here, dropping any that will not parse, so `mark_color(String)` stays a pure
@@ -1139,13 +1120,26 @@ module Gori::Tui
       @@custom_marks = marks
     end
 
-    # Resolve a Colormarker rule's colour LABEL to a hue. A custom colour (matched first, so an
-    # operator's own name wins) resolves to its stored hex; a built-in word (and the tolerant
-    # aliases `MarkerColor.from_label` accepts) resolves through the ACTIVE palette; anything
-    # else — a dangling reference to a custom colour that has since been deleted — falls back to
-    # a VISIBLE `yellow`, not `muted`: the rule is still enabled, so its row must not read as
-    # unmarked chrome. Kept string-keyed and Store-free, the same decoupling `mark_color(Symbol)`
-    # documents.
+    # Resolve a Colormarker rule's colour LABEL to a hue — the ONE resolver, and the only place
+    # the marker vocabulary is spelled out.
+    #
+    # A custom colour is matched first, so an operator's own name wins. A built-in word resolves
+    # through the ACTIVE palette, so a rule reads the same on GORIDARK and GORIDAY (and on any
+    # custom theme, which inherits a base); those six are what `marker_hue` above already vets as
+    # "maximally separated and present in every palette", with `blue` and `purple` borrowing the
+    # two syntax hues, which is where the palette keeps them. Anything else — a dangling
+    # reference to a custom colour that has since been deleted, or a typo in a hand-edited file —
+    # falls back to a VISIBLE `yellow`, not `muted`: the rule is still enabled, so its row must
+    # not read as unmarked chrome.
+    #
+    # `cyan`/`magenta`/`violet` are accepted as spellings of the nearest member so the words an
+    # operator reaches for parse, even though the palette has no field for them. This list used
+    # to be a copy of `Store::MarkerColor.from_label`'s, kept in step by hand; that enum is now
+    # the built-in VOCABULARY only (the words the pickers offer and the CLI/MCP validate
+    # against) and parses nothing, so the aliases live here alone and cannot drift.
+    #
+    # Takes a String rather than a Store type so Theme stays decoupled from Store, exactly as
+    # `status_color` takes a plain Int.
     def self.mark_color(label : String) : Color
       key = label.downcase
       if c = @@custom_marks[key]?

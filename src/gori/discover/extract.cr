@@ -41,27 +41,59 @@ module Gori::Discover
     # The closing quote is NOT required — an interpolated or concatenated path has none, and
     # the character class already terminates the run. `{1,256}` bounds it: a path longer than
     # that is not a path.
-    ENDPOINT = /https?:\/\/[^\s"'`<>\\,;)\]}]{3,}|["'`](\/[A-Za-z0-9_\-.~%\/]{1,256})/i
+    #
+    # The URL branch is bounded for the same reason and needs it MORE, because its class ends
+    # at whitespace and quotes and at nothing else. `+` meant one un-quoted `http://` in a
+    # minified bundle could run to the end of the scanned body, and `MAX_SCAN` is 2 MiB: that
+    # one "URL" then went through `Url.resolve`, `URI.parse`, `visit_key` and `template_key`
+    # and was held in `@seen` for the rest of the run. `{3,2048}` is far past any URL a server
+    # will route (nginx defaults to 8 KB for the whole request line, IIS to 2 KB for the path)
+    # and turns an unbounded run into a truncated one, which is a candidate that simply 404s.
+    ENDPOINT = /https?:\/\/[^\s"'`<>\\,;)\]}]{3,2048}|["'`](\/[A-Za-z0-9_\-.~%\/]{1,256})/i
 
-    def self.from_html(body : Bytes) : Array(String)
+    # One extracted URL string, plus HOW the document yielded it.
+    #
+    # `declared` is true when the markup NAMED it as a link — an `href`/`src`/`action` attribute
+    # or a `<meta refresh>` — and false when the endpoint pass recovered it from a quoted string
+    # in the body's text. The distinction is invisible in the URL itself and cannot be recovered
+    # downstream, which is why it rides along from here.
+    #
+    # It exists because the two justify very different spending. A declared link is the target's
+    # own statement that a resource is there; an inferred one is a pattern match on text that
+    # merely LOOKS like a path, and a locale key, an asset manifest entry or a vendor bundle's
+    # internals all look exactly like one. `Engine#consider_link` seeds a brute-force sweep of a
+    # link's whole DIRECTORY — hundreds of requests — and doing that on faith for an inferred
+    # literal is how a bundle of i18n namespaces turns one response into tens of thousands of
+    # requests that find nothing. See `Engine#confirm_bruteforce_dir`.
+    record Found, href : String, declared : Bool
+
+    def self.from_html(body : Bytes) : Array(Found)
       # `acc`, not `out`: `out` is a Crystal keyword in ARGUMENT position, so a local named
       # that cannot be passed to `endpoints` below (it parses as an out-parameter).
-      acc = [] of String
+      acc = [] of Found
       seen = Set(String).new
       text = scan_text(body)
       text.scan(ATTR) do |m|
         break if acc.size >= MAX_LINKS
         v = m[1]? || m[2]? || m[3]?
-        acc << v if v && !v.empty? && seen.add?(v)
+        acc << Found.new(v, true) if v && !v.empty? && seen.add?(v)
       end
       text.scan(META) do |m|
+        # The cap is per BODY, not per pass — this loop appends to the same `acc` the one above
+        # filled, so without the guard a page could leave here over MAX_LINKS and hand the
+        # orchestrator the excess anyway.
+        break if acc.size >= MAX_LINKS
         v = m[1]?
-        acc << v if v && !v.empty? && seen.add?(v)
+        acc << Found.new(v, true) if v && !v.empty? && seen.add?(v)
       end
       # Inline <script> — where a single-page app keeps the endpoints no attribute names, and
       # where a server-rendered page keeps its bootstrap JSON. Run over the WHOLE body rather
       # than over extracted <script> blocks: the pass is one regex either way, finding the
       # blocks is a second one, and anything it re-finds in an attribute is already `seen`.
+      #
+      # `seen` being shared is also what fixes the PRECEDENCE: a URL that appears both as an
+      # `href` and inside a script is added by the attribute pass first and keeps `declared`,
+      # rather than the weaker classification winning by arriving second.
       endpoints(text, acc, seen)
       acc
     end
@@ -78,23 +110,27 @@ module Gori::Discover
     # Content-type-blind on purpose: the two shapes it looks for are spelled identically in
     # JS, JSON, YAML, XML and plain text, so the caller only has to decide whether the bytes
     # are text at all (`Engine#text_like?`).
+    #
+    # Returns bare strings rather than `Found`: a body that is not markup declares no links at
+    # all, so every result here is inferred by construction and the caller tags them as one.
     def self.from_text(body : Bytes) : Array(String)
-      acc = [] of String
+      acc = [] of Found
       endpoints(scan_text(body), acc, Set(String).new)
-      acc
+      acc.map(&.href)
     end
 
-    # Appends every distinct ENDPOINT match to `acc`. `seen` is shared with the caller so an
-    # href already captured by ATTR is not re-added when the same string appears in an inline
+    # Appends every distinct ENDPOINT match to `acc`, always as INFERRED — this pass reads text,
+    # not markup, so nothing it finds was declared as a link. `seen` is shared with the caller so
+    # an href already captured by ATTR is not re-added when the same string appears in an inline
     # script.
-    private def self.endpoints(text : String, acc : Array(String), seen : Set(String)) : Nil
+    private def self.endpoints(text : String, acc : Array(Found), seen : Set(String)) : Nil
       return if acc.size >= MAX_LINKS
       text.scan(ENDPOINT) do |m|
         break if acc.size >= MAX_LINKS
         # Group 1 is the path branch's capture; on the URL branch it is nil and the whole
         # match IS the URL.
         v = m[1]? || m[0]
-        acc << v if !v.empty? && seen.add?(v)
+        acc << Found.new(v, false) if !v.empty? && seen.add?(v)
       end
     end
 

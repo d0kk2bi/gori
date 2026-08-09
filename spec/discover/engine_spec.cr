@@ -459,6 +459,47 @@ describe Gori::Discover::Engine do
     findings.find { |f| f.url == "http://t/oauth2/token" }.not_nil!.source.well_known?.should be_true
   end
 
+  # …and it stops there. `WellKnown` inherits for ONE hop; a page an OIDC-named endpoint links
+  # to is an ordinary `<a href>`, not a path gori guessed, so it must come back `Crawled`.
+  it "does not inherit the well-known source past the document's own links" do
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 4, concurrency: 2, retries: 0)
+    oidc = %({"token_endpoint":"http://t/oauth2/token"})
+    findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+      case t
+      when "/.well-known/openid-configuration" then make(200, oidc, "application/json")
+      when "/oauth2/token"                     then html(%(<a href="/deep/page">deep</a>))
+      when "/deep/page"                        then html("an ordinary page")
+      when "/"                                 then html("home, nothing linked")
+      else                                          notfound
+      end
+    end
+    findings.find { |f| f.url == "http://t/oauth2/token" }.not_nil!.source.well_known?.should be_true
+    findings.find { |f| f.url == "http://t/deep/page" }.not_nil!.source.crawled?.should be_true
+  end
+
+  # The harm the hop limit prevents, on the run shape that shows it: an origin answering 401 to
+  # unknown paths. A crawled page's 401 is a FINDING (`record_page` keeps 401/403 — an
+  # auth-protected endpoint is the point); judged against that origin's own soft-404 baseline it
+  # diverges in nothing and is dropped. Reaching the SAME page by the SAME link from `/` is the
+  # control: whatever the run does to it there, it must do here.
+  it "keeps a 401 page linked from a well-known endpoint, as if linked from the root" do
+    route = ->(t : String) do
+      case t
+      when "/.well-known/openid-configuration"
+        make(200, %({"token_endpoint":"http://t/oauth2/token"}), "application/json")
+      when "/oauth2/token" then html(%(<a href="/deep/page">deep</a>))
+      when "/deep/page"    then make(401, "Unauthorized")
+      when "/"             then html("home")
+      else                      make(401, "Unauthorized")
+      end
+    end
+    cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 4, concurrency: 2,
+      retries: 0, calibrate_probes: 3)
+    findings, _ = run_discover("http://t/", [] of String, cfg) { |t| route.call(t) }
+    deep = findings.find { |f| f.url == "http://t/deep/page" }
+    deep.not_nil!.source.crawled?.should be_true
+  end
+
   # A path-confined run still checks the origin's well-known documents — they only ever live
   # there — and the endpoints they declare are then bounded like any other derived URL.
   it "still fetches the well-known registry on a path-confined run" do
@@ -488,6 +529,70 @@ describe Gori::Discover::Engine do
     # Nothing on the site LINKS to either — they exist only as string literals in the bundle.
     urls.should contain("http://t/api/v2/orders")
     urls.should contain("http://t/api/v2/invoices")
+  end
+
+  # ── what an INFERRED link may spend ─────────────────────────────────────────────────────
+  # Seeding a directory sweep costs the whole wordlist. `consider_link` spends it on a link the
+  # target DECLARED; a literal recovered from text has to be confirmed first. These three pin the
+  # three outcomes that rule produces.
+  describe "brute-force directories derived from links" do
+    # The saving. A bundle of i18n/asset/vendor paths that resolve to nothing must not each buy a
+    # sweep of their own directory: measured against a live origin, seeding on faith turned one
+    # response into 38,929 requests for 2 findings.
+    it "does not sweep a directory named only by a script literal that 404s" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      bundle = %(var T={"a":"/locales/ns7/messages.json","b":"/assets/chunk3/style.css"};)
+      sent = [] of String
+      run_discover("http://t/", %w[admin secret], cfg) do |t|
+        sent << t
+        case t
+        when "/"       then html(%(<script src="/app.js"></script>))
+        when "/app.js" then make(200, bundle, "application/javascript")
+        else                notfound
+        end
+      end
+      # The literals themselves are still FETCHED — that is how they get confirmed or not.
+      sent.should contain("/locales/ns7/messages.json")
+      # …but nothing in those directories is brute-forced, because nothing there answered.
+      sent.should_not contain("/locales/ns7/admin")
+      sent.should_not contain("/assets/chunk3/secret")
+    end
+
+    # The coverage that must survive it: a route the bundle names which DOES answer earns its
+    # directory a sweep, one round-trip later than before.
+    it "sweeps the directory of a script literal that turns out to be real" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[admin], cfg) do |t|
+        sent << t
+        case t
+        when "/"              then html(%(<script src="/app.js"></script>))
+        when "/app.js"        then make(200, %(fetch("/api/v2/orders")), "application/javascript")
+        when "/api/v2/orders" then make(200, "[]", "application/json")
+        else                       notfound
+        end
+      end
+      sent.should contain("/api/v2/admin")
+    end
+
+    # And the case that separates this from "confirm everything": a DECLARED link is the target's
+    # own statement, so its directory is swept even when the link itself is stale. A robots.txt
+    # naming a file that is gone is a classic reason to look at what else is in that directory.
+    it "still sweeps the directory of a declared link that 404s" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[admin], cfg) do |t|
+        sent << t
+        case t
+        when "/" then html(%(<a href="/backup/db.sql.gz">old</a>))
+        else          notfound
+        end
+      end
+      sent.should contain("/backup/admin")
+    end
   end
 
   # The other half of `text_like?`: a crawl follows `<img src>` like any other link, so binary

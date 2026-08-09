@@ -380,7 +380,12 @@ module Gori::Discover
     # can't expand the brute-force wordlist onto a directory outside the run's own scope.
     seed_only : Bool = false
 
-  private record RawLink, href : String, source : Source
+  # `declared` — did the response NAME this as a link (an attribute, a `<meta refresh>`, a
+  # robots.txt value, a sitemap `<loc>`), or did the endpoint pass infer it from a quoted string
+  # in the body's text? Defaults true, so the sources that are declared by construction —
+  # robots, sitemap, a followed redirect — construct unchanged. See `Extract::Found` for why the
+  # bit exists and `consider_link` for what it gates.
+  private record RawLink, href : String, source : Source, declared : Bool = true
 
   # Worker → orchestrator. One per received Task, so the orchestrator's @pending balances.
   # `exchange` is the wire bytes kept for an outcome that can still become a finding; the
@@ -885,7 +890,28 @@ module Gori::Discover
       else
         record_page(task, fetched, oc.exchange)
       end
+      confirm_bruteforce_dir(task, fetched)
       expand_links(oc, task, fetched)
+    end
+
+    # The other half of `consider_link`'s declared-only rule: this page's own directory, seeded
+    # now that the fetch has come back and says something is there.
+    #
+    # Placed here rather than in `record_page` so it covers the WELL_KNOWN branch above too, and
+    # so it is asked once per fetched page regardless of which gate scored it. It is a no-op for
+    # a DECLARED link — `consider_link` already enqueued that directory and `@dirs` dedups — so
+    # what this actually restores is the inferred half: a route recovered from a bundle earns its
+    # directory a sweep by answering, one round-trip later than before and only when real.
+    #
+    # The existence test is `record_page`'s, deliberately: `< 400`, plus 401 and 403, because an
+    # endpoint behind auth is the strongest reason there is to sweep its neighbours. A 404 earns
+    # nothing, which is the entire saving.
+    private def confirm_bruteforce_dir(task : Task, fetched : Calibrate::Fetched) : Nil
+      return unless @config.bruteforce?
+      s = fetched.status
+      return unless s && (s < 400 || s == 401 || s == 403)
+      return unless p = Url.parse(task.url)
+      enqueue_dir(Url.dir_of(p), task.depth)
     end
 
     # A finding the run GUESSED rather than followed a link to: the WELL_KNOWN documents, and
@@ -1178,7 +1204,16 @@ module Gori::Discover
         @crawl_enqueued += 1
         @frontier << Task.new(TaskKind::Crawl, norm, task.depth + 1, link.source)
       end
-      enqueue_dir(Url.dir_of(p), task.depth) if @config.bruteforce?
+      # Seeding a brute-force sweep of this link's DIRECTORY costs the whole wordlist — ~315
+      # sends with the defaults, before extensions — so it is spent only on a link the target
+      # DECLARED. An inferred literal has to be confirmed first: it comes back through
+      # `confirm_bruteforce_dir` once its own fetch says something is actually there.
+      #
+      # Measured, on a bundle of 120 i18n/asset/vendor paths that resolve to nothing: seeding on
+      # faith turned one response into 38,929 requests for 2 findings. The same guard costs a
+      # real SPA nothing — its bundle names routes that answer 200, so every directory it points
+      # at is seeded one round-trip later.
+      enqueue_dir(Url.dir_of(p), task.depth) if @config.bruteforce? && link.declared
     end
 
     private def enqueue_dir_from_url(url : String, depth : Int32) : Nil
@@ -1433,7 +1468,19 @@ module Gori::Discover
       # What a well-known document DECLARES is a guess too — the origin's word for it, at a
       # path gori chose — so it inherits the source that keeps it behind the soft-404 gate
       # (`well_known?`). Everything else a page points at is an ordinary crawl link.
-      src = task.source.well_known? ? Source::WellKnown : Source::Crawled
+      #
+      # `task.kind.fetch?` bounds that inheritance to ONE HOP, the same way the robots branch
+      # above does, and it is load-bearing rather than tidy. Only `enqueue_well_known` queues a
+      # Fetch; every link this method yields is enqueued as a Crawl. Without the guard the
+      # source propagated down the WHOLE subtree — an `<a href>` on a page an OIDC document
+      # named came back `WellKnown`, and so did its children — which routes an ordinary crawled
+      # page through `resolve_seed_finding` and judges it against the SEED ORIGIN ROOT's
+      # soft-404 baseline. That is not a stricter gate, it is the wrong question: measured, a
+      # linked `/deep/page` answering 401 on an origin that 401s unknown paths cleared nothing
+      # and was dropped into `calibrated_out`, while the identical page reached by a link from
+      # `/` was recorded at 0.85. A guess deserves the baseline; a link the target itself
+      # published does not.
+      src = task.kind.fetch? && task.source.well_known? ? Source::WellKnown : Source::Crawled
       if Extract.sitemap_body?(body)
         return Extract.from_sitemap(body).map { |h| RawLink.new(h, Source::Sitemap) }
       end
@@ -1441,9 +1488,13 @@ module Gori::Discover
       # No content type at all stays html-like, which is where it has always gone — and now
       # loses nothing by it, since `from_html` runs the endpoint pass too.
       if ct.nil? || html_like?(ct)
-        Extract.from_html(body).map { |h| RawLink.new(h, src) }
+        # The one MIXED source: `from_html` runs both the attribute passes and the endpoint pass,
+        # and only it can say which found what.
+        Extract.from_html(body).map { |f| RawLink.new(f.href, src, f.declared) }
       elsif text_like?(ct)
-        Extract.from_text(body).map { |h| RawLink.new(h, src) }
+        # A bundle, a JSON document, a `.map`: not markup, so it declares no links at all and
+        # every literal here is inferred.
+        Extract.from_text(body).map { |h| RawLink.new(h, src, false) }
       else
         EMPTY_LINKS
       end

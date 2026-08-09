@@ -116,12 +116,23 @@ module Gori
       #
       # Public so a spec can pin the shape, the same reason `list_leftover_error` is: the
       # commands that print it end in `abort`/`exit`, which cannot be exercised from a spec.
-      def self.colormarker_rule_row(r : Store::ColorRule) : String
+      #
+      # `color_w` is the colour column's width, measured across the rules being printed
+      # (`colormarker_color_width`). It was a literal 6, which fitted the longest built-in word
+      # (`orange`) and nothing else — a custom colour is an operator-typed name of any length, so
+      # a single `hotpink` shifted the name and condition columns on EVERY row of the listing.
+      def self.colormarker_rule_row(r : Store::ColorRule, color_w : Int32 = 6) : String
         mark = r.enabled? ? "x" : " "
         name = r.name.empty? ? "" : " [#{r.name}]"
         scope = "#{r.scope.badge}#{r.overridden? ? "*" : ""}"
         cond = r.match_filter.empty? ? "(every flow)" : r.match_filter
-        "#{scope}##{r.id} [#{mark}] #{r.style.label.ljust(5)} #{r.color.ljust(6)}#{name}  #{cond}"
+        "#{scope}##{r.id} [#{mark}] #{r.style.label.ljust(5)} #{r.color.ljust(color_w)}#{name}  #{cond}"
+      end
+
+      # The colour column's width for one listing: the longest colour name in it, never narrower
+      # than the built-in default so a list of built-ins keeps the shape it has always had.
+      def self.colormarker_color_width(rules : Array(Store::ColorRule)) : Int32
+        {rules.max_of?(&.color.size) || 6, 6}.max
       end
 
       # `--scope` on every rule subcommand: WHICH store the id names (or, on list, which half
@@ -224,7 +235,8 @@ module Gori
           elsif rules.empty?
             puts "No colour rules configured."
           else
-            rules.each { |r| puts colormarker_rule_row(r) }
+            w = colormarker_color_width(rules)
+            rules.each { |r| puts colormarker_rule_row(r, w) }
           end
         ensure
           store.close

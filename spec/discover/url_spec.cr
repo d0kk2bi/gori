@@ -387,6 +387,48 @@ describe Gori::Discover::Url do
       U.probe(dir, dir_url, "").should be_nil
     end
 
+    # The built-in list is one corpus and proves the fast path works on it; this proves it
+    # cannot be WRONG on anything else, which is the property `enqueue_probes` relies on when it
+    # takes whichever derivation answered. `--wordlist` is operator-supplied, so the corpus is
+    # not the boundary.
+    it "either agrees with parse or declines, for every octet in every position" do
+      disagree = [] of String
+      (0..255).each do |b|
+        ["a#{b.unsafe_chr}b", "#{b.unsafe_chr}x", "x#{b.unsafe_chr}"].each do |cand|
+          next unless cand.valid_encoding?
+          next unless fast = U.probe(dir, dir_url, cand)
+          slow = U.parse("#{dir_url}#{cand}")
+          if slow.nil?
+            disagree << "0x#{b.to_s(16)} #{cand.inspect}: probe answered where parse refused"
+            next
+          end
+          disagree << "0x#{b.to_s(16)} #{cand.inspect}: #{fast.parts} != #{slow}" if fast.parts != slow
+          disagree << "0x#{b.to_s(16)} #{cand.inspect}: #{fast.url.inspect} != #{U.normalize(slow).inspect}" if fast.url != U.normalize(slow)
+          disagree << "0x#{b.to_s(16)} #{cand.inspect}: key #{fast.url.inspect} != #{U.visit_key(slow).inspect}" if fast.url != U.visit_key(slow)
+        end
+      end
+      disagree.should be_empty
+    end
+
+    # The specific shape that broke it, kept as its own case because the octet sweep above
+    # would not name it: `URI.parse` RSTRIPS the path with the UNICODE `Char#whitespace?`, so a
+    # trailing U+00A0 / U+3000 / U+2028 vanishes from `parse`'s answer while a byte-level guard
+    # sees three perfectly ordinary octets. A copy-pasted or HTML-scraped wordlist carries
+    # trailing NBSP routinely; the fast path used to keep it and request a URL the fallback
+    # never would.
+    it "declines a candidate whose trailing character parse would strip" do
+      ["\u{a0}", "\u{3000}", "\u{2028}"].each do |ws|
+        U.probe(dir, dir_url, "admin#{ws}").should be_nil
+        U.parse("#{dir_url}admin#{ws}").not_nil!.path.should eq("/shop/catalog/admin")
+      end
+      # Non-ASCII is declined wholesale, not just at the end — the guard is per byte and the
+      # predicate it is standing in for is per character.
+      U.probe(dir, dir_url, "관리자").should be_nil
+      U.probe(dir, dir_url, "café").should be_nil
+      # …and the fallback still reaches those candidates, so declining costs coverage nothing.
+      U.parse("#{dir_url}관리자").not_nil!.path.should eq("/shop/catalog/관리자")
+    end
+
     it "leaves an already-encoded candidate alone, exactly as parse does" do
       # `%` is not in the repair class, so neither derivation re-encodes it.
       pr = U.probe(dir, dir_url, "my%20file.pdf").not_nil!

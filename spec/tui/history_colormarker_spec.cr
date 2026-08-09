@@ -95,7 +95,7 @@ describe "History — Colormarker row marks" do
         backend.grid[1][3, 4].join.should eq("TIME") # header moved with the column
         row_y = 3                                           # QL bar, header, divider, first row
         backend.grid[row_y][1].should eq('█')
-        backend.fg_grid[row_y][1].should eq(Theme.mark_color(:red))
+        backend.fg_grid[row_y][1].should eq(Theme.mark_color("red"))
         # The swatch column is its own cell: TIME still starts at +3, not over the block.
         backend.grid[row_y][2].should eq(' ')
       end
@@ -146,7 +146,7 @@ describe "History — Colormarker row marks" do
 
         row_y = 4 # QL bar, header, divider, cursor row, then this one
         gap_x = 15 # TIME is "MM-DD HH:MM:SS" at x=1..14; METHOD starts at 16
-        tint = Theme.row_tint(Theme.mark_color(:red), Theme.bg)
+        tint = Theme.row_tint(Theme.mark_color("red"), Theme.bg)
         backend.grid[row_y][gap_x].should eq(' ') # genuinely a gap, not a glyph cell
         backend.bg_grid[row_y][gap_x].should eq(tint)
         backend.bg_grid[row_y][0].should eq(tint) # the gutter cell too
@@ -174,7 +174,7 @@ describe "History — Colormarker row marks" do
         painted = backend.bg_grid[row_y][12]
         painted.should_not eq(Theme.bg)         # not the plain canvas
         painted.should_not eq(Theme.accent_bg)  # not the bare selection band either
-        painted.should eq(Theme.row_tint(Theme.mark_color(:red), Theme.accent_bg))
+        painted.should eq(Theme.row_tint(Theme.mark_color("red"), Theme.accent_bg))
         backend.grid[row_y][0].should eq('▎')   # and the cursor bar is still there
       end
     end
@@ -225,7 +225,7 @@ describe "History — Colormarker row marks" do
 
         after = MemoryBackend.new(80, 12)
         view.render_list(Screen.new(after), Rect.new(0, 0, 80, 12))
-        after.bg_grid[4][15].should eq(Theme.row_tint(Theme.mark_color(:red), Theme.bg))
+        after.bg_grid[4][15].should eq(Theme.row_tint(Theme.mark_color("red"), Theme.bg))
       end
     end
   end
@@ -251,7 +251,7 @@ describe "History — Colormarker row marks" do
 
         after = MemoryBackend.new(80, 12)
         view.render_list(Screen.new(after), Rect.new(0, 0, 80, 12))
-        after.bg_grid[4][15].should eq(Theme.row_tint(Theme.mark_color(:red), Theme.bg))
+        after.bg_grid[4][15].should eq(Theme.row_tint(Theme.mark_color("red"), Theme.bg))
       end
     end
   end

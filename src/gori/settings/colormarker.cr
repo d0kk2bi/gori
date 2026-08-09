@@ -111,10 +111,11 @@ module Gori::Settings
     list
   end
 
-  # Tolerant global-rule parse: a non-array (or absent) node keeps the current value; the two
-  # enum fields are clamped to their allowed sets rather than parsed with `from_label`, so a
-  # typo in a hand-edited settings.json cannot take the whole file down through `load`'s
-  # blanket rescue.
+  # Tolerant global-rule parse: a non-array (or absent) node keeps the current value; `style` is
+  # clamped to its allowed set rather than parsed with `from_label`, so a typo in a hand-edited
+  # settings.json cannot take the whole file down through `load`'s blanket rescue.
+  #
+  # `color` is NOT clamped — see `parse_color_label`.
   #
   # TWO deliberate departures from `parse_rewriter_rules`, both load-bearing:
   #
@@ -142,10 +143,31 @@ module Gori::Settings
         o["enabled"]?.try(&.as_bool?) != false,
         o["name"]?.try(&.as_s?) || "",
         o["when"]?.try(&.as_s?) || "",
-        clamp_field(o["color"]?.try(&.as_s?), COLORMARKER_COLORS, "yellow"),
+        parse_color_label(o["color"]?.try(&.as_s?)),
         clamp_field(o["style"]?.try(&.as_s?), COLORMARKER_STYLES, "full"))
     end
     list
+  end
+
+  # A rule's `color`, normalised but NOT clamped to a known set — the one field here that must
+  # survive a value this parser cannot vet.
+  #
+  # `style` can be clamped because `COLORMARKER_STYLES` is closed and always will be. A colour
+  # is not: it is a built-in word OR the name of a custom colour from `colormarker.colors`, and
+  # clamping to `COLORMARKER_COLORS` silently rewrote every custom reference to "yellow" on
+  # load — then `save` wrote that back, so a global rule painted with a custom colour lost it
+  # permanently at the next restart. Widening the clamp to include the custom names would only
+  # move the bug: it makes this parser depend on `colors` having been read first, and it still
+  # destroys a rule whose colour was deleted and is about to be re-added.
+  #
+  # Passing the label through costs nothing, because the RESOLVER is already total and already
+  # tolerant: `Tui::Theme.mark_color` answers a custom name from the registry, a built-in word
+  # (and its `cyan`/`magenta`/`violet` aliases) through the active palette, and anything else —
+  # a typo, a dangling reference — with a visible yellow. Same forgiving outcome on screen, minus
+  # the write-back that made it permanent. Blank/absent still reads as "yellow" so the field is
+  # never empty.
+  private def self.parse_color_label(s : String?) : String
+    s.try(&.strip.downcase).presence || "yellow"
   end
 
   # --- global rule CRUD -----------------------------------------------------------------

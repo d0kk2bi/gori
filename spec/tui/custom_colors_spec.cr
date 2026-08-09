@@ -9,11 +9,14 @@ include Gori::Tui
 describe "Theme.mark_color(String)" do
   it "resolves a built-in word through the active palette, keyed by string" do
     Theme.apply("goridark")
-    # The string overload agrees with the symbol one for the six built-ins.
-    Theme.mark_color("red").should eq(Theme.mark_color(:red))
-    Theme.mark_color("purple").should eq(Theme.mark_color(:purple))
-    # …and accepts the tolerant aliases the enum's from_label does.
-    Theme.mark_color("cyan").should eq(Theme.mark_color(:blue))
+    # Against the palette FIELD each word names — `theme_row_tint_spec` pins the same mapping
+    # across every built-in theme; these are the spot checks that keep this file readable.
+    Theme.mark_color("red").should eq(Theme.red)
+    Theme.mark_color("purple").should eq(Theme.syn_literal)
+    # …and the tolerant aliases resolve to the nearest member's field.
+    Theme.mark_color("cyan").should eq(Theme.syn_header)
+    Theme.mark_color("magenta").should eq(Theme.syn_literal)
+    Theme.mark_color("violet").should eq(Theme.syn_literal)
   end
 
   it "resolves a registered custom colour to its absolute hex, custom winning over an alias" do
@@ -30,7 +33,7 @@ describe "Theme.mark_color(String)" do
   it "falls back to a VISIBLE yellow for a dangling custom name, not muted" do
     Theme.set_custom_marks({} of String => String)
     # A rule still naming a deleted colour must not read as chrome — its row is active.
-    Theme.mark_color("gone").should eq(Theme.mark_color(:yellow))
+    Theme.mark_color("gone").should eq(Theme.yellow)
     Theme.mark_color("gone").should_not eq(Theme.muted)
   end
 end

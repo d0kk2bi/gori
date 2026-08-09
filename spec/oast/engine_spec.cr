@@ -91,6 +91,21 @@ private class SeqHttp < O::Http
   end
 end
 
+# The same script, but the transport RAISES once the scripted responses run out instead of
+# answering 404 — the shape a reset connection, a TLS failure or `HttpClient`'s MAX_BODY refusal
+# takes mid-drain, as opposed to `SeqHttp`'s "a 200 carrying junk".
+private class RaisingAfterHttp < O::Http
+  def initialize(@responses : Array(Tuple(Int32, String)))
+  end
+
+  def request(method : String, url : String,
+              headers : Hash(String, String) = {} of String => String,
+              body : String? = nil) : O::Http::Response
+    r = @responses.shift? || raise Gori::Error.new("OAST: connection reset by peer")
+    O::Http::Response.new(r[0], r[1])
+  end
+end
+
 describe Gori::Oast do
   describe O::RsaKeyPair do
     it "generates a 2048 key and exports a valid SPKI PEM that round-trips" do
@@ -316,6 +331,28 @@ describe Gori::Oast do
       results = provider.poll(http, session) # must NOT raise
       results.size.should eq(2)
       results.map(&.unique_id).should eq(["a", "b"])
+    end
+
+    # …and the same holds when the SHIFT ITSELF fails rather than its body: a reset connection,
+    # a TLS error, or the MAX_BODY refusal `HttpClient` raises on an over-large response. The
+    # bin has already handed those two over and no longer holds them.
+    it "keeps the interactions already shifted when a later shift raises" do
+      provider = O::Postbin.new("https://postb.in")
+      session = O::Session.new(1_i64, O::ProviderKind::Postbin, "https://postb.in", "binid", "", token: "binid")
+      good = ->(id : String) { {200, {"reqId" => id, "method" => "GET", "path" => "/#{id}"}.to_json} }
+      http = RaisingAfterHttp.new([good.call("a"), good.call("b")])
+      results = provider.poll(http, session)
+      results.map(&.unique_id).should eq(["a", "b"])
+    end
+
+    # The other half: swallowing the failure would report "nothing arrived" for an unreachable
+    # provider. With nothing collected there is no evidence to protect, so the error surfaces.
+    it "raises when the very first shift fails, so an unreachable provider is not silent" do
+      provider = O::Postbin.new("https://postb.in")
+      session = O::Session.new(1_i64, O::ProviderKind::Postbin, "https://postb.in", "binid", "", token: "binid")
+      expect_raises(Gori::Error, /connection reset/) do
+        provider.poll(RaisingAfterHttp.new([] of Tuple(Int32, String)), session)
+      end
     end
   end
 
