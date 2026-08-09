@@ -104,7 +104,6 @@ module Gori::Tui
 
     private def handle_prefix_key(ev : Termisu::Event::Key) : Symbol
       key = ev.key
-      c = ev.char || key.to_char
       if key.escape?
         cancel_prefix_edit
       elsif key.enter?
@@ -121,7 +120,6 @@ module Gori::Tui
 
     private def handle_add_key(ev : Termisu::Event::Key) : Symbol
       key = ev.key
-      c = ev.char || key.to_char
       if key.escape?
         cancel_add
       elsif key.enter?

@@ -228,9 +228,8 @@ module Gori::Miner
 
       # The whole injected `additions` block is candidate content (Content-Disposition
       # framing gori wrote plus the injected names/values) — mark it all verbatim: no injected
-      # byte is ever scanned for a `$NAME`, and the framing carries none.
-      start = 0
-      stop = 0
+      # byte is ever scanned for a `$NAME`, and the framing carries none. Both branches below
+      # set `start`/`stop` before the tuple reads them — there is no un-marked path.
       close = "--#{boundary}--".to_slice
       if ci = last_index_of(body, close)
         io.write(body[0, ci])

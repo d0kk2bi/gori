@@ -4343,7 +4343,6 @@ module Gori::Tui
 
     private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.h < 2
-      ins = focused && target_insert?
       Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: Frame.pane_border(focused))
       Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 8, target_insert?) # the REAL mode, not focused&&mode — see Frame.mode_badge
       sni_x, tr_edge = target_chrome_chain(rect)

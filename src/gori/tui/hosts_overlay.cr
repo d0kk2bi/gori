@@ -106,7 +106,6 @@ module Gori::Tui
     # esc cancels. Never closes the overlay — it drops back to the list.
     private def handle_add_key(ev : Termisu::Event::Key) : Symbol
       key = ev.key
-      c = ev.char || key.to_char
       if key.escape?
         cancel_add
       elsif key.enter?
