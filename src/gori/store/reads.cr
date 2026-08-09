@@ -126,6 +126,55 @@ module Gori
       nil
     end
 
+    # How many same-(host, target) rows the URL lookup below will consider. A URL polled every
+    # few seconds leaves tens of thousands of them, and this runs inline on the TUI's render
+    # fiber (AGENTS.md §3) — the ordering puts the answer at the head, so the tail is rows that
+    # would lose the ranking anyway.
+    URL_LOOKUP_SCAN_CAP = 256
+
+    # The captured flow an absolute URL came from — a REVERSE match against `FlowRow#url`, for
+    # a surface that holds the URL as a bare string and nothing else. A Probe issue's AFFECTED
+    # list is the one: `upsert_probe_issue` accumulates `Detection#url` into a JSON array and
+    # keeps no per-URL flow id, so the URLs outlive every id that could have pointed back at a
+    # row. Storing the id beside each URL would make this exact and is the better shape; it
+    # needs a `probe_issues` migration and a second array kept index-aligned across the store,
+    # the headless `Probe::Group` fold and both export surfaces, so it is not this change.
+    #
+    # `host` narrows the scan to `idx_flows_sitemap`'s leading column, and the caller always
+    # has it — a probe issue group is keyed by (code, host), so every URL on its list is on
+    # that host. The `target` predicate covers both capture shapes at once (absolute-form rows
+    # store the whole URL, origin-form rows store the bare path), and the survivors are then
+    # re-derived through `FlowRow.url_of` rather than trusted: `/x` captured on http:8080 and
+    # on https:443 share a target and mean two different URLs, and only the full rebuild —
+    # default port, IPv6 brackets and all — tells them apart.
+    #
+    # THE METHOD IS THE FIRST SORT KEY, and it is why `prefer_method` exists. A URL is not an
+    # endpoint: `GET /v1/me` and `POST /v1/me` are one (host, target) pair and two exchanges,
+    # and a finding that fired on one must not open the other — `representative_flow_id` keys
+    # on the method for exactly this reason, and a probe group records none, so the caller
+    # passes the method of the sample flow that produced the finding. Response-bearing and
+    # newest break the remaining ties, as they do one screen up: opening a finding onto an
+    # aborted request shows nothing of what the finding is about.
+    def flow_id_for_url(url : String, host : String, prefer_method : String? = nil) : Int64?
+      @db.query("SELECT id, scheme, host, port, target FROM flows WHERE host = ? AND (target = ? OR target = ?) " \
+                "ORDER BY (method = ?) DESC, (status IS NOT NULL) DESC, id DESC LIMIT ?",
+        host, url, Url.origin_path(url), prefer_method || "", URL_LOOKUP_SCAN_CAP) do |rs|
+        rs.each do
+          id = rs.read(Int64)
+          scheme, h, port, target = rs.read(String), rs.read(String), rs.read(Int32), rs.read(String)
+          return id if FlowRow.url_of(scheme, h, port, target) == url
+        end
+      end
+      nil
+    rescue ex
+      # Degrade to "not found" (the live TUI must never crash the render loop) but LEAVE A
+      # TRACE, the way `Store#search` does 90 lines up. The caller turns nil into "no captured
+      # flow for that URL" — a positive claim about a specific URL — so a busy or corrupt DB
+      # answering silently would send the operator hunting for a retention setting.
+      ::Log.warn { "flow_id_for_url failed: #{ex.message}" }
+      nil
+    end
+
     # Full detail incl. raw BLOBs (the truth) for the detail view.
     # `body_max`, when set, caps request/response body BLOBs via SQLite `substr`
     # (byte-oriented on BLOBs) so list-preview paths never pull multi-MiB bodies

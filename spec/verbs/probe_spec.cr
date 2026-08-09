@@ -93,6 +93,22 @@ describe "Gori::Verbs.register_probe" do
       end
       verb_intents(r, "probe.close").should eq([:probe_close])
     end
+
+    # ↵ over the AFFECTED URLS list. `o` reaches the group's ONE sample flow, so before this
+    # every other URL in a group of up to 50 was a dead row in the pane that listed it.
+    it "opens the caret's affected URL on ↵, distinct from the sample flow on `o`" do
+      r["probe.open-affected"].scope.should eq(Gori::Verb::Scope::ProbeDetail)
+      # ↵/l/→ mirrors probe.close's esc/h/← in the same scope: ← leaves the detail, → goes
+      # deeper. The aliases also keep a bare `enter` — structurally reserved — off the
+      # rebindable surface (see spec/verb/keymap_spec.cr).
+      r["probe.open-affected"].chords.should eq([Gori::Verb::Chord.new("enter"),
+                                                 Gori::Verb::Chord.new("l"), Gori::Verb::Chord.new("right")])
+      verb_intents(r, "probe.open-affected").should eq([:probe_open_affected])
+      # A menu key of its own: `o` is taken by the sample flow, and the space menu is the one
+      # place both are listed side by side.
+      r["probe.open-affected"].menu_key.should eq('u')
+      r["probe.open-flow"].chords.map(&.key).should_not contain("enter")
+    end
   end
 
   describe "the Rules sub-tab" do

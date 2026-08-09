@@ -889,6 +889,10 @@ private class FakeContext < ExecContext
     @calls << :probe_open_flow
   end
 
+  def probe_open_affected : Nil
+    @calls << :probe_open_affected
+  end
+
   def probe_repeater_flow : Nil
     @calls << :probe_repeater_flow
   end
