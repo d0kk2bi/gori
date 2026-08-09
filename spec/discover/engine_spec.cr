@@ -149,11 +149,31 @@ private class DenyAfterFirstAsk < D::ScopePolicy
   end
 end
 
+# Every path `seed_frontier` queues by name at the origin, in order.
+private WELL_KNOWN_PATHS = Gori::Discover::Engine::WELL_KNOWN.map { |path, _| path }.to_a
+
 # The bogus soft-404 probes an origin-root calibration sends: one path segment directly under
-# "/", minus the two well-known paths seed_frontier queues by name. A path-scoped run's own
-# brute-force probes are deeper (/app/…), so they never land in here.
+# "/", minus the well-known paths seed_frontier queues by name. Derived from the constant, so
+# adding a single-segment well-known document cannot silently turn it into a "calibration
+# probe" here. A path-scoped run's own brute-force probes are deeper (/app/…), so they never
+# land in here.
 private def root_calibration_probes(targets : Array(String)) : Array(String)
-  targets.select { |t| t.matches?(%r{\A/[^/]+\z}) && t != "/robots.txt" && t != "/sitemap.xml" }
+  targets.select { |t| t.matches?(%r{\A/[^/]+\z}) && !WELL_KNOWN_PATHS.includes?(t) }
+end
+
+# A rate limiter that trips PARTWAY THROUGH a directory's sweep: an ordinary 404 origin for
+# the first `until_drift` sends, then one uniform 429 for everything. The shape a stale
+# baseline turns into 300 confidence-1.0 findings.
+private def limiter_route(until_drift : Int32) : Proc(String, R)
+  sent = 0
+  ->(t : String) do
+    sent += 1
+    if sent <= until_drift
+      t == "/admin" ? html("REAL ADMIN PANEL") : notfound
+    else
+      make(429, "<html>Too Many Requests. Slow down.</html>")
+    end
+  end
 end
 
 private def run_discover(seed : String, words : Array(String), cfg : D::Config,
@@ -397,6 +417,181 @@ describe Gori::Discover::Engine do
     urls.should contain("http://t/sitemap.xml")
   end
 
+  # ── the `.well-known/` registry, and the bodies it hands back ───────────────────────────
+  #
+  # `.well-known` and `.well-known/security.txt` do ship in the built-in wordlist, but that
+  # only probes them once per calibrated DIRECTORY (so never at the origin on a path-confined
+  # run) and reads nothing they say. These are fetched at the origin like robots.txt, and
+  # their bodies are parsed for further endpoints.
+  it "fetches the whole well-known registry at the origin, not just robots/sitemap" do
+    cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 2, retries: 0)
+    sent = [] of String
+    run_discover("http://t/", [] of String, cfg) do |t|
+      sent << t
+      t == "/" ? html("home, no links") : notfound
+    end
+    sent.should contain("/.well-known/openid-configuration")
+    sent.should contain("/.well-known/security.txt")
+    sent.should contain("/sitemap_index.xml")
+  end
+
+  # The highest-yield document there is: one 200 hands over authorize/token/userinfo/jwks as
+  # absolute URLs. It is JSON, so before `Extract.from_text` existed the response was fetched,
+  # decoded, fingerprinted — and every endpoint in it dropped for not being html-like.
+  it "crawls the endpoints an OIDC discovery document declares" do
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 2, concurrency: 2, retries: 0)
+    oidc = %({"issuer":"http://t","token_endpoint":"http://t/oauth2/token",\
+"userinfo_endpoint":"http://t/oauth2/userinfo"})
+    findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+      case t
+      when "/.well-known/openid-configuration" then make(200, oidc, "application/json")
+      when "/oauth2/token"                     then make(200, "token endpoint", "application/json")
+      when "/oauth2/userinfo"                  then make(200, "userinfo endpoint", "application/json")
+      when "/"                                 then html("home, nothing linked")
+      else                                          notfound
+      end
+    end
+    urls = findings.map(&.url)
+    urls.should contain("http://t/oauth2/token")
+    urls.should contain("http://t/oauth2/userinfo")
+    # A guessed document and everything it declares carry the well-known source, which is what
+    # routes both through the soft-404 baseline instead of `record_page`'s raw-status trust.
+    findings.find { |f| f.url == "http://t/oauth2/token" }.not_nil!.source.well_known?.should be_true
+  end
+
+  # A path-confined run still checks the origin's well-known documents — they only ever live
+  # there — and the endpoints they declare are then bounded like any other derived URL.
+  it "still fetches the well-known registry on a path-confined run" do
+    cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 2, retries: 0)
+    sent = [] of String
+    run_discover("http://t/app/", [] of String, cfg) do |t|
+      sent << t
+      t == "/app/" ? html("app root") : notfound
+    end
+    sent.should contain("/.well-known/security.txt")
+  end
+
+  # ── the script-bundle branch ────────────────────────────────────────────────────────────
+  it "extracts API routes from a crawled script bundle" do
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+    bundle = %(var a=1;fetch("/api/v2/orders");axios.get("/api/v2/invoices");)
+    findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+      case t
+      when "/"                then html(%(<script src="/app.js"></script>))
+      when "/app.js"          then make(200, bundle, "application/javascript")
+      when "/api/v2/orders"   then make(200, "[]", "application/json")
+      when "/api/v2/invoices" then make(200, "[]", "application/json")
+      else                         notfound
+      end
+    end
+    urls = findings.map(&.url)
+    # Nothing on the site LINKS to either — they exist only as string literals in the bundle.
+    urls.should contain("http://t/api/v2/orders")
+    urls.should contain("http://t/api/v2/invoices")
+  end
+
+  # The other half of `text_like?`: a crawl follows `<img src>` like any other link, so binary
+  # responses are the common case here. Scanning one costs `Extract.text` a full `String#scrub`
+  # (a second walk that rebuilds the whole body) to feed a regex no image can match.
+  it "does not scan a binary response body for endpoints" do
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+    findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+      case t
+      when "/"           then html(%(<img src="/logo.png">))
+      when "/logo.png"   then make(200, %(PNG\u{0}\u{0}"/api/hidden"), "image/png")
+      when "/api/hidden" then make(200, "should never be reached", "application/json")
+      else                    notfound
+      end
+    end
+    findings.map(&.url).should_not contain("http://t/api/hidden")
+  end
+
+  # ── drift: the baseline is a snapshot, and origins change their mind ────────────────────
+  #
+  # A `DirBaseline` is measured once, before a directory's ~315 probes, and never revisited.
+  # An origin whose rate limiter trips (or WAF, or a 5xx meltdown) then answers every
+  # remaining probe with one uniform response that diverges from the stale baseline in status
+  # AND length AND content — so it is not merely reported, it is reported at confidence 1.0.
+  describe "a baseline that goes stale mid-sweep" do
+    it "stops reporting once the origin answers everything the same way" do
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 3, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      words = (1..80).map { |i| "w#{i}" }
+      findings, stats = run_discover("http://t/", words, cfg, &limiter_route(6))
+      limited = findings.select { |f| f.status == 429 }
+      # The FIRST member of a uniform run is indistinguishable from a real finding at the
+      # moment it arrives, so one gets through by design; every later one is held and then
+      # dropped. Before the guard this was the whole rest of the wordlist, at confidence 1.0.
+      limited.size.should be <= 1
+      stats.drift_suppressed.should be > 0
+    end
+
+    it "re-measures the directory instead of only muting it" do
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 3, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      words = (1..80).map { |i| "w#{i}" }
+      backend = RouteBackend.new(limiter_route(6))
+      engine = D::Engine.new("http://t/", words, backend, cfg, D::OpenScope.new)
+      kinds = [] of String
+      engine.run { |ev| kinds << ev.kind if ev.is_a?(D::BaselineEvent) }
+      # The first calibration, the drift declaration, and the re-calibration it queued — a
+      # guard that only suppressed would show the first two and stop.
+      kinds.should contain("drifted")
+      kinds.size.should be >= 3
+    end
+
+    it "keeps a SHORT run of look-alike hits, which is an ordinary directory" do
+      # Several endpoints answering identically is normal (one SPA shell behind several
+      # routes); it only means drift when it does not stop. These are held while the run is
+      # alive and released the moment a miss breaks it — DRIFT_RUN sits far above this.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 3, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      alike = %w[alpha bravo charlie delta]
+      findings, _ = run_discover("http://t/", alike + %w[zulu], cfg) do |t|
+        alike.any? { |w| t == "/#{w}" } ? html("ONE SHELL FOR EVERY REAL ROUTE HERE") : notfound
+      end
+      findings.map(&.url).size.should eq(alike.size)
+    end
+
+    it "releases a run still open when the sweep ends" do
+      # The wordlist ends on a run of look-alike hits, so nothing is coming to break it.
+      # Without the drain-time release the second one would be held for the lifetime of the
+      # process and never reported. The bogus calibration names must fall to `notfound` here —
+      # routing them to the shell instead would make the shell the BASELINE and there would be
+      # no hits at all, which is a green test measuring nothing.
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 3, concurrency: 1,
+        retries: 0, confidence_floor: 0.4, max_depth: 0)
+      findings, _ = run_discover("http://t/", %w[alpha bravo], cfg) do |t|
+        t == "/alpha" || t == "/bravo" ? html("ONE SHELL FOR EVERY REAL ROUTE HERE") : notfound
+      end
+      findings.map(&.url).sort!.should eq(["http://t/alpha", "http://t/bravo"])
+    end
+  end
+
+  # The echo test rides on the calibration probes themselves — each searches its own body for
+  # its own name — so it costs no extra request. It has to be a byte search: `bogus_name` is
+  # 16 hex characters and `Fingerprint.dynamic?` skips all-hex runs of 12 or more, which makes
+  # the reflected name invisible to the very hash the reflection would show up in.
+  describe "an origin that quotes the requested path back" do
+    it "does not turn every wordlist entry into a finding" do
+      cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 3, concurrency: 1,
+        retries: 0, confidence_floor: 0.4)
+      filler = "lorem ipsum dolor sit amet consectetur " * 12
+      findings, _ = run_discover("http://t/", %w[admin api/v2/orders swagger/v1/swagger.json], cfg) do |t|
+        if t == "/admin"
+          html("<h1>the real admin panel</h1>#{filler}#{filler}")
+        else
+          html("<h1>Nothing found at #{t} on this server</h1>#{filler}")
+        end
+      end
+      urls = findings.map(&.url)
+      urls.should contain("http://t/admin")
+      # These exist only as the echo of their own request.
+      urls.should_not contain("http://t/api/v2/orders")
+      urls.should_not contain("http://t/swagger/v1/swagger.json")
+    end
+  end
+
   it "confines a path-scoped run to the seed subtree" do
     cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 4, concurrency: 1, retries: 0)
     findings, _ = run_discover("http://t/app/", %w(), cfg) do |t|
@@ -609,9 +804,9 @@ describe Gori::Discover::Engine do
       sent.should be_empty
     end
 
-    it "drops robots.txt/sitemap.xml when Layer 2 excludes them, and keeps the seed" do
+    it "drops every well-known path when Layer 2 excludes them, and keeps the seed" do
       cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 1, retries: 0)
-      denied = Set{"http://t/robots.txt", "http://t/sitemap.xml"}
+      denied = WELL_KNOWN_PATHS.map { |p| "http://t#{p}" }.to_set
       sent = [] of String
       run_discover("http://t/", [] of String, cfg, DenyExact.new(denied)) do |t|
         sent << t
@@ -620,20 +815,20 @@ describe Gori::Discover::Engine do
       sent.should eq(["/"])
     end
 
-    it "still fetches both when nothing denies them (the control for the case above)" do
+    it "still fetches them all when nothing denies them (the control for the case above)" do
       cfg = D::Config.new(spider: true, bruteforce: false, concurrency: 1, retries: 0)
       sent = [] of String
       run_discover("http://t/", [] of String, cfg) do |t|
         sent << t
         t == "/" ? html("home, no links") : notfound
       end
-      sent.sort.should eq(["/", "/robots.txt", "/sitemap.xml"])
+      sent.sort.should eq((["/"] + WELL_KNOWN_PATHS).sort)
     end
 
-    it "gates the origin calibration a path-scoped run queues to grade those two paths" do
-      # The seed-only calibration is the LARGEST part of the trio's blast radius — one bogus
+    it "gates the origin calibration a path-scoped run queues to grade those paths" do
+      # The seed-only calibration is the LARGEST part of the blast radius — one bogus
       # probe per calibrate_probes, at the origin root, on a run confined to /app/. Denying
-      # the root dir alone leaves the seed and both well-known paths allowed, so what this
+      # the root dir alone leaves the seed and every well-known path allowed, so what this
       # asserts on is the calibration and nothing else.
       cfg = D::Config.new(spider: true, bruteforce: true, calibrate_probes: 3, max_depth: 1,
         concurrency: 1, retries: 0)
@@ -655,6 +850,8 @@ describe Gori::Discover::Engine do
         open << t
         route.call(t)
       end
+      # calibrate_probes, and no more: the echo test rides ON these probes (it searches each
+      # body for that probe's own name) rather than costing a request of its own.
       root_calibration_probes(open).size.should eq(3)
     end
 

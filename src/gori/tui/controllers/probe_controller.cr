@@ -101,7 +101,10 @@ module Gori::Tui
         edits = rules_custom_selected? ? " · ↵/e edit · d delete" : ""
         return "↑/↓ select · x on/off · a add#{edits} · space cmds · ↑ sub-tabs · esc sub-tabs"
       elsif @probe.detail_open?
-        "↑/↓ URL · ⇧arrows select · y copy · o flow · r repeater · p promote · space cmds · ←/esc back"
+        # `↵ open` and `o flow` are two different destinations and both belong here — the
+        # caret's own affected URL, and the issue's sample evidence. The Issues detail names
+        # the same pair for the same reason (`↵ open` over its related links, `o flow`).
+        "↑/↓ URL · ↵ open · ⇧arrows select · y copy · o flow · r repeater · p promote · space cmds · ←/esc back"
       elsif @probe.querying?
         "type to filter · ↹ complete · ↵ apply · esc clear"
       elsif @probe.mode.off?
@@ -592,6 +595,12 @@ module Gori::Tui
     # --- READ-pane delegators (the detail's read verbs + the Runner's read_* ladders) ---
     def probe_detail_readable? : Bool
       !rules_tab? && @probe.detail_open?
+    end
+
+    # The AFFECTED URL under the caret — what `probe.open-affected` navigates to.
+    def probe_affected_url : String?
+      return nil unless probe_detail_readable?
+      @probe.affected_url
     end
 
     def probe_detail_selection_active? : Bool

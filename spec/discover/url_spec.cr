@@ -321,4 +321,76 @@ describe Gori::Discover::Url do
       end
     end
   end
+
+  # `Url.probe` is an OPTIMIZATION of `parse("#{dir_url}#{cand}")` and is never allowed to be
+  # a second opinion — `enqueue_probes` picks whichever ran, so a one-byte disagreement would
+  # send a URL the gates were never asked about. These pin equivalence where it answers and
+  # refusal (→ the caller's `parse` fallback) where it does not.
+  describe ".probe" do
+    dir_url = "https://acme.test/shop/catalog/"
+    dir = U.parse(dir_url).not_nil!
+
+    it "agrees with .parse on every entry of the built-in wordlist, plus extensions" do
+      words = Gori::Discover::Wordlist.builtin
+      words.size.should be > 300 # the list is the point of the sweep; a stub would prove nothing
+      answered = 0
+      words.each do |w|
+        [w, "#{w}.php", "#{w}.json", "#{w}.bak"].each do |cand|
+          fast = U.probe(dir, dir_url, cand)
+          next unless fast
+          answered += 1
+          slow = U.parse("#{dir_url}#{cand}").not_nil!
+          fast.parts.should eq(slow)
+          # ONE string standing in for both, which is the whole allocation win: they are
+          # equal for any query-less URL, and `probe` only ever produces query-less ones.
+          fast.url.should eq(U.normalize(slow))
+          fast.url.should eq(U.visit_key(slow))
+        end
+      end
+      # Guards the sweep itself: a `plain_bytes?` that refused everything would pass silently.
+      answered.should eq(words.size * 4)
+    end
+
+    it "builds the candidate under the directory's own origin and path" do
+      pr = U.probe(dir, dir_url, ".well-known/security.txt").not_nil!
+      pr.url.should eq("https://acme.test/shop/catalog/.well-known/security.txt")
+      pr.parts.path.should eq("/shop/catalog/.well-known/security.txt")
+      pr.parts.query.should be_nil
+    end
+
+    it "keeps a non-default port, which is part of the resource's identity" do
+      d = U.parse("http://acme.test:8080/api/").not_nil!
+      U.probe(d, "http://acme.test:8080/api/", "admin").not_nil!
+        .url.should eq("http://acme.test:8080/api/admin")
+    end
+
+    it "declines every candidate parse would have rewritten, split or refused" do
+      # A dot-segment: `parse` collapses it, so the concatenation would name a different
+      # resource than the one the gates judged. Traversal entries are common in public lists.
+      U.probe(dir, dir_url, "../admin").should be_nil
+      U.probe(dir, dir_url, "a/./b").should be_nil
+      U.probe(dir, dir_url, "sub/..").should be_nil
+      U.probe(dir, dir_url, "trailing/.").should be_nil
+      # An empty segment: `//` collapses too.
+      U.probe(dir, dir_url, "/admin").should be_nil
+      U.probe(dir, dir_url, "a//b").should be_nil
+      # `URI.parse` would split these off as query and fragment.
+      U.probe(dir, dir_url, "search?q=1").should be_nil
+      U.probe(dir, dir_url, "page#frag").should be_nil
+      # The request-line octet class: SP and TAB `encode_unsafe` repairs, CR/LF
+      # `Headers.safe_url?` refuses. Either way `parse` is the authority, not this.
+      U.probe(dir, dir_url, "zzadmin ").should be_nil
+      U.probe(dir, dir_url, "zz\tadmin").should be_nil
+      U.probe(dir, dir_url, "zz\radmin").should be_nil
+      U.probe(dir, dir_url, "zz\nadmin").should be_nil
+      U.probe(dir, dir_url, "del\u{7f}").should be_nil
+      U.probe(dir, dir_url, "").should be_nil
+    end
+
+    it "leaves an already-encoded candidate alone, exactly as parse does" do
+      # `%` is not in the repair class, so neither derivation re-encodes it.
+      pr = U.probe(dir, dir_url, "my%20file.pdf").not_nil!
+      pr.parts.should eq(U.parse("#{dir_url}my%20file.pdf").not_nil!)
+    end
+  end
 end

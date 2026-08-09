@@ -22,6 +22,14 @@ module Gori::Tui
 
     SECRET_H = 3 # the SECRET card is a fixed single-line field, framed top + bottom.
 
+    # Left stops for the top card's border chrome. `Frame.card` draws its title as ` TITLE `
+    # from card.x + 2, so ` INPUT ` ends at card.x + 8 and ` HEADER ` at card.x + 9 — one past
+    # each is where a right-chained badge may start. The INPUT number was a literal 8 in the
+    # draw and a second literal 8 in `JwtController`'s hit-test, which let the mode badge take
+    # the title's last cell at ~17 columns; both now read it here.
+    INPUT_MIN_X  =  9
+    HEADER_MIN_X = 10
+
     @dec_scroll : Int32 = 0
     @dec_h : Int32 = 0
     @dec_lines : Int32 = 0
@@ -66,11 +74,11 @@ module Gori::Tui
     # ===================== DECODE lens =====================
     def render_decode(screen : Screen, rect : Rect, *, input : TextArea, input_mode : InputMode,
                       input_read : TextReadState, decoded : String, attacks : Array(Jwt::Attack),
-                      pane : Symbol, focused : Bool) : Nil
+                      pane : Symbol, focused : Bool, lens_chord : String) : Nil
       return if rect.empty?
       input_c, dec_c, atk_c = decode_layout(rect)
 
-      render_input(screen, input_c, input, focused && pane == :input, input_mode, input_read) unless input_c.empty?
+      render_input(screen, input_c, input, focused && pane == :input, input_mode, input_read, lens_chord) unless input_c.empty?
       unless dec_c.empty?
         lines = decoded_lines(decoded)
         @dec_lines = lines.size
@@ -82,11 +90,16 @@ module Gori::Tui
     # ===================== ENCODE lens =====================
     def render_encode(screen : Screen, rect : Rect, *, header : TextArea, payload : TextArea,
                       secret : String, secret_cx : Int32, secret_pre : String, alg : String,
-                      output : String, output_ok : Bool, pane : Symbol, focused : Bool) : Nil
+                      output : String, output_ok : Bool, pane : Symbol, focused : Bool,
+                      lens_chord : String) : Nil
       return if rect.empty?
       hdr_c, pay_c, sec_c, out_c = encode_layout(rect)
 
-      render_json_editor(screen, hdr_c, "HEADER", header, focused && pane == :header) unless hdr_c.empty?
+      unless hdr_c.empty?
+        render_json_editor(screen, hdr_c, "HEADER", header, focused && pane == :header)
+        # HEADER is this lens' top card, so it carries the way back — see draw_lens_chip.
+        draw_lens_chip(screen, hdr_c, :encode, lens_chord)
+      end
       render_json_editor(screen, pay_c, "PAYLOAD", payload, focused && pane == :payload) unless pay_c.empty?
       render_secret(screen, sec_c, secret, secret_cx, secret_pre, alg, focused && pane == :secret) unless sec_c.empty?
       unless out_c.empty?
@@ -103,7 +116,7 @@ module Gori::Tui
 
     # ---- INPUT (editable, INS/READ like the Decoder input) ----
     private def render_input(screen : Screen, card : Rect, input : TextArea, active : Bool,
-                             mode : InputMode, read : TextReadState) : Nil
+                             mode : InputMode, read : TextReadState, lens_chord : String) : Nil
       reading = active && mode == InputMode::Read
       insert = active && mode == InputMode::Insert
       Frame.card(screen, card, "INPUT", bg: Theme.bg, border: Frame.pane_border(active))
@@ -112,10 +125,62 @@ module Gori::Tui
       # `insert`) left a live 8-cell target on an unpainted border: with focus on DECODED,
       # ATTACKS or SECRET, clicking the INPUT card's top-right corner toggled insert.
       # See the same fix in notes_view / fuzzer_view; focus stays in the border colour.
-      Frame.mode_badge(screen, card.right - 1, card.y, card.x + 8, mode == InputMode::Insert)
+      Frame.mode_badge(screen, card.right - 1, card.y, card.x + INPUT_MIN_X, mode == InputMode::Insert)
+      # …and the lens chip chains LEFT of it (`draw_lens_chip` re-derives that edge rather
+      # than taking this return, so the hit-test can compute it the same way).
+      draw_lens_chip(screen, card, :decode, lens_chord, mode == InputMode::Insert)
       body = card.inset(1, 1)
       input.render(screen, body, cursor: insert, gauge: true, gauge_focused: active)
       paint_read_chrome(screen, body, input, read) if reading
+    end
+
+    # ---- the lens chip: the ONE control on this tab with no other trace on screen ----
+    # ` ^T:→ENCODE ` on the DECODE lens' INPUT card, ` ^T:→DECODE ` on the ENCODE lens'
+    # HEADER card — the top card either way, where the eye lands when the tab opens. Each
+    # lens is a complete workbench, so nothing inside one said the other existed: `^T` was
+    # named in Help and in the footer and nowhere on the panes themselves.
+    #
+    # The NAME is where `^T` GOES, and the `→` says so. Naming the CURRENT lens — the way
+    # the sibling ` ↵:READ ` chip names its own mode — would repeat what the card titles
+    # under it already state (DECODED/ATTACKS vs PAYLOAD/SECRET/OUTPUT), and ` ^T:DECODE `
+    # riding a decoding pane reads as "^T decodes this", i.e. as a key that does something
+    # else. `chord` comes from the keymap, so a rebind moves this and the footer together —
+    # and `lens_chord:` is REQUIRED on both render entry points rather than defaulting to
+    # `"^T"`, so a second render path cannot quietly paint the default at someone who
+    # rebound the switch.
+    #
+    # Never lit: a two-way switch has no "on" state to light (the Fuzzer's sort chip passes
+    # `false` for the same reason).
+    private def lens_name(mode : Symbol) : String
+      mode == :decode ? "→ENCODE" : "→DECODE"
+    end
+
+    # `{right_edge, min_x}` for the chip. Draw and hit-test both derive from this one pair,
+    # so the chip cannot drift off its own click target. On DECODE it chains left of INPUT's
+    # READ/INS chip; on ENCODE the HEADER border carries nothing else, so it takes the edge.
+    private def lens_chip_geom(card : Rect, mode : Symbol, insert : Bool) : {Int32, Int32}
+      if mode == :decode
+        min_x = card.x + INPUT_MIN_X
+        {Frame.mode_badge_edge(card.right - 1, min_x, insert), min_x}
+      else
+        {card.right - 1, card.x + HEADER_MIN_X}
+      end
+    end
+
+    private def draw_lens_chip(screen : Screen, card : Rect, mode : Symbol, chord : String,
+                               insert : Bool = false) : Nil
+      edge, min_x = lens_chip_geom(card, mode, insert)
+      Frame.toggle_badge(screen, edge, card.y, min_x, chord, lens_name(mode), false)
+    end
+
+    # Hit-test the lens chip on the lens' top card — `JwtController#handle_click` runs it for
+    # INPUT in DECODE and HEADER in ENCODE. `insert` is INPUT's REAL mode (the chip chains
+    # past a badge whose two labels differ in width), and is unread on the ENCODE side.
+    def lens_chip_hit(card : Rect, mx : Int32, my : Int32, mode : Symbol, chord : String,
+                      insert : Bool = false) : Bool
+      edge, min_x = lens_chip_geom(card, mode, insert)
+      !Frame.right_badge_hit(mx, my, card.y, edge, min_x,
+        [{:lens, chord, lens_name(mode)}] of {Symbol, String, String}).nil?
     end
 
     # ---- HEADER / PAYLOAD (editable JSON, always-insert small editors) ----

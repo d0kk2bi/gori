@@ -211,6 +211,91 @@ describe Gori::Tui::ProbeView do
     end
   end
 
+  # The AFFECTED list is the finding's evidence and its rows led nowhere: `o` opens the group's
+  # ONE sample flow, so 49 of a 50-URL group were unreachable from the detail that listed them.
+  # `affected_url` is what `probe.open-affected` (↵) resolves through.
+  it "reports the affected URL under the caret, and follows the caret down the list" do
+    view_store do |store|
+      %w[/a /b /c].each do |path|
+        store.upsert_probe_issue(Gori::Probe::Detection.new("missing_hsts", "headers", "a.test",
+          "https://a.test#{path}", "t", Gori::Store::Severity::Low))
+      end
+      view = Gori::Tui::ProbeView.new
+      view.reload(store)
+      view.affected_url.should be_nil # no detail open yet
+      view.open_detail(store).should be_true
+      view.affected_url.should eq("https://a.test/a")
+
+      view.detail_move(1, false)
+      view.affected_url.should eq("https://a.test/b")
+      view.detail_move(1, false)
+      view.affected_url.should eq("https://a.test/c")
+      view.detail_move(1, false) # clamped at the last row, not walked off the end
+      view.affected_url.should eq("https://a.test/c")
+
+      view.close_detail
+      view.affected_url.should be_nil
+    end
+  end
+
+  # The caret has to be CARRIED somewhere non-zero for this to test anything: a row-3 caret
+  # surviving into a 1-URL issue reads `affected[3]?` → nil → "no affected URL selected" on a
+  # finding that plainly has a URL. Sitting on row 0 both times asserts nothing, which is what
+  # this used to do.
+  #
+  # `close_detail` and `open_detail` BOTH reset the pane and either one alone is sufficient
+  # (the detail is always closed before another opens — `probe.open` only resolves in the list
+  # scope), so this pins the property, not one of the two lines: whichever of them survives, a
+  # carried caret must resolve against the list it is now pointing at.
+  it "re-points the affected caret at the newly opened issue's own URLs" do
+    view_store do |store|
+      # Seeded oldest-first: the list sorts severity DESC, last_seen DESC, so the 4-URL group
+      # lands on row 0 and the 1-URL one below it.
+      store.upsert_probe_issue(Gori::Probe::Detection.new("missing_csp", "headers", "b.test",
+        "https://b.test/only", "t", Gori::Store::Severity::Low))
+      %w[/one /two /three /four].each do |path|
+        store.upsert_probe_issue(Gori::Probe::Detection.new("missing_hsts", "headers", "a.test",
+          "https://a.test#{path}", "t", Gori::Store::Severity::Low))
+      end
+      view = Gori::Tui::ProbeView.new
+      view.reload(store)
+      view.open_detail(store)
+      3.times { view.detail_move(1, false) } # caret on the 4-URL issue's LAST row
+      view.affected_url.should eq("https://a.test/four")
+
+      view.close_detail
+      view.move(1)
+      view.open_detail(store)
+      # Not nil, and not `affected[3]` of a list that only has one entry.
+      view.affected_url.should eq("https://b.test/only")
+    end
+  end
+
+  # ↑/↓ address URLs, not drawn rows: the pane soft-wraps, so a URL wider than the pane spans
+  # several visual rows, and `ReadPane#move` would leave `↵`/`y` pointed at the same entry for
+  # every press but the last. The render is what turns wrapping on (it is what measures the
+  # content width), hence the explicit narrow draw.
+  it "steps one URL per arrow even when a URL wraps across several rows" do
+    view_store do |store|
+      long = "https://a.test/#{"x" * 140}"
+      ["#{long}/one", "#{long}/two"].each do |u|
+        store.upsert_probe_issue(Gori::Probe::Detection.new("missing_hsts", "headers", "a.test",
+          u, "t", Gori::Store::Severity::Low))
+      end
+      view = Gori::Tui::ProbeView.new
+      view.reload(store)
+      view.open_detail(store)
+      screen = Gori::Tui::Screen.new(MemoryBackend.new(80, 24))
+      view.render(screen, Gori::Tui::Rect.new(0, 0, 80, 24)) # 155-char URLs over ~78 columns
+      view.affected_url.should eq("#{long}/one")
+
+      view.detail_move(1, false)
+      view.affected_url.should eq("#{long}/two") # ONE press, not three
+      view.detail_move(-1, false)
+      view.affected_url.should eq("#{long}/one")
+    end
+  end
+
   it "keeps the MODE chip visible on a narrow band when all severities are present" do
     view_store do |store|
       sevs = [Gori::Store::Severity::Info, Gori::Store::Severity::Low, Gori::Store::Severity::Medium,

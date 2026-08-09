@@ -542,7 +542,7 @@ describe Gori::Tui::Pet do
   # The whole reason Theme.paper/soot exist. Shading with `blend(x, Theme.bg, t)` darkens
   # on a dark palette and LIGHTENS on a light one, so a highlight/shadow pair defined that
   # way silently inverts on roughly half the built-ins. Assert the ramp holds on EVERY
-  # theme, because eyeballing one of them proves nothing about the other 27.
+  # theme, because eyeballing one of them proves nothing about the other 29.
   it "keeps highlight brighter than shadow on every built-in theme" do
     prev = Theme.active_name
     begin

@@ -2,7 +2,7 @@ require "json"
 require "../paths"
 
 module Gori::Tui
-  # The TUI colour palette. gori ships twenty-eight themes — GORIDARK (the default; a
+  # The TUI colour palette. gori ships thirty themes — GORIDARK (the default; a
   # monochrome palette in the spirit of Grok Build: near-black canvas, white/grey
   # text, a white highlight, hairline dividers), GORIDAY (the same relationships
   # inverted onto an off-white canvas with dark ink), LATTE (a soft, cool light
@@ -25,9 +25,12 @@ module Gori::Tui
   # Contrast), GITHUB_LIGHT (GitHub's Primer light palette on pure white),
   # GRUVBOX_LIGHT (GRUVBOX's warm cream light counterpart), ONE_LIGHT (the Atom One
   # Light grey-white palette), AYU_LIGHT (a bright light palette with Ayu's orange
-  # accent), ROSEPINE (the deep-indigo dark base that ROSEPINE_DAWN inverts), and
+  # accent), ROSEPINE (the deep-indigo dark base that ROSEPINE_DAWN inverts),
   # TOKYONIGHT_DAY (TOKYONIGHT's official light counterpart on a cool blue-grey
-  # canvas). Only HTTP status keeps functional colour.
+  # canvas), DANCHEONG (Korean temple-beam ornament — obangsaek pigments on a dark
+  # green-black lacquer canvas), and HANJI (Korean mulberry paper — ink text and
+  # natural-dye accents on warm ivory; DANCHEONG's light pair). Only HTTP status
+  # keeps functional colour.
   #
   # `Termisu::Color` is a value struct, so colours can't be mutated in place to
   # re-theme. Instead one Palette is active at a time (`@@active`) and every colour
@@ -848,7 +851,64 @@ module Gori::Tui
       syn_keyword: Color.from_hex("#7943c0"),   # language keywords / auth schemes (darkened day magenta, 4.8:1)
     )
 
-    BUILTIN_THEMES = {"goridark" => GORIDARK, "goriday" => GORIDAY, "latte" => LATTE, "espresso" => ESPRESSO, "tokyonight" => TOKYONIGHT, "gruvbox" => GRUVBOX, "nord" => NORD, "dracula" => DRACULA, "solarized_light" => SOLARIZED_LIGHT, "rosepine_dawn" => ROSEPINE_DAWN, "catppuccin_mocha" => CATPPUCCIN_MOCHA, "monokai" => MONOKAI, "everforest" => EVERFOREST, "onedark" => ONEDARK, "kanagawa" => KANAGAWA, "github_dark" => GITHUB_DARK, "zenburn" => ZENBURN, "synthwave84" => SYNTHWAVE84, "cyberpunk" => CYBERPUNK, "matrix" => MATRIX, "cobalt2" => COBALT2, "high_contrast" => HIGH_CONTRAST, "github_light" => GITHUB_LIGHT, "gruvbox_light" => GRUVBOX_LIGHT, "one_light" => ONE_LIGHT, "ayu_light" => AYU_LIGHT, "rosepine" => ROSEPINE, "tokyonight_day" => TOKYONIGHT_DAY}
+    # Dancheong (단청) — the painted ornament of Korean temple beams: a dark
+    # 뇌록(noerok) green-black lacquer canvas carrying the vivid obangsaek pigments
+    # (석간주 red oxide, 장단 minium orange, 치자 gardenia gold, 삼청 blue, 하엽
+    # lotus green) with 호분 whitewash as the highlight. HANJI is its light pair.
+    DANCHEONG = Palette.new(
+      bg: Color.from_hex("#0c110e"),            # 옻칠 lacquer night — green-black beam undercoat
+      panel: Color.from_hex("#141b16"),         # top bar / status / overlays
+      elevated: Color.from_hex("#1b241e"),      # header band, active segment
+      border: Color.from_hex("#2c3a30"),        # hairline dividers (resting)
+      border_focus: Color.from_hex("#3d5041"),  # brighter hairline for an active modal card
+      focus_gold: Color.from_hex("#d9b23f"),    # 금박 gilt — focus outline (9.4:1)
+      accent: Color.from_hex("#f3eee0"),        # 호분 whitewash highlight
+      accent_bg: Color.from_hex("#25332a"),     # selection band (focused pane) — 1.44:1
+      selection_dim: Color.from_hex("#161f19"), # selection band (unfocused pane)
+      text: Color.from_hex("#c4ccc2"),          # body text (11.6:1)
+      text_bright: Color.from_hex("#f3f5ee"),   # emphasis / active
+      muted: Color.from_hex("#78877b"),         # secondary (5.0:1)
+      green: Color.from_hex("#5cc282"),         # 2xx — 양록 emerald (8.6:1)
+      yellow: Color.from_hex("#ddb44a"),        # 4xx — 치자 gardenia (9.7:1)
+      red: Color.from_hex("#e2685e"),           # 5xx / error — 석간주 red oxide (5.8:1)
+      orange: Color.from_hex("#e0854a"),        # 장단 minium orange (6.9:1)
+      syn_header: Color.from_hex("#7cb0de"),    # 삼청 blue — header/field names, JSON keys (8.3:1)
+      syn_string: Color.from_hex("#8fbf7a"),    # 하엽 lotus-leaf green — quoted strings (9.0:1)
+      syn_number: Color.from_hex("#d1a35c"),    # 치자 tan — numbers, tag attribute names (8.3:1)
+      syn_literal: Color.from_hex("#b294d6"),   # 포도 grape purple — true / false / null (7.4:1)
+      syn_comment: Color.from_hex("#6e8878"),   # 뇌록 muted green — comments (5.0:1)
+      syn_keyword: Color.from_hex("#de8b96"),   # 연지 rouge pink — keywords / auth schemes (7.5:1)
+    )
+
+    # Hanji (한지) — Korean mulberry paper: a warm ivory canvas written in 먹 (ink)
+    # with natural-dye accents — 쪽 indigo, 꼭두서니 madder red, 치자 gardenia gold,
+    # 황토 ochre, 쑥 mugwort green, 자주 purple. DANCHEONG's light counterpart.
+    HANJI = Palette.new(
+      bg: Color.from_hex("#f4ecdb"),            # 한지 mulberry paper — warm ivory canvas
+      panel: Color.from_hex("#ece2cc"),         # top bar / status / overlays
+      elevated: Color.from_hex("#e4d8bd"),      # header band, active segment
+      border: Color.from_hex("#b3a58a"),        # hairline dividers (resting)
+      border_focus: Color.from_hex("#97876a"),  # brighter hairline for an active modal card
+      focus_gold: Color.from_hex("#2f4d7e"),    # 쪽빛 indigo — focus outline on light (7.2:1)
+      accent: Color.from_hex("#35342e"),        # 먹 ink highlight
+      accent_bg: Color.from_hex("#dbcca6"),     # selection band (focused pane) — 1.35:1
+      selection_dim: Color.from_hex("#ece4d0"), # selection band (unfocused pane)
+      text: Color.from_hex("#43423a"),          # body text — diluted ink (8.6:1)
+      text_bright: Color.from_hex("#26251f"),   # emphasis / active — full-strength 먹
+      muted: Color.from_hex("#77705d"),         # secondary (4.2:1)
+      green: Color.from_hex("#566f38"),         # 2xx — 쑥 mugwort (4.8:1)
+      yellow: Color.from_hex("#816116"),        # 4xx — 치자 gardenia dye, darkened for AA (4.9:1)
+      red: Color.from_hex("#a83a32"),           # 5xx / error — 꼭두서니 madder (5.4:1)
+      orange: Color.from_hex("#96540f"),        # 황토 ochre (5.0:1)
+      syn_header: Color.from_hex("#33527d"),    # 쪽 indigo — header/field names, JSON keys (6.8:1)
+      syn_string: Color.from_hex("#566f38"),    # quoted strings (green)
+      syn_number: Color.from_hex("#96540f"),    # numbers, tag attribute names (orange)
+      syn_literal: Color.from_hex("#6d4a8e"),   # 자주 purple — true / false / null (5.9:1)
+      syn_comment: Color.from_hex("#837b66"),   # comments — faded ink (3.6:1)
+      syn_keyword: Color.from_hex("#9c3a55"),   # 연지 crimson — keywords / auth schemes (5.7:1)
+    )
+
+    BUILTIN_THEMES = {"goridark" => GORIDARK, "goriday" => GORIDAY, "latte" => LATTE, "espresso" => ESPRESSO, "tokyonight" => TOKYONIGHT, "gruvbox" => GRUVBOX, "nord" => NORD, "dracula" => DRACULA, "solarized_light" => SOLARIZED_LIGHT, "rosepine_dawn" => ROSEPINE_DAWN, "catppuccin_mocha" => CATPPUCCIN_MOCHA, "monokai" => MONOKAI, "everforest" => EVERFOREST, "onedark" => ONEDARK, "kanagawa" => KANAGAWA, "github_dark" => GITHUB_DARK, "zenburn" => ZENBURN, "synthwave84" => SYNTHWAVE84, "cyberpunk" => CYBERPUNK, "matrix" => MATRIX, "cobalt2" => COBALT2, "high_contrast" => HIGH_CONTRAST, "github_light" => GITHUB_LIGHT, "gruvbox_light" => GRUVBOX_LIGHT, "one_light" => ONE_LIGHT, "ayu_light" => AYU_LIGHT, "rosepine" => ROSEPINE, "tokyonight_day" => TOKYONIGHT_DAY, "dancheong" => DANCHEONG, "hanji" => HANJI}
     DEFAULT_THEME  = "goridark"
 
     # User themes loaded from <GORI_HOME>/themes/*.json (filename stem = name), merged
@@ -1117,7 +1177,7 @@ module Gori::Tui
     # half the built-ins. A tint is not a direction: it interpolates between two endpoints that
     # are BOTH already tuned for the pole in question (the hue comes from the active palette,
     # the base from the active theme's own bands). `marker_bg` is this construction at this
-    # ratio and ships on all 28 built-ins today.
+    # ratio and ships on all 30 built-ins today.
     #
     # The luma clamp is what makes the contrast guarantee provable rather than eyeballed.
     # Rec. 601 luma is a LINEAR combination of r,g,b and `blend` is a per-channel lerp, so
@@ -1168,7 +1228,7 @@ module Gori::Tui
     #
     # These exist because `blend(x, bg, t)` is not a direction: it darkens on a dark
     # palette and LIGHTENS on a light one. Anything shaded that way — a drop shadow, a
-    # specular highlight — inverts on half the 28 built-ins (and on any custom theme).
+    # specular highlight — inverts on half the 30 built-ins (and on any custom theme).
     # Shade toward `soot` and light toward `paper` instead and the same code reads
     # correctly on GORIDARK and GORIDAY alike.
     def self.paper : Color

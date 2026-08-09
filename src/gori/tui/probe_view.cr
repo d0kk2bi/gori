@@ -203,6 +203,13 @@ module Gori::Tui
       @detail
     end
 
+    # The open issue's SAMPLE flow row, already resolved for the "evidence" line. Read by the
+    # affected-URL jump for its METHOD: the group records none of its own, and the sample's is
+    # the one method known to have produced this finding.
+    def detail_flow : Store::FlowRow?
+      @detail_flow
+    end
+
     # The issue an action targets: the open detail, else the list selection.
     def target_issue : Store::ProbeIssue?
       @detail || @issues[@selected]?
@@ -321,8 +328,23 @@ module Gori::Tui
       with_affected { @affected.move(delta, 0) }
     end
 
+    # A plain ↑/↓ steps one URL, not one drawn row. The pane soft-wraps and `ReadPane#move`
+    # steps VISUAL rows there — right for a body of prose, wrong for a list whose row is the
+    # thing `↵` opens and `y` copies: a 155-character URL on an 80-column pane took three
+    # presses to reach the next entry, and the first two changed nothing about what those two
+    # keys would act on while the hint said "↑/↓ URL".
+    #
+    # ⇧arrows keep `move`'s per-row character selection — that gesture is about text, so it
+    # has to be able to land inside a wrapped row. `goto_line` drops the selection, which is
+    # what a plain cursor key means everywhere else in the app.
     def detail_move(delta : Int32, selecting : Bool) : Nil
-      with_affected { @affected.move(delta, 0, selecting: selecting) }
+      with_affected do
+        if selecting
+          @affected.move(delta, 0, selecting: true)
+        else
+          @affected.goto_line(@affected.cursor.cy + delta)
+        end
+      end
     end
 
     def detail_wheel(delta : Int32) : Nil
@@ -361,6 +383,16 @@ module Gori::Tui
       issue = @detail || return ""
       sync_affected(issue)
       @affected.copy_all
+    end
+
+    # The AFFECTED URL the caret sits on — what `↵` navigates to. One row is one URL (the pane
+    # soft-wraps, so a long URL spans several visual rows but stays one LINE), which is why the
+    # caret's line index addresses the list directly. nil when no detail is open or the issue
+    # has no affected URLs.
+    def affected_url : String?
+      issue = @detail || return nil
+      sync_affected(issue)
+      issue.affected[@affected.cursor.cy]?
     end
 
     # The AFFECTED list's rect inside the detail card — the derivation `render_detail` walks, so

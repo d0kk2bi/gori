@@ -7,7 +7,7 @@ require "../spec_helper"
 # `FlowStatus.cell` (STA) each carry a MEANING the renderer cannot re-choose without destroying
 # it. So the guarantee runs the other way round — bound how far the band moves and the existing
 # semantic foregrounds stay valid on it. That bound is `Theme::ROW_TINT_LUMA`, and this file is
-# the only thing holding it across all 28 built-in palettes in both polarities.
+# the only thing holding it across all 30 built-in palettes in both polarities.
 describe "Theme.row_tint" do
   colors = [:red, :orange, :yellow, :green, :blue, :purple]
   # The three bands a History row can already have: canvas, marked, selected+focused.

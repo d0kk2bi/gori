@@ -39,12 +39,31 @@ module Gori::Discover
       fingerprints : Array(UInt64),
       redirect_target : String?,
       kind : BaselineKind,
-      distance : Int32
+      distance : Int32,
+      # Does the miss page REFLECT the requested path back into its body? Measured by
+      # `Engine#process_calibrate`, which is the only place that still holds a bogus probe's
+      # BODY and its NAME at the same time, and passed in — `Fetched` deliberately carries no
+      # body, so this cannot be re-derived here.
+      #
+      # It is the one property that decides whether `fp_novel` carries information on a
+      # wildcard-200 baseline, so it rides with the kind rather than being asked per probe.
+      echoes : Bool = false
+
+    # The kind as an operator reads it, plus the measured property that changes how a hit on
+    # it is judged. `Engine#handle_calibrate` reports THIS, not `kind.label`: two directories
+    # both labelled `wildcard-200` behave completely differently under the same wordlist, and
+    # the operator has no other way to see which one they got.
+    struct DirBaseline
+      def label : String
+        echoes ? "#{kind.label} (echoes path)" : kind.label
+      end
+    end
 
     # Build a baseline from K bogus-path responses. The length band is proportional (a big
     # page churns more), the fingerprint set absorbs dynamic bits, and the kind classifies
     # the server's 404 behavior.
-    def self.build(dir : String, bogus : Array(Fetched), distance : Int32) : DirBaseline
+    def self.build(dir : String, bogus : Array(Fetched), distance : Int32,
+                   echoes : Bool = false) : DirBaseline
       ok = bogus.select { |f| f.error.nil? }
       if ok.empty?
         return DirBaseline.new(dir, Set(Int32).new, 0_i64, 0_i64, [] of UInt64, nil,
@@ -67,7 +86,7 @@ module Gori::Discover
         else
           BaselineKind::Normal
         end
-      DirBaseline.new(dir, statuses, lo, hi, fps, rt, kind, distance)
+      DirBaseline.new(dir, statuses, lo, hi, fps, rt, kind, distance, echoes)
     end
 
     # {hit?, confidence 0..1}. Divergence must hold vs the baseline, evaluated per kind.
@@ -84,24 +103,51 @@ module Gori::Discover
       hit =
         case b.kind
         in BaselineKind::WildcardRedirect then p.redirect_to.nil? || redir_div # escaped the funnel
-        in BaselineKind::WildcardOk       then fp_novel && length_div          # content must genuinely differ
-        in BaselineKind::Uncalibratable   then status_div                      # only trust status
-        in BaselineKind::Normal           then status_div || (length_div && fp_novel)
+        # Content is the only axis left on a 200-everything origin — UNLESS the origin
+        # quotes the path back, in which case content divergence is the echo and not the
+        # endpoint, and length has to corroborate it (see `echoes`).
+        in BaselineKind::WildcardOk     then b.echoes ? (fp_novel && length_div) : fp_novel
+        in BaselineKind::Uncalibratable then status_div # only trust status
+        in BaselineKind::Normal         then status_div || (length_div && fp_novel)
         end
+
+      # `fp_novel` earns the weight `status_div` carries on a wildcard-200 baseline that does
+      # NOT echo, and stays a corroborating signal everywhere else. The asymmetry is the kind's
+      # whole meaning: `WildcardOk` is assigned only when the bogus probes came back 200 AND
+      # proved COHESIVE (`build`), a stricter calibration than `Normal` is ever held to —
+      # `Normal` needs two non-erroring probes and no cohesion at all — so on that baseline
+      # "outside the cluster" is a calibrated verdict rather than a hint, and status has
+      # nothing left to say. On an ECHOING one the cluster proves nothing, so the weight and
+      # the conjunction both revert.
+      fp_weight = b.kind.wildcard_ok? && !b.echoes ? 0.55 : 0.35
 
       conf = 0.0
       conf += 0.50 if status_div
       conf += 0.25 if length_div
-      conf += 0.35 if fp_novel
+      conf += fp_weight if fp_novel
       conf += 0.30 if redir_div
       penalty =
         case b.kind
         in BaselineKind::Normal           then 1.0
         in BaselineKind::WildcardRedirect then 0.8
-          # A WildcardOk hit is gated on fp_novel && length_div (0.35 + 0.25 = 0.60); at 0.7 the
-          # product 0.42 could never clear the default 0.5 floor, so a genuinely content-divergent
-          # page on a 200-everything site was never reported. 0.85 → 0.51 lets a real divergence through.
-        in BaselineKind::WildcardOk     then 0.85
+          # 1.0, and it moves together with the conjunction now being CONDITIONAL above.
+          #
+          # Unconditionally, the conjunction scored the same doubt twice on a non-echoing
+          # origin: it required a real page to differ from the soft-404 in LENGTH as well as in
+          # content, and the band is proportional — `delta = max(16, max // 20)`, i.e. 5% of
+          # the page. A real page sharing the error page's template (the same header, sidebar
+          # and footer, which is what a CMS or SPA soft-404 always is) lands inside that 5% and
+          # was dropped no matter how different its content was: measured, `/soft/admin` at
+          # 524 B against a 545 B soft-404 sat inside a [518, 572] band and was never reported.
+          #
+          # The old 0.85 was itself reverse-engineered from the conjunction (0.35 + 0.25 = 0.60
+          # → 0.51, just over the default floor), so keeping it would put a content-only hit at
+          # 0.47 and change nothing. A cohesive baseline is not a less trustworthy one, so the
+          # penalty goes and the evidence carries its own weight: on a non-echoing origin
+          # content alone scores 0.55 and content plus length 0.80, on an echoing one both are
+          # required and score 0.60. An operator who wants only the strongest raises
+          # `confidence_floor` — which is what that knob is for.
+        in BaselineKind::WildcardOk     then 1.0
         in BaselineKind::Uncalibratable then 0.6
         end
       {hit, (conf * penalty).clamp(0.0, 1.0)}

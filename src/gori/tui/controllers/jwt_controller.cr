@@ -241,15 +241,33 @@ module Gori::Tui
           if s.mode == :decode
             s.view.render_decode(screen, body,
               input: s.input, input_mode: s.input_mode, input_read: s.input_read,
-              decoded: s.decoded, attacks: s.attacks, pane: s.pane, focused: body_focused)
+              decoded: s.decoded, attacks: s.attacks, pane: s.pane, focused: body_focused,
+              lens_chord: lens_chord)
           else
             s.view.render_encode(screen, body,
               header: s.header, payload: s.payload, secret: s.secret, secret_cx: s.secret_cx,
               secret_pre: s.secret_pre, alg: s.alg, output: s.output, output_ok: s.output_ok?,
-              pane: s.pane, focused: body_focused)
+              pane: s.pane, focused: body_focused, lens_chord: lens_chord)
           end
         end
       end
+    end
+
+    # The lens switch's CURRENT chord. Read from the keymap (not hardcoded `^T`) so a rebind
+    # moves the top card's chip and the footer that names the same key together — see the
+    # note in `body_hint`.
+    private def lens_chord : String
+      reg = @host.session.registry
+      lens_chord(reg, Hotkeys.rebindable_overrides(reg))
+    end
+
+    # …and the arity that takes the overrides map, for a caller resolving more than one chord
+    # in the same breath. `Hotkeys.binding_label` defaults that argument to
+    # `rebindable_overrides(registry)`, which re-parses every persisted override label and
+    # builds a fresh Hash per call — `body_hint` resolves two chords and would pay for it
+    # twice. One build per frame, which is what this file cost before the chip existed.
+    private def lens_chord(reg : Verb::Registry, overrides : Hash(String, Array(Verb::Chord))) : String
+      Hotkeys.binding_label(reg, "jwt.toggle-mode", "^T", overrides)
     end
 
     # --- key handling ---
@@ -532,16 +550,25 @@ module Gori::Tui
     # with no drag and no double-click at all, while the identical Decoder pane has both. The
     # press placed a caret there the whole time; only the two gestures that continue it were
     # missing.
+    #
+    # `my > card.y` on the top card of each lens: that border row is BUTTONS (the lens chip,
+    # and INPUT's READ/INS chip), and both gestures here CONTINUE a press that
+    # `handle_click` already answered as a button. Without it, pressing the lens chip and
+    # twitching the mouse flipped the lens and then dragged a selection open in the pane the
+    # flip had just revealed, and an impatient double-tap on the chip took a word out of a
+    # pane nobody had clicked — `click_to_cursor` pins a row above the body to row 0 rather
+    # than refusing it. The Repeater refuses a double-click on its own border badges for the
+    # same reason (`chrome_hit` in `RepeaterController#handle_double_click`).
     private def editor_at(rect : Rect, mx : Int32, my : Int32) : {TextArea, Rect, TextReadState?}?
       body = body_rect_below_filter(rect)
       s = cur
       if s.mode == :decode
         input_c, _, _ = s.view.decode_layout(body)
-        return nil unless input_c.contains?(mx, my)
+        return nil unless input_c.contains?(mx, my) && my > input_c.y
         {s.input, input_c.inset(1, 1), s.input_mode == InputMode::Insert ? nil : s.input_read}
       else
         hdr_c, pay_c, _, _ = s.view.encode_layout(body)
-        return {s.header, hdr_c.inset(1, 1), nil} if hdr_c.contains?(mx, my)
+        return {s.header, hdr_c.inset(1, 1), nil} if hdr_c.contains?(mx, my) && my > hdr_c.y
         return {s.payload, pay_c.inset(1, 1), nil} if pay_c.contains?(mx, my)
         nil
       end
@@ -556,10 +583,14 @@ module Gori::Tui
         if input_c.contains?(mx, my)
           enter_pane(s, :input)
           # NOR/INS border chip toggles insert (same as ↵ / esc); don't move caret.
-          if Frame.mode_badge_hit(mx, my, input_c.y, input_c.right - 1, input_c.x + 8,
+          if Frame.mode_badge_hit(mx, my, input_c.y, input_c.right - 1, input_c.x + JwtView::INPUT_MIN_X,
                s.input_mode == InputMode::Insert)
             s.input_mode = s.input_mode == InputMode::Insert ? InputMode::Read : InputMode::Insert
             s.input_read.sync_from(s.input) if s.input_mode == InputMode::Read
+          elsif s.view.lens_chip_hit(input_c, mx, my, :decode, lens_chord,
+                  s.input_mode == InputMode::Insert)
+            # ` ^T:→ENCODE `, chained left of the mode chip. Same act as the chord.
+            toggle_mode
           elsif s.input_mode == InputMode::Insert
             s.input.click_to_cursor(input_c.inset(1, 1), mx, my)
           else
@@ -584,7 +615,12 @@ module Gori::Tui
         hdr_c, pay_c, sec_c, out_c = s.view.encode_layout(body)
         if hdr_c.contains?(mx, my)
           enter_pane(s, :header)
-          s.header.click_to_cursor(hdr_c.inset(1, 1), mx, my)
+          # ` ^T:→DECODE ` on this card's border — the way back, and the same act as the chord.
+          if s.view.lens_chip_hit(hdr_c, mx, my, :encode, lens_chord)
+            toggle_mode
+          else
+            s.header.click_to_cursor(hdr_c.inset(1, 1), mx, my)
+          end
         elsif pay_c.contains?(mx, my)
           enter_pane(s, :payload)
           s.payload.click_to_cursor(pay_c.inset(1, 1), mx, my)
@@ -769,15 +805,17 @@ module Gori::Tui
     def body_hint(focus : Symbol) : String
       s = cur
       reg = @host.session.registry
-      y = Hotkeys.binding_label(reg, "jwt.copy", "y")
+      ov = Hotkeys.rebindable_overrides(reg)
+      y = Hotkeys.binding_label(reg, "jwt.copy", "y", ov)
       # The lens switch was `^E` — a letter `Hotkeys::CLAIMED_CTRL_LETTERS` reserves for the
       # shell's open-in-$EDITOR. It worked (the shell's ^E branch has no `:jwt` arm and falls
       # through) but could never be a registered chord, so it was unbindable AND it spent the
       # key that would one day give this tab's INPUT pane an external editor. `^T` is the
       # Repeater's letter for the same gesture (`repeater.toggle-decoded`: switch which
       # representation the pane is showing), and free here. Read from the keymap, so a rebind
-      # shows up in the footer instead of the footer lying about it.
-      lens = Hotkeys.binding_label(reg, "jwt.toggle-mode", "^T")
+      # shows up in the footer instead of the footer lying about it — and in the top card's
+      # ` ^T:→ENCODE ` chip, which resolves the same chord through the same helper.
+      lens = lens_chord(reg, ov)
       case s.pane
       when :input
         if s.input_mode == InputMode::Insert

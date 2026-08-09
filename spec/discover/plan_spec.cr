@@ -53,26 +53,36 @@ private def run_config(wordlist : String) : D::Config
     containment: D::Containment::SameOrigin)
 end
 
-# A one-request run against a local listener: spider only, depth 0, `max_requests: 1` so the
-# derived robots.txt / sitemap.xml probes are refused by CappedBackend without touching the
-# network. Exactly one GET reaches the origin, so the head it records is unambiguous.
+# A one-request run against a local listener: spider only, depth 0, `max_requests: 1` so every
+# derived well-known probe is refused by CappedBackend without touching the network. Exactly
+# one GET reaches the origin, so the head it records is unambiguous.
 private def one_shot_config(headers : Array({String, String}) = [] of {String, String}) : D::Config
   D::Config.new(concurrency: 1, retries: 0, max_requests: 1_i64, spider: true,
     bruteforce: false, max_depth: 0, timeout: 3.seconds, headers: headers)
 end
 
-# Room for the seed plus its two derived well-known probes plus ONE crawled link, so a
+# Every path `seed_frontier` queues by name at the origin, and how many requests the seed plus
+# that whole set costs. Derived from the constant rather than written out, because these
+# budgets are what let a crawled link reach the wire at all: a hard-coded one meant that
+# widening `WELL_KNOWN` silently starved the crawled-link assertions below into passing
+# vacuously — `CappedBackend` refuses over budget without touching the network, so the origin
+# simply never saw the hop the test is about, and `seen` was empty for the right reason and
+# the wrong one at once.
+private WELL_KNOWN_PATHS     = D::Engine::WELL_KNOWN.map { |path, _| path }.to_a
+private SEED_PLUS_WELL_KNOWN = (1 + WELL_KNOWN_PATHS.size).to_i64
+
+# Room for the seed plus its derived well-known probes plus ONE crawled link, so a
 # depth-1 hop is observable. Used by the policy A/B, which asserts on that hop.
 private def crawl_config : D::Config
-  D::Config.new(concurrency: 1, retries: 0, max_requests: 6_i64, spider: true,
+  D::Config.new(concurrency: 1, retries: 0, max_requests: SEED_PLUS_WELL_KNOWN + 1, spider: true,
     bruteforce: false, max_depth: 1, timeout: 3.seconds)
 end
 
-# The seed and its two derived well-known paths and NOTHING else: depth 0 so no link can add
-# a fourth request, and headroom on `max_requests` so a fourth would still be visible on the
-# wire rather than swallowed by CappedBackend. Used by the Layer-2 tests on the seed trio.
+# The seed and its derived well-known paths and NOTHING else: depth 0 so no link can add
+# a further request, and headroom on `max_requests` so one would still be visible on the
+# wire rather than swallowed by CappedBackend. Used by the Layer-2 tests on the seed set.
 private def seed_trio_config : D::Config
-  D::Config.new(concurrency: 1, retries: 0, max_requests: 10_i64, spider: true,
+  D::Config.new(concurrency: 1, retries: 0, max_requests: SEED_PLUS_WELL_KNOWN + 4, spider: true,
     bruteforce: false, max_depth: 0, timeout: 3.seconds)
 end
 
@@ -315,11 +325,11 @@ describe Gori::Discover::Plan do
     end
   end
 
-  # Issue #364 / DESIGN.md §7. The seed and its two derived well-known paths waive Layer 1 —
+  # Issue #364 / DESIGN.md §7. The seed and its derived well-known paths waive Layer 1 —
   # a human typed the target — but not Layer 2, whose promise ("blocks ALL out-of-scope
   # traffic") is unconditional. These drive a REAL `Gori::Scope` end to end and assert on the
   # bytes the origin received, because a policy double could only restate the decision.
-  describe "Layer 2 on the seed and its two derived well-known paths" do
+  describe "Layer 2 on the seed and its derived well-known paths" do
     it "sends nothing at all — and says why — when Sandbox blocks the seed's host" do
       with_store do |store|
         scope = Gori::Scope.load(store)
@@ -339,7 +349,7 @@ describe Gori::Discover::Plan do
       end
     end
 
-    it "sends all three once Sandbox allowlists the host" do
+    it "sends the seed and every well-known path once Sandbox allowlists the host" do
       with_store do |store|
         scope = Gori::Scope.load(store)
         scope.add("include", "host", "127.0.0.1")
@@ -347,18 +357,22 @@ describe Gori::Discover::Plan do
         _findings, seen = run_one(Gori::Outbound.interactive(scope)) do |port|
           D::PlanOptions.new("http://127.0.0.1:#{port}/", config: seed_trio_config, verify: false)
         end
-        targets_of(seen).sort.should eq(["/", "/robots.txt", "/sitemap.xml"])
+        targets_of(seen).sort.should eq((["/"] + WELL_KNOWN_PATHS).sort)
       end
     end
 
-    it "drops the derived pair to an EXCLUDE rule while the seed still goes out" do
+    it "drops every derived well-known path to an EXCLUDE rule while the seed still goes out" do
       # Sandbox is OFF here: Layer 2 is Sandbox *plus* explicit excludes, and discover is the
       # most automated sweep gori has, so an operator's carve-out has to hold on its seed
       # requests exactly as it does on every URL the crawl derives afterwards.
+      #
+      # The rule excludes every path with anything after the origin's slash, which is exactly
+      # the well-known set and nothing else at depth 0 — written that way rather than as a
+      # list of filenames so it keeps covering `WELL_KNOWN` as that grows.
       with_store do |store|
         scope = Gori::Scope.load(store)
         scope.add("include", "host", "127.0.0.1")
-        scope.add("exclude", "regex", "/(robots\\.txt|sitemap\\.xml)\\z")
+        scope.add("exclude", "regex", "127\\.0\\.0\\.1/.+")
         _findings, seen = run_one(Gori::Outbound.interactive(scope)) do |port|
           D::PlanOptions.new("http://127.0.0.1:#{port}/", config: seed_trio_config, verify: false)
         end
