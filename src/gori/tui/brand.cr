@@ -7,16 +7,21 @@ module Gori::Tui
   # optical centering so the visible shape — not its leading spaces — is centred.
   module Brand
     # The interlocked rings of the gori logo (docs/static/images/gori.svg), hand
-    # drawn at 20 cells over 9 rows. A terminal cell is about half as wide as it
+    # drawn at 24 cells over 11 rows. A terminal cell is about half as wide as it
     # is tall, so that reads as a roughly square figure — the mark's own artwork is
     # 1365×1193 (1.14:1), close enough that it reads as the logo rather than a
     # stretched copy.
     #
-    # This is the small cut. A 32×16 version was drawn first and resolved more of
-    # the rings' overlap, but it dominated the picker and pushed the height gate to
-    # 34 rows, so anything shorter fell back to the bare wordmark. At this size the
-    # rings read as a simplified silhouette rather than a traced outline, and the
-    # gate drops to 27 rows / 26 cols — see ProjectPicker.art_shown?.
+    # Size is set by the top arc, not by overall detail. What makes this read as a
+    # ring is that its outer contour closes: a 20×9 cut fit in more terminals but
+    # left the upper-left arc a lone floating cell with gaps either side, and a
+    # broken arc reads as debris, not as a loop. 24 columns is the narrowest the
+    # arc stays connected at. Going the other way costs more than it buys — a
+    # 30×15 version resolves the logo's inner highlights, but they land as 1-cell
+    # specks at terminal scale, and `art_shown?` is a cliff rather than a slope:
+    # its floor would rise to 33 rows, above a default 80×24 or any split pane, so
+    # those terminals lose the mark entirely instead of getting a smaller one.
+    # Here the gate is 29 rows / 30 cols — see ProjectPicker.art_shown?.
     #
     # The figure is two rings — a big tilted ellipse and a flat one lying across
     # the bottom, its tips curling up either side — and at this size they only
@@ -28,15 +33,17 @@ module Gori::Tui
     # draw places glyph N of a line at column N, so a two-cell grapheme would
     # shear its row and pull the rings apart.
     ART = [
-      "          ██████",
-      "       █       ███",
-      "   ███    ███  ███",
-      "  ███    ██    ███",
-      "  ███         ███",
-      " ▒ ████     ████  ▒",
-      "▒▒  █████ █████   ▒▒",
-      " ▒▒   ████████  ▒▒▒",
-      "  ██████████▒▒▒▒▒▒▒",
+      "            ███████",
+      "         ██       ███",
+      "     ████████     ████",
+      "   ███         ██ ████",
+      "   ███        █  ████",
+      "   ███          ████ ▒",
+      " ▒ █████      █████  ▒▒",
+      "▒▒  ██████  ██████    ▒▒",
+      " ▒▒▒  ██████████    ▒▒▒",
+      " █████████████ ▒▒▒▒▒▒▒▒",
+      "   ███████   ▒▒▒▒▒▒▒▒",
     ]
 
     # The far ring's marker, and how far its colour sits toward the canvas.
