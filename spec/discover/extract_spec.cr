@@ -2,10 +2,18 @@ require "../spec_helper"
 
 private alias E = Gori::Discover::Extract
 
+# `from_html` returns `Extract::Found` (url + how the document yielded it) because it is the one
+# extractor that runs BOTH the attribute passes and the endpoint pass. Most cases here are about
+# WHICH urls come out, not how, so they go through this; the `declared` bit has its own cases at
+# the bottom of the file.
+private def html_hrefs(body : Bytes) : Array(String)
+  E.from_html(body).map(&.href)
+end
+
 describe Gori::Discover::Extract do
   it "extracts href / src / action links from html" do
     body = %(<a href="/a">x</a> <img src='/b.png'> <form action="/submit"> <link href=/style.css>).to_slice
-    links = E.from_html(body)
+    links = html_hrefs(body)
     links.should contain("/a")
     links.should contain("/b.png")
     links.should contain("/submit")
@@ -14,7 +22,7 @@ describe Gori::Discover::Extract do
 
   it "extracts a meta-refresh url" do
     body = %(<meta http-equiv="refresh" content="0; url=/next-page">).to_slice
-    E.from_html(body).should contain("/next-page")
+    html_hrefs(body).should contain("/next-page")
   end
 
   it "extracts robots Disallow / Allow paths (skipping a bare slash)" do
@@ -47,7 +55,7 @@ describe Gori::Discover::Extract do
     pad = " " * (E::MAX_SCAN - before.bytesize) # before + pad == exactly MAX_SCAN bytes
     body = (before + pad + after).to_slice
     body.size.should be > E::MAX_SCAN # the /after token lives beyond the cap
-    links = E.from_html(body)
+    links = html_hrefs(body)
     links.should contain("/before")
     links.should_not contain("/after")
   end
@@ -82,12 +90,12 @@ describe Gori::Discover::Extract do
   # is captured via the third alternation group.
   it "skips an empty href but captures a bare unquoted src" do
     body = %(<a href="">empty</a> <script src=foo.js></script>).to_slice
-    E.from_html(body).should eq(["foo.js"])
+    html_hrefs(body).should eq(["foo.js"])
   end
 
   it "captures bare unquoted href / action values (third regex group)" do
-    E.from_html(%(<a href=/plain.html>).to_slice).should eq(["/plain.html"])
-    E.from_html(%(<form action=submit.php>).to_slice).should eq(["submit.php"])
+    html_hrefs(%(<a href=/plain.html>).to_slice).should eq(["/plain.html"])
+    html_hrefs(%(<form action=submit.php>).to_slice).should eq(["submit.php"])
   end
 
   # (6) from_sitemap treats a <sitemapindex> child <loc> exactly like a <urlset> page <loc>.
@@ -124,7 +132,7 @@ describe Gori::Discover::Extract do
     html = IO::Memory.new
     html.write(bad)
     html << %(<a href="/ok">x</a>)
-    E.from_html(html.to_slice).should eq(["/ok"])
+    html_hrefs(html.to_slice).should eq(["/ok"])
 
     robots = IO::Memory.new
     robots.write(bad)
@@ -199,7 +207,7 @@ describe Gori::Discover::Extract do
       (0..E::MAX_LINKS).each { |i| s << %(<a href="/a#{i}">x</a>) }
       (0..200).each { |i| s << %(<meta http-equiv="refresh" content="0;url=/m#{i}">) }
     end.to_slice
-    E.from_html(body).size.should eq(E::MAX_LINKS)
+    html_hrefs(body).size.should eq(E::MAX_LINKS)
   end
 
   # An un-quoted `http://` in a minified bundle: the URL branch's class ends at whitespace and
@@ -217,19 +225,19 @@ describe Gori::Discover::Extract do
   # ── from_html: inline script + the wider attribute set ─────────────────────────────────
   it "extracts endpoints out of an inline script as well as out of attributes" do
     body = %(<a href="/about">a</a><script>fetch("/api/v2/session");</script>).to_slice
-    links = E.from_html(body)
+    links = html_hrefs(body)
     links.should contain("/about")
     links.should contain("/api/v2/session")
   end
 
   it "de-duplicates an href the inline endpoint pass finds again" do
     body = %(<a href="/about">a</a><script>go("/about");</script>).to_slice
-    E.from_html(body).should eq(["/about"])
+    html_hrefs(body).should eq(["/about"])
   end
 
   it "extracts poster and data-url attributes alongside href/src/action" do
     body = %(<video poster="/thumb.jpg"><div data-url="/api/lazy">).to_slice
-    links = E.from_html(body)
+    links = html_hrefs(body)
     links.should contain("/thumb.jpg")
     links.should contain("/api/lazy")
   end
@@ -238,7 +246,7 @@ describe Gori::Discover::Extract do
   # carries no word boundary, so they already match through `src` / `href` / `action`. Pinned
   # because a future "tighten the regex with \b" would silently drop three real sources.
   it "still captures data-src, data-href and formaction through the unanchored alternation" do
-    links = E.from_html(%(<img data-src="/lazy.png"><a data-href="/x"><button formaction="/submit">).to_slice)
+    links = html_hrefs(%(<img data-src="/lazy.png"><a data-href="/x"><button formaction="/submit">).to_slice)
     links.should contain("/lazy.png")
     links.should contain("/x")
     links.should contain("/submit")
@@ -250,7 +258,7 @@ describe Gori::Discover::Extract do
   # because its character class ends at the descriptor's space. Pinned in that shape: what must
   # never appear is the joined `/a.png 1x, /b.png 2x`.
   it "takes a real URL out of a srcset rather than its whole descriptor list" do
-    E.from_html(%(<img srcset="/a.png 1x, /b.png 2x">).to_slice).should eq(["/a.png"])
+    html_hrefs(%(<img srcset="/a.png 1x, /b.png 2x">).to_slice).should eq(["/a.png"])
   end
 
   # (8) Adversarial regex regression guard (spec/fuzz_spec.cr style): a long unclosed
@@ -258,9 +266,41 @@ describe Gori::Discover::Extract do
   # rescue Regex::Error, so a hang → harness timeout and a raise → spec failure). NOT a known-vuln claim.
   it "handles a long unclosed meta/attr body in bounded time (backtracking guard)" do
     evil = ("<meta http-equiv=\"refresh\" content=\"" + ("url= " * 100_000)).to_slice
-    E.from_html(evil).should be_a(Array(String)) # returned, did not hang or raise
+    html_hrefs(evil).should be_a(Array(String)) # returned, did not hang or raise
     # a giant bare unquoted src value ([^\s"'>]+) is linear, not pathological
     big = ("<img src=" + ("a" * 500_000)).to_slice
-    E.from_html(big).should eq(["a" * 500_000])
+    html_hrefs(big).should eq(["a" * 500_000])
+  end
+
+  # ── declared vs inferred ────────────────────────────────────────────────────────────────
+  # The bit `Engine#consider_link` spends hundreds of requests on. A URL the markup NAMED as a
+  # link is the target's own statement that something is there; a quoted string in a script that
+  # happens to look like a path is a pattern match on text, and a locale key or an asset manifest
+  # entry looks exactly the same.
+  describe "Found#declared" do
+    it "marks attribute and meta-refresh links declared, and script literals inferred" do
+      body = %(<a href="/about">x</a>\
+<meta http-equiv="refresh" content="0; url=/next">\
+<script>fetch("/api/v2/cart")</script>).to_slice
+      by_href = E.from_html(body).to_h { |f| {f.href, f.declared} }
+      by_href["/about"].should be_true
+      by_href["/next"].should be_true
+      by_href["/api/v2/cart"].should be_false
+    end
+
+    # Precedence: the attribute passes run first and share `seen` with the endpoint pass, so a URL
+    # that appears BOTH ways keeps the stronger classification instead of the later one winning.
+    it "keeps a url declared when it is also present as a script literal" do
+      body = %(<a href="/dash">x</a><script>go("/dash")</script>).to_slice
+      found = E.from_html(body)
+      found.count { |f| f.href == "/dash" }.should eq(1)
+      found.find { |f| f.href == "/dash" }.not_nil!.declared.should be_true
+    end
+
+    # A body that is not markup declares nothing at all — the caller tags the whole list inferred,
+    # which is why this returns bare strings.
+    it "returns plain strings from from_text, which are inferred by construction" do
+      E.from_text(%(fetch("/api/ping")).to_slice).should eq(["/api/ping"])
+    end
   end
 end

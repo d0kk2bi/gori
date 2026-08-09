@@ -531,6 +531,70 @@ describe Gori::Discover::Engine do
     urls.should contain("http://t/api/v2/invoices")
   end
 
+  # ── what an INFERRED link may spend ─────────────────────────────────────────────────────
+  # Seeding a directory sweep costs the whole wordlist. `consider_link` spends it on a link the
+  # target DECLARED; a literal recovered from text has to be confirmed first. These three pin the
+  # three outcomes that rule produces.
+  describe "brute-force directories derived from links" do
+    # The saving. A bundle of i18n/asset/vendor paths that resolve to nothing must not each buy a
+    # sweep of their own directory: measured against a live origin, seeding on faith turned one
+    # response into 38,929 requests for 2 findings.
+    it "does not sweep a directory named only by a script literal that 404s" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      bundle = %(var T={"a":"/locales/ns7/messages.json","b":"/assets/chunk3/style.css"};)
+      sent = [] of String
+      run_discover("http://t/", %w[admin secret], cfg) do |t|
+        sent << t
+        case t
+        when "/"       then html(%(<script src="/app.js"></script>))
+        when "/app.js" then make(200, bundle, "application/javascript")
+        else                notfound
+        end
+      end
+      # The literals themselves are still FETCHED — that is how they get confirmed or not.
+      sent.should contain("/locales/ns7/messages.json")
+      # …but nothing in those directories is brute-forced, because nothing there answered.
+      sent.should_not contain("/locales/ns7/admin")
+      sent.should_not contain("/assets/chunk3/secret")
+    end
+
+    # The coverage that must survive it: a route the bundle names which DOES answer earns its
+    # directory a sweep, one round-trip later than before.
+    it "sweeps the directory of a script literal that turns out to be real" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[admin], cfg) do |t|
+        sent << t
+        case t
+        when "/"              then html(%(<script src="/app.js"></script>))
+        when "/app.js"        then make(200, %(fetch("/api/v2/orders")), "application/javascript")
+        when "/api/v2/orders" then make(200, "[]", "application/json")
+        else                       notfound
+        end
+      end
+      sent.should contain("/api/v2/admin")
+    end
+
+    # And the case that separates this from "confirm everything": a DECLARED link is the target's
+    # own statement, so its directory is swept even when the link itself is stale. A robots.txt
+    # naming a file that is gone is a classic reason to look at what else is in that directory.
+    it "still sweeps the directory of a declared link that 404s" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[admin], cfg) do |t|
+        sent << t
+        case t
+        when "/" then html(%(<a href="/backup/db.sql.gz">old</a>))
+        else          notfound
+        end
+      end
+      sent.should contain("/backup/admin")
+    end
+  end
+
   # The other half of `text_like?`: a crawl follows `<img src>` like any other link, so binary
   # responses are the common case here. Scanning one costs `Extract.text` a full `String#scrub`
   # (a second walk that rebuilds the whole body) to feed a regex no image can match.
