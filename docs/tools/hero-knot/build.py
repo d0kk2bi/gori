@@ -34,10 +34,12 @@ STEPS = 4000         # sampling resolution for crossing detection
 
 CHUNK = math.radians(8.0)    # z-sort granularity: one shadow + a few quads
 QUAD = math.radians(3.2)     # quad size inside a chunk
-WMIN, WMAX = 2.5, 8.6        # ribbon width, far side to near side
-SHADOW_PAD = 1.5             # how far the shadow strip reaches past each edge
-SHADOW_OFF = 2.9             # cast distance, resolved per sample (see below)
+WMIN, WMAX = 1.9, 6.3        # ribbon width, far side to near side
+SHADOW_PAD = 1.2             # how far the shadow strip reaches past each edge
+SHADOW_OFF = 2.4             # cast distance, resolved per sample (see below)
 EPS = 0.15                   # forward overlap between quads, hides AA seams
+OCC_DEPTH = 0.45             # how far the under strand dips at a crossing
+OCC_SIGMA = 11.0             # dip radius along the strand, in arc units
 PEN = math.radians(35.0)     # calligraphic pen angle (screen space)
 CAL = 0.12                   # strength of the pen-angle width modulation
 LX, LY = -0.5473, -0.8370    # light direction (upper left; screen y is down)
@@ -146,6 +148,42 @@ def edge(i, th, sign, pad=0.0):
     return (x - sign * ty * h, y + sign * tx * h)
 
 
+# --- pair up the crossings and note who passes under whom ------------------
+# For each crossing point, the strand with the smaller z at that point is the
+# under strand. It gets an "occlusion dip": its brightness eases down as it
+# approaches the crossing and back up leaving it, on BOTH sides, which is
+# what makes the over strand read as resting on it. The cast shadow alone
+# cannot do this -- it falls on one side only, and the strand meeting the
+# over edge at full brightness on the other side reads as two pictures
+# pasted together.
+
+under = {0: [], 1: [], 2: []}      # ring -> [theta of a crossing it dips at]
+for i in range(3):
+    for j in range(i + 1, 3):
+        cs_i, cs_j = crossings(i, j), crossings(j, i)
+        for ta in cs_i:
+            pa = pt(i, ta)
+            tb = min(cs_j, key=lambda t: (pt(j, t)[0] - pa[0]) ** 2 +
+                                         (pt(j, t)[1] - pa[1]) ** 2)
+            if z(ta) < z(tb):
+                under[i].append(ta)
+            else:
+                under[j].append(tb)
+
+
+def occlusion(i, th):
+    """0 clear of any crossing this strand passes under, ~1 right at one."""
+    o = 0.0
+    for tc in under[i]:
+        d = abs((th - tc + math.pi) % (2 * math.pi) - math.pi)
+        # arc distance, using the local projected speed at the crossing
+        x, y = pt(i, tc)
+        tx, ty = -R * math.sin(tc), RY * math.cos(tc)
+        s = d * math.hypot(tx, ty)
+        o = max(o, math.exp(-((s / OCC_SIGMA) ** 2)))
+    return o
+
+
 # --- cut each ring at horizons and crossings, then chop into chunks --------
 
 chunks = []
@@ -170,7 +208,12 @@ chunks.sort(key=lambda c: c["z"])
 
 def emit_chunk(c, indent):
     i, a, b = c["ring"], c["a"], c["b"]
-    nq = max(1, math.ceil((b - a) / QUAD))
+    # Inside an occlusion dip the brightness changes fast, and at the base
+    # quad size the eye reads the per-quad steps as facets: subdivide finer
+    # wherever the dip is in play.
+    q = QUAD / 3 if max(occlusion(i, a), occlusion(i, b),
+                        occlusion(i, (a + b) / 2)) > 0.04 else QUAD
+    nq = max(1, math.ceil((b - a) / q))
     ths = [a + (b - a) * k / nq for k in range(nq + 1)]
     lines = []
 
@@ -212,10 +255,13 @@ def emit_chunk(c, indent):
         x1i, y1i = x1i + tx * EPS, y1i + ty * EPS
         # One decimal on the mix percentages: integer steps are close enough
         # together on the near side that the eye reads the boundaries as
-        # Mach-band hairlines across the ribbon.
+        # Mach-band hairlines across the ribbon. The occlusion dip pulls
+        # both brightness and glint down where this strand passes under
+        # another -- shade, not paint.
         mid = (t0 + t1) / 2
-        dv = 100 * nearness(mid) ** D_GAMMA
-        sv = 100 * spec(i, mid)
+        occ = occlusion(i, mid)
+        dv = 100 * nearness(mid) ** D_GAMMA * (1 - OCC_DEPTH * occ)
+        sv = 100 * spec(i, mid) * (1 - occ)
         style = f"--d:{dv:.1f}%" + (f";--s:{sv:.1f}%" if sv >= 0.5 else "")
         d = (f"M{fmt(x0o)} {fmt(y0o)}L{fmt(x1o)} {fmt(y1o)}"
              f"L{fmt(x1i)} {fmt(y1i)}L{fmt(x0i)} {fmt(y0i)}Z")
@@ -242,7 +288,7 @@ def nodes(kind):
     the motion CSS mean each lap shows the front copies for the near half and
     the back copies for the far half -- real occlusion, not a fade."""
     lines = [f'      <g class="knot-nodes knot-nodes-{kind}">']
-    radii = [3.1, 2.2, 1.6, 1.1]
+    radii = [2.6, 1.9, 1.4, 1.0]
     for i in range(3):
         for k, r in enumerate(radii):
             lines.append(f'        <circle class="knot-node kn-r{i} kn-t{k}" r="{r}"/>')
@@ -308,7 +354,7 @@ doc = f"""{{# The hero mark: three rings woven around a disc of the official art
 """
 
 OUT.write_text(doc)
-nq = sum(max(1, math.ceil((c["b"] - c["a"]) / QUAD)) for c in chunks)
+nq = doc.count('class="knot-q"')
 print(f"wrote {OUT} ({len(chunks)} chunks, {nq} quads)")
 print()
 print("Paste these into static/css/style.css, on the .kn-r* rules -- the nodes")

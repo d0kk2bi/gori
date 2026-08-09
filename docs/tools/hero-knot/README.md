@@ -23,6 +23,13 @@ away-from-light vector projected onto the local normal — a fixed vector would
 slide each chunk's shadow onto its neighbour's ribbon and read as a dark tick
 at every chunk boundary.
 
+At every crossing the under strand also takes an occlusion dip: its brightness
+and glint ease down approaching the crossing and back up leaving it, on both
+sides. The cast shadow falls on one side only, and a strand meeting the over
+edge at full brightness on the other side reads as two pictures pasted
+together. Chunks inside a dip subdivide their quads 3× finer — at the base
+size the fast brightness change reads as facets.
+
 ## What lives where
 
 - **Geometry, depth order, width, shading terms** — this script, into the
