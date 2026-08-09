@@ -226,6 +226,56 @@ module Gori::Discover
       pairs.join("&")
     end
 
+    # One brute-force candidate resolved against its directory: the Parts the gates ask about,
+    # and the ONE string that is simultaneously the frontier entry (`normalize`) and the
+    # `seen` key (`visit_key`) — those two are the same string whenever the query is nil,
+    # which on this path it always is.
+    record Probe, parts : Parts, url : String
+
+    # `#{dir_url}#{cand}` without the `URI.parse`.
+    #
+    # `enqueue_probes` runs in the ORCHESTRATOR fiber — the single fiber that also dispatches
+    # every job to every worker — once per calibrated directory, over the whole wordlist: 315
+    # built-in words times (1 + extensions) times directories. Each candidate used to cost a
+    # full `URI.parse` plus three more separately built strings (`visit_key`, `gate_url`,
+    # `normalize`) to produce one frontier entry, and adding coverage anywhere upstream
+    # multiplies that by more directories.
+    #
+    # Returns nil for any candidate whose fast derivation could differ from `parse`'s by even
+    # one byte; the caller then falls back to `parse`, so this can only ever be an
+    # optimization and never a second opinion. The conditions mirror `parse_path` exactly:
+    #
+    #   * nothing `encode_unsafe` would rewrite and no CR/LF (`plain_bytes?`), so the path
+    #     goes through verbatim;
+    #   * no `?` or `#`, so `URI.parse` would split off neither a query nor a fragment;
+    #   * none of the four dot/slash shapes `parse_path` reacts to, so `normalize_path` would
+    #     have been a no-op.
+    #
+    # The host, scheme and port are the directory's own — `dir_url` is required to be
+    # `normalize(dir)`, and `Engine#enqueue_probes` checks that once per directory rather
+    # than trusting it. That is what makes `origin(dir) + dir.path + cand` and
+    # `dir_url + cand` provably the same bytes.
+    def self.probe(dir : Parts, dir_url : String, cand : String) : Probe?
+      return nil if cand.empty?
+      return nil unless plain_bytes?(cand)
+      path = dir.path + cand
+      return nil if path.includes?("..") || path.includes?("./") ||
+                    path.includes?("//") || path.ends_with?("/.")
+      Probe.new(Parts.new(dir.scheme, dir.host, dir.port, path, nil), dir_url + cand)
+    end
+
+    # A candidate that reaches the request line as itself: no octet `encode_unsafe` repairs or
+    # `Headers.safe_url?` refuses (both are the `<= 0x20 || 0x7F` class), and neither of the
+    # two delimiters `URI.parse` acts on. A wordlist entry outside this set — a query, a
+    # traversal, an IIS trailing-space bypass — is not rejected, it just takes `parse`.
+    private def self.plain_bytes?(s : String) : Bool
+      s.each_byte do |b|
+        return false if b <= 0x20_u8 || b == 0x7f_u8
+        return false if b == 0x3f_u8 || b == 0x23_u8 # '?' '#'
+      end
+      true
+    end
+
     # The directory a URL lives in — everything up to and including the last '/'. Query and
     # fragment are dropped. Used to seed the brute-forcer per directory.
     def self.dir_of(p : Parts) : String

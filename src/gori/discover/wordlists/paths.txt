@@ -4,6 +4,11 @@
 # are comments. Merge your own list with --wordlist / the config overlay.
 # NOTE: this list is authorized-testing tooling. Some entries (.git/config, .env) are
 # high-value but noisy; review before running against production.
+#
+# EVERY line here costs one real request PER CALIBRATED DIRECTORY, so length is a budget,
+# not a free parameter — a run with 20 directories pays 20 sends for each entry added.
+# Paths that only ever exist at the ORIGIN belong in `Engine::WELL_KNOWN` instead, where
+# they are fetched once and their bodies are read for further endpoints.
 
 # --- admin / management ---
 admin
@@ -112,6 +117,18 @@ actuator/env
 actuator/mappings
 actuator/beans
 actuator/httptrace
+actuator/heapdump
+actuator/loggers
+actuator/threaddump
+actuator/configprops
+# springdoc / redoc / the swagger paths that are NOT api/swagger
+v3/api-docs
+v2/api-docs
+swagger/v1/swagger.json
+redoc
+openapi
+graphql/console
+graphql/playground
 
 # --- config / secrets ---
 .env
@@ -143,9 +160,18 @@ credentials.json
 .htpasswd
 .htaccess
 .aws/credentials
+.aws/config
+.kube/config
 .npmrc
+.pypirc
 .dockercfg
 .docker/config.json
+.user.ini
+terraform.tfstate
+application.properties
+application.yml
+WEB-INF/web.xml
+META-INF/MANIFEST.MF
 id_rsa
 private.key
 server.key
@@ -154,6 +180,7 @@ server.key
 .git
 .git/config
 .git/HEAD
+.git/index
 .git/logs/HEAD
 .gitignore
 .svn
@@ -162,6 +189,8 @@ server.key
 .bzr
 .gitlab-ci.yml
 .travis.yml
+.circleci/config.yml
+.github/workflows
 Jenkinsfile
 Dockerfile
 docker-compose.yml
@@ -175,9 +204,18 @@ yarn.lock
 Gemfile
 Gemfile.lock
 requirements.txt
+pyproject.toml
 go.mod
 pom.xml
 build.gradle
+# build/config artifacts that name the rest of the app
+webpack.config.js
+next.config.js
+vite.config.js
+# source maps — a .map hands over the unminified bundle, and Extract reads its paths
+main.js.map
+app.js.map
+bundle.js.map
 
 # --- backup / archive / temp ---
 backup
@@ -254,12 +292,23 @@ test.php
 info
 server-status
 server-info
+elmah.axd
+trace.axd
 .well-known
 .well-known/security.txt
+security.txt
 robots.txt
 sitemap.xml
 crossdomain.xml
+clientaccesspolicy.xml
 humans.txt
+# self-hosted infrastructure that ends up mounted under an app path
+grafana
+prometheus
+kibana
+jenkins
+sonar
+minio
 
 # --- framework / cms internals ---
 wp-content

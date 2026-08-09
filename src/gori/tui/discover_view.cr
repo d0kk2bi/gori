@@ -436,7 +436,8 @@ module Gori::Tui
         "budget exhausted · #{r.queued} queued unexplored — raise max requests to finish"
       else
         if s = r.stats
-          "fp-cut #{s.calibrated_out} · dedup #{s.dedup_suppressed} · tmpl #{s.template_suppressed} · clust #{s.cluster_suppressed}"
+          drift = s.drift_suppressed > 0 ? " · drift #{s.drift_suppressed}" : ""
+          "fp-cut #{s.calibrated_out} · dedup #{s.dedup_suppressed} · tmpl #{s.template_suppressed} · clust #{s.cluster_suppressed}#{drift}"
         else
           "found #{r.found} · #{r.sent} sent · #{r.queued} queued · #{r.errors} err"
         end

@@ -253,6 +253,9 @@ module Gori
               j.field "template_suppressed", s.template_suppressed
               j.field "cluster_suppressed", s.cluster_suppressed
               j.field "uncalibratable_dirs", s.uncalibratable_dirs
+              # Non-zero means the ORIGIN stopped discriminating between paths mid-sweep, so
+              # an agent must read that directory's silence as unmeasured rather than empty.
+              j.field "drift_suppressed", s.drift_suppressed
               j.field("confidence_histogram") { j.array { s.conf_hist.each { |c| j.number(c) } } }
             end
             emit_audit(j, djob.audit, djob.ended_at_ms)

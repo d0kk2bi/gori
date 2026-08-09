@@ -125,7 +125,7 @@ module Gori::Discover
 
     # `keep_alive` reuses one HTTP/1.1 connection across many sends per origin (see
     # `Repeater::ConnPool`). It is the single largest cost of a run against a remote origin:
-    # a brute-force pass is ~278 sends PER DIRECTORY, and dial-per-send paid a TCP — and on
+    # a brute-force pass is ~315 sends PER DIRECTORY, and dial-per-send paid a TCP — and on
     # https a TLS — handshake for every one of them. `idle_conns` bounds the sockets one
     # origin may park and should be the run's concurrency (one per worker fiber is the most
     # that can ever be checked out at once), capped at MAX_IDLE_PER_POOL.
@@ -250,7 +250,7 @@ module Gori::Discover
     # these values once at plan-build, so what survives here is exactly the declared binding
     # names, resolved now instead of then.
     #
-    # Recomputed only when the binding table moves: a brute-force pass is ~278 sends per
+    # Recomputed only when the binding table moves: a brute-force pass is ~315 sends per
     # directory, and the block is identical for every one of them.
     private def binding_headers : String
       return @header_block unless @header_tokens
@@ -331,13 +331,50 @@ module Gori::Discover
     Probe     # brute-force one wordlist entry against a calibrated dir
   end
 
+  # A directory's live brute-force state, shared BY REFERENCE with every Probe task that
+  # directory queued. A record would be wrong here, and that is the whole point:
+  # `enqueue_probes` fills the frontier with hundreds of tasks at once, so the only way a
+  # RE-MEASURED baseline can reach the ones that have not run yet is for them to hold a
+  # mutable reference rather than a copy.
+  #
+  # Owned by the ORCHESTRATOR — every field is written only there. Workers READ `baseline` in
+  # `process_probe`, and on the single-threaded scheduler (no -Dpreview_mt) nothing yields
+  # between that read and its use, so no worker can observe a half-applied swap.
+  private class DirState
+    property baseline : Calibrate::DirBaseline
+    # Bumped on every baseline SWAP. A probe reads the baseline and this together at judgement
+    # time and carries the pair back, so an outcome scored against a snapshot that has since
+    # been replaced is recognisable as stale instead of being believed — see
+    # `Engine#handle_probe`. `drifted` cannot express that: it covers the window between the
+    # drift being declared and the re-measurement landing, and is CLEARED by the very swap
+    # that strands the probes still in flight.
+    property generation : Int32 = 0
+    # The current run of consecutive CLEARED-AND-ALIKE probe outcomes, and what they look
+    # like. This is the drift signal: a directory of real endpoints does not answer a dozen
+    # unrelated wordlist entries with one identical response, and a rate limiter, a WAF block
+    # page and a 5xx meltdown all do exactly that. See `Engine#admit_hit`.
+    property run : Int32 = 0
+    property run_fp : UInt64 = 0_u64
+    property run_status : Int32? = nil
+    # Findings held back because they are the second and later members of such a run — kept
+    # until it either BREAKS (they were real divergence after all, and are emitted) or reaches
+    # `Engine::DRIFT_RUN` (they were the origin's new uniform answer, and are dropped).
+    getter held : Array({Finding, Exchange?}) = [] of {Finding, Exchange?}
+    property? drifted : Bool = false
+    property recalibrations : Int32 = 0
+
+    def initialize(@baseline : Calibrate::DirBaseline)
+    end
+  end
+
   private record Task,
     kind : TaskKind,
     url : String,
     depth : Int32,
     source : Source,
     dir : String? = nil,
-    baseline : Calibrate::DirBaseline? = nil,
+    # The directory this Probe belongs to, LIVE — see `DirState`. Nil for every other kind.
+    state : DirState? = nil,
     # A Calibrate task queued ONLY to gate robots.txt/sitemap.xml against a soft-404
     # baseline (see enqueue_seed_only_calibration) — never feeds enqueue_probes, so it
     # can't expand the brute-force wordlist onto a directory outside the run's own scope.
@@ -355,7 +392,9 @@ module Gori::Discover
     baseline : Calibrate::DirBaseline?,
     hit : Bool,
     confidence : Float64,
-    exchange : Exchange? = nil
+    exchange : Exchange? = nil,
+    # The `DirState#generation` the verdict above was reached under. Probes only.
+    generation : Int32 = 0
 
   # The spider + brute-force engine. Single-threaded fiber scheduler (no -Dpreview_mt), so
   # the ORCHESTRATOR fiber owns all bookkeeping state (frontier/seen/templates/dirs/clusters)
@@ -391,6 +430,74 @@ module Gori::Discover
     # went out, the run says so.
     NOTHING_TO_SEND = "nothing to send: no crawl page or brute-force candidate survived the scope and containment gates"
 
+    # How many consecutive cleared-AND-identical probe outcomes in one directory mean the
+    # baseline no longer describes the origin.
+    #
+    # A `DirBaseline` is a SNAPSHOT, measured once before the directory's ~315 probes and never
+    # revisited, and a target that changes its mind halfway through is the ordinary case, not
+    # the exotic one: a rate limiter trips, a WAF starts serving a block page, the origin falls
+    # over. Every remaining probe then diverges from the stale baseline in status AND length
+    # AND content — 0.50 + 0.25 + 0.35 — so it is not merely reported, it is reported at
+    # confidence 1.0. Measured against an origin whose limiter tripped on the 8th request:
+    # 320 findings, of which 310 were the limiter.
+    #
+    # Deliberately generous, because the number costs almost nothing to raise: the false
+    # positives a drift can leak are bounded by the HOLD (see `admit_hit`), not by this, so
+    # 12 is chosen to sit far above a real cluster of same-content endpoints (a docs SPA
+    # serving one shell for several routes) rather than close to it. Raising it only spends a
+    # few more requests before the guard fires; lowering it would start eating real findings.
+    DRIFT_RUN = 12
+
+    # How many times ONE directory may be re-measured. A target that keeps flipping — a
+    # limiter that relents and trips again — would otherwise re-calibrate forever, and each
+    # round is `calibrate_probes + extensions` real requests. Past the cap the directory stops
+    # producing findings entirely and says so in `RunStats#drift_suppressed`: fail safe, and
+    # loud enough to read.
+    MAX_RECALIBRATIONS = 2
+
+    # The documents fetched ONCE at the origin to seed the crawl, in the order they are
+    # queued. Every one is a GUESS at a registered path whose BODY names further endpoints —
+    # which is the whole reason they are fetched here instead of being left to the wordlist:
+    # `.well-known` and `.well-known/security.txt` do ship in `wordlists/paths.txt`, but that
+    # probes them once per calibrated DIRECTORY (so never at the origin on a path-confined
+    # run) and reads nothing they say.
+    #
+    #   robots.txt / sitemap.xml / sitemap_index.xml
+    #     the site's own declared surface. `sitemap_index.xml` is the WordPress/Yoast
+    #     spelling, which is the majority of the sitemaps in the wild that `sitemap.xml`
+    #     misses; a `<sitemapindex>` child recurses for free (`Extract.from_sitemap`).
+    #   .well-known/openid-configuration, oauth-authorization-server, oauth-protected-resource
+    #     OIDC Discovery / RFC 8414 / RFC 9728. The highest-yield document on this list by a
+    #     wide margin: one 200 hands over authorize, token, userinfo, jwks, revocation,
+    #     introspection, registration and end-session as absolute URLs, and the endpoints it
+    #     names are routinely on a host the crawl would otherwise never reach.
+    #   .well-known/apple-app-site-association, assetlinks.json
+    #     the deep-link manifests. AASA enumerates the app's PATHS literally — a hand-written
+    #     list of the routes the product considers real, including the ones behind auth.
+    #   .well-known/security.txt
+    #     RFC 9116 Contact / Policy / Acknowledgments / Hiring URLs.
+    #   .well-known/host-meta
+    #     XRD `<Link href>`, and the one that points at a separate API origin often enough to
+    #     be worth the request.
+    #   .well-known/change-password
+    #     RFC-registered pointer at the real credential-management flow.
+    #
+    # Eleven requests per run — a rounding error against a brute-force pass of ~315 per
+    # directory, and the only part of a run that reads a target's own declaration of itself.
+    WELL_KNOWN = {
+      {"/robots.txt", Source::Robots},
+      {"/sitemap.xml", Source::Sitemap},
+      {"/sitemap_index.xml", Source::Sitemap},
+      {"/.well-known/openid-configuration", Source::WellKnown},
+      {"/.well-known/oauth-authorization-server", Source::WellKnown},
+      {"/.well-known/oauth-protected-resource", Source::WellKnown},
+      {"/.well-known/apple-app-site-association", Source::WellKnown},
+      {"/.well-known/assetlinks.json", Source::WellKnown},
+      {"/.well-known/security.txt", Source::WellKnown},
+      {"/.well-known/host-meta", Source::WellKnown},
+      {"/.well-known/change-password", Source::WellKnown},
+    }
+
     enum State : UInt8
       Running
       Paused
@@ -415,6 +522,7 @@ module Gori::Discover
     @seen : Set(String)
     @templates : Hash(String, Int32)
     @dirs : Set(String)
+    @dir_states : Hash(String, DirState)
     @found_urls : Set(String)
     @clusters : ClusterMap
     @pending : Int32
@@ -438,6 +546,7 @@ module Gori::Discover
     @template_suppressed : Int32
     @cluster_suppressed : Int32
     @uncalibratable : Int32
+    @drift_suppressed : Int32
     @conf_hist : Array(Int32)
     @last_dispatch : Time::Instant
     @phase : Phase
@@ -489,6 +598,7 @@ module Gori::Discover
       @seen = Set(String).new
       @templates = Hash(String, Int32).new
       @dirs = Set(String).new
+      @dir_states = Hash(String, DirState).new
       @found_urls = Set(String).new
       @clusters = ClusterMap.new
       @pending = 0
@@ -501,6 +611,7 @@ module Gori::Discover
       @template_suppressed = 0
       @cluster_suppressed = 0
       @uncalibratable = 0
+      @drift_suppressed = 0
       @conf_hist = [0, 0, 0, 0]
       @last_dispatch = Time.instant
       @phase = Phase::Seeding
@@ -636,6 +747,15 @@ module Gori::Discover
         handle(@discovered.receive)
         @pending -= 1
       end
+      release_held
+    end
+
+    # Every directory whose last probes formed a run too SHORT to be drift still has that run
+    # held (see `admit_hit`), and nothing is coming to break it. Releasing here rather than in
+    # `orchestrate` puts it in the one place every ending passes — including a stopped run,
+    # whose held findings are as real as any other.
+    private def release_held : Nil
+      @dir_states.each_value { |state| break_run(state) }
     end
 
     private def seed_frontier : Nil
@@ -646,16 +766,15 @@ module Gori::Discover
         @crawl_enqueued += 1
         @frontier << Task.new(TaskKind::Crawl, Url.normalize(@seed_parts), 0, Source::Seed)
         root = Url.origin(@seed_parts)
-        enqueue_well_known("#{root}/robots.txt", Source::Robots)
-        enqueue_well_known("#{root}/sitemap.xml", Source::Sitemap)
+        WELL_KNOWN.each { |path, source| enqueue_well_known("#{root}#{path}", source) }
       end
       bf_dir = bruteforce_root
       enqueue_dir(bf_dir, 0) if @config.bruteforce?
-      # robots.txt/sitemap.xml are GUESSED well-known paths, not organically-linked ones — they
-      # deserve the same soft-404 gate a brute-forced wordlist hit gets, not the "exists by
+      # WELL_KNOWN paths are GUESSED, not organically-linked — they deserve the same soft-404
+      # gate a brute-forced wordlist hit gets, not the "exists by
       # construction" trust record_page gives a crawled <a href>. Only wire this up when
       # bruteforce is on: that's the only mode with a calibration baseline to gate against.
-      # The origin is calibrated separately — robots.txt/sitemap.xml always live there even on
+      # The origin is calibrated separately — a well-known path always lives there even on
       # a path-scoped run confined elsewhere — and `enqueue_seed_only_calibration`'s own @dirs
       # check reuses the bf_dir calibration when that dir IS the origin. Asking @dirs rather
       # than comparing `root_dir == bf_dir` is the whole fix for #393: the old comparison
@@ -679,8 +798,8 @@ module Gori::Discover
       end
     end
 
-    # robots.txt / sitemap.xml are DERIVED, not typed: nothing but the run itself asked for
-    # them, and they are anchored on the origin, so on a path-confined run they sit outside
+    # A WELL_KNOWN document is DERIVED, not typed: nothing but the run itself asked for
+    # it, and they are anchored on the origin, so on a path-confined run they sit outside
     # the subtree by construction. They keep waiving Layer 1, containment and the path confine
     # for the calibration reason above — but not Layer 2, same as the seed (DESIGN.md §7,
     # #364). A blocked one is skipped silently rather than failing the run: unlike the seed,
@@ -761,12 +880,25 @@ module Gori::Discover
         end
         return
       end
-      if @seed_calibration_dir && (task.source.robots? || task.source.sitemap?)
+      if @seed_calibration_dir && well_known?(task.source)
         resolve_seed_finding(task, fetched, oc.exchange)
       else
         record_page(task, fetched, oc.exchange)
       end
       expand_links(oc, task, fetched)
+    end
+
+    # A finding the run GUESSED rather than followed a link to: the WELL_KNOWN documents, and
+    # everything they declare. Their claim to exist rests on gori having asked for a fixed
+    # path, so it goes through the soft-404 baseline (`resolve_seed_finding`) instead of
+    # `record_page`'s raw-status trust — a wildcard-200 origin answers 200 to
+    # `/.well-known/openid-configuration` exactly as readily as to `/robots.txt`.
+    #
+    # ONE predicate rather than three call sites repeating the same three-way or, because the
+    # routing test and the confidence anchor must agree: a source routed to the baseline gate
+    # and then scored on the crawl ladder would report a soft-404 at 0.95.
+    private def well_known?(source : Source) : Bool
+      source.robots? || source.sitemap? || source.well_known?
     end
 
     # The link-expansion half of handle_crawl: the page's own links unless its content cluster
@@ -794,12 +926,26 @@ module Gori::Discover
       bl = oc.baseline
       return unless bl
       @uncalibratable += 1 if bl.kind.uncalibratable?
-      @events.send(BaselineEvent.new(bl.dir, bl.kind.label, nil))
+      @events.send(BaselineEvent.new(bl.dir, bl.label, nil))
       if bl.dir == @seed_calibration_dir
         @seed_baseline = bl
         flush_pending_seed_fetches
       end
-      enqueue_probes(oc.task, bl) unless oc.task.seed_only
+      return if oc.task.seed_only
+      # A RE-calibration (`declare_drift`): this directory already has state, and a frontier
+      # full of probes pointing at it. Swap the baseline in place — that is what the shared
+      # `DirState` reference exists for — and resume. Queueing the wordlist a second time here
+      # would double the directory's cost and re-probe everything already in `@seen`.
+      if state = @dir_states[bl.dir]?
+        state.baseline = bl
+        state.generation += 1
+        state.drifted = false
+        break_run(state)
+        return
+      end
+      state = DirState.new(bl)
+      @dir_states[bl.dir] = state
+      enqueue_probes(oc.task, state)
     end
 
     private def handle_probe(oc : Outcome) : Nil
@@ -815,15 +961,112 @@ module Gori::Discover
         end
         return
       end
-      if oc.hit && oc.confidence >= @config.confidence_floor
-        record_finding(Finding.new(oc.task.url, "GET", fetched.status, fetched.length,
-          fetched.content_type, Source::Bruteforced, oc.task.depth, oc.confidence, nil), oc.exchange)
-        s = fetched.status
-        if s && s >= 200 && s < 300 && oc.task.depth < @config.max_depth
-          enqueue_dir_from_url(oc.task.url, oc.task.depth + 1) # a hit that's a container → recurse
-        end
-      else
+      state = oc.task.state
+      admissible = oc.hit && oc.confidence >= @config.confidence_floor
+      if state && oc.generation != state.generation
+        # Scored against a baseline that has since been REPLACED — the very snapshot
+        # `declare_drift` threw out — so it is evidence about nothing and is discarded rather
+        # than believed. Counted only when it would have been a finding, because that is the
+        # number the operator is being told about; a stale miss is not a suppressed result.
+        @drift_suppressed += 1 if admissible
+        return
+      end
+      unless admissible
         @calibrated_out += 1
+        # A MISS breaks the run: the origin is still discriminating between paths, so whatever
+        # was held back was ordinary divergence and is released now.
+        break_run(state) if state
+        return
+      end
+      admit_hit(state, Finding.new(oc.task.url, "GET", fetched.status, fetched.length,
+        fetched.content_type, Source::Bruteforced, oc.task.depth, oc.confidence, nil),
+        fetched, oc.exchange)
+    end
+
+    # A probe that cleared its baseline — emitted, held, or dropped.
+    #
+    # The three outcomes are what makes the drift guard cost ONE false positive instead of the
+    # rest of the wordlist. The FIRST member of a uniform run is indistinguishable from a real
+    # finding at the moment it arrives, so it is emitted; the second and later members are
+    # HELD, because by then "several unrelated paths answering identically" is a hypothesis
+    # worth waiting on; and if the run reaches DRIFT_RUN the hypothesis is confirmed and the
+    # whole held batch goes in the bin. A run that breaks first releases everything, so the
+    # common case — a directory with a handful of scattered real hits — pays nothing but the
+    # latency of one more probe outcome.
+    private def admit_hit(state : DirState?, f : Finding, fetched : Calibrate::Fetched,
+                          ex : Exchange?) : Nil
+      unless state
+        emit_probe_finding(f, ex)
+        return
+      end
+      if state.drifted?
+        # Already declared, and either re-calibrating or past MAX_RECALIBRATIONS. Probes
+        # dispatched before the declaration land here judged against the stale baseline.
+        @drift_suppressed += 1
+        return
+      end
+      unless extends_run?(state, fetched)
+        break_run(state)
+        state.run = 1
+        state.run_fp = fetched.simhash
+        state.run_status = fetched.status
+        emit_probe_finding(f, ex)
+        return
+      end
+      state.run += 1
+      if state.run >= DRIFT_RUN
+        declare_drift(state)
+        return
+      end
+      state.held << {f, ex}
+    end
+
+    # Does this outcome look like the one before it — same status, and content inside the
+    # run's own simhash cluster? The same `simhash_distance` the calibrator and the crawl's
+    # `ClusterMap` use, because it is the same question about the same fingerprint.
+    private def extends_run?(state : DirState, fetched : Calibrate::Fetched) : Bool
+      return false if state.run == 0
+      return false unless state.run_status == fetched.status
+      Fingerprint.hamming(state.run_fp, fetched.simhash) <= @config.simhash_distance
+    end
+
+    # End the current run and emit everything it was holding.
+    private def break_run(state : DirState) : Nil
+      state.run = 0
+      return if state.held.empty?
+      state.held.each { |f, ex| emit_probe_finding(f, ex) }
+      state.held.clear
+    end
+
+    # DRIFT_RUN probes in a row came back cleared AND identical to each other. That is not a
+    # directory of endpoints; that is an origin that stopped answering the question. Drop what
+    # the run was holding, stop counting this directory, and go re-measure it — which is the
+    # part a status heuristic could not do, since the new uniform answer is as often a 200
+    # block page or a 403 as it is a 429.
+    private def declare_drift(state : DirState) : Nil
+      state.drifted = true
+      @drift_suppressed += state.held.size + 1
+      state.held.clear
+      state.run = 0
+      dir = state.baseline.dir
+      if state.recalibrations < MAX_RECALIBRATIONS
+        state.recalibrations += 1
+        @events.send(BaselineEvent.new(dir, "drifted", "re-calibrating"))
+        enqueue_recalibration(dir)
+      else
+        @events.send(BaselineEvent.new(dir, "drifted", "giving up on this directory"))
+      end
+    end
+
+    # Emit a brute-force hit and, when it looks like a container, recurse into it. The two
+    # move together on purpose: a finding the drift guard is still holding must not seed a
+    # directory before the guard has decided whether it was real — otherwise a WAF block page
+    # answering 200 would enqueue a wordlist sweep of its own URL.
+    private def emit_probe_finding(f : Finding, ex : Exchange?) : Nil
+      record_finding(f, ex)
+      s = f.status
+      if s && s >= 200 && s < 300 && f.depth < @config.max_depth
+        enqueue_dir_from_url(f.url, f.depth + 1)
       end
     end
 
@@ -850,7 +1093,7 @@ module Gori::Discover
     end
 
     private def crawl_confidence(source : Source, status : Int32) : Float64
-      if source.robots? || source.sitemap?
+      if well_known?(source)
         status < 400 ? 0.9 : 0.7
       elsif status >= 200 && status < 300
         0.95
@@ -956,29 +1199,75 @@ module Gori::Discover
       @frontier << Task.new(TaskKind::Calibrate, dir, depth, Source::Bruteforced, dir: dir)
     end
 
-    private def enqueue_probes(task : Task, bl : Calibrate::DirBaseline) : Nil
+    # A SECOND Calibrate task for a directory `@dirs` already holds, so it deliberately skips
+    # `enqueue_dir`'s dedup — that set exists to stop the wordlist being queued twice, which
+    # `handle_calibrate` prevents here by taking the swap branch instead.
+    #
+    # Queued at the FRONT of the frontier: every probe behind it is about to be judged against
+    # the baseline that was just found stale, and each one dispatched before the re-measurement
+    # lands is a request spent on an answer that will be thrown away. Layer 2 is re-asked, as
+    # it is for every URL this engine derives — the scope may have changed since the first
+    # calibration, and this queues `calibrate_probes + extensions` real sends.
+    private def enqueue_recalibration(dir : String) : Nil
+      return unless p = Url.parse(dir)
+      return unless @scope.allowed?(Url.gate_url(p), p.host)
+      @frontier.unshift(Task.new(TaskKind::Calibrate, dir, 0, Source::Bruteforced, dir: dir))
+    end
+
+    private def enqueue_probes(task : Task, state : DirState) : Nil
+      bl = state.baseline
       cap = @config.per_dir_cap
       count = 0
+      exts = @config.extensions
+      # Parse the DIRECTORY once for the whole wordlist. `Url.probe` can then derive each
+      # candidate's Parts and its one shared `visit_key`/`normalize` string by concatenation,
+      # instead of `URI.parse`-ing `#{bl.dir}#{cand}` and building three more strings from the
+      # result — 315 words × (1 + extensions) × directories, all of it on the ORCHESTRATOR
+      # fiber, which is also the only fiber that dispatches jobs.
+      #
+      # The fast path is armed ONLY when `bl.dir` is already its own normal form and carries
+      # no query, because that equality is the whole proof that `dir_url + cand` is the string
+      # `Url.parse` would have produced. Every directory this engine derives satisfies it
+      # (`Url.dir_of` is `origin + a path ending in '/'`), but `enqueue_dir_from_url` appends a
+      # '/' to a normalized PROBE url, which a wordlist entry carrying a query would leave
+      # spelled differently — so it is checked, not assumed, and a mismatch simply falls back.
+      dp = Url.parse(bl.dir)
+      base = dp && dp.query.nil? && Url.normalize(dp) == bl.dir ? dp : nil
       @words.each do |w|
         break if @capped.cap_reached?
-        candidates = [w]
-        @config.extensions.each { |ext| candidates << "#{w}.#{ext}" }
-        candidates.each do |cand|
-          break if cap > 0 && count >= cap
-          p = Url.parse("#{bl.dir}#{cand}")
-          next unless p
-          # @seen first: it is a hash lookup, while probe_allowed? walks every scope rule
-          # under a mutex with PCRE2. Same verdict either way — this runs 275 words × dirs.
-          key = Url.visit_key(p)
-          next if @seen.includes?(key)
-          next unless probe_allowed?(p)
-          @seen << key
-          count += 1
-          @frontier << Task.new(TaskKind::Probe, Url.normalize(p), task.depth,
-            Source::Bruteforced, dir: bl.dir, baseline: bl)
-        end
         break if cap > 0 && count >= cap
+        count += 1 if enqueue_probe(task, state, base, w)
+        exts.each do |ext|
+          break if cap > 0 && count >= cap
+          count += 1 if enqueue_probe(task, state, base, "#{w}.#{ext}")
+        end
       end
+    end
+
+    # One brute-force candidate against a calibrated directory. True when it entered the
+    # frontier — and therefore counts against the per-directory cap — false when it was
+    # unparseable, already seen, or refused by the gates.
+    private def enqueue_probe(task : Task, state : DirState,
+                              base : Url::Parts?, cand : String) : Bool
+      dir = state.baseline.dir
+      p, key, url =
+        if base && (pr = Url.probe(base, dir, cand))
+          # `visit_key` and `normalize` are the SAME string for a query-less URL (compare the
+          # two: both are `origin + path`), and `Url.probe` built it once.
+          {pr.parts, pr.url, pr.url}
+        else
+          slow = Url.parse("#{dir}#{cand}")
+          return false unless slow
+          {slow, Url.visit_key(slow), Url.normalize(slow)}
+        end
+      # @seen first: it is a hash lookup, while probe_allowed? walks every scope rule
+      # under a mutex with PCRE2. Same verdict either way — this runs 315 words × dirs.
+      return false if @seen.includes?(key)
+      return false unless probe_allowed?(p)
+      @seen << key
+      @frontier << Task.new(TaskKind::Probe, url, task.depth,
+        Source::Bruteforced, dir: dir, state: state)
+      true
     end
 
     # Containment (origin/subdomain/scope-aware) + the injected scope policy + path confine.
@@ -1051,7 +1340,7 @@ module Gori::Discover
     end
 
     # A brute-force candidate is `bl.dir` + a wordlist entry, and only the DIRECTORY was ever
-    # authorised — one `allowed?` answer standing in for ~278 real requests with the defaults.
+    # authorised — one `allowed?` answer standing in for ~315 real requests with the defaults.
     # Two things do not survive that append:
     #
     #   * The path confine. `Url.parse` collapses dot-segments, so a wordlist entry like
@@ -1129,14 +1418,32 @@ module Gori::Discover
     # payload is a sitemap (the well-known /sitemap.xml, a <sitemapindex> child, OR a
     # robots.txt `Sitemap:` URL at any path), and only genuine HTML is parsed as HTML. This
     # stops a non-standard-path sitemap from being wrongly parsed as HTML and lost.
+    #
+    # A text body that is NEITHER goes to `Extract.from_text`, and that branch is where most
+    # of a modern target's surface actually lives. It used to be `EMPTY_LINKS`: the spider
+    # followed `<script src>` like any other link, spent a real request on the bundle, decoded
+    # it, fingerprinted it — and then discarded every endpoint in it because
+    # `application/javascript` is not html-like. The same held for every JSON document,
+    # including each of the `.well-known/` ones this run now fetches, whose entire value IS
+    # the URLs they list.
     private def extract_links(task : Task, fetched : Calibrate::Fetched, body : Bytes) : Array(RawLink)
       if task.kind.fetch? && task.source.robots?
         return Extract.from_robots(body).map { |h| RawLink.new(h, Source::Robots) }
       end
+      # What a well-known document DECLARES is a guess too — the origin's word for it, at a
+      # path gori chose — so it inherits the source that keeps it behind the soft-404 gate
+      # (`well_known?`). Everything else a page points at is an ordinary crawl link.
+      src = task.source.well_known? ? Source::WellKnown : Source::Crawled
       if Extract.sitemap_body?(body)
-        Extract.from_sitemap(body).map { |h| RawLink.new(h, Source::Sitemap) }
-      elsif html_like?(fetched.content_type)
-        Extract.from_html(body).map { |h| RawLink.new(h, Source::Crawled) }
+        return Extract.from_sitemap(body).map { |h| RawLink.new(h, Source::Sitemap) }
+      end
+      ct = fetched.content_type
+      # No content type at all stays html-like, which is where it has always gone — and now
+      # loses nothing by it, since `from_html` runs the endpoint pass too.
+      if ct.nil? || html_like?(ct)
+        Extract.from_html(body).map { |h| RawLink.new(h, src) }
+      elsif text_like?(ct)
+        Extract.from_text(body).map { |h| RawLink.new(h, src) }
       else
         EMPTY_LINKS
       end
@@ -1145,31 +1452,85 @@ module Gori::Discover
     private def process_calibrate(task : Task) : Outcome
       dir = task.dir || task.url
       probes = [] of Calibrate::Fetched
+      echoes = false
       @config.calibrate_probes.times do
         break if @capped.cap_reached?
-        probes << distill_only("#{dir}#{bogus_name}")
+        probes << calibration_probe(dir, bogus_name) { |hit| echoes ||= hit }
       end
       @config.extensions.each do |ext|
         break if @capped.cap_reached?
-        probes << distill_only("#{dir}#{bogus_name}.#{ext}")
+        probes << calibration_probe(dir, "#{bogus_name}.#{ext}") { |hit| echoes ||= hit }
       end
-      baseline = Calibrate.build(dir, probes, @config.simhash_distance)
+      baseline = Calibrate.build(dir, probes, @config.simhash_distance, echoes)
       Outcome.new(task, nil, EMPTY_LINKS, baseline, false, 0.0)
+    end
+
+    # One bogus probe, distilled — and, on the way past, the answer to "does this directory's
+    # miss page QUOTE the requested path back into its body?".
+    #
+    # Asked here because this is the only place that holds a bogus probe's BODY and its NAME at
+    # the same time: `Calibrate::Fetched` deliberately carries no body, so the baseline builder
+    # cannot ask it, and the fingerprint cannot answer it. That second half is worth being
+    # precise about, because it is what let an echoing soft-404 hide for so long:
+    # `Fingerprint.dynamic?` skips any all-hex run of 12 or more — deliberately, so ids,
+    # hashes and CSRF tokens cannot move a hash — and `bogus_name` is exactly 16 hex
+    # characters. The reflected name is invisible to the very hash the reflection would show up
+    # in, so every bogus probe agrees with every other one no matter how loudly the page quotes
+    # the path. Inferring the echo from an out-of-cluster fingerprint does not work either: one
+    # extra token in an 80-token page moves a simhash by fewer bits than `simhash_distance`,
+    # while a multi-segment wordlist entry like `swagger/v1/swagger.json` contributes four and
+    # clears it — so the inferred test is LESS sensitive than the thing it is trying to
+    # predict, which is the wrong way round. A byte search is exact and costs no extra request.
+    private def calibration_probe(dir : String, name : String, & : Bool ->) : Calibrate::Fetched
+      raw = send_with_retries("#{dir}#{name}")
+      body = decode_body(raw)
+      yield raw.error.nil? && body_contains?(body, name)
+      distill(raw, body)
+    end
+
+    # `body.includes?(needle)` for bytes. `String.new(body).includes?` would copy the whole
+    # response and would have to reckon with invalid UTF-8; the needle here is ASCII by
+    # construction (`bogus_name` is hex, plus a configured extension), so a byte scan answers
+    # the same question without either.
+    private def body_contains?(body : Bytes, needle : String) : Bool
+      n = needle.to_slice
+      return false if n.empty? || body.size < n.size
+      first = n.unsafe_fetch(0)
+      i = 0
+      last = body.size - n.size
+      while i <= last
+        if body.unsafe_fetch(i) == first
+          k = 1
+          while k < n.size && body.unsafe_fetch(i + k) == n.unsafe_fetch(k)
+            k += 1
+          end
+          return true if k == n.size
+        end
+        i += 1
+      end
+      false
     end
 
     private def process_probe(task : Task) : Outcome
       raw = send_with_retries(task.url)
       fetched = distill(raw, decode_body(raw))
-      bl = task.baseline
+      # Read through the shared `DirState`, so a probe queued before a drift re-calibration is
+      # judged against the baseline in force NOW rather than the one queued alongside it. The
+      # baseline and the generation are read TOGETHER, with no yield between them, so the pair
+      # the orchestrator gets back always describes one snapshot.
+      state = task.state
+      bl = state.try(&.baseline)
+      gen = state.try(&.generation) || 0
       if bl
         hit, conf = Calibrate.hit?(bl, fetched)
         # Only a HIT can become a finding, and `hit?` is decided right here in the worker — so
         # a wordlist sweep keeps the bytes of the handful it found and forgets the thousands of
         # soft-404s it did not, instead of shipping every miss's body through the channel for
         # the orchestrator to drop.
-        Outcome.new(task, fetched, EMPTY_LINKS, nil, hit, conf, hit ? capture_exchange(task.url, raw) : nil)
+        Outcome.new(task, fetched, EMPTY_LINKS, nil, hit, conf,
+          hit ? capture_exchange(task.url, raw) : nil, gen)
       else
-        Outcome.new(task, fetched, EMPTY_LINKS, nil, false, 0.0)
+        Outcome.new(task, fetched, EMPTY_LINKS, nil, false, 0.0, nil, gen)
       end
     end
 
@@ -1237,11 +1598,6 @@ module Gori::Discover
       end
     end
 
-    private def distill_only(url : String) : Calibrate::Fetched
-      raw = send_with_retries(url)
-      distill(raw, decode_body(raw))
-    end
-
     private def distill(raw : Repeater::Result, body : Bytes) : Calibrate::Fetched
       status = raw.response.try(&.status)
       ct = raw.response.try(&.headers.get?("content-type"))
@@ -1259,10 +1615,21 @@ module Gori::Discover
       body.size > MAX_BODY ? body[0, MAX_BODY] : body
     end
 
-    private def html_like?(ct : String?) : Bool
-      return true unless ct
+    private def html_like?(ct : String) : Bool
       c = ct.downcase
       c.includes?("html") || c.includes?("xml") || c.includes?("xhtml") || c.empty?
+    end
+
+    # Bodies worth scanning for endpoint literals, asked POSITIVELY on purpose. A crawl
+    # follows `<img src>`, `<link href>` and every font and archive a page names, so binary
+    # responses are the common case here, not the rare one — and each would cost
+    # `Extract.text` a full `String#scrub` (a second walk that rebuilds the whole body) to
+    # feed a regex no image can match. A body with NO content type never reaches this: it is
+    # html-like by default, which the branch above already handles.
+    private def text_like?(ct : String) : Bool
+      c = ct.downcase
+      c.starts_with?("text/") || c.includes?("json") || c.includes?("javascript") ||
+        c.includes?("ecmascript") || c.includes?("yaml") || c.includes?("graphql")
     end
 
     private def bogus_name : String
@@ -1328,7 +1695,8 @@ module Gori::Discover
 
     private def run_stats : RunStats
       RunStats.new(@capped.sent, @found, @calibrated_out, @dedup_suppressed,
-        @template_suppressed, @cluster_suppressed, @uncalibratable, @conf_hist.dup)
+        @template_suppressed, @cluster_suppressed, @uncalibratable, @conf_hist.dup,
+        @drift_suppressed)
     end
   end
 end

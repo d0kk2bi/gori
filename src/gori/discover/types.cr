@@ -45,6 +45,11 @@ module Gori
       Robots
       Sitemap
       Redirect
+      # A document the run GUESSED at a fixed origin path — the `.well-known/` registry
+      # (`Engine::WELL_KNOWN`) — plus everything those documents name. Distinct from Robots
+      # and Sitemap only so an operator can tell where a finding came from; all three are
+      # guesses at a well-known location and are gated identically (`Engine#well_known?`).
+      WellKnown
 
       def label : String
         case self
@@ -54,6 +59,7 @@ module Gori
         in Robots      then "robots"
         in Sitemap     then "sitemap"
         in Redirect    then "redirect"
+        in WellKnown   then "well-known"
         end
       end
     end
@@ -134,7 +140,17 @@ module Gori
     #   template_suppressed  — URLs skipped by folded-template saturation (param-explosion guard)
     #   cluster_suppressed   — crawl expansions stopped by content-cluster saturation (template trap)
     #   uncalibratable_dirs  — catch-all dirs where signal is weak (elevated FN risk)
+    #   drift_suppressed     — probes dropped because their directory's baseline went STALE
+    #                          mid-sweep (the origin started answering everything the same
+    #                          way: a rate limiter, a WAF block page, a 5xx meltdown). Worth
+    #                          reading as a signal about the RUN, not about the target: a
+    #                          large number means the origin stopped discriminating between
+    #                          paths, so whatever that directory did hold was not measured.
+    #                          See `Engine::DRIFT_RUN`.
     #   conf_hist            — 4-bucket confidence distribution [.5,.7) [.7,.85) [.85,.95) [.95,1]
+    #
+    # `drift_suppressed` is last and defaulted so the seven counters that predate it keep
+    # their positions — three surfaces construct and destructure this.
     record RunStats,
       sent : Int64,
       found : Int32,
@@ -143,7 +159,8 @@ module Gori
       template_suppressed : Int32,
       cluster_suppressed : Int32,
       uncalibratable_dirs : Int32,
-      conf_hist : Array(Int32)
+      conf_hist : Array(Int32),
+      drift_suppressed : Int32 = 0
 
     # Engine → consumer events (a record union, matching Fuzz/Miner so a Channel(Event)
     # carries them without boxing). Progress is droppable (latest wins); the rest never

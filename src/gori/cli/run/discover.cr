@@ -297,7 +297,8 @@ module Gori
         s = ev.stats
         STDERR.puts "done · #{s.found} found · #{s.sent} sent · #{ev.progress.errors} errors" \
                     " · calibrated-out #{s.calibrated_out} · dedup #{s.dedup_suppressed}" \
-                    " · template #{s.template_suppressed} · cluster #{s.cluster_suppressed}#{ev.stopped ? " (stopped)" : ""}"
+                    " · template #{s.template_suppressed} · cluster #{s.cluster_suppressed}" \
+                    "#{s.drift_suppressed > 0 ? " · drift #{s.drift_suppressed}" : ""}#{ev.stopped ? " (stopped)" : ""}"
         # A sweep that stopped on its budget must never read like one that finished: with
         # `--max-requests 8` against a 283-candidate wordlist this line said `5 found` and
         # exited 0, and 275 of those candidates were never sent. `queued` is what is still

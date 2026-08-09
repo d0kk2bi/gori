@@ -137,6 +137,100 @@ describe Gori::Discover::Extract do
     E.from_sitemap(sitemap.to_slice).should eq(["http://h/p"])
   end
 
+  # ── from_text: the endpoints no markup mentions ────────────────────────────────────────
+  #
+  # The branch that used to be `EMPTY_LINKS`. The spider fetches `<script src>` like any other
+  # link; before this, it decoded and fingerprinted the bundle and then discarded every route
+  # in it, so an API reachable only from JS was invisible to BOTH halves of the engine.
+  it "extracts quoted root-relative paths and absolute URLs from a script bundle" do
+    body = <<-JS.to_slice
+      const API="/api/v2";
+      fetch("/api/v2/cart",{method:"POST"});
+      axios.get('/account/orders');
+      import("https://cdn.acme.test/chunks/checkout.js");
+      JS
+    links = E.from_text(body)
+    links.should contain("/api/v2")
+    links.should contain("/api/v2/cart")
+    links.should contain("/account/orders")
+    links.should contain("https://cdn.acme.test/chunks/checkout.js")
+  end
+
+  # A `.well-known/` document's whole value is the URLs it lists, and every one of them is a
+  # JSON string — the same shape from_text already looks for.
+  it "extracts the endpoint URLs from an OIDC discovery document" do
+    body = %({"issuer":"https://acme.test","token_endpoint":"https://acme.test/oauth2/token",\
+"jwks_uri":"https://acme.test/oauth2/keys","registration_endpoint":"https://acme.test/connect/register"}).to_slice
+    links = E.from_text(body)
+    links.should contain("https://acme.test/oauth2/token")
+    links.should contain("https://acme.test/oauth2/keys")
+    links.should contain("https://acme.test/connect/register")
+  end
+
+  # An interpolated route has no closing quote and the class stops at `$`, which is why the
+  # match does not require one: the DIRECTORY is exactly what the brute-forcer wants from it.
+  it "yields the containing directory of an interpolated template-literal route" do
+    E.from_text("fetch(`/api/users/${id}/roles`)".to_slice).should contain("/api/users/")
+  end
+
+  # The quote is the whole false-positive filter. Without it every division, regex literal and
+  # date in a minified bundle would enter the frontier as a path.
+  it "does not mistake regex literals, MIME types, dates or a bare slash for endpoints" do
+    E.from_text(%(var re=/foo/g; var t="application/json"; var d="2026-07-19"; var s="/";).to_slice)
+      .should be_empty
+  end
+
+  it "de-duplicates repeated endpoints within one body" do
+    body = (%(fetch("/api/ping");) * 50).to_slice
+    E.from_text(body).should eq(["/api/ping"])
+  end
+
+  # `consider_link` costs the ORCHESTRATOR fiber a resolve + parse + two keys per entry, so no
+  # single response may hand it an unbounded list (see MAX_LINKS).
+  it "caps one body at MAX_LINKS distinct endpoints" do
+    body = (0..(E::MAX_LINKS + 500)).map { |i| %(f("/r#{i}");) }.join.to_slice
+    E.from_text(body).size.should eq(E::MAX_LINKS)
+  end
+
+  # ── from_html: inline script + the wider attribute set ─────────────────────────────────
+  it "extracts endpoints out of an inline script as well as out of attributes" do
+    body = %(<a href="/about">a</a><script>fetch("/api/v2/session");</script>).to_slice
+    links = E.from_html(body)
+    links.should contain("/about")
+    links.should contain("/api/v2/session")
+  end
+
+  it "de-duplicates an href the inline endpoint pass finds again" do
+    body = %(<a href="/about">a</a><script>go("/about");</script>).to_slice
+    E.from_html(body).should eq(["/about"])
+  end
+
+  it "extracts poster and data-url attributes alongside href/src/action" do
+    body = %(<video poster="/thumb.jpg"><div data-url="/api/lazy">).to_slice
+    links = E.from_html(body)
+    links.should contain("/thumb.jpg")
+    links.should contain("/api/lazy")
+  end
+
+  # `data-src` / `data-href` / `formaction` need no alternative of their own: the alternation
+  # carries no word boundary, so they already match through `src` / `href` / `action`. Pinned
+  # because a future "tighten the regex with \b" would silently drop three real sources.
+  it "still captures data-src, data-href and formaction through the unanchored alternation" do
+    links = E.from_html(%(<img data-src="/lazy.png"><a data-href="/x"><button formaction="/submit">).to_slice)
+    links.should contain("/lazy.png")
+    links.should contain("/x")
+    links.should contain("/submit")
+  end
+
+  # srcset's value is a `url 1x, url 2x` descriptor list, not one URL, so ATTR deliberately
+  # does not match it — capturing it whole would hand `Url.resolve` a string it percent-encodes
+  # into a URL nobody serves. The endpoint pass then picks the first entry out of it correctly,
+  # because its character class ends at the descriptor's space. Pinned in that shape: what must
+  # never appear is the joined `/a.png 1x, /b.png 2x`.
+  it "takes a real URL out of a srcset rather than its whole descriptor list" do
+    E.from_html(%(<img srcset="/a.png 1x, /b.png 2x">).to_slice).should eq(["/a.png"])
+  end
+
   # (8) Adversarial regex regression guard (spec/fuzz_spec.cr style): a long unclosed
   # <meta ... url= with a multi-KB attribute value must complete and RETURN (from_html does not
   # rescue Regex::Error, so a hang → harness timeout and a raise → spec failure). NOT a known-vuln claim.
