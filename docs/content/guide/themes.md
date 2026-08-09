@@ -17,7 +17,7 @@ The picker is a vertical, scrollable list; each row shows a small swatch of the 
 
 `Ctrl-,` works in the project picker too, so you can set your theme on first launch before opening a project. Theme is the only section editable there; the rest need a project open.
 
-The same History view across four of the built-ins:
+The same History view across six of the built-ins:
 
 <div class="tui-gallery">
   <figure>
@@ -35,6 +35,14 @@ The same History view across four of the built-ins:
   <figure>
     <img src="/images/tui/theme-gruvbox.svg" alt="gori History tab in the gruvbox theme: warm dark canvas with retro amber and green accents">
     <figcaption>gruvbox</figcaption>
+  </figure>
+  <figure>
+    <img src="/images/tui/theme-dancheong.svg" alt="gori History tab in the dancheong theme: green-black lacquer canvas carrying the vivid obangsaek pigments of a painted temple beam, with a gilt focus outline">
+    <figcaption>dancheong</figcaption>
+  </figure>
+  <figure>
+    <img src="/images/tui/theme-hanji.svg" alt="gori History tab in the hanji light theme: warm ivory mulberry-paper canvas written in ink, with an indigo focus outline">
+    <figcaption>hanji (light)</figcaption>
   </figure>
 </div>
 

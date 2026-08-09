@@ -98,6 +98,30 @@ for attempt in 1 2 3; do
   rm -f "$DB" "$DB-wal" "$DB-shm"
 done
 
+# A provider, an idle listener session, and four callbacks, written straight
+# into the throwaway DB for the OAST scene. The tab hydrates its Callbacks table
+# from `oast_callbacks`, so this is the whole shot — nothing registers with a
+# public interactsh server and nothing waits on a real callback.
+#
+# The source IPs are RFC 5737 documentation addresses ON PURPOSE. A live capture
+# would put a real resolver and a real egress IP — mine, or whoever regenerates
+# these — into an image published on the docs site.
+seed_oast() {
+  local now=1754750000000000
+  sqlite3 "$DB" <<SQL
+INSERT INTO oast_providers (created_at,updated_at,name,kind,host,token,enabled,position)
+  VALUES ($now,$now,'oast.pro','interactsh','oast.pro',NULL,1,0);
+INSERT INTO oast_sessions (created_at,provider_id,kind,server_url,correlation_id,secret,private_key_pem,token,last_poll_at)
+  VALUES ($now,1,'interactsh','https://oast.pro','ux9u36vnxl7cfjfk6kgy','',NULL,NULL,$now);
+INSERT INTO oast_callbacks (session_id,created_at,provider_uid,protocol,method,source_ip,full_id,raw_request,raw_response) VALUES
+ (1,$((now + 1000000)),'cb-1','dns','A','203.0.113.10','ux9u36vnxl7cfjfk6kgyp75ihzbesxa9u.oast.pro',X'00',NULL),
+ (1,$((now + 2000000)),'cb-2','http','GET','203.0.113.24','ux9u36vnxl7cfjfk6kgyp75ihzbesxa9u.oast.pro',X'00',NULL),
+ (1,$((now + 3000000)),'cb-3','http','GET','203.0.113.24','ux9u36vnxl7cfjfk6kgyp75ihzbesxa9u.oast.pro',X'00',NULL),
+ (1,$((now + 4000000)),'cb-4','dns','A','198.51.100.7','ux9u36vnxl7cfjfk6kgyp75ihzbesxa9u.oast.pro',X'00',NULL);
+SQL
+}
+seed_oast
+
 # _shoot <name> <rows> <title> <subcmd> <preamble:0|1> <tmux-keys...>
 # Launches `gori <subcmd>` in a fresh tmux pane, optionally walks the project
 # picker preamble, sends the keys, and renders the capture to SVG. Interleave
@@ -159,13 +183,36 @@ shoot_all() {
   run_scene sitemap      26 "gori · Sitemap"                   2 SLEEP1.2
   run_scene project      26 "gori · Project"                   1 SLEEP1.2
   run_scene intercept    26 "gori · Intercept"                 4 SLEEP1.2
-  # Probe and Issues sit past the 1-9 positional-jump range (10th/11th visible
-  # tab), so land on Comparer (9) and cycle right with `]` the rest of the way.
-  # Issues then promotes a few Probe findings on the way through so the shot
-  # isn't the empty-state onboarding card.
-  run_scene probe        26 "gori · Probe scanner"             9 SLEEP0.3 ] SLEEP1.4
-  run_scene issues       26 "gori · Issues"                    9 SLEEP0.3 ] SLEEP0.3 Enter SLEEP0.4 p SLEEP0.6 Down SLEEP0.3 p SLEEP0.6 Down SLEEP0.3 p SLEEP0.6 Down SLEEP0.3 p SLEEP0.7 Escape SLEEP0.3 ] SLEEP1.4
-  run_scene decoder      26 "gori · Decoder"                   7 SLEEP1.2
+  # Probe and Issues sit past the 1-9 positional-jump range (11th/12th visible
+  # tab — Rewriter went visible and pushed both right), so land on Comparer (9)
+  # and cycle right with `]` the rest of the way. Issues then promotes a few
+  # Probe findings on the way through so the shot isn't the empty-state
+  # onboarding card.
+  #
+  # COUNT THE BAR, DON'T TRUST THIS LIST. Every positional jump here is a
+  # position in Chrome::TABS minus DEFAULT_HIDDEN, and a tab going visible
+  # silently retargets every jump to its right — that is how the Decoder scene
+  # below spent three weeks shipping a picture of the OAST tab. After a catalog
+  # change, re-read the strip in a capture and fix the numbers.
+  run_scene probe        26 "gori · Probe scanner"             9 SLEEP0.3 ] SLEEP0.3 ] SLEEP1.4
+  run_scene issues       26 "gori · Issues"                    9 SLEEP0.3 ] SLEEP0.3 ] SLEEP0.3 Enter SLEEP0.4 p SLEEP0.6 Down SLEEP0.3 p SLEEP0.6 Down SLEEP0.3 p SLEEP0.6 Down SLEEP0.3 p SLEEP0.7 Escape SLEEP0.3 ] SLEEP1.4
+  # The Decoder opens EMPTY, so the shot has to build the chain the guide
+  # describes (base64-encode then upper, with the per-step PIPELINE readout).
+  # `Tab` — not `Enter` — is what drops focus from the tab strip into the body;
+  # at TABS scope a bare `i` is the intercept toggle, not "edit". The trailing
+  # Escape closes the converter completer, which otherwise hangs over CHAIN's
+  # bottom border.
+  run_scene decoder      26 "gori · Decoder"                   8 SLEEP0.8 Tab SLEEP0.5 i SLEEP0.4 "admin:hunter2" SLEEP0.4 Escape SLEEP0.4 Down SLEEP0.5 "base64 > upper" SLEEP0.8 Escape SLEEP0.8
+  # OAST reads its Callbacks table straight out of the project DB (hydrate →
+  # oast_callbacks_since 0), so seed_oast's synthetic hits are all this needs —
+  # no live registration, no third-party provider, and no real source IP baked
+  # into a published image.
+  run_scene oast         26 "gori · OAST"                      7 SLEEP1.4
+  # The Sequencer shot is the SEND TO SEQUENCER card over History, not the tab
+  # (which is hidden and empty until something is sent to it). Down x7 lands on
+  # the /cookies/set flow — the one with a Set-Cookie for the config card to
+  # auto-detect — and `q` is that verb's space-menu mnemonic.
+  run_scene sequencer    26 "gori · Sequencer"                 3 SLEEP1.4 Down Down Down Down Down Down Down SLEEP0.5 Space SLEEP0.4 q SLEEP1.4
   run_scene repeater     26 "gori · Repeater"                  3 SLEEP0.6 Enter SLEEP0.4 C-r SLEEP1.2 C-r SLEEP3
   run_scene fuzzer       34 "gori · Fuzzer"                    3 SLEEP0.6 Enter SLEEP0.3 Down SLEEP0.3 I SLEEP1 C-a SLEEP0.6 C-l SLEEP0.8 admin Enter root SLEEP0.5 Escape SLEEP0.7 C-r SLEEP5
   # JWT ships HIDDEN, so this reveals it the way the guide tells a reader to (palette →
@@ -183,7 +230,7 @@ shoot_all() {
 # theme cards, not the light/dark split of a scene.
 shoot_themes() {
   OUT="$TUI_ROOT"
-  for th in goridark goriday tokyonight gruvbox; do
+  for th in goridark goriday tokyonight gruvbox dancheong hanji; do
     write_settings "$th"
     run_scene "theme-$th" 26 "$th · default" 3 SLEEP1 Enter
   done

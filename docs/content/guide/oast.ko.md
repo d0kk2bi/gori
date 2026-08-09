@@ -12,7 +12,7 @@ group = "워크벤치"
 **OAST** 탭은 기본적으로 표시됩니다(Fuzzer 옆). 두 개의 서브탭이 있습니다. **Callbacks**(hit 목록, 기본)와 **Providers**(설정한 리스너)입니다.
 
 <figure class="tui-shot">
-  <img src="/images/tui/oast.svg" alt="interactsh payload를 리스닝 중인 gori OAST 탭: 복호화된 콜백 4건(DNS A 조회 2건, HTTP GET 2건)이 각각 source IP와 목적지 payload와 함께 나열된 Callbacks 테이블">
+  <img src="/images/tui/oast.svg" alt="interactsh payload로 들어온 복호화된 콜백 4건(DNS A 조회 2건, HTTP GET 2건)이 각각 source IP와 목적지 payload와 함께 나열된 gori OAST 탭의 Callbacks 테이블">
   <figcaption><strong>OAST</strong> 탭은 payload를 등록하고, 대상이 그 payload로 보내는 모든 DNS, HTTP, SMTP 콜백을 복호화해 타임스탬프와 함께 나열합니다.</figcaption>
 </figure>
 

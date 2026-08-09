@@ -12,7 +12,7 @@ Some bugs never show up in the response. A blind SSRF, a blind XXE, an out-of-ba
 The **OAST** tab is visible by default (next to Fuzzer). It has two sub-tabs: **Callbacks** (the hits, default) and **Providers** (the listeners you've configured).
 
 <figure class="tui-shot">
-  <img src="/images/tui/oast.svg" alt="gori OAST tab listening on an interactsh payload, with a Callbacks table of four decrypted callbacks: two DNS A lookups and two HTTP GET requests, each with a source IP and the payload as destination">
+  <img src="/images/tui/oast.svg" alt="gori OAST tab with a Callbacks table of four decrypted hits on an interactsh payload: two DNS A lookups and two HTTP GET requests, each with a source IP and the payload as destination">
   <figcaption>The <strong>OAST</strong> tab registers a payload and lists every DNS, HTTP, or SMTP callback the target makes to it, decrypted and timestamped.</figcaption>
 </figure>
 

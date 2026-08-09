@@ -5,7 +5,7 @@
 <circle cx="18.0" cy="17.0" r="5.5" fill="#e0645f"/>
 <circle cx="34.0" cy="17.0" r="5.5" fill="#e0b24f"/>
 <circle cx="50.0" cy="17.0" r="5.5" fill="#4fb06a"/>
-<text x="603.0" y="22.0" text-anchor="middle" fill="#959597" font-size="12.3px">gori · Guided tour</text>
+<text x="603.0" y="22.0" text-anchor="middle" fill="#959597" font-family="'Apple Symbols','Segoe UI Symbol','Cambria Math','STIX Two Math','Noto Sans Math','DejaVu Sans',ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,monospace" font-size="12.3px">gori · Guided tour</text>
 <rect x="18.00" y="52.00" width="1170.00" height="18.00" fill="#0a0a0b"/>
 <rect x="18.00" y="70.00" width="306.00" height="18.00" fill="#0a0a0b"/>
 <rect x="324.00" y="70.00" width="81.00" height="18.00" fill="#26262c"/>
@@ -28,7 +28,7 @@
 <rect x="18.00" y="394.00" width="243.00" height="18.00" fill="#0a0a0b"/>
 <rect x="18.00" y="412.00" width="243.00" height="18.00" fill="#0a0a0b"/>
 <rect x="18.00" y="430.00" width="243.00" height="18.00" fill="#0a0a0b"/>
-<rect x="18.00" y="484.00" width="747.00" height="18.00" fill="#0a0a0b"/>
+<rect x="18.00" y="484.00" width="765.00" height="18.00" fill="#0a0a0b"/>
 <rect x="18.00" y="502.00" width="1089.00" height="18.00" fill="#0a0a0b"/>
 <rect x="1107.00" y="502.00" width="81.00" height="18.00" fill="#26262c"/>
 <text x="36.00" y="65.68" textLength="36.00" lengthAdjust="spacingAndGlyphs" fill="#fafafa" font-weight="700" xml:space="preserve">gori</text>
@@ -176,14 +176,15 @@
 <text x="261.00" y="425.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#3a3a42" xml:space="preserve">│</text>
 <text x="954.00" y="425.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#3a3a42" xml:space="preserve">│</text>
 <text x="261.00" y="443.68" textLength="702.00" lengthAdjust="spacingAndGlyphs" fill="#3a3a42" xml:space="preserve">╰────────────────────────────────────────────────────────────────────────────╯</text>
-<text x="450.00" y="497.68" textLength="27.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">↵/n</text>
-<text x="486.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">start</text>
-<text x="540.00" y="497.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">·</text>
-<text x="558.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">click</text>
-<text x="612.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">Start</text>
-<text x="666.00" y="497.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">·</text>
-<text x="684.00" y="497.68" textLength="27.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">esc</text>
-<text x="720.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">leave</text>
+<text x="432.00" y="497.68" textLength="27.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">↵/n</text>
+<text x="468.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">start</text>
+<text x="522.00" y="497.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">·</text>
+<text x="540.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">click</text>
+<text x="594.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">Start</text>
+<text x="648.00" y="497.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">·</text>
+<text x="666.00" y="497.68" textLength="27.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">esc</text>
+<text x="702.00" y="497.68" textLength="27.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">esc</text>
+<text x="738.00" y="497.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">leave</text>
 <text x="45.00" y="515.68" textLength="9.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">←</text>
 <text x="63.00" y="515.68" textLength="36.00" lengthAdjust="spacingAndGlyphs" fill="#6e6e76" xml:space="preserve">Prev</text>
 <text x="1116.00" y="515.68" textLength="45.00" lengthAdjust="spacingAndGlyphs" fill="#fafafa" font-weight="700" xml:space="preserve">Start</text>
