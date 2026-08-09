@@ -10,16 +10,40 @@ Every ring is cut at its own z=0 points and at every crossing with another
 ring, then all pieces are painted back to front.  That is a painter's
 algorithm over a real 3D embedding, so the over/under pattern is the one the
 solid would actually show: the weave is derived, not hand-authored.
+
+Each ring is drawn not as a stroke but as a ribbon: a strip of filled quads
+whose width, brightness and specular glint are computed per sample from the
+same embedding.  The ribbon swells and brightens on the near side of its
+turn, narrows and falls toward the page colour on the far side, and carries
+tight glints where the tube would catch a light from the upper left.  A
+soft shadow strip under each chunk is what the crossings read by.
+
+The quads carry only two numbers into the page -- --d (depth brightness)
+and --s (specular) -- and the stylesheet turns those into theme-aware
+colour.  Regenerate rather than edit the emitted arcs by hand.
 """
 import math
 import pathlib
 
-C = 120.0          # centre of the 240x240 viewBox
-R = 113.0          # ring radius
+C = 120.0            # centre of the 240x240 viewBox
+R = 113.0            # ring radius
 TAU = math.radians(55.0)
 PHI = [0.0, 60.0, 120.0]
-DISC = 79.0        # radius of the core disc
-STEPS = 4000       # sampling resolution for crossing detection
+DISC = 79.0          # radius of the core disc
+STEPS = 4000         # sampling resolution for crossing detection
+
+CHUNK = math.radians(8.0)    # z-sort granularity: one shadow + a few quads
+QUAD = math.radians(3.2)     # quad size inside a chunk
+WMIN, WMAX = 2.5, 8.6        # ribbon width, far side to near side
+SHADOW_PAD = 1.5             # how far the shadow strip reaches past each edge
+SHADOW_OFF = 2.9             # cast distance, resolved per sample (see below)
+EPS = 0.15                   # forward overlap between quads, hides AA seams
+PEN = math.radians(35.0)     # calligraphic pen angle (screen space)
+CAL = 0.12                   # strength of the pen-angle width modulation
+LX, LY = -0.5473, -0.8370    # light direction (upper left; screen y is down)
+SPEC_POW = 7                 # glint tightness
+D_GAMMA = 1.35               # depth-brightness falloff
+W_GAMMA = 1.15               # width falloff
 
 RY = R * math.cos(TAU)
 ZAMP = R * math.sin(TAU)
@@ -34,8 +58,38 @@ def pt(i, th):
     return (C + a * cx - b * sx, C + a * sx + b * cx)
 
 
+def tangent(i, th):
+    p = math.radians(PHI[i])
+    cx, sx = math.cos(p), math.sin(p)
+    dx, dy = -R * math.sin(th), RY * math.cos(th)
+    tx, ty = dx * cx - dy * sx, dx * sx + dy * cx
+    n = math.hypot(tx, ty)
+    return tx / n, ty / n
+
+
 def z(th):
     return ZAMP * math.sin(th)
+
+
+def nearness(th):
+    """0 at the far side of the turn, 1 at the near side."""
+    return (math.sin(th) + 1) / 2
+
+
+def width(i, th):
+    """Ribbon width: swells toward the viewer, with a slight calligraphic
+    bias so the strokes read brushed rather than machined."""
+    t = nearness(th) ** W_GAMMA
+    tx, ty = tangent(i, th)
+    cal = 1 + CAL * math.cos(2 * (math.atan2(ty, tx) - PEN))
+    return (WMIN + (WMAX - WMIN) * t) * cal
+
+
+def spec(i, th):
+    """Glint where the tube runs perpendicular to the light, near side only."""
+    tx, ty = tangent(i, th)
+    cross = abs(tx * LY - ty * LX)
+    return (cross ** SPEC_POW) * (nearness(th) ** 2)
 
 
 def implicit(i, x, y):
@@ -80,17 +134,21 @@ def dedupe(vals, eps=1e-4):
 
 
 def fmt(v):
-    s = f"{v:.2f}".rstrip("0").rstrip(".")
+    s = f"{v:.1f}".rstrip("0").rstrip(".")
     return s if s not in ("-0", "") else "0"
 
 
-# A piece gets one width and one opacity, taken at its middle, so a long
-# piece would step visibly against its neighbours. Splitting every run down
-# to at most STEP keeps consecutive pieces close enough in depth that the
-# taper reads continuous.
-STEP = math.radians(22.0)
+def edge(i, th, sign, pad=0.0):
+    """A point on the ribbon's edge: centreline offset along the normal."""
+    x, y = pt(i, th)
+    tx, ty = tangent(i, th)
+    h = width(i, th) / 2 + pad
+    return (x - sign * ty * h, y + sign * tx * h)
 
-pieces = []
+
+# --- cut each ring at horizons and crossings, then chop into chunks --------
+
+chunks = []
 for i in range(3):
     cuts = [0.0, math.pi]
     for j in range(3):
@@ -101,42 +159,72 @@ for i in range(3):
         b = cuts[(k + 1) % len(cuts)]
         if b <= a:
             b += 2 * math.pi
-        n = max(1, math.ceil((b - a) / STEP))
+        n = max(1, math.ceil((b - a) / CHUNK))
         for s in range(n):
             t0 = a + (b - a) * s / n
             t1 = a + (b - a) * (s + 1) / n
-            x1, y1 = pt(i, t0)
-            x2, y2 = pt(i, t1)
-            large = 1 if (t1 - t0) > math.pi else 0
-            pieces.append({
-                "z": z((t0 + t1) / 2),
-                "d": (f"M{fmt(x1)} {fmt(y1)}"
-                      f"A{fmt(R)} {fmt(RY)} {fmt(PHI[i])} {large} 1 {fmt(x2)} {fmt(y2)}"),
-            })
+            chunks.append({"ring": i, "a": t0, "b": t1, "z": z((t0 + t1) / 2)})
 
-pieces.sort(key=lambda p: p["z"])
+chunks.sort(key=lambda c: c["z"])
 
 
-def shade(zv):
-    """Near side thicker and brighter: what gives a flat stroke the weight of
-    a turning ribbon."""
-    t = (zv / ZAMP + 1) / 2            # 0 far, 1 near
-    return 1.7 + 3.3 * t, t ** 1.7
-
-
-def emit(group, indent):
+def emit_chunk(c, indent):
+    i, a, b = c["ring"], c["a"], c["b"]
+    nq = max(1, math.ceil((b - a) / QUAD))
+    ths = [a + (b - a) * k / nq for k in range(nq + 1)]
     lines = []
-    for p in group:
-        w, o = shade(p["z"])
-        lines.append(f'{indent}<path class="knot-cut" stroke-width="{fmt(w + 2.2)}"'
-                     f' d="{p["d"]}"/>')
-        lines.append(f'{indent}<path class="knot-arc" stroke-width="{fmt(w)}"'
-                     f' style="--d:{o * 100:.1f}%" d="{p["d"]}"/>')
+
+    # Shadow strip: the ribbon's outline, padded a little and displaced away
+    # from the light, one filled path per chunk so its edges join the
+    # neighbouring chunks' exactly. The displacement is what makes it read
+    # as a cast shadow rather than a halo -- on the cream theme especially,
+    # a symmetric dark outline reads as blur, not depth. It is not a fixed
+    # vector: that would have a tangential component sliding each chunk's
+    # shadow onto its neighbours' ribbon, a dark tick every chunk. Instead
+    # the away-from-light vector is projected onto the local normal, so the
+    # shadow always falls beside the ribbon and thins where the ribbon runs
+    # parallel to the light.
+    def sh(th, sign):
+        x, y = edge(i, th, sign, SHADOW_PAD)
+        tx, ty = tangent(i, th)
+        nx, ny = -ty, tx
+        proj = SHADOW_OFF * (-LX * nx + -LY * ny)
+        return (x + nx * proj, y + ny * proj)
+
+    outer = [sh(th, +1) for th in ths]
+    inner = [sh(th, -1) for th in ths]
+    d = "M" + "L".join(f"{fmt(x)} {fmt(y)}" for x, y in outer)
+    d += "L" + "L".join(f"{fmt(x)} {fmt(y)}" for x, y in reversed(inner)) + "Z"
+    o = 0.45 + 0.55 * nearness((a + b) / 2)
+    lines.append(f'{indent}<path class="knot-sh" opacity="{o:.2f}" d="{d}"/>')
+
+    # Ribbon quads. The leading edge of each quad is nudged EPS forward
+    # along the tangent so opaque neighbours overlap instead of meeting at
+    # an antialiased hairline.
+    for k in range(nq):
+        t0, t1 = ths[k], ths[k + 1]
+        tx, ty = tangent(i, t1)
+        x0o, y0o = edge(i, t0, +1)
+        x0i, y0i = edge(i, t0, -1)
+        x1o, y1o = edge(i, t1, +1)
+        x1i, y1i = edge(i, t1, -1)
+        x1o, y1o = x1o + tx * EPS, y1o + ty * EPS
+        x1i, y1i = x1i + tx * EPS, y1i + ty * EPS
+        # One decimal on the mix percentages: integer steps are close enough
+        # together on the near side that the eye reads the boundaries as
+        # Mach-band hairlines across the ribbon.
+        mid = (t0 + t1) / 2
+        dv = 100 * nearness(mid) ** D_GAMMA
+        sv = 100 * spec(i, mid)
+        style = f"--d:{dv:.1f}%" + (f";--s:{sv:.1f}%" if sv >= 0.5 else "")
+        d = (f"M{fmt(x0o)} {fmt(y0o)}L{fmt(x1o)} {fmt(y1o)}"
+             f"L{fmt(x1i)} {fmt(y1i)}L{fmt(x0i)} {fmt(y0i)}Z")
+        lines.append(f'{indent}<path class="knot-q" style="{style}" d="{d}"/>')
     return "\n".join(lines)
 
 
-back = emit([p for p in pieces if p["z"] < 0], "      ")
-front = emit([p for p in pieces if p["z"] >= 0], "      ")
+back = "\n".join(emit_chunk(c, "      ") for c in chunks if c["z"] < 0)
+front = "\n".join(emit_chunk(c, "      ") for c in chunks if c["z"] >= 0)
 
 # Full-ring paths, handed to CSS as the motion path each traffic node rides.
 rings = []
@@ -146,6 +234,21 @@ for i in range(3):
     rings.append(f"M{fmt(x0)} {fmt(y0)}"
                  f"A{fmt(R)} {fmt(RY)} {fmt(PHI[i])} 0 1 {fmt(xh)} {fmt(yh)}"
                  f"A{fmt(R)} {fmt(RY)} {fmt(PHI[i])} 0 1 {fmt(x0)} {fmt(y0)}")
+
+
+def nodes(kind):
+    """One head and three trail dots per ring. The same six dots exist twice,
+    once behind the disc and once in front; complementary opacity windows in
+    the motion CSS mean each lap shows the front copies for the near half and
+    the back copies for the far half -- real occlusion, not a fade."""
+    lines = [f'      <g class="knot-nodes knot-nodes-{kind}">']
+    radii = [3.1, 2.2, 1.6, 1.1]
+    for i in range(3):
+        for k, r in enumerate(radii):
+            lines.append(f'        <circle class="knot-node kn-r{i} kn-t{k}" r="{r}"/>')
+    lines.append("      </g>")
+    return "\n".join(lines)
+
 
 # The art box overhangs the clip circle: the drift below scales and slides it,
 # and without the overhang a corner would swing into view at the far end of
@@ -157,10 +260,11 @@ side = fmt(2 * ART)
 doc = f"""{{# The hero mark: three rings woven around a disc of the official art, the
    same weave the logo carries. Generated geometry -- three circles of radius
    {fmt(R)} tilted {fmt(math.degrees(TAU))} deg out of the screen plane and spun 0/60/120 deg about the
-   view axis, each cut at its own horizon and at every crossing, then painted
-   back to front. So the over/under pattern is the one the solid would show,
-   not a hand-authored guess, and a rigid spin of the whole group keeps it
-   true. Re-generate rather than edit these arcs by hand. #}}
+   view axis, cut at every horizon and crossing and painted back to front, so
+   the over/under pattern is the one the solid would show. Each ring is a
+   ribbon of filled quads whose width, depth brightness (--d) and glint (--s)
+   are computed per sample; the stylesheet turns those into colour.
+   Re-generate (tools/hero-knot/build.py) rather than edit by hand. #}}
 <figure class="hero-art">
   <svg class="hero-knot" viewBox="0 0 240 240" role="img" aria-label="{{{{ "home.hero_art_alt" | t }}}}">
     <defs>
@@ -175,9 +279,10 @@ doc = f"""{{# The hero mark: three rings woven around a disc of the official art
       </clipPath>
     </defs>
 
-    {{# Everything behind the disc. #}}
+    {{# Everything behind the disc, plus the far-half copies of the nodes. #}}
     <g class="knot-spin">
 {back}
+{nodes("back")}
     </g>
 
     {{# The core. Not in a spinning group: the art holds still while the
@@ -193,26 +298,22 @@ doc = f"""{{# The hero mark: three rings woven around a disc of the official art
       <circle class="knot-core-rim" cx="{fmt(C)}" cy="{fmt(C)}" r="{fmt(DISC - 0.4)}"/>
     </g>
 
-    {{# Everything in front of it, and the three request nodes riding the
-       rings -- traffic circling the loop. #}}
+    {{# Everything in front of it, and the near-half node copies. #}}
     <g class="knot-spin">
 {front}
-      <circle class="knot-node knot-node-0" r="3.1"/>
-      <circle class="knot-node knot-node-1" r="2.7"/>
-      <circle class="knot-node knot-node-2" r="2.4"/>
+{nodes("front")}
     </g>
   </svg>
 </figure>
 """
 
 OUT.write_text(doc)
-print(f"wrote {OUT} ({len(pieces)} pieces)")
+nq = sum(max(1, math.ceil((c["b"] - c["a"]) / QUAD)) for c in chunks)
+print(f"wrote {OUT} ({len(chunks)} chunks, {nq} quads)")
 print()
-print("Paste these into static/css/style.css, inside the offset-path @supports")
-print("block -- the nodes ride the same ellipses the arcs are cut from, so they")
-print("have to be regenerated together with the partial:")
+print("Paste these into static/css/style.css, on the .kn-r* rules -- the nodes")
+print("ride the same ellipses the ribbons are cut from, so they have to be")
+print("regenerated together with the partial:")
 print()
 for i, r in enumerate(rings):
-    print(f'  .knot-node-{i} {{')
-    print(f'    offset-path: path("{r}");')
-    print("  }")
+    print(f'  .kn-r{i} {{ offset-path: path("{r}"); }}')
