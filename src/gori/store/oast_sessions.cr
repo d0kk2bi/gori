@@ -27,9 +27,9 @@ module Gori
     end
 
     def update_oast_provider(id : Int64, name : String, kind : String, host : String,
-    # `exec_task_ok`: the store answers whether the write COMMITTED, and dropping that made
-    # every caller report the change for a rolled-back batch. Same conversion as `delete_flows`
-    # (`reads.cr`), whose comment states the reasoning once.
+                             # `exec_task_ok`: the store answers whether the write COMMITTED, and dropping that made
+                             # every caller report the change for a rolled-back batch. Same conversion as `delete_flows`
+                             # (`reads.cr`), whose comment states the reasoning once.
                              token : String?, enabled : Bool) : Bool
       exec_task_ok ->(c : DB::Connection) {
         c.exec("UPDATE oast_providers SET name=?, kind=?, host=?, token=?, enabled=?, updated_at=? WHERE id=?",

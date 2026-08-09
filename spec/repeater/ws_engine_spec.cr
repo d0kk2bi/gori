@@ -345,9 +345,9 @@ describe Gori::Repeater::WsEngine do
     result = WsEngine.send(UPGRADE, [] of WsEngine::OutMsg,
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, idle: 500.milliseconds)
 
-    result.close_code.should eq(1000)                                     # whole script consumed
+    result.close_code.should eq(1000) # whole script consumed
     result.truncated.not_nil!.should contain("control-frame cap")
-    result.messages.any? { |m| WS.notice?(m.payload) }.should be_true     # the marker row
+    result.messages.any? { |m| WS.notice?(m.payload) }.should be_true # the marker row
     # Only the cap's worth of ping rows survive (plus the CLOSE and the one marker), never all 65.
     result.messages.count { |m| m.opcode == WS::OP_PING.to_i }.should eq(WsEngine::MAX_CONTROL_MESSAGES)
   end
@@ -377,10 +377,10 @@ describe Gori::Repeater::WsEngine do
       scheme: "http", host: "127.0.0.1", port: port, verify_upstream: false, idle: 500.milliseconds)
 
     inbound = result.messages.select { |m| m.direction == "in" }
-    inbound[0].shape.fin.should be_false                                  # the truncated fragment
+    inbound[0].shape.fin.should be_false # the truncated fragment
     inbound[0].payload.size.should eq(big.size)
     result.truncated.not_nil!.should contain("server-payload cap")
-    inbound.any? { |m| WS.notice?(m.payload) }.should be_true             # the marker sits adjacent
+    inbound.any? { |m| WS.notice?(m.payload) }.should be_true # the marker sits adjacent
   end
 end
 

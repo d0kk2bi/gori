@@ -1069,8 +1069,8 @@ describe Gori::MCP::Server do
     it "refuses conditions and enum values that would never do what the caller meant" do
       with_store do |store|
         {
-          %({"when":"host:"}),          # a term with an empty value is dropped ⇒ matches everything
-          %({"when":"size:>10000"}),    # a History QL field this backend free-texts ⇒ never fires
+          %({"when":"host:"}),       # a term with an empty value is dropped ⇒ matches everything
+          %({"when":"size:>10000"}), # a History QL field this backend free-texts ⇒ never fires
           %({"when":"a","color":"chartreuse"}),
           %({"when":"a","style":"sideways"}),
         }.each_with_index do |args, i|

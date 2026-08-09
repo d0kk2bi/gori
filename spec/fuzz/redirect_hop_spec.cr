@@ -375,8 +375,8 @@ describe "Fuzz::Engine#follow_redirects — the collapsed Result's fields" do
     refused = Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64,
       Gori::Outbound::EXCLUDE_SWEEP_ERROR)
     res, backend = follow([reply(302, "/offsite"), refused])
-    backend.sent.size.should eq(2)          # the hop WAS attempted
-    res.status.should eq(302)               # …but the 302 survives the collapse
+    backend.sent.size.should eq(2) # the hop WAS attempted
+    res.status.should eq(302)      # …but the 302 survives the collapse
     res.error.should_not be_nil
     res.error.not_nil!.should contain("redirect hop refused")
   end

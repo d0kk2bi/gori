@@ -106,20 +106,20 @@ module Gori
       # empty/-h/--help case is handled above.
       private def self.dispatch_subcommand2(sub : String?, rest : Array(String)) : Nil
         case sub
-        when "probe"    then cmd_probe(rest)
-        when "discover" then cmd_discover(rest)
-        when "oast"     then cmd_oast(rest)
-        when "sitemap"  then cmd_sitemap(rest)
-        when "import"   then cmd_import(rest)
-        when "notes"    then cmd_notes(rest)
-        when "issues"   then cmd_issues(rest)
-        when "jwt"      then cmd_jwt(rest)
-        when "cookie"   then cmd_cookie(rest)
-        when "decoder"  then cmd_decoder(rest)
-        when "rewriter" then cmd_rewriter(rest)
+        when "probe"       then cmd_probe(rest)
+        when "discover"    then cmd_discover(rest)
+        when "oast"        then cmd_oast(rest)
+        when "sitemap"     then cmd_sitemap(rest)
+        when "import"      then cmd_import(rest)
+        when "notes"       then cmd_notes(rest)
+        when "issues"      then cmd_issues(rest)
+        when "jwt"         then cmd_jwt(rest)
+        when "cookie"      then cmd_cookie(rest)
+        when "decoder"     then cmd_decoder(rest)
+        when "rewriter"    then cmd_rewriter(rest)
         when "colormarker" then cmd_colormarker(rest)
-        when "project"  then cmd_project(rest)
-        else                 dispatch_subcommand3(sub, rest)
+        when "project"     then cmd_project(rest)
+        else                    dispatch_subcommand3(sub, rest)
         end
       end
 

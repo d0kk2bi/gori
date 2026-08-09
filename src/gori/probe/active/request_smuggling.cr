@@ -43,8 +43,8 @@ module Gori
         # idle timeout — seconds — not the milliseconds a live endpoint answers in). BASE_FAST
         # gates the whole verdict on a reproducibly FAST baseline: a slow/loaded endpoint cannot
         # support a timing test, so it declines instead of firing on every variant.
-        DELAY_THRESHOLD =  4_000_000_i64 # 4s slower than baseline ⇒ a tier blocked
-        BASE_FAST       =  1_000_000_i64 # baseline must answer under 1s or we decline
+        DELAY_THRESHOLD = 4_000_000_i64 # 4s slower than baseline ⇒ a tier blocked
+        BASE_FAST       = 1_000_000_i64 # baseline must answer under 1s or we decline
         # Per-probe read bound for the DIFFERENTIAL pipeline (well under the analyzer's
         # ACTIVE_TIMEOUT of 10s): a poisoned follow-up either answers or misframes quickly, and we
         # never want a hung pipeline member to eat the whole per-probe budget. Timing probes ride
@@ -75,8 +75,8 @@ module Gori
         #   [2],[3] CL.TE probes             [4],[5] TE.CL probes    [6],[7] TE.TE probes
         #   [8] differential smuggle  [9] differential benign follow-up   (aggressive only)
         BASELINE_COUNT   = 2
-        DIFF_SMUGGLE_IDX = BASELINE_COUNT + VARIANTS.size * 2       # 8
-        DIFF_BENIGN_IDX  = DIFF_SMUGGLE_IDX + 1                     # 9
+        DIFF_SMUGGLE_IDX = BASELINE_COUNT + VARIANTS.size * 2 # 8
+        DIFF_BENIGN_IDX  = DIFF_SMUGGLE_IDX + 1               # 9
 
         def info : RuleInfo
           RuleInfo.new("request_smuggling", "HTTP request smuggling / desync (CL.TE/TE.CL/TE.TE)",

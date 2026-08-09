@@ -611,14 +611,14 @@ describe "Gori::Scope host-rule shape validation" do
 
   it "rejects a scheme/path/userinfo/whitespace host pattern and names the bare host to use" do
     {
-      "https://acme.test"           => "acme.test",
-      "http://acme.test/admin"      => "acme.test",
-      "acme.test/admin"             => "acme.test",
-      "https://user@acme.test/x"    => "acme.test",
-      "https://acme.test:8443/api"  => "acme.test", # scheme AND port peeled for the suggestion
-      "https://[::1]:8443/api"      => "::1",       # bare IPv6 form, matching the port check's advice
-      "acme.test?q=1"               => "acme.test",
-      "https://*.acme.test/"        => "*.acme.test", # a glob survives the peel
+      "https://acme.test"          => "acme.test",
+      "http://acme.test/admin"     => "acme.test",
+      "acme.test/admin"            => "acme.test",
+      "https://user@acme.test/x"   => "acme.test",
+      "https://acme.test:8443/api" => "acme.test", # scheme AND port peeled for the suggestion
+      "https://[::1]:8443/api"     => "::1",       # bare IPv6 form, matching the port check's advice
+      "acme.test?q=1"              => "acme.test",
+      "https://*.acme.test/"       => "*.acme.test", # a glob survives the peel
     }.each do |pattern, suggestion|
       Gori::Scope.valid?("host", pattern).should be_false
       err = Gori::Scope.validation_error("host", pattern).not_nil!

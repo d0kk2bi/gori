@@ -419,7 +419,7 @@ describe Gori::Rules do
             "X-One: b", "X-One: c")
 
           rules.rules.map(&.scope).should eq([Gori::Store::RuleScope::Global,
-                                             Gori::Store::RuleScope::Project])
+                                              Gori::Store::RuleScope::Project])
           # b→c only fires because a→b ran first: the order is the whole claim.
           head = "GET / HTTP/1.1\r\nHost: acme.test\r\nX-One: a\r\n\r\n".to_slice
           String.new(rules.rewrite_request(head, "acme.test")).should contain("X-One: c")

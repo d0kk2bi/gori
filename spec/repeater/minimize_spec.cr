@@ -191,7 +191,7 @@ describe Gori::Repeater::Minimize do
       "GET /p HTTP/1.1",
       "Host: h",
       "X-Keep: yes",
-      "Cookie: sid=abc123",     # load-bearing → header 1 is never emptied/deleted
+      "Cookie: sid=abc123",      # load-bearing → header 1 is never emptied/deleted
       "Cookie: junk=1; trash=2", # cosmetic → must still be reachable and removed
     ].join("\n")
 
@@ -266,10 +266,10 @@ describe Gori::Repeater::Minimize do
     report.minimized_text.should_not contain("drop")
     # Everything load-bearing survived, byte-for-byte, in the STORED text.
     report.minimized_text.should contain(%("keep":1))
-    report.minimized_text.should contain(%("dup":3))   # the duplicate key is NOT collapsed…
-    report.minimized_text.should contain(%("dup":4))   # …both occurrences remain
-    report.minimized_text.should contain("a\\/b")       # `\/` is NOT unescaped to `/`
-    report.minimized_text.should contain("1.50")        # `1.50` is NOT reformatted to `1.5`
+    report.minimized_text.should contain(%("dup":3)) # the duplicate key is NOT collapsed…
+    report.minimized_text.should contain(%("dup":4)) # …both occurrences remain
+    report.minimized_text.should contain("a\\/b")    # `\/` is NOT unescaped to `/`
+    report.minimized_text.should contain("1.50")     # `1.50` is NOT reformatted to `1.5`
     # And the drop splice took its trailing comma with it, leaving valid JSON.
     report.minimized_text.should contain(%({"keep":1,"dup":3))
   end

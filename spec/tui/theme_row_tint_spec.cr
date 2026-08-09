@@ -11,9 +11,9 @@ require "../spec_helper"
 describe "Theme.row_tint" do
   colors = %w[red orange yellow green blue purple]
   # The three bands a History row can already have: canvas, marked, selected+focused.
-  bands = ->{ {"bg" => Gori::Tui::Theme.bg,
-               "selection_dim" => Gori::Tui::Theme.selection_dim,
-               "accent_bg" => Gori::Tui::Theme.accent_bg} }
+  bands = -> { {"bg"            => Gori::Tui::Theme.bg,
+                "selection_dim" => Gori::Tui::Theme.selection_dim,
+                "accent_bg"     => Gori::Tui::Theme.accent_bg} }
 
   it "never moves a band's luma past ROW_TINT_LUMA, on any theme, hue or band" do
     before = Gori::Tui::Theme.active_name
