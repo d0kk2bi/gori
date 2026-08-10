@@ -88,6 +88,23 @@ private def start_mcp_ws_origin : Int32
   port
 end
 
+# An origin that completes the TCP handshake and then says nothing, so a send_request
+# against it occupies the tools worker until its own idle timeout fires. The socket is held
+# by the fiber for the life of the example (the spec's timeout, not the origin's, ends it).
+private def start_silent_origin : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    conn = origin.accept?
+    sleep 5.seconds
+    conn.try(&.close) rescue nil
+    origin.close rescue nil
+  rescue
+    origin.close rescue nil
+  end
+  port
+end
+
 # One-shot HTTP/1 origin used to verify send_request audit recording, response
 # header redaction, and continuation reads for bodies larger than the MCP cap.
 private def start_mcp_http_origin(body : String, extra_headers = "") : Int32
@@ -199,6 +216,16 @@ private class BrokenInput < IO
   end
 end
 
+# The structuredContent emitter has to answer for shapes no tool in the tree produces
+# today (a bare scalar, a text that is not one whole JSON document) — that is the point of
+# the guard, so it is reachable from here rather than only through whichever tool happens
+# to return the shape this month.
+class Gori::MCP::Server
+  def spec_structured(text : String) : String
+    JSON.build { |j| j.object { emit_structured(j, text) } }
+  end
+end
+
 describe Gori::MCP::Server do
   describe "transport resilience" do
     it "shuts down cleanly (no unhandled error) when the output pipe breaks mid-write" do
@@ -211,6 +238,84 @@ describe Gori::MCP::Server do
           allow_actions: true, verify_upstream: false,
           input: input, output: sink).run
         sink.writes.should eq(1)
+      end
+    end
+
+    # One line that is not valid UTF-8 used to END the process: the JSON parse failed (as
+    # it should), and the id recovery that answers such a line ran a regex over it — PCRE2
+    # refuses a non-UTF-8 subject and raises `ArgumentError`, which nothing on the way out
+    # of `run` caught. The client lost every later answer over one byte it never saw.
+    it "answers a line whose bytes are not valid UTF-8 and keeps serving" do
+      with_store do |store|
+        bad = "\xff\xfe" + %({"jsonrpc":"2.0","id":9,"method":"ping"})
+        bad.valid_encoding?.should be_false # guard the guard: the fixture must really be invalid
+        out = drive(store, bad, INIT)
+        out.size.should eq(2)
+        out[0]["error"]["code"].as_i.should eq(-32700) # answered, correlated…
+        out[0]["id"].as_i.should eq(9)
+        out[1]["result"]["serverInfo"]["name"].as_s.should eq("gori") # …and the session lived on
+      end
+    end
+
+    # structuredContent is copied through from the tool's own JSON text rather than parsed
+    # and rebuilt. These pin the two things the copy has to keep doing: the MCP object shape
+    # (an array payload is wrapped under `items`), and the refusal to emit anything that is
+    # not exactly one JSON document — a raw copy of a half-JSON text would break the frame.
+    it "wraps an array tool payload under items in structuredContent" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oast_presets","arguments":{}}})
+        sc = drive(store, call)[0]["result"]["structuredContent"]
+        sc.as_h.keys.should eq(["items"])
+        sc["items"].as_a.should_not be_empty
+      end
+    end
+
+    it "emits no structuredContent for a text a raw copy could not carry" do
+      server = Gori::MCP::Server.new(nil, allow_actions: false, verify_upstream: false,
+        input: IO::Memory.new, output: IO::Memory.new)
+      server.spec_structured(%({"a":1})).should eq(%({"structuredContent":{"a":1}}))
+      server.spec_structured(%([1,2])).should eq(%({"structuredContent":{"items":[1,2]}}))
+      server.spec_structured("5").should eq(%({"structuredContent":{"value":5}}))
+      server.spec_structured("plain sentence").should eq("{}")
+      server.spec_structured(%({"a":1} and then some)).should eq("{}")
+    end
+
+    # The reader/worker split exists for exactly this: a `ping` is a liveness probe, and a
+    # client whose probe stalls behind a long tool call concludes the server is dead and
+    # kills it mid-work. `SlowInput` holds the stream open past the tool call the way a real
+    # client's idle connection does, so the ping is genuinely concurrent with the tool.
+    it "answers ping while a tool call is still running" do
+      with_store do |store|
+        port = start_silent_origin # accepts, then never answers: send_request waits out its timeout
+        send = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":) +
+               %({"name":"send_request","arguments":{"url":"http://127.0.0.1:#{port}/",) +
+               %("allow_unscoped":true,"timeout_ms":1500}}})
+        started = Time.instant
+        out = drive(store, send, %({"jsonrpc":"2.0","id":2,"method":"ping"}))
+        # The ping came back FIRST — it did not wait out the request in front of it. Before
+        # the reader/worker split this line arrived only after the whole timeout elapsed.
+        out.map { |r| r["id"].as_i }.should eq([2, 1])
+        (Time.instant - started).should be >= 1.second # …and the slow call really was slow
+      end
+    end
+
+    it "drops the response to a request the client cancelled" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"project_info","arguments":{}}})
+        cancel = %({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"timed out"}})
+        # The cancel is read (and recorded) by the reader before the worker gets to id 7.
+        out = drive(store, call, cancel, %({"jsonrpc":"2.0","id":8,"method":"ping"}))
+        out.map { |r| r["id"].as_i }.should eq([8]) # 7's answer suppressed, 8 still served
+      end
+    end
+
+    it "keeps a cancellation for an id it never held from accumulating" do
+      with_store do |store|
+        cancel = %({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"never-sent"}})
+        out = drive(store, cancel, %({"jsonrpc":"2.0","id":"never-sent","method":"ping"}))
+        # A cancel that arrived before (or without) its request must not silence a LATER
+        # request that happens to reuse the id — nothing was pending, so nothing was recorded.
+        out.map { |r| r["id"].as_s }.should eq(["never-sent"])
       end
     end
 
@@ -2585,10 +2690,14 @@ describe Gori::MCP::Server do
 
     it "answers a parse error with id null and keeps serving" do
       with_store do |store|
+        # Correlated by id, not by position: `ping` is answered by the READER, ahead of a
+        # queue it must never wait behind, so it can legitimately overtake the error that
+        # was read before it. JSON-RPC pairs a response to its request by id alone.
         out = drive(store, "{not json", %({"jsonrpc":"2.0","id":1,"method":"ping"}))
-        out[0]["error"]["code"].as_i.should eq(-32700)
-        out[0]["id"].raw.should be_nil
-        out[1]["result"].as_h.should be_empty # loop recovered
+        parse_error = out.find! { |r| r["error"]?.try(&.["code"].as_i) == -32700 }
+        parse_error["id"].raw.should be_nil
+        pong = out.find! { |r| r["id"]?.try(&.as_i?) == 1 }
+        pong["result"].as_h.should be_empty # loop recovered
       end
     end
 
@@ -3173,6 +3282,58 @@ describe "Gori::MCP::Tools unbound mode" do
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(root)
+    end
+  end
+
+  # A project that cannot be OPENED (corrupt db, unreadable projects dir) used to abort the
+  # process before the handshake, which every MCP client reports as one dead "server failed
+  # to start" line — the reason reachable only in a log, and no way for the agent to fix it.
+  # The server now starts unbound CARRYING the reason, so the failure is visible on the
+  # surface the agent reads and the tools that repair it stay reachable.
+  describe "degraded start (bind_error)" do
+    it "names the failure in instructions and in every NO_PROJECT error" do
+      input = IO::Memory.new(%({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_history","arguments":{}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"project_info","arguments":{}}}
+))
+      output = IO::Memory.new
+      Gori::MCP::Server.new(nil, allow_actions: true, verify_upstream: false,
+        selection_source: "unbound", bind_error: "cannot open database /tmp/x.db: file is not a database",
+        input: input, output: output).run
+      lines = output.to_s.each_line.reject(&.strip.empty?).map { |l| JSON.parse(l) }.to_a
+
+      lines[0]["result"]["instructions"].as_s.should contain("file is not a database")
+
+      lines[1]["result"]["isError"].as_bool.should be_true
+      err = lines[1]["result"]["structuredContent"]
+      err["error_code"].as_s.should eq("NO_PROJECT")
+      err["message"].as_s.should contain("file is not a database")
+      err["message"].as_s.should contain("switch_project") # the recovery, still named
+
+      info = JSON.parse(lines[2]["result"]["content"][0]["text"].as_s)
+      info["bound"].as_bool.should be_false
+      info["bind_error"].as_s.should contain("file is not a database")
+    end
+
+    it "stops blaming the failed db once a switch binds a working one" do
+      root = File.tempname("gori-bind-error")
+      Dir.mkdir_p(root)
+      prev = ENV["GORI_HOME"]?
+      ENV["GORI_HOME"] = root
+      reg = Gori::ProjectRegistry.new(Gori::Paths.projects_dir)
+      seeded = reg.create("Seeded")
+      Gori::Store.open(seeded.db_path).close
+
+      tools = Gori::MCP::Tools.new(nil, allow_actions: true, verify_upstream: false,
+        selection_source: "unbound", bind_error: "cannot open database /tmp/x.db: file is not a database")
+      begin
+        tools.call("list_history", JSON.parse("{}")).text.should contain("file is not a database")
+        JSON.parse(tools.call("switch_project", JSON.parse(%({"project":"Seeded"}))).text)["switched"].as_bool.should be_true
+        JSON.parse(tools.call("project_info", JSON.parse("{}")).text)["bind_error"]?.should be_nil
+      ensure
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(root)
+      end
     end
   end
 

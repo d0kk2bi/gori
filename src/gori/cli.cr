@@ -1084,13 +1084,13 @@ module Gori
       Log.setup(:info, Log::IOBackend.new(STDERR))
       Settings.load # send_request's repeater engines read the upstream-proxy setting from here
 
-      selection = if no_project
-                    MCP::ProjectResolver::Selection.new(nil, nil, nil, "unbound")
-                  else
-                    resolve_mcp_project(db_path, project,
-                      workspace_project: !use_active_project,
-                      allow_active_fallback: use_active_project)
-                  end
+      selection, bind_error = if no_project
+                                {MCP::ProjectResolver::Selection.new(nil, nil, nil, "unbound"), nil}
+                              else
+                                resolve_mcp_project(db_path, project,
+                                  workspace_project: !use_active_project,
+                                  allow_active_fallback: use_active_project)
+                              end
       project_name = selection.project_name
       project_slug = selection.project_slug
       project_id = selection.project_id
@@ -1099,7 +1099,8 @@ module Gori
         Log.info { "mcp: unbound (no project); use list_projects / create_project / switch_project (actions=#{!read_only})" }
         server = MCP::Server.new(nil, allow_actions: !read_only, verify_upstream: !insecure_upstream,
           project_name: nil, project_slug: nil, db_path: nil,
-          selection_source: selection.source, workspace_root: nil, project_id: nil)
+          selection_source: selection.source, workspace_root: nil, project_id: nil,
+          bind_error: bind_error)
         server.run
         return
       end
@@ -1112,13 +1113,25 @@ module Gori
         Log.warn { "mcp: no source workspace or explicit selector — defaulting via #{selection.source} to #{resolved}" }
       end
 
-      # Opening a non-SQLite / unreadable file raises deep in the driver; turn that
-      # into a clean error instead of an unhandled backtrace (parity with `gori run`).
+      # Opening a non-SQLite / unreadable file raises deep in the driver. Aborting here
+      # would kill the process BEFORE the handshake, and every MCP client reports that as
+      # "the server failed to start" — the reason lands in a log the agent cannot read and
+      # the human rarely opens. So degrade to the unbound mode this server already has:
+      # the handshake succeeds, the reason rides on `instructions` and on every NO_PROJECT
+      # tool error, and list_projects / switch_project — the very tools that fix it — stay
+      # reachable. A dead server can only be repaired by hand; a degraded one repairs itself.
       store =
         begin
           Store.open(resolved, events: nil, retention_flows: Store::RETENTION_UNLIMITED) # never prune the user's history
         rescue ex : DB::Error | SQLite3::Exception
-          abort "gori mcp: cannot open database #{resolved}: #{ex.message.presence || "not a valid SQLite database (or unreadable)"}"
+          reason = "cannot open database #{resolved}: #{ex.message.presence || "not a valid SQLite database (or unreadable)"}"
+          Log.error { "mcp: #{reason}; starting unbound" }
+          server = MCP::Server.new(nil, allow_actions: !read_only, verify_upstream: !insecure_upstream,
+            project_name: nil, project_slug: nil, db_path: nil,
+            selection_source: "unbound", workspace_root: nil, project_id: nil,
+            bind_error: reason)
+          server.run
+          return
         end
       Log.warn { "mcp: #{resolved} has no captured flows (empty database)" } if store.count.zero?
       begin
@@ -1164,12 +1177,23 @@ module Gori
       abort "Failed to install MCP config: #{ex.message.presence || ex.class}"
     end
 
+    # The selection, plus the reason it could not be made. A resolution failure is a
+    # RUNTIME condition — a project renamed since the client config was written, a db moved
+    # out from under `--db`, a HOME the process cannot write — not a usage error, and this
+    # process is not run by a human who would see an abort: it is spawned by an agent
+    # client that reports a non-starting server as one dead line. So NOTHING here aborts;
+    # the caller starts unbound carrying the reason (see the store-open path above).
+    # The rescue is deliberately blanket: `Paths.ensure_dirs` and the registry read can
+    # raise `File::Error` too, and an unhandled backtrace is the same dead server with a
+    # worse message.
     private def self.resolve_mcp_project(db : String?, project : String?, *, workspace_project : Bool,
-                                         allow_active_fallback : Bool) : MCP::ProjectResolver::Selection
-      MCP::ProjectResolver.resolve(db, project, workspace_project: workspace_project,
-        allow_active_fallback: allow_active_fallback)
-    rescue ex : MCP::ProjectResolver::Error | Gori::Error
-      abort "gori mcp: #{ex.message}"
+                                         allow_active_fallback : Bool) : {MCP::ProjectResolver::Selection, String?}
+      {MCP::ProjectResolver.resolve(db, project, workspace_project: workspace_project,
+        allow_active_fallback: allow_active_fallback), nil}
+    rescue ex
+      reason = ex.message.presence || ex.class.name
+      Log.error { "mcp: #{reason}; starting unbound" }
+      {MCP::ProjectResolver::Selection.new(nil, nil, nil, "unresolved"), reason}
     end
 
     private def self.run_update(args : Array(String)) : Nil
