@@ -123,6 +123,9 @@ module Gori
         @db_path = proj.db_path
         @workspace_root = reg.workspace_of(proj)
         @selection_source = source
+        # The start-up bind failure is history now — a later NO_PROJECT (after a switch to
+        # another broken project, say) must not still blame the db we just moved off.
+        @bind_error = nil
         # Same REPLACEMENT discipline as the binding layer below: the loader assigns every
         # network property including nil, so a project with no pinned upstream does not
         # inherit the previous project's jump host (#538).

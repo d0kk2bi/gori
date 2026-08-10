@@ -215,10 +215,14 @@ module Gori
 
       # Tools may start *unbound* (`store` nil): project lifecycle + pure-compute tools
       # work immediately; traffic/action tools return NO_PROJECT until switch/create binds a DB.
+      # `bind_error` is set when the process WANTED a project and could not open it (a
+      # corrupt/absent db, an unreadable projects dir). It only ever accompanies an unbound
+      # start, and it is cleared the moment a bind succeeds — see `bind_project`.
       def initialize(@store : Store?, @allow_actions : Bool, @verify_upstream : Bool,
                      @project_name : String? = nil, @project_slug : String? = nil,
                      @db_path : String? = nil, @selection_source : String? = nil,
-                     @workspace_root : String? = nil, @project_id : String? = nil)
+                     @workspace_root : String? = nil, @project_id : String? = nil,
+                     @bind_error : String? = nil)
         # The binding table (#501) is built ONCE per bound project and kept, not rebuilt per
         # call: an MCP server is long-lived and IS an extraction source — `send_request` goes
         # through `Repeater::Sender`, so a `$SESSION` bound by a login here has to still be
@@ -305,7 +309,16 @@ module Gori
         "oast_presets", "oast_start", "oast_poll", "oast_payload", "oast_stop",
       }
 
+      # Unbound because the START-UP bind FAILED reads differently from unbound by design:
+      # naming the failure here is the only place an agent (which never sees our stderr)
+      # can learn that its configured project is broken rather than merely unselected —
+      # and the recovery is the same one sentence either way.
       private def no_project : Result
+        if reason = @bind_error
+          return err("no project bound — the configured project could not be opened: #{reason}. " \
+                     "Call list_projects, then switch_project (or create_project) to continue.",
+            "NO_PROJECT")
+        end
         err("no project bound; call list_projects, create_project, or switch_project first",
           "NO_PROJECT")
       end

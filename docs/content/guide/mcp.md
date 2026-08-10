@@ -45,6 +45,8 @@ With no explicit selector, gori discovers the nearest Git root and binds its can
 
 **Outside a Git workspace** (the common case when an AI client spawns MCP from a home or app directory), the server starts **unbound**: the MCP handshake and tool list succeed immediately, but traffic tools (`list_history`, `send_request`, …) return `NO_PROJECT` until the agent calls `list_projects`, `create_project` (auto-binds when unbound), or `switch_project`. Unbound mode never silently opens the active TUI or MRU project — that requires the explicit `--use-active-project` opt-in (or `--project` / `--db` / `GORI_MCP_PROJECT` / `GORI_MCP_DB`).
 
+**If the selected project cannot be opened** — a database that is missing, corrupt, or unreadable, a project name that no longer exists — the server still completes the handshake and starts unbound rather than exiting. The reason is written to stderr, repeated in the handshake `instructions`, returned with every `NO_PROJECT` tool error, and reported as `bind_error` by `project_info`, so the agent can call `list_projects` and `switch_project` to recover without a restart.
+
 Call `project_info` before using data. It reports `bound`, the selected project, database path, workspace root, and selection source.
 
 ## Read-Only Mode
@@ -161,6 +163,10 @@ The mutating half (`intercept_forward`, `intercept_forward_edit`, `intercept_dro
 Agent actions are visible, not silent. Each one lands in the notification center tagged as coming from an agent, rendered differently from your own actions, so you can see what a co-pilot did to traffic while you were reading another tab.
 
 One safety rule is worth knowing before you leave an agent running. A held message normally waits forever for a human decision, which is what you want when you are the only one at the keyboard. Once an agent attaches to the intercept queue in that session, gori arms a 30 second auto-forward for items nobody is watching, so a client that dies mid-hold cannot wedge the connection indefinitely. A session with no agent attached never auto-forwards.
+
+## One Call at a Time
+
+Tools run one at a time, in the order they arrive — a fuzz or a slow `send_request` does not overlap with the next call, and responses come back in order. Two messages are answered immediately regardless: `ping`, so a client's liveness probe never stalls behind a long call and declares the server dead, and `notifications/cancelled`, which suppresses the response to a request you stopped waiting for. Cancelling does not abort work already in flight — an in-progress request finishes, its answer is simply not sent.
 
 ## Why an MCP Seam
 

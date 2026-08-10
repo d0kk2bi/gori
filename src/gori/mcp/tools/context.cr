@@ -49,6 +49,14 @@ module Gori
               if ea = s.earliest_created_at
                 j.field "earliest_created_at_iso", Serialize.unix_micros_iso(ea)
               end
+            elsif reason = @bind_error
+              # Unbound because the configured project FAILED to open, not because none was
+              # chosen. project_info is the tool an agent calls to orient itself, so the
+              # distinction (and the reason) belongs in its answer as a field, not only in
+              # the prose note.
+              j.field "bind_error", reason
+              j.field "note", "The configured project could not be opened (#{reason}). " \
+                              "Call list_projects, then switch_project or create_project."
             else
               j.field "note", "No project bound. Call list_projects, create_project, or switch_project before traffic tools."
             end

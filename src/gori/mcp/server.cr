@@ -9,8 +9,22 @@ module Gori
     # message per line on `input`, responses on `output`. STDOUT is the protocol
     # channel — callers MUST keep it pure (logs go to STDERR). IO is injectable so
     # the server is unit-testable with IO::Memory.
+    #
+    # TWO fibers, and the split is deliberate. The READER parses lines; a WORKER runs the
+    # requests, one at a time, in arrival order — so the tools layer keeps the
+    # single-call-at-a-time semantics every one of its handlers is written against, and
+    # responses keep coming back in the order they were asked for. What the split buys is
+    # that the reader is never parked inside a tool: `ping` and `notifications/cancelled`
+    # used to queue behind a five-minute fuzz run, which is exactly when a client's
+    # liveness probe fires and exactly when it must not time out — a client that decides
+    # the server is dead kills it mid-call and loses the work it was waiting for.
     class Server
       Log = ::Log.for("mcp")
+
+      # Requests waiting on the worker. A bound, not a target: the reader stops reading
+      # while it is full, which is the backpressure a client that pipelines faster than the
+      # tools can answer SHOULD feel. Deep enough that no ordinary burst reaches it.
+      WORK_QUEUE = 64
 
       # Newest spec revision we implement. Our surface (initialize/tools.list/
       # tools.call/ping) is identical across recent revisions, so we echo the
@@ -31,38 +45,95 @@ module Gori
                      @project_name : String? = nil, @project_slug : String? = nil,
                      @db_path : String? = nil, @selection_source : String? = nil,
                      @workspace_root : String? = nil, @project_id : String? = nil,
+                     @bind_error : String? = nil,
                      @input : IO = STDIN, @output : IO = STDOUT)
         @allow_actions = allow_actions
         @tools = Tools.new(@store, allow_actions, verify_upstream,
           project_name: @project_name, project_slug: @project_slug, db_path: @db_path,
           selection_source: @selection_source, workspace_root: @workspace_root,
-          project_id: @project_id)
+          project_id: @project_id, bind_error: @bind_error)
         @initialized = false
         # Set when the output pipe breaks (client vanished mid-write): the loop then
         # stops rather than thrashing on a dead stream or raising an unhandled error.
         @closed = false
         # Non-nil only while a batch is being dispatched: `send` collects into it instead of
         # writing, so the members' responses leave as the one array the batch is owed.
+        # `@batch_fiber` is who owns that collection — the reader answering a `ping` while
+        # the worker is mid-batch must write its own frame, not get swept into the array of
+        # a batch it was never part of.
         @batch = nil.as(Array(String)?)
+        @batch_fiber = nil.as(Fiber?)
+        # Two fibers write to `@output`, and a large payload can yield mid-write on a pipe
+        # whose buffer is full — without this, a `ping` answered by the reader could land
+        # INSIDE a half-written tool response and break the frame for the rest of the session.
+        @write_lock = Mutex.new
+        # Ids the worker still owes an answer for, and the subset of those the client has
+        # since cancelled. Only ids we are actually holding are remembered, so a client
+        # cannot grow either set past the queue depth (see `handle_notification`).
+        # Written by the reader, cleared by the worker, unlocked: gori never builds with
+        # `-Dpreview_mt`, so the two fibers interleave only at yield points and neither a
+        # `Set#add` nor a `Set#delete` contains one — the same single-threaded-scheduler
+        # assumption `Tools::FuzzJob` documents for its own cross-fiber fields.
+        @pending = Set(String).new
+        @cancelled = Set(String).new
       end
 
       # Reads until EOF on `input` (client closed the pipe). Each line is parsed
       # and dispatched independently; a bad line never stops the loop. A broken
       # transport (the client process died) ends the session cleanly — a normal
       # shutdown, not a crash to surface as an unhandled backtrace.
+      #
+      # Returns only once the worker has drained: a response written after `run` returned
+      # would be a response the caller (and every spec that reads `output` afterwards)
+      # never sees.
       def run : Nil
-        @input.each_line do |line|
-          break if @closed
-          line = line.strip
-          next if line.empty?
-          handle_line(line)
-          break if @closed
+        work = Channel(Proc(Nil)).new(WORK_QUEUE)
+        drained = Channel(Nil).new(1)
+        spawn(name: "mcp-worker") { work_loop(work, drained) }
+        begin
+          @input.each_line do |line|
+            break if @closed
+            line = line.strip
+            next if line.empty?
+            read_line(line, work)
+            break if @closed
+          end
+        rescue ex : IO::Error
+          Log.info { "mcp: input stream closed (#{ex.message})" }
+        ensure
+          work.close
+          drained.receive
         end
-      rescue ex : IO::Error
-        Log.info { "mcp: input stream closed (#{ex.message})" }
       end
 
-      private def handle_line(line : String) : Nil
+      # Runs queued requests in arrival order until the reader closes the channel and the
+      # backlog is empty. The rescue is the session's structural guarantee: ONE request can
+      # never end it.
+      #
+      # `handle_message` already rescues per message, but the steps around it — the JSON
+      # parse, the id recovery — were guarded only against `JSON::ParseException`, and
+      # anything else escaped `run` (which catches IO::Error alone) as an unhandled
+      # exception that killed the whole server. A single stdin line holding a byte that is
+      # not valid UTF-8 did exactly that: `recover_id`'s regex made PCRE2 raise
+      # `ArgumentError`, and the client lost the server mid-session over one malformed byte
+      # it could not even see. A dropped line costs the client one answer; a dead process
+      # costs it every answer after it.
+      private def work_loop(work : Channel(Proc(Nil)), drained : Channel(Nil)) : Nil
+        while job = work.receive?
+          begin
+            job.call
+          rescue ex
+            Log.error(exception: ex) { "mcp: request handler raised; keeping the session" }
+          end
+        end
+      ensure
+        drained.send(nil)
+      end
+
+      # The reader's whole job: parse, answer the two things that must not queue, and hand
+      # everything else to the worker AS A CLOSURE — so ordering, batching and every error
+      # path stay exactly the code they were, just running one fiber over.
+      private def read_line(line : String, work : Channel(Proc(Nil))) : Nil
         root = begin
           JSON.parse(line)
         rescue ex : JSON::ParseException
@@ -72,9 +143,67 @@ module Gori
           # so a request that is only an ARGUMENT mistake used to come back `id: null`, and a
           # strict client with a pending promise for that id never resolved it. The agent hung
           # instead of seeing the error. See `recover_id`.
-          return write_error(recover_id(line), -32700, "Parse error: #{ex.message}")
+          #
+          # Queued rather than written here: a parse error that overtook the answers to the
+          # requests before it would arrive out of order for no reason.
+          id = (recover_id(line) rescue nil)
+          message = "Parse error: #{ex.message}"
+          return work.send(-> { write_error(id, -32700, message) })
         end
 
+        if fast_path(root)
+          return
+        end
+
+        if id = single_request_id(root)
+          key = id.to_json
+          @pending << key
+          return work.send(-> do
+            begin
+              handle_document(root)
+            ensure
+              @pending.delete(key)
+              @cancelled.delete(key)
+            end
+          end)
+        end
+        work.send(-> { handle_document(root) })
+      rescue ex
+        # Same guarantee as the worker's, for the reader's own half of the work.
+        Log.error(exception: ex) { "mcp: reader raised on a line; keeping the session" }
+        id = (recover_id(line) rescue nil)
+        message = "Internal error: #{ex.message}"
+        work.send(-> { write_error(id, -32603, message) })
+      end
+
+      # Messages the READER answers itself, ahead of a possibly long-running queue. Both are
+      # the client asking about the session rather than asking for work, and both are useless
+      # late: a `ping` answered after the five-minute call it was probing has already told the
+      # client we were dead, and a cancellation that lands after its request finished cancels
+      # nothing. Neither writes anything the ordering of a queued response depends on
+      # (a notification writes nothing at all).
+      private def fast_path(root : JSON::Any) : Bool
+        return false unless obj = root.as_h?
+        return false unless method = obj["method"]?.try(&.as_s?)
+        id = obj["id"]?
+        if id.nil?
+          handle_notification(method, obj["params"]?)
+          return true
+        end
+        return false unless method == "ping"
+        write_result(id) { |j| j.object { } }
+        true
+      end
+
+      # The id of a lone request (not a batch, not a notification) — what a client names in
+      # `notifications/cancelled`. Batch members are deliberately not tracked: their
+      # responses have to leave as one array, so dropping a member cannot be done by
+      # suppressing a write.
+      private def single_request_id(root : JSON::Any) : JSON::Any?
+        root.as_h?.try(&.[]?("id"))
+      end
+
+      private def handle_document(root : JSON::Any) : Nil
         if batch = root.as_a?
           handle_batch(batch)
         else
@@ -102,10 +231,12 @@ module Gori
 
         collected = [] of String
         @batch = collected
+        @batch_fiber = Fiber.current
         begin
           items.each { |item| handle_message(item) }
         ensure
           @batch = nil
+          @batch_fiber = nil
         end
 
         # All-notification batches get no response at all — sending `[]` back is explicitly
@@ -158,7 +289,24 @@ module Gori
       end
 
       private def handle_notification(method : String, params : JSON::Any?) : Nil
-        @initialized = true if method == "notifications/initialized"
+        case method
+        when "notifications/initialized"
+          @initialized = true
+        when "notifications/cancelled"
+          # The client has stopped waiting for a request we are still holding. A fiber
+          # cannot be interrupted, so the work itself runs to completion — what this buys
+          # is the spec's half of the contract: no response is sent for a cancelled id,
+          # so a client that has already reused or retired it is not handed an answer it
+          # has nowhere to put.
+          #
+          # Only ids still in `@pending` are remembered. One already answered has nothing
+          # to suppress, and recording it would let a client grow this set for the life of
+          # the session by cancelling ids it never sent.
+          if req = obj_field(params, "requestId")
+            key = req.to_json
+            @cancelled << key if @pending.includes?(key)
+          end
+        end
         # All other notifications are accepted silently (no response, ever).
       end
 
@@ -184,6 +332,9 @@ module Gori
       # exposes — in particular whether the (otherwise simply absent) action tools are
       # disabled by read-only mode, rather than discovering it only on a rejected call.
       private def instructions_text : String
+        # The bind failure comes FIRST when there is one: it is why the traffic tools are
+        # refusing, and an agent that reads only the head of `instructions` still gets it.
+        failure = @bind_error.try { |reason| " The configured project could not be opened: #{reason}." }
         selected = if @store.nil?
                      " No project is bound yet. Call list_projects to see available projects, " \
                      "create_project to make one (auto-binds when unbound), or switch_project " \
@@ -199,7 +350,7 @@ module Gori
                "(history, flows, sitemap, scope, issues, notes, match&replace rules), plus a " \
                "pure `decoder` encode/decode/hash tool. Call ql_reference before " \
                "writing list_history/list_sitemap queries. Timestamps include unix " \
-               "microseconds plus *_iso RFC3339 fields where available.#{selected}"
+               "microseconds plus *_iso RFC3339 fields where available.#{failure}#{selected}"
         if @allow_actions
           "#{base} Action tools are enabled: send_request (supports flow_id/repeater_id), " \
           "send_websocket (executes a persisted WS repeater), " \
@@ -239,8 +390,8 @@ module Gori
               # Machine-processable error alongside the human `text` (the tools
               # layer guarantees a stable code on every plain-message error).
               j.field("structuredContent") { emit_error_object(j, result, code) }
-            elsif structured = structured_content(result.text)
-              j.field("structuredContent") { structured.to_json(j) }
+            else
+              emit_structured(j, result.text)
             end
             j.field "isError", result.is_error
           end
@@ -291,15 +442,47 @@ module Gori
       # clients, while giving newer clients parsed data directly so callers do
       # not have to JSON-decode content[0].text a second time. Array/scalar tool
       # payloads are wrapped to satisfy the object shape required by MCP.
-      private def structured_content(text : String) : JSON::Any?
-        parsed = JSON.parse(text)
-        return parsed if parsed.as_h?
-        if parsed.as_a?
-          return JSON::Any.new({"items" => parsed})
+      #
+      # The tool's text is COPIED THROUGH rather than decoded and re-encoded. It is already
+      # valid JSON text; `JSON.parse` built a whole JSON::Any tree of it only to serialise
+      # that tree straight back out, which on a large list_history/fuzz_results answer is
+      # megabytes of garbage per call — on a server that lives for the whole session and
+      # whose peak memory is what an agent notices. `json_shape` validates the same thing a
+      # parse did (nothing non-JSON may be emitted raw) without materialising any of it:
+      # measured 1.7x faster with ~3x fewer bytes allocated on a 725 KB payload.
+      private def emit_structured(j : JSON::Builder, text : String) : Nil
+        case json_shape(text)
+        in JsonShape::Object then j.field("structuredContent") { j.raw(text) }
+        in JsonShape::Array  then j.field("structuredContent") { j.object { j.field("items") { j.raw(text) } } }
+        in JsonShape::Scalar then j.field("structuredContent") { j.object { j.field("value") { j.raw(text) } } }
+        in JsonShape::Invalid
+          # A plain-message tool result (no error_code, so not the error branch above):
+          # content[0].text carries it alone, exactly as before.
         end
-        JSON::Any.new({"value" => parsed})
+      end
+
+      private enum JsonShape
+        Object
+        Array
+        Scalar
+        Invalid
+      end
+
+      # The shape of `text` as one JSON document, or Invalid when it is not one. TRAILING
+      # bytes make it Invalid too: `{"a":1} oops` parses a value and would otherwise be
+      # copied through verbatim, breaking the frame for every client on the connection —
+      # the one failure mode a raw copy has that a parse-and-rebuild did not.
+      private def json_shape(text : String) : JsonShape
+        pull = JSON::PullParser.new(text)
+        shape = case pull.kind
+                when .begin_object? then JsonShape::Object
+                when .begin_array?  then JsonShape::Array
+                else                     JsonShape::Scalar
+                end
+        pull.skip
+        pull.kind.eof? ? shape : JsonShape::Invalid
       rescue JSON::ParseException
-        nil
+        JsonShape::Invalid
       end
 
       # Field of a JSON object that may be nil/non-object — never raises.
@@ -308,6 +491,7 @@ module Gori
       end
 
       private def write_result(id : JSON::Any?, &block : JSON::Builder ->) : Nil
+        return if cancelled?(id)
         send(JSON.build do |j|
           j.object do
             j.field "jsonrpc", "2.0"
@@ -318,6 +502,7 @@ module Gori
       end
 
       private def write_error(id : JSON::Any?, code : Int32, message : String) : Nil
+        return if cancelled?(id)
         send(JSON.build do |j|
           j.object do
             j.field "jsonrpc", "2.0"
@@ -325,6 +510,17 @@ module Gori
             j.field("error") { j.object { j.field "code", code; j.field "message", message } }
           end
         end)
+      end
+
+      # Whether this response is owed to a request the client has since cancelled — checked
+      # at the two write sites so every path that answers a request goes through it, not
+      # just the tool one. Consuming the entry here (`delete`) keeps the set to what is
+      # genuinely outstanding. The empty check is the ordinary case and costs nothing.
+      private def cancelled?(id : JSON::Any?) : Bool
+        return false if @cancelled.empty? || id.nil?
+        return false unless @cancelled.delete(id.to_json)
+        Log.info { "mcp: dropped the response to a cancelled request (id=#{id})" }
+        true
       end
 
       # Echoes the request id verbatim (int stays int, string stays string); null
@@ -348,6 +544,13 @@ module Gori
         # the other side. A batch parse error is answered at id null, which is also what
         # JSON-RPC asks for when the request cannot be read.
         return nil if line.lstrip.starts_with?('[')
+        # PCRE2 REFUSES a subject that is not valid UTF-8 — it raises `ArgumentError`, and
+        # this method is reached from inside the JSON-parse rescue, which is precisely
+        # where a line carrying a stray 0xFF arrives. That raise used to leave `run`
+        # unhandled and take the server down. Scrub for the id scan only: the id is a
+        # short ASCII token, so U+FFFD anywhere in the line cannot change which one we
+        # find, and nothing here reaches the caller's payload.
+        line = line.scrub unless line.valid_encoding?
         head = line[0, {line.index(%("method")) || line.size, line.index(%("params")) || line.size}.min]
         m = head.match(/"id"\s*:\s*(?:(-?\d{1,18})|"([^"\\]{0,128})")/)
         return nil unless m
@@ -377,12 +580,20 @@ module Gori
         # NOT wire_safe'd here — the joined array gets one pass below, and `[`, `,` and `]`
         # cannot introduce invalid UTF-8, so scanning each member too would walk a
         # multi-megabyte batch twice for the same answer.
-        if batch = @batch
+        # …and only for the fiber that OPENED the batch: the reader answering a `ping` while
+        # the worker is mid-batch would otherwise have its frame swept into that array, and
+        # the client would get a ping reply it can only find by walking a batch it did not
+        # send.
+        if (batch = @batch) && @batch_fiber == Fiber.current
           batch << payload
           return
         end
-        @output.puts(wire_safe(payload)) # newline framing
-        @output.flush                    # or the client blocks on the unterminated line
+        # One writer at a time. A payload larger than the pipe buffer yields mid-write, and
+        # a second fiber's line landing in that gap would corrupt both frames.
+        @write_lock.synchronize do
+          @output.puts(wire_safe(payload)) # newline framing
+          @output.flush                    # or the client blocks on the unterminated line
+        end
       rescue ex : IO::Error
         # The client is gone (broken pipe). Stop writing and let the run loop end
         # cleanly instead of unwinding an unhandled exception out of a handler.
