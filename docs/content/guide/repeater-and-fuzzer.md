@@ -11,7 +11,7 @@ Once you've captured an interesting flow, **Repeater** and the **Fuzzer** are wh
 
 ## Repeater
 
-Repeater is a request workbench, like a repeater. Send a flow to it, edit any part of the request, and re-send. The response, timing, and a diff against the previous response are shown side by side. Sessions persist with the project, so you can come back to them later.
+Repeater is a request workbench. Send a flow to it, edit any part of the request, and re-send. The response, timing, and a diff against the previous response are shown side by side. Sessions persist with the project, so you can come back to them later.
 
 <figure class="tui-shot">
   <img src="/images/tui/repeater.svg" alt="gori Repeater tab with an editable HTTP/2 request pane, a response pane showing headers and a JSON body, and a replayed 200 in 1152ms status line">

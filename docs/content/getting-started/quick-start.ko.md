@@ -89,7 +89,7 @@ gori는 요청 시 루트로부터 호스트별 리프 인증서를 발급하므
 | **커맨드 팔레트** | `Ctrl-P` | 앱 전역 제어: 설정, Open browser, Export CA, 이동 동작 등 전역적인 모든 것 |
 | **space 메뉴** | `Space` | 지금 포커스를 가진 대상에 대한 동작(History 행, 상세 패널, Repeater, …) |
 
-팔레트는 도구 전체의 지도입니다. space 메뉴는 *이* 패널의 지도입니다. 둘 다 키 힌트를 보여주니, 코드를 잊었으면 둘 중 하나를 여세요.
+팔레트는 도구 전체의 지도입니다. space 메뉴는 *이* 패널의 지도입니다. 둘 다 키 힌트를 보여주니, 키 조합이 기억나지 않으면 둘 중 하나를 여세요.
 
 <figure class="tui-shot">
   <img src="/images/tui/command-palette.svg" alt="History 탭 위에 열린 gori 커맨드 팔레트로, 필터 상자와 함께 설정, 이동, 내보내기 동작을 나열한다">
@@ -106,7 +106,7 @@ gori는 요청 시 루트로부터 호스트별 리프 인증서를 발급하므
 
 ## 4. TUI 이동하기 {#4-move-around-the-tui}
 
-gori는 탭의 한 줄입니다. 기본 순서는 Project → Target → **History** → Intercept → Repeater → Fuzzer → … 로 시작합니다.
+gori의 화면은 한 줄로 늘어선 탭입니다. 기본 순서는 Project → Target → **History** → Intercept → Repeater → Fuzzer → … 로 시작합니다.
 
 | 키 | 동작 |
 |-----|--------|
@@ -179,12 +179,12 @@ method:POST body:password
 이제 핵심 루프를 갖췄습니다. 여기서 나아갈 몇 가지 방향이며, 각각 [가이드](/ko/guide/)에서 깊이 다룹니다:
 
 - **파라미터 퍼징.** 플로우를 선택하고 `Shift-I`로 **Fuzzer**에 보낸 뒤, 위치를 표시하고(`Ctrl-A`가 흔한 파라미터를 자동 표시), 워드리스트를 붙이고 `Ctrl-R`로 실행합니다. [Repeater & Fuzzer](/ko/guide/repeater-and-fuzzer/)를 보세요.
-- **진행 중 인터셉트와 편집.** `i`를 눌러 일치하는 요청을 잡아 두고, 계속 진행되기 전에 forward, drop, 또는 수정합니다. [Proxy & History](/ko/guide/proxy/#intercept)를 보세요.
+- **오가는 도중에 잡아 편집하기.** `i`를 눌러 일치하는 요청을 잡아 두고, 계속 진행되기 전에 forward, drop, 또는 수정합니다. [Proxy & History](/ko/guide/proxy/#intercept)를 보세요.
 - **찾은 것 추적하기.** 보고할 가치가 있는 것은 `Shift-F`로 **Issue**로 만들고, 둘러보는 동안 **Probe** 탭에서 패시브 결과를 읽으세요. [Scanning & Issues](/ko/guide/scanning/)를 보세요.
 
 ## Day-1 키 맵 {#day-1-key-map}
 
-코드가 손에 익을 때까지 이 표를 가까이 두세요:
+키 조합이 손에 익을 때까지 이 표를 가까이 두세요:
 
 | 키 | 위치 | 동작 |
 |-----|--------|--------|
@@ -210,7 +210,7 @@ gori wizard
 
 바인드 단계는 `settings.json`의 공유 기본값을 설정합니다. Preferences → **Network & Tabs** → **Network**와 같은 계층입니다. 프로젝트별 잠금이 아니며, 필요하면 Project 탭에서 평가마다 다른 주소를 고정하세요.
 
-마지막 **Review** 스텝은 선택한 값을 요약하며, 편집 가능한 행이 하나 있습니다 — **Shortcuts**입니다. `←`/`→`로 gori 내장 코드 패밀리(`^P` `^N` `^W` `^1-9`)의 모디파이어를 `Ctrl`과 `Option (⌥)` 사이에서 전환합니다. Option을 고르면 Ctrl을 대체하는 게 아니라 `⌥` 별칭이 *추가*됩니다 — 터미널이나 멀티플렉서가 Ctrl 형태를 전달하지 않을 때 유용합니다. macOS의 Option-as-Meta 요구사항은 [커맨드 모디파이어](/ko/guide/hotkeys/#command-modifier)를 참고하세요.
+마지막 **Review** 스텝은 선택한 값을 요약하며, 편집 가능한 행이 하나 있습니다 — **Shortcuts**입니다. `←`/`→`로 gori 내장 키 조합 패밀리(`^P` `^N` `^W` `^1-9`)의 모디파이어를 `Ctrl`과 `Option (⌥)` 사이에서 전환합니다. Option을 고르면 Ctrl을 대체하는 게 아니라 `⌥` 별칭이 *추가*됩니다 — 터미널이나 멀티플렉서가 Ctrl 형태를 전달하지 않을 때 유용합니다. macOS의 Option-as-Meta 요구사항은 [커맨드 모디파이어](/ko/guide/hotkeys/#command-modifier)를 참고하세요.
 
 ## 가이드 UI 투어 {#guided-ui-tour}
 
@@ -233,4 +233,4 @@ gori tutorial
 - [Proxy & History](/ko/guide/proxy/): 캡처, 인터셉트, 스코프, 가져오기, match & replace
 - [Repeater & Fuzzer](/ko/guide/repeater-and-fuzzer/): 테스트 워크벤치와 env 토큰
 - [Query Language](/ko/reference/query-language/): 전체 필터 문법
-- [Hotkeys](/ko/guide/hotkeys/): 위의 코드를 원하는 대로 재지정
+- [Hotkeys](/ko/guide/hotkeys/): 위의 키 조합을 원하는 대로 재지정
