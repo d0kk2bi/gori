@@ -65,6 +65,21 @@ describe Gori::Discover::Fingerprint do
       end
     end
 
+    # `tokens` changed ROLE with the bit-sliced accumulator. It used to bound the loop and
+    # nothing else, so miscounting it was invisible; it is now the DENOMINATOR every output bit
+    # is decided against (`2 * ones > tokens`). A token that is counted but never folded in —
+    # the shape a `tokens += 1` that drifted above the `dynamic?` guard would produce — inflates
+    # the denominator without contributing any ones, and silently clears every contested bit.
+    #
+    # Nothing else here catches that: the all-dynamic body below answers 0 either way, and the
+    # majority cases hold no dynamic tokens at all.
+    it "counts only the tokens it folds in, so a skipped one cannot move the majority" do
+      # 200 `alpha` against 199 `bravo`, with an all-digit token after each — `dynamic?` drops
+      # those, so the denominator is 399 and not 798.
+      body = (("alpha 12345 " * 200) + ("bravo 67890 " * 199)).to_slice
+      FP.simhash(body).should eq(FP.simhash("alpha".to_slice))
+    end
+
     it "counts a body with no scannable token as empty" do
       FP.simhash(Bytes.new(0)).should eq(0_u64)
       FP.simhash("   ---   ".to_slice).should eq(0_u64)

@@ -183,13 +183,17 @@ rng = Random.new(20260811)
   body = Bytes.new(size) { rng.rand(256).to_u8 }
   raise "simhash disagrees on random body ##{i} (#{size}B)" unless Fingerprint.simhash(body) == Legacy.simhash(body)
 end
-# Bodies made ONLY of the token classes the filter reacts to.
+# Bodies made ONLY of the token classes the filter reacts to — plus the one that crosses
+# MAX_TOKENS. The corpus above tops out around 20k tokens (`"x" * 199_999` is ONE token, and
+# the all-digit / long-hex strings yield none), so nothing else reaches the truncation, and it
+# is the one input where the `tokens` denominator meets an early exit.
 ["", "0123456789", "deadbeefcafebabe", "a", ("z" * 400), ("1234 " * 500), ("////" * 500),
- ("DEADBEEFCAFE" * 100), ("x" * 199_999 + " y")].each do |s|
+ ("DEADBEEFCAFE" * 100), ("x" * 199_999 + " y"), ("ab " * (Fingerprint::MAX_TOKENS + 1)),
+ ("ab cd 42 " * (Fingerprint::MAX_TOKENS // 2))].each do |s|
   b = s.to_slice
   raise "simhash disagrees on #{s.bytesize}B edge body" unless Fingerprint.simhash(b) == Legacy.simhash(b)
 end
-puts "simhash == legacy on #{CORPUS.size} corpus bodies + 2000 random + 9 edge bodies"
+puts "simhash == legacy on #{CORPUS.size} corpus bodies + 2000 random + 11 edge bodies (incl. past MAX_TOKENS)"
 
 HAMMING_PAIRS = Array.new(4096) { |i| {Random.new(i).rand(UInt64), Random.new(i + 99_991).rand(UInt64)} }
 HAMMING_PAIRS.each do |a, b|
