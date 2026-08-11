@@ -69,8 +69,10 @@ module Gori
             j.field "tag", tag.presence
             j.field "cleared", tag.empty?
             j.field "matches_endpoint", matched
-            unless matched || tag.empty?
+            if matched == false && !tag.empty?
               j.field "warning", "no captured endpoint at #{host}#{path} — this tag will not show in list_sitemap or the TUI until one exists (check for a typo or a trailing slash)"
+            elsif matched.nil? && !tag.empty?
+              j.field "warning", "tag stored, but there are more than #{Store::SITEMAP_MAX} captured endpoints so it could not be confirmed against one — check with list_sitemap"
             end
           end
         end)
@@ -95,10 +97,17 @@ module Gori
 
       # Whether any captured endpoint on `host` normalizes to `path` — the same derivation
       # list_sitemap's tag stamping uses, so "matched" here means "will be visible there".
-      private def sitemap_node_exists?(host : String, path : String) : Bool
-        store.sitemap_entries_detailed(QL::EMPTY, Store::SITEMAP_MAX).any? do |e|
-          e.host == host && sitemap_tag_path(e.target) == path
-        end
+      #
+      # `nil` means UNKNOWN, and the distinction is load-bearing: the scan is capped at
+      # SITEMAP_MAX, and that cap is on the 6-column transport key, which multiplies past
+      # 10k long before the collapsed host/method/target count suggests. Answering a flat
+      # `false` off a truncated read made a positive claim about the capture that the query
+      # could not support — and the warning built on it told the operator to go hunting for
+      # a typo in a tag that was stored and does show.
+      private def sitemap_node_exists?(host : String, path : String) : Bool?
+        entries = store.sitemap_entries_detailed(QL::EMPTY, Store::SITEMAP_MAX)
+        return true if entries.any? { |e| e.host == host && sitemap_tag_path(e.target) == path }
+        entries.size >= Store::SITEMAP_MAX ? nil : false
       end
 
       # A sitemap tag's key is the node path the tree stamps, which Sitemap.normalize_path
