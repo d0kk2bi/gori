@@ -73,8 +73,8 @@ module Gori
         matched = sitemap_node_exists?(store, host, key)
         abort "gori run sitemap tag: NOT applied (project busy) — the node is unchanged" unless store.set_sitemap_tag(host, key, text)
         puts text.empty? ? "Tag cleared on #{host}#{key}." : "Tagged #{host}#{key}: #{text}"
-        unless matched || text.empty?
-          STDERR.puts "gori run sitemap tag: warning: no captured endpoint at #{host}#{key} — this tag will not show in the tree until one exists (check for a typo or a trailing slash)"
+        if warning = tag_match_warning(matched, host, key, text)
+          STDERR.puts "gori run sitemap tag: warning: #{warning}"
         end
       end
 
@@ -82,10 +82,32 @@ module Gori
       # names no endpoint is stored but unreachable — it can never stamp onto a tree node. The
       # common causes are a typo and a trailing slash (Sitemap.add drops one, so /api/users/ is
       # stamped as /api/users).
-      private def self.sitemap_node_exists?(store : Store, host : String, path : String) : Bool
-        store.sitemap_entries_detailed(QL::EMPTY, Store::SITEMAP_MAX).any? do |e|
-          e.host == host && sitemap_tag_path(e.target) == path
+      # The sentence for a tag that could not be confirmed against a captured endpoint, or nil
+      # when there is nothing to say. Pure and separate so the three-way answer from
+      # `sitemap_node_exists?` reads as three cases rather than as branches inside the
+      # command body (which is also what kept its complexity in budget).
+      private def self.tag_match_warning(matched : Bool?, host : String, key : String,
+                                         text : String) : String?
+        return nil if text.empty? || matched
+        if matched.nil?
+          "tag stored, but there are more than #{Store::SITEMAP_MAX} captured endpoints so " \
+          "it could not be confirmed against one — check with `gori run sitemap`"
+        else
+          "no captured endpoint at #{host}#{key} — this tag will not show in the tree until " \
+          "one exists (check for a typo or a trailing slash)"
         end
+      end
+
+      # `nil` means UNKNOWN, matching the MCP twin: the scan is capped at SITEMAP_MAX, and
+      # that cap counts 6-column transport keys, which multiply past 10k long before the
+      # collapsed host/method/target count suggests. Answering a flat `false` off a truncated
+      # read made a positive claim about the capture that the query cannot support, and the
+      # warning built on it sent the operator hunting for a typo in a tag that was stored and
+      # does show.
+      private def self.sitemap_node_exists?(store : Store, host : String, path : String) : Bool?
+        entries = store.sitemap_entries_detailed(QL::EMPTY, Store::SITEMAP_MAX)
+        return true if entries.any? { |e| e.host == host && sitemap_tag_path(e.target) == path }
+        entries.size >= Store::SITEMAP_MAX ? nil : false
       end
 
       # A tag's key is the node path the tree stamps, which Sitemap.normalize_path produces —

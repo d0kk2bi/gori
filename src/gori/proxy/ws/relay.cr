@@ -1094,7 +1094,12 @@ module Gori::Proxy::WS
       remaining = MAX_MESSAGE - assembling.size
       # Exactly the frame that crosses the cap, so one notice per message rather than one
       # per frame: after this, `remaining` is 0 for every later fragment.
-      crossed = remaining > 0 && frame.payload.size > remaining
+      # Fires on the frame that first COSTS bytes. `> remaining` is the ordinary overrun;
+      # `== remaining && !fin?` is the exact fill — nothing is lost in this frame, but the
+      # buffer is now full and every later fragment (there is one, or FIN would be set) is
+      # dropped whole with `remaining` already 0, which would leave the overrun unreported.
+      crossed = remaining > 0 &&
+                (frame.payload.size > remaining || (frame.payload.size == remaining && !frame.fin?))
       if remaining > 0 && !frame.payload.empty?
         take = {frame.payload.size, remaining}.min
         assembling.write(frame.payload[0, take])
@@ -1109,9 +1114,14 @@ module Gori::Proxy::WS
         # marker is a row of its own; `NOTICE_PREFIX` is what `Store::WsMessage#notice?`
         # reads to refuse replaying it as a seed. The payload row that follows keeps the
         # captured PREFIX, which is the evidence worth having.
+        # NO `shape.take` here — `take` RESETS the accumulator, so consuming it for this
+        # notice handed the real payload row that follows a fabricated shape (frames 1,
+        # masked nil), losing the fragment count and the masking evidence the shape exists
+        # to record. The default shape is also the honest one: this row is gori's own
+        # sentence, not a frame the peer sent — the same choice every other NOTICE row makes.
         sink.on_ws_message(flow_id, direction, message_opcode.to_i,
           "#{NOTICE_PREFIX}WebSocket message truncated at #{MAX_MESSAGE} bytes for capture; " \
-          "the forwarded message was longer".to_slice, shape.take)
+          "the forwarded message was longer".to_slice)
       end
       return assembling unless frame.fin?
       sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)

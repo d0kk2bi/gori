@@ -4,6 +4,7 @@ private alias WS = Gori::Proxy::WS
 
 private class TruncSink < Gori::Proxy::FlowSink
   getter rows = [] of {String, Int32, Bytes}
+  getter shapes = [] of Gori::Proxy::WS::Shape
 
   def on_request(req : Gori::Store::CapturedRequest) : Int64
     1_i64
@@ -15,6 +16,7 @@ private class TruncSink < Gori::Proxy::FlowSink
   def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
                     shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
     @rows << {direction, opcode, payload.dup}
+    @shapes << shape
   end
 end
 
@@ -71,6 +73,48 @@ describe "WS capture truncation" do
 
     sink.rows.size.should eq(1)
     String.new(sink.rows[0][2]).should eq("AAABBB")
+  end
+
+  # `MessageShape#take` RESETS the accumulator, so taking it for the notice handed the real
+  # payload row a fabricated shape — frames 1, masked nil — losing the fragment count and the
+  # masking evidence the shape exists to record. The notice is gori's own row, so it carries
+  # the DEFAULT shape like every other NOTICE, and the payload row keeps the message's.
+  it "does not spend the message's shape on the notice row" do
+    sink = TruncSink.new
+    shape = WS::MessageShape.new
+    buf = IO::Memory.new
+    key = Bytes[1_u8, 2_u8, 3_u8, 4_u8]
+
+    head = Bytes.new(WS::Relay::MAX_MESSAGE - 4, 'A'.ord.to_u8)
+    shape.note(false, 0_u8, true, key)
+    buf = WS::Relay.capture_frame(data_frame(false, head), buf, "out", 1_i64, sink,
+      WS::OP_TEXT, shape)
+    shape.note(true, 0_u8, true, key)
+    WS::Relay.capture_frame(data_frame(true, Bytes.new(64, 'B'.ord.to_u8)), buf, "out",
+      1_i64, sink, WS::OP_TEXT, shape)
+
+    sink.rows.size.should eq(2)
+    payload_shape = sink.shapes[1] # the real message row, emitted after the notice
+    payload_shape.frames.should eq(2)
+    payload_shape.masked.should be_true
+  end
+
+  # An EXACT fill followed by more fragments used to drop every later byte with no notice:
+  # nothing is lost on the filling frame, and `remaining` is 0 for all the rest.
+  it "marks an overrun when a fragment lands exactly on the cap and more follows" do
+    sink = TruncSink.new
+    shape = WS::MessageShape.new
+    buf = IO::Memory.new
+
+    shape.note(false, 0_u8, false, nil)
+    buf = WS::Relay.capture_frame(
+      data_frame(false, Bytes.new(WS::Relay::MAX_MESSAGE, 'A'.ord.to_u8)), buf, "out",
+      1_i64, sink, WS::OP_TEXT, shape)
+    shape.note(true, 0_u8, false, nil)
+    WS::Relay.capture_frame(data_frame(true, Bytes.new(32, 'B'.ord.to_u8)), buf, "out",
+      1_i64, sink, WS::OP_TEXT, shape)
+
+    sink.rows.count { |(_, _, p)| WS.notice?(p) }.should eq(1)
   end
 
   # One notice per MESSAGE, not one per fragment: after the crossing frame every later

@@ -55,6 +55,16 @@ describe "HAR round-trip fixed point" do
     req.should start_with("GET /x HTTP/9.9\r\n")
   end
 
+  # Chrome DevTools writes "http/2.0". Keeping it verbatim split the codebase's two h2 tests
+  # against each other — `starts_with?("HTTP/2")` in the probe layer vs `== "HTTP/2"` in the
+  # Repeater — so an imported h2 flow replayed over HTTP/1.1 while being scanned as h2.
+  it "folds every h2 spelling to the canonical HTTP/2" do
+    {"h2", "http/2", "HTTP/2", "http/2.0", "HTTP/2.0"}.each do |v|
+      req, _ = import_heads(v, "HTTP/1.1")
+      req.should start_with("GET /x HTTP/2\r\n")
+    end
+  end
+
   it "still folds the h2 spellings and defaults a token that is not a version" do
     req, _ = import_heads("h2", "HTTP/1.1")
     req.should start_with("GET /x HTTP/2\r\n")
@@ -75,6 +85,14 @@ describe "HAR round-trip fixed point" do
   it "preserves an empty statusText rather than re-inventing a phrase" do
     _, resp = import_heads("HTTP/1.1", "HTTP/1.1", status_text: "")
     resp.should start_with("HTTP/1.1 200\r\n")
+  end
+
+  # `JSON::Any#[]?` returns JSON::Any(nil) for an EXPLICIT null, which is TRUTHY — so a
+  # foreign HAR writing `"statusText": null` took the present branch and fabricated the
+  # reason-less status line that is supposed to mean the origin really sent one.
+  it "treats an explicit null statusText as absent, not as an empty phrase" do
+    _, resp = import_heads("HTTP/1.1", "HTTP/1.1", status_text: nil)
+    resp.should start_with("HTTP/1.1 200 OK\r\n")
   end
 
   it "still invents a phrase when statusText is absent entirely" do

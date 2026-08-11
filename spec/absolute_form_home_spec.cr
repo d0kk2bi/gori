@@ -16,6 +16,22 @@ describe "the absolute-form predicate has one home" do
     Gori::Url.location("a.test", "HTTP://a.test:8080/abs").should eq("HTTP://a.test:8080/abs")
   end
 
+  # A path-less absolute target still carries a query or fragment, and dropping them fed
+  # `Outbound.scope_url` a url a path/query EXCLUDE could no longer match — the carve-out
+  # `sweep_block` promises holds even under --allow-unscoped. RFC 3986 3.3: an empty path
+  # with a query is "/" + the rest.
+  it "keeps a query or fragment when the absolute target has no path" do
+    Gori::Url.origin_path("http://acme.test?admin=1").should eq("/?admin=1")
+    Gori::Url.origin_path("http://acme.test#frag").should eq("/#frag")
+    Gori::Url.origin_path("http://acme.test").should eq("/")
+    Gori::Url.origin_path("http://acme.test/a?b=1").should eq("/a?b=1")
+  end
+
+  it "gates a query-only absolute target on the query an exclude is keyed to" do
+    Gori::Outbound.scope_url("https", "acme.test", "http://acme.test?admin=1")
+      .should eq("https://acme.test/?admin=1")
+  end
+
   describe "Sitemap.normalize_path" do
     # The case-sensitive pair kept the scheme+authority on an uppercase target, which then
     # got segmented into path nodes named "http:" and the host.

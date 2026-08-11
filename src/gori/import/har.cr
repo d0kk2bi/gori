@@ -78,9 +78,14 @@ module Gori
         # (`HTTP/1.1 200\r\n` — a real server fingerprint and a deliberate probe target),
         # export writes `"statusText": ""`, and inventing "OK" on the way back put three
         # bytes on the head that the origin never sent. Only a MISSING field earns a phrase.
-        raw_reason = resp["statusText"]?
+        # `.as_s?`, not a bare truthiness test: `JSON::Any#[]?` returns `JSON::Any(nil)` for
+        # an EXPLICIT null, which is truthy — so a foreign HAR writing `"statusText": null`
+        # took the present branch and yielded "", fabricating the reason-less status line
+        # that is supposed to mean the origin really sent one. Absent and null both fall
+        # through to the phrase; only a present STRING is honoured, empty included.
+        raw_reason = resp["statusText"]?.try(&.as_s?)
         reason = if raw_reason
-                   raw_reason.to_s
+                   raw_reason
                  elsif resp_version.starts_with?("HTTP/2")
                    ""
                  else
@@ -187,6 +192,12 @@ module Gori
         when "", "http/1.1"          then "HTTP/1.1"
         when "http/1.0"              then "HTTP/1.0"
         else
+          # Chrome DevTools writes "http/2.0". Keeping it verbatim split the codebase's two
+          # h2 tests against each other — `starts_with?("HTTP/2")` true in the probe layer,
+          # `== "HTTP/2"` false in the Repeater — so an imported h2 flow replayed over
+          # HTTP/1.1 while being scanned as h2. Any 2.x folds to the canonical spelling;
+          # only an otherwise well-formed version is kept as it arrived.
+          return "HTTP/2" if v =~ /\Ahttp\/2(\.\d+)?\z/i
           v =~ /\Ahttp\/\d+\.\d+\z/i ? v.upcase : "HTTP/1.1"
         end
       end

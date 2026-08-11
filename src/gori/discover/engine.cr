@@ -672,7 +672,6 @@ module Gori::Discover
     private def orchestrate : Nil
       seed_frontier
       @phase = Phase::Crawling
-      interval = pace_interval
       loop do
         break if @state == State::Stopped
         if job = @frontier.first?
@@ -684,7 +683,8 @@ module Gori::Discover
           when @jobs.send(job)
             @frontier.shift
             @pending += 1
-            pace(interval)
+            # No pace here: `send_with_retries` paces every wire request, and a Calibrate
+            # task is MANY of them. Pacing the dispatch too charged a task one extra slot.
           when oc = @discovered.receive
             handle(oc)
             @pending -= 1
@@ -1545,11 +1545,6 @@ module Gori::Discover
     # clears it — so the inferred test is LESS sensitive than the thing it is trying to
     # predict, which is the wrong way round. A byte search is exact and costs no extra request.
     private def calibration_probe(dir : String, name : String, & : Bool ->) : Calibrate::Fetched
-      # Each probe is a REQUEST. The dispatch loop paces the Calibrate TASK once, so without
-      # this the whole batch went out back-to-back for one interval — and with `concurrency`
-      # workers each doing that, calibration effectively ignored `--rate`. It is this
-      # engine's largest single cost, so it is also where the rate matters most.
-      pace(pace_interval)
       raw = send_with_retries("#{dir}#{name}")
       body = decode_body(raw)
       yield raw.error.nil? && body_contains?(body, name)
@@ -1644,7 +1639,14 @@ module Gori::Discover
       end
       target = p.query ? "#{p.path}?#{p.query}" : p.path
       attempts = 0
+      interval = pace_interval
       loop do
+        # The single funnel for this engine's wire sends, so pacing HERE is what makes
+        # `--rate` mean requests/sec exactly once per request. Two things it fixes over
+        # pacing the dispatch loop: a RETRY was spaced only by `retry_pause` and so ran on
+        # top of the operator's rate, and a Calibrate task used to pay one slot for the task
+        # plus one per probe, undershooting the rate by a slot per directory.
+        pace(interval)
         raw = @capped.fetch(p.scheme, p.host, p.port, target)
         if raw.error && raw.error != CappedBackend::CAP_ERROR && attempts < @config.retries
           attempts += 1
