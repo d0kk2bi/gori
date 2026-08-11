@@ -55,6 +55,15 @@ private CORPUS = [
   both(f("X-Echo", "v"), false, "an uppercase field name the PEER sent"),
   both(f("", "v"), false, "an empty field name"),
   both(f("x-echo", "   lead"), false, "a leading space in a value (h1 OWS strips it)"),
+  # A peer field whose name collides with one of gori's own markers. Lowercase, colon-free
+  # and CRLF-free, so every other check passes — but `peer_field_name` renames it to
+  # `X-Peer-…` in the text form and the re-encode lowercases that, so a DIFFERENT name went
+  # on the wire. The rename is deliberate (keep the peer's anomaly visible under a name that
+  # cannot be confused for gori's own); refusing the round trip is what keeps it from
+  # reaching the peer.
+  both(f("x-gori-trailers", "v"), false, "a field name colliding with gori's trailer marker"),
+  both(f("x-gori-pushed", "v"), false, "a field name colliding with gori's pushed marker"),
+  both(f("x-gori-protocol", "v"), false, "a field name colliding with gori's protocol marker"),
   both(f("x-echo", "   "), false, "an all-spaces value"),
   # --- regular fields the text carries exactly ---------------------------------------------
   both(f("x-echo", "trail   "), true, "a trailing space in a value"),
