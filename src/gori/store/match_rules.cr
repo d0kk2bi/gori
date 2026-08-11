@@ -7,12 +7,17 @@ module Gori
 
     def match_rules : Array(MatchRule)
       list = [] of MatchRule
-      @db.query("SELECT id, enabled, target, part, pattern, replacement, op, match_kind, name, host, body_file FROM match_rules ORDER BY position, id") do |rs|
+      @db.query("SELECT id, enabled, target, part, CAST(pattern AS BLOB) AS pattern, CAST(replacement AS BLOB) AS replacement, op, match_kind, name, host, body_file FROM match_rules ORDER BY position, id") do |rs|
         rs.each do
           list << MatchRule.new(
             rs.read(Int64), rs.read(Int32) != 0,
             RuleTarget.from_label(rs.read(String)), RulePart.from_label(rs.read(String)),
-            rs.read(String), rs.read(String),
+            # pattern/replacement are OPERATOR bytes and rewrite live traffic: an MCP
+            # `create_rule` can carry a real NUL (JSON permits \u0000), and reading a TEXT
+            # column through the driver's NUL-terminated pointer truncated it — so the rule
+            # that rewrote traffic was not the rule that was created, and `list_rules`
+            # echoed the truncated form, making the discrepancy invisible everywhere.
+            String.new(rs.read(Bytes)), String.new(rs.read(Bytes)),
             RuleOp.from_label(rs.read(String)), MatchKind.from_label(rs.read(String)),
             rs.read(String), rs.read(String), rs.read(String))
         end
