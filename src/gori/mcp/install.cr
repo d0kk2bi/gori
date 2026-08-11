@@ -1,4 +1,5 @@
 require "json"
+require "../durable_file"
 
 module Gori
   module MCP
@@ -206,57 +207,12 @@ module Gori
       # two steps destroys exactly what that check exists to protect, and the installer that
       # was only adding one entry is what destroyed it.
       #
-      # Temp file in the SAME directory (rename is atomic only within a filesystem), fsync
-      # before the rename so the rename cannot land ahead of the bytes, and carry the
-      # original's permissions across — a credential-bearing config found at 0600 must not
-      # come back 0644 because gori recreated it under the umask.
-      #
-      # Resolve a symlink to its target FIRST. These paths are dotfiles, which people
-      # routinely symlink into a dotfiles repo; File.write wrote THROUGH the link, and a
-      # rename over the link itself would quietly detach it — the client would then read a
-      # plain file while the repo copy it was linked to went stale, with nothing to show
-      # for it in `git status`. A HARDLINKED config is not detectable this way and does get
-      # detached (rename installs a new inode); that is the standing cost of an atomic
-      # replace, and it is the trade every durable writer in this repo already makes.
+      # `DurableFile` is this method generalized: it grew up here, and the other five
+      # temp+rename impls in the repo each dropped a different part of it. The default mode
+      # is private because these hold auth and are nobody else's business; an existing
+      # file's own mode wins (`inherit`).
       private def self.write_atomic(path : String, content : String) : Nil
-        target = resolve_symlink(path)
-        dir = File.dirname(target)
-        # The mode to land on: the file's own if it has one, else private — these hold auth
-        # and are nobody else's business.
-        perm = File.info?(target).try(&.permissions) || File::Permissions.new(0o600)
-        # Randomized, not pid-derived: a pid repeats, and a temp left behind by a killed run
-        # would then be re-opened (mode intact, since `perm` only applies on CREATE) and
-        # renamed into place at whatever mode it was abandoned with.
-        tmp = File.tempname(".#{File.basename(target)}.gori", ".tmp", dir: dir)
-        begin
-          # Create at the final mode rather than widening under the umask and narrowing
-          # after: the content is written before any chmod could run, so a 0644 temp holding
-          # an auth-bearing ~/.claude.json is a window the in-place File.write never opened.
-          File.open(tmp, "w", perm: perm) do |file|
-            file.print(content)
-            file.flush
-            file.fsync
-          end
-          File.chmod(tmp, perm)
-          File.rename(tmp, target)
-        rescue ex
-          # `rescue nil` on the cleanup: an unwritable directory or a read-only filesystem
-          # makes the delete raise too, and that exception would REPLACE the ENOSPC (or
-          # whatever actually failed) with a permission complaint about a temp file the user
-          # has never heard of. The cause is what install_all is about to report.
-          File.delete?(tmp) rescue nil
-          raise ex
-        end
-      end
-
-      # The path a symlink points at, or *path* itself. A broken link (or an unreadable
-      # one) resolves to itself, so the write replaces the dangling link with a real file
-      # rather than failing the install over it.
-      private def self.resolve_symlink(path : String) : String
-        return path unless File.symlink?(path)
-        File.realpath(path)
-      rescue
-        path
+        DurableFile.write(path, content, perm: File::Permissions.new(0o600))
       end
 
       # Replace or append a TOML table named *header* (without brackets), including any

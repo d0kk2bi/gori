@@ -237,20 +237,35 @@ module Gori::Proxy::Tls
       Gori::Paths.ensure_dir(dir, tighten: false)
       cert_path = File.join(dir, CA_CERT_FILE)
       key_path = File.join(dir, CA_KEY_FILE)
-      cert_tmp = "#{cert_path}.tmp"
-      key_tmp = "#{key_path}.tmp"
+      # `stage` both, THEN commit both: that ordering is the guarantee described above, and
+      # `DurableFile::Staged` exists to express it. `--ca-dir` is also why the symlink
+      # resolution matters here — an operator pointing gori at PEMs symlinked from another
+      # trust store would otherwise have them detached one at a time.
+      #
+      # `inherit: false` on the KEY only. 0600 is dictated for a private key, never
+      # inherited: a root.key.pem left at 0644 by an operator (or an older gori) must be
+      # tightened as it is replaced, and KeyPair#write_pem has always forced the mode
+      # rather than preserving it. The cert is public, so its mode is the operator's call.
+      key_staged = DurableFile.stage(key_path, perm: File::Permissions.new(0o600), inherit: false) do |tmp, _mode|
+        key.write_pem(tmp) # sets 0600 itself, before any key bytes reach the temp
+      end
       begin
-        cert.write_pem(cert_tmp)
-        # 0600 before any key bytes reach the temp (KeyPair#write_pem); rename moves the
-        # inode, mode and all, so the installed key is never briefly readable.
-        key.write_pem(key_tmp)
-        File.rename(key_tmp, key_path)
-        File.rename(cert_tmp, cert_path)
+        cert_staged = DurableFile.stage(cert_path, perm: File::Permissions.new(0o644)) do |tmp, _mode|
+          cert.write_pem(tmp)
+        end
       rescue ex
-        File.delete?(cert_tmp)
-        File.delete?(key_tmp)
+        key_staged.discard
         raise ex
       end
+      # A raise from the first commit must not strand the second's temp: it is randomly
+      # named and hidden, so nothing in the tree would ever sweep it.
+      begin
+        key_staged.commit
+      rescue ex
+        cert_staged.discard
+        raise ex
+      end
+      cert_staged.commit
       cert_path
     end
 
