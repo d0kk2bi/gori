@@ -272,4 +272,39 @@ describe Gori::Tui::FuzzSetOverlay do
     h.rendered?("한").should be_true
     ov.build_spec.not_nil!.value.should eq("x") # composing text is not in the buffer yet
   end
+
+  # `Overlay#handle_click` places the caret in whichever listed field the press landed in —
+  # "a press inside a drawn field is a caret, not a no-op". This card overrides handle_click
+  # to pick the row and used to stop there, so the caret stayed wherever the last keystroke
+  # left it and the next character went somewhere the operator did not point.
+  it "places the caret where a click lands in a field, not where typing left it" do
+    ov = FuzzSetOverlay.editing(Gori::Tui::SetSpec.new(:brute, "abcdef:1:3"), 0)
+    area = Rect.new(0, 0, 120, 30)
+    ov.render(Screen.new(MemoryBackend.new(120, 30)), area)
+    box = ov.overlay_box(area).not_nil!
+
+    # Charset is the first field row of :brute, drawn at box.y + 3, value column at +2+LABEL_W.
+    value_x = box.x + 2 + 9
+    ov.handle_click(area, value_x + 3, box.y + 3).should eq(:stay)
+    otype(ov, "X")
+
+    ov.build_spec.not_nil!.value.should start_with("abcXdef")
+  end
+
+  # `@fields` holds all eight for every payload type while `render_fields` draws only the
+  # current type's rows, so an off-screen field kept the geometry it was drawn at under a
+  # PREVIOUS type and could win a hit-test against a click meant for a visible one.
+  it "exposes only the payload type's own fields to the pointer" do
+    ov = FuzzSetOverlay.editing(Gori::Tui::SetSpec.new(:brute, "abcdef:1:3"), 0)
+    ov.text_fields.size.should eq(3) # charset, min, max — not all eight
+
+    # NOTE: the SetSpec kind is `:file`; `:wordlist` is the overlay's ptype name for it.
+    wl = FuzzSetOverlay.editing(Gori::Tui::SetSpec.new(:file, "/tmp/w.txt"), 0)
+    wl.text_fields.size.should eq(1) # path
+
+    # :preset has no TextField at all, so the card must not claim drag support for it.
+    pre = FuzzSetOverlay.editing(Gori::Tui::SetSpec.new(:preset, "sqli"), 0)
+    pre.text_fields.should be_empty
+    pre.supports_drag?.should be_false
+  end
 end
