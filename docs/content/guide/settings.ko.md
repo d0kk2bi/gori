@@ -62,7 +62,7 @@ gori에 저장되는 모든 환경설정은 하나의 화면, **Preferences** �
 | 섹션 | 필드 |
 |------|------|
 | **Theme** | 오프너: 테마 선택기(내장 테마와 직접 만든 테마) |
-| **Display** | Default detail pane, History list time, Line numbers, Preview body limit (KiB), Resource meter, Terminal title |
+| **Display** | Default detail pane, History list time, Line numbers, Wrap long lines, Preview body limit (KiB), Resource meter, Terminal title |
 | **Layout** | History Req/Res preview, Probe issue preview, Issues preview, History list order, Sitemap expand depth |
 | **Companion** | Companion (Miss Ring), Placement, Motion, Notices |
 

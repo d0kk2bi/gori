@@ -348,6 +348,7 @@ Message-body and chrome prefs (command palette → **Settings: Display**). Omitt
     "detail_pane": "request",
     "history_time_format": "absolute",
     "show_gutter": true,
+    "wrap_lines": true,
     "preview_body_kib": 64,
     "resource_meter": true,
     "terminal_title": "project"
@@ -360,6 +361,7 @@ Message-body and chrome prefs (command palette → **Settings: Display**). Omitt
 | `detail_pane` | string | `"request"` | Which pane a freshly-opened History flow shows first: `"request"` or `"response"` |
 | `history_time_format` | string | `"absolute"` | History list time column: `"absolute"` (MM-DD HH:MM:SS) or `"relative"` (3s/5m/2h) |
 | `show_gutter` | bool | `true` | Line-number gutter on the message body views |
+| `wrap_lines` | bool | `true` | Soft-wrap a line too wide for a message pane onto continuation rows (the gutter numbers the first). `false` draws one row per line and scrolls sideways instead, following the caret |
 | `preview_body_kib` | integer | `64` | How many body bytes the History list preview reads (display only, not the capture limit) |
 | `resource_meter` | bool | `true` | CPU/memory readout for gori's own process, at the far right of the bottom bar |
 | `terminal_title` | string | `"project"` | Terminal window title: `"project"` → `Gori - <project> - <tab>`, `"tab"` → `Gori - <tab>`, `"off"` → gori never writes the title (leave it to your shell or tmux) |
@@ -646,7 +648,7 @@ Omitted until you apply or star a wordlist.
 | `mine` | Saved Param Miner defaults. See [mine](#mine) above |
 | `layout` | History / Probe / Issues previews + Sitemap expand depth. See [layout](#layout) above |
 | `statusline` | Bottom status row that runs a command on an interval. See [statusline](#statusline) above |
-| `display` | Default detail pane, list time format, line-number gutter, preview body cap, `resource_meter` (the CPU/memory readout at the far right of the bottom bar, on by default), and `terminal_title` |
+| `display` | Default detail pane, list time format, line-number gutter, `wrap_lines` (soft-wrap long lines, on by default), preview body cap, `resource_meter` (the CPU/memory readout at the far right of the bottom bar, on by default), and `terminal_title` |
 
 ## Per-Project Overrides
 

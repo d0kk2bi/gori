@@ -62,7 +62,7 @@ Notifications fire on background results from the Miner, Fuzzer, Probe, and Disc
 | Section | Fields |
 |---------|--------|
 | **Theme** | Opener: the theme picker (built-ins plus your own) |
-| **Display** | Default detail pane, History list time, Line numbers, Preview body limit (KiB), Resource meter, Terminal title |
+| **Display** | Default detail pane, History list time, Line numbers, Wrap long lines, Preview body limit (KiB), Resource meter, Terminal title |
 | **Layout** | History Req/Res preview, Probe issue preview, Issues preview, History list order, Sitemap expand depth |
 | **Companion** | Companion (Miss Ring), Placement, Motion, Notices |
 

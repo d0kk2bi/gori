@@ -444,7 +444,7 @@ module Gori::Tui
       acc = 0
       line.each do |span|
         t = span.text
-        if printable_ascii?(t)
+        if printable_ascii?(t, limit - acc)
           if acc + t.size > limit
             overflow = true
             break
@@ -469,7 +469,7 @@ module Gori::Tui
       line.each do |span|
         break if done
         t = span.text
-        if printable_ascii?(t)
+        if printable_ascii?(t, room - visual_col)
           # Each printable-ASCII char is one width-1 cell; pass the Char to `cell` (interned
           # via Screen::ASCII_CELL — zero allocation) instead of a fresh `g.to_s` String.
           t.each_char do |ch|
@@ -538,6 +538,18 @@ module Gori::Tui
           acc += sw
           next
         end
+        # ASCII: one column per char, so the cut can never straddle a cluster and the char
+        # index IS the column — take the tail directly instead of walking start_col graphemes
+        # (each of which allocates a String for `grapheme_cols`). That walk is what a minified
+        # body line costs once it is panned to the right: O(the columns scrolled off), every
+        # frame, on the one line long enough to need panning.
+        if span.text.ascii_only?
+          kept = span.text[(start_col - acc)..]
+          acc = start_col
+          cutting = false
+          out << Span.new(kept, span.fg, span.attr) unless kept.empty?
+          next
+        end
         kept = String.build do |io|
           span.text.each_grapheme do |g|
             if cutting
@@ -565,6 +577,9 @@ module Gori::Tui
     # than a styled `Line`. Identity when start_col <= 0.
     def self.slice_left_text(s : String, start_col : Int32) : String
       return s if start_col <= 0
+      # ASCII fast path, exactly as in `slice_left` above and for the same reason: column ==
+      # char index, so no cluster can straddle the cut and the tail is one slice.
+      return start_col >= s.size ? "" : s[start_col..] if s.ascii_only?
       acc = 0
       cutting = true
       String.build do |io|
@@ -1280,8 +1295,19 @@ module Gori::Tui
     # (< 0x20 / 0x7f) or any byte >= 0x80 (a multibyte lead/continuation, or a codepoint
     # whose display width may be 0/2) falls through to the exact grapheme-walk path. Empty
     # string is trivially true (the fast path then draws nothing, matching each_grapheme).
-    private def self.printable_ascii?(s : String) : Bool
-      s.to_slice.all? { |b| b >= 0x20_u8 && b <= 0x7e_u8 }
+    # `upto` bounds the scan: only the first `upto + 1` BYTES decide the answer, because both
+    # callers stop consuming the span within that many COLUMNS and a printable-ASCII byte is
+    # exactly one column. If the prefix is clean and the span runs past it, the span is wider
+    # than the viewport either way — the measure pass overflows on `t.size` (≥ the prefix
+    # length) and the draw pass fills `room` before reaching a byte the check never looked at.
+    #
+    # Unbounded, this walks the whole span. That is invisible under soft wrap, where a row is
+    # pre-sliced to about the pane's width, and it is the frame's cost without it: a 1 MB
+    # minified body line is ONE span, scanned twice per draw.
+    private def self.printable_ascii?(s : String, upto : Int32) : Bool
+      n = {s.bytesize, {upto + 1, 0}.max}.min
+      return true if n == 0
+      s.to_slice[0, n].all? { |b| b >= 0x20_u8 && b <= 0x7e_u8 }
     end
 
     private def self.plain(raw : String) : Line

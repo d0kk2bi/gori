@@ -6,11 +6,16 @@ include Gori::Tui
 # Draw `text` as the base line at (x, y) exactly as a view would before the
 # search overlay runs, then apply the overlay — mirrors the real call order so
 # the yellow band lands on cells the base draw actually painted.
+#
+# The subject is `Wrap.mark_search` over ONE unwrapped row (`[0, size)`, no conceal, no
+# h-scroll), which is the shape the retired `SearchHi.mark` had and the shape every pane
+# still draws when soft wrap is off. `wrap_spec` covers what only the row form can express
+# — a match straddling a break, and a hit's column within a continuation row.
 private def base_and_mark(text : String, query : String, max_x : Int32, x = 0, w = 40) : MemoryBackend
   backend = MemoryBackend.new(w, 1)
   screen = Screen.new(backend)
   screen.text(x, 0, text, Theme.text)
-  SearchHi.mark(screen, x, 0, text, query, max_x)
+  Wrap.mark_search(screen, x, 0, text, 0, text.size, query, max_x)
   backend
 end
 
@@ -18,7 +23,7 @@ end
 # "nothing was painted" assertion distinguish a highlighted cell from a bare one.
 private def mark_only(text : String, query : String, max_x : Int32, x = 0, w = 40) : MemoryBackend
   backend = MemoryBackend.new(w, 1)
-  SearchHi.mark(Screen.new(backend), x, 0, text, query, max_x)
+  Wrap.mark_search(Screen.new(backend), x, 0, text, 0, text.size, query, max_x)
   backend
 end
 
@@ -27,7 +32,7 @@ private def yellow_cols(b : MemoryBackend, w = 40) : Array(Int32)
   (0...w).select { |x| b.bg_at(x, 0) == Theme.yellow }
 end
 
-describe Gori::Tui::SearchHi do
+describe "Gori::Tui::Wrap.mark_search (single unwrapped row)" do
   describe "early return (empty query or empty text)" do
     it "paints nothing when the query is empty (bg stays default across the row)" do
       b = mark_only("a FOObar", "", 40)
@@ -186,7 +191,7 @@ describe Gori::Tui::SearchHi do
       text = "ab" * 2_000
       backend = MemoryBackend.new(10, 1)
       t0 = Time.instant
-      SearchHi.mark(Screen.new(backend), 0, 0, text, "ab", 8)
+      Wrap.mark_search(Screen.new(backend), 0, 0, text, 0, text.size, "ab", 8)
       # Generous ceiling: normal runs are tens of ms; only a quadratic/hang regression
       # (which would take many seconds) trips it, so a slow CI box can't flake this.
       ((Time.instant - t0).total_milliseconds).should be < 5_000.0
@@ -198,7 +203,7 @@ describe Gori::Tui::SearchHi do
       text = "a" * 200_000
       backend = MemoryBackend.new(10, 1)
       t0 = Time.instant
-      SearchHi.mark(Screen.new(backend), 0, 0, text, "zzz", 10)
+      Wrap.mark_search(Screen.new(backend), 0, 0, text, 0, text.size, "zzz", 10)
       ((Time.instant - t0).total_milliseconds).should be < 5_000.0
       yellow_cols(backend, 10).should be_empty
     end

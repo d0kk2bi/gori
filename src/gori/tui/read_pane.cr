@@ -6,6 +6,7 @@ require "./highlight"
 require "./read_cursor"
 require "./geometry"
 require "./wrap"
+require "../settings"
 
 module Gori::Tui
   # A scrollable READ-ONLY text pane: the state (`ReadCursor` + vertical scroll + horizontal
@@ -56,9 +57,10 @@ module Gori::Tui
     # document, an O(document) pass on every width change over bodies that reach multiple MB.
     # Every walk below is O(the rows it is asked to move).
     getter scroll_sub : Int32 = 0
-    # Horizontal offset in display columns (⇧←/→). Clamped by `render` to the widest row on
-    # screen, so a pane whose long line scrolls off can always be scrolled back. Pinned at 0
-    # for good on a wrapping pane — there is nothing off to the side of a wrapped row.
+    # Horizontal offset in display columns. On a hand-scrolled pane (⇧←/→, `hscroll`) `render`
+    # clamps it to the widest row on screen, so a long line that scrolls off can always be
+    # scrolled back. On a `wrap` pane it is 0 while wrapping — nothing sits off to the side of a
+    # wrapped row — and caret-driven while the Display preference has wrap off.
     getter xscroll : Int32 = 0
     # Interior height of the last `render`. `0` before the first frame — every gesture that
     # needs a viewport (page, wheel) is inert until then, which is what the panes did already.
@@ -87,6 +89,11 @@ module Gori::Tui
     # mutually exclusive with the `viewport_top` self-drawing shape below — those panes place
     # their own rows from a logical line index, so a wrapped anchor would name a row they never
     # draw. Every pane that calls `render` should take it; the four that self-draw must not.
+    #
+    # The flag is the pane's OPT-IN, not the answer: `Settings.wrap_lines?` can turn it off for
+    # the whole app (Preferences ▸ Appearance ▸ Display), and then a pane that asked for wrap
+    # falls back to the one-row-per-line model with the h-scroll it carried before wrap existed
+    # — see `wrapping?` and `ensure_visible_x`.
     def initialize(*, @gutter : Bool = false, @line_select_only : Bool = false,
                    @wrap : Bool = false)
       @cursor = ReadCursor.new
@@ -256,7 +263,7 @@ module Gori::Tui
     # Inert on a wrapping pane: nothing sits off to the side of a wrapped row, and a stored
     # offset the renderer no longer reads would only fight the clamp every frame.
     def hscroll(step : Int32) : Nil
-      return if @wrap
+      return if wrap_on?
       @xscroll = {@xscroll + step * 4, 0}.max
     end
 
@@ -441,19 +448,26 @@ module Gori::Tui
         @xscroll = 0 # `wrap` has no sideways — pinned here as well as in `hscroll`
         clamp_wrapped_anchor(cw, h)
       else
+        @scroll_sub = 0 # no continuation rows to anchor into; the twin of the `xscroll` pin above
         @scroll = @scroll.clamp(0, {@size - h, 0}.max)
       end
     end
 
-    # The h-scroll ceiling: the widest row currently on screen, so a pane whose long line
-    # scrolled off can always be scrolled back. Inert under wrap (nothing is off to the side).
+    # The h-scroll ceiling for a pane the OPERATOR scrolls by hand (`hscroll`): the widest row
+    # currently on screen, so one whose long line scrolled off can always be scrolled back.
+    #
+    # Skipped entirely for a `wrap` pane, in both of its modes. Wrapped there is nothing off to
+    # the side; unwrapped the offset is caret-driven, and this ceiling is one column short of
+    # what an end-of-line caret needs (it sits one past the last char) — so on the widest row
+    # on screen the two would fight and the caret would be clipped away. `ensure_visible_x`
+    # self-clamps, which is why it can be the only writer.
     #
     # draw_width_upto, not display_width: these rows go out through `screen.text` /
     # `Highlight.draw`, which advance ≥1 cell per grapheme. A control byte scores 0 on the raw
     # measure, which used to pin the clamp short and leave the tail of such a line unreachable.
     # `_upto` keeps the per-frame early exit on a huge single line.
     private def clamp_xscroll(rows : Array(Wrap::Row), cw : Int32) : Nil
-      return if wrapping?
+      return if @wrap
       widest = rows.max_of? { |vr| Screen.draw_width_upto(@line_at.call(vr.li), @xscroll + cw + 1) } || 0
       @xscroll = @xscroll.clamp(0, {widest - cw, 0}.max)
     end
@@ -554,6 +568,7 @@ module Gori::Tui
         @scroll, @scroll_sub = Wrap.ensure_visible(@scroll, @scroll_sub, @cursor.cy, csub, @last_h, layout_fn(cw))
         return
       end
+      ensure_visible_x
       cy = @cursor.cy
       if cy < @scroll
         @scroll = cy
@@ -563,6 +578,42 @@ module Gori::Tui
       @scroll = @scroll.clamp(0, {@size - @last_h, 0}.max)
     end
 
+    # Horizontal companion to `ensure_visible`, and the ONLY way sideways on a pane whose wrap
+    # the Display preference turned off: the h-scroll bindings those panes carried were deleted
+    # when they started wrapping, so ⇧←/→ moves the caret and the view has to come with it.
+    #
+    # Gated on `@wrap` rather than on `!wrapping?` alone. A pane that never asked for wrap keeps
+    # a horizontal offset the operator placed by hand (`hscroll`), and dragging that offset back
+    # to a caret nobody moved is exactly the two-measures-fighting-per-frame failure the History
+    # detail's retired reveal clamp had.
+    #
+    # `Wrap.row_col`, cluster-wise, because that is the measure `Highlight.slice_left` consumes
+    # the offset in and the one the draw advances by — a second measure beside it is this
+    # module's standing hazard, and on a tabbed line the two disagreeing left the caret unable
+    # to scroll into view at all.
+    #
+    # The "does the line even need scrolling" test goes through `draw_width_upto`, which stops
+    # counting at `cw + 1` columns: a minified body line reaches megabytes, and measuring it
+    # whole every frame to conclude "wider than 80" is the one O(line) question this pane has
+    # no reason to ask.
+    private def ensure_visible_x : Nil
+      return unless @wrap # opt-in pane, wrap switched off app-wide
+      cw = @last_cw
+      if cw <= 0 || empty?
+        @xscroll = 0
+        return
+      end
+      line = line(@cursor.cy.clamp(0, @size - 1))
+      if Screen.draw_width_upto(line, cw + 1) <= cw
+        @xscroll = 0 # the whole line is on screen — no reason to hold an offset
+        return
+      end
+      curx = Wrap.row_col(line, nil, 0, @cursor.cx.clamp(0, line.size))
+      @xscroll = curx if curx < @xscroll
+      @xscroll = curx - cw + 1 if curx >= @xscroll + cw
+      @xscroll = 0 if @xscroll < 0
+    end
+
     # --- soft-wrap layout ------------------------------------------------------
     # Everything below is inert (or trivially one-row-per-line) while `wrap` is off.
 
@@ -570,7 +621,17 @@ module Gori::Tui
     # mapping outside render needs that width, and guessing one would put the caret on a
     # different row than the draw did.
     private def wrapping? : Bool
-      @wrap && @last_cw > 0 && @size > 0
+      wrap_on? && @last_cw > 0 && @size > 0
+    end
+
+    # The pane's opt-in AND the app-wide preference. Read live rather than latched at
+    # construction: the Display toggle has to reach panes that were built at startup, and every
+    # mapping here derives from `wrapping?` per call, so a flip is one frame away. Nothing is
+    # invalidated on the flip — a `Wrap::Layout` is a pure function of (line, width), so a memo
+    # built while wrapping stays correct if wrap comes back — but `xscroll` and `scroll_sub` are
+    # each other's dead state, and the branch that owns them zeroes the other one.
+    private def wrap_on? : Bool
+      @wrap && Settings.wrap_lines?
     end
 
     private def drop_wrap_cache : Nil

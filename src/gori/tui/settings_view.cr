@@ -100,7 +100,7 @@ module Gori::Tui
       Field.new("Interval (s)",
         "how often to re-run the command — seconds (min 1)"),
     ]
-    # Display: message-body + chrome prefs (three choice fields, two bools, a text cap).
+    # Display: message-body + chrome prefs (three choice fields, three bools, a text cap).
     DISPLAY_PANE_CHOICES = ["request", "response"]
     DISPLAY_TIME_CHOICES = ["absolute", "relative"]
     # Kept short: all three render inline on one row inside the settings box.
@@ -114,6 +114,9 @@ module Gori::Tui
         choices: DISPLAY_TIME_CHOICES),
       Field.new("Line numbers",
         "show the line-number gutter on the message body views — ←/→/space toggles",
+        bool: true),
+      Field.new("Wrap long lines",
+        "a line too wide for a message pane spills onto continuation rows (the gutter numbers the first) — off scrolls it sideways instead, following the caret — ←/→/space toggles",
         bool: true),
       Field.new("Preview body limit (KiB)",
         "how many body bytes the History list preview reads/shows — KiB (min 1)"),
@@ -264,6 +267,7 @@ module Gori::Tui
                   Settings::DEFAULT_DETAIL_PANE,
                   Settings::DEFAULT_HISTORY_TIME_FORMAT,
                   Settings::DEFAULT_SHOW_GUTTER ? "on" : "off",
+                  Settings::DEFAULT_WRAP_LINES ? "on" : "off",
                   Settings::DEFAULT_PREVIEW_BODY_KIB.to_s,
                   Settings::DEFAULT_RESOURCE_METER ? "on" : "off",
                   title_label(Settings::DEFAULT_TERMINAL_TITLE),
@@ -403,6 +407,7 @@ module Gori::Tui
         Settings.default_detail_pane,
         Settings.history_time_format,
         Settings.show_gutter ? "on" : "off",
+        Settings.wrap_lines? ? "on" : "off",
         Settings.preview_body_kib.to_s,
         Settings.resource_meter? ? "on" : "off",
         title_label(Settings.terminal_title),
@@ -602,18 +607,19 @@ module Gori::Tui
         return persist
       end
       if @section == :display
-        kib = @values[3].strip.to_i?
+        kib = @values[4].strip.to_i?
         unless kib && kib >= 1
           @status = "invalid preview limit"
-          return "settings: invalid preview body limit #{@values[3].inspect} (KiB, min 1)"
+          return "settings: invalid preview body limit #{@values[4].inspect} (KiB, min 1)"
         end
         kib = kib.clamp(1, Settings::MAX_PREVIEW_BODY_KIB) # keep kib*1024 within Int32
         Settings.default_detail_pane = @values[0] == "response" ? "response" : "request"
         Settings.history_time_format = @values[1] == "relative" ? "relative" : "absolute"
         Settings.show_gutter = @values[2] == "on"
+        Settings.wrap_lines = @values[3] == "on"
         Settings.preview_body_kib = kib
-        Settings.resource_meter = @values[4] == "on"
-        Settings.terminal_title = title_from_label(@values[5])
+        Settings.resource_meter = @values[5] == "on"
+        Settings.terminal_title = title_from_label(@values[6])
         @values = display_values
         return persist
       end
