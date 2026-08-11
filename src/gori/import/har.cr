@@ -73,9 +73,14 @@ module Gori
         # field is absent — HTTP/2 has no reason phrase on the wire, and inventing "OK"
         # (or a trailing space on an empty phrase) broke the export→import fixed point.
         resp_version = normalize_http_version(resp["httpVersion"]?.to_s.presence || http_version)
-        raw_reason = resp["statusText"]?.to_s
-        reason = if raw_reason.presence
-                   raw_reason
+        # ABSENT and PRESENT-BUT-EMPTY are different answers, and `.to_s` collapsed them:
+        # `parse_response_head` yields reason == "" for a reason-less status line
+        # (`HTTP/1.1 200\r\n` — a real server fingerprint and a deliberate probe target),
+        # export writes `"statusText": ""`, and inventing "OK" on the way back put three
+        # bytes on the head that the origin never sent. Only a MISSING field earns a phrase.
+        raw_reason = resp["statusText"]?
+        reason = if raw_reason
+                   raw_reason.to_s
                  elsif resp_version.starts_with?("HTTP/2")
                    ""
                  else
@@ -169,11 +174,20 @@ module Gori
         encoding.try(&.downcase) == "base64" ? Base64.decode(text) : text.to_slice
       end
 
+      # `Export::Har` writes the stored version verbatim and says this maps it back onto
+      # itself. The old `else` swallowed everything outside {1.0, 1.1, 2} into "HTTP/1.1",
+      # so a stored HTTP/0.9 / HTTP/3 / HTTP/9.9 — `flow_mapper` keeps the request line's
+      # version token verbatim, and `Repeater::Plan` deliberately leaves HTTP/9.9 alone on
+      # the send path — came back rewritten, silently editing an operator's version-line
+      # probe. An `HTTP/<digits>.<digits>` token is now kept as it arrived, uppercased; only
+      # a token that is not a version at all still falls back.
       private def self.normalize_http_version(v : String) : String
         case v.downcase
         when "h2", "http/2", "http2" then "HTTP/2"
-        when "", "http/1.0"          then "HTTP/1.0"
-        else                              "HTTP/1.1"
+        when "", "http/1.1"          then "HTTP/1.1"
+        when "http/1.0"              then "HTTP/1.0"
+        else
+          v =~ /\Ahttp\/\d+\.\d+\z/i ? v.upcase : "HTTP/1.1"
         end
       end
 
