@@ -201,13 +201,28 @@ module Gori
                       enqueue_active : Bool = false) : Nil
         return if @stopped
         return unless @mode.scanning?
-        detections = Passive.analyze(detail, ws_messages, disabled: @disabled, custom: @custom)
+        # Only ANALYSIS gets the silent skip. That is what the blanket rescue was written for
+        # ("a single detail's analysis blew up"), and the only step where nothing has been
+        # produced yet, so there is nothing to report losing.
+        detections =
+          begin
+            Passive.analyze(detail, ws_messages, disabled: @disabled, custom: @custom)
+          rescue ex : DB::Error | SQLite3::Exception
+            raise ex
+          rescue
+            return
+          end
         persist(detections, flow_id: detail.row.id, repeater_id: repeater_id)
         maybe_enqueue_active(detail) if enqueue_active
       rescue ex : DB::Error | SQLite3::Exception
         raise ex
-      rescue
-        # a single detail's analysis blew up — skip it
+      rescue ex
+        # Past this point findings HAVE been made, so a failure is a loss worth naming rather
+        # than the same silent skip: the operator otherwise sees a scan that completed and no
+        # issues, with no way to tell that apart from a clean target. Still never raises into
+        # the caller — the TUI event loop has no catch-all — and `emit` is non-blocking, so a
+        # headless run with no drainer is unaffected.
+        emit(ErrorEvent.new("probe: findings for flow #{detail.row.id} were not recorded: #{ex.message}"))
       end
 
       # Per-flow active-scan estimate for the manual "Run active scan" action: every ENABLED
