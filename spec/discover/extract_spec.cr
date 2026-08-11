@@ -122,6 +122,49 @@ describe Gori::Discover::Extract do
     E.sitemap_body?(io.to_slice).should be_true
   end
 
+  # `sitemap_body?` runs a byte prefilter before it will build a String, so that the common
+  # answer — "no", on every image, font and archive a spider follows — costs no allocation and
+  # no PCRE2. The prefilter carries the LITERALS only; the `\b` stays with the regex, which
+  # reads it with Unicode semantics (`<locé` is not a match, `<loc ` is). This pins the
+  # two against each other: the shipped predicate must agree, body for body, with running
+  # SITEMAP_ROOT over the sniff window directly.
+  it "answers exactly what the sitemap regex answers, prefilter or not" do
+    oracle = ->(body : Bytes) do
+      slice = body.size > E::SNIFF_MAX ? body[0, E::SNIFF_MAX] : body
+      String.new(slice).scrub.matches?(E::SITEMAP_ROOT)
+    end
+
+    bodies = [
+      # the real shapes
+      %(<?xml version="1.0"?><urlset><url><loc>http://h/p</loc></url></urlset>),
+      %(<sitemapindex><sitemap><loc>http://h/s.xml</loc></sitemap></sitemapindex>),
+      %(<URLSET><URL><LOC>http://h/p</LOC></URL></URLSET>), # the `i` flag
+      %(<UrlSet >), %(<Loc\t>), %(<sitemapINDEX\n>),
+      # literal present, boundary absent — the prefilter says maybe, the regex says no
+      %(<location>a</location>), %(<locale lang="en">), %(<urlsets>), %(<sitemapindexes>),
+      %(<locé>), %(<loc_id>), %(<loc0>),
+      # literal absent — the prefilter alone decides
+      %(<html><body><a href="/loc">not a sitemap</a></body></html>),
+      %(<html><urlsetx</html>), %(no angle brackets at all: urlset loc sitemapindex),
+      "User-agent: *\nDisallow: /admin\n", "", "<", "<l", "<lo", "<loc", "<urlse",
+      # the literal split across the end of the sniff window
+      ("y" * (E::SNIFF_MAX - 2)) + "<loc>", ("y" * (E::SNIFF_MAX - 5)) + "<loc>",
+    ].map(&.to_slice)
+
+    # …plus bodies that are not valid UTF-8, where the regex only ever sees the scrubbed form.
+    binaries = [
+      Bytes[0xff, 0xfe, 0x3c, 0x6c, 0x6f, 0x63, 0x3e],      # <loc> behind invalid lead bytes
+      Bytes[0x3c, 0x6c, 0x6f, 0x63, 0xff, 0x3e],            # <loc followed by an invalid byte
+      Bytes[0x3c, 0x4c, 0x4f, 0x43, 0xc0, 0x80],            # <LOC + an overlong sequence
+      Bytes.new(2048) { |i| ((i * 7) % 251).to_u8 },        # an "image"
+      Bytes.new(E::SNIFF_MAX + 64) { |i| (i % 256).to_u8 }, # larger than the sniff window
+    ]
+
+    (bodies + binaries).each do |body|
+      E.sitemap_body?(body).should eq(oracle.call(body))
+    end
+  end
+
   # The scrub is only reached for a body that is ACTUALLY invalid: `String#scrub` walks the
   # whole string through a Char::Reader whether or not it finds anything (130µs on a valid
   # 40 KB page against 9µs for `valid_encoding?`), and EVERY crawled page and probe response

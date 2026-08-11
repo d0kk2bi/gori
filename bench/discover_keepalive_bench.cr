@@ -30,6 +30,11 @@ end
 
 require "../src/gori/discover/engine"
 require "../src/gori/discover/wordlist"
+# `Env.expand_bindings` (reached from `Sender#binding_headers`) calls `Bindings.boundary_forging?`,
+# and `env.cr` cannot require `bindings.cr` back without a cycle — so a partial build that stops at
+# the engine leaves the constant undefined. The full binary always has it; name it here so the
+# bench does too.
+require "../src/gori/bindings"
 
 alias D = Gori::Discover
 

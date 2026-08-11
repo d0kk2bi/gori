@@ -14,8 +14,42 @@ module Gori::Discover
     FNV_OFFSET = 0xcbf29ce484222325_u64
     FNV_PRIME  = 0x00000100000001b3_u64
 
+    # How many tokens the bit-sliced accumulator below may fold in before it must be drained
+    # into `votes`. Eight planes count to 2**8 - 1, and the 256th token would carry out of the
+    # top plane and be lost — so the drain happens ON 255, not after it.
+    PLANE_FULL = 255
+
+    # 64-bit SimHash. Counts, per bit position, how many token hashes set it; the output bit is
+    # set when that is a strict majority.
+    #
+    # The count is kept BIT-SLICED — eight UInt64 "planes", where bit j of plane i is bit i of
+    # the counter for column j — so folding a token in is eight register-only half-adds of the
+    # whole 64-column counter at once, instead of 64 separate loop iterations. That inner loop
+    # was ~90% of this function: it read, compared and wrote one `Int32` per BIT per token, and
+    # branched on an FNV output bit, which is ~50/50 and therefore the branch predictor's worst
+    # case. On a 155 KB body it ran 20k tokens x 64 = 1.3M times.
+    #
+    # `distill` calls this on EVERY response — a brute-force pass is ~315 sends per directory —
+    # and the scheduler is single-threaded (no -Dpreview_mt), so this CPU is taken from the same
+    # thread the orchestrator dispatches on.
+    #
+    # Counting ONES rather than the old ±1 votes is what makes the planes work, and it is exact
+    # rather than approximate: the old `votes = ones - (tokens - ones) = 2*ones - tokens`, so
+    # `votes > 0` iff `2*ones > tokens`, ties falling the same way in both. `discover_fingerprint_bench`
+    # pins the equality over a corpus, 2000 random bodies and the token-class edge cases.
     def self.simhash(body : Bytes) : UInt64
       votes = StaticArray(Int32, 64).new(0)
+      # The vertical counter. Locals rather than an array so they stay in registers — a
+      # StaticArray is a value type and passing one to a helper would copy it per token.
+      p0 = 0_u64
+      p1 = 0_u64
+      p2 = 0_u64
+      p3 = 0_u64
+      p4 = 0_u64
+      p5 = 0_u64
+      p6 = 0_u64
+      p7 = 0_u64
+      pending = 0
       tokens = 0
       i = 0
       n = body.size
@@ -32,34 +66,63 @@ module Gori::Discover
         next if len == 0
         next if dynamic?(body, start, len)
         tokens += 1
-        h = fnv1a(body, start, len)
-        bit = 0
-        while bit < 64
-          if (h >> bit) & 1_u64 == 1_u64
-            votes.to_unsafe[bit] += 1
-          else
-            votes.to_unsafe[bit] -= 1
-          end
-          bit += 1
+        # Add 1 to every column whose bit is set, in parallel: `c` is the carry mask, and each
+        # plane is a half-add (sum = plane ^ carry, carry out = plane & carry). The top plane
+        # drops its carry, which is why `pending` never reaches 256.
+        c = fnv1a(body, start, len)
+        t = p0 & c; p0 ^= c; c = t
+        t = p1 & c; p1 ^= c; c = t
+        t = p2 & c; p2 ^= c; c = t
+        t = p3 & c; p3 ^= c; c = t
+        t = p4 & c; p4 ^= c; c = t
+        t = p5 & c; p5 ^= c; c = t
+        t = p6 & c; p6 ^= c; c = t
+        p7 ^= c
+        pending += 1
+        if pending == PLANE_FULL
+          drain(votes.to_unsafe, p0, p1, p2, p3, p4, p5, p6, p7)
+          p0 = p1 = p2 = p3 = p4 = p5 = p6 = p7 = 0_u64
+          pending = 0
         end
       end
+      drain(votes.to_unsafe, p0, p1, p2, p3, p4, p5, p6, p7) if pending > 0
       out = 0_u64
       bit = 0
       while bit < 64
-        out |= (1_u64 << bit) if votes.to_unsafe[bit] > 0
+        # `2 * ones > tokens` — the old `votes > 0`, restated for a ones-only count.
+        out |= (1_u64 << bit) if votes.to_unsafe[bit] &* 2 > tokens
         bit += 1
       end
       out
     end
 
-    def self.hamming(a : UInt64, b : UInt64) : Int32
-      x = a ^ b
-      c = 0
-      while x != 0
-        x &= x - 1
-        c += 1
+    # Add the bit-sliced counters back into the per-column totals and leave the planes to be
+    # zeroed by the caller. Runs once per PLANE_FULL tokens, so its 64 iterations amortize to
+    # well under one per token.
+    private def self.drain(votes : Int32*, p0 : UInt64, p1 : UInt64, p2 : UInt64, p3 : UInt64,
+                           p4 : UInt64, p5 : UInt64, p6 : UInt64, p7 : UInt64) : Nil
+      bit = 0
+      while bit < 64
+        v = (p0 >> bit) & 1_u64
+        v |= ((p1 >> bit) & 1_u64) << 1
+        v |= ((p2 >> bit) & 1_u64) << 2
+        v |= ((p3 >> bit) & 1_u64) << 3
+        v |= ((p4 >> bit) & 1_u64) << 4
+        v |= ((p5 >> bit) & 1_u64) << 5
+        v |= ((p6 >> bit) & 1_u64) << 6
+        v |= ((p7 >> bit) & 1_u64) << 7
+        votes[bit] += v.to_i32
+        bit += 1
       end
-      c
+    end
+
+    # `popcount` is one instruction on every target gori builds for; the loop it replaces ran
+    # once per DIFFERING bit, which for two unrelated fingerprints is ~32 iterations with an
+    # unpredictable trip count. That matters because of who calls it: `ClusterMap#observe`
+    # linear-scans up to MAX_CLUSTERS representatives per crawl page, and `Calibrate.hit?`
+    # runs it over the baseline set for every probe.
+    def self.hamming(a : UInt64, b : UInt64) : Int32
+      (a ^ b).popcount.to_i32
     end
 
     private def self.alnum?(b : UInt8) : Bool
