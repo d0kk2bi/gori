@@ -346,13 +346,13 @@ describe SettingsView do
     end
   end
 
-  it "saves and resets the DISPLAY section (detail pane, time format, gutter, preview cap, resource meter, terminal title)" do
+  it "saves and resets the DISPLAY section (detail pane, time format, gutter, wrap, preview cap, resource meter, terminal title)" do
     dir = File.tempname("gori-settings-display-view")
     Dir.mkdir_p(dir)
     prev_home = ENV["GORI_HOME"]?
     prev = {
       Gori::Settings.default_detail_pane, Gori::Settings.history_time_format,
-      Gori::Settings.show_gutter, Gori::Settings.preview_body_kib,
+      Gori::Settings.show_gutter, Gori::Settings.wrap_lines?, Gori::Settings.preview_body_kib,
       Gori::Settings.resource_meter?, Gori::Settings.terminal_title,
     }
     begin
@@ -360,6 +360,7 @@ describe SettingsView do
       Gori::Settings.default_detail_pane = "request"
       Gori::Settings.history_time_format = "absolute"
       Gori::Settings.show_gutter = true
+      Gori::Settings.wrap_lines = true
       Gori::Settings.preview_body_kib = 64
       Gori::Settings.resource_meter = true
       Gori::Settings.terminal_title = "project"
@@ -372,6 +373,8 @@ describe SettingsView do
       v.move_field(1)
       v.toggle_or_move(1) # line numbers: on → off (bool)
       v.move_field(1)
+      v.toggle_or_move(1) # wrap long lines: on → off (bool)
+      v.move_field(1)
       set_text(v, "128") # preview body limit (text)
       v.move_field(1)
       v.toggle_or_move(1) # resource meter: on → off (bool)
@@ -381,6 +384,7 @@ describe SettingsView do
       Gori::Settings.default_detail_pane.should eq("response")
       Gori::Settings.history_time_format.should eq("relative")
       Gori::Settings.show_gutter.should be_false
+      Gori::Settings.wrap_lines?.should be_false
       Gori::Settings.preview_body_kib.should eq(128)
       Gori::Settings.resource_meter?.should be_false
       Gori::Settings.terminal_title.should eq("tab")
@@ -390,12 +394,13 @@ describe SettingsView do
       Gori::Settings.default_detail_pane.should eq(Gori::Settings::DEFAULT_DETAIL_PANE)
       Gori::Settings.history_time_format.should eq(Gori::Settings::DEFAULT_HISTORY_TIME_FORMAT)
       Gori::Settings.show_gutter.should eq(Gori::Settings::DEFAULT_SHOW_GUTTER)
+      Gori::Settings.wrap_lines?.should eq(Gori::Settings::DEFAULT_WRAP_LINES)
       Gori::Settings.preview_body_kib.should eq(Gori::Settings::DEFAULT_PREVIEW_BODY_KIB)
       Gori::Settings.resource_meter?.should eq(Gori::Settings::DEFAULT_RESOURCE_METER)
       Gori::Settings.terminal_title.should eq(Gori::Settings::DEFAULT_TERMINAL_TITLE)
     ensure
       prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
-      Gori::Settings.default_detail_pane, Gori::Settings.history_time_format, Gori::Settings.show_gutter, Gori::Settings.preview_body_kib, Gori::Settings.resource_meter, Gori::Settings.terminal_title = prev
+      Gori::Settings.default_detail_pane, Gori::Settings.history_time_format, Gori::Settings.show_gutter, Gori::Settings.wrap_lines, Gori::Settings.preview_body_kib, Gori::Settings.resource_meter, Gori::Settings.terminal_title = prev
       FileUtils.rm_rf(dir)
     end
   end

@@ -1,5 +1,6 @@
 require "./screen"
 require "./theme"
+require "./highlight"
 
 module Gori::Tui
   # Soft wrap: one LOGICAL line → N VISUAL rows, Burp-style (the line number is printed
@@ -152,6 +153,22 @@ module Gori::Tui
       built
     end
 
+    # The UNWRAPPED companion of `rows`: `h` rows from logical line `li`, one per line, each
+    # holding the whole line. What a pane draws when soft wrap is switched off (Preferences ▸
+    # Appearance ▸ Display) — the horizontal offset is then applied at the draw, so every
+    # consumer of a `Row` (the click inverse, the caret, the band, the search overdraw) stays
+    # on one model in both modes instead of growing a second one for the flat case.
+    def self.plain_rows(li : Int32, h : Int32, size : Int32, line_at : Int32 -> String) : Array(Row)
+      built = Array(Row).new({h, 0}.max)
+      return built if h <= 0 || size <= 0
+      i = li.clamp(0, size - 1)
+      while i < size && built.size < h
+        built << Row.new(i, 0, 0, line_at.call(i).size)
+        i += 1
+      end
+      built
+    end
+
     # The position `back` visual rows ABOVE (li, sub), stopping at the top of the buffer.
     def self.step_back(li : Int32, sub : Int32, back : Int32,
                        layout_at : Int32 -> Layout) : {Int32, Int32}
@@ -289,6 +306,12 @@ module Gori::Tui
     # Overdraw ^F search matches on ONE visual row `[a, b)` of `line`, which was drawn
     # starting at content-x `x`; clipped to `max_x` (exclusive).
     #
+    # `xoff` is how many display columns the base draw scrolled off to the LEFT — always 0
+    # under soft wrap (a wrapped row has no sideways), non-zero only on a pane whose wrap the
+    # operator turned off and is panning instead. A match straddling the left edge is CUT
+    # there rather than dropped, the same way the base draw cuts it, so the overdraw
+    # reproduces exactly the cells underneath it.
+    #
     # Separate from `SearchHi.mark` — and NOT a call to it with the row's text — because
     # `SearchHi.mark` is given only the string it should scan and therefore cannot know that
     # something preceded it on the same logical line. Handed one wrapped row at a time it
@@ -300,24 +323,44 @@ module Gori::Tui
     # on BOTH rows it occupies, which is also what the reader expects to see.
     def self.mark_search(screen : Screen, x : Int32, y : Int32, line : String,
                          a : Int32, b : Int32, query : String, max_x : Int32,
-                         conceal : Array({Int32, Int32})? = nil) : Nil
+                         conceal : Array({Int32, Int32})? = nil, xoff : Int32 = 0) : Nil
       return if query.empty? || line.empty? || a >= b
       q = query.downcase
       dl = line.downcase
       # Match in the downcased copy, then slice the ORIGINAL to preserve case — valid only
-      # while downcase is 1:1 (mirrors SearchHi.mark, including its fallback).
-      src = dl.size == line.size ? line : dl
+      # while downcase is 1:1. For the rare char that changes length under it (U+0130 'İ'
+      # → "i" + U+0307) fall back to the downcased string for the COLUMN as well as the
+      # slice: `i` is an index into `dl`, and measuring it against `line` put the band a
+      # glyph off — the two disagree about how many chars precede the match.
+      same = dl.size == line.size
+      src = same ? line : dl
+      lo, hi = a, b
+      unless same
+        # `a`/`b` index `line`, which the downcased copy no longer lines up with, so the
+        # only row that can be marked without mapping the bounds across that difference is
+        # one covering the WHOLE line — every row with soft wrap off, and the only shape the
+        # retired plain-string marker ever had. A wrapped row of such a line is left unmarked
+        # rather than marked at a column, or a length, that is a glyph off.
+        return unless a <= 0 && b >= line.size
+        lo, hi = 0, dl.size
+      end
       pos = 0
       while (i = dl.index(q, pos))
         pos = i + q.size
-        ma = {i, a}.max
-        mb = {pos, b}.min
+        ma = {i, lo}.max
+        mb = {pos, hi}.min
         next if ma >= mb # this match doesn't touch the row
-        col = x + row_col(line, conceal, a, ma)
+        col = x + row_col(src, conceal, lo, ma) - xoff
         seg = src[ma...mb]
         # Concealed chars inside the match aren't on screen; drop them so the overdraw
         # reproduces exactly the cells the base draw painted.
         seg = strip_hidden(seg, conceal, ma) if conceal && !conceal.empty?
+        if col < x
+          # Cut the columns that scrolled off the left, cluster-wise (`slice_left_text`'s
+          # rule) — the base draw cut them the same way, so what is left lines up with it.
+          seg = Highlight.slice_left_text(seg, x - col)
+          col = x
+        end
         screen.text(col, y, seg, Theme.bg, Theme.yellow, width: {max_x - col, 0}.max) if col < max_x && !seg.empty?
       end
     end

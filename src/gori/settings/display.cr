@@ -25,6 +25,12 @@ module Gori::Settings
   # freshly-opened History flow shows first; history_time_format = list time column;
   # show_gutter = line-number gutter on the message body views; preview_body_kib = how many
   # body bytes the History list PREVIEW reads/shows (display-only, not the capture limit).
+  # wrap_lines = soft wrap on the panes that opted into it (message bodies, the Repeater
+  # request/response, the Decoder output, …): a line too wide for the pane spills onto
+  # continuation rows and the gutter numbers the first of them. Off restores the model those
+  # panes carried before — one row per line, the tail off the right edge, reached by walking
+  # the caret sideways (the view follows it). Read LIVE at each pane's wrap predicate, so the
+  # toggle applies to the next frame rather than to the next launch.
   # resource_meter = the bottom bar's far-right CPU/MEM readout for gori's own process.
   # terminal_title = what gori writes into the OS terminal-window title (OSC): the project
   # and active tab, the tab alone, or nothing at all ("off" leaves the title untouched,
@@ -32,6 +38,7 @@ module Gori::Settings
   DEFAULT_DETAIL_PANE         = "request"  # "request" | "response"
   DEFAULT_HISTORY_TIME_FORMAT = "absolute" # "absolute" | "relative"
   DEFAULT_SHOW_GUTTER         = true
+  DEFAULT_WRAP_LINES          = true
   DEFAULT_PREVIEW_BODY_KIB    = 64
   DEFAULT_RESOURCE_METER      = true
   DEFAULT_TERMINAL_TITLE      = "project" # "project" | "tab" | "off"
@@ -73,6 +80,9 @@ module Gori::Settings
   class_property default_detail_pane : String = DEFAULT_DETAIL_PANE
   class_property history_time_format : String = DEFAULT_HISTORY_TIME_FORMAT
   class_property show_gutter : Bool = DEFAULT_SHOW_GUTTER
+  # `?` toggle read live by every pane that opted into soft wrap (ReadPane/TextArea's `wrap`
+  # flag, the History detail and the Repeater response). Off ⇒ those panes scroll sideways.
+  class_property? wrap_lines : Bool = DEFAULT_WRAP_LINES
   class_property preview_body_kib : Int32 = DEFAULT_PREVIEW_BODY_KIB
   # `?` toggle read live by the status bar's ResourceMeter; off means it never samples.
   class_property? resource_meter : Bool = DEFAULT_RESOURCE_METER
@@ -138,6 +148,7 @@ module Gori::Settings
       self.history_time_format = v == "relative" ? "relative" : "absolute"
     end
     self.show_gutter = load_bool_h(o, "show_gutter", show_gutter)
+    self.wrap_lines = load_bool_h(o, "wrap_lines", wrap_lines?)
     if v = int_field(o, "preview_body_kib")
       self.preview_body_kib = v.clamp(1, MAX_PREVIEW_BODY_KIB)
     end
@@ -220,6 +231,7 @@ module Gori::Settings
     unless default_detail_pane == DEFAULT_DETAIL_PANE &&
            history_time_format == DEFAULT_HISTORY_TIME_FORMAT &&
            show_gutter == DEFAULT_SHOW_GUTTER &&
+           wrap_lines? == DEFAULT_WRAP_LINES &&
            preview_body_kib == DEFAULT_PREVIEW_BODY_KIB &&
            resource_meter? == DEFAULT_RESOURCE_METER &&
            terminal_title == DEFAULT_TERMINAL_TITLE
@@ -228,6 +240,7 @@ module Gori::Settings
           j.field "detail_pane", default_detail_pane
           j.field "history_time_format", history_time_format
           j.field "show_gutter", show_gutter
+          j.field "wrap_lines", wrap_lines?
           j.field "preview_body_kib", preview_body_kib
           j.field "resource_meter", resource_meter?
           j.field "terminal_title", terminal_title

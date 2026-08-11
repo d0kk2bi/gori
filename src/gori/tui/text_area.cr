@@ -7,7 +7,6 @@ require "../env"
 require "../settings"
 require "./gutter"
 require "./read_cursor"
-require "./search_hi"
 require "./reveal"
 require "./env_complete"
 require "./env_peek"
@@ -143,10 +142,20 @@ module Gori::Tui
     setter search_hl : String
     setter reveal : Bool
     setter bg_regions : Array({Int32, Int32, Color})
-    # Enable horizontal cursor-following (the Project description); off everywhere
+    # Enable horizontal cursor-following (the Decoder/JWT inputs); off everywhere
     # else, so those editors keep @xscroll == 0 and their hot render path unchanged.
-    # Ignored while @wrap is on — a wrapped line has nothing off to the side.
+    # Ignored while wrap is on — a wrapped line has nothing off to the side.
     setter follow_x : Bool
+
+    # …and ON, unasked, for an editor that opted into wrap while the Display preference has
+    # wrap switched off. Every one of those panes REPLACED a `follow_x` pan when it started
+    # wrapping (their constructors say so), and the ⇧←/→ h-scroll bindings went with it — so
+    # without this the operator would be left with a right-clipped line and no way to reach
+    # its tail, which is neither of the two models on offer.
+    private def follow_x? : Bool
+      @follow_x || (@wrap && !Settings.wrap_lines?)
+    end
+
     getter edits : Int32
     getter cy : Int32
     getter cx : Int32
@@ -1271,11 +1280,17 @@ module Gori::Tui
       # text column every time a line spilled — the gutter names logical lines, and there
       # are exactly as many of those as there ever were.
       @last_cw = cw # the wrap mappings that run outside render (move / click / at_top?) need it
+      # Each branch zeroes the OTHER's state. They were mutually exclusive by construction
+      # while `wrap=` was the only way in; the Display preference can now flip the answer
+      # under a live editor, and a leftover offset would shift every wrapped row left by it
+      # (or leave the caret anchored to a continuation row that no longer exists).
       if wrapping?
+        @xscroll = 0
         ensure_visible_wrapped(cw, rect.h)
       else
+        @scroll_sub = 0
         ensure_visible(rect.h)
-        ensure_visible_x(cw) # slide @xscroll so the caret stays on screen (no-op unless @follow_x)
+        ensure_visible_x(cw) # slide @xscroll so the caret stays on screen (no-op unless follow_x?)
       end
       styled = highlight ? highlighted(highlight) : nil
       rows = visible_rows(cw, rect.h)
@@ -1367,17 +1382,18 @@ module Gori::Tui
         # itself no-ops when there are no regions or in reveal mode.
         paint_bg_regions(screen, cx0, rect.y + i, line_off, @lines[li], cw, cr, a, b) unless composing
         unless @search_hl.empty?
-          if wrapping?
-            # Scan the WHOLE logical line and clip each hit to this row, so a match that
-            # straddles a wrap break lights up on both rows instead of on neither — see
-            # Wrap.mark_search.
-            Wrap.mark_search(screen, cx0, rect.y + i, line, a, b, @search_hl, cx0 + cw, cr)
-          else
-            # Mark on the visible (left-sliced) text so the highlight columns line up
-            # with the cells we actually drew once horizontally scrolled.
-            st = @xscroll > 0 ? Highlight.slice_left_text(line, @xscroll) : line
-            SearchHi.mark(screen, cx0, rect.y + i, st, @search_hl, cx0 + cw)
-          end
+          # ONE scan for both modes: over the WHOLE logical line, each hit clipped to this
+          # row (so a match straddling a wrap break lights up on both rows instead of on
+          # neither) and shifted by @xscroll, which is 0 whenever the editor wraps.
+          #
+          # The h-scrolled branch this replaces marked the RAW line and ignored `cr`, while
+          # `draw_concealed_line` had DELETED the concealed ¦chain run from what it drew — so
+          # on a marker line every hit past a marker painted a second, highlighted copy of the
+          # query to the right of the real one. Unreachable while wrap was a per-editor
+          # constant (the two editors with conceal both wrapped); the Display preference can
+          # now send them down this path.
+          Wrap.mark_search(screen, cx0, rect.y + i, line, a, b, @search_hl, cx0 + cw, cr,
+            xoff: @xscroll)
         end
         # The INS selection tint, over the text and the search marks, under the caret —
         # the same stacking (and the same `Theme.accent_bg`) the READ-mode over-painter
@@ -1454,7 +1470,16 @@ module Gori::Tui
     # every mapping outside render (move / click / at_top? / wheel) needs that width, and
     # guessing one would put the caret on a different row than the draw did.
     private def wrapping? : Bool
-      @wrap && @last_cw > 0
+      wrap_on? && @last_cw > 0
+    end
+
+    # This editor's opt-in AND the app-wide preference (Preferences ▸ Appearance ▸ Display).
+    # Read live, not latched into `@wrap`, so the toggle reaches editors built at startup;
+    # every mapping here goes through `wrapping?` per call, so a flip lands on the next frame.
+    # No memo is dropped on the flip — a `Wrap::Layout` is a pure function of (line, width,
+    # conceal), so one built while wrapping is still correct when wrap comes back.
+    private def wrap_on? : Bool
+      @wrap && Settings.wrap_lines?
     end
 
     # Logical line `li` AS DRAWN: the buffer line, with any IME preedit spliced in at the
@@ -1968,7 +1993,7 @@ module Gori::Tui
     # resets to 0 (no needless side-scroll). No-op unless @follow_x, so every other
     # editor keeps @xscroll == 0 and renders exactly as before.
     private def ensure_visible_x(cw : Int32) : Nil
-      return unless @follow_x
+      return unless follow_x?
       return if cw <= 0
       line = @lines[@cy]
       # draw_width, not display_width (#289): the preedit is drawn by `screen.text` /

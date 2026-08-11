@@ -459,14 +459,14 @@ describe Gori::Tui::Highlight do
   # The search overlay repaints cells the base draw already painted, using screen.text
   # (grapheme-walked). Its column must therefore be grapheme-summed too, or the yellow
   # band lands right of the match and covers unrelated glyphs.
-  describe "SearchHi column alignment" do
+  describe "search-overlay column alignment" do
     it "highlights the match columns after a ZWJ emoji, not 3 columns right of them" do
       zwj = "\u{1F468}\u{200D}\u{1F4BB}"
       text = zwj + "needle"
       b = MemoryBackend.new(40, 1)
       screen = Screen.new(b)
       screen.text(0, 0, text, Theme.text)
-      SearchHi.mark(screen, 0, 0, text, "needle", 40)
+      Wrap.mark_search(screen, 0, 0, text, 0, text.size, "needle", 40)
       # The emoji occupies cols 0-1, so "needle" is drawn at cols 2..7 and that is exactly
       # where the yellow band must sit. Under column_width it started at col 5.
       (2...8).each { |x| b.bg_at(x, 0).should eq(Theme.yellow) }
@@ -480,7 +480,7 @@ describe Gori::Tui::Highlight do
       b = MemoryBackend.new(40, 1)
       screen = Screen.new(b)
       screen.text(0, 0, text, Theme.text)
-      SearchHi.mark(screen, 0, 0, text, "needle", 40)
+      Wrap.mark_search(screen, 0, 0, text, 0, text.size, "needle", 40)
       (2...8).each { |x| b.bg_at(x, 0).should eq(Theme.yellow) }
       b.bg_at(1, 0).should_not eq(Theme.yellow)
     end
