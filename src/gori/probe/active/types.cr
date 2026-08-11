@@ -155,6 +155,14 @@ module Gori
           rest = authority[(close + 1)..]
           return {host, rest.starts_with?(':') ? rest[1..].to_i? : nil}
         end
+        # An UNBRACKETED authority is a whole IPv6 host when it is a valid v6 literal — a
+        # port cannot be told apart from the address colons without brackets. Shared with
+        # `Upstream.split_host_port`, whose comment states the rule; this copy omitted it, so
+        # "::1" split on the last colon into host ":" port 1 and "2001:db8::1" into
+        # "2001:db8:". `url_authority` only rejects an EMPTY host, so that garbage reached
+        # the open-redirect and host-header rules, where it can only fail to match
+        # PROBE_HOST — a missed detection rather than a false one, but silent either way.
+        return {authority, nil} if Gori::Proxy::Upstream.valid_ipv6?(authority)
         if (colon = authority.rindex(':')) && (p = authority[(colon + 1)..].to_i?)
           return {authority[0...colon], p}
         end

@@ -1482,12 +1482,19 @@ module Gori::Tui
       t.to_local.to_s("%Y-%m-%d %H:%M")
     end
 
+    # Prose sizes for the Project pane — a space before the unit and a TB step, which is why
+    # this is not `Fmt.size` (that one is a fixed ≤6-column table cell, no space, capped at
+    # GB). What it MUST share is `Fmt`'s rounding convention, stated in that module's
+    # docstring: pick the unit from the ROUNDED magnitude, so a value just under a boundary
+    # rolls up instead of printing the misleading form. This loop compared the UNROUNDED
+    # value, so 1_048_575 bytes rendered as "1024.0 KB" — verbatim the string `Fmt` names as
+    # the thing it exists to prevent — where `Fmt.size` gives "1.0MB".
     private def human_size(bytes : Int64) : String
       return "0 B" if bytes <= 0
       units = ["B", "KB", "MB", "GB", "TB"]
       i = 0
       b = bytes.to_f64
-      while b >= 1024.0 && i < units.size - 1
+      while b.round(1) >= 1024.0 && i < units.size - 1
         b /= 1024.0
         i += 1
       end

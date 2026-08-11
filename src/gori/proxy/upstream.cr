@@ -1026,7 +1026,11 @@ module Gori::Proxy
     # A bare (unbracketed) IPv6 literal. The charset guard scrubs and rejects anything
     # outside the v6 alphabet before valid_v6? (mirrors cert_builder's ipv6?), so an
     # invalid-UTF-8 / otherwise odd authority can't raise on this parse path.
-    private def self.valid_ipv6?(host : String) : Bool
+    #
+    # Public because it is the disambiguation half of `split_host_port`, and the probe
+    # rules need exactly that half without the default-port half — their own splitter
+    # returns a nilable port. See `Probe::Active::Rule.split_host_port`.
+    def self.valid_ipv6?(host : String) : Bool
       return false unless (host.scrub =~ /\A[0-9A-Fa-f:.]+\z/) != nil
       Socket::IPAddress.valid_v6?(host)
     end
