@@ -58,6 +58,15 @@ module Gori
         acc
       end
 
+      # Whether `lines` would CUT either side. The cap is silent by construction — `lines`
+      # returns a diff of the truncated inputs and cannot say so — and the docstring above
+      # makes noting it the caller's job. Deriving it here rather than at each call site is
+      # what stops a caller forgetting: three of them did, and reported "no differences" over
+      # a change that sat past the cut.
+      def self.truncated?(a : Array(String), b : Array(String)) : Bool
+        a.size > MAX_LINES || b.size > MAX_LINES
+      end
+
       def self.lines(a : Array(String), b : Array(String)) : Array(DiffLine)
         a = a.first(MAX_LINES)
         b = b.first(MAX_LINES)

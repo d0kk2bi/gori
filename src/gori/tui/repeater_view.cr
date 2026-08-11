@@ -5231,7 +5231,17 @@ module Gori::Tui
         elsif !(baseline = diff_baseline_lines)
           [Repeater::DiffLine.new(Repeater::DiffKind::Same, "— first send: resend (^R) to diff against the previous response —")]
         else
-          Repeater::Diff.lines(baseline, message_lines(result.head, display_body(result.head, result.body)))
+          fresh = message_lines(result.head, display_body(result.head, result.body))
+          rows = Repeater::Diff.lines(baseline, fresh)
+          # The Comparer tab has always shown this; the Repeater diff tab rendered a CUT diff
+          # with nothing to say so, and an empty diff then reads as "the payload changed
+          # nothing". Prepended rather than appended: at the cap the row list is long, and a
+          # marker at the bottom is the one an operator scrolls past.
+          if Repeater::Diff.truncated?(baseline, fresh)
+            rows.unshift(Repeater::DiffLine.new(Repeater::DiffKind::Same,
+              "— diff truncated to #{Repeater::Diff::MAX_LINES} lines/side; later lines were not compared —"))
+          end
+          rows
         end
       end
     end

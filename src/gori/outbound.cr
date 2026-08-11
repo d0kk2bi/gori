@@ -315,12 +315,22 @@ module Gori
     # and Repeater paths passed the raw target through, so hoisting it here is what makes the
     # rule identical on all three surfaces. Port is omitted to match `Scope.request_url`'s
     # origin-form convention (the scope lens keys on host, not port).
+    # Reduced with `Url.origin_path`, the LEXICAL split, rather than `URI.parse` — which
+    # raises on exactly the targets a security tool is most likely to be handed. A
+    # non-numeric or oversized port (`http://acme.test:abc/admin`, `:99999999999999999999`)
+    # raises `URI::Error`/`OverflowError`, and rescuing that to nil read as "no path", so
+    # the gate evaluated `scheme://host/`. An INCLUDE still matched on host, so this was
+    # invisible for the common config — but a path EXCLUDE (`/admin`) no longer matched the
+    # url it was tested against, and the operator's carve-out silently stopped holding.
+    # `sweep_block` promises that carve-out holds even under `--allow-unscoped`.
+    #
+    # The proxy already refuses this input rather than degrading (`ClientConn#handle_one`
+    # records it and writes a gateway error); there is no reason for the gate that guards
+    # the ACTIVE tools to be the lenient one. `origin_path` cannot raise, so it does not
+    # degrade at all: it keeps path+query verbatim, fragment included — one more thing for
+    # an exclude to match, never one fewer.
     def self.scope_url(scheme : String, host : String, target : String) : String
-      if Store::FlowRow.absolute_form?(target)
-        uri = URI.parse(target) rescue nil
-        path = uri.try(&.path).presence || "/"
-        target = (q = uri.try(&.query)) ? "#{path}?#{q}" : path
-      end
+      target = Url.origin_path(target) if Store::FlowRow.absolute_form?(target)
       Scope.request_url(scheme, host, target)
     end
 

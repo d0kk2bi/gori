@@ -1953,16 +1953,13 @@ module Gori::Tui
       t.to_local.to_s("%m-%d %H:%M:%S")
     end
 
-    # Compact relative age from now: "3s" / "5m" / "2h" / "1d" (mirrors
-    # notifications_overlay#ago). Clamped at 0 so clock skew never shows a negative age.
+    # Compact relative age from now: "3s" / "5m" / "2h" / "1d". This said it "mirrors
+    # notifications_overlay#ago" — a copy that no longer exists as one: that overlay and its
+    # two siblings were collapsed into `Fmt.ago` for exactly this reason, and the two methods
+    # right below already delegate to `Fmt`. Byte-identical to the home, so this is the last
+    # copy going home rather than a behaviour change.
     private def fmt_time_relative(t : Time) : String
-      secs = {(Time.local - t).total_seconds.to_i, 0}.max
-      return "#{secs}s" if secs < 60
-      mins = secs // 60
-      return "#{mins}m" if mins < 60
-      hours = mins // 60
-      return "#{hours}h" if hours < 24
-      "#{hours // 24}d"
+      Fmt.ago(t)
     end
 
     # Compact response size (B/KB/MB/GB), bounded to ≤6 cols. "—" until the response

@@ -7,7 +7,13 @@ module Gori
       Probe::Mode.from_setting(setting(Probe::MODE_SETTING_KEY))
     end
 
-    def set_probe_mode(mode : Probe::Mode) : Nil
+    # Returns whether the write COMMITTED (false = store busy/locked/closing), for the same
+    # reason `set_probe_disabled_rules` below does — `set_setting` is `exec_task_ok`, so the
+    # answer was already here and only had to stop being thrown away. The direction that
+    # matters is setting `off`/`passive` to STOP active probing: every surface reported that
+    # as done, while a separate live instance kept the persisted `active`/`aggressive` mode
+    # and kept firing attack payloads at production.
+    def set_probe_mode(mode : Probe::Mode) : Bool
       set_setting(Probe::MODE_SETTING_KEY, mode.label)
     end
 

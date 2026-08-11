@@ -29,7 +29,12 @@ module Gori
                 # method/target/host are captured (attacker/server-controlled) data — an embedded
                 # newline (reachable via an h2 :path/:method pseudo-header) would break the one-line
                 # structure, so sanitize them like f.title/f.host above.
-                loc = flow.row.target.starts_with?("http") ? one_line(flow.row.target) : "#{one_line(flow.row.host)}#{one_line(flow.row.target)}"
+                # `Url.absolute_form?`, not `starts_with?("http")`: the loose test calls
+                # `httpbin.org/x` absolute and drops the host, and misses `HTTP://` (schemes
+                # are case-insensitive, RFC 3986 3.1) so an uppercase target came out doubled
+                # as `a.testHTTP://a.test/x`. Composed by hand rather than via `Url.location`
+                # only because each part has to be `one_line`d first.
+                loc = Url.absolute_form?(flow.row.target) ? one_line(flow.row.target) : "#{one_line(flow.row.host)}#{one_line(flow.row.target)}"
                 io << one_line(flow.row.method) << " " << loc << " → " << (flow.row.status || "-") << " (#" << fid << ")\n"
               else
                 io << "#" << fid << " (no longer captured)\n"

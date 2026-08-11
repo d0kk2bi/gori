@@ -120,6 +120,35 @@ describe Gori::Proxy::H2::Assembler do
     String.new(sink.responses.first.head).should contain("HTTP/2 200")
   end
 
+  # RFC 9113 8.1 forbids pseudo-headers in trailers, so a `:status` arriving AFTER a final
+  # response head is a broken or hostile origin — not the interim-1xx handover the replace
+  # branch exists for. It used to take that branch anyway: the trailer REPLACED the real
+  # head, so the flow reported the trailer's status and lost the head's content-type and
+  # Set-Cookie, with `trailer_names.clear` erasing the marker that would have explained it.
+  it "does not let a status-bearing TRAILER replace a final response head" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    # A real 200 head carrying a content-type worth losing.
+    head = Gori::Proxy::H2::HPACK::Encoder.new.encode([
+      {":status", "200"}, {"content-type", "application/grpc"},
+    ])
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, head))
+    assembler.feed("in", data_frame(1_u32, 0_u8, "body"))
+    # Then a trailer block that illegally carries :status alongside grpc-status.
+    trailer = Gori::Proxy::H2::HPACK::Encoder.new.encode([
+      {":status", "500"}, {"grpc-status", "13"},
+    ])
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM, trailer))
+
+    sink.responses.size.should eq(1)
+    resp = sink.responses.first
+    resp.status.should eq(200)                               # not the trailer's 500
+    String.new(resp.head).should contain("application/grpc") # the real head survives
+    String.new(resp.head).should contain("grpc-status")      # the trailer is still recorded
+  end
+
   it "carries a request body across DATA frames" do
     sink = RecSink.new
     assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)

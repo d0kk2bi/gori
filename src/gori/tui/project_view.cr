@@ -754,11 +754,15 @@ module Gori::Tui
       current_override.try(&.host)
     end
 
-    # Removes the selected override, returning its host (for the toast) or nil.
+    # Removes the selected override, returning its host (for the toast) — or nil when there
+    # was nothing selected OR the delete did not COMMIT. `HostOverrides#remove` answers that
+    # (its doc: "false = store busy/locked/closing") and this discarded it, so a dropped
+    # write still reported "host override deleted" while the routing pin stayed live. The
+    # two writes right above in `ov_commit` already check theirs.
     def ov_delete : String?
       entry = current_override
       return nil unless entry
-      @host_overrides.remove(entry.id)
+      return nil unless @host_overrides.remove(entry.id)
       clamp_ov_sel
       entry.host
     end
@@ -1478,12 +1482,19 @@ module Gori::Tui
       t.to_local.to_s("%Y-%m-%d %H:%M")
     end
 
+    # Prose sizes for the Project pane — a space before the unit and a TB step, which is why
+    # this is not `Fmt.size` (that one is a fixed ≤6-column table cell, no space, capped at
+    # GB). What it MUST share is `Fmt`'s rounding convention, stated in that module's
+    # docstring: pick the unit from the ROUNDED magnitude, so a value just under a boundary
+    # rolls up instead of printing the misleading form. This loop compared the UNROUNDED
+    # value, so 1_048_575 bytes rendered as "1024.0 KB" — verbatim the string `Fmt` names as
+    # the thing it exists to prevent — where `Fmt.size` gives "1.0MB".
     private def human_size(bytes : Int64) : String
       return "0 B" if bytes <= 0
       units = ["B", "KB", "MB", "GB", "TB"]
       i = 0
       b = bytes.to_f64
-      while b >= 1024.0 && i < units.size - 1
+      while b.round(1) >= 1024.0 && i < units.size - 1
         b /= 1024.0
         i += 1
       end

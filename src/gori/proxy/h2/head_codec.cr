@@ -397,6 +397,16 @@ module Gori::Proxy::H2
              "it back as two fields (a header-injection primitive — the raw frames are " \
              "untouched and the stored head escapes it)" if line_broken?(f.value)
       return "the value of #{name.inspect} starts with a space, which the h1 round trip eats" if f.value.starts_with?(' ')
+      # `peer_field_name` renames a field whose name collides with one of gori's own markers,
+      # so the peer's anomaly stays visible under a name that cannot be confused for gori's.
+      # That rename is deliberate — but it is exactly the "comes back as a DIFFERENT field"
+      # case this method exists to refuse, and it was invisible here: the name is lowercase,
+      # colon-free and CRLF-free, so every check above passed and `h1_faithful?` called the
+      # round trip sound. Re-encoding then put `x-peer-<marker>` on the wire in place of the
+      # name the peer actually sent.
+      return "the field name #{name.inspect} collides with a marker gori adds to the h1 text " \
+             "form, so the round trip would rename it and a different name would go on the " \
+             "wire" if reserved_marker?(name)
       nil
     end
 

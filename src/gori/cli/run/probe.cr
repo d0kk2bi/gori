@@ -577,7 +577,10 @@ module Gori
         begin
           if w = want
             mode = Probe::Mode.from_setting(w)
-            store.set_probe_mode(mode)
+            unless store.set_probe_mode(mode)
+              store.close
+              abort "gori run probe mode: project is busy (write did not commit) — try again"
+            end
             puts "Scan mode set to #{mode.label}."
           else
             puts store.probe_mode.label

@@ -98,7 +98,34 @@ module Gori::Proxy::Tls
     rescue
       # Client refused our cert (the untrusted-CA warning) — nothing to serve.
     ensure
-      client_tls.try(&.close) rescue nil
+      close_client_transport(client, client_tls)
+    end
+
+    # Tear down the client side of a handshake attempt, whichever half owns it.
+    #
+    # `sync_close: true` hands the transport to the TLS socket — but only once the
+    # constructor RETURNS. When the handshake raises instead, `client_tls` was never
+    # assigned, so closing only it left the accepted socket open until GC finalized the
+    # fd. Crystal's stdlib covers half of this: `OpenSSL::SSL::Socket::Server#accept`
+    # closes `bio.io` when `SSL_accept` returns an error CODE, which is the ordinary
+    # cert-rejection path — but not when the underlying BIO read RAISES, because control
+    # never reaches that line. Two ordinary triggers do exactly that: a peer RST between
+    # ClientHello and Finished (`IO::Error`), and a stalled ClientHello hitting the 30 s
+    # CLIENT_IO_TIMEOUT armed in `Server` (`IO::TimeoutError`) — a browser's speculative
+    # preconnect, or a NAT'd mobile client that half-opens.
+    #
+    # Two of the three callers own nothing else that would close it (`serve_transparent_tls`,
+    # `serve_reverse_tls` both end on the intercept call); the CONNECT path and the
+    # self-page reach `ClientConn#run`'s ensure, where this is a harmless early close —
+    # every close path here is rescue-guarded, so the double close is a no-op. Same
+    # standard as `ConnPool#close_all`, which exists so a stopped sweep does not leave
+    # fds open until GC, and the outbound twin of this constructor semantic in `Upstream`.
+    private def close_client_transport(client : IO, client_tls : IO?) : Nil
+      if tls = client_tls
+        tls.close rescue nil
+      else
+        client.close rescue nil
+      end
     end
 
     # `dial_addr` is the seam #529 needed: `host` names the connection, `dial_addr` reaches it.
@@ -178,7 +205,7 @@ module Gori::Proxy::Tls
       # nothing decrypted to capture. The outer connection is torn down.
     ensure
       upstream.try(&.close) rescue nil # a probe orphaned by a failed client handshake
-      client_tls.try(&.close) rescue nil
+      close_client_transport(client, client_tls)
     end
 
     # ALPN reflection probe (#323). When this host is an h2 candidate, pre-dial the origin

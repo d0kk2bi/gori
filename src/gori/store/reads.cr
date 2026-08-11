@@ -459,6 +459,16 @@ module Gori
       statuses : String?, count : Int64, ok : Int64, errors : Int64,
       first_seen : Int64, last_seen : Int64
 
+    # ORDER BY names every GROUP BY column, so the ordering is TOTAL and the `LIMIT` cut is
+    # deterministic. Six columns key a group and only two ordered it, so `GET /x` and
+    # `POST /x` — and https:443 vs http:80 vs HTTP/2 on one path — tied completely, and which
+    # survived the cut was unspecified. With no cursor on this read, a group that loses an
+    # arbitrary tiebreak is not on a later page; it is unreachable.
+    #
+    # The success bucket starts at 100, not 200: status 101 is exactly what `proto:ws` means
+    # (see ql.cr), so every WebSocket endpoint reported "N attempts, 0 successes, 0 errors".
+    # A NULL status stays in neither bucket on purpose — a Pending flow has no outcome yet —
+    # so ok + errors can legitimately be less than count.
     def sitemap_entries_detailed(filter : QL::Filter = QL::EMPTY, limit : Int32 = SITEMAP_MAX, *,
                                  raise_on_error : Bool = false) : Array(SitemapEntry)
       rows = [] of SitemapEntry
@@ -466,12 +476,12 @@ module Gori
       args << limit
       sql = "SELECT scheme, host, port, http_version, method, target, " \
             "GROUP_CONCAT(DISTINCT status), COUNT(*), " \
-            "SUM(CASE WHEN status BETWEEN 200 AND 399 THEN 1 ELSE 0 END), " \
+            "SUM(CASE WHEN status BETWEEN 100 AND 399 THEN 1 ELSE 0 END), " \
             "SUM(CASE WHEN status = 0 OR status >= 400 THEN 1 ELSE 0 END), " \
             "MIN(created_at), MAX(created_at) " \
             "FROM flows WHERE #{filter.sql} " \
             "GROUP BY scheme, host, port, http_version, method, target " \
-            "ORDER BY host, target LIMIT ?"
+            "ORDER BY host, target, method, scheme, port, http_version LIMIT ?"
       @db.query(sql, args: args) do |rs|
         rs.each do
           rows << SitemapEntry.new(
@@ -493,7 +503,10 @@ module Gori
       rows = [] of {String, String, String}
       args = filter.args.dup
       args << limit
-      @db.query("SELECT DISTINCT host, method, target FROM flows WHERE #{filter.sql} ORDER BY host, target LIMIT ?",
+      # `method` is SELECTed, so it must ORDER too, or the LIMIT cut between two rows that
+      # differ only by method is arbitrary — and with no cursor here the loser is unreachable.
+      @db.query("SELECT DISTINCT host, method, target FROM flows WHERE #{filter.sql} " \
+                "ORDER BY host, target, method LIMIT ?",
         args: args) do |rs|
         rs.each { rows << {rs.read(String), rs.read(String), rs.read(String)} }
       end

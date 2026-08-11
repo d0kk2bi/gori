@@ -212,7 +212,13 @@ module Gori
             j.object do
               j.field "status", row.status || resp.status
               j.field "statusText", resp.reason
-              j.field "httpVersion", version
+              # The RESPONSE's own version, not the request's. `detail.http_version` is the
+              # request column (flow_mapper), so an origin answering HTTP/1.0 to an HTTP/1.1
+              # request exported as HTTP/1.1 and re-imported with its response head rewritten
+              # — and 1.0 vs 1.1 is semantically load-bearing (no default keep-alive). The
+              # truth was already parsed two lines up, from `resp.raw_head`, which is stored
+              # verbatim.
+              j.field "httpVersion", resp.version.presence || version
               j.field "cookies" { response_cookies(j, resp.headers) }
               j.field "headers" { headers(j, resp.headers) }
               j.field "redirectURL", resp.headers.get?("location") || ""

@@ -116,17 +116,23 @@ describe Gori::Tui::Url do
     end
 
     # --- query/fragment on an empty path ---
-    # NOTE: the source keys off the first '/' after the authority. A URL whose only
-    # component after the authority is a query or fragment (no '/') has no such slash,
-    # so it collapses to "/". This is the actual, safe behavior for the display helper;
-    # such wire targets are rare (origin-form always carries a path). Asserting actual.
+    # These two used to assert the collapse to "/" — explicitly as "asserting actual", i.e.
+    # characterising what the code did rather than what it owed. It owed more: the same
+    # helper feeds `Outbound.scope_url`, so collapsing dropped the query a scope EXCLUDE was
+    # keyed to and the carve-out silently stopped matching. RFC 3986 3.3 makes an empty path
+    # with a query "/" + the rest, which is also the more faithful thing to show in the
+    # History/Comparer/picker columns that read this.
 
-    it "collapses an absolute URL whose only tail is a query to '/'" do
-      Gori::Tui::Url.origin_path("http://example.com?q=1").should eq("/")
+    it "keeps the query of an absolute URL whose only tail is a query" do
+      Gori::Tui::Url.origin_path("http://example.com?q=1").should eq("/?q=1")
     end
 
-    it "collapses an absolute URL whose only tail is a fragment to '/'" do
-      Gori::Tui::Url.origin_path("http://example.com#f").should eq("/")
+    it "keeps the fragment of an absolute URL whose only tail is a fragment" do
+      Gori::Tui::Url.origin_path("http://example.com#f").should eq("/#f")
+    end
+
+    it "still yields a bare slash when nothing follows the authority" do
+      Gori::Tui::Url.origin_path("http://example.com").should eq("/")
     end
 
     # --- multibyte / adversarial ---

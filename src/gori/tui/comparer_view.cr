@@ -445,7 +445,7 @@ module Gori::Tui
       return [] of Repeater::SideBySide::Row unless @slot_a && @slot_b
       al = lines_a
       bl = lines_b
-      @truncated = al.size > Repeater::Diff::MAX_LINES || bl.size > Repeater::Diff::MAX_LINES
+      @truncated = Repeater::Diff.truncated?(al, bl)
       result = Repeater::SideBySide.rows(Repeater::Diff.lines(al, bl))
       @change_count = Repeater::SideBySide.change_count(result)
       result

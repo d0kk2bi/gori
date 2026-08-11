@@ -1,5 +1,7 @@
 require "json"
 require "./bind_address"
+require "./durable_file"
+require "./paths"
 
 module Gori
   # Per-project capture sidecar written by the session that holds the capture lock.
@@ -16,21 +18,24 @@ module Gori
     end
 
     def self.write(dir : String, host : String, port : Int32, listening : Bool) : Nil
-      Dir.mkdir_p(dir) unless Dir.exists?(dir)
-      dest = path(dir)
-      tmp = "#{dest}.tmp.#{Process.pid}"
+      # `Paths.ensure_dir`, not a bare `Dir.mkdir_p`: this can be the call that creates a
+      # project directory, and every gori dir is owner-only 0700 (see Paths::DIR_MODE) —
+      # the captured traffic DB lands in here. A plain mkdir_p leaves it at the umask,
+      # world-traversable on a shared host.
+      #
+      # `tighten: false` because this directory is not always gori's. `Project#dir` is
+      # `File.dirname(db_path)`, so a `--db /shared/team/traffic.db` project borrows an
+      # arbitrary parent (project.cr says so); chmod'ing THAT to 0700 would strip group
+      # access from a directory gori merely found. A dir gori creates still lands at 0700.
+      Paths.ensure_dir(dir, tighten: false)
       payload = {
         "host"      => host,
         "port"      => port,
         "listening" => listening,
       }.to_json
-      begin
-        File.write(tmp, payload)
-        File.rename(tmp, dest)
-      rescue ex
-        File.delete?(tmp)
-        raise ex
-      end
+      # 0644 is the fallback for a file that does not exist yet; this marker holds a bind
+      # address, not a secret, and the 0700 dir above is what keeps it private.
+      DurableFile.write(path(dir), payload, perm: File::Permissions.new(0o644))
     end
 
     def self.read(dir : String) : Status?

@@ -1,5 +1,6 @@
 require "file_utils"
 require "digest/sha256"
+require "./durable_file"
 require "./project"
 require "./store"
 require "./capture_lock"
@@ -145,7 +146,13 @@ module Gori
       Paths.ensure_dir(dir) # 0700 — the project dir holds a DB of captured secrets
       # Persist the verbatim display name so a later `list` shows "My Project", not
       # the lossy slug "my-project".
-      File.write(File.join(dir, NAME_FILE), display) rescue nil
+      #
+      # Durably, because this REPLACES an existing name on a reopen and `File.write`
+      # truncates first: a crash or a full disk between the two leaves the picker showing a
+      # half-written name, or none. Same helper the settings/CA/marker writes use — the
+      # sidecars were the last user-visible state still on a truncating write.
+      DurableFile.write(File.join(dir, NAME_FILE), display,
+        perm: File::Permissions.new(0o600)) rescue nil
       write_id_if_absent(dir) # a fresh project gets a stable short id; a reopen keeps its own
       proj = Project.new(display, db_path)
       # Open once even with no description: this creates the DB + runs migrations, and #list
@@ -186,8 +193,11 @@ module Gori
             # racing for the same basename cannot both bind this directory.
             Dir.mkdir(dir, Paths::DIR_MODE)
             File.chmod(dir, Paths::DIR_MODE) rescue nil
-            File.write(File.join(dir, WORKSPACE_FILE), workspace)
-            File.write(File.join(dir, NAME_FILE), display) rescue nil
+            # The binding itself: a torn write here mis-binds a workspace to a project.
+            DurableFile.write(File.join(dir, WORKSPACE_FILE), workspace,
+              perm: File::Permissions.new(0o600))
+            DurableFile.write(File.join(dir, NAME_FILE), display,
+              perm: File::Permissions.new(0o600)) rescue nil
             write_id_if_absent(dir)
             return Project.new(display, db)
           rescue File::AlreadyExistsError
@@ -288,7 +298,11 @@ module Gori
       display = new_name.strip
       raise Gori::Error.new("invalid project name") if display.empty?
       raise Gori::Error.new("project directory missing") unless Dir.exists?(project.dir)
-      File.write(File.join(project.dir, NAME_FILE), display)
+      # A rename replaces a name that is already there, so it gets the same durable
+      # replace as `create`'s — and unlike that one it is NOT best-effort: a rename the
+      # operator asked for either lands or raises.
+      DurableFile.write(File.join(project.dir, NAME_FILE), display,
+        perm: File::Permissions.new(0o600))
       Project.new(display, project.db_path, project.ephemeral?)
     end
 

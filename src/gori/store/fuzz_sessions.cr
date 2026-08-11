@@ -7,12 +7,23 @@ module Gori
     # the read pool (see data_version docs); live TUI paths must soft-sync, not
     # full-restore session UI on every poll.
 
+    # The template is an operator's REQUEST — captured wire bytes seeded by `^F`, so it can
+    # hold a NUL (a gRPC/protobuf frame, a gzip'd POST, a multipart PNG). The column is TEXT
+    # storage and the driver reads TEXT through a NUL-TERMINATED pointer, so `rs.read(String)`
+    # truncated it at the first 0x00 while the write side bound the full bytesize — the bytes
+    # were on disk and the read threw them away. Measured: 73 bytes in, 58 out.
+    #
+    # Same fix, same reason as `RepeaterSessions::REQUEST_COL`, whose column was migrated for
+    # exactly this in V2; the Fuzzer was the last workbench still on the broken shape. CAST is
+    # a documented no-op on an already-BLOB value, so this is safe on every existing row.
+    TEMPLATE_COL = "CAST(template AS BLOB) AS template"
+
     def fuzz_sessions : Array(FuzzSessionRecord)
       list = [] of FuzzSessionRecord
-      @db.query("SELECT id, target, template, http2, sni, config, flow_id, position, name FROM fuzz_sessions ORDER BY position, id") do |rs|
+      @db.query("SELECT id, target, #{TEMPLATE_COL}, http2, sni, config, flow_id, position, name FROM fuzz_sessions ORDER BY position, id") do |rs|
         rs.each do
           list << FuzzSessionRecord.new(
-            rs.read(Int64), rs.read(String), rs.read(String), rs.read(Int32) != 0,
+            rs.read(Int64), rs.read(String), String.new(rs.read(Bytes)), rs.read(Int32) != 0,
             rs.read(String?), rs.read(String), rs.read(Int64?), rs.read(Int32), rs.read(String?))
         end
       end
@@ -21,10 +32,10 @@ module Gori
 
     def get_fuzz_session(id : Int64) : FuzzSessionRecord?
       @db.query(
-        "SELECT id, target, template, http2, sni, config, flow_id, position, name FROM fuzz_sessions WHERE id = ?",
+        "SELECT id, target, #{TEMPLATE_COL}, http2, sni, config, flow_id, position, name FROM fuzz_sessions WHERE id = ?",
         id) do |rs|
         return FuzzSessionRecord.new(
-          rs.read(Int64), rs.read(String), rs.read(String), rs.read(Int32) != 0,
+          rs.read(Int64), rs.read(String), String.new(rs.read(Bytes)), rs.read(Int32) != 0,
           rs.read(String?), rs.read(String), rs.read(Int64?), rs.read(Int32), rs.read(String?)) if rs.move_next
       end
       nil

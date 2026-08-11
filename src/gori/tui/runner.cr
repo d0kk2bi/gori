@@ -2161,8 +2161,12 @@ module Gori::Tui
 
     # Apply the picked Probe scan MODE to the analyzer and re-read the findings list.
     private def apply_probe_mode(p : ChoicePicker) : Nil
-      @session.probe.set_mode(Probe::Mode.new(p.selected_value))
+      committed = @session.probe.set_mode(Probe::Mode.new(p.selected_value))
       probe_controller.view.reload(@session.store)
+      unless committed
+        @toast = "scan mode NOT saved — project busy; another instance keeps the old mode"
+        return
+      end
       mode = @session.probe.mode
       @toast = case mode
                when .aggressive?
@@ -4865,12 +4869,24 @@ module Gori::Tui
         confirm("ENABLE SANDBOX",
           "The scope has no include rules yet, so the sandbox will BLOCK ALL captured traffic until you add one.\nEnable anyway?",
           confirm_label: "enable", danger: true) do
-          @scope.enable_sandbox
-          project_controller.toast_sandbox_state
+          report_sandbox_write(@scope.enable_sandbox)
         end
       else
-        @scope.toggle_sandbox
+        report_sandbox_write(@scope.toggle_sandbox)
+      end
+    end
+
+    # Toast the sandbox state only once the flag actually COMMITTED. `toast_sandbox_state`
+    # reads the in-memory flag, which the setter updates whether or not the write landed —
+    # so on a busy/locked store this announced "sandbox ON … everything else is blocked"
+    # over a gate that was still off, and the next `Scope#reload` reverted the in-memory
+    # flag to match the disk it never reached. MCP and the CLI both already confirm this
+    # write before reporting it; the TUI was the surface that did not.
+    private def report_sandbox_write(committed : Bool) : Nil
+      if committed
         project_controller.toast_sandbox_state
+      else
+        status("sandbox NOT changed — the project store is busy or unwritable")
       end
     end
 

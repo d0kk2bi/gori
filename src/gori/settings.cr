@@ -349,11 +349,15 @@ module Gori
       # the OPERATOR named and gori does not own (see Paths.ensure_dir). What actually
       # protects the env values and decoder sessions is the file's own 0600, below.
       Paths.ensure_dir(File.dirname(path), tighten: false)
-      # Atomic write: a torn File.write (crash / two instances / disk-full) would leave a
+      # Durable write: a torn File.write (crash / two instances / disk-full) would leave a
       # half-written settings.json that load()'s blanket rescue silently resets to factory
       # defaults — losing theme, hotkeys, hostname overrides, tab prefs, decoder sessions.
-      # Stage to a sibling temp then rename (atomic on POSIX), mirroring cert_authority.
-      tmp = "#{path}.tmp"
+      # `DurableFile` stages to a randomly-named sibling and fsyncs before the rename, which
+      # is what makes those three threats actually survivable: the fixed `"#{path}.tmp"` this
+      # used to stage through was shared with every peer process AND with
+      # `drop_legacy_decoder_sessions`, so "two instances" raced on one temp file, and
+      # without the fsync the rename could still land ahead of the bytes.
+      #
       # `mine` = THIS process's serialization of its OWN in-memory state. Base the next
       # merge on it, NOT on a re-read of the file we just wrote: that file also carries a
       # concurrent peer's values for sections WE didn't change (we merged them through). If
@@ -362,34 +366,28 @@ module Gori
       # Basing on `mine` keeps "did I change this section?" honest, so an unchanged section
       # always yields to disk on every subsequent save.
       mine = serialize
-      # Written 0600, and renamed rather than copied, so the FINAL file carries that mode too
-      # (rename moves the inode, permissions and all).
-      write_private(tmp, merge_with_disk(mine))
-      File.rename(tmp, path)
+      write_private(path, merge_with_disk(mine))
       @@loaded_raw = mine
       true
     rescue
-      File.delete?("#{path}.tmp") rescue nil
       false
     end
 
-    # Write a settings document owner-only. Inside GORI_HOME the 0700 tree already covers it,
-    # but `--config` can put this file anywhere — a shared checkout, /tmp, a home directory at
-    # 0755 — and it carries `env` token VALUES and saved decoder sessions (SECRET_SECTIONS
-    # below names both). `CLI.write_export` already does exactly this for the EXPORTED copy;
-    # the live file holds the same secrets and was the one still landing at the umask default.
+    # Durably replace the settings file, owner-only. Inside GORI_HOME the 0700 tree already
+    # covers it, but `--config` can put this file anywhere — a shared checkout, /tmp, a home
+    # directory at 0755 — and it carries `env` token VALUES and saved decoder sessions
+    # (SECRET_SECTIONS below names both). `CLI.write_export` already does exactly this for
+    # the EXPORTED copy; the live file holds the same secrets and was the one still landing
+    # at the umask default.
     #
-    # The mode is set at CREATE time so the bytes are never on disk at 0644 even briefly, and
-    # chmod'd as well because `File.open`'s perm applies only to a file it actually creates —
-    # a `.tmp` left by a crashed save would otherwise keep its old mode and carry it through
-    # the rename. The chmod is best-effort: a filesystem that cannot represent 0600 (a mounted
-    # share) must not turn every settings save into a failure.
-    private def self.write_private(path : String, doc : String) : Nil
-      perm = File::Permissions.new(0o600)
-      File.open(path, "w", perm: perm) do |f|
-        File.chmod(path, perm) rescue nil
-        f.print(doc)
-      end
+    # `inherit: false` because 0600 is DICTATED here rather than preserved: a copy found at
+    # 0644 (an older gori wrote it under the umask) must be tightened on the way past, not
+    # carried forward. `--config` is also why the symlink resolution inside `DurableFile`
+    # matters here more than anywhere else — pointing gori at a path under a dotfiles repo
+    # is the advertised way to use that flag, and a rename over the link would detach it on
+    # the first save.
+    private def self.write_private(dest : String, doc : String) : Nil
+      DurableFile.write(dest, doc, perm: File::Permissions.new(0o600), inherit: false)
     end
 
     # 3-way merge (base = what we loaded, mine = `current` serialization, theirs = the

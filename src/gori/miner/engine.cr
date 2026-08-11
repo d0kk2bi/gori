@@ -336,10 +336,15 @@ module Gori::Miner
       last_canary = canary
       last_grpc_status = nil.as(Int32?)
       last_grpc_message = nil.as(String?)
+      interval = pace_interval
       rounds.times do
         c = Canary.fresh
         # Same span-protection as the main loop — the confirm re-send injects the same name.
         bytes, spans = Inject.apply_with_spans(@base, location, [{name, c}], @config.add_content_length_when_missing?)
+        # A confirm round is a REQUEST. Only the bucket send that produced this candidate was
+        # paced by the dispatch loop, so these ran on top of the operator's rate — up to
+        # `confirm_rounds` extra unpaced requests for every candidate that shows signal.
+        pace(interval)
         raw = send_with_retries(bytes, spans)
         next if raw.error
         probe = Fingerprint.probe(raw)

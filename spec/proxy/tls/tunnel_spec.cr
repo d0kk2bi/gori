@@ -671,4 +671,49 @@ describe Gori::Proxy::Tls::Tunnel do
       FileUtils.rm_rf(dir) if Dir.exists?(dir)
     end
   end
+
+  # `sync_close: true` hands the accepted socket to the TLS socket — but only once the
+  # constructor RETURNS. A handshake that RAISES (rather than returning an SSL_accept error
+  # code) never assigns `client_tls`, and the stdlib's own `bio.io.close` sits behind that
+  # same error-code check, so nothing closed the transport and the fd survived until GC.
+  # A peer RST between ClientHello and Finished is the ordinary trigger; the reverse and
+  # transparent listeners own nothing else that would close it.
+  it "closes the accepted socket when the client handshake raises mid-ClientHello" do
+    dir = File.tempname("gori-ca")
+    begin
+      ca = CertAuthority.load_or_create(dir)
+      tunnel = Tunnel.new(ca, verify_upstream: false)
+      listener = TCPServer.new("127.0.0.1", 0)
+      accepted = [] of TCPSocket
+      attempts = 3
+
+      spawn do
+        attempts.times do
+          s = listener.accept
+          accepted << s
+          spawn do
+            tunnel.intercept("acme.test", 443, s, RecordingSink.new(Channel(Nil).new(1)),
+              tls_upstream: false)
+          rescue
+            # the handshake failing IS the case under test
+          end
+        end
+      end
+
+      attempts.times do
+        c = TCPSocket.new("127.0.0.1", listener.local_address.port)
+        c.linger = 0                             # close(2) sends RST, not FIN
+        c.write("\x16\x03\x01\x00\x05".to_slice) # a ClientHello that never completes
+        c.flush
+        c.close
+        sleep 0.2.seconds
+      end
+      sleep 1.second
+
+      accepted.size.should eq(attempts)
+      accepted.count(&.closed?).should eq(attempts)
+    ensure
+      FileUtils.rm_rf(dir) if Dir.exists?(dir)
+    end
+  end
 end

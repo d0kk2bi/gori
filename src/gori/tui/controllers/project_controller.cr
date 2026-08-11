@@ -666,6 +666,8 @@ module Gori::Tui
         confirm_label: "delete", danger: true) do
         if removed = @project_view.ov_delete
           @host.status("host override deleted: #{removed}")
+        else
+          @host.status("host override NOT deleted (project busy) — it is still in effect")
         end
       end
     end

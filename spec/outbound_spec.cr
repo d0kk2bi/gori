@@ -402,6 +402,36 @@ describe Gori::Outbound do
         ob.send_block("https", "evil.test", "http://acme.test/x").should eq(Gori::Outbound::SANDBOX_ERROR)
       end
     end
+
+    # The reduction is LEXICAL because `URI.parse` raises on exactly the targets a security
+    # tool gets handed. A non-numeric or oversized port used to rescue to nil, read as "no
+    # path", and gate `scheme://host/` — so a path EXCLUDE stopped matching the url it was
+    # tested against while a host INCLUDE still did, and the carve-out silently opened.
+    it "keeps the path when the absolute-form target has a port URI.parse cannot read" do
+      Gori::Outbound.scope_url("https", "acme.test", "http://acme.test:abc/admin/purge")
+        .should eq("https://acme.test/admin/purge")
+      Gori::Outbound.scope_url("https", "acme.test", "http://acme.test:99999999999999999999/admin")
+        .should eq("https://acme.test/admin")
+    end
+
+    it "still honours a path exclude on a target with an unparseable port" do
+      with_scope do |scope, _store|
+        scope.add("include", "host", "acme.test")
+        scope.add("exclude", "string", "/admin")
+        scope.enable_sandbox
+        ob = Gori::Outbound.interactive(scope)
+        # The carve-out holds for the well-formed target…
+        ob.send_block("https", "acme.test", "http://acme.test/admin/purge")
+          .should eq(Gori::Outbound::SANDBOX_ERROR)
+        # …and must hold identically when the port is what makes URI.parse raise.
+        ob.send_block("https", "acme.test", "http://acme.test:abc/admin/purge")
+          .should eq(Gori::Outbound::SANDBOX_ERROR)
+      end
+    end
+
+    it "reduces a target with no path at all to the root" do
+      Gori::Outbound.scope_url("https", "acme.test", "http://acme.test").should eq("https://acme.test/")
+    end
   end
 
   describe ".request_target" do

@@ -71,12 +71,9 @@ module Gori::Settings
         j.field "decoder", kept unless kept.empty?
       end
     end
-    tmp = "#{path}.tmp"
-    write_private(tmp, doc)
-    File.rename(tmp, path)
+    write_private(path, doc)
     true
   rescue
-    File.delete?("#{path}.tmp") rescue nil
     false
   end
 

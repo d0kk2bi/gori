@@ -142,8 +142,15 @@ module Gori::Tui
     # The single-line fields the pointer can reach — see `Overlay#text_fields`. Listing them
     # is the whole opt-in: caret placement on a press, drag to extend, double-click for a
     # word, all inverted by the field against the geometry `render` last drew it at.
+    #
+    # Only the CURRENT payload type's rows, because that is exactly what `render_fields`
+    # draws. `@fields` holds all eight for every type, and a field the current type does not
+    # show still carries the `@last_x/@last_y` it was drawn at under a PREVIOUS type — so
+    # returning all of them let an off-screen field win a hit-test on stale geometry.
+    # `field_rows` also names rows that are not `TextField`s at all (`:values` is the list
+    # TextArea, `:preset_name` has no field), which `[]?` drops.
     def text_fields : Array(TextField)
-      @fields.values.to_a # NamedTuple on some cards, Hash on others — one shape out
+      field_rows.compact_map { |f| @fields[f]? }
     end
 
     def hint : String
@@ -545,6 +552,12 @@ module Gori::Tui
         i = my - (box.y + 3)
         @sel = (i + 1).clamp(1, rows.size - 1) if 0 <= i < field_rows.size
         sync_path_complete
+        # A press inside a drawn field is a caret, not just a row focus — the one line every
+        # other overlay with `text_fields` runs (`Overlay#handle_click`), and the whole
+        # reason this card lists them. Without it the caret stayed wherever the last
+        # keystroke left it, so the next character landed somewhere other than where the
+        # operator pointed, and a drag anchored from that stale caret instead of the press.
+        click_text_field(mx, my)
       end
       :stay
     end

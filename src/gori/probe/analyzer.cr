@@ -154,14 +154,18 @@ module Gori
       # Transitioning INTO Active re-arms probes over recent History: live traffic alone
       # misses flows that already completed passive analysis (passive_loop never re-enqueues
       # them), and a restart clears both the event channel and @active_seen.
-      def set_mode(m : Mode) : Nil
+      # Returns whether the mode PERSISTED. The in-memory `@mode` governs this process either
+      # way, so the arming below is unchanged — but a surface must not report the change as
+      # done when another instance will keep reading the old mode off disk.
+      def set_mode(m : Mode) : Bool
         prev = @mode
         @mode = m
-        @store.set_probe_mode(m)
+        committed = @store.set_probe_mode(m)
         # Re-arm when entering an actively-probing mode from one that wasn't (OFF/PASSIVE), OR when
         # switching between ACTIVE and AGGRESSIVE — the wider AGGRESSIVE opts (unsafe methods,
         # raised caps) produce new dedup keys, so recent in-scope traffic should be re-swept.
         arm_active_backfill if m.probes_actively? && (!prev.probes_actively? || prev != m)
+        committed
       end
 
       def start : Nil
@@ -197,13 +201,28 @@ module Gori
                       enqueue_active : Bool = false) : Nil
         return if @stopped
         return unless @mode.scanning?
-        detections = Passive.analyze(detail, ws_messages, disabled: @disabled, custom: @custom)
+        # Only ANALYSIS gets the silent skip. That is what the blanket rescue was written for
+        # ("a single detail's analysis blew up"), and the only step where nothing has been
+        # produced yet, so there is nothing to report losing.
+        detections =
+          begin
+            Passive.analyze(detail, ws_messages, disabled: @disabled, custom: @custom)
+          rescue ex : DB::Error | SQLite3::Exception
+            raise ex
+          rescue
+            return
+          end
         persist(detections, flow_id: detail.row.id, repeater_id: repeater_id)
         maybe_enqueue_active(detail) if enqueue_active
       rescue ex : DB::Error | SQLite3::Exception
         raise ex
-      rescue
-        # a single detail's analysis blew up — skip it
+      rescue ex
+        # Past this point findings HAVE been made, so a failure is a loss worth naming rather
+        # than the same silent skip: the operator otherwise sees a scan that completed and no
+        # issues, with no way to tell that apart from a clean target. Still never raises into
+        # the caller — the TUI event loop has no catch-all — and `emit` is non-blocking, so a
+        # headless run with no drainer is unaffected.
+        emit(ErrorEvent.new("probe: findings for flow #{detail.row.id} were not recorded: #{ex.message}"))
       end
 
       # Per-flow active-scan estimate for the manual "Run active scan" action: every ENABLED

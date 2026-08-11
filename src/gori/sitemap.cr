@@ -176,7 +176,10 @@ module Gori
     # An absolute-form target ("https://host/p?q") → its path+query; an origin-form
     # target is returned unchanged. "/" for a bare root.
     def self.normalize_path(target : String) : String
-      return target unless target.starts_with?("http://") || target.starts_with?("https://")
+      # `Url.absolute_form?` is the one home for this test, and it is case-INSENSITIVE
+      # (RFC 3986 3.1). The hand-rolled pair missed `HTTP://host/p`, which then kept its
+      # scheme+authority and got segmented into path nodes named `http:` and `host`.
+      return target unless Url.absolute_form?(target)
       uri = URI.parse(target)
       path = uri.path
       path = "/" if path.empty?

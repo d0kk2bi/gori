@@ -1,3 +1,5 @@
+require "./durable_file"
+
 module Gori
   # gori keeps everything under ONE directory — `~/.gori` by default, overridable
   # with `$GORI_HOME`: settings.json, the CA (machine secret + the cert the user
@@ -46,10 +48,10 @@ module Gori
 
     def self.write_active_project(path : String) : Nil
       ensure_dir(home_dir)
-      dest = active_project_file
-      tmp = "#{dest}.tmp.#{Process.pid}"
-      File.write(tmp, path)
-      File.rename(tmp, dest)
+      # Via DurableFile for its temp cleanup as much as its durability: the old staging here
+      # swallowed every failure at the method-level rescue and left `active_project.tmp.<pid>`
+      # behind, and nothing in the tree ever swept those.
+      DurableFile.write(active_project_file, path, perm: File::Permissions.new(0o644))
     rescue
       # best-effort: a missing/failed marker leaves explicit active-project lookup unavailable.
     end

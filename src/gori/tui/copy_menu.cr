@@ -132,7 +132,10 @@ module Gori::Tui
     # target base joined with the origin-form path (falling back to the Host header
     # when no target base is set — a hand-authored request). "" when unresolvable.
     private def self.resolve_url(req_target : String, target : String, header_lines : Array(String)) : String
-      return req_target if req_target.starts_with?("http://") || req_target.starts_with?("https://")
+      # Case-insensitive via the one home: an `HTTP://acme.test/x` target used to fall
+      # through and get a base prefixed, yielding `https://acme.test/HTTP://acme.test/x`
+      # on the operator's clipboard.
+      return req_target if Gori::Url.absolute_form?(req_target)
       base = authority_base(target.strip)
       if base.empty?
         host = header_value(header_lines, "host")
