@@ -164,13 +164,65 @@ module Gori::Discover
     SNIFF_MAX    = 8192 # a sitemap's root element sits at the top; no need to read further
     SITEMAP_ROOT = /<(?:urlset|sitemapindex|loc)\b/i
 
+    # The three root-element names SITEMAP_ROOT can open with, lowercased. A match REQUIRES one
+    # of these right after a `<`, so their absence is proof the regex cannot match — which is
+    # what makes the byte prefilter below exact rather than approximate.
+    SITEMAP_TAGS = {"urlset".to_slice, "sitemapindex".to_slice, "loc".to_slice}
+
     # Does this body look like an XML sitemap? Lets the engine pick the sitemap parser from
     # the RESPONSE rather than from how the URL was found — so a sitemap served off the
     # well-known /sitemap.xml path (a robots.txt `Sitemap:` URL, or a <sitemapindex> child)
     # still gets its <loc> URLs extracted instead of being wrongly parsed as HTML/robots.
+    #
+    # `Engine#extract_links` asks this of EVERY response body before it looks at the content
+    # type, deliberately — a sitemap served under a wrong type still has to parse. That made it
+    # the one extractor a crawl pays for on bodies it then does nothing with, and the bill was
+    # not small: `text` builds a String of the whole sniff window, and on a body that is not
+    # valid UTF-8 — an image, a font, an archive, which the `text_like?` comment notes are the
+    # COMMON case for a spider — `scrub` then rebuilds it again with a 3-byte replacement per
+    # bad byte. Measured on a 120 KB binary: 52µs and 32 KB of garbage, per response, to answer
+    # "no".
+    #
+    # So the String is now built only for a body that could actually match. `sitemap_prefix?`
+    # is a STRICT SUPERSET of the regex — same literals, minus the `\b` — so a negative from it
+    # is a negative from `SITEMAP_ROOT`, and a positive falls through to the regex for the real
+    # answer. That keeps the Unicode-aware `\b` (PCRE2 reads `<locé` as no match) exactly where
+    # it was instead of being restated per byte, which is the half of this predicate a byte
+    # scan has no business deciding.
     def self.sitemap_body?(body : Bytes) : Bool
       slice = body.size > SNIFF_MAX ? body[0, SNIFF_MAX] : body
+      return false unless sitemap_prefix?(slice)
       text(slice).matches?(SITEMAP_ROOT)
+    end
+
+    # `<` followed, case-insensitively, by one of SITEMAP_TAGS — the literal part of
+    # SITEMAP_ROOT, on the raw bytes. Every name is ASCII, so a byte-wise ASCII fold answers
+    # the same question the `i` flag does for them.
+    private def self.sitemap_prefix?(body : Bytes) : Bool
+      i = 0
+      n = body.size
+      while i < n
+        if body.unsafe_fetch(i) == 0x3c_u8 # '<'
+          SITEMAP_TAGS.each do |tag|
+            return true if tag_at?(body, i + 1, tag)
+          end
+        end
+        i += 1
+      end
+      false
+    end
+
+    # Does `tag` (already lowercase ASCII) sit at `body[at...]`, ignoring ASCII case?
+    private def self.tag_at?(body : Bytes, at : Int32, tag : Bytes) : Bool
+      return false if at + tag.size > body.size
+      k = 0
+      while k < tag.size
+        b = body.unsafe_fetch(at + k)
+        b |= 0x20_u8 if b >= 0x41_u8 && b <= 0x5a_u8 # fold A-Z
+        return false unless b == tag.unsafe_fetch(k)
+        k += 1
+      end
+      true
     end
 
     private def self.scan_text(body : Bytes) : String
