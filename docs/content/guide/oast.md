@@ -23,7 +23,7 @@ The **OAST** tab is visible by default (next to Fuzzer). It has two sub-tabs: **
 3. Plant it wherever the target might dereference a URL or resolve a hostname: a URL parameter, a `Host`/`X-Forwarded-For` header, an XML entity, a webhook field.
 4. When the target's infrastructure resolves the name or connects back, the callback lands in **Callbacks** with its protocol (`dns` / `http` / `smtp`), source IP, timestamp, and the full sub-identifier so you can tell which payload fired.
 
-A callback is proof the target reached a server it shouldn't have. No callback is not proof of safety (egress may be filtered), only that this path stayed quiet.
+A callback is proof the target reached a server it shouldn't have. The absence of one is not proof of safety (egress may be filtered), only that this path stayed quiet.
 
 ## Providers
 

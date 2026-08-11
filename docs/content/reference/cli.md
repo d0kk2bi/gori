@@ -306,7 +306,7 @@ Connections are reused per origin by default, so a brute-force pass pays one TCP
 
 ### Session bindings from the command line
 
-A session binding (`$SESSION` filled from a login response — see the [Rewriter guide](/guide/workbench/#rewriter)) lives in the **memory** of the gori process that observed it. It is never written to `settings.json` or to the project database: a restored token is stale by construction, and re-extracting one costs a single request.
+A session binding (`$SESSION` filled from a login response — see [Session bindings](/guide/proxy/#session-bindings)) lives in the **memory** of the gori process that observed it. It is never written to `settings.json` or to the project database: a restored token is stale by construction, and re-extracting one costs a single request.
 
 `gori run` is one process per invocation, and a sweep is deliberately **not** an extraction source (a response echoing an attack payload back could otherwise rebind your session to it). So a headless `fuzz` / `mine` / `sequence` / `discover` whose template names a declared binding has nothing to resolve it with, and is refused before it sends.
 

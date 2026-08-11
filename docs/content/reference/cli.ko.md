@@ -302,7 +302,7 @@ gori run discover --target https://target.example --max-depth 3 --extensions php
 
 ### run import {#run-import}
 
-프로젝트의 History로 플로우를 일괄 임포트합니다. TUI의 Import 오버레이에 대응하는 CLI입니다([Proxy & History → 임포트](/guide/proxy/#import) 참고). 소스 플래그는 정확히 하나만 지정해야 하며, 트래픽은 전혀 보내지 않습니다.
+프로젝트의 History로 플로우를 일괄 임포트합니다. TUI의 Import 오버레이에 대응하는 CLI입니다([Proxy & History → 임포트](/ko/guide/proxy/#import) 참고). 소스 플래그는 정확히 하나만 지정해야 하며, 트래픽은 전혀 보내지 않습니다.
 
 ```bash
 gori run import --postman api.postman_collection.json --db ./assessment.db --format json
@@ -445,7 +445,7 @@ gori run links delete --owner=note --id=2 --ref=repeater --ref-id=3
 
 ### run rewriter {#run-rewriter}
 
-스크립트에서 Match & Replace 규칙을 관리합니다. [Rewriter 탭](/guide/proxy/)이 편집하는 것과 같은 규칙이며, 실시간 프록시 트래픽에 적용됩니다:
+스크립트에서 Match & Replace 규칙을 관리합니다. [Rewriter 탭](/ko/guide/proxy/)이 편집하는 것과 같은 규칙이며, 실시간 프록시 트래픽에 적용됩니다:
 
 ```bash
 gori run rewriter                                       # 적용 순서대로 규칙 목록
@@ -473,12 +473,12 @@ gori run rewriter rm 3
 | `--host=GLOB` | 매칭되는 호스트로 규칙을 한정(부분 문자열, `*` 와일드카드). 생략하면 전체 적용 |
 | `--name=NAME` | 규칙 목록에 표시할 라벨 |
 | `--disabled` | 규칙을 만들되 활성화하지 않음 |
-| `--scope=SCOPE` | `project`(기본값) 또는 `global`. 전역 규칙은 `settings.json` 에 저장되어 모든 프로젝트에 적용됨 |
-| `--everywhere` | 전역 규칙의 `enable`/`disable` 에서, 이 프로젝트의 오버라이드 대신 규칙 자체의 기본값을 변경 |
+| `--scope=SCOPE` | `project`(기본값) 또는 `global`. 전역 규칙은 `settings.json`에 저장되어 모든 프로젝트에 적용됨 |
+| `--everywhere` | 전역 규칙의 `enable`/`disable`에서, 이 프로젝트의 오버라이드 대신 규칙 자체의 기본값을 변경 |
 
-`preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id와 함께 `--scope`도 받습니다. 두 저장소가 규칙 번호를 각자 매기므로 id 하나가 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 범위를 `G`/`P` 접두어로 출력하고(`G*` 는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻), 프록시가 적용하는 순서 그대로 전역 규칙을 먼저 보여 줍니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#reusing-a-rule-across-projects)을 참고하세요.
+`preview`는 같은 규칙 플래그를 받아, 규칙을 저장하지 않고 저장된 플로우 중 몇 개가 바뀌었을지 보고합니다. `rm`(`delete`), `enable`, `disable`은 목록의 규칙 id와 함께 `--scope`도 받습니다. 두 저장소가 규칙 번호를 각자 매기므로 id 하나가 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 범위를 `G`/`P` 접두어로 출력하고(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻), 프록시가 적용하는 순서 그대로 전역 규칙을 먼저 보여 줍니다. [전역 규칙과 프로젝트 규칙](/ko/guide/proxy/#reusing-a-rule-across-projects)을 참고하세요.
 
-본문 규칙은 필요에 따라 `Content-Length`를 다시 맞추고 청크를 해제하며, 활성화된 규칙은 매칭되는 호스트에서 HTTP/1.1을 강제합니다. 대화형 편집기는 [Proxy & History](/guide/proxy/)를 참고하세요.
+본문 규칙은 필요에 따라 `Content-Length`를 다시 맞추고 청크를 해제하며, 활성화된 규칙은 매칭되는 호스트에서 HTTP/1.1을 강제합니다. 대화형 편집기는 [Proxy & History](/ko/guide/proxy/)를 참고하세요.
 
 ### run colormarker {#run-colormarker}
 
@@ -497,7 +497,7 @@ gori run colormarker rm 3
 
 | 옵션 | 설명 |
 |--------|-------------|
-| `-w`, `--when=FILTER` | 필수. flow가 만족해야 할 조건 (아래 참고) |
+| `-w`, `--when=FILTER` | 필수. 플로우가 만족해야 할 조건 (아래 참고) |
 | `--color=NAME` | `red`, `orange`, `yellow`(기본), `green`, `blue`, `purple`. 활성 테마 팔레트로 해석되므로 밝은 테마와 어두운 테마 양쪽에서 제대로 읽힙니다 |
 | `--style=STYLE` | `full`(기본)은 행 전체 배경을 칠하고, `strip`은 `TIME` 앞 좁은 컬럼에 색 셀 하나를 칠합니다 |
 | `--name=NAME` | 규칙 목록에 표시할 라벨 |
@@ -508,15 +508,15 @@ gori run colormarker rm 3
 
 **우선순위가 곧 규칙 집합의 의미입니다.** Match & Replace 규칙은 *합성*되어 활성화된 모든 규칙이 순서대로 실행되지만, 색상 규칙은 *해석*됩니다. **첫 번째로 매칭되는 활성 규칙이 행을 칠하고 나머지는 조회조차 되지 않습니다.** `move`가 `rewriter`에는 없고 여기에만 있는 이유입니다. 전역 규칙이 프로젝트 규칙보다 먼저 해석되므로, 상시 정책이 로컬 레이어보다 우선합니다.
 
-`--when`은 조건부 인터셉트 바가 쓰는 것과 같은 불리언 문법입니다. `host:` `path:` `method:` `scheme:` `status:` `proto:`에 `AND` / `OR` / `NOT`, `-부정`, `(그룹)`을 더한 형태이며 캡처된 flow 행에 대해 평가됩니다. 그냥 두면 조용히 실패할 세 가지가 있어, gori는 거부하거나 경고합니다.
+`--when`은 조건부 인터셉트 바가 쓰는 것과 같은 불리언 문법입니다. `host:` `path:` `method:` `scheme:` `status:` `proto:`에 `AND` / `OR` / `NOT`, `-부정`, `(그룹)`을 더한 형태이며 캡처된 플로우 행에 대해 평가됩니다. 그냥 두면 조용히 실패할 세 가지가 있어, gori는 거부하거나 경고합니다.
 
 - **`body:`는 여기서 절대 매칭되지 않습니다.** History 행에는 payload가 없습니다. (거부가 아니라 경고 — 문법상 적법한 항이기 때문입니다.)
 - **`host:`는 DNS 레이블 글롭이 아니라 부분문자열입니다.** `host:alpha.test`는 `xalpha.test`도 매칭합니다. (경고)
 - **`header:` / `size:` / `dur:` / `url:` / `stub:`는 없습니다.** 이들은 쿼리가 필요한 History QL 필드이고, 여기는 렌더 경로에서 평가됩니다. 모르는 필드는 **거부**됩니다. 그냥 두면 조용히 자유 텍스트 검색이 되어 규칙이 영원히 발동하지 않습니다.
 
-모든 flow에 매칭되는 조건(빈 값이나 입력 중인 `host:`)도 거부됩니다.
+모든 플로우에 매칭되는 조건(빈 값이나 입력 중인 `host:`)도 거부됩니다.
 
-`preview`는 조건이 최근 flow 중 몇 개에 **매칭**되는지와, 실제로 몇 개를 **칠하게** 되는지를 함께 보고합니다. 앞선 활성 규칙이 이미 그 행을 차지했다면 두 숫자가 달라집니다. `rm`(`delete`), `enable`, `disable`, `move`는 목록의 규칙 id와 `--scope`를 받습니다. 두 저장소가 서로 독립적으로 번호를 매기므로 id만으로는 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 스코프를 `G`/`P` 접두사로 출력합니다(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻).
+`preview`는 조건이 최근 플로우 중 몇 개에 **매칭**되는지와, 실제로 몇 개를 **칠하게** 되는지를 함께 보고합니다. 앞선 활성 규칙이 이미 그 행을 차지했다면 두 숫자가 달라집니다. `rm`(`delete`), `enable`, `disable`, `move`는 목록의 규칙 id와 `--scope`를 받습니다. 두 저장소가 서로 독립적으로 번호를 매기므로 id만으로는 서로 다른 두 규칙을 가리키기 때문입니다. 목록은 스코프를 `G`/`P` 접두사로 출력합니다(`G*`는 이 프로젝트가 해당 전역 규칙의 기본값을 오버라이드했다는 뜻).
 
 탭은 **기본적으로 숨겨져 있습니다.** `settings:tabs`에서 Rewriter 옆에 표시할 수 있습니다. 대화형 편집기는 [프록시 & History](/ko/guide/proxy/)를 참고하세요.
 
@@ -783,7 +783,7 @@ env  (holds secrets — excluded unless named; not set — at its default)
 
 import는 TUI와 동일한 저장 경로를 거치므로 원자적 쓰기가 유지되고, 동시에 실행 중인 gori가 건드리지 않은 섹션에 한 편집이나 삭제를 덮어쓰지 않습니다. 파일에 있는 알 수 없는 섹션은 보고하고 무시합니다 — 실행 중인 설정에도, 파일에도 반영되지 않습니다.
 
-gori가 `settings.json`을 읽지 못하는 상태 — 파싱 실패, 권한 문제, `--config`가 열 수 없는 대상을 가리키는 경우 — 라면 `export`와 `import` 모두 진행하지 않고 거부합니다. 그 시점의 gori는 모든 섹션이 공장 기본값이므로, import는 프로필이 언급하지 않은 섹션 전부를 기본값으로 디스크에 박고, export는 그 기본값을 당신의 설정인 양 파일로 내보내기 때문입니다. 먼저 파일을 고치거나 지우세요 — 파싱되지 않은 원본은 옆에 `settings.json.corrupt`로 보관됩니다. `--dry-run`은 예외입니다: 아무것도 쓰지 않으므로 그대로 실행되고, 비교 대상이 기본값이라는 사실을 stderr로 알려줍니다.
+gori가 `settings.json`을 읽지 못하는 상태 — 파싱 실패, 권한 문제, `--config`가 열 수 없는 대상을 가리키는 경우 — 라면 `export`와 `import` 모두 진행하지 않고 거부합니다. 그 시점의 gori는 모든 섹션이 공장 기본값이므로, import는 프로필이 언급하지 않은 섹션 전부를 기본값으로 디스크에 박고, export는 그 기본값을 원래 설정인 양 파일로 내보내기 때문입니다. 먼저 파일을 고치거나 지우세요 — 파싱되지 않은 원본은 옆에 `settings.json.corrupt`로 보관됩니다. `--dry-run`은 예외입니다: 아무것도 쓰지 않으므로 그대로 실행되고, 비교 대상이 기본값이라는 사실을 stderr로 알려줍니다.
 
 `env`와 `decoder`는 export에서 기본 제외됩니다 — `env`는 토큰 값을, `decoder`는 마지막 입력과 저장된 세션을 담기 때문입니다. 명시적으로 이름을 적는 것(`--sections env`)이 포함에 대한 동의입니다. `upstream_rules`는 공유해도 안전합니다 — 사용자명과 환경변수 *이름*만 저장하고 비밀번호는 담지 않습니다.
 
