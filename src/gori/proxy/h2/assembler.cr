@@ -302,7 +302,17 @@ module Gori::Proxy::H2
                   decoder.decode(side.header_buf.to_slice)
                 end
       added = decoded.sum { |(n, v)| n.bytesize + v.bytesize + HPACK::Decoder::ENTRY_OVERHEAD }
-      if (existing = side.headers) && !decoded.any? { |(n, _)| n == ":status" }
+      # A block is TRAILERS when a head already exists and either it carries no `:status`,
+      # or the head it would replace is already FINAL. The `else` branch below exists for the
+      # interim-1xx handover (100/103 then the real response), and that is the ONLY case a
+      # status-bearing second block legitimately replaces a head — RFC 9113 8.1 forbids
+      # pseudo-headers in trailers, so a `:status` arriving after a final head is a broken or
+      # hostile origin. It used to take the replace branch, which overwrote the real response
+      # head: `emit_response` then reported the TRAILER's status and the head's
+      # content-type / content-encoding / Set-Cookie were gone from the flow row, with
+      # `trailer_names.clear` erasing the marker that would have shown why.
+      if (existing = side.headers) &&
+         (!decoded.any? { |(n, _)| n == ":status" } || !interim_status?(existing))
         # Trailers (no :status) append to the existing header list — grpc-status et al.
         # Bound the CUMULATIVE list: the per-decode MAX_HEADER_LIST caps ONE block, but a
         # flood of repeated non-status HEADERS blocks (fake trailers on a stream held open
@@ -567,6 +577,15 @@ module Gori::Proxy::H2
         @streams.each { |id, stream| finalize_stream(id, stream, reason) }
         @streams.clear
       end
+    end
+
+    # Whether a decoded head is an INTERIM (1xx) response — the one head a later
+    # status-bearing block is allowed to replace. A request head has no `:status` at all and
+    # is not interim, so a stray `:status` block on the request side is treated as trailers
+    # too rather than replacing the request.
+    private def interim_status?(headers : Array({String, String})) : Bool
+      code = pseudo(headers, ":status").try(&.to_i?)
+      !code.nil? && code >= 100 && code < 200
     end
 
     private def pseudo(headers : Array({String, String}), name : String) : String?
