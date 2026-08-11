@@ -108,7 +108,7 @@ module Gori
       private def sitemap_tag_path(target : String) : String
         path = Sitemap.normalize_path(target.strip)
         return "/" if path.empty?
-        path.starts_with?('/') || path.starts_with?("http") ? path : "/#{path}"
+        path.starts_with?('/') ? path : "/#{path}"
       end
 
       # The legacy collapsed sitemap (distinct host/method/target only), for

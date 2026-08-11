@@ -549,8 +549,7 @@ module Gori::Tui
     end
 
     private def normalize_endpoint(url : String) : String
-      h = url.strip.rstrip('/')
-      h.starts_with?("http") ? h : "https://#{h}"
+      Gori::Oast::Provider.normalize_endpoint(url)
     end
 
     # What the operator recognises a session BY: the host its payloads point at. That is the

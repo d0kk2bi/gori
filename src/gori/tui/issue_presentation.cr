@@ -54,9 +54,12 @@ module Gori::Tui
     end
 
     # An absolute-form target ("GET http://h/p") already carries the host, so don't
-    # prepend it again; origin-form ("/p") gets the host prefixed.
+    # prepend it again; origin-form ("/p") gets the host prefixed. That is exactly
+    # `Url.location` — re-deriving it as `starts_with?("http")` called `httpbin.org/x`
+    # absolute and dropped the host, and missed `HTTP://` (schemes are case-insensitive)
+    # so an uppercase target rendered doubled as `a.testHTTP://a.test/x`.
     private def flow_location(f : Store::FlowRow) : String
-      f.target.starts_with?("http") ? f.target : "#{f.host}#{f.target}"
+      Gori::Url.location(f.host, f.target)
     end
   end
 end

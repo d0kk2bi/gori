@@ -94,8 +94,21 @@ module Gori::Oast
     # The configured host as a normalized base URL (scheme forced to https when absent,
     # trailing slash trimmed).
     protected def base_url : String
-      h = @host.strip.rstrip('/')
-      h.starts_with?("http") ? h : "https://#{h}"
+      Provider.normalize_endpoint(@host)
+    end
+
+    # ONE home for that normalisation, because the TUI has to reproduce it exactly: a
+    # session stores the normalised form ("https://oast.pro") while the provider row holds
+    # whatever was typed ("oast.pro"), so the controller's "is this the same endpoint?"
+    # comparison only works if both sides normalise identically. It had a byte-identical
+    # copy whose comment already said it normalises "the way `Provider#base_url` does".
+    #
+    # `Url.absolute_form?`, not `starts_with?("http")`: schemes are case-insensitive
+    # (RFC 3986 3.1), so a host typed `HTTPS://oast.pro` used to come back
+    # `https://HTTPS://oast.pro`.
+    def self.normalize_endpoint(url : String) : String
+      h = url.strip.rstrip('/')
+      Gori::Url.absolute_form?(h) ? h : "https://#{h}"
     end
 
     protected def json_headers : Hash(String, String)

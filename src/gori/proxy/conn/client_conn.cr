@@ -1319,7 +1319,10 @@ module Gori::Proxy
     # produced `ws 127.0.0.1http://127.0.0.1:19251/ws`. An absolute-form target already
     # names the authority, leaving the host nothing to add.
     private def ws_log_label(host : String, target : String) : String
-      target.starts_with?("http://") || target.starts_with?("https://") ? target : "#{host}#{target}"
+      # `Url.location` is that rule's one home, and it tests the scheme case-INSENSITIVELY
+      # (RFC 3986 3.1) — the hand-rolled pair here missed `HTTP://`, so an uppercase-scheme
+      # request line still produced the doubled label this method exists to prevent.
+      Gori::Url.location(host, target)
     end
 
     private def websocket_upgrade?(resp : Codec::RawResponse) : Bool

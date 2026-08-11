@@ -95,7 +95,7 @@ module Gori
       private def self.sitemap_tag_path(target : String) : String
         path = Sitemap.normalize_path(target.strip)
         return "/" if path.empty?
-        path.starts_with?('/') || path.starts_with?("http") ? path : "/#{path}"
+        path.starts_with?('/') ? path : "/#{path}"
       end
 
       private def self.cmd_sitemap_tree(args : Array(String)) : Nil
