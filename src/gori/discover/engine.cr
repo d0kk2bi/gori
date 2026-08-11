@@ -1504,16 +1504,24 @@ module Gori::Discover
       end
     end
 
+    # Calibration is the ONE task that fans out into many sends — every other `process_*`
+    # makes a single `send_with_retries` call — so it is also the one place where
+    # `worker_loop`'s stop check, which runs once per RECEIVED task, is not enough. Without a
+    # per-probe check a worker already inside here kept firing its whole batch after
+    # `stop`: at the defaults that is 20 workers × 3 probes × (1 + 1 retry) = up to ~120
+    # requests at a third party AFTER the operator pressed stop. Calibration runs for every
+    # directory and is this engine's largest single cost (see the comment on the frontier),
+    # so it is also the batch most likely to be in flight when stop arrives.
     private def process_calibrate(task : Task) : Outcome
       dir = task.dir || task.url
       probes = [] of Calibrate::Fetched
       echoes = false
       @config.calibrate_probes.times do
-        break if @capped.cap_reached?
+        break if @capped.cap_reached? || stopped?
         probes << calibration_probe(dir, bogus_name) { |hit| echoes ||= hit }
       end
       @config.extensions.each do |ext|
-        break if @capped.cap_reached?
+        break if @capped.cap_reached? || stopped?
         probes << calibration_probe(dir, "#{bogus_name}.#{ext}") { |hit| echoes ||= hit }
       end
       baseline = Calibrate.build(dir, probes, @config.simhash_distance, echoes)

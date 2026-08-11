@@ -1249,4 +1249,28 @@ describe Gori::Discover::Engine do
     asked.select(&.includes?("8443")).should eq([] of String) # never the port-bearing form
     asked.all?(&.starts_with?("http://acme.test/")).should be_true
   end
+
+  # Calibration is the only task that fans out into many sends, so `worker_loop`'s stop check
+  # — which runs once per RECEIVED task — did not cover it: a worker already inside the batch
+  # kept firing every remaining bogus probe after `stop`. At the shipped defaults that is
+  # 20 workers x 3 probes x (1 + 1 retry) reaching a third party AFTER the operator stopped.
+  it "stops firing calibration probes as soon as the run is stopped" do
+    cfg = D::Config.new(spider: false, bruteforce: true, calibrate_probes: 8, concurrency: 1,
+      retries: 0)
+    bogus = 0
+    engine = uninitialized D::Engine
+    backend = RouteBackend.new(->(t : String) do
+      # The calibrator's bogus paths are a 16-hex name at the directory root.
+      if t.matches?(/\A\/[0-9a-f]{16}\z/)
+        bogus += 1
+        engine.stop # the operator presses stop during the first probe of the batch
+      end
+      notfound
+    end)
+    engine = D::Engine.new("http://t/", ["admin", "secret"], backend, cfg, D::OpenScope.new)
+    engine.run { }
+
+    # One probe was in flight when stop was requested; the remaining seven must not go out.
+    bogus.should eq(1)
+  end
 end
