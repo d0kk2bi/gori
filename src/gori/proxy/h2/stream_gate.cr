@@ -655,7 +655,30 @@ module Gori::Proxy::H2
         # credit sat until the client happened to send another frame — and a client whose
         # remaining work is DATA has no window left to send one with, which is the wedge this
         # refund exists to prevent, reached through the intercept path instead of the sandbox.
-        run_cross(@mutex.synchronize { resolve_locked(item, block, decision) })
+        begin
+          run_cross(@mutex.synchronize { resolve_locked(item, block, decision) })
+        rescue
+          # The held peer died between the hold and the operator's decision, so the write
+          # inside `release_locked` raises. This is a SPAWNED fiber: an escape here has no
+          # caller to unwind to and reaches Crystal's fiber handler, which prints
+          # "Unhandled exception in spawn" plus a backtrace on STDERR — under `gori tui`
+          # that lands on top of the rendered frame. Every other writer in this file is
+          # already guarded (`close`, `write_cross_rst`, `write_cross_window_update`), as
+          # is the WebSocket twin in `ws/message_gate.cr`; this one was the hole.
+          #
+          # Slots already ready behind the one that raised stay queued until `close`
+          # drains them, which is the same place they would have gone had the leg died a
+          # moment earlier.
+          #
+          # No spec: the only observable difference is Crystal's fiber handler printing,
+          # which a spec cannot assert from in-process, and the `refund_swallowed` below is
+          # a no-op on the path that raises (a FORWARD discards nothing, so nothing is
+          # owed). This guard rests on symmetry with the three writers above rather than on
+          # a reproduction — an attempt at one passed with and without it, so it was dropped
+          # rather than kept as a spec that proves nothing.
+        end
+        # Runs either way: the refund is credit for DATA gori discarded, and the leg being
+        # dead is exactly when a wedged client most needs it. Its own write is guarded.
         refund_swallowed
       end
     end
