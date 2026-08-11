@@ -1092,9 +1092,26 @@ module Gori::Proxy::WS
                            shape : MessageShape) : IO::Memory
       return assembling unless frame.data?
       remaining = MAX_MESSAGE - assembling.size
+      # Exactly the frame that crosses the cap, so one notice per message rather than one
+      # per frame: after this, `remaining` is 0 for every later fragment.
+      crossed = remaining > 0 && frame.payload.size > remaining
       if remaining > 0 && !frame.payload.empty?
         take = {frame.payload.size, remaining}.min
         assembling.write(frame.payload[0, take])
+      end
+      if crossed
+        # Say that the transcript is short. The oversized-FRAME path already writes a
+        # `NOTICE_PREFIX` marker for its own case (see `stream_oversized_frame`), and a
+        # message assembled past MAX_MESSAGE is the same loss reached by fragmentation —
+        # but it used to be recorded with `fin: true` and a plausible payload, so a
+        # truncated transcript was indistinguishable from a complete one. `ws_messages`
+        # carries no truncation column (unlike `CapturedResponse#body_truncated`), so the
+        # marker is a row of its own; `NOTICE_PREFIX` is what `Store::WsMessage#notice?`
+        # reads to refuse replaying it as a seed. The payload row that follows keeps the
+        # captured PREFIX, which is the evidence worth having.
+        sink.on_ws_message(flow_id, direction, message_opcode.to_i,
+          "#{NOTICE_PREFIX}WebSocket message truncated at #{MAX_MESSAGE} bytes for capture; " \
+          "the forwarded message was longer".to_slice, shape.take)
       end
       return assembling unless frame.fin?
       sink.on_ws_message(flow_id, direction, message_opcode.to_i, assembling.to_slice.dup, shape.take)
