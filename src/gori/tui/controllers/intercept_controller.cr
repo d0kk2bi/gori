@@ -424,7 +424,7 @@ module Gori::Tui
     def intercept_forward : Nil
       ids = @intercept.target_ids
       return if ids.empty?
-      return if refuse_unappliable_edit?
+      return if refuse_unappliable_edit?(ids)
       ic = @host.session.interceptor
       edit = @intercept.pending_edit
       label = batch_label(ids) # built BEFORE the decisions go out — the items are gone after
@@ -448,10 +448,19 @@ module Gori::Tui
       ids = @intercept.target_ids
       return if ids.empty?
       ic = @host.session.interceptor
-      label = batch_label(ids)
-      ids.each { |id| ic.drop(id) }
+      label = batch_label(ids) # built BEFORE the decisions go out — the items are gone after
+      # Count what actually got dropped, exactly as the forward above does. `Interceptor#drop`
+      # is a no-op on an item somebody else already settled — the h2/WS gates fail a hold OPEN
+      # from a proxy fiber when a stream resets or the buffer ceiling is hit — and "dropped GET
+      # /admin" for a request that went to the origin is the worst version of this lie: it says
+      # gori BLOCKED bytes that are already on the wire.
+      dropped = ids.count { |id| ic.drop(id) }
       @intercept.reload(ic)
-      @host.status("dropped #{label}")
+      if dropped == ids.size
+        @host.status("dropped #{label}")
+      else
+        @host.status("dropped #{dropped} of #{ids.size} — the rest were already decided elsewhere")
+      end
     end
 
     # How a forward/drop toast names its targets: the one held message when the verb ran on
@@ -476,22 +485,32 @@ module Gori::Tui
     # the operator can forward it as it is, drop it, or write a different edit. And the WHOLE
     # batch is refused rather than the edited item alone — reporting "forwarded 4 held
     # messages" for a set that went out as 3 is the lie being removed.
-    private def refuse_unappliable_edit? : Bool
+    #
+    # `ids` scopes that to the batch actually going out. The editor holds ONE item's edit and
+    # `pending_edit` is keyed on the item the EDITOR loaded, not on the queue cursor — so an
+    # unappliable edit left behind on a message the operator has since arrowed away from refused
+    # every later forward of every OTHER hold, under a toast naming a message that was not in
+    # the batch. A refusal has to be about something the operator is actually about to send.
+    private def refuse_unappliable_edit?(ids : Array(Int64)) : Bool
       refusal = @intercept.refused_edit
       return false unless refusal
       item, reason = refusal
+      return false unless ids.includes?(item.id)
       @host.status("edit NOT applied to #{item.label} — #{reason}")
       true
     end
 
     def intercept_forward_all : Nil
-      n = @host.session.interceptor.pending_count
-      return if refuse_unappliable_edit?
+      ic = @host.session.interceptor
+      return if refuse_unappliable_edit?(ic.pending.map(&.id))
       # Carry the currently-loaded item's in-progress edit into the bulk forward, so
       # "forward all" doesn't send its stale original bytes (single-forward already does).
       overrides = @intercept.pending_edit.try { |e| {e[0] => e[1]} }
-      @host.session.interceptor.forward_all(overrides)
-      @intercept.reload(@host.session.interceptor)
+      # The count comes BACK from the release rather than from a `pending_count` read before it:
+      # a proxy fiber holding a message in that window has it forwarded too, and this toast is
+      # the operator's only record of how many irreversible decisions just went out.
+      n = ic.forward_all(overrides)
+      @intercept.reload(ic)
       @host.status("forwarded all (#{n})")
     end
 

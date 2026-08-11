@@ -77,8 +77,43 @@ describe Gori::Interceptor do
       result = Channel(Gori::Interceptor::Decision).new
       spawn { result.send(req(ic, "GET / HTTP/1.1\r\n\r\n")) }
       Fiber.yield
-      ic.drop(ic.pending.first.id)
+      ic.drop(ic.pending.first.id).should be_true
       receive_within(result).action.should eq(Gori::Interceptor::Action::Drop)
+    end
+  end
+
+  # The claim `forward` already makes, now made by `drop` too. The involuntary releases run on
+  # PROXY fibers (`H2::StreamGate#fail_open` past the buffer ceiling, `#close`, `#abandon_locked`,
+  # `WS::MessageGate#fail_open_locked`) concurrently with the surface a human or agent drops
+  # from, so "dropped" for a message the gate already put on the wire is the worst version of an
+  # ack that does not describe the act: it says gori BLOCKED those bytes.
+  it "drop reports whether IT settled the item (false when somebody else got there first)" do
+    with_store do |store|
+      ic = Gori::Interceptor.new(Gori::Scope.load(store))
+      ic.toggle
+      result = Channel(Gori::Interceptor::Decision).new
+      spawn { result.send(req(ic, "GET / HTTP/1.1\r\n\r\n")) }
+      Fiber.yield
+      id = ic.pending.first.id
+
+      ic.forward(id).should be_true # a gate fails the hold open first
+      ic.drop(id).should be_false   # …so this drop decided nothing
+      receive_within(result).action.should eq(Gori::Interceptor::Action::Forward)
+      ic.drop(999_i64).should be_false # never-held id, same answer
+    end
+  end
+
+  it "forward_all returns how many it actually released" do
+    with_store do |store|
+      ic = Gori::Interceptor.new(Gori::Scope.load(store))
+      ic.toggle
+      done = Channel(Nil).new
+      2.times { spawn { req(ic, "GET / HTTP/1.1\r\n\r\n"); done.send(nil) } }
+      Fiber.yield
+      ic.pending_count.should eq(2)
+      ic.forward_all.should eq(2)
+      2.times { receive_within(done) }
+      ic.forward_all.should eq(0) # nothing held → nothing claimed
     end
   end
 

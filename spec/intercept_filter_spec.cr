@@ -112,6 +112,16 @@ describe Gori::InterceptFilter do
       Gori::InterceptFilter.suggestions("body:tra", 8).should be_empty
     end
 
+    it "offers only the proto values a hold gate can ever answer (no grpc/sse)" do
+      # A gate knows its leg — Ws for a held WebSocket message, Http for everything else — and
+      # `grpc`/`sse` are read off a CAPTURED response's Content-Type, which does not exist yet
+      # when the message is being held. Completing them handed the operator a condition that
+      # silently holds nothing, which reads as intercept being broken.
+      Gori::InterceptFilter.suggestions("proto:", 6).should eq(["proto:ws", "proto:http"])
+      Gori::InterceptFilter.suggestions("proto:g", 7).should be_empty
+      Gori::InterceptFilter.suggestions("proto:s", 7).should be_empty
+    end
+
     it "takes host values from the injected pool and preserves a leading -" do
       hosts = ["api.acme.test", "app.acme.test"]
       Gori::InterceptFilter.suggestions("host:ap", 7, hosts).should eq(["host:api.acme.test", "host:app.acme.test"])
