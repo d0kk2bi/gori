@@ -25,11 +25,39 @@ describe Gori::DurableFile do
     it "replaces a DANGLING symlink with a real file rather than failing" do
       DurableFileSpec.in_tmp do |dir|
         link = File.join(dir, "link.json")
-        File.symlink(File.join(dir, "gone.json"), link)
+        target = File.join(dir, "gone.json")
+        File.symlink(target, link)
 
         Gori::DurableFile.write(link, "new", perm: DurableFileSpec::RW)
 
+        # `File.read(link)` alone would also pass if the code had FOLLOWED the dangling
+        # link and created its target — reading through the link returns "new" either way.
+        File.symlink?(link).should be_false
+        File.exists?(target).should be_false
         File.read(link).should eq("new")
+      end
+    end
+
+    # The shape the module doc leads with: the link and its target in DIFFERENT directories.
+    # The temp has to be staged beside the TARGET, not beside the link, or the rename
+    # crosses a filesystem boundary and the mode lands on the wrong side.
+    it "stages beside the target when the link points into another directory" do
+      DurableFileSpec.in_tmp do |dir|
+        link_dir = File.join(dir, "home")
+        real_dir = File.join(dir, "dotfiles")
+        Dir.mkdir_p(link_dir)
+        Dir.mkdir_p(real_dir)
+        real = File.join(real_dir, "gori.json")
+        link = File.join(link_dir, "gori.json")
+        File.write(real, "old")
+        File.symlink(real, link)
+
+        Gori::DurableFile.write(link, "new", perm: DurableFileSpec::RW)
+
+        File.symlink?(link).should be_true
+        File.read(real).should eq("new")
+        Dir.children(link_dir).should eq(["gori.json"])
+        Dir.children(real_dir).should eq(["gori.json"])
       end
     end
   end
@@ -54,6 +82,21 @@ describe Gori::DurableFile do
         Gori::DurableFile.write(path, "new", perm: File::Permissions.new(0o600))
 
         File.info(path).permissions.should eq(File::Permissions.new(0o600))
+      end
+    end
+
+    # Every other mode example uses 0600, so an implementation that ignored `perm` and
+    # hardcoded 0600 would pass all of them — while silently flipping the two 0644 callers
+    # (`.capture.status` and the active-project marker) to 0600. This is the one that
+    # observes `perm` actually taking effect. It also catches the umask leaking through
+    # `File.open`'s `perm:`.
+    it "honours a perm other than 0600 for a new file" do
+      DurableFileSpec.in_tmp do |dir|
+        path = File.join(dir, "marker")
+
+        Gori::DurableFile.write(path, "new", perm: File::Permissions.new(0o644))
+
+        File.info(path).permissions.should eq(File::Permissions.new(0o644))
       end
     end
 
@@ -91,10 +134,50 @@ describe Gori::DurableFile do
     it "stages in the destination's own directory so the rename stays intra-filesystem" do
       DurableFileSpec.in_tmp do |dir|
         path = File.join(dir, "cfg.json")
+        yielded = false
         Gori::DurableFile.stage(path, perm: DurableFileSpec::RW) do |tmp, _m|
+          yielded = true
           File.dirname(tmp).should eq(dir)
           File.write(tmp, "x")
         end.discard
+        # Asserted OUTSIDE the block: an implementation that stopped yielding would
+        # otherwise pass this example by never running its only assertion.
+        yielded.should be_true
+      end
+    end
+
+    # `replace`'s cleanup has to cover a rename that fails AFTER staging succeeded, not
+    # just a failing write. A destination that is a non-empty directory makes rename(2)
+    # fail exactly there. This is the contract `CertAuthority.write_pair` broke by
+    # committing two staged files without a guard over both.
+    it "leaves no temp behind when the COMMIT fails" do
+      DurableFileSpec.in_tmp do |dir|
+        occupied = File.join(dir, "cfg.json")
+        Dir.mkdir_p(occupied)
+        File.write(File.join(occupied, "child"), "x")
+
+        expect_raises(Exception) do
+          Gori::DurableFile.write(occupied, "new", perm: DurableFileSpec::RW)
+        end
+
+        Dir.children(dir).should eq(["cfg.json"])
+      end
+    end
+
+    # `fsync` opens the temp with "a", which CREATES it. Without a guard, a block that
+    # wrote nothing yields a valid-looking Staged over a zero-byte file, and committing it
+    # blanks live data. No caller does this today; the guard is for the next one.
+    it "refuses to install a replacement the block never wrote" do
+      DurableFileSpec.in_tmp do |dir|
+        path = File.join(dir, "cfg.json")
+        File.write(path, "IMPORTANT LIVE DATA")
+
+        expect_raises(Gori::Error, /staged no file/) do
+          Gori::DurableFile.replace(path, perm: DurableFileSpec::RW) { |_t, _m| }
+        end
+
+        File.read(path).should eq("IMPORTANT LIVE DATA")
+        Dir.children(dir).should eq(["cfg.json"])
       end
     end
 

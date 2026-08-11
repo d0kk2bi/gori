@@ -101,11 +101,18 @@ module Gori
                    inherit : Bool = true, & : String, File::Permissions ->) : Staged
       target = resolve_symlink(path)
       dir = File.dirname(target)
-      mode = (inherit ? File.info?(target).try(&.permissions) : nil) || perm
+      # `file?` guards the inherit: a destination that is a directory or a device would
+      # otherwise lend its mode — execute bits included — to the replacement.
+      mode = (inherit ? File.info?(target).try { |i| i.permissions if i.file? } : nil) || perm
       tmp = File.tempname(".#{File.basename(target)}.gori", ".tmp", dir: dir)
       staged = Staged.new(tmp, target)
       begin
         yield tmp, mode
+        # A block that wrote nothing must not be installed over live data. Checked here
+        # rather than left to `fsync`, whose "a" mode would CREATE the missing temp and
+        # hand back a valid-looking `Staged` pointing at a zero-byte file — with the
+        # chmod's own ENOENT already swallowed, nothing else would notice.
+        raise Gori::Error.new("durable write staged no file at #{tmp}") unless File.exists?(tmp)
         # chmod as well as creating at `mode`, because a block that opened the temp
         # itself may not have honoured the mode at all (an OpenSSL BIO does not).
         #

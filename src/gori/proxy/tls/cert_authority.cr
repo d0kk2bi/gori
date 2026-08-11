@@ -257,15 +257,19 @@ module Gori::Proxy::Tls
         key_staged.discard
         raise ex
       end
-      # A raise from the first commit must not strand the second's temp: it is randomly
-      # named and hidden, so nothing in the tree would ever sweep it.
+      # ONE guard over BOTH commits. A rename can fail after staging succeeded (the dir goes
+      # read-only, ENOSPC on the directory entry, a sandbox denial), and every such path has
+      # to clean up both temps — including the key's, which holds a PRIVATE KEY under a
+      # random hidden name nothing in the tree would ever sweep. `discard` on an
+      # already-renamed temp is a no-op, so this is correct whichever commit failed.
       begin
         key_staged.commit
+        cert_staged.commit
       rescue ex
+        key_staged.discard
         cert_staged.discard
         raise ex
       end
-      cert_staged.commit
       cert_path
     end
 
