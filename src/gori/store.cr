@@ -259,6 +259,7 @@ module Gori
                    @prune_interval : Int32 = PRUNE_INTERVAL)
       @writes = Channel(WriteOp).new(1024) # widened: h2 frames now queue fire-and-forget
       @done = Channel(Nil).new
+      @closed = false # see #close: a second drain would park forever on @done
       @write_failures = Atomic(Int32).new(0)
       @h2_frames_dropped = Atomic(Int32).new(0)
       @inserts_since_prune = 0
@@ -419,7 +420,18 @@ module Gori
     end
 
     # Drains outstanding writes, stops the writer fiber, then closes the DB.
+    #
+    # Idempotent, and it has to be: `@done` is an unbuffered channel the writer fiber sends
+    # exactly ONE value on as it exits, so a second `close` parked on `@done.receive` would
+    # wait for a sender that no longer exists and hang the caller forever — not raise, HANG.
+    # That distinction matters because two teardown paths guard this call with
+    # `store.close rescue nil` (`Session.open`'s failure unwind among them), and a `rescue`
+    # is no defence against a deadlock. It is the same hazard `writer_loop` already protects
+    # against from the other side, where a failed batch must not kill the writer "or every
+    # blocked caller (and close()) deadlocks".
     def close : Nil
+      return if @closed
+      @closed = true
       @writes.close
       @done.receive
       @db.close

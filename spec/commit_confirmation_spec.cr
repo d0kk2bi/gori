@@ -1,8 +1,8 @@
 require "./spec_helper"
 
-# NOTE: `Store#close` is NOT idempotent — it blocks on `@done.receive`, which the writer
-# fiber only ever sends once, so a second call hangs forever. Every example here closes the
-# store itself (that is the lever for a failed commit), so the helper must not close it again.
+# Every example closes the store itself — that is the lever for a failed commit — so the
+# helper must not close it again. `Store#close` is idempotent, but this file should fail on
+# its own subject, not on teardown.
 private def with_store(&)
   path = File.tempname("gori-commit", ".db")
   store = Gori::Store.open(path)
@@ -88,6 +88,38 @@ describe "commit confirmation" do
         rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
           "", "B").should be_false
         rules.rules.should be_empty
+      end
+    end
+  end
+
+  # `@done` is unbuffered and the writer fiber sends exactly one value as it exits, so a
+  # second `close` used to park forever waiting for a sender that no longer existed. Asserted
+  # with a deadline rather than by just calling it twice: a regression here HANGS, and a spec
+  # that hangs wedges the suite instead of reporting a failure.
+  describe "Store#close" do
+    it "is idempotent instead of parking on an exhausted channel" do
+      path = File.tempname("gori-close", ".db")
+      begin
+        store = Gori::Store.open(path)
+        store.close
+
+        returned = Channel(Nil).new(1)
+        spawn do
+          store.close
+          store.close
+          returned.send(nil)
+        end
+
+        select
+        when returned.receive
+          # closed again without blocking
+        when timeout(5.seconds)
+          fail "Store#close blocked on a second call"
+        end
+      ensure
+        File.delete?(path)
+        File.delete?("#{path}-wal")
+        File.delete?("#{path}-shm")
       end
     end
   end
