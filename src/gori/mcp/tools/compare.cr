@@ -39,7 +39,7 @@ module Gori
 
         lines_a = compare_lines(detail_a, pane, include_sensitive)
         lines_b = compare_lines(detail_b, pane, include_sensitive)
-        truncated = lines_a.size > Repeater::Diff::MAX_LINES || lines_b.size > Repeater::Diff::MAX_LINES
+        truncated = Repeater::Diff.truncated?(lines_a, lines_b)
         full_diff = Repeater::Diff.lines(lines_a, lines_b)
         change_count = Repeater::Diff.change_count(full_diff)
         # `context` folds the unchanged runs to counted markers; `changes_only` drops them
@@ -65,7 +65,11 @@ module Gori
             j.field "flow_id_b", id_b
             j.field "pane", pane.to_s
             j.field "changed_lines", change_count
-            j.field "identical", change_count == 0
+            # `identical` is a stronger claim than `changed_lines: 0` and has to earn it:
+            # over a CUT diff the honest answer is "unknown", not "the same". `truncated`
+            # sits beside it either way, but an agent reading one field should not be told
+            # two responses match when only their first MAX_LINES lines were compared.
+            j.field "identical", change_count == 0 && !truncated
             j.field "truncated", truncated
             j.field "meta" do
               j.object do

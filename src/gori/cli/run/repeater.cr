@@ -548,12 +548,15 @@ module Gori
         outbound.close
 
         new_body, _ = decode_body(result.head, result.body)
-        diff =
-          if do_diff && (base_head = rec.response_head)
-            orig = message_lines(base_head, display_body(base_head, rec.response_body))
-            Repeater::Diff.lines(orig, message_lines(result.head, new_body))
-          end
-        emit_repeater_result(result, new_body, diff, format)
+        diff = nil.as(Array(Repeater::DiffLine)?)
+        diff_capped = false
+        if do_diff && (base_head = rec.response_head)
+          orig = message_lines(base_head, display_body(base_head, rec.response_body))
+          fresh = message_lines(result.head, new_body)
+          diff_capped = Repeater::Diff.truncated?(orig, fresh)
+          diff = Repeater::Diff.lines(orig, fresh)
+        end
+        emit_repeater_result(result, new_body, diff, format, diff_capped)
         persist_repeater_response(id, result.head, result.body, result.error, result.duration_us, project_name, db_path) if result.ok?
         exit 1 unless result.ok?
       end
@@ -799,15 +802,22 @@ module Gori
       # already decoded `new_body` and built `diff` (the diff baseline differs per
       # path); caller owns the exit code.
       private def self.emit_repeater_result(result : Repeater::Result, new_body : Bytes?,
-                                            diff : Array(Repeater::DiffLine)?, format : Symbol) : Nil
+                                            diff : Array(Repeater::DiffLine)?, format : Symbol,
+                                            diff_capped : Bool = false) : Nil
         if format == :json
-          puts repeater_json(result, diff)
+          puts repeater_json(result, diff, diff_capped)
         elsif result.ok?
           STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result, result.timed_out?)})" : ""}"
           if d = diff
             print_diff(d)
             n = Repeater::Diff.change_count(d)
+            # Never a bare "no differences" over a CUT diff: `Diff.lines` caps both sides at
+            # MAX_LINES, so a change past the cut is absent from the diff AND from the count
+            # — and a longer new response (an appended payload, a stack trace) puts its extra
+            # lines exactly there. `cmd_compare` in this directory has always said so; the
+            # repeater paths did not, and "no differences" is the answer an operator acts on.
             STDERR.puts(n == 0 ? "no differences" : "#{n} line#{n == 1 ? "" : "s"} changed")
+            STDERR.puts "(diff truncated to #{Repeater::Diff::MAX_LINES} lines/side — lines past the cut were not compared)" if diff_capped
           else
             print_message_text(result.head, new_body, result.body)
           end
@@ -1300,17 +1310,21 @@ module Gori
         # baseline isn't free for large bodies). The JSON path decodes independently
         # inside emit_body_json, from the raw head+body, to match MCP's contract.
         new_body, _ = decode_body(result.head, result.body)
-        diff =
-          if do_diff
-            orig = message_lines(detail.response_head, display_body(detail.response_head, detail.response_body))
-            Repeater::Diff.lines(orig, message_lines(result.head, new_body))
-          end
+        diff = nil.as(Array(Repeater::DiffLine)?)
+        diff_capped = false
+        if do_diff
+          orig = message_lines(detail.response_head, display_body(detail.response_head, detail.response_body))
+          fresh = message_lines(result.head, new_body)
+          diff_capped = Repeater::Diff.truncated?(orig, fresh)
+          diff = Repeater::Diff.lines(orig, fresh)
+        end
 
-        emit_repeater_result(result, new_body, diff, format)
+        emit_repeater_result(result, new_body, diff, format, diff_capped)
         exit 1 unless result.ok?
       end
 
-      private def self.repeater_json(result : Repeater::Result, diff : Array(Repeater::DiffLine)?) : String
+      private def self.repeater_json(result : Repeater::Result, diff : Array(Repeater::DiffLine)?,
+                                     diff_capped : Bool = false) : String
         JSON.build do |j|
           j.object do
             j.field "ok", result.ok?
@@ -1339,6 +1353,10 @@ module Gori
             emit_body_json(j, "body", result.head, result.body, false)
             if d = diff
               j.field "changed_lines", Repeater::Diff.change_count(d)
+              # Sibling to changed_lines, exactly as `cmd_compare`'s JSON carries it: a
+              # consumer reading changed_lines: 0 has to be able to tell "identical" from
+              # "compared only the first MAX_LINES lines".
+              j.field "truncated", diff_capped
             end
           end
         end

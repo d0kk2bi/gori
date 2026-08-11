@@ -58,7 +58,7 @@ module Gori
 
         lines_a = compare_lines(detail_a, pane)
         lines_b = compare_lines(detail_b, pane)
-        truncated = lines_a.size > Repeater::Diff::MAX_LINES || lines_b.size > Repeater::Diff::MAX_LINES
+        truncated = Repeater::Diff.truncated?(lines_a, lines_b)
         full_diff = Repeater::Diff.lines(lines_a, lines_b)
         change_count = Repeater::Diff.change_count(full_diff)
         folded = if changes_only
