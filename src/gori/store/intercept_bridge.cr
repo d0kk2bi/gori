@@ -39,6 +39,22 @@ module Gori
       rows
     end
 
+    # {item_id => viewed_ms} for one session's held rows — the auto-forward reaper's whole
+    # question, without the `raw` BLOB.
+    #
+    # The reaper runs on the cross-process cadence (every 750ms) for as long as anything is
+    # held and the human is not on the intercept tab, and it used to ask `intercept_held`, which
+    # SELECTs every column. A held multi-MiB response therefore came off disk, through SQLite
+    # and into a fresh `Bytes` copy per Item, better than once a second — to read one Int64 per
+    # row that the query below reads directly.
+    def intercept_viewed_ms(token : String) : Hash(Int64, Int64)
+      viewed = {} of Int64 => Int64
+      @db.query("SELECT item_id, viewed_ms FROM intercept_held WHERE session_token = ?", token) do |rs|
+        rs.each { viewed[rs.read(Int64)] = rs.read(Int64) }
+      end
+      viewed
+    end
+
     # Stamp `viewed_ms` on held items an MCP intercept_list/get just returned — the agent's
     # liveness signal for the auto-forward reaper. Best-effort (no-op if a row was released).
     def touch_intercept_held(token : String, item_ids : Array(Int64), now_ms : Int64) : Nil

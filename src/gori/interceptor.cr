@@ -505,23 +505,37 @@ module Gori
       true
     end
 
-    def drop(id : Int64) : Nil
+    # True when THIS call is the one that settled the item — the same claim `forward` makes,
+    # and for the same reason. A drop is not a private decision: it tells the operator (and an
+    # agent's ack) that the message never reached its destination. The involuntary releases run
+    # on PROXY fibers (`H2::StreamGate#fail_open` past the buffer ceiling, `#close`,
+    # `#abandon_locked`, `WS::MessageGate#fail_open_locked`) concurrently with the TUI fiber, so
+    # a `forward` landing first leaves this a no-op — and reporting "dropped" for it claims gori
+    # blocked bytes the gate had already put on the wire.
+    def drop(id : Int64) : Bool
       item = @mutex.synchronize { @items.delete(id) }
-      return unless item
+      return false unless item
       @revision.add(1)
       item.reply.send(Decision.new(Action::Drop, Bytes.empty))
+      true
     end
 
     # `overrides` lets the caller supply edited bytes for specific held items (keyed by
     # id) — e.g. an in-progress editor edit that would otherwise be lost when the whole
     # queue is released at once. Items without an override forward their original bytes.
-    def forward_all(overrides : Hash(Int64, Bytes)? = nil) : Nil
+    #
+    # Returns how many were actually released. The caller cannot get that from a preceding
+    # `pending_count`: proxy fibers enqueue holds concurrently, so a message held between the
+    # count and this call goes out under a toast reporting the older number — the same
+    # "the ack must describe the act" rule `forward`'s return value exists for.
+    def forward_all(overrides : Hash(Int64, Bytes)? = nil) : Int32
       items = @mutex.synchronize { vals = @items.values; @items.clear; vals }
       @revision.add(1) unless items.empty?
       items.each do |it|
         bytes = overrides.try(&.[it.id]?) || it.raw
         it.reply.send(Decision.new(Action::Forward, bytes))
       end
+      items.size
     end
 
     # Shutdown: latch so nothing re-enqueues, then auto-forward every held item

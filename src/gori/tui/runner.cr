@@ -682,7 +682,14 @@ module Gori::Tui
           store.ack_intercept_command(cmd.id, "forwarded", desc)
           push_agent_note(:success, "forwarded #{desc}", item)
         when "drop"
-          ic.drop(item_id)
+          # Same claim `forward` above makes, for the same reason: `drop` is a no-op on an item
+          # somebody else settled first, and the h2/WS gates fail a hold OPEN from a PROXY fiber
+          # (buffer ceiling, RST_STREAM, teardown) concurrently with this one. Acking "dropped"
+          # there tells the agent gori blocked a message that is already on the wire.
+          unless ic.drop(item_id)
+            store.ack_intercept_command(cmd.id, "error", "already decided by another surface: #{desc}")
+            return false
+          end
           store.ack_intercept_command(cmd.id, "dropped", desc)
           push_agent_note(:warn, "dropped #{desc}", item)
         when "forward_edit"
@@ -768,8 +775,11 @@ module Gori::Tui
       ic = @session.interceptor
       pending = ic.pending
       return false if pending.empty?
-      viewed = {} of Int64 => Int64
-      @session.store.intercept_held(@session.intercept_token).each { |r| viewed[r.item_id] = r.viewed_ms }
+      # `intercept_viewed_ms`, NOT `intercept_held`: this runs on the 750ms cross-process cadence
+      # for as long as anything is held, and the full row carries the held `raw` BLOB — a held
+      # multi-MiB response was being read out of SQLite and copied more than once a second to
+      # answer a question that is one Int64 per row.
+      viewed = @session.store.intercept_viewed_ms(@session.intercept_token)
       @intercept_agent_seen = true if viewed.each_value.any? { |v| v > 0 } # an agent polled the queue
       return false unless @intercept_agent_seen                            # no agent ever attached → P4: hold indefinitely
       now_ms = Time.utc.to_unix_ms
