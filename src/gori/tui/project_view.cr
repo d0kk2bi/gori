@@ -754,11 +754,15 @@ module Gori::Tui
       current_override.try(&.host)
     end
 
-    # Removes the selected override, returning its host (for the toast) or nil.
+    # Removes the selected override, returning its host (for the toast) — or nil when there
+    # was nothing selected OR the delete did not COMMIT. `HostOverrides#remove` answers that
+    # (its doc: "false = store busy/locked/closing") and this discarded it, so a dropped
+    # write still reported "host override deleted" while the routing pin stayed live. The
+    # two writes right above in `ov_commit` already check theirs.
     def ov_delete : String?
       entry = current_override
       return nil unless entry
-      @host_overrides.remove(entry.id)
+      return nil unless @host_overrides.remove(entry.id)
       clamp_ov_sel
       entry.host
     end

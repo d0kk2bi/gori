@@ -149,31 +149,41 @@ module Gori
     def add(target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
             op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
             name : String = "", host : String = "", body_file : String = "",
-            scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true) : Nil
-      return if pattern.empty?
+            scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true) : Bool
+      return false if pattern.empty?
       target, part = normalize_shape(op, target, part)
-      if scope.global?
-        Settings.add_rewriter_rule(target.label, part.label, pattern, replacement, op.label,
-          match_kind.label, name, host, body_file, enabled)
-      else
-        @store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled, body_file: body_file)
-      end
+      # Both writers already answered — a global add returns the new id (0 = not written),
+      # a project add the same through `insert_rule`'s `exec_task`. This threw it away, so a
+      # surface printed "rule duplicated" (or silently closed its overlay having "added" the
+      # rule) over a write the store dropped. A rewrite rule can be the operator's control —
+      # stripping an Authorization header, redacting a token before it leaves — so a silently
+      # absent one is not cosmetic. Mirrors `remove` below: true means COMMITTED.
+      ok =
+        if scope.global?
+          Settings.add_rewriter_rule(target.label, part.label, pattern, replacement, op.label,
+            match_kind.label, name, host, body_file, enabled) != 0
+        else
+          @store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled, body_file: body_file) != 0
+        end
       refresh
+      ok
     end
 
     def update(id : Int64, target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
                op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
                name : String = "", host : String = "", body_file : String = "",
-               scope : Store::RuleScope = Store::RuleScope::Project) : Nil
-      return if pattern.empty?
+               scope : Store::RuleScope = Store::RuleScope::Project) : Bool
+      return false if pattern.empty?
       target, part = normalize_shape(op, target, part)
-      if scope.global?
-        Settings.update_rewriter_rule(id, target.label, part.label, pattern, replacement,
-          op.label, match_kind.label, name, host, body_file)
-      else
-        @store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
-      end
+      ok =
+        if scope.global?
+          Settings.update_rewriter_rule(id, target.label, part.label, pattern, replacement,
+            op.label, match_kind.label, name, host, body_file)
+        else
+          @store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
+        end
       refresh
+      ok
     end
 
     # Move a rule to the OTHER scope, keeping its fields and its state in this project. Not an

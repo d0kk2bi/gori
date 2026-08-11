@@ -703,12 +703,10 @@ module Gori
                         "so the sandbox will BLOCK ALL captured traffic until you add one " \
                         "(gori run project scope add ...)"
           end
-          # Scope's sandbox setters persist through the SAME settings-table write the TUI uses
-          # (set_sandbox_unlocked → Store#set_setting) but return Nil, so confirm the flag
-          # committed by reading it back — a busy/locked store must not report success
-          # (mirrors scope enable/disable's committed check).
-          enable ? scope.enable_sandbox : scope.disable_sandbox
-          unless store.setting(Scope::SETTING_SANDBOX) == (enable ? "1" : "0")
+          # The setters return whether the write COMMITTED (mirrors scope enable/disable's
+          # check). A busy/locked store must not report success: the in-memory flag flips
+          # either way, and the next reload reverts it to the disk value.
+          unless enable ? scope.enable_sandbox : scope.disable_sandbox
             store.close
             abort "gori run project sandbox #{action}: project is busy (write did not commit) — try again"
           end

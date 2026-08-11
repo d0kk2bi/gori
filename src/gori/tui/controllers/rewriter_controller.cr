@@ -631,8 +631,10 @@ module Gori::Tui
     def rewriter_duplicate : Nil
       rule = selected_rule || return @host.status("no rewrite rule selected")
       name = rule.name.empty? ? "" : "#{rule.name} copy"
-      rules_engine.add(rule.target, rule.part, rule.pattern, rule.replacement,
-        rule.op, rule.match_kind, name, rule.host, rule.body_file, scope: rule.scope)
+      unless rules_engine.add(rule.target, rule.part, rule.pattern, rule.replacement,
+               rule.op, rule.match_kind, name, rule.host, rule.body_file, scope: rule.scope)
+        return @host.status("rule NOT duplicated (project busy or settings not writable)")
+      end
       @host.status(rule.global? ? "global rule duplicated" : "rule duplicated")
     end
 
@@ -665,8 +667,11 @@ module Gori::Tui
       return false unless ov.valid?
       if id = ov.edit_id
         from = ov.edit_scope || Store::RuleScope::Project
-        rules_engine.update(id, ov.target, ov.part, ov.pattern, ov.replacement,
-          ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: from)
+        unless rules_engine.update(id, ov.target, ov.part, ov.pattern, ov.replacement,
+                 ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: from)
+          @host.status("rule NOT saved (project busy or settings not writable) — it is unchanged")
+          return true
+        end
         if from != ov.scope
           moved = rule_list.find { |r| r.scope == from && r.id == id }
           if moved && !rules_engine.set_scope(moved, ov.scope)
@@ -674,8 +679,13 @@ module Gori::Tui
           end
         end
       else
-        rules_engine.add(ov.target, ov.part, ov.pattern, ov.replacement,
-          ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: ov.scope)
+        unless rules_engine.add(ov.target, ov.part, ov.pattern, ov.replacement,
+                 ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: ov.scope)
+          # Report rather than re-select: with nothing added, `last_index_of_scope` would
+          # move the highlight onto whatever already sat at the end of that block.
+          @host.status("rule NOT added (project busy or settings not writable)")
+          return true
+        end
         # A global rule lands at the end of the GLOBAL block, which is not the end of the list.
         @sel = last_index_of_scope(ov.scope)
       end

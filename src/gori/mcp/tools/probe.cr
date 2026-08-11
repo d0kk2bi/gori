@@ -292,7 +292,12 @@ module Gori
           return err("invalid mode '#{label}' (#{valid.join("|")})", "INVALID_ARGUMENT", field: "mode")
         end
         mode = Probe::Mode.from_setting(label)
-        store.set_probe_mode(mode)
+        # Echoing the REQUESTED mode as fact would misreport a dropped write — and the
+        # direction that matters is lowering the mode to STOP active probing, where a live
+        # capture instance keeps the persisted mode and keeps sending.
+        unless store.set_probe_mode(mode)
+          return busy("scan mode NOT persisted (store busy or unwritable); the mode is unchanged")
+        end
         Result.new({"mode" => mode.label, "scanning" => mode.scanning?,
                     "probes_actively" => mode.probes_actively?}.to_json)
       end

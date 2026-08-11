@@ -154,14 +154,18 @@ module Gori
       # Transitioning INTO Active re-arms probes over recent History: live traffic alone
       # misses flows that already completed passive analysis (passive_loop never re-enqueues
       # them), and a restart clears both the event channel and @active_seen.
-      def set_mode(m : Mode) : Nil
+      # Returns whether the mode PERSISTED. The in-memory `@mode` governs this process either
+      # way, so the arming below is unchanged — but a surface must not report the change as
+      # done when another instance will keep reading the old mode off disk.
+      def set_mode(m : Mode) : Bool
         prev = @mode
         @mode = m
-        @store.set_probe_mode(m)
+        committed = @store.set_probe_mode(m)
         # Re-arm when entering an actively-probing mode from one that wasn't (OFF/PASSIVE), OR when
         # switching between ACTIVE and AGGRESSIVE — the wider AGGRESSIVE opts (unsafe methods,
         # raised caps) produce new dedup keys, so recent in-scope traffic should be re-swept.
         arm_active_backfill if m.probes_actively? && (!prev.probes_actively? || prev != m)
+        committed
       end
 
       def start : Nil

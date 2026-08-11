@@ -124,11 +124,10 @@ module Gori
         enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled' (true or false)", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
         scope = Scope.load(store)
-        # Scope's sandbox setters persist through the SAME settings write the TUI uses but
-        # return Nil, so confirm the flag committed by reading it back — a busy/locked store
-        # must not report success (mirrors set_scope_enabled's committed check).
-        enabled ? scope.enable_sandbox : scope.disable_sandbox
-        unless store.setting(Scope::SETTING_SANDBOX) == (enabled ? "1" : "0")
+        # The setters return whether the write COMMITTED (mirrors set_scope_enabled's check).
+        # A busy/locked store must not report success: the in-memory flag flips either way,
+        # and the next reload reverts it to the disk value.
+        unless enabled ? scope.enable_sandbox : scope.disable_sandbox
           return busy("sandbox enable/disable NOT persisted (store busy or unwritable); the gate is unchanged")
         end
         Result.new(JSON.build do |j|

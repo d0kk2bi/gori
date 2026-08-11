@@ -286,15 +286,21 @@ module Gori
       inc_ok && !excluded
     end
 
-    def toggle_sandbox : Nil
+    # These three return whether the persisted sandbox flag COMMITTED (false = store
+    # busy/locked/closing), exactly as `enable`/`disable` do for the enabled flag beside
+    # them. The in-memory `@sandbox` is set either way, and one `Scope` instance is shared
+    # by the Interceptor and by every `Outbound` built from it — so a dropped write is not
+    # merely "does not survive restart": the next `reload` re-reads the PERSISTED value and
+    # silently reverts the gate a surface has already reported as on.
+    def toggle_sandbox : Bool
       @mutex.synchronize { set_sandbox_unlocked(!@sandbox) }
     end
 
-    def enable_sandbox : Nil
+    def enable_sandbox : Bool
       @mutex.synchronize { set_sandbox_unlocked(true) }
     end
 
-    def disable_sandbox : Nil
+    def disable_sandbox : Bool
       @mutex.synchronize { set_sandbox_unlocked(false) }
     end
 
@@ -568,7 +574,7 @@ module Gori
       @store.set_setting(SETTING_ENABLED, value ? "1" : "0")
     end
 
-    private def set_sandbox_unlocked(value : Bool) : Nil
+    private def set_sandbox_unlocked(value : Bool) : Bool
       @sandbox = value
       @store.set_setting(SETTING_SANDBOX, value ? "1" : "0")
     end
