@@ -1545,6 +1545,11 @@ module Gori::Discover
     # clears it — so the inferred test is LESS sensitive than the thing it is trying to
     # predict, which is the wrong way round. A byte search is exact and costs no extra request.
     private def calibration_probe(dir : String, name : String, & : Bool ->) : Calibrate::Fetched
+      # Each probe is a REQUEST. The dispatch loop paces the Calibrate TASK once, so without
+      # this the whole batch went out back-to-back for one interval — and with `concurrency`
+      # workers each doing that, calibration effectively ignored `--rate`. It is this
+      # engine's largest single cost, so it is also where the rate matters most.
+      pace(pace_interval)
       raw = send_with_retries("#{dir}#{name}")
       body = decode_body(raw)
       yield raw.error.nil? && body_contains?(body, name)

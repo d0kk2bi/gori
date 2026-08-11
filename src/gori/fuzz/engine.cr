@@ -534,7 +534,11 @@ module Gori::Fuzz
         wanted = Math.min(wanted.to_i64, room).to_i32
       end
       samples = [] of BaselineSample
+      interval = pace_interval
       @generator.calibration_requests(wanted).each do |bytes, payload_len|
+        # Calibration samples are real requests at the target, sent before `start`'s dispatch
+        # loop exists — so without this they were the one burst that ignored `--rate` outright.
+        pace(interval)
         raw = @backend.send(bytes)
         samples << BaselineSample.new(@matcher.metrics(raw), payload_len) if raw.error.nil?
       end
@@ -738,6 +742,12 @@ module Gori::Fuzz
         # is either a literal gori wrote (`GET`, `Host:`, `Connection: close`) or the origin's
         # own `Location`. Neither is a place an operator could have written a `$NAME` for a
         # binding to resolve, so there is nothing here to substitute in the first place.
+        # A hop is a REQUEST, so it owes the operator's rate the same as any other. Only the
+        # first request of a payload goes through the dispatch loop's `pace`, so an unpaced
+        # chain ran at up to (max_redirects + 1)x the configured rate — 6x at defaults, on
+        # every 3xx, which is the ordinary shape of an auth-gated target. `pace` claims its
+        # slot without yielding, so calling it from this worker fiber is safe.
+        pace(pace_interval)
         hop = @backend.send(nxt, Backend.all_verbatim(nxt))
         retried ||= hop.retried?
         total_us += hop.duration_us

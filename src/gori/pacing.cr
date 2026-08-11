@@ -15,8 +15,9 @@ module Gori
   #   `@last_dispatch`  — a `Time::Instant` it also initialises
   #
   # `@last_dispatch` is deliberately the includer's own ivar rather than state owned here:
-  # each engine keeps its clock ORCHESTRATOR-local (one fiber advances it) so pacing never
-  # races across the worker fibers it dispatches to.
+  # each engine keeps ONE clock for its whole run. It is shared across the orchestrator and
+  # its workers on purpose — see `pace`, which claims a slot without yielding so concurrent
+  # fibers serialise onto it rather than racing.
   module Pacing
     # The gap to hold between dispatches, or nil when the run is unthrottled.
     #
@@ -33,16 +34,29 @@ module Gori
       end
     end
 
-    # Wait out the remaining gap before the next dispatch, then apply jitter.
+    # Wait out the remaining gap before the next request, then apply jitter.
     #
-    # The clock is re-read AFTER the sleep rather than reusing `target`, so a scheduler that
-    # overslept does not leave the next interval measured from a moment already past.
+    # A TICKET, not a "sleep until the last one was long enough ago": each caller claims the
+    # next slot by advancing `@last_dispatch` and only then sleeps until its own slot. The
+    # claim is a read and a write with no yield between them, so under the single-threaded
+    # cooperative scheduler two fibers cannot take the same slot — which is what makes this
+    # safe to call from a WORKER and not just from the orchestrator.
+    #
+    # That matters because the operator-facing knob is `--rate=RPS "Cap requests/sec"`, a
+    # promise about REQUESTS. Pacing only the orchestrator's dispatch loop kept that promise
+    # only where one dispatched unit is one request; every path that fans a unit out into
+    # several sends (a redirect chain, a confirm round, a calibration batch) then ran its
+    # extra requests unpaced, and the rate the operator set did not hold.
+    #
+    # `{.., now}.max` floors the claim at the present: after an idle stretch the stored
+    # instant is far in the past, and without the floor a burst of callers would all compute
+    # a target already elapsed and go out at once — the opposite of a rate limit.
     private def pace(interval : Time::Span?) : Nil
       if interval
         now = Time.instant
-        target = @last_dispatch + interval
+        target = {@last_dispatch, now}.max
+        @last_dispatch = target + interval # claim it before sleeping — no yield in between
         sleep(target - now) if now < target
-        @last_dispatch = Time.instant
       end
       # Jitter applies on its own — don't gate it behind a base rate, which silently
       # dropped jitter unless rps/throttle was also set.
