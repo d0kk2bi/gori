@@ -1239,12 +1239,15 @@ module Gori::Tui
       # events (incl. Done), so jobs.finish would never run and the bottom-bar spinner would
       # animate forever (mirrors MinerController#close_tab).
       @host.jobs.finish(tab.view.job_id, :stopped, "closed") if tab.view.running?
-      if id = tab.db_id
-        @host.session.store.delete_fuzz_session(id)
-      end
+      # The store reports whether the DELETE committed. The tab leaves the list either way —
+      # the operator asked to close it — but a rolled-back batch leaves the saved session on
+      # disk, so it reappears on the next project open. Saying so is the difference between a
+      # transient failure and one that looks like the close simply did not work.
+      orphaned = (id = tab.db_id) ? !@host.session.store.delete_fuzz_session(id) : false
       @fuzzers.delete_at(@current_idx)
       @current_idx = @fuzzers.empty? ? -1 : @current_idx.clamp(0, @fuzzers.size - 1)
-      @host.status(@fuzzers.empty? ? "closed — none open (^N new · ⇧I from History)" : "closed (#{@fuzzers.size} open)")
+      base = @fuzzers.empty? ? "closed — none open (^N new · ⇧I from History)" : "closed (#{@fuzzers.size} open)"
+      @host.status(orphaned ? "#{base} — the saved tab could NOT be removed (project busy); it will reappear" : base)
     end
 
     # Halt EVERY running sweep, not just the current tab's — the project-level exits

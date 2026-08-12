@@ -77,8 +77,10 @@ module Gori
     # out of the V10 rebuild that gave fuzz/miner `AUTOINCREMENT` (there was no id to protect),
     # and it needs its own migration on that day — otherwise reuse makes a stray dangerous
     # rather than merely dead. See the V10 comment in schema.cr for the shape.
-    def delete_sequencer_session(id : Int64) : Nil
-      exec_task ->(c : DB::Connection) {
+    # Returns whether the delete COMMITTED, like `delete_repeater` and `delete_fuzz_session`: a
+    # rolled-back batch leaves the row, so the tab the operator closed reappears on the next open.
+    def delete_sequencer_session(id : Int64) : Bool
+      exec_task_ok ->(c : DB::Connection) {
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'sequencer' AND ref_id = ?", id)
         c.exec("DELETE FROM sequencer_sessions WHERE id = ?", id)
         nil

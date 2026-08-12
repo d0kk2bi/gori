@@ -662,12 +662,11 @@ module Gori::Tui
       # events (incl. Done), so jobs.finish would never run and the bottom-bar spinner would
       # animate forever. The background fiber still unwinds on its own via request_stop.
       @host.jobs.finish(tab.view.job_id, :stopped, "closed") if tab.view.running?
-      if id = tab.db_id
-        @host.session.store.delete_miner_session(id)
-      end
+      orphaned = (id = tab.db_id) ? !@host.session.store.delete_miner_session(id) : false
       @miners.delete_at(@current_idx)
       @current_idx = @miners.empty? ? -1 : @current_idx.clamp(0, @miners.size - 1)
-      @host.status(@miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)")
+      base = @miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)"
+      @host.status(orphaned ? "#{base} — the saved tab could NOT be removed (project busy); it will reappear" : base)
     end
 
     # Halt EVERY running mine on a project-level exit (leave project / quit) — the same

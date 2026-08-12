@@ -69,8 +69,10 @@ module Gori
     # a surviving link re-binds — silently — to a session against another target instead of
     # reading `miner #N (gone)`. One exec_task for both statements so a rollback can never
     # strand the link, and the predicate carries ref_kind because ids collide across kinds.
-    def delete_miner_session(id : Int64) : Nil
-      exec_task ->(c : DB::Connection) {
+    # Returns whether the delete COMMITTED, like `delete_repeater` and `delete_fuzz_session`: a
+    # rolled-back batch leaves the row, so the tab the operator closed reappears on the next open.
+    def delete_miner_session(id : Int64) : Bool
+      exec_task_ok ->(c : DB::Connection) {
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'miner' AND ref_id = ?", id)
         c.exec("DELETE FROM miner_sessions WHERE id = ?", id)
         nil
