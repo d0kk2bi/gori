@@ -7,13 +7,13 @@ module Gori::Oast
   module Presets
     record Preset, kind : ProviderKind, name : String, host : String, token : String? = nil
 
-    INTERACTSH_SERVERS = %w(
+    INTERACTSH_SERVERS = %w[
       https://oast.pro
       https://oast.live
       https://oast.site
       https://oast.fun
       https://oast.me
-    )
+    ]
 
     def self.all : Array(Preset)
       list = [] of Preset

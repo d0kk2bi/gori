@@ -461,7 +461,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method)
+      %w[name host method]
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)

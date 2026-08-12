@@ -154,7 +154,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(tag name host method)
+      %w[tag name host method]
     end
 
     # The filter bar occupies a body row whenever the strip is up (from the first session),

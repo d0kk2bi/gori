@@ -22,7 +22,7 @@ module Gori::Tui
     DEPTHS       = [1, 2, 3, 4, 5, 6, 8]
     CONCS        = [10, 20, 40, 80]
     CONTAINMENTS = [Discover::Containment::ScopeAware, Discover::Containment::SameOrigin, Discover::Containment::HostAndSubdomains]
-    COMMON_EXT   = %w(php asp aspx jsp html json txt bak zip)
+    COMMON_EXT   = %w[php asp aspx jsp html json txt bak zip]
 
     # Hard ceiling on REQUESTS the run may put on the target (retries and redirect hops
     # each charge it — `Fuzz::CappedBackend`, the same counter `--max-requests` and MCP's

@@ -26,14 +26,14 @@ module Gori::Repeater
     # so we never strip an identity header just because THIS response happened to ignore it.
     # (Cookie is minimized crumb-by-crumb instead — see cookie_crumbs.) Matched
     # case-insensitively.
-    REMOVABLE_HEADERS = %w(
+    REMOVABLE_HEADERS = %w[
       accept accept-encoding accept-language accept-charset
       user-agent referer origin dnt sec-gpc
       upgrade-insecure-requests cache-control pragma
       if-modified-since if-none-match priority purpose x-requested-with
-    )
+    ]
     # `sec-fetch-*` and `sec-ch-ua*` are whole families of client-hint headers.
-    REMOVABLE_PREFIXES = %w(sec-fetch- sec-ch-ua)
+    REMOVABLE_PREFIXES = %w[sec-fetch- sec-ch-ua]
     # Headers that are NEVER candidates for removal: the framing / hop-by-hop set (stripping
     # them breaks the request or its wire framing) PLUS `host` — required for virtual-host
     # routing, so removing it can silently change which site answers. `host` is already in the
@@ -531,8 +531,8 @@ module Gori::Repeater
     # body — a param that only moves these (a redirect target, a Set-Cookie, CORS/auth) must
     # not be silently stripped. Set-Cookie is handled separately (by cookie NAME, since its
     # value rotates); the rest compare by value. Only ones stable across calibration are used.
-    BEHAVIOR_HEADERS = %w(location content-type content-disposition
-      access-control-allow-origin access-control-allow-credentials www-authenticate)
+    BEHAVIOR_HEADERS = %w[location content-type content-disposition
+      access-control-allow-origin access-control-allow-credentials www-authenticate]
 
     # Normalized signature of a response's behavior-relevant headers (empty when the head
     # can't be parsed). Set-Cookie reduces to its sorted cookie NAMES so a rotating session/

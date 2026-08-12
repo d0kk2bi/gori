@@ -140,7 +140,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name)
+      %w[name]
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)

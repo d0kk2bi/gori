@@ -5342,9 +5342,9 @@ module Gori::Tui
     # detail_copy_selection), so its title stays the static "Copy selection" —
     # flipping it here would be a no-op at best and misleading at worst (no
     # selection ⇒ it still only copies the current line, not "the whole pane").
-    READ_COPY_VERBS = %w(
+    READ_COPY_VERBS = %w[
       notes.copy repeater.copy decoder.copy issue.copy project.copy fuzzer.copy
-    )
+    ]
 
     def space_menu_title(verb_id : String) : String?
       return "Copy selection" if READ_COPY_VERBS.includes?(verb_id) && read_selection_active?

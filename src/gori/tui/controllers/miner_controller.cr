@@ -345,7 +345,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method) # mining sessions carry an HTTP request (target + method)
+      %w[name host method] # mining sessions carry an HTTP request (target + method)
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)

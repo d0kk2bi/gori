@@ -127,7 +127,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name) # a conversion has no HTTP context; free-text covers the chain + input
+      %w[name] # a conversion has no HTTP context; free-text covers the chain + input
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)

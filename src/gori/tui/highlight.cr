@@ -784,7 +784,7 @@ module Gori::Tui
 
     # Well-known Set-Cookie attribute names (lowercased) — coloured as keywords so the
     # cookie's own name/value pairs stand out from the flags that follow.
-    COOKIE_ATTRS = %w(path domain expires max-age samesite secure httponly partitioned priority)
+    COOKIE_ATTRS = %w[path domain expires max-age samesite secure httponly partitioned priority]
 
     # Colour a header value by header name: cookies and auth get dedicated tokenisers,
     # everything else a light param lexer. `v` keeps the leading space after the colon
@@ -975,7 +975,7 @@ module Gori::Tui
             i += 1
           end
           word = raw.byte_slice(start, i - start)
-          spans << Span.new(word, %w(true false null).includes?(word) ? Theme.syn_literal : Theme.text)
+          spans << Span.new(word, %w[true false null].includes?(word) ? Theme.syn_literal : Theme.text)
         elsif json_struct?(c)
           spans << Span.new(raw.byte_slice(i, 1), Theme.muted)
           i += 1
@@ -1019,7 +1019,7 @@ module Gori::Tui
     end
 
     # GraphQL operation keywords (styled distinctly from `true`/`false`/`null` literals).
-    GRAPHQL_KEYWORDS = %w(query mutation subscription fragment on)
+    GRAPHQL_KEYWORDS = %w[query mutation subscription fragment on]
 
     # GraphQL query language (the Pretty/decoded display form): `#` comments, operation
     # keywords, `$variables`, `@directives`, strings, numbers, and field/type names (an

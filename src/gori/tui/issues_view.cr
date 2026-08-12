@@ -24,7 +24,7 @@ module Gori::Tui
     include PreviewPane
     include IssuePresentation
 
-    QUERY_FIELDS = %w(severity: status: host: title:)
+    QUERY_FIELDS = %w[severity: status: host: title:]
 
     def initialize
       @all = [] of Store::Issue    # the raw store list (severity-desc)

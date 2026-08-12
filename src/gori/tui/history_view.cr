@@ -53,8 +53,8 @@ module Gori::Tui
     # nothing, and the empty list reads as "no flows match". `url` is the reverse case —
     # a real, working field that was never suggested. spec/tui/history_view_spec.cr pins
     # this list against ql.cr so the two cannot drift apart again.
-    QL_FIELDS  = %w(host url method status path scheme proto body header size reqsize respsize dur stub)
-    METHOD_VAL = %w(GET POST PUT DELETE PATCH HEAD OPTIONS QUERY)
+    QL_FIELDS  = %w[host url method status path scheme proto body header size reqsize respsize dur stub]
+    METHOD_VAL = %w[GET POST PUT DELETE PATCH HEAD OPTIONS QUERY]
     # Discoverability hints for the QL filter, kept loosely in sync with QL_FIELDS.
     # FILTER_HINT sits on the idle bar (press `/` to start filtering); QUERY_HINT sits
     # on the suggestion row at a cold start (already editing, nothing to Tab-complete

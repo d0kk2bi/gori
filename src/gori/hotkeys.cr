@@ -10,7 +10,7 @@ module Gori
   module Hotkeys
     # Selectable OS default profiles (the Settings.keymap_os domain). "auto" tracks the
     # build's native platform.
-    PROFILES = %w(auto darwin linux windows)
+    PROFILES = %w[auto darwin linux windows]
 
     # Verb ids the editor must NOT expose, because their chord is consumed by a hardcoded
     # handler BEFORE the keymap — so a rebind/unbind on them can't take effect:
@@ -35,9 +35,9 @@ module Gori
     #     JWT, Rewriter, Project — nine controllers consume it before the keymap is read).
     #     Listed late: the guards predate the list, so the hotkey editor was offering ^Z as
     #     bindable and the binding was shadowed wherever an editor had focus.
-    CLAIMED_CTRL_LETTERS = %w(g f b e p n w z)
+    CLAIMED_CTRL_LETTERS = %w[g f b e p n w z]
     CLAIMED_CTRL_DIGITS  = ('1'..'9').map(&.to_s)
-    CLAIMED_CTRL_PUNCT   = %w(,)
+    CLAIMED_CTRL_PUNCT   = %w[,]
 
     # Every claimed key, modifier-free. The ctrl and alt chord sets below are both built
     # from this, and Keybind.dealias uses it to decide which events to rewrite.
@@ -48,7 +48,7 @@ module Gori
 
     # Selectable command modifiers (the Settings.command_modifier domain). "ctrl" is the
     # built-in family's native modifier; "alt" ADDS an ⌥ alias for it (see #alias_active?).
-    COMMAND_MODIFIERS = %w(ctrl alt)
+    COMMAND_MODIFIERS = %w[ctrl alt]
 
     # Clamped on READ as well as on parse (Settings.normalize_command_modifier), the same
     # defence #chord_overrides applies to hand-edited bindings: nothing downstream should

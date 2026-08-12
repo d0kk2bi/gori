@@ -22,7 +22,7 @@ module Gori
       DEFAULT_SALT    = "django.core.signing"
       SESSION_SALT    = "django.contrib.sessions.backends.signed_cookies"
       DEFAULT_ALGO    = "sha256"
-      SUPPORTED_ALGOS = %w(sha1 sha256)
+      SUPPORTED_ALGOS = %w[sha1 sha256]
 
       record Parsed,
         payload_seg : String, # base64url, possibly leading-"." for zlib

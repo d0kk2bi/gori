@@ -45,10 +45,10 @@ module Gori
     class SubtabFilter
       # Completable field names (canonical forms shown in the filter guidance row).
       # Aliases host/target and method/verb share value pools below.
-      FIELDS = %w(tag name host target method verb)
+      FIELDS = %w[tag name host target method verb]
 
       # Common HTTP methods suggested even when no open session uses them yet.
-      METHODS = %w(GET POST PUT PATCH DELETE HEAD OPTIONS CONNECT TRACE)
+      METHODS = %w[GET POST PUT PATCH DELETE HEAD OPTIONS CONNECT TRACE]
 
       # The searchable projection of one Repeater session. Kept free of TUI types so the
       # matcher is pure + unit-testable; the controller builds these from its views.

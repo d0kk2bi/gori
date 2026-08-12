@@ -91,7 +91,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method) # fuzz sessions carry an HTTP template (target + method)
+      %w[name host method] # fuzz sessions carry an HTTP template (target + method)
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)

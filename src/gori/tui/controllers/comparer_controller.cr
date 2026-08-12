@@ -47,7 +47,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method) # each session's A/B slots carry a target + method
+      %w[name host method] # each session's A/B slots carry a target + method
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
