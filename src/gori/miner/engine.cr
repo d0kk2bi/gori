@@ -221,22 +221,20 @@ module Gori::Miner
 
       workers.times do |i|
         spawn(name: "miner-worker-#{i}") do
-          begin
-            while task = jobs.receive?
-              # Children are queued BEFORE the task is counted out, so the "queue empty and
-              # nothing in flight" test below is a true end-of-work and never races a child in.
-              process_bucket(task).each { |child| work << child } unless @state.stopped?
-              @inflight -= 1
-              # Non-blocking: a worker must never park reporting completion (the dispatcher
-              # only listens while it is idle). Dropping a poke is safe — see `wait_for_worker`.
-              select
-              when @idle.send(nil)
-              else
-              end
+          while task = jobs.receive?
+            # Children are queued BEFORE the task is counted out, so the "queue empty and
+            # nothing in flight" test below is a true end-of-work and never races a child in.
+            process_bucket(task).each { |child| work << child } unless @state.stopped?
+            @inflight -= 1
+            # Non-blocking: a worker must never park reporting completion (the dispatcher
+            # only listens while it is idle). Dropping a poke is safe — see `wait_for_worker`.
+            select
+            when @idle.send(nil)
+            else
             end
-          ensure
-            finished.send(nil)
           end
+        ensure
+          finished.send(nil)
         end
       end
 

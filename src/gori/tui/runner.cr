@@ -2039,14 +2039,12 @@ module Gori::Tui
         "certificate in your clients (gori ca / path copied).\n" \
         "New connections use it immediately.",
         confirm_label: "import", danger: true) do
-        begin
-          warning = @session.ca.import!(cert, key)
-          Clipboard.copy(path)
-          note = warning ? " (warning: #{warning})" : ""
-          @toast = "root CA imported#{note} — re-trust it (path copied): #{path}"
-        rescue ex
-          @toast = "CA import failed: #{ex.message}"
-        end
+        warning = @session.ca.import!(cert, key)
+        Clipboard.copy(path)
+        note = warning ? " (warning: #{warning})" : ""
+        @toast = "root CA imported#{note} — re-trust it (path copied): #{path}"
+      rescue ex
+        @toast = "CA import failed: #{ex.message}"
       end
       false
     end
@@ -5304,13 +5302,11 @@ module Gori::Tui
         "certificate in your clients (gori ca / path copied).\n" \
         "New connections use it immediately.",
         confirm_label: "regenerate", danger: true) do
-        begin
-          @session.ca.regenerate!
-          Clipboard.copy(path)
-          @toast = "root CA regenerated — re-trust it (path copied): #{path}"
-        rescue ex
-          @toast = "CA regeneration failed: #{ex.message}"
-        end
+        @session.ca.regenerate!
+        Clipboard.copy(path)
+        @toast = "root CA regenerated — re-trust it (path copied): #{path}"
+      rescue ex
+        @toast = "CA regeneration failed: #{ex.message}"
       end
     end
 

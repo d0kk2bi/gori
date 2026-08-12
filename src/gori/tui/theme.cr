@@ -1110,12 +1110,11 @@ module Gori::Tui
     def self.set_custom_marks(map : Hash(String, String)) : Nil
       marks = {} of String => Color
       map.each do |name, hex|
-        begin
-          marks[name.downcase] = Color.from_hex(hex)
-        rescue
-          # A hex the parser rejects is simply absent, resolving to the fallback below — the
-          # registry's own `normalize_hex` should have caught it, this is belt and braces.
-        end
+        marks[name.downcase] = Color.from_hex(hex)
+      rescue
+        # A hex the parser rejects is simply absent, resolving to the fallback below — the
+        # registry's own `normalize_hex` should have caught it, this is belt and braces.
+
       end
       @@custom_marks = marks
     end
