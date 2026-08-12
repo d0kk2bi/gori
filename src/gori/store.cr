@@ -1019,17 +1019,17 @@ module Gori
       response_size = (resp.head.empty? && resp.body.nil?) ? nil : resp.head.size.to_i64 + body_size
       conn.exec(
         <<-SQL,
-        UPDATE flows SET
-          response_head = ?, response_body = ?, status = ?, reason = ?,
-          content_type = ?, response_size = ?, state = ?,
-          ttfb_us = ?, duration_us = ?, error = ?, response_body_truncated = ?,
-          -- nil means "the response side has nothing to add", NOT "clear it": the request
-          -- side may already have written an advisory on this row and a bare `advisory = ?`
-          -- would erase it. COALESCE keeps whatever is stored when the DTO carries nothing.
-          advisory = COALESCE(?, advisory),
-          fts_dirty = 1
-        WHERE id = ?
-        SQL
+          UPDATE flows SET
+            response_head = ?, response_body = ?, status = ?, reason = ?,
+            content_type = ?, response_size = ?, state = ?,
+            ttfb_us = ?, duration_us = ?, error = ?, response_body_truncated = ?,
+            -- nil means "the response side has nothing to add", NOT "clear it": the request
+            -- side may already have written an advisory on this row and a bare `advisory = ?`
+            -- would erase it. COALESCE keeps whatever is stored when the DTO carries nothing.
+            advisory = COALESCE(?, advisory),
+            fts_dirty = 1
+          WHERE id = ?
+          SQL
         resp.head, resp.body, resp.status, resp.reason, resp.content_type,
         response_size,
         resp.state.value, resp.ttfb_us, resp.duration_us, resp.error,

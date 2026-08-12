@@ -41,6 +41,16 @@ Style/RedundantNilInControlExpression:
 Naming/AccessorMethodName:
   Enabled: false
 
+# All 42 sites are the same nil-guard: `return X unless val && !val.empty?`. The rule
+# exists for the double negative `unless !x`, but here the `!` sits on the INNER term,
+# and `!x.empty?` is simply how Crystal spells "is non-empty" — there is no `non_empty?`
+# predicate to use instead. The condition as written reads positively ("unless we have a
+# non-empty val"); De Morgan turns it into `if !val || val.empty?`, which reads worse and
+# is what the rule would have us write. Re-check this if a site ever appears that is a
+# genuine `unless !x`.
+Style/NegatedConditionsInUnless:
+  Enabled: false
+
 # Duplicate signal — `just check` already runs `crystal tool format --check`, and
 # this rule reports the same files a second time.
 Lint/Formatting:

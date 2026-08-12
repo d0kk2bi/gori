@@ -38,30 +38,30 @@ module Gori
 
       private def self.print_project_help : Nil
         puts <<-HELP
-        gori run project — list/create/delete projects, or manage project-scoped config
+          gori run project — list/create/delete projects, or manage project-scoped config
 
-        Usage: gori run project [<subcommand>] [options]
+          Usage: gori run project [<subcommand>] [options]
 
-        Subcommands:
-          list               List known projects (default when no subcommand)
-          create <name>      Create (or reopen) a project by name
-          delete|rm <name>   Delete a project and everything captured in it
-          scope              Manage scope rules (list, add, update, delete, enable/disable)
-          sandbox            Get/set the hard-containment sandbox gate (status, on, off)
-          env                Manage project env vars ($KEY substitution)
-          host-override      Manage host overrides (list, add, update, delete)
+          Subcommands:
+            list               List known projects (default when no subcommand)
+            create <name>      Create (or reopen) a project by name
+            delete|rm <name>   Delete a project and everything captured in it
+            scope              Manage scope rules (list, add, update, delete, enable/disable)
+            sandbox            Get/set the hard-containment sandbox gate (status, on, off)
+            env                Manage project env vars ($KEY substitution)
+            host-override      Manage host overrides (list, add, update, delete)
 
-        Examples:
-          gori run project --format json
-          gori run project create "API test" --description="staging sweep"
-          gori run project delete api-test --yes
-          gori run project scope add --kind=include --type=host --pattern=api.example.com
-          gori run project sandbox on
-          gori run project env set TOKEN=secret
-          gori run project host-override add --host=api.example.com --ip=10.0.0.1
+          Examples:
+            gori run project --format json
+            gori run project create "API test" --description="staging sweep"
+            gori run project delete api-test --yes
+            gori run project scope add --kind=include --type=host --pattern=api.example.com
+            gori run project sandbox on
+            gori run project env set TOKEN=secret
+            gori run project host-override add --host=api.example.com --ip=10.0.0.1
 
-        See 'gori run project <subcommand> --help' for more.
-        HELP
+          See 'gori run project <subcommand> --help' for more.
+          HELP
       end
 
       private def self.cmd_project_list(args : Array(String)) : Nil
