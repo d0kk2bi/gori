@@ -25,6 +25,24 @@ private def beats(companion : Companion, t0 : Time::Instant, n : Int32) : Int32
   (1..n).count { |i| companion.tick(t0 + Companion::BEAT * i) }
 end
 
+# Step `n` beats and hand every drawn frame to the block. She is kept awake by hand:
+# SLEEP_AFTER is 450 beats and a dozing companion stops advancing the beat entirely, so a
+# sweep long enough to catch a RARE track has to poke her, exactly as someone at the
+# keyboard does. Poking while awake only re-arms the idle clock — it cannot arm the startle.
+private def gesture_sweep(n : Int32, motion : String, &block : Mascot::Frame ->) : Nil
+  with_companion(true, motion) do
+    companion = Companion.new(Notifications.new)
+    t0 = Time.instant
+    companion.tick(t0)
+    n.times do |i|
+      now = t0 + Companion::BEAT * (i + 1)
+      companion.poke(now)
+      companion.tick(now)
+      companion.frame.try { |f| block.call(f) }
+    end
+  end
+end
+
 describe Gori::Tui::Companion do
   # The hello is once per PROCESS, not once per Companion (Companion.@@greeted) — so without this
   # every example after the first would inherit "already greeted" from whichever ran
@@ -164,6 +182,59 @@ describe Gori::Tui::Companion do
       beats(companion, t0, n)
     end
     calm.should be < lively
+  end
+
+  # --- idle gestures --------------------------------------------------------
+
+  # The feature itself — and it asserts the gestures arrive EARLY, not merely eventually.
+  # @beat starts at 0 in every process, so this opening is not a sample of the schedule, it
+  # IS the schedule as far as most sessions are concerned: the same fixed sequence for every
+  # user of every build. A draw that is perfectly uniform in aggregate can still leave one
+  # of the four unplayed across all of it, which is what the first draw did (the deadpan
+  # first appeared 20 minutes in). 1300 beats is 4.3 minutes of AWAKE time — she dozes after
+  # 90s, so a real session only gets there by someone actually working in gori.
+  #
+  # A sweep rather than hand-computed beat indices: the schedule is a pure function of the
+  # beat so this replays identically every run, but pinning exact beats would re-break on
+  # any retune of the shift or the odds.
+  it "plays every idle gesture inside the first few minutes" do
+    seen = Set(Symbol).new
+    gesture_sweep(1300, "lively") { |f| seen << f.pose }
+    Companion::GESTURES.flatten.uniq!.each { |pose| seen.should contain(pose) }
+  end
+
+  # "calm halves the blink rate and drops the rest" — the gestures are part of the rest.
+  it "drops the gestures on calm, leaving her the blink" do
+    seen = Set(Symbol).new
+    gesture_sweep(6000, "calm") { |f| seen << f.pose }
+    seen.should eq(Set{:idle, :blink})
+  end
+
+  # Mascot.cavity applies a wink to :idle and nothing else, so a Frame carrying one on any
+  # other pose describes cells that are not painted — #tick would report a change the diff
+  # then forwards nothing for. Held over the whole schedule, not just one beat.
+  it "never asks for a wink the art would fold away" do
+    folded = [] of Symbol
+    gesture_sweep(6000, "lively") { |f| folded << f.pose if f.wink != :none && f.pose != :idle }
+    folded.should be_empty
+  end
+
+  it "keeps every gesture script inside its window" do
+    Companion::GESTURES.min_of(&.size).should be > 0
+    Companion::GESTURES.max_of(&.size).should be <= Companion::GESTURE_MAX
+    # …which is what bounds the hashed start offset, so it has to leave room for one.
+    Companion::GESTURE_MAX.should be < (1 << Companion::GESTURE_SHIFT)
+  end
+
+  # Mascot.eyes and .mouth both fall through an `else` to the idle face, so a pose added to
+  # the script table but not to BOTH tables renders as a gesture that never visibly happens.
+  # Scoped to the gesture poses on purpose: asserting this across all of POSES would forbid
+  # a future pose that differs only by badge or mood.
+  it "gives every idle gesture a face of its own" do
+    idle = Mascot.rows(Mascot::Frame.new)[1]
+    rows = Companion::GESTURES.flatten.uniq!.map { |p| Mascot.rows(Mascot::Frame.new(pose: p))[1] }
+    rows.each(&.should_not(eq(idle)))
+    rows.uniq.size.should eq(rows.size)
   end
 
   # --- the greeting ---------------------------------------------------------
@@ -530,11 +601,16 @@ describe Gori::Tui::Companion do
   end
 
   # A wink is a gesture of the open-eyed idle pose; on a mood pose it would read as a
-  # rendering glitch.
+  # rendering glitch. EVERY other pose, not just :alert — this is the half of the invariant
+  # that Companion#compose has to honour too, by never asking for a wink it would fold.
   it "only winks on the idle face" do
     Mascot.cavity(:idle, :left)[1].should eq('─')
     Mascot.cavity(:idle, :right)[3].should eq('─')
-    Mascot.cavity(:alert, :left).should eq(Mascot.cavity(:alert, :none))
+    Mascot::POSES.reject(:idle).each do |pose|
+      Mascot::WINKS.each do |wink|
+        Mascot.cavity(pose, wink).should eq(Mascot.cavity(pose, :none))
+      end
+    end
   end
 
   # --- palette --------------------------------------------------------------

@@ -35,9 +35,33 @@ module Gori::Tui
     SLEEP_AFTER = 90.seconds
 
     # Idle-track windows, as a shift of the beat counter: 2^n beats per window.
-    BLINK_SHIFT = 4 #  16 beats = 3.2s
-    WINK_SHIFT  = 6 #  64 beats = 12.8s
-    GLINT_SHIFT = 7 # 128 beats = 25.6s
+    BLINK_SHIFT   = 4 #  16 beats = 3.2s
+    WINK_SHIFT    = 6 #  64 beats = 12.8s
+    GLINT_SHIFT   = 7 # 128 beats = 25.6s
+    GESTURE_SHIFT = 7 # 128 beats = 25.6s
+
+    # …but a gesture fires in only one window in GESTURE_ODDS, so she plays one about every
+    # 75 seconds and any PARTICULAR one about every five minutes. Deliberately rare: the
+    # blink is what she does, and a gesture only reads as one if it is not the norm.
+    GESTURE_ODDS = 3
+
+    # The gestures themselves, one pose per beat. The hash picks the script and where in the
+    # window it starts, so a gesture is a tiny scripted animation rather than a single frame
+    # flashed for 200ms — the yawn in particular only reads as a yawn because the mouth opens
+    # before the eyes shut.
+    #
+    # ALL FIVE POSES LIVE IN THE CAVITY (eyes + mouth), which is the constraint that picked
+    # them: Mascot.draw_row paints the middle row alone, so a gesture expressed in the badge,
+    # the glint or the shake is invisible to everyone running `placement = bar`.
+    GESTURES = [
+      [:oh, :yawn, :yawn, :blink], # mouth opens, eyes squeeze shut, settles on a blink
+      [:smile, :smile, :smile],    # eyes crinkle shut over the resting mouth
+      [:squint, :squint],          # pupils shrink — peering at something
+      [:flat, :flat],              # deadpan
+    ]
+    # The longest script. The hashed start offset is bounded by (window - this) so a script
+    # can never straddle a window edge and play half of itself; a spec pins the two together.
+    GESTURE_MAX = 4
 
     # Beats she stays startled after being woken from a doze.
     WAKE_BEATS = 3
@@ -232,9 +256,16 @@ module Gori::Tui
         return Mascot::Frame.new(pose: :alert, badge: '·', bubble: @bubble)
       end
       mood = @mood
+      pose = pose_for(mood)
       Mascot::Frame.new(
-        pose: pose_for(mood),
-        wink: mood == :info ? wink_for : :none,
+        pose: pose,
+        # ONLY :idle TAKES A WINK. Mascot.cavity ignores the field on every other pose, so
+        # asking for one there produces a Frame that compares unequal to its neighbour and
+        # paints identical cells — #tick reports a change the backend's diff then forwards
+        # nothing for. Exactly what shake_for's ceiling refuses to do, and it was already
+        # happening on any blink beat that landed inside a wink window; the multi-beat
+        # gestures would have made it routine.
+        wink: mood == :info && pose == :idle ? wink_for : :none,
         badge: badge_for(mood),
         glint: glint_for,
         mood: mood,
@@ -248,10 +279,18 @@ module Gori::Tui
       when :happy then :happy
       when :warn  then :alert
       when :alarm then :error # ×_× — its own face now, not :alert with a different badge
-      else
-        # The settle beat right after a reaction expires reads as her composing herself.
-        @beat == @settle_beat || blink? ? :blink : :idle
+      else             idle_pose
       end
+    end
+
+    # The idle face, resolved through ONE ladder so exactly one track can own the cavity on
+    # a given beat. Two of them writing it independently is the wink bug in another costume:
+    # a blink landing inside a gesture would either flicker or silently lose to whichever
+    # branch was written last.
+    private def idle_pose : Symbol
+      # The settle beat right after a reaction expires reads as her composing herself.
+      return :blink if @beat == @settle_beat
+      gesture_pose || (blink? ? :blink : :idle)
     end
 
     private def badge_for(mood : Symbol) : Char?
@@ -309,6 +348,35 @@ module Gori::Tui
       at = (h % 13).to_i
       return true if off == at
       ((h >> 8) & 3) == 0 && off == at + 2
+    end
+
+    # One gesture in one window in GESTURE_ODDS — which script, and where in the window it
+    # starts, both from the hash. Returns the pose for THIS beat, or nil for "no gesture
+    # running", which is the common answer by a wide margin.
+    #
+    # Lively only, like the wink and the glint: "calm halves the blink rate and drops the
+    # rest" is the contract someone on SSH or a battery picked.
+    private def gesture_pose : Symbol?
+      return nil unless Settings.companion_lively?
+      h, off = window(GESTURE_SHIFT, 4_u32) # salts 1..3 are the blink, wink and glint
+      return nil unless h % GESTURE_ODDS == 0
+      # WHICH gesture is its OWN draw rather than a slice of the gate's hash, and the salt is
+      # chosen rather than incidental. @beat starts at 0 in every process, so the schedule's
+      # opening is not a sample of it — it IS the schedule as far as most sessions get, the
+      # same fixed sequence for every user of every build. Bits of `h` are only
+      # pseudo-independent of the `% GESTURE_ODDS` that just selected on it, and that opening
+      # left the deadpan unplayed through its first twenty minutes: a draw can be flawless in
+      # aggregate and still hide a quarter of the feature across the only stretch most people
+      # watch. This one opens on four DIFFERENT gestures and stays even long-run; the spec
+      # below pins the first half of that, which is the half a retune can silently lose.
+      script = GESTURES[(Companion.beat_hash(@beat >> GESTURE_SHIFT, 45_u32) % GESTURES.size).to_i]
+      # Bounded by the window MINUS the longest script, so the whole thing plays inside one
+      # window — a script that ran off the end would drop its last beats, and the yawn would
+      # lose the blink it settles on.
+      at = ((h >> 9) % ((1 << GESTURE_SHIFT) - GESTURE_MAX)).to_i
+      d = off - at
+      return nil if d < 0 || d >= script.size
+      script[d]
     end
 
     # A wink in one window in three, 2 beats long, side chosen by the hash. This is what

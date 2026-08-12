@@ -14,7 +14,7 @@
 - Fuzzer: built-in payload preset sets (SQLi and more), selectable across TUI/CLI/MCP (#568)
 - OAST: blind SSRF — plant a payload, promote the finding when the target calls home (#609)
 - Export: HAR export, with the import-side fields to round-trip it (#506)
-- Miss Ring: an opt-in companion in the body's corner, and on the project picker delivering the update notice (#474, #548, #550)
+- Miss Ring: an opt-in companion in the body's corner, and on the project picker delivering the update notice; on `lively` she now also plays one of four idle gestures — a yawn, a smile, a squint or a deadpan — about once a minute, in the status-bar chip as well as the body sprite (#474, #548, #550)
 
 ### Changes
 
