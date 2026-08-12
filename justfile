@@ -82,15 +82,18 @@ test-import:
     crystal spec spec/import
 
 # Check code format and lint without changing files.
+# Paths are explicit and must stay in step with ci.yml's `format` job: bare
+# `crystal tool format` walks the whole working directory, so once `shards install`
+# has run it reformats `lib/` too — third-party code that is not ours to change.
 [group('development')]
 check:
-    crystal tool format --check
+    crystal tool format --check src spec bench scripts
     lib/ameba/bin/ameba.cr
 
 # Auto-format code and fix lint issues.
 [group('development')]
 fix:
-    crystal tool format
+    crystal tool format src spec bench scripts
     lib/ameba/bin/ameba.cr --fix
 
 # Check that every version-bearing file agrees: shard.yml, src/gori.cr,
