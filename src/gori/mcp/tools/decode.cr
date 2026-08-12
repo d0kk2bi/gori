@@ -33,7 +33,7 @@ module Gori
         reg = Decoder.shared_registry
         result = Decoder.run(reg, input, spec)
 
-        if (idx = result.failed_at)
+        if idx = result.failed_at
           step = result.steps[idx]
           msg = "decoder failed at step #{idx + 1} '#{step.token}': #{step.error || "failed"}"
           msg += " — available converters: #{reg.names.join(", ")}" if step.state.unknown?

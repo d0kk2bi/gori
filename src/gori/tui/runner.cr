@@ -174,7 +174,7 @@ module Gori::Tui
       # The target is held by VIEW identity (not a positional index): the cross-session
       # reconcile can reorder/remove repeater tabs while the prompt is open, so the
       # controller's apply_rename re-finds the tab by its view — never a shifted neighbour.
-      @rename_view = nil.as(RepeaterView | FuzzerView | DecoderView | JwtView | MinerView | SequencerView | ComparerView | Nil)
+      @rename_view = nil.as(RepeaterView | FuzzerView | DecoderView | JwtView | MinerView | SequencerView | ComparerView?)
       # The Repeater sub-tab TAG editor (issue #121) — a bottom prompt mirroring rename,
       # space-separated tags. Held by VIEW identity for the same reconcile-race reason.
       @tag_edit_open = false
@@ -872,7 +872,7 @@ module Gori::Tui
       chars = 0
       nav = 0
       keys = 0
-      while (more = @term.poll_event(0))
+      while more = @term.poll_event(0)
         handle(more)
         keys += 1 if more.is_a?(Termisu::Event::Key)
         if coalesceable_char?(more)

@@ -82,7 +82,7 @@ module Gori
       # The cookie subject: positional argument or STDIN (mirrors jwt_token_input).
       private def self.cookie_input(positional : Array(String)) : String
         s =
-          if (v = positional.first?)
+          if v = positional.first?
             abort "gori run cookie: too many arguments (one cookie)" if positional.size > 1
             v.strip
           elsif !STDIN.tty?

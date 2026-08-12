@@ -139,22 +139,22 @@ module Gori::Fuzz
     # the old `spec.nil? || spec.blank?` guard — so a match dimension stays "unconstrained"
     # rather than flipping to "reject everything".
     macro num_spec(name)
-      getter {{name.id}} : String?
-      @{{name.id}}_c : Array(NumTerm)?
+      getter {{ name.id }} : String?
+      @{{ name.id }}_c : Array(NumTerm)?
 
-      def {{name.id}}=(v : String?)
-        @{{name.id}} = v
-        @{{name.id}}_c = (v && !v.blank?) ? Predicate.compile_num(v) : nil
+      def {{ name.id }}=(v : String?)
+        @{{ name.id }} = v
+        @{{ name.id }}_c = (v && !v.blank?) ? Predicate.compile_num(v) : nil
       end
     end
 
     macro status_spec(name)
-      getter {{name.id}} : String?
-      @{{name.id}}_c : Array(StatusTerm)?
+      getter {{ name.id }} : String?
+      @{{ name.id }}_c : Array(StatusTerm)?
 
-      def {{name.id}}=(v : String?)
-        @{{name.id}} = v
-        @{{name.id}}_c = (v && !v.blank?) ? Predicate.compile_status(v) : nil
+      def {{ name.id }}=(v : String?)
+        @{{ name.id }} = v
+        @{{ name.id }}_c = (v && !v.blank?) ? Predicate.compile_status(v) : nil
       end
     end
 

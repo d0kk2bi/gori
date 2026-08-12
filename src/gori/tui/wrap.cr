@@ -345,7 +345,7 @@ module Gori::Tui
         lo, hi = 0, dl.size
       end
       pos = 0
-      while (i = dl.index(q, pos))
+      while i = dl.index(q, pos)
         pos = i + q.size
         ma = {i, lo}.max
         mb = {pos, hi}.min

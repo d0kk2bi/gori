@@ -39,7 +39,7 @@ module Gori
       end
 
       private def self.jwt_token_input(positional : Array(String)) : String
-        if (s = positional.first?)
+        if s = positional.first?
           abort "gori run jwt: too many arguments (one token)" if positional.size > 1
           s.strip
         elsif !STDIN.tty?

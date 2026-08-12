@@ -687,7 +687,7 @@ module Gori::Tui
     private def run_overlay_selection : Nil
       if @overlay == :palette
         rows = filtered_palette
-        if (row = rows[@pal_sel]?)
+        if row = rows[@pal_sel]?
           # Mirror a couple of real "Go to …" actions so the palette feels alive.
           case row[1]
           when "Go to Repeater" then @p_tab = 4; mark_switch

@@ -365,13 +365,13 @@ module Gori::Tui
         at = Attribute::None
         case c
         when '`'
-          if (j = text.index('`', i + 1))
+          if j = text.index('`', i + 1)
             e = j + 1
             col = Theme.syn_string
           end
         when '*'
           if i + 1 < n && text[i + 1] == '*'
-            if (k = text.index("**", i + 2))
+            if k = text.index("**", i + 2)
               e = k + 2
               at = Attribute::Bold
             end

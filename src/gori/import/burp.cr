@@ -50,7 +50,7 @@ module Gori
         skipped = 0
         found = 0
         pos = 0
-        while (block = next_element(raw, "item", pos))
+        while block = next_element(raw, "item", pos)
           inner, pos = block
           found += 1
           # One unparseable item (no URL, undecodable base64, a host that isn't a host) skips
@@ -123,7 +123,7 @@ module Gori
       private def self.next_element(src : String, name : String, from : Int32) : {String, Int32}?
         needle = "<#{name}"
         pos = from
-        while (open_at = src.index(needle, pos))
+        while open_at = src.index(needle, pos)
           after = open_at + needle.size
           ch = src[after]?
           # `<response` must not match `<responselength`: the next char has to end the name.
@@ -145,7 +145,7 @@ module Gori
       private def self.element(src : String, name : String) : {String, String}?
         needle = "<#{name}"
         pos = 0
-        while (open_at = src.index(needle, pos))
+        while open_at = src.index(needle, pos)
           after = open_at + needle.size
           ch = src[after]?
           unless ch && (ch.whitespace? || ch == '>' || ch == '/')

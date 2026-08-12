@@ -64,7 +64,7 @@ module Gori::Tui
     end
 
     def selection_span(cx : Int32) : {Int32, Int32}?
-      return nil unless (ax = @anchor)
+      return nil unless ax = @anchor
       x0, x1 = {ax, cx}.min, {ax, cx}.max
       return nil if x0 >= x1
       {x0, x1}

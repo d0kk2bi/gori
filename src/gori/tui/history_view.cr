@@ -735,7 +735,7 @@ module Gori::Tui
       if (d = @detail) && d.row.id == id
         return "#{d.row.method} #{Url.origin_path(d.row.target)}"
       end
-      if (row = @rows.find { |r| r.id == id })
+      if row = @rows.find { |r| r.id == id }
         return "#{row.method} #{Url.origin_path(row.target)}"
       end
       "flow ##{id}"
@@ -835,7 +835,7 @@ module Gori::Tui
     def query_suggestions : Array(String)
       cur = FilterAst.token_at(@query, @qcx)
       return [] of String if cur.core.empty?
-      if (colon = cur.core.index(':'))
+      if colon = cur.core.index(':')
         field = cur.core[0...colon].downcase
         prefix = FilterAst.unquote_prefix(cur.core[(colon + 1)..])
         suggest_values(field, prefix).map { |s| "#{cur.prefix}#{s}" }
@@ -1809,11 +1809,11 @@ module Gori::Tui
       # (Each span includes its trailing 1-col gap.) HOST+PATH split the rest.
       cluster_w = 4                                # STA (3-digit code + gap)
       spare = rect.right - host_x - 18 - cluster_w # reserve 18 for HOST+PATH first
-      if (show_type = spare >= 7)
+      if show_type = spare >= 7
         cluster_w += 7
         spare -= 7
       end
-      if (show_size = spare >= 7)
+      if show_size = spare >= 7
         cluster_w += 7
         spare -= 7
       end
