@@ -24,6 +24,7 @@
 - Probe: passive-rule improvements, the OAST SSRF rule classed CWE-918, and a navigable AFFECTED URLS list in a finding
 - Miner: latency-bound scheduling — one work queue for all locations, parallel calibration (~2.4x)
 - JWT: the lens switch (`^T`) now shows on the pane it acts on; new `dancheong` (dark) and `hanji` (light) themes
+- Project picker: multi-select over the project list — `Tab` / `⇧Tab` mark and step, `⇧↑` / `⇧↓` extend a range, `ctrl-a` marks everything the search shows, `esc` clears. The space menu's **Delete** then acts on the marks if any are set, else the cursor row; it names what it is about to wipe, says how much of the set the current search is hiding, and keeps (rather than silently skips) a project another gori still has open
 - `gori ca`: reject a flag written before the verb, repair a CA directory missing one of the key/cert pair, and reject an Ed25519/Ed448 or mismatched-key root with an operator-legible message instead of failing at the first CONNECT
 - Fixes: bracketed-paste freeze and poison in the Repeater; the `--` separator dropping subcommand args across ~60 `gori run` sites; colormarker custom-colour persistence and reorder writes; clipboard OSC 52 over tty; project-settings and host-override reload/rollback audit; OAST partial-poll evidence loss; and many dogfood-surfaced bugs
 

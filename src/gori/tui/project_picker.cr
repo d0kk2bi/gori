@@ -11,6 +11,7 @@ require "./screen"
 require "./theme"
 require "./frame"
 require "./confirm_dialog"
+require "./project_marks"
 require "./notifications"
 require "./companion"
 require "./settings_view"
@@ -27,6 +28,14 @@ module Gori::Tui
   # same discovery surface as the in-session space menu, scoped to the picker.
   # Use arrows + ↵ , Space, ctrl-n/ctrl-t/ctrl-d etc. Returns chosen Project or nil
   # to quit. Monochrome, keyboard-first (Grok Build feel).
+  #
+  # The list also MARKS (ProjectMarks): Tab / ⇧Tab flip a project's mark and step, ⇧↑/⇧↓
+  # extend a range, ctrl-a marks the whole filter, esc clears. The space menu's Delete then
+  # acts on the marks if any are set, else the cursor row — the one target rule History and
+  # the Issues list use. The chords deviate from the app-wide `t` / ⇧T ON PURPOSE and cannot
+  # be "fixed" back: on this screen every printable key types into the search box (see
+  # handle_list), so `t` would filter rather than mark. Tab is fzf's toggle in exactly this
+  # shape of list, and ctrl-a is the same select-all everything else spells ⇧T.
   class ProjectPicker
     # Throttle flock + status-file probes so the 50 ms poll loop doesn't hammer
     # the filesystem on every visible project row every frame.
@@ -52,6 +61,40 @@ module Gori::Tui
       SpaceEntry.new('d', "Delete", :delete),
     ]
 
+    # The menu while marks are set. Delete is the batch verb and says so; the other three
+    # are named SINGLE-target explicitly, the way the Runner tags its HISTORY_CURSOR_ONLY
+    # verbs, so a menu opened over 3 marks can't read as an offer to do all three:
+    #   • Open returns ONE project (that is the picker's whole return value).
+    #   • Rename edits one display name.
+    #   • Compress measures and VACUUMs synchronously on this event loop, with a per-project
+    #     byte estimate in its popup — N of those is N multi-second freezes and an estimate
+    #     that would be a fiction for every individual project.
+    # Clear marks mirrors the in-app `*.mark-clear` entry, mnemonic and all.
+    #
+    # Class-level and pure so the labels a destructive menu shows can be pinned in a spec:
+    # the picker holds a live Termisu and cannot be built in one.
+    def self.space_entries(marked : Int32) : Array(SpaceEntry)
+      return SPACE_ENTRIES if marked <= 0
+      [
+        SpaceEntry.new('o', "Open (cursor)", :open),
+        SpaceEntry.new('r', "Rename (cursor)", :rename),
+        SpaceEntry.new('c', "Compress (cursor)", :compress),
+        SpaceEntry.new('d', "Delete #{plural_projects(marked)}", :delete),
+        SpaceEntry.new('n', "Clear marks", :mark_clear),
+      ]
+    end
+
+    def self.plural_projects(n : Int32) : String
+      "#{n} project#{n == 1 ? "" : "s"}"
+    end
+
+    # The mark count appended to the list divider, or "" with nothing marked (so an unmarked
+    # picker's divider stays byte-identical to what it always drew).
+    def self.mark_chip(marked : Int32, hidden : Int32) : String
+      return "" if marked <= 0
+      hidden > 0 ? " · #{marked} marked (#{hidden} hidden)" : " · #{marked} marked"
+    end
+
     # `notice` is why the caller is showing the picker rather than a project — a session
     # that failed to open (a bad `--db`, an unreadable store). It rides the same h-3 row as
     # the update notice but in red, because without it a failed open is indistinguishable
@@ -65,7 +108,7 @@ module Gori::Tui
       @query = "" # current search filter; only editable when Search row selected
       @selected = 0
       @results_scroll = 0
-      @mode = :list # :list | :new | :confirm | :space | :rename | :settings | :theme | :compress | :measuring | :compressing
+      @mode = :list # :list | :new | :confirm | :space | :rename | :settings | :theme | :compress | + BUSY_LABELS
       @name = ""
       @desc = ""
       @new_field = :name # :name | :desc (only in :new mode)
@@ -73,7 +116,12 @@ module Gori::Tui
       @preedit = ""      # live IME composing text for the active field (search/name/desc)
       # Delete confirmation (project deletion is irreversible — wipes its dir).
       @confirm = nil.as(ConfirmDialog?)
-      @pending_delete = nil.as(Project?)
+      # The projects a confirmed delete will wipe — a LIST because the space menu's Delete
+      # acts on the mark set (see target_projects). Captured when the confirm opens, so a
+      # cursor move or a peer's write between the question and the answer can't retarget it.
+      @pending_deletes = [] of Project
+      # Multi-select over the project rows; every batch verb reads it through target_projects.
+      @marks = ProjectMarks.new
       # Space menu over a project row (open/rename/compress/delete).
       @space_selected = 0
       @space_project = nil.as(Project?)
@@ -320,7 +368,14 @@ module Gori::Tui
     # --- input ---------------------------------------------------------------
 
     private def entry_count : Int32
-      3 + filtered_projects.size # New, Temp, Search, then (filtered) projects
+      entry_count_for(filtered_projects) # New, Temp, Search, then (filtered) projects
+    end
+
+    # `entry_count` off a list already in hand. `filtered_projects` re-runs the whole fuzzy
+    # scoring on every call, so the mark gestures — which need both the list and its bound —
+    # would otherwise score the registry twice per keystroke.
+    private def entry_count_for(fp : Array(Project)) : Int32
+      3 + fp.size
     end
 
     # Saved projects filtered by @query using Gori::Fuzzy.
@@ -347,13 +402,19 @@ module Gori::Tui
       # Space on a project row opens the action menu (open/rename/delete); on the
       # Search row it types a literal space into the query.
       if key.up?
-        @selected = (@selected - 1).clamp(0, entry_count - 1)
+        ev.shift? ? mark_extend(-1) : move_selection(-1)
       elsif key.down?
-        @selected = (@selected + 1).clamp(0, entry_count - 1)
+        ev.shift? ? mark_extend(1) : move_selection(1)
+      elsif (key.tab? || key.back_tab?) && !ev.ctrl? && !ev.alt?
+        # BEFORE the printable arm below: Tab reaches it as '\t' (Event::Key#char falls back
+        # to key.to_char), which would type a tab into the search query instead of marking.
+        # Modifier-guarded like every other arm here: ^I is byte-identical to Tab (0x09, so
+        # termisu hands back Key::Tab), and ^I is not a request to mark anything.
+        mark_toggle(key.tab? ? 1 : -1)
       elsif key.enter?
         return activate
       elsif key.space? && !ev.ctrl? && !ev.alt?
-        if @selected >= 3
+        if space_opens_menu?
           open_space_menu
         elsif @selected == 2
           @query += " "
@@ -366,7 +427,12 @@ module Gori::Tui
           @results_scroll = 0
         end
       elsif key.escape?
-        if @query.empty?
+        # Marks first — esc is the reflex for dropping a selection everywhere else in gori,
+        # and a set that outlived the esc meant to clear it would go on aiming the next
+        # delete. Only then does esc mean "clear the query", and only then "quit".
+        if !@marks.empty?
+          @marks.clear
+        elsif @query.empty?
           return :quit
         else
           @query = ""
@@ -391,6 +457,8 @@ module Gori::Tui
         return open_temp
       elsif ev.ctrl? && key.lower_d?
         request_delete
+      elsif ev.ctrl? && key.lower_a?
+        mark_all
       elsif ev.ctrl? && key.comma?
         @preferences.open_default
         @mode = :settings
@@ -499,17 +567,18 @@ module Gori::Tui
     # Project-row space menu: ↑/↓ move, mnemonic key or ↵ run, esc dismiss.
     private def handle_space(ev : Termisu::Event::Key) : Project | Symbol | Nil
       key = ev.key
+      entries = space_entries
       @preedit = ""
       if key.escape? || ev.ctrl_c?
         close_space_menu
       elsif key.up?
-        @space_selected = (@space_selected - 1).clamp(0, SPACE_ENTRIES.size - 1)
+        @space_selected = (@space_selected - 1).clamp(0, entries.size - 1)
       elsif key.down?
-        @space_selected = (@space_selected + 1).clamp(0, SPACE_ENTRIES.size - 1)
+        @space_selected = (@space_selected + 1).clamp(0, entries.size - 1)
       elsif key.enter?
-        return activate_space_entry(SPACE_ENTRIES[@space_selected])
+        return activate_space_entry(entries[@space_selected])
       elsif (c = ev.char || key.to_char) && !ev.ctrl? && !ev.alt?
-        if entry = SPACE_ENTRIES.find { |e| e.key == c.downcase }
+        if entry = entries.find { |e| e.key == c.downcase }
           return activate_space_entry(entry)
         end
       end
@@ -576,65 +645,229 @@ module Gori::Tui
       nil
     end
 
-    # Open the delete-confirmation modal for the selected project (project
-    # deletion wipes its directory — irreversible, so it's always confirmed).
-    # When `project` is passed (space menu), use that; otherwise the list selection.
-    private def request_delete(project : Project? = nil) : Nil
-      target = project
-      if target.nil?
-        return if @selected < 3
-        target = filtered_projects[@selected - 3]?
+    # Open the delete-confirmation modal for the target set — the marks if any are set, else
+    # the cursor project (project deletion wipes the directory, so it's always confirmed).
+    # The ONE entry point: ctrl-d, the footer button and the space menu all land here, so
+    # there is no path on which "delete" means something other than target_projects.
+    private def request_delete : Nil
+      targets = target_projects
+      return if targets.empty?
+      # Split off what can't be deleted BEFORE asking, so the dialog only ever offers a
+      # delete that can actually happen. Two ways to be in use: another live instance
+      # capturing into it, and a peer (an MCP server takes no capture lock) merely holding
+      # the database open. `registry.delete` refuses both as the TOCTOU backstop.
+      blocked = [] of Project
+      deletable = targets.reject do |p|
+        in_use = probe_running(p)[0] || OpenLock.in_use?(p.db_path)
+        blocked << p if in_use
+        in_use
       end
-      return unless target
-      # Don't offer to delete a project another live instance is capturing into —
-      # the green "● on" dot already flags it; deleting would silently orphan its
-      # capture. (registry.delete also refuses, as a TOCTOU backstop below.)
-      return if probe_running(target)[0]
-      # And a project some other gori merely has OPEN — an MCP server takes no capture lock, so
-      # the dot above says nothing about it. Without this the confirm dialog offered a delete
-      # `registry.delete` was always going to refuse, which reads as the delete being broken.
-      if OpenLock.in_use?(target.db_path)
-        set_flash(%(can't delete "#{target.name}" — it's open in another gori instance), ok: false)
+      if deletable.empty?
+        # Said out loud even for the capture-lock case the green "● on" dot already flags:
+        # a ctrl-d that does nothing at all reads as delete being broken rather than refused
+        # — the same reasoning the post-confirm refusal below is written for.
+        set_flash(ProjectPicker.delete_blocked_flash(blocked.map(&.name)), ok: false)
         return
       end
-      @confirm = ConfirmDialog.new("DELETE PROJECT",
-        %(Delete "#{target.name}"?\nThis permanently removes all of its captured data.),
+      # Hoisted: `filtered_projects` re-runs the fuzzy scoring on every call.
+      shown = filtered_projects.map(&.dir).to_set
+      hidden = deletable.count { |p| !shown.includes?(p.dir) }
+      dialog = ConfirmDialog.new(deletable.size == 1 ? "DELETE PROJECT" : "DELETE PROJECTS",
+        ProjectPicker.delete_confirm_body(deletable.map(&.name), hidden, blocked.size),
         confirm_label: "delete", cancel_label: "cancel", danger: true)
-      @pending_delete = target
+      # ConfirmDialog DECLINES to draw on a terminal too small for its card (render and
+      # overlay_box share the guard, the latter answering with a 0×0 rect). Its mouse path
+      # already takes that as "not showing"; the key path never did, so on a short window
+      # ctrl-d used to arm an invisible dialog that `y` then committed — an unattended,
+      # unreadable rm_rf. Refuse to arm it at all instead: a delete you cannot read is a
+      # delete you cannot have confirmed.
+      w, h = @backend.size
+      if dialog.overlay_box(Rect.new(0, 0, w, h)).w == 0
+        set_flash("window too small to confirm a delete — make it taller", ok: false)
+        return
+      end
+      @confirm = dialog
+      @pending_deletes = deletable
       @confirm_kind = :delete
       @mode = :confirm
     end
 
+    # How many projects the confirm names outright before falling back to the count.
+    NAMED_DELETE_MAX = 3
+
+    # …and how wide those names may run. ConfirmDialog caps its card at 60 columns and draws
+    # each line with `width: box.w - 6`, so anything past this is ELLIPSIZED — which on this
+    # dialog means the operator confirms an irreversible wipe having read `Delete "acme-01",
+    # "acme-02", "acme-…`, with a project name and the question mark cut off. A count is a
+    # worse sentence than three names but an honest one, so the width decides, not the count
+    # alone. (Kept in step with ConfirmDialog#overlay_box / #render by the spec below.)
+    NAMED_DELETE_WIDTH = 54
+
+    # The last sentence read before N project directories are wiped, so it has to name the
+    # whole set — including the marks the current filter is hiding, which is the one thing
+    # the list itself cannot show.
+    # Pure + class-level so a spec can pin it without a Termisu.
+    def self.delete_confirm_body(names : Array(String), hidden : Int32, blocked : Int32) : String
+      one = names.size == 1
+      head = "Delete #{plural_projects(names.size)}?"
+      if names.size <= NAMED_DELETE_MAX
+        named = %(Delete #{names.map { |n| %("#{n}") }.join(", ")}?)
+        # A single project is named whatever it costs: "Delete 1 project?" names nothing at
+        # all, and ConfirmDialog ellipsizes a long name the same way the list row does.
+        head = named if one || Screen.display_width(named) <= NAMED_DELETE_WIDTH
+      end
+      String.build do |io|
+        io << head
+        io << '\n' << "This permanently removes all of " << (one ? "its" : "their") << " captured data."
+        if hidden > 0
+          io << '\n'
+          # "them" needs a plural to refer to; with one target the sentence is about it.
+          one ? (io << "It is hidden by the current search.") : (io << hidden << " of them " << (hidden == 1 ? "is" : "are") << " hidden by the current search.")
+        end
+        io << '\n' << blocked << " more " << (blocked == 1 ? "is" : "are") << " in use and will be kept." if blocked > 0
+      end
+    end
+
+    # Why a delete never got as far as the confirm: every target is in use.
+    def self.delete_blocked_flash(names : Array(String)) : String
+      return "nothing to delete" if names.empty?
+      return %(can't delete "#{names.first}" — it's open in another gori instance) if names.size == 1
+      "can't delete #{plural_projects(names.size)} — they're open in another gori instance"
+    end
+
     private def commit_delete : Nil
-      if project = @pending_delete
-        begin
-          @registry.delete(project) # refuses if a live instance took the lock since request_delete
-          @projects = @registry.list
-          invalidate_running_cache
-          @selected = 2
+      targets = @pending_deletes
+      unless targets.empty?
+        deleted = [] of String # dirs — only these are unmarked (a refusal stays marked to retry)
+        refused = [] of String
+        first_error = nil.as(String?)
+        # N synchronous rm_rf calls, each potentially over a multi-GB project directory, on
+        # the same event loop that draws. Paint the busy card first for the same reason the
+        # compress path does (see commit_compress) — otherwise the picker freezes on the
+        # stale confirm frame and reads as hung rather than as working.
+        @mode = :deleting
+        render
+        targets.each do |project|
+          @registry.delete(project) # refuses if it went live since request_delete
+          deleted << project.dir
         rescue ex : Gori::Error
           # Became live (capturing, or opened by a peer) between the confirm and here. The
           # message names WHICH, and it has to reach the screen: swallowed, the dialog just
           # closed with the project still listed and nothing said, so the operator saw delete
           # as broken rather than as refused.
-          set_flash(ex.message || %(can't delete "#{project.name}" — it is in use), ok: false)
-        rescue IO::Error
+          refused << project.name
+          first_error ||= ex.message
+        rescue ex : IO::Error
           # rm_rf hit a real filesystem failure (permission, locked file) — keep the TUI
-          # alive; refresh the list since the directory may be partially removed.
-          @projects = @registry.list
-          invalidate_running_cache
+          # alive; the directory may be partially removed, so the reload below re-reads it.
+          # Its message is captured too: reported as the generic refusal it is NOT, this
+          # reads as "close the other gori" and sends the operator after an instance that
+          # was never there.
+          refused << project.name
+          first_error ||= %(can't delete "#{project.name}" — #{ex.message})
+        end
+        @marks.unmark(deleted)
+        reload_projects
+        @selected = 2 unless deleted.empty?
+        if msg = ProjectPicker.delete_result_flash(deleted.size, refused, first_error)
+          set_flash(msg, ok: refused.empty?)
         end
       end
       cancel_confirm
+    end
+
+    # What a committed delete says afterwards. A clean single delete stays silent (the row
+    # is gone from the list — that IS the report, and the notice row belongs to the open
+    # error); anything partial or refused has to say so.
+    def self.delete_result_flash(deleted : Int32, refused : Array(String), first_error : String?) : String?
+      return nil if refused.empty? && deleted <= 1
+      if refused.empty?
+        return "deleted #{plural_projects(deleted)}"
+      end
+      if deleted == 0 && refused.size == 1
+        return first_error || %(can't delete "#{refused.first}")
+      end
+      # No cause named on the batch line: the refusals can be a mix of in-use and filesystem
+      # failures, and one sentence cannot claim both. The single-target line above says which,
+      # because there it can (it carries the raising error's own message).
+      kept = refused.size == 1 ? %("#{refused.first}") : refused.size.to_s
+      deleted == 0 ? "deleted nothing — kept #{kept}" : "deleted #{plural_projects(deleted)} — kept #{kept}"
     end
 
     private def cancel_confirm : Nil
       @mode = :list
       @confirm = nil
       @confirm_kind = :delete
-      @pending_delete = nil
+      @pending_deletes = [] of Project
       @pending_compact = nil
       @compact_project = nil
+    end
+
+    # --- marks (multi-select) -------------------------------------------------
+
+    # A plain arrow ends a ⇧arrow range gesture and hands its marks back, the way a GUI list
+    # collapses its highlight when you let go of ⇧. Nothing is said about it: the picker's
+    # one message row belongs to the open error (the only trace that a project failed to
+    # open) and to the compaction flash, and the divider chip already carries a live count.
+    private def move_selection(delta : Int32) : Nil
+      @marks.end_gesture
+      @selected = (@selected + delta).clamp(0, entry_count - 1)
+    end
+
+    # Tab / ⇧Tab — flip the cursor project's mark, then step, so a run of Tab marks
+    # consecutive rows. From an action row it acts on the TOP VISIBLE match instead of doing
+    # nothing: "type a filter, Tab Tab Tab" is the gesture this list is shaped for, and
+    # after a keystroke of typing the cursor is parked on the Search row by definition.
+    #
+    # @results_scroll, not 0: it is the top drawn row by construction (see render_list), so
+    # the mark lands on the row the operator is looking at. The two agree today — a render
+    # runs between every keystroke, and `ensure_results_visible` zeroes the scroll while the
+    # cursor sits on an action row — but that is an ordering argument, not an invariant this
+    # method establishes, and it is one refactor away from marking an off-screen project.
+    private def mark_toggle(step : Int32) : Nil
+      fp = filtered_projects
+      return if fp.empty?
+      idx = @selected < 3 ? @results_scroll : @selected - 3
+      return unless proj = fp[idx]?
+      @marks.toggle(proj.dir)
+      @selected = (idx + step + 3).clamp(3, entry_count_for(fp) - 1)
+    end
+
+    # ⇧↑/⇧↓ — extend a contiguous range from the anchor. Until the cursor is on a project
+    # row there is nothing to anchor on, so it just moves, exactly like the plain arrow.
+    private def mark_extend(delta : Int32) : Nil
+      fp = filtered_projects
+      if @selected < 3 || fp.empty?
+        @selected = (@selected + delta).clamp(0, entry_count_for(fp) - 1)
+        return
+      end
+      @selected = @marks.extend(fp.map(&.dir), @selected - 3, delta) + 3
+    end
+
+    # ctrl-a — mark everything the current filter shows (the list's ⇧T, respelled: see the
+    # class comment for why the app-wide letter chords can't reach this screen).
+    private def mark_all : Nil
+      fp = filtered_projects
+      return if fp.empty?
+      @marks.mark_all(fp.map(&.dir), selected_project.try(&.dir))
+    end
+
+    # The set every batch verb acts on: the marks if any are set, else the cursor row. One
+    # rule, so no verb here needs a notion of "batch mode" — the same shape as
+    # HistoryView#target_ids. Marks outlive the fuzzy filter, so this deliberately reaches
+    # projects the list is not currently showing; what that means for a delete is spelled
+    # out in the confirm (see delete_confirm_body).
+    private def target_projects : Array(Project)
+      return [selected_project].compact if @marks.empty?
+      by_dir = @projects.to_h { |p| {p.dir, p} }
+      @marks.ordered(filtered_projects.map(&.dir)).compact_map { |dir| by_dir[dir]? }
+    end
+
+    # Re-read the registry after a mutation, dropping marks whose project is gone with it.
+    private def reload_projects : Nil
+      @projects = @registry.list
+      @marks.retain(@projects.map(&.dir))
+      invalidate_running_cache
     end
 
     # --- space menu (project row actions) ------------------------------------
@@ -642,6 +875,24 @@ module Gori::Tui
     private def selected_project : Project?
       return nil if @selected < 3
       filtered_projects[@selected - 3]?
+    end
+
+    private def space_entries : Array(SpaceEntry)
+      ProjectPicker.space_entries(@marks.size)
+    end
+
+    # Where `space` opens the action menu: a project row, marks or no marks. It was briefly
+    # allowed from New/Temp while marks were set, and that was wrong twice over — three of the
+    # five entries (Open/Rename/Compress) are cursor-only, so they closed the menu in silence
+    # with no cursor project to act on, and the footer had to grow "space actions" on the row
+    # that already carries ctrl-n/ctrl-t, pushing `ctrl-c quit` off an 80-column terminal.
+    # Marks still reach a delete from anywhere via ctrl-d, which needs no cursor row.
+    #
+    # THE single source of the rule: the key ladder and the footer hint (whose "space actions"
+    # token is clickable) both read it, so the row can never offer a button the chord doesn't
+    # honour. The Search row is excluded by the same rule — it is a text field, so space types.
+    private def space_opens_menu? : Bool
+      @selected >= 3
     end
 
     private def open_space_menu : Nil
@@ -657,9 +908,21 @@ module Gori::Tui
       @space_selected = 0
     end
 
+    # Delete reads target_projects (marks, else the cursor) rather than the row the menu was
+    # opened on, so it is the SAME resolver ctrl-d and the footer button go through. The
+    # other three are single-target by design and stay on the cursor project — the menu says
+    # so while marks are set (see ProjectPicker.space_entries).
     private def activate_space_entry(entry : SpaceEntry) : Project | Symbol | Nil
       project = @space_project || selected_project
       close_space_menu
+      case entry.action
+      when :delete
+        request_delete
+        return nil
+      when :mark_clear
+        @marks.clear
+        return nil
+      end
       return nil unless project
       case entry.action
       when :open
@@ -669,9 +932,6 @@ module Gori::Tui
         nil
       when :compress
         start_compress(project)
-        nil
-      when :delete
-        request_delete(project)
         nil
       end
     end
@@ -689,8 +949,7 @@ module Gori::Tui
       if project && !name.empty?
         begin
           renamed = @registry.rename(project, name)
-          @projects = @registry.list
-          invalidate_running_cache
+          reload_projects # the dir slug is untouched by a rename, so any mark on it survives
           # Keep the cursor on the renamed project when it still matches the filter;
           # otherwise clamp so we don't land past the end of a shrunken list.
           if idx = filtered_projects.index { |p| p.dir == renamed.dir }
@@ -810,8 +1069,7 @@ module Gori::Tui
         rescue ex : Gori::Error | IO::Error | DB::Error | SQLite3::Exception
           set_flash("compress failed: #{ex.message}", ok: false)
         end
-        @projects = @registry.list
-        invalidate_running_cache
+        reload_projects
       end
       cancel_confirm # resets mode → :list and clears the confirm/compress state
     end
@@ -897,9 +1155,11 @@ module Gori::Tui
       when :theme        then handle_theme_mouse(w, h, mx, my)
       when :space        then handle_space_mouse(w, h, mx, my)
       when :compress     then handle_compress_mouse(w, h, mx, my)
-      when :compressing  then nil # blocking VACUUM in progress — ignore clicks
       when :new, :rename then nil # text form — keyboard only (cursor placement is Phase 2)
-      else                    handle_list_mouse(mx, my)
+      else
+        # A blocking step (VACUUM, measure, the batch rm_rf) owns the loop — ignore clicks
+        # rather than let one land on the list drawn under the busy card.
+        BUSY_LABELS.has_key?(@mode) ? nil : handle_list_mouse(mx, my)
       end
     end
 
@@ -933,6 +1193,10 @@ module Gori::Tui
       if idx == @selected
         activate
       else
+        # Like a plain arrow, moving the cursor by click ends a ⇧arrow range and hands its
+        # marks back; deliberate Tab marks stay. (So does the wheel — on this screen it moves
+        # the selection rather than scrolling under it. See picker_wheel.)
+        @marks.end_gesture
         @selected = idx
         @results_scroll = 0 if idx < 3 # focusing an action row shows the list from the top
         nil
@@ -941,12 +1205,18 @@ module Gori::Tui
 
     private def picker_wheel(delta : Int32) : Nil
       case @mode
-      when :settings                             then @preferences.wheel(delta)
-      when :theme                                then (@theme_card.move_field(delta); preview_theme)
-      when :space                                then @space_selected = (@space_selected + delta.sign).clamp(0, SPACE_ENTRIES.size - 1)
-      when :compress                             then @compact.try(&.move(delta.sign))
-      when :new, :confirm, :rename, :compressing then nil # nothing to scroll
-      else                                            @selected = (@selected + delta).clamp(0, entry_count - 1)
+      when :settings               then @preferences.wheel(delta)
+      when :theme                  then (@theme_card.move_field(delta); preview_theme)
+      when :space                  then @space_selected = (@space_selected + delta.sign).clamp(0, space_entries.size - 1)
+      when :compress               then @compact.try(&.move(delta.sign))
+      when :new, :confirm, :rename then nil # nothing to scroll
+      when .in?(BUSY_LABELS.keys)  then nil # a blocking step owns the loop
+      else
+        # The picker's wheel moves the SELECTION (it has no independent scroll of its own),
+        # so it is an arrow by another name and ends a ⇧arrow range exactly as one does.
+        # Without this the anchor outlived a scroll: wheel down five rows, press ⇧↓ once,
+        # and the range snapped back to the stale anchor — marking six projects on one key.
+        move_selection(delta)
       end
     end
 
@@ -981,11 +1251,12 @@ module Gori::Tui
     end
 
     private def handle_space_mouse(w : Int32, h : Int32, mx : Int32, my : Int32) : Project | Symbol | Nil
+      entries = space_entries
       box = space_menu_box(w, h)
       return close_space_menu unless box.contains?(mx, my) # click away → dismiss
       if idx = space_row_at(box, mx, my)
         if idx == @space_selected
-          return activate_space_entry(SPACE_ENTRIES[idx])
+          return activate_space_entry(entries[idx])
         else
           @space_selected = idx
         end
@@ -1153,7 +1424,7 @@ module Gori::Tui
         @theme_card.render(screen, Rect.new(0, 0, w, h)) if @mode == :theme
         render_space_menu(screen, w, h) if @mode == :space
         @compact.try(&.render(screen, Rect.new(0, 0, w, h))) if @mode == :compress
-        render_compressing(screen, w, h) if @mode == :compressing || @mode == :measuring
+        render_busy(screen, w, h) if BUSY_LABELS.has_key?(@mode)
       end
       # Sync the terminal hardware cursor to the focused caret so the terminal's
       # own IME composition UI (jamo/candidate popup) anchors at the right cell —
@@ -1233,7 +1504,14 @@ module Gori::Tui
       div_y = box.y + 1 + actions
       Frame.tee_divider(screen, box, div_y, bg: Theme.panel)
       count = @query.empty? ? "Projects (#{fp.size})" : "Matches (#{fp.size})"
-      screen.text(box.x + 2, div_y, " #{count} ", Theme.muted, Theme.panel)
+      # The live mark count rides the divider the way the in-app mark chip rides the filter
+      # row — including how much of the set the current search is hiding, since a mark
+      # outlives the query that scrolled it off screen and still aims the next delete.
+      # Guarded rather than relying on hidden_count's own empty fast path: the argument is
+      # built BEFORE the call, so an unmarked picker — the overwhelmingly common state —
+      # would allocate a full dir array 20 times a second for a chip that renders as "".
+      count += ProjectPicker.mark_chip(@marks.size, @marks.hidden_count(fp.map(&.dir))) unless @marks.empty?
+      screen.text(box.x + 2, div_y, " #{count} ", Theme.muted, Theme.panel, width: {cw - 4, 1}.max)
       list_top = div_y + 1
 
       ensure_results_visible(res_rows)
@@ -1247,13 +1525,18 @@ module Gori::Tui
           proj = fp[ri]
           py = list_top + vi
           is_selected = (ri + 3 == @selected)
-          bg = is_selected ? Theme.accent_bg : Theme.panel
-          screen.fill(Rect.new(box.x + 1, py, cw - 2, 1), bg) if is_selected
-          screen.cell(box.x + 1, py, is_selected ? '▎' : ' ', Theme.accent, bg)
+          # A marked row reads as a dim band with a FULLER gutter bar, so it stays legible
+          # as marked next to the cursor row (accent band + ▎) and on the cursor row that is
+          # ALSO marked (accent band + ▌) — the same two glyphs every marking list in gori
+          # uses. Both are single-width, so the row never shifts.
+          marked = @marks.marked?(proj.dir)
+          bg = is_selected ? Theme.accent_bg : (marked ? Theme.selection_dim : Theme.panel)
+          screen.fill(Rect.new(box.x + 1, py, cw - 2, 1), bg) if is_selected || marked
+          screen.cell(box.x + 1, py, marked ? '▌' : (is_selected ? '▎' : ' '), Theme.accent, bg)
           meta, meta_fg = project_meta(proj)
           mdw = Screen.display_width(meta)
           name_w = cw - 3 - (mdw + 2)
-          screen.text(box.x + 3, py, proj.name, is_selected ? Theme.text_bright : Theme.text, bg, width: [name_w, 1].max)
+          screen.text(box.x + 3, py, proj.name, is_selected || marked ? Theme.text_bright : Theme.text, bg, width: [name_w, 1].max)
           meta_x = box.right - mdw - 2
           screen.text(meta_x, py, meta, meta_fg, bg) unless meta.empty?
         end
@@ -1268,10 +1551,15 @@ module Gori::Tui
         hint = case
                when @mode == :compress
                  "↑/↓ select   ‹/› keep   space toggle   ↵ compress   esc close"
-               when @mode == :compressing
-                 "compressing …"
-               else # :space
-                 "↑/↓ select   ↵ run   o open   r rename   c compress   d delete   esc close"
+               when label = BUSY_LABELS[@mode]?
+                 # Every blocking mode, off the one table — :measuring used to fall through
+                 # to the :space arm below and label its busy card with the action menu's
+                 # mnemonics, and :deleting would have joined it.
+                 label.strip.downcase
+               else # :space — mnemonics read off the live menu, so a mark-only entry
+                 # (Clear marks) can't be missing from the row that lists them.
+                 keys = space_entries.map { |e| "#{e.key} #{e.label.split(' ').first.downcase}" }.join("   ")
+                 "↑/↓ select   ↵ run   #{keys}   esc close"
                end
         centered(screen, h - 2, hint, Theme.muted, w)
       end
@@ -1353,8 +1641,20 @@ module Gori::Tui
       # A project row is selected → `space` opens its action menu; on the New/Temp/Search
       # rows that chord does something else entirely, so the token (and its button) is
       # offered only where it applies, exactly as the flat hint used to switch.
-      tokens << HintToken.new("space actions", :space) if @selected >= 3
-      tokens << HintToken.new("type to search")
+      tokens << HintToken.new("space actions", :space) if space_opens_menu?
+      # On a project row the mark gesture TAKES the search hint's place rather than joining
+      # it (and takes esc's new first meaning with it once marks are live). This row is the
+      # widest thing the picker draws and it trims from the right, so a token added without
+      # one given back pushes `ctrl-c quit` off the end — and on the action rows, where the
+      # row is at its longest (ctrl-n/ctrl-t ride there), the search hint is the one that
+      # applies and marking is not offered at all. Both are inert, like every token that
+      # describes a gesture rather than a button.
+      if @selected >= 3
+        tokens << HintToken.new("tab mark")
+        tokens << HintToken.new("esc clear") unless @marks.empty?
+      else
+        tokens << HintToken.new("type to search")
+      end
       if @selected < 3
         tokens << HintToken.new("ctrl-n new", :new)
         tokens << HintToken.new("ctrl-t temp", :temp)
@@ -1428,9 +1728,22 @@ module Gori::Tui
     # Bottom-right space menu over the project list — open / rename / delete.
     # Mirrors the in-session SpaceMenu chrome (card + mnemonic + ▎ selection).
     private def space_menu_box(w : Int32, h : Int32) : Rect
-      label_w = SPACE_ENTRIES.max_of(&.label.size)
-      mw = {label_w + 6, 16}.max # border + ▎ + key + gap + label + border
-      mh = SPACE_ENTRIES.size + 2
+      ProjectPicker.space_menu_box(w, h, space_entries, space_menu_title)
+    end
+
+    # "SPACE · 3 MARKED" while a mark set is live — the picker's form of the Runner's space
+    # menu banner, so opening the menu over marks announces up front that Delete below is
+    # plural. Sized for BOTH the widest label and this title: Frame.card ellipsizes a title
+    # past `w - 4`, and a menu that silently truncates its own count is worse than no count.
+    private def space_menu_title : String
+      @marks.empty? ? "SPACE" : "SPACE · #{@marks.size} MARKED"
+    end
+
+    def self.space_menu_box(w : Int32, h : Int32, entries : Array(SpaceEntry), title : String) : Rect
+      label_w = entries.max_of { |e| Screen.display_width(e.label) }
+      mw = {label_w + 6, Screen.display_width(title) + 5, 16}.max # border + ▎ + key + gap + label + border
+      mw = {mw, w - 2}.min
+      mh = entries.size + 2
       x = {w - mw - 2, 0}.max
       y = {h - mh - 3, 1}.max # above the hint row
       Rect.new(x, y, mw, mh)
@@ -1438,15 +1751,15 @@ module Gori::Tui
 
     private def space_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       i = my - (box.y + 1)
-      return nil if i < 0 || i >= SPACE_ENTRIES.size
+      return nil if i < 0 || i >= space_entries.size
       return nil if mx <= box.x || mx >= box.right - 1
       i
     end
 
     private def render_space_menu(screen : Screen, w : Int32, h : Int32) : Nil
       box = space_menu_box(w, h)
-      Frame.card(screen, box, "SPACE", border: Theme.border_focus)
-      SPACE_ENTRIES.each_with_index do |entry, i|
+      Frame.card(screen, box, space_menu_title, border: Theme.border_focus)
+      space_entries.each_with_index do |entry, i|
         ry = box.y + 1 + i
         active = i == @space_selected
         bg = active ? Theme.accent_bg : Theme.panel
@@ -1461,8 +1774,17 @@ module Gori::Tui
     # A small centered busy card painted while a synchronous blocking step runs (the picker
     # has no background jobs / spinner), so the freeze reads as work — the measure scan on a
     # multi-GB project, then the VACUUM.
-    private def render_compressing(screen : Screen, w : Int32, h : Int32) : Nil
-      msg = @mode == :measuring ? " Measuring … " : " Compressing … "
+    # The blocking steps the picker runs on its own event loop, and what the busy card calls
+    # each. Keyed by @mode so `render` needs no growing `||` chain, and so a mode added
+    # without a label can't silently paint a blank card.
+    BUSY_LABELS = {
+      :measuring   => " Measuring … ",
+      :compressing => " Compressing … ",
+      :deleting    => " Deleting … ",
+    }
+
+    private def render_busy(screen : Screen, w : Int32, h : Int32) : Nil
+      msg = BUSY_LABELS[@mode]? || " Working … "
       bw = {msg.size + 4, 22}.max
       bh = 3
       box = Rect.new({(w - bw) // 2, 0}.max, {(h - bh) // 2, 0}.max, bw, bh)
