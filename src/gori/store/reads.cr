@@ -361,9 +361,20 @@ module Gori
     # `ws_messages.flow_id` is NOT NULL, so a repeater-owned WS row (`repeater_id` set, which
     # `delete_flow_one` deliberately spares) keeps its id. Its session is covered instead:
     # `repeaters.flow_id` is nulled here, which is where a surface reads the provenance from.
+    # `probe_oast_probes` belongs here even though nothing READS its `flow_id` for display: it
+    # COPIES it into a new finding. An outstanding out-of-band probe deliberately outlives the
+    # scan that planted it (that is the whole point of the table), so a `history clear` leaves the
+    # row while resetting the rowid counter — and when the payload finally calls home,
+    # `Probe::OutOfBand.detection_for` passes `p.flow_id` into the `Detection`, which
+    # `upsert_probe_issue` writes as `probe_issues.sample_flow_id`. So the very failure the note
+    # above records as MEASURED — "a probe finding promoted to an Issue after a clear cited a flow
+    # captured afterwards" — came back one hop upstream: nulling `sample_flow_id` at clear time
+    # does not help when the value is re-supplied afterwards from a row that kept it. This table
+    # arrived in a later migration than the list, which is how it came to be missing from a
+    # comment that says "every table".
     private def detach_flow_refs(conn : DB::Connection, id : Int64?) : Nil
       {"issues", "repeaters", "fuzz_sessions", "miner_sessions", "sequencer_sessions",
-       "events", "intercept_held"}.each do |table|
+       "events", "intercept_held", "probe_oast_probes"}.each do |table|
         if fid = id
           conn.exec("UPDATE #{table} SET flow_id = NULL WHERE flow_id = ?", fid)
         else
