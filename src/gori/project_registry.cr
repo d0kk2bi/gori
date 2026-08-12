@@ -4,6 +4,7 @@ require "./durable_file"
 require "./project"
 require "./store"
 require "./capture_lock"
+require "./open_lock"
 
 module Gori
   # Discovers and creates project workspaces under a root directory. Named
@@ -326,6 +327,15 @@ module Gori
     def delete(project : Project) : Nil
       return unless Dir.exists?(project.dir)
       raise Gori::Error.new("project is in use by another gori instance — stop its capture first") if CaptureLock.held?(project.dir)
+      # Capturing is not the only way to be writing to a project. An MCP server takes no capture
+      # lock and still writes issues, notes, repeaters and fuzz history, so the guard above saw
+      # nothing while one MCP server deleted the project another was serving — after which the
+      # second kept reporting successful writes into an unlinked inode, which is the exact loss
+      # the capture guard exists to prevent (reproduced with two servers). `OpenLock` answers the
+      # question that was actually being asked: does ANY live process have this database open.
+      if OpenLock.in_use?(project.db_path)
+        raise Gori::Error.new("project is open in another gori instance — close it there first")
+      end
       FileUtils.rm_rf(project.dir)
     end
 

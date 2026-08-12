@@ -29,6 +29,7 @@ require "./store/h2_frames"
 require "./store/reads"
 require "./store/sitemap_tags"
 require "./ql"
+require "./open_lock"
 
 module Gori
   # SQLite-primary storage (P5/P7): raw request/response BYTES are the truth
@@ -220,7 +221,16 @@ module Gori
                   retention_flows : Int32 = RETENTION_DEFAULT) : Store
       url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=5000"
       refuse_non_database(path)
-      db = DB.open(url)
+      # Announce that this process has the database open, for as long as it is (see OpenLock).
+      # Taken BEFORE `DB.open` so the window in which a peer could delete the file out from
+      # under a half-built store does not exist.
+      open_lock = OpenLock.try_shared(path)
+      db = begin
+        DB.open(url)
+      rescue ex
+        open_lock.try(&.close)
+        raise ex
+      end
       # Everything between DB.open and handing the pool to `new` has to be unwound on
       # failure, because `db` is a live connection POOL and nothing else has a reference
       # to it yet: an escaping exception left the sqlite handle (plus its -wal/-shm)
@@ -243,10 +253,11 @@ module Gori
         Schema.migrate!(db)
       rescue ex
         db.close rescue nil
+        open_lock.try(&.close)
         raise ex
       end
       # Past this point the Store owns the pool and closes it in #close.
-      new(db, events, probe_events, retention_flows)
+      new(db, events, probe_events, retention_flows, open_lock: open_lock)
     end
 
     # The 16-byte header every SQLite database file starts with: 15 ASCII bytes plus the
@@ -333,7 +344,8 @@ module Gori
     def initialize(@db : DB::Database, @events : Channel(FlowEvent)? = nil,
                    @probe_events : Channel(FlowEvent)? = nil,
                    @retention_flows : Int32 = RETENTION_DEFAULT,
-                   @prune_interval : Int32 = PRUNE_INTERVAL)
+                   @prune_interval : Int32 = PRUNE_INTERVAL,
+                   @open_lock : OpenLock? = nil)
       @writes = Channel(WriteOp).new(1024) # widened: h2 frames now queue fire-and-forget
       @done = Channel(Nil).new
       @closed = false # see #close: a second drain would park forever on @done
@@ -535,11 +547,16 @@ module Gori
       # so nothing should poison a statement in the first place; if something ever does, leaking
       # one connection pool for the rest of the process beats crashing it, and the log line says
       # which happened.
+      # Released on BOTH exits below, and last: while it is held, a peer's delete is refused,
+      # so dropping it before the pool is done with the file would reopen the very window it
+      # exists to close.
       if @writer_teardown_failed
         ::Log.warn { "store: leaving the connection pool open — the writer's connection did not tear down cleanly" }
+        @open_lock.try(&.close)
         return
       end
       @db.close
+      @open_lock.try(&.close)
     end
 
     # --- internals -----------------------------------------------------------
