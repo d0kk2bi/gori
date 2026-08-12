@@ -492,7 +492,7 @@ module Gori
     # live bind address. No-op when this session doesn't hold the capture lock.
     def sync_capture_status! : Nil
       return unless capturing_lock_held?
-      CaptureStatus.write(@project.dir, @proxy.host, @proxy.port, capturing?)
+      CaptureStatus.write_at(@project.capture_status_path, @proxy.host, @proxy.port, capturing?)
     rescue
       # The capture-status file is a purely informational sidecar; a write failure
       # (disk full, dir vanished) must not abort session open / capture toggle / settings.
@@ -511,7 +511,7 @@ module Gori
       # Best-effort: a delete failure here must not skip the lock/probe/store teardown below
       # (which would leak the flock + writer fiber + fibers) or, via a caller's `ensure`,
       # replace the real exception being unwound.
-      (CaptureStatus.clear(@project.dir) if capturing_lock_held?) rescue nil
+      (CaptureStatus.clear_at(@project.capture_status_path) if capturing_lock_held?) rescue nil
       # Stop Probe FIRST so its active workers wind down and its passive fiber stops issuing
       # get_flow against a live DB; this also closes the probe_events channel it consumes.
       @probe.stop

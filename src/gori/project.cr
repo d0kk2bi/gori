@@ -1,5 +1,6 @@
 require "file_utils"
 require "./capture_lock"
+require "./capture_status"
 
 module Gori
   # A workspace: a named SQLite DB, so each project's history/sitemap/etc. are
@@ -27,6 +28,22 @@ module Gori
     # live capturer with no regression.
     def capture_lock_path : String
       File.basename(@db_path) == DB_FILE ? CaptureLock.path(dir) : "#{@db_path}.capture.lock"
+    end
+
+    # Path of this project's capture-status marker, keyed exactly like the lock above and for
+    # the same reason: the marker DESCRIBES the capture the lock guards, so if the two are
+    # keyed differently they describe different things. They were — the lock on the db file,
+    # the marker on the parent directory — so two `--db` databases sharing a directory, which
+    # correctly hold independent locks and capture at the same time, shared ONE marker: the
+    # second session's bind address overwrote the first's, and whichever closed first deleted
+    # the marker belonging to a session still live. The picker reads that marker to say where
+    # a project opened in another window is listening, so it reported the wrong port, or a
+    # live project with no address.
+    #
+    # The canonical registry db keeps the legacy per-directory path, so the picker's
+    # `CaptureStatus.read(project.dir)` (and every existing marker on disk) is unchanged.
+    def capture_status_path : String
+      File.basename(@db_path) == DB_FILE ? CaptureStatus.path(dir) : "#{@db_path}.capture.status"
     end
 
     # A one-line, operator-readable reason this project's store would not open, for a
