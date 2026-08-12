@@ -37,7 +37,9 @@ module Gori
     #     bindable and the binding was shadowed wherever an editor had focus.
     CLAIMED_CTRL_LETTERS = %w[g f b e p n w z]
     CLAIMED_CTRL_DIGITS  = ('1'..'9').map(&.to_s)
-    CLAIMED_CTRL_PUNCT   = %w[,]
+    # Spelled as a plain array, not `%w[,]`: in a word list a comma reads as a separator,
+    # so the one-element form looks like a typo for an empty list. This is the ^, prefs chord.
+    CLAIMED_CTRL_PUNCT = [","]
 
     # Every claimed key, modifier-free. The ctrl and alt chord sets below are both built
     # from this, and Keybind.dealias uses it to decide which events to rewrite.
