@@ -1,5 +1,6 @@
 require "termisu"
 require "../capture_lock"
+require "../open_lock"
 require "../capture_status"
 require "../project"
 require "../project_registry"
@@ -589,6 +590,13 @@ module Gori::Tui
       # the green "● on" dot already flags it; deleting would silently orphan its
       # capture. (registry.delete also refuses, as a TOCTOU backstop below.)
       return if probe_running(target)[0]
+      # And a project some other gori merely has OPEN — an MCP server takes no capture lock, so
+      # the dot above says nothing about it. Without this the confirm dialog offered a delete
+      # `registry.delete` was always going to refuse, which reads as the delete being broken.
+      if OpenLock.in_use?(target.db_path)
+        set_flash(%(can't delete "#{target.name}" — it's open in another gori instance), ok: false)
+        return
+      end
       @confirm = ConfirmDialog.new("DELETE PROJECT",
         %(Delete "#{target.name}"?\nThis permanently removes all of its captured data.),
         confirm_label: "delete", cancel_label: "cancel", danger: true)
@@ -604,8 +612,12 @@ module Gori::Tui
           @projects = @registry.list
           invalidate_running_cache
           @selected = 2
-        rescue Gori::Error
-          # became live between confirm and here — leave it in place
+        rescue ex : Gori::Error
+          # Became live (capturing, or opened by a peer) between the confirm and here. The
+          # message names WHICH, and it has to reach the screen: swallowed, the dialog just
+          # closed with the project still listed and nothing said, so the operator saw delete
+          # as broken rather than as refused.
+          set_flash(ex.message || %(can't delete "#{project.name}" — it is in use), ok: false)
         rescue IO::Error
           # rm_rf hit a real filesystem failure (permission, locked file) — keep the TUI
           # alive; refresh the list since the directory may be partially removed.

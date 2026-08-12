@@ -493,7 +493,7 @@ module Gori
         enabled = enabled.nil? ? true : enabled
         bindings = extract_bindings
         if bad = bindings.add(name, str(h, "when") || "", kind, selector, pos_start, pos_end, str(h, "host") || "")
-          return err(bad, "INVALID_ARGUMENT", field: "name")
+          return bad == Gori::Bindings::STORE_REFUSED ? busy(bad) : err(bad, "INVALID_ARGUMENT", field: "name")
         end
         row = store.extract_rules.find { |r| r.name == name }
         return busy("failed to persist extract rule (store busy or unwritable)") unless row
@@ -538,7 +538,9 @@ module Gori
         en = enabled_arg(h, existing.enabled?)
         return en if en.is_a?(Result)
         if bad = extract_bindings.update(id, name, filter, kind, selector, pos_start, pos_end, host)
-          return err(bad, "INVALID_ARGUMENT", field: "name")
+          # A store refusal is transient and gets the retryable code; a validation refusal is the
+          # caller's own values and does not.
+          return bad == Gori::Bindings::STORE_REFUSED ? busy(bad) : err(bad, "INVALID_ARGUMENT", field: "name")
         end
         unless en.nil?
           return busy("extract rule fields were updated but the enable/disable did not persist (store busy or unwritable); retry") unless store.set_extract_rule_enabled(id, en)

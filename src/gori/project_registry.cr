@@ -333,10 +333,17 @@ module Gori
       # second kept reporting successful writes into an unlinked inode, which is the exact loss
       # the capture guard exists to prevent (reproduced with two servers). `OpenLock` answers the
       # question that was actually being asked: does ANY live process have this database open.
-      if OpenLock.in_use?(project.db_path)
+      # HELD across the rm_rf, not probed and released: a peer that opens the database in the gap
+      # between the answer and the unlink is exactly the writer this refuses to strand.
+      guard = OpenLock.try_exclusive(project.db_path)
+      unless guard
         raise Gori::Error.new("project is open in another gori instance — close it there first")
       end
-      FileUtils.rm_rf(project.dir)
+      begin
+        FileUtils.rm_rf(project.dir)
+      ensure
+        guard.close
+      end
     end
 
     # Rename a project's display name (the `.name` sidecar). The on-disk directory

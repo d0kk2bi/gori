@@ -1,6 +1,7 @@
 require "db"
 require "sqlite3"
 require "../capture_lock"
+require "../open_lock"
 require "./schema"
 
 # On-demand project compaction: drop the less-important, space-dominating data
@@ -121,6 +122,16 @@ class Gori::Store
     lock_path = File.basename(path) == Project::DB_FILE ? CaptureLock.path(dir) : "#{path}.capture.lock"
     lock = CaptureLock.try_at(lock_path)
     return nil unless lock # another live instance is capturing into this project
+    # And the other half of "in use", for the same reason `ProjectRegistry#delete` asks it: an MCP
+    # server takes no capture lock and still writes into this database. Compaction is the MORE
+    # destructive of the two — it runs `DELETE FROM fuzz_results/h2_frames/...` and rewrites the
+    # whole file — so a peer holding it open must stop it just as a peer capturing does. Held
+    # across the strip and the VACUUM, then released with the capture lock.
+    open_guard = OpenLock.try_exclusive(path)
+    unless open_guard
+      lock.close
+      return nil
+    end
     begin
       before = File.info(path).size
       db = DB.open(compact_url(path))
@@ -149,6 +160,7 @@ class Gori::Store
       harden_permissions(path)
       CompactResult.new(before, File.info(path).size, vacuumed)
     ensure
+      open_guard.close
       lock.close
     end
   end

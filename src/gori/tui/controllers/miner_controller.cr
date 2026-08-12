@@ -665,8 +665,7 @@ module Gori::Tui
       orphaned = (id = tab.db_id) ? !@host.session.store.delete_miner_session(id) : false
       @miners.delete_at(@current_idx)
       @current_idx = @miners.empty? ? -1 : @current_idx.clamp(0, @miners.size - 1)
-      base = @miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)"
-      @host.status(orphaned ? "#{base} — the saved tab could NOT be removed (project busy); it will reappear" : base)
+      @host.status(TabClose.message(@miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)", orphaned))
     end
 
     # Halt EVERY running mine on a project-level exit (leave project / quit) — the same

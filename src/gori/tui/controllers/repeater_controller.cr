@@ -1440,8 +1440,7 @@ module Gori::Tui
       orphaned = (id = @repeaters[@current_repeater_idx].db_id) ? !@host.session.store.delete_repeater(id) : false # also propagates the close to peer sessions
       @repeaters.delete_at(@current_repeater_idx)
       @current_repeater_idx = @repeaters.empty? ? -1 : @current_repeater_idx.clamp(0, @repeaters.size - 1)
-      base = @repeaters.empty? ? "closed repeater — none open (^N new · ^R from History)" : "closed repeater (#{@repeaters.size} open)"
-      @host.status(orphaned ? "#{base} — the saved tab could NOT be removed (project busy); it will reappear" : base)
+      @host.status(TabClose.message(@repeaters.empty? ? "closed repeater — none open (^N new · ^R from History)" : "closed repeater (#{@repeaters.size} open)", orphaned))
     end
 
     # Stop the one running minimize on a project-level exit (leave project / quit), for the

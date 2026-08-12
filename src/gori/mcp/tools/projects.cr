@@ -2,6 +2,7 @@ require "json"
 require "../../project_registry"
 require "../../paths"
 require "../../capture_lock"
+require "../../open_lock"
 require "../../store"
 require "../../env"
 
@@ -112,9 +113,13 @@ module Gori
         rescue ex
           return err("could not open project database: #{ex.message}", "INTERNAL")
         end
-        if @owns_store
-          @store.try(&.close)
-        end
+        # Closed regardless of who opened it. `@owns_store` was about not closing a handle the
+        # CLI still needed — it does not: `cli.cr` only reads `store.count` before `server.run`,
+        # and its own `ensure store.close` is idempotent. Leaving it open leaked a descriptor,
+        # which was invisible; now it also leaks the project's `OpenLock`, so `delete_project` on
+        # a project this server has SWITCHED AWAY FROM is refused as "open in another gori
+        # instance" — by this server, which no longer serves it and offers no way to let go.
+        @store.try(&.close)
         @store = new_store
         @owns_store = true
         @project_name = proj.name
@@ -185,6 +190,9 @@ module Gori
             j.field "db_size", proj.db_size
             j.field "disk_size", proj.disk_size
             j.field "capture_lock_held", CaptureLock.held?(proj.dir)
+            # Both guards `ProjectRegistry#delete` applies, so a dry run that hands back a token
+            # is not promising a delete the confirmed call then refuses.
+            j.field "open_in_another_instance", OpenLock.in_use?(proj.db_path)
             j.field "confirmation_token", token
             j.field "token_expires_in_seconds", DELETE_TOKEN_TTL
             j.field "note", "Re-call with dry_run:false and this confirmation_token to delete."

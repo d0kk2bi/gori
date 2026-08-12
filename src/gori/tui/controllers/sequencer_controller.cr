@@ -779,8 +779,7 @@ module Gori::Tui
       orphaned = (id = tab.db_id) ? !@host.session.store.delete_sequencer_session(id) : false
       @sessions.delete_at(@current_idx)
       @current_idx = @sessions.empty? ? -1 : @current_idx.clamp(0, @sessions.size - 1)
-      base = @sessions.empty? ? "closed — none open" : "closed (#{@sessions.size} open)"
-      @host.status(orphaned ? "#{base} — the saved tab could NOT be removed (project busy); it will reappear" : base)
+      @host.status(TabClose.message(@sessions.empty? ? "closed — none open" : "closed (#{@sessions.size} open)", orphaned))
     end
 
     # Halt EVERY running collection on a project-level exit (leave project / quit) — the

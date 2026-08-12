@@ -27,7 +27,7 @@ module Gori
     # so the registry's directory-based CaptureLock.held? guards (delete/rename) still detect a
     # live capturer with no regression.
     def capture_lock_path : String
-      File.basename(@db_path) == DB_FILE ? CaptureLock.path(dir) : "#{@db_path}.capture.lock"
+      sidecar_path(CaptureLock.path(dir), ".capture.lock")
     end
 
     # Path of this project's capture-status marker, keyed exactly like the lock above and for
@@ -43,7 +43,17 @@ module Gori
     # The canonical registry db keeps the legacy per-directory path, so the picker's
     # `CaptureStatus.read(project.dir)` (and every existing marker on disk) is unchanged.
     def capture_status_path : String
-      File.basename(@db_path) == DB_FILE ? CaptureStatus.path(dir) : "#{@db_path}.capture.status"
+      sidecar_path(CaptureStatus.path(dir), ".capture.status")
+    end
+
+    # The keying rule the two sidecars above share, expressed once: the canonical registry db
+    # keeps its LEGACY per-directory path (so every marker already on disk, and every dir-based
+    # probe, keeps working), and anything else — a `--db` file — is keyed on the DATABASE. Their
+    # own comments insist the two must agree, which is an invariant a second copy of the ternary
+    # can only weaken: a third sidecar, or a change to what counts as canonical, would have to be
+    # applied everywhere for it to hold.
+    private def sidecar_path(legacy : String, suffix : String) : String
+      File.basename(@db_path) == DB_FILE ? legacy : "#{@db_path}#{suffix}"
     end
 
     # A one-line, operator-readable reason this project's store would not open, for a

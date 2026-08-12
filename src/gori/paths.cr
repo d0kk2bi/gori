@@ -62,6 +62,22 @@ module Gori
       nil
     end
 
+    # A path canonicalized for IDENTITY comparison — the same file reached by a different
+    # spelling must compare equal. `realpath` on the file when it exists; otherwise on its
+    # DIRECTORY plus the basename, because a path naming something not created yet is legitimate
+    # (only its parent has to exist) and `realpath` raises on a missing leaf.
+    #
+    # Two things need this and reached it independently: matching a `--db` against the registry's
+    # own `db_path` (built from `$GORI_HOME` exactly as spelled), and keying `OpenLock` so one
+    # database cannot end up with two lock files. `$GORI_HOME` behind a symlink — a dotfiles-managed
+    # home, `/tmp` on macOS — is the ordinary way to hit both.
+    def self.canonical_file(path : String) : String
+      return File.realpath(path) if File.exists?(path)
+      File.join(File.realpath(File.dirname(path)), File.basename(path))
+    rescue
+      path
+    end
+
     def self.ensure_dirs : Nil
       ensure_dir(home_dir)
       ensure_dir(projects_dir) # lock the projects ROOT too (registry only mkdir's leaves)

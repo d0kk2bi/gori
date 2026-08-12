@@ -88,3 +88,35 @@ describe "unattributed HTTP/2 frames" do
     end
   end
 end
+
+# The orphan reap used to sit BEHIND retention's early returns, so it never ran for the two
+# commonest projects: an MCP server opens with RETENTION_UNLIMITED, and a TUI project under its
+# cap returns at `cutoff <= 0`. The comment there promised such a db would heal itself.
+describe "the unattributed-frame reap and retention" do
+  it "runs with retention disabled" do
+    h2_store(retention: Gori::Store::RETENTION_UNLIMITED, prune_interval: 1) do |store|
+      3.times do |i|
+        store.@db.exec("INSERT INTO h2_frames (conn_id, created_at, direction, stream_id, type, flags, length, payload) " \
+                       "VALUES (0,?,?,?,1,0,4,X'')", 1_000_i64 + i, "out", (i + 1).to_i64)
+      end
+      store.@db.scalar("SELECT COUNT(*) FROM h2_frames").as(Int64).should eq(3_i64)
+
+      2.times { |i| store.insert_flow(h2_request("/keep#{i}", nil)) }
+      store.flush
+
+      store.@db.scalar("SELECT COUNT(*) FROM h2_frames").as(Int64).should eq(0_i64)
+      store.count.should eq(2_i64) # and nothing was pruned — retention is off
+    end
+  end
+
+  it "runs for a project still under its retention cap" do
+    h2_store(retention: 1000, prune_interval: 1) do |store|
+      store.@db.exec("INSERT INTO h2_frames (conn_id, created_at, direction, stream_id, type, flags, length, payload) " \
+                     "VALUES (0,1,'out',1,1,0,4,X'')")
+      2.times { |i| store.insert_flow(h2_request("/keep#{i}", nil)) }
+      store.flush
+      store.@db.scalar("SELECT COUNT(*) FROM h2_frames").as(Int64).should eq(0_i64)
+      store.count.should eq(2_i64)
+    end
+  end
+end

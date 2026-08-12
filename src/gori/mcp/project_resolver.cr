@@ -111,15 +111,11 @@ module Gori
         registry.list.find { |candidate| canonical_db(candidate.db_path) == wanted }
       end
 
-      # A path canonicalized for identity comparison. `realpath` on the file itself when it
-      # exists; otherwise on its DIRECTORY plus the basename, because a `--db` naming a database
-      # that does not exist yet is legitimate (only the parent has to be there) and `realpath`
-      # raises on a missing leaf.
+      # `Paths.canonical_file` owns the rule; `OpenLock` keys its lock files by the same one, so
+      # a `--db` spelling that resolves to a registry project is matched here AND locked there
+      # under one identity.
       private def self.canonical_db(path : String) : String
-        return File.realpath(path) if File.exists?(path)
-        File.join(File.realpath(File.dirname(path)), File.basename(path))
-      rescue
-        path
+        Paths.canonical_file(path)
       end
 
       private def self.active_fallback(registry : ProjectRegistry) : Selection

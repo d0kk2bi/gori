@@ -15,12 +15,14 @@ module Gori
 
     # The legacy per-DIRECTORY marker path (`<dir>/.capture.status`), which the canonical
     # registry db keeps — see Project#capture_status_path for why anything else does not.
+    #
+    # `path` and `read` take a DIRECTORY because the project picker legitimately has only that:
+    # it lists registry projects, whose marker is at the legacy path by definition. The WRITERS
+    # are `_at`-only on purpose — a directory-keyed write is the defect this file's history is
+    # about (two `--db` databases in one directory sharing one marker), so there is no
+    # directory-keyed writer left for a new caller to reach for.
     def self.path(dir : String) : String
       File.join(dir, STATUS_FILE)
-    end
-
-    def self.write(dir : String, host : String, port : Int32, listening : Bool) : Nil
-      write_at(path(dir), host, port, listening)
     end
 
     # Write the marker at an explicit PATH. The path-taking trio (`write_at`/`read_at`/
@@ -72,10 +74,6 @@ module Gori
       )
     rescue
       nil
-    end
-
-    def self.clear(dir : String) : Nil
-      clear_at(path(dir))
     end
 
     def self.clear_at(marker : String) : Nil

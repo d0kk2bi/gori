@@ -1246,8 +1246,7 @@ module Gori::Tui
       orphaned = (id = tab.db_id) ? !@host.session.store.delete_fuzz_session(id) : false
       @fuzzers.delete_at(@current_idx)
       @current_idx = @fuzzers.empty? ? -1 : @current_idx.clamp(0, @fuzzers.size - 1)
-      base = @fuzzers.empty? ? "closed — none open (^N new · ⇧I from History)" : "closed (#{@fuzzers.size} open)"
-      @host.status(orphaned ? "#{base} — the saved tab could NOT be removed (project busy); it will reappear" : base)
+      @host.status(TabClose.message(@fuzzers.empty? ? "closed — none open (^N new · ⇧I from History)" : "closed (#{@fuzzers.size} open)", orphaned))
     end
 
     # Halt EVERY running sweep, not just the current tab's — the project-level exits

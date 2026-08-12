@@ -103,3 +103,67 @@ describe Gori::OpenLock do
     end
   end
 end
+
+# The review found three ways this could fail closed instead of open. Each is pinned here.
+describe "Gori::OpenLock resilience" do
+  it "yields no lock instead of raising when the lock file cannot be opened" do
+    with_project do |_registry, project|
+      # A DIRECTORY where the lock file goes: `File.open(…, "a")` raises EISDIR while the
+      # database itself opens fine. The same shape as an unwritable project dir or a lock file
+      # owned by a teammate — `File::Error`, which is neither `DB::Error` nor `Gori::Error`, so
+      # letting it escape would kill `gori mcp` before the handshake and backtrace `gori run
+      # capture`. The class promises to degrade to "no lock", never to "no store".
+      File.delete?(Gori::OpenLock.path(project.db_path)) # `create` already materialized it
+      Dir.mkdir_p(Gori::OpenLock.path(project.db_path))
+      Gori::OpenLock.try_shared(project.db_path).should be_nil
+      store = Gori::Store.open(project.db_path)
+      begin
+        store.count.should eq(0) # the store opened regardless
+      ensure
+        store.close
+      end
+    end
+  end
+
+  it "keys on the canonicalized database, so two spellings share one lock" do
+    real = File.tempname("gori-lock-real")
+    link = File.tempname("gori-lock-link")
+    Dir.mkdir_p(File.join(real, "projects", "api"))
+    File.symlink(real, link)
+    begin
+      through_link = File.join(link, "projects", "api", Gori::Project::DB_FILE)
+      through_real = File.join(real, "projects", "api", Gori::Project::DB_FILE)
+      # `--db` takes what the operator typed; the registry builds its path from `$GORI_HOME` as
+      # it was given. One database must not end up with two lock files, or a probe against the
+      # wrong one answers "nobody has it open" and the rm_rf proceeds under a live writer.
+      Gori::OpenLock.path(through_link).should eq(Gori::OpenLock.path(through_real))
+      store = Gori::Store.open(through_link)
+      begin
+        Gori::OpenLock.in_use?(through_real).should be_true
+      ensure
+        store.close
+      end
+      Gori::OpenLock.in_use?(through_real).should be_false
+    ensure
+      File.delete?(link)
+      FileUtils.rm_rf(real)
+    end
+  end
+
+  it "gives up rather than raising while an exclusive guard is held, and works once it is not" do
+    with_project do |_registry, project|
+      Gori::Store.open(project.db_path).close # materialize the lock file
+      guard = Gori::OpenLock.try_exclusive(project.db_path).not_nil!
+      begin
+        # Bounded retries, so a store open can never be parked behind a long VACUUM. Giving up
+        # is a logged degradation, never an exception.
+        Gori::OpenLock.try_shared(project.db_path).should be_nil
+      ensure
+        guard.close
+      end
+      shared = Gori::OpenLock.try_shared(project.db_path)
+      shared.should_not be_nil
+      shared.not_nil!.close
+    end
+  end
+end

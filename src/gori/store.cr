@@ -366,6 +366,9 @@ module Gori
       # Set only when the writer's connection RELEASE raised (see writer_loop). It is the exact
       # predicate for "this connection is half-closed", which is what #close must not re-close.
       @writer_teardown_failed = false
+      # Set by `writer_connection_loop` once its loop has returned, so `writer_loop`'s rescue can
+      # tell "the connection release raised" from "the loop itself died".
+      @writer_loop_exited = false
       spawn(name: "gori-store-writer") do
         # `ensure`, not a bare sequence. `#close` parks on `@done.receive` for a value this
         # fiber sends exactly once as it exits, so ANY escape from `writer_loop` leaves that
@@ -578,13 +581,33 @@ module Gori
         writer_connection_loop
       rescue ex
         # gori.log, not STDERR (#411): in TUI mode STDERR is the alternate screen.
-        ::Log.warn { "store writer connection teardown failed: #{ex.message}" }
-        @writer_teardown_failed = true
+        #
+        # WHICH failure this was decides what is safe to do next, and conflating them was wrong
+        # in both directions. `@writer_loop_exited` is set inside the connection block after the
+        # loop returns, so:
+        #
+        # * set ⇒ the LOOP finished and the RELEASE raised (the constraint-poisoned statement).
+        #   Every op has been answered; the connection is half-closed, so `#close` must not
+        #   re-close the pool (that is a use-after-free — see #close).
+        # * clear ⇒ the loop itself died with `@writes` still OPEN and no reader. A caller that
+        #   sends after this would park forever on its reply channel: the hang this rescue was
+        #   added to prevent, moved from `close` to the next write. Close the channel so every
+        #   caller takes its existing `rescue Channel::ClosedError` path (0 / false / dropped)
+        #   instead, and leave the pool closable.
+        if @writer_loop_exited
+          ::Log.warn { "store writer connection teardown failed: #{ex.message}" }
+          @writer_teardown_failed = true
+        else
+          ::Log.error { "store writer fiber died mid-loop: #{ex.message} — further writes will be refused" }
+          @writes.close rescue nil
+        end
       end
     end
 
     private def writer_connection_loop : Nil
       @db.using_connection do |conn|
+        # Reset per connection; `writer_loop` reads it to tell a loop death from a release failure.
+        @writer_loop_exited = false
         # Bound the WAL file so it doesn't grow without limit under sustained
         # writes (the default is 1000 pages; set it explicitly on the writer).
         conn.exec("PRAGMA wal_autocheckpoint=1000") rescue nil
@@ -709,6 +732,7 @@ module Gori
           # (Store#index_pending!) also picks up rows this very batch just dirtied.
           index_replies.each(&.send(index_pending_batch(conn)))
         end
+        @writer_loop_exited = true # the loop is done; anything that raises now is the release
       end
     end
 
@@ -729,6 +753,16 @@ module Gori
     # ordinary retention drop. `Compact.prune_old_flows` already documents and fixes this exact
     # arithmetic; the two sweeps now share one definition of "the newest N".
     private def prune(conn : DB::Connection) : Nil
+      # BEFORE the retention early-returns. The reap below is not retention — it removes frames
+      # whose connection row does not exist, which no cap has any opinion about — and putting it
+      # after `@retention_flows <= 0` meant it never ran for the two commonest projects: an MCP
+      # server opens with RETENTION_UNLIMITED, and a TUI project under its cap returns at
+      # `cutoff <= 0`. The comment there promised a db carrying frames from an older build would
+      # heal itself; for those it did not.
+      #
+      # Still on the prune cadence (once per PRUNE_INTERVAL inserts), so a project that never
+      # inserts another flow heals only via `compact` — which reaps the same rows.
+      reap_unattributed_h2_frames(conn)
       return if @retention_flows <= 0
       # Served by the primary key: a rightmost-leaf descending scan of @retention_flows rows.
       oldest_kept = conn.query_one?(
@@ -771,16 +805,6 @@ module Gori
                 "AND id NOT IN (SELECT conn_id FROM h2_frames WHERE created_at >= ?)"
         c.exec("DELETE FROM h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE #{stale})", oldest)
         c.exec("DELETE FROM h2_connections WHERE #{stale}", oldest)
-        # Frames whose connection row does not exist at all. The guard in `insert_h2_frame`
-        # stops new ones, but a db that ran an older build carries however many it wrote, and
-        # the two statements above can never reach them — they select through `h2_connections`,
-        # and that is exactly the row these frames do not have. Without this the sweep's
-        # promise (the db plateaus) is false for that slice, forever.
-        #
-        # `h2_connections.id` is an INTEGER PRIMARY KEY so the subquery yields no NULL, which
-        # is what makes `NOT IN` safe here. Served by `idx_h2_frames_conn`, and it runs once per
-        # PRUNE_INTERVAL inserts.
-        c.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
       end
       # Say that history was dropped. A sweep is otherwise completely silent, so a flow the
       # operator looked at an hour ago simply vanishing is indistinguishable from a bug. At most
@@ -788,6 +812,20 @@ module Gori
       log_retention_drop(dropped) if dropped > 0
     rescue ex
       ::Log.warn { "retention prune failed (will retry): #{ex.message}" } # gori.log, not STDERR (#411)
+    end
+
+    # Frames whose connection row does not exist at all. The guard in `insert_h2_frame` stops new
+    # ones, but a db that ran an older build carries however many it wrote, and the retention
+    # sweep can never reach them — it selects through `h2_connections`, and that is exactly the
+    # row these frames do not have.
+    #
+    # `h2_connections.id` is an INTEGER PRIMARY KEY so the subquery yields no NULL, which is what
+    # makes `NOT IN` safe here. Served by `idx_h2_frames_conn`. Its own transaction and its own
+    # rescue, like the sweep it runs ahead of: this must never cost the batch that just committed.
+    private def reap_unattributed_h2_frames(conn : DB::Connection) : Nil
+      conn.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
+    rescue ex
+      ::Log.warn { "unattributed h2-frame reap failed (will retry): #{ex.message}" } # gori.log (#411)
     end
 
     # One gori.log line per sweep that actually removed history, naming the setting that
@@ -1058,14 +1096,15 @@ module Gori
       # zero-length WS text/binary frame (valid per RFC 6455 — e.g. an empty heartbeat)
       # reaches here with an empty payload, so use the SQL literal X'' for it, mirroring
       # insert_h2_frame_one's empty-DATA handling.
-      empty = op.payload.empty?
       args = [op.flow_id, op.repeater_id, op.created_at, op.direction, op.opcode] of DB::Any
-      args << op.payload unless empty
+      # `Store.blob_slot` — the site that first found this trap, now using the one helper that
+      # owns it, so the rule has a single implementation rather than this copy plus that one.
+      slot = Store.blob_slot(args, op.payload)
       Store.bind_ws_shape(args, op.shape)
       conn.exec(
         "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
         "fin, rsv, masked, mask_key, frames, declared_len) " \
-        "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"},?,?,?,?,?,?)", args: args)
+        "VALUES (?,?,?,?,?,#{slot},?,?,?,?,?,?)", args: args)
     end
 
     # Append `value` to `args` and answer the placeholder to write in its slot — `X''` for an
