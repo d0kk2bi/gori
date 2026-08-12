@@ -246,5 +246,9 @@ class Gori::Store
             "AND id NOT IN (SELECT conn_id FROM h2_frames WHERE created_at >= ?)"
     conn.exec("DELETE FROM h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE #{stale})", oldest)
     conn.exec("DELETE FROM h2_connections WHERE #{stale}", oldest)
+    # Connection-less frames, which neither statement above can select (they go through
+    # `h2_connections`, and that row is the thing these frames lack). Same reap as `Store#prune`
+    # — the two sweeps keep one definition of what is reclaimable.
+    conn.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
   end
 end

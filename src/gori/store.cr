@@ -704,6 +704,16 @@ module Gori
                 "AND id NOT IN (SELECT conn_id FROM h2_frames WHERE created_at >= ?)"
         c.exec("DELETE FROM h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE #{stale})", oldest)
         c.exec("DELETE FROM h2_connections WHERE #{stale}", oldest)
+        # Frames whose connection row does not exist at all. The guard in `insert_h2_frame`
+        # stops new ones, but a db that ran an older build carries however many it wrote, and
+        # the two statements above can never reach them — they select through `h2_connections`,
+        # and that is exactly the row these frames do not have. Without this the sweep's
+        # promise (the db plateaus) is false for that slice, forever.
+        #
+        # `h2_connections.id` is an INTEGER PRIMARY KEY so the subquery yields no NULL, which
+        # is what makes `NOT IN` safe here. Served by `idx_h2_frames_conn`, and it runs once per
+        # PRUNE_INTERVAL inserts.
+        c.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
       end
       # Say that history was dropped. A sweep is otherwise completely silent, so a flow the
       # operator looked at an hour ago simply vanishing is indistinguishable from a bug. At most
@@ -860,6 +870,17 @@ module Gori
       # request_size is the TRUE wire size (body_size when the BLOB was truncated),
       # so the History size column stays honest even for a capped body.
       body_size = req.body_size || req.body.try(&.size.to_i64) || 0_i64
+      # 0 is not an id, it is the "no raw frame log for this connection" sentinel — that is what
+      # `FlowSink#on_h2_open`'s default returns, and what `StoreSink#on_h2_open` hands back when
+      # `insert_h2_connection` did not commit. Stored as-is it becomes a NON-NULL id pointing at
+      # no row, and two History guards read this column with `.nil?` / a truthiness check:
+      # `load_detail_logs` does `if cid = detail.h2_conn_id` — and `0_i64` is truthy in Crystal —
+      # so the frame-log pane opened `h2_frames(0)`, which is the merged pile of EVERY
+      # unattributed connection's frames shown under one flow. The other two treat a non-nil
+      # value as "a streaming h2 flow, keep re-reading it", so a complete, immutable flow
+      # re-fetched and re-split its body on every poll tick forever. NULL says the one true
+      # thing: this flow has no frame log.
+      h2_conn_id = req.h2_conn_id.try { |cid| cid > 0 ? cid : nil }
       res = conn.exec(
         <<-SQL,
         INSERT INTO flows
@@ -872,7 +893,7 @@ module Gori
         req.http_version, req.sni, req.alpn, req.tls_version,
         req.head, req.body,
         req.head.size.to_i64 + body_size,
-        FlowState::Pending.value, req.h2_conn_id, req.h2_stream_id,
+        FlowState::Pending.value, h2_conn_id, req.h2_stream_id,
         req.body_truncated? ? 1 : 0, unsent ? 1 : 0, req.short_circuited? ? 1 : 0, req.advisory)
       # The INSERT's own result carries the rowid — no separate `SELECT last_insert_rowid()`.
       # No flows_fts write here: `fts_dirty = 1` hands the trigram work to the off-commit
