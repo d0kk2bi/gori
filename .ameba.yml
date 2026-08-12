@@ -25,6 +25,22 @@ Lint/NotNilAfterNoBang:
 Style/RedundantNilInControlExpression:
   Enabled: false
 
+# 106 sites, every one of them in the TUI. 43 of the flagged `set_*` methods are not
+# field writes at all: `TextArea#set_text` resets ten sibling ivars and clears the
+# undo stack, `SpaceMenu#set_selected` clamps what it stores, others break the typing
+# run or drop stale conceal spans. `x.text = s` reads as a cheap idempotent assignment
+# and would hide exactly that. The rule is all-or-nothing per rule, not per site, so
+# renaming only the 63 genuine one-liners is not expressible here — and splitting the
+# set two ways by name would leave the distinction invisible at the call site anyway.
+#
+# NB the return value is NOT the hazard people expect coming from Ruby: Crystal's
+# `foo=` yields its BODY's value, not the assigned one (`(t.v = 99)` is 5 when the
+# body clamps to 5), so the rename would be value-preserving. It is the 106 call-site
+# renames through the least-tested part of the tree, for no behavioural gain, that
+# make this not worth it.
+Naming/AccessorMethodName:
+  Enabled: false
+
 # Duplicate signal — `just check` already runs `crystal tool format --check`, and
 # this rule reports the same files a second time.
 Lint/Formatting:

@@ -35,7 +35,7 @@ module Gori
             flags = segs[1..].map(&.strip.downcase)
             # Keep the ORIGINAL-case Expires value for date parsing (flags are lowercased above,
             # which would break HTTP_DATE's month/day names).
-            expires_val = segs[1..].map(&.strip).find { |f| f.downcase.starts_with?("expires=") }.try { |f| f.partition('=')[2].strip }
+            expires_val = segs[1..].map(&.strip).find(&.downcase.starts_with?("expires=")).try(&.partition('=').[2].strip)
             # A cookie being deleted holds no secret — skip its hygiene (avoids logout/reset FPs).
             next if deletion?(value, flags, expires_val)
 

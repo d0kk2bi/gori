@@ -648,7 +648,7 @@ module Gori::Tui
       # unwrapped line, and it must not allocate a copy per row per frame. O(spans), and
       # deliberately NOT "materialise the plain text and compare lengths": that would
       # rebuild a multi-MB body line on the hot render path.
-      total = line.sum { |span| span.text.size }
+      total = line.sum(&.text.size)
       return line if a <= 0 && b >= total
       sliced = Line.new
       return sliced if a >= b

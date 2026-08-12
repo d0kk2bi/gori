@@ -489,7 +489,7 @@ module Gori::Tui
     def apply_tag(text : String) : Nil
       value = text.blank? ? nil : text
       index = node_index
-      @tag_targets.each { |key| index[key]?.try { |node| node.tag = value } }
+      @tag_targets.each { |key| index[key]?.try(&.tag=(value)) }
       cancel_tag
     end
 

@@ -728,7 +728,7 @@ module Gori::Tui
       @current_idx =
         if cur_db && (idx = @miners.index { |t| t.db_id == cur_db })
           idx
-        elsif (cv = cur_view) && (idx = @miners.index { |t| t.view.same?(cv) })
+        elsif (cv = cur_view) && (idx = @miners.index(&.view.same?(cv)))
           idx
         elsif @miners.empty?
           -1

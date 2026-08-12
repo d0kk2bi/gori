@@ -997,7 +997,7 @@ module Gori::Tui
     # Apply the typed name to the captured tab + persist. Re-find by VIEW identity (the
     # reconcile may have reordered/removed it) — gone → no-op, never hits a neighbour.
     def apply_rename(view : RepeaterView, name : String) : Nil
-      return unless tab = @repeaters.find { |t| t.view.same?(view) }
+      return unless tab = @repeaters.find(&.view.same?(view))
       clean = name.strip
       view.name = clean.empty? ? nil : clean
       if id = tab.db_id
@@ -1009,7 +1009,7 @@ module Gori::Tui
     # reconcile may have reordered/removed it) — gone → no-op. Mirrors apply_rename;
     # blank clears every tag. The raw string is normalized (ws/comma split, dedupe).
     def apply_tags(view : RepeaterView, raw : String) : Nil
-      return unless tab = @repeaters.find { |t| t.view.same?(view) }
+      return unless tab = @repeaters.find(&.view.same?(view))
       view.tags = Repeater::Tags.parse(raw)
       if id = tab.db_id
         @host.session.store.set_repeater_tags(id, Repeater::Tags.serialize(view.tags))
@@ -1029,7 +1029,7 @@ module Gori::Tui
         view, result = pair
         # Drop a result whose sub-tab was closed (^W) mid-flight — applying it would
         # mutate an orphaned view and flash a toast for a gone session.
-        next unless tab = @repeaters.find { |t| t.view.same?(view) }
+        next unless tab = @repeaters.find(&.view.same?(view))
         view.apply(result)
         # Persist a SUCCESSFUL send as the tab's last response (V11) so it survives a
         # reopen. Only on success: a later failed resend must not wipe a good response.
@@ -1042,7 +1042,7 @@ module Gori::Tui
       end
       while pair = nonblocking_ws_result
         view, result = pair
-        next unless tab = @repeaters.find { |t| t.view.same?(view) } # sub-tab closed mid-flight
+        next unless tab = @repeaters.find(&.view.same?(view)) # sub-tab closed mid-flight
         view.apply_ws(result)
         if result.ok?
           recv = result.messages.count(&.direction.==("in"))
@@ -1059,7 +1059,7 @@ module Gori::Tui
       end
       while pair = nonblocking_group_result
         view, labeled = pair
-        next unless @repeaters.find { |t| t.view.same?(view) } # sub-tab closed mid-flight
+        next unless @repeaters.find(&.view.same?(view)) # sub-tab closed mid-flight
         view.apply_group(labeled)
         ok = labeled.count { |(_, r)| r.error.nil? }
         @host.status("send group: #{ok}/#{labeled.size} ok on one connection")
@@ -1067,7 +1067,7 @@ module Gori::Tui
       end
       while pair = nonblocking_minimize_event
         view, msg = pair
-        next unless tab = @repeaters.find { |t| t.view.same?(view) } # sub-tab closed mid-run → drop
+        next unless tab = @repeaters.find(&.view.same?(view)) # sub-tab closed mid-run → drop
         case msg
         in Repeater::Minimize::Progress
           if (mj = @minimize_job) && mj[0].same?(view)
@@ -1282,7 +1282,7 @@ module Gori::Tui
       @current_repeater_idx =
         if cur_db && (idx = @repeaters.index { |t| t.db_id == cur_db })
           idx
-        elsif (cv = cur_view) && (idx = @repeaters.index { |t| t.view.same?(cv) })
+        elsif (cv = cur_view) && (idx = @repeaters.index(&.view.same?(cv)))
           idx # a db_id-less (WS) active tab: re-find by identity so the resort can't swap it
         elsif @repeaters.empty?
           -1
