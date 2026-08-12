@@ -78,17 +78,26 @@ module Gori::Tui
 
     def self.mouth(pose : Symbol) : Char
       case pose
-      when :happy then 'o' # delighted, open — x-height
-      when :alert then '_' # tense, flat — baseline
-      when :error then '_'
-      when :doze  then '·' # slack — mid
-      else             'u' # the resting smile — a cup below the eyes
+      when :happy  then 'o' # delighted, open — x-height
+      when :alert  then '_' # tense, flat — baseline
+      when :error  then '_'
+      when :doze   then '·' # slack — mid
+      when :oh     then 'o' # the yawn winding up, and a small "oh" on its own
+      when :yawn   then 'o'
+      when :smile  then 'u' # the resting cup, under crinkled-shut eyes
+      when :squint then 'u'
+      when :flat   then '_' # deadpan: the tense mouth on an unbothered face
+      else              'u' # the resting smile — a cup below the eyes
       end
     end
 
-    # Every pose. Kept small on purpose — most expression variety comes from the independent
-    # wink/badge/glint axes below rather than from growing this table.
-    POSES = {:idle, :blink, :happy, :alert, :error, :doze}
+    # Every pose. Two families, and the split matters: the first six are REACTIONS (what
+    # mood she is in, chosen by Companion#pose_for), the rest are IDLE GESTURES she plays
+    # unprompted (Companion::GESTURES). Still kept small — expression variety comes first
+    # from the independent wink/badge/glint axes below, and a new entry here has to earn
+    # itself a face no other pose already wears.
+    POSES = {:idle, :blink, :happy, :alert, :error, :doze,
+             :oh, :yawn, :smile, :squint, :flat}
     WINKS = {:none, :left, :right}
 
     # Ink roles, one char per art cell, parallel to the assembled art rows:
@@ -146,14 +155,23 @@ module Gori::Tui
       corner : Color, eye : Color, lash : Color, mouth : Color,
       badge : Color, plate : Color
 
+    # SPELL OUT EVERY POSE, including the ones that land on the `else` value anyway. A pose
+    # missing an arm here falls through to the open idle eyes and — paired with an idle
+    # mouth — renders as a pose that never visibly happened, which nothing about the code
+    # or a tmux capture flags. Same for .mouth above.
     def self.eyes(pose : Symbol) : {Char, Char}
       case pose
-      when :blink then {'─', '─'}
-      when :happy then {'^', '^'}
-      when :alert then {'O', 'O'}
-      when :error then {'×', '×'} # the ✘_✘ read, with a glyph every face actually has
-      when :doze  then {'~', '~'}
-      else             {'●', '●'} # :idle
+      when :blink  then {'─', '─'}
+      when :happy  then {'^', '^'}
+      when :alert  then {'O', 'O'}
+      when :error  then {'×', '×'} # the ✘_✘ read, with a glyph every face actually has
+      when :doze   then {'~', '~'}
+      when :yawn   then {'─', '─'} # squeezed shut mid-yawn
+      when :smile  then {'^', '^'} # crinkled — :happy's eyes over the resting mouth
+      when :squint then {'·', '·'} # pupils down to a dot, peering at something
+      when :oh     then {'●', '●'} # open, over an open mouth
+      when :flat   then {'●', '●'} # open, over a flat mouth — deadpan
+      else              {'●', '●'} # :idle
       end
     end
 
