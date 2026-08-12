@@ -130,8 +130,19 @@ module Gori
                              method : String?, source_ip : String?, full_id : String,
                              raw_request : Bytes, raw_response : Bytes?, created_at : Int64) : Int64
       exec_task ->(c : DB::Connection) {
-        c.exec("INSERT OR IGNORE INTO oast_callbacks (session_id, created_at, provider_uid, protocol, method, source_ip, full_id, raw_request, raw_response) VALUES (?,?,?,?,?,?,?,?,?)",
-          session_id, created_at, provider_uid, protocol, method, source_ip, full_id, raw_request, raw_response)
+        # `raw_request` through `Store.blob_slot`. The column is `BLOB NOT NULL`, an empty slice
+        # binds SQL NULL, and `OR IGNORE` swallows the violation — so a callback with no raw
+        # request was DROPPED. That is not a hypothetical shape: `Interaction#raw_request` is a
+        # plain String the providers fill from a `raw-request` field, the interactsh parser
+        # already branches on `unless raw.empty?`, and a DNS/SMTP hit need not carry one. The
+        # operator saw the hit live (a notification plus the in-memory list) and it was gone
+        # after a reload — evidence loss on an out-of-band finding, which is the whole product
+        # of this table. Measured: a DNS-only callback and an HTTP one, only the HTTP one kept.
+        args = [session_id, created_at, provider_uid, protocol, method, source_ip, full_id] of DB::Any
+        slot = Store.blob_slot(args, raw_request)
+        args << raw_response
+        c.exec("INSERT OR IGNORE INTO oast_callbacks (session_id, created_at, provider_uid, protocol, method, source_ip, full_id, raw_request, raw_response) " \
+               "VALUES (?,?,?,?,?,?,?,#{slot},?)", args: args)
         nil
       }
     end

@@ -48,7 +48,12 @@ module Gori
                  "title = ?, evidence = ?, last_seen = ? WHERE id = ?",
             urls.to_json, new_sev, new_title, new_evidence, ts, id)
         else
-          c.exec("INSERT INTO probe_issues (code, category, host, title, severity, status, hit_count, " \
+          # OR IGNORE: this is a SELECT-then-INSERT across a transaction, so a peer process that
+          # inserted the same (code, host) in between would land on the table\'s UNIQUE — and a
+          # RAISE here does not merely lose this detection, it rolls back the whole writer batch
+          # and poisons the connection (see `update_scope_rule`). Ignoring is the right outcome
+          # anyway: the row exists, and the next detection for it takes the UPDATE branch above.
+          c.exec("INSERT OR IGNORE INTO probe_issues (code, category, host, title, severity, status, hit_count, " \
                  "affected, sample_flow_id, evidence, first_seen, last_seen, sample_repeater_id) " \
                  "VALUES (?,?,?,?,?,0,1,?,?,?,?,?,?)",
             d.code, d.category, d.host, d.title, d.severity.value,

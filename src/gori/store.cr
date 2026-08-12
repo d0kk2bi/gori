@@ -931,20 +931,27 @@ module Gori
       # re-fetched and re-split its body on every poll tick forever. NULL says the one true
       # thing: this flow has no frame log.
       h2_conn_id = req.h2_conn_id.try { |cid| cid > 0 ? cid : nil }
+      # Built as an args array, in the column order listed below, so `request_head` can take the
+      # `X\'\'` slot when it is empty (see Store.blob_slot — an empty slice would otherwise bind
+      # SQL NULL and violate `BLOB NOT NULL`, rolling back this whole capture batch).
+      args = [req.created_at, req.scheme, req.host, req.port, req.method, req.target,
+              req.http_version, req.sni, req.alpn, req.tls_version] of DB::Any
+      head_slot = Store.blob_slot(args, req.head)
+      args << req.body
+      args << req.head.size.to_i64 + body_size
+      args << FlowState::Pending.value
+      args << h2_conn_id
+      args << req.h2_stream_id
+      args << (req.body_truncated? ? 1 : 0)
+      args << (unsent ? 1 : 0)
+      args << (req.short_circuited? ? 1 : 0)
+      args << req.advisory
       res = conn.exec(
-        <<-SQL,
-        INSERT INTO flows
-          (created_at, scheme, host, port, method, target, http_version,
-           sni, alpn, tls_version, request_head, request_body, request_size, state,
-           h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, fts_dirty)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
-        SQL
-        req.created_at, req.scheme, req.host, req.port, req.method, req.target,
-        req.http_version, req.sni, req.alpn, req.tls_version,
-        req.head, req.body,
-        req.head.size.to_i64 + body_size,
-        FlowState::Pending.value, h2_conn_id, req.h2_stream_id,
-        req.body_truncated? ? 1 : 0, unsent ? 1 : 0, req.short_circuited? ? 1 : 0, req.advisory)
+        "INSERT INTO flows " \
+        "(created_at, scheme, host, port, method, target, http_version, " \
+        " sni, alpn, tls_version, request_head, request_body, request_size, state, " \
+        " h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, fts_dirty) " \
+        "VALUES (?,?,?,?,?,?,?,?,?,?,#{head_slot},?,?,?,?,?,?,?,?,?,1)", args: args)
       # The INSERT's own result carries the rowid — no separate `SELECT last_insert_rowid()`.
       # No flows_fts write here: `fts_dirty = 1` hands the trigram work to the off-commit
       # indexer, so a capture commit no longer pays for tokenization (see V4 / await_op).
@@ -1042,6 +1049,24 @@ module Gori
         "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
         "fin, rsv, masked, mask_key, frames, declared_len) " \
         "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"},?,?,?,?,?,?)", args: args)
+    end
+
+    # Append `value` to `args` and answer the placeholder to write in its slot — `X''` for an
+    # EMPTY slice, `?` otherwise.
+    #
+    # An empty `Bytes` is a NULL POINTER, and the driver binds a null pointer as SQL NULL, so a
+    # zero-length blob handed to a `BLOB NOT NULL` column violates the constraint instead of
+    # storing nothing. `insert_ws_one` and `insert_h2_frame_one` each discovered this and each
+    # wrote their own `X''` branch; the remaining NOT NULL BLOB columns (`flows.request_head`,
+    # `miner_sessions.request`, `sequencer_sessions.request`) did not, and measured, an empty
+    # value there did not merely drop its own row — the violation RAISES inside the writer
+    # transaction, so the whole BATCH rolls back, taking every captured flow the writer had
+    # grouped with it, and (before the teardown guards) poisoned the connection into hanging
+    # `Store#close`. One helper now, so a fourth column cannot rediscover it.
+    def self.blob_slot(args : Array(DB::Any), value : Bytes) : String
+      return "X''" if value.empty?
+      args << value
+      "?"
     end
 
     # The six V7 shape columns, in the order every `ws_messages` INSERT lists them. Shared

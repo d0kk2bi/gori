@@ -22,9 +22,19 @@ module Gori
           placeholders = Array.new(rows.size, "?").join(",")
           c.exec("DELETE FROM intercept_held WHERE session_token = ? AND item_id NOT IN (#{placeholders})", args: keep)
           rows.each do |r|
-            c.exec("INSERT OR IGNORE INTO intercept_held (session_token, item_id, kind, method, host, port, scheme, target, flow_id, raw, held_at_ms, edited, edit_refusal, head_only, binary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-              token, r.item_id, r.kind, r.method, r.host, r.port, r.scheme, r.target, r.flow_id, r.raw, r.held_at_ms, r.edited ? 1 : 0,
-              r.edit_refusal, r.head_only? ? 1 : 0, r.binary? ? 1 : 0)
+            # `raw` through `Store.blob_slot`: the column is `BLOB NOT NULL`, an empty slice binds
+            # SQL NULL, and `OR IGNORE` then SWALLOWS the violation — the row simply never
+            # appears. A zero-length WebSocket frame is valid (RFC 6455; the same empty heartbeat
+            # `insert_ws_one` has its own `X\'\'` branch for) and it is held like any other, so
+            # `intercept_list`/`intercept_get` and `gori run intercept` saw a queue with that item
+            # MISSING while the gate kept its fiber blocked — nothing on those surfaces could
+            # forward or drop it. Measured: publishing an empty frame and a normal one left only
+            # the normal one visible.
+            args = [token, r.item_id, r.kind, r.method, r.host, r.port, r.scheme, r.target, r.flow_id] of DB::Any
+            slot = Store.blob_slot(args, r.raw)
+            args << r.held_at_ms << (r.edited ? 1 : 0) << r.edit_refusal << (r.head_only? ? 1 : 0) << (r.binary? ? 1 : 0)
+            c.exec("INSERT OR IGNORE INTO intercept_held (session_token, item_id, kind, method, host, port, scheme, target, flow_id, raw, held_at_ms, edited, edit_refusal, head_only, binary) " \
+                   "VALUES (?,?,?,?,?,?,?,?,?,#{slot},?,?,?,?,?)", args: args)
           end
         end
         nil
