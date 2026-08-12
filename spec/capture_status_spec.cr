@@ -14,7 +14,7 @@ describe Gori::CaptureStatus do
   it "writes, reads, and clears the status sidecar" do
     dir = File.tempname("gori-status")
     begin
-      Gori::CaptureStatus.write(dir, "127.0.0.1", 8070, true)
+      Gori::CaptureStatus.write_at(Gori::CaptureStatus.path(dir), "127.0.0.1", 8070, true)
       File.exists?(Gori::CaptureStatus.path(dir)).should be_true
 
       status = Gori::CaptureStatus.read(dir)
@@ -23,7 +23,7 @@ describe Gori::CaptureStatus do
       status.not_nil!.port.should eq(8070)
       status.not_nil!.listening.should be_true
 
-      Gori::CaptureStatus.clear(dir)
+      Gori::CaptureStatus.clear_at(Gori::CaptureStatus.path(dir))
       File.exists?(Gori::CaptureStatus.path(dir)).should be_false
       Gori::CaptureStatus.read(dir).should be_nil
     ensure

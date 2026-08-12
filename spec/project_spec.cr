@@ -52,6 +52,21 @@ describe Gori::Project do
       end
     end
 
+    # `Store.open` diagnoses two cases itself and raises a Gori::Error that already names the
+    # db — "cannot open <path>: not a valid SQLite database". Wrapping that in "could not open
+    # 'p': …" prints the path twice and adds nothing, and re-deriving a guess from the path
+    # would be free to contradict a reason the store actually established.
+    it "passes through a reason that already names the database" do
+      with_tmp_dir do |dir|
+        path = File.join(dir, "gori.db")
+        File.write(path, "not a database")
+        reason = Gori::Project.new("p", path)
+          .open_failure_reason(Gori::Error.new("cannot open #{path}: not a valid SQLite database"))
+        reason.should eq("cannot open #{path}: not a valid SQLite database")
+        reason.should_not contain("could not open")
+      end
+    end
+
     # A non-DB exception against an EXISTING file takes the same fallback: only a driver
     # error is evidence about the file's contents.
     it "does not blame the file for a non-database error" do

@@ -75,6 +75,16 @@ module Gori
           return err(e, "INVALID_ARGUMENT", field: "pattern")
         end
 
+        # Split the two causes `update_scope_rule`'s single `false` collapses: a collision with
+        # ANOTHER rule on `scope_rules`' UNIQUE(kind, match_type, pattern) is deterministic (never
+        # retry), a rolled-back store write is transient. The same split `update_host_override`
+        # already makes next door, and `gori run project scope update` too — with a comment naming
+        # this exact misreport: "the busy-store abort below reported a duplicate as 'store busy or
+        # unwritable' — sending the operator to hunt for a lock".
+        if scope.rules.any? { |r| r.id != id && r.kind == kind && r.match_type == match_type && r.pattern == pattern }
+          return err("another scope rule already matches #{kind} #{match_type} #{pattern}",
+            "INVALID_ARGUMENT", field: "pattern")
+        end
         unless store.update_scope_rule(id, kind, match_type, pattern)
           return busy("scope rule NOT updated (store busy or unwritable); it is unchanged and still gates traffic")
         end

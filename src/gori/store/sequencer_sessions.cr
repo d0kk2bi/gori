@@ -31,8 +31,14 @@ module Gori
                                  config : String, flow_id : Int64?, position : Int32, name : String? = nil) : Int64
       ts = now_us
       exec_task ->(c : DB::Connection) {
-        c.exec("INSERT INTO sequencer_sessions (created_at, updated_at, target, request, http2, sni, config, flow_id, position, name) VALUES (?,?,?,?,?,?,?,?,?,?)",
-          ts, ts, target, request, http2 ? 1 : 0, sni, config, flow_id, position, name)
+        # `request` goes through `Store.blob_slot`: the column is `BLOB NOT NULL`, and an empty
+        # slice binds SQL NULL, which violated it and rolled back the whole writer batch —
+        # silently, since this returns 0 for "dropped" and the caller reads that as "no session".
+        args = [ts, ts, target] of DB::Any
+        slot = Store.blob_slot(args, request)
+        args << (http2 ? 1 : 0) << sni << config << flow_id << position << name
+        c.exec("INSERT INTO sequencer_sessions (created_at, updated_at, target, request, http2, sni, config, flow_id, position, name) " \
+               "VALUES (?,?,?,#{slot},?,?,?,?,?,?)", args: args)
         nil
       }
     end
@@ -40,8 +46,10 @@ module Gori
     def update_sequencer_session(id : Int64, target : String, request : Bytes, http2 : Bool,
                                  sni : String?, config : String, name : String? = nil) : Nil
       exec_task ->(c : DB::Connection) {
-        c.exec("UPDATE sequencer_sessions SET target=?, request=?, http2=?, sni=?, config=?, name=?, updated_at=? WHERE id=?",
-          target, request, http2 ? 1 : 0, sni, config, name, now_us, id)
+        args = [target] of DB::Any
+        slot = Store.blob_slot(args, request) # BLOB NOT NULL — see the insert above
+        args << (http2 ? 1 : 0) << sni << config << name << now_us << id
+        c.exec("UPDATE sequencer_sessions SET target=?, request=#{slot}, http2=?, sni=?, config=?, name=?, updated_at=? WHERE id=?", args: args)
         nil
       }
     end
@@ -69,8 +77,10 @@ module Gori
     # out of the V10 rebuild that gave fuzz/miner `AUTOINCREMENT` (there was no id to protect),
     # and it needs its own migration on that day — otherwise reuse makes a stray dangerous
     # rather than merely dead. See the V10 comment in schema.cr for the shape.
-    def delete_sequencer_session(id : Int64) : Nil
-      exec_task ->(c : DB::Connection) {
+    # Returns whether the delete COMMITTED, like `delete_repeater` and `delete_fuzz_session`: a
+    # rolled-back batch leaves the row, so the tab the operator closed reappears on the next open.
+    def delete_sequencer_session(id : Int64) : Bool
+      exec_task_ok ->(c : DB::Connection) {
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'sequencer' AND ref_id = ?", id)
         c.exec("DELETE FROM sequencer_sessions WHERE id = ?", id)
         nil

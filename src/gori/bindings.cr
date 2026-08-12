@@ -304,6 +304,15 @@ module Gori
       !kind.position?
     end
 
+    # Returned by `add`/`update` when the STORE refused the write rather than the values being
+    # wrong: the project's writer is held by another instance, or a peer added a rule with this
+    # `name` since the last refresh and it hit `extract_rules`' UNIQUE(name) (which
+    # `insert/update_extract_rule` turn into a no-op rather than a raise). Both are worth
+    # retrying, so a caller that distinguishes a transient failure — MCP's PROJECT_BUSY — keys
+    # off this exact value; a retry either succeeds or comes back as `validate`'s precise
+    # duplicate message once `refresh` has seen the peer's rule.
+    STORE_REFUSED = "extract rule NOT saved (project busy, or that name was just taken); it is unchanged"
+
     # Add a rule. Returns nil on success, or the refusal message.
     def add(name : String, match_filter : String, kind : Gori::ExtractKind,
             selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
@@ -311,7 +320,10 @@ module Gori
       if err = validate(name, kind, selector, pos_start: pos_start, pos_end: pos_end)
         return err
       end
-      @store.insert_extract_rule(name, match_filter, kind, selector, pos_start, pos_end, host)
+      # 0 is `insert_extract_rule`'s "the write was dropped" (its own comment says so), and it
+      # was discarded here — so a rule that never landed was reported as added, and the TUI form
+      # closed on it.
+      return STORE_REFUSED if @store.insert_extract_rule(name, match_filter, kind, selector, pos_start, pos_end, host) == 0
       refresh
       nil
     end
@@ -323,7 +335,13 @@ module Gori
         return err
       end
       previous = @mutex.synchronize { @rules.find(&.id.==(id)) }
-      @store.update_extract_rule(id, name, match_filter, kind, selector, pos_start, pos_end, host)
+      # BEFORE the rename side effect below, and checked: `update_extract_rule` reports whether
+      # the UPDATE landed, and dropping that meant a refused edit still dropped the in-memory
+      # value under the old name — an extraction lost for a rename that never happened — while
+      # the surface reported `updated: true` for a rule still observing under its old descriptor.
+      unless @store.update_extract_rule(id, name, match_filter, kind, selector, pos_start, pos_end, host)
+        return STORE_REFUSED
+      end
       # A RENAME drops the old name's value rather than carrying it over: the value was
       # observed under the old descriptor, and silently re-labelling it is how a binding
       # would come to disagree with the rule that claims to own it.

@@ -364,10 +364,25 @@ module Gori
       return false if pattern.empty? || !Scope.valid?(match_type, pattern)
       @mutex.synchronize do
         return false if @rules.any? { |r| r.id != id && r.kind == kind && r.match_type == match_type && r.pattern == pattern }
-        @store.update_scope_rule(id, kind, match_type, pattern)
+        # The store's answer, not an unconditional `true`. `update_scope_rule` is `exec_task_ok`
+        # and has always reported whether the UPDATE committed; `remove` below returns it, and
+        # `HostOverrides#update` next door returns it with the note "false also when the store
+        # write rolled back (busy/locked), not just on dup" — this was the one sibling still
+        # discarding it. `ProjectView#commit_scope_rule`, its only caller, is written around
+        # getting it: it settles the duplicate case itself so that "whatever false survives that
+        # is the store", and answers `:failed` — "the store refused the write, the scope is
+        # unchanged". That branch was unreachable for an EDIT, so an operator who narrowed a
+        # rule was told the scope had changed while the old, wider pattern was still the one
+        # gating what may be probed and fuzzed.
+        #
+        # The dup pre-check above is not the whole guard: it reads THIS object's snapshot, so a
+        # rule another instance added since the last reload is invisible to it and the write
+        # then violates the table's UNIQUE triple and rolls back. That is the reachable path,
+        # and it is the one that used to report success.
+        committed = @store.update_scope_rule(id, kind, match_type, pattern)
         reload_rules_unlocked
+        committed
       end
-      true
     end
 
     # Returns whether the DELETE COMMITTED (false = store busy/locked/closing).

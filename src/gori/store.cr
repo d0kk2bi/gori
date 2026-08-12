@@ -29,6 +29,7 @@ require "./store/h2_frames"
 require "./store/reads"
 require "./store/sitemap_tags"
 require "./ql"
+require "./open_lock"
 
 module Gori
   # SQLite-primary storage (P5/P7): raw request/response BYTES are the truth
@@ -219,13 +220,100 @@ module Gori
                   probe_events : Channel(FlowEvent)? = nil,
                   retention_flows : Int32 = RETENTION_DEFAULT) : Store
       url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=5000"
-      db = DB.open(url)
-      harden_permissions(path)
-      # Make REGEXP byte-safe on every connection before any query runs (so a binary
-      # body can't crash a `body~`/`header~` scan or a regex scope rule). See SafeRegexp.
-      SafeRegexp.install(db)
-      Schema.migrate!(db)
-      new(db, events, probe_events, retention_flows)
+      refuse_non_database(path)
+      # Announce that this process has the database open, for as long as it is (see OpenLock).
+      # Taken BEFORE `DB.open` so the window in which a peer could delete the file out from
+      # under a half-built store does not exist.
+      open_lock = OpenLock.try_shared(path)
+      db = begin
+        DB.open(url)
+      rescue ex
+        open_lock.try(&.close)
+        raise ex
+      end
+      # Everything between DB.open and handing the pool to `new` has to be unwound on
+      # failure, because `db` is a live connection POOL and nothing else has a reference
+      # to it yet: an escaping exception left the sqlite handle (plus its -wal/-shm)
+      # open for the rest of the process. That is not a one-shot cost — every surface
+      # that opens a project RECOVERS from a failed open and keeps running: the TUI
+      # picker falls back to the project list with `open_failure_reason` (app.cr),
+      # MCP `switch_project` answers an error and stays bound to the old project, and
+      # both `delete_project`'s dry run and `gori run project delete`'s preview open a
+      # short-lived handle they report `nil` counts for. Each retry against the same
+      # unopenable project leaked another descriptor, so a session that repeatedly
+      # bumped into one corrupt project ran the process out of fds.
+      #
+      # `compact`/`measure` next door already wrap their own DB.open in begin/ensure;
+      # this was the one sibling without it.
+      begin
+        harden_permissions(path)
+        # Make REGEXP byte-safe on every connection before any query runs (so a binary
+        # body can't crash a `body~`/`header~` scan or a regex scope rule). See SafeRegexp.
+        SafeRegexp.install(db)
+        Schema.migrate!(db)
+      rescue ex
+        db.close rescue nil
+        open_lock.try(&.close)
+        raise ex
+      end
+      # Past this point the Store owns the pool and closes it in #close.
+      new(db, events, probe_events, retention_flows, open_lock: open_lock)
+    end
+
+    # The 16-byte header every SQLite database file starts with: 15 ASCII bytes plus the
+    # terminating NUL. Written as an escape — a raw NUL in a source literal is invisible.
+    SQLITE_MAGIC = "SQLite format 3\u0000".to_slice
+
+    # Refuse a path that exists but is not a SQLite database, BEFORE the driver is asked to
+    # open it. Two independent reasons, both about this exact URL:
+    #
+    # 1. The driver LEAKS the fd on this input. `SQLite3::Connection#initialize` calls
+    #    `sqlite3_open_v2` (which succeeds on any file — sqlite reads the header lazily) and
+    #    then execs the pragmas this URL carries; `PRAGMA journal_mode=wal` is what actually
+    #    reads page 1, fails SQLITE_NOTADB, and unwinds the constructor through a bare
+    #    `rescue raise DB::ConnectionRefused` that never closes the handle it opened. Since
+    #    `DB.open` eagerly builds the pool's first connection, the leak happens INSIDE
+    #    DB.open — before `Store.open` holds anything it could close. Measured at exactly
+    #    one descriptor per attempt, and every surface here retries: the TUI picker returns
+    #    to the project list and lets the operator pick again, MCP `switch_project` stays
+    #    bound and answers an error. The same URL WITHOUT pragmas leaks nothing, which is
+    #    what pins the cause on the pragma exec rather than on the open.
+    # 2. It is the only one of the unopenable cases whose real reason is knowable here.
+    #    `DB::ConnectionRefused` carries a nil message, so "this file is not a database",
+    #    "no read permission" and "that is a directory" arrive indistinguishable — which is
+    #    why `Project#open_failure_reason` has to reconstruct a guess from the path. Naming
+    #    it at the source means every surface (TUI picker, `gori run`, MCP bind) reports the
+    #    same true sentence instead of three re-derivations of it.
+    #
+    # Only an EXISTING, NON-EMPTY REGULAR file is judged: a missing path and a zero-byte file
+    # are both how a new project legitimately starts (sqlite creates/initialises them), and
+    # `:memory:` is not a path at all.
+    private def self.refuse_non_database(path : String) : Nil
+      info = File.info?(path)
+      return unless info # missing (a new project) or unstatable — the driver's problem
+      raise Gori::Error.new("cannot open #{path}: that is a directory, not a database file") if info.directory?
+      # Judged from the TYPE, before any open. A pipe/socket/device is not a database, and
+      # deciding that from `stat` rather than from its contents means this never opens one:
+      # a FIFO reports size 0 and yields nothing to read, so a content-based check would
+      # either wave it through to the driver or block on the open waiting for a writer.
+      unless info.file?
+        raise Gori::Error.new("cannot open #{path}: not a regular file (#{info.type.to_s.downcase}), so not a database")
+      end
+      return if info.size.zero? # empty file: sqlite initialises it in place
+      header = begin
+        File.open(path) do |file|
+          buf = Bytes.new(SQLITE_MAGIC.size)
+          file.read_fully?(buf) ? buf : nil
+        end
+      rescue
+        return # unreadable / vanished — let the driver produce the error, it does not leak on those
+      end
+      return if header == SQLITE_MAGIC
+      # Same shape and the same key phrase as the five other surfaces that report an
+      # unopenable db (`Project#open_failure_reason`, `gori run`, `gori run capture`, `gori
+      # mcp`), so one failure keeps being described one way. "wrong file header" rather than
+      # their "(or unreadable)": this path READ the file, so unreadability is ruled out.
+      raise Gori::Error.new("cannot open #{path}: not a valid SQLite database (wrong file header)")
     end
 
     # The db (and its WAL/SHM sidecars) hold captured request/response bytes — cookies,
@@ -256,7 +344,8 @@ module Gori
     def initialize(@db : DB::Database, @events : Channel(FlowEvent)? = nil,
                    @probe_events : Channel(FlowEvent)? = nil,
                    @retention_flows : Int32 = RETENTION_DEFAULT,
-                   @prune_interval : Int32 = PRUNE_INTERVAL)
+                   @prune_interval : Int32 = PRUNE_INTERVAL,
+                   @open_lock : OpenLock? = nil)
       @writes = Channel(WriteOp).new(1024) # widened: h2 frames now queue fire-and-forget
       @done = Channel(Nil).new
       @closed = false # see #close: a second drain would park forever on @done
@@ -274,9 +363,26 @@ module Gori
       # The TUI polls this every main-loop tick — more reliable than PRAGMA data_version
       # (same-process writer visibility is flaky) or the droppable Probe event channel.
       @probe_generation = 0_i64
+      # Set only when the writer's connection RELEASE raised (see writer_loop). It is the exact
+      # predicate for "this connection is half-closed", which is what #close must not re-close.
+      @writer_teardown_failed = false
+      # Set by `writer_connection_loop` once its loop has returned, so `writer_loop`'s rescue can
+      # tell "the connection release raised" from "the loop itself died".
+      @writer_loop_exited = false
       spawn(name: "gori-store-writer") do
-        writer_loop
-        @done.send(nil)
+        # `ensure`, not a bare sequence. `#close` parks on `@done.receive` for a value this
+        # fiber sends exactly once as it exits, so ANY escape from `writer_loop` leaves that
+        # receive waiting on a sender that no longer exists — and that is a HANG, which no
+        # `store.close rescue nil` guard can catch. `writer_loop` rescues around each batch for
+        # this reason, but the batch rescue cannot cover the teardown of the connection the
+        # loop borrowed, and that teardown is exactly where the escape came from (see the
+        # rescue inside `writer_loop`). Making the send unconditional means a writer that dies
+        # for any future reason degrades to "writes stop" instead of "gori never exits".
+        begin
+          writer_loop
+        ensure
+          @done.send(nil)
+        end
       end
     end
 
@@ -434,13 +540,74 @@ module Gori
       @closed = true
       @writes.close
       @done.receive
+      # LAST-DITCH GUARD, and it is about a segfault rather than an exception. `DB::Disposable`
+      # documents that "if an exception is raised, the resource will not be marked as closed" —
+      # but `SQLite3::Statement#do_close` has ALREADY called `sqlite3_finalize` (freeing the
+      # stmt) before its `check` raises the deferred error, and `SQLite3::Connection#do_close`
+      # aborts mid-cache leaving the connection unmarked and still in the pool. So `@db.close`
+      # walks the pool and finalizes freed statements a second time: use-after-free, SIGSEGV,
+      # measured. Every write gori issues into a UNIQUE-bearing table now goes through OR IGNORE
+      # so nothing should poison a statement in the first place; if something ever does, leaking
+      # one connection pool for the rest of the process beats crashing it, and the log line says
+      # which happened.
+      # Released on BOTH exits below, and last: while it is held, a peer's delete is refused,
+      # so dropping it before the pool is done with the file would reopen the very window it
+      # exists to close.
+      if @writer_teardown_failed
+        ::Log.warn { "store: leaving the connection pool open — the writer's connection did not tear down cleanly" }
+        @open_lock.try(&.close)
+        return
+      end
       @db.close
+      @open_lock.try(&.close)
     end
 
     # --- internals -----------------------------------------------------------
 
     private def writer_loop : Nil
+      # Wrapped, because the RELEASE of the borrowed connection can raise and the per-batch
+      # rescue below is inside the block, so it cannot see it. When a statement hits a
+      # constraint (`UPDATE scope_rules` colliding with the table's UNIQUE triple is the
+      # reachable one — `gori run project scope update` documents that very collision), sqlite
+      # holds the error until the statement is FINALIZED, and the driver finalizes its cached
+      # statements when `using_connection` gives the connection back. That finalize returns the
+      # error code, `SQLite3::Statement#check` raises it, and it unwound straight out of this
+      # fiber — past the batch rescue, which had already correctly rolled the batch back and
+      # answered the caller `false`. So one colliding edit made `Store#close` hang FOREVER at
+      # shutdown (measured: the process never exits), which in the TUI means gori does not quit
+      # and leaves the terminal on the alternate screen. Logged, not raised: the loop is over by
+      # then — every op has been answered — and there is nothing left to abort.
+      begin
+        writer_connection_loop
+      rescue ex
+        # gori.log, not STDERR (#411): in TUI mode STDERR is the alternate screen.
+        #
+        # WHICH failure this was decides what is safe to do next, and conflating them was wrong
+        # in both directions. `@writer_loop_exited` is set inside the connection block after the
+        # loop returns, so:
+        #
+        # * set ⇒ the LOOP finished and the RELEASE raised (the constraint-poisoned statement).
+        #   Every op has been answered; the connection is half-closed, so `#close` must not
+        #   re-close the pool (that is a use-after-free — see #close).
+        # * clear ⇒ the loop itself died with `@writes` still OPEN and no reader. A caller that
+        #   sends after this would park forever on its reply channel: the hang this rescue was
+        #   added to prevent, moved from `close` to the next write. Close the channel so every
+        #   caller takes its existing `rescue Channel::ClosedError` path (0 / false / dropped)
+        #   instead, and leave the pool closable.
+        if @writer_loop_exited
+          ::Log.warn { "store writer connection teardown failed: #{ex.message}" }
+          @writer_teardown_failed = true
+        else
+          ::Log.error { "store writer fiber died mid-loop: #{ex.message} — further writes will be refused" }
+          @writes.close rescue nil
+        end
+      end
+    end
+
+    private def writer_connection_loop : Nil
       @db.using_connection do |conn|
+        # Reset per connection; `writer_loop` reads it to tell a loop death from a release failure.
+        @writer_loop_exited = false
         # Bound the WAL file so it doesn't grow without limit under sustained
         # writes (the default is 1000 pages; set it explicitly on the writer).
         conn.exec("PRAGMA wal_autocheckpoint=1000") rescue nil
@@ -565,6 +732,7 @@ module Gori
           # (Store#index_pending!) also picks up rows this very batch just dirtied.
           index_replies.each(&.send(index_pending_batch(conn)))
         end
+        @writer_loop_exited = true # the loop is done; anything that raises now is the release
       end
     end
 
@@ -585,6 +753,16 @@ module Gori
     # ordinary retention drop. `Compact.prune_old_flows` already documents and fixes this exact
     # arithmetic; the two sweeps now share one definition of "the newest N".
     private def prune(conn : DB::Connection) : Nil
+      # BEFORE the retention early-returns. The reap below is not retention — it removes frames
+      # whose connection row does not exist, which no cap has any opinion about — and putting it
+      # after `@retention_flows <= 0` meant it never ran for the two commonest projects: an MCP
+      # server opens with RETENTION_UNLIMITED, and a TUI project under its cap returns at
+      # `cutoff <= 0`. The comment there promised a db carrying frames from an older build would
+      # heal itself; for those it did not.
+      #
+      # Still on the prune cadence (once per PRUNE_INTERVAL inserts), so a project that never
+      # inserts another flow heals only via `compact` — which reaps the same rows.
+      reap_unattributed_h2_frames(conn)
       return if @retention_flows <= 0
       # Served by the primary key: a rightmost-leaf descending scan of @retention_flows rows.
       oldest_kept = conn.query_one?(
@@ -634,6 +812,20 @@ module Gori
       log_retention_drop(dropped) if dropped > 0
     rescue ex
       ::Log.warn { "retention prune failed (will retry): #{ex.message}" } # gori.log, not STDERR (#411)
+    end
+
+    # Frames whose connection row does not exist at all. The guard in `insert_h2_frame` stops new
+    # ones, but a db that ran an older build carries however many it wrote, and the retention
+    # sweep can never reach them — it selects through `h2_connections`, and that is exactly the
+    # row these frames do not have.
+    #
+    # `h2_connections.id` is an INTEGER PRIMARY KEY so the subquery yields no NULL, which is what
+    # makes `NOT IN` safe here. Served by `idx_h2_frames_conn`. Its own transaction and its own
+    # rescue, like the sweep it runs ahead of: this must never cost the batch that just committed.
+    private def reap_unattributed_h2_frames(conn : DB::Connection) : Nil
+      conn.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
+    rescue ex
+      ::Log.warn { "unattributed h2-frame reap failed (will retry): #{ex.message}" } # gori.log (#411)
     end
 
     # One gori.log line per sweep that actually removed history, naming the setting that
@@ -783,20 +975,38 @@ module Gori
       # request_size is the TRUE wire size (body_size when the BLOB was truncated),
       # so the History size column stays honest even for a capped body.
       body_size = req.body_size || req.body.try(&.size.to_i64) || 0_i64
+      # 0 is not an id, it is the "no raw frame log for this connection" sentinel — that is what
+      # `FlowSink#on_h2_open`'s default returns, and what `StoreSink#on_h2_open` hands back when
+      # `insert_h2_connection` did not commit. Stored as-is it becomes a NON-NULL id pointing at
+      # no row, and two History guards read this column with `.nil?` / a truthiness check:
+      # `load_detail_logs` does `if cid = detail.h2_conn_id` — and `0_i64` is truthy in Crystal —
+      # so the frame-log pane opened `h2_frames(0)`, which is the merged pile of EVERY
+      # unattributed connection's frames shown under one flow. The other two treat a non-nil
+      # value as "a streaming h2 flow, keep re-reading it", so a complete, immutable flow
+      # re-fetched and re-split its body on every poll tick forever. NULL says the one true
+      # thing: this flow has no frame log.
+      h2_conn_id = req.h2_conn_id.try { |cid| cid > 0 ? cid : nil }
+      # Built as an args array, in the column order listed below, so `request_head` can take the
+      # `X\'\'` slot when it is empty (see Store.blob_slot — an empty slice would otherwise bind
+      # SQL NULL and violate `BLOB NOT NULL`, rolling back this whole capture batch).
+      args = [req.created_at, req.scheme, req.host, req.port, req.method, req.target,
+              req.http_version, req.sni, req.alpn, req.tls_version] of DB::Any
+      head_slot = Store.blob_slot(args, req.head)
+      args << req.body
+      args << req.head.size.to_i64 + body_size
+      args << FlowState::Pending.value
+      args << h2_conn_id
+      args << req.h2_stream_id
+      args << (req.body_truncated? ? 1 : 0)
+      args << (unsent ? 1 : 0)
+      args << (req.short_circuited? ? 1 : 0)
+      args << req.advisory
       res = conn.exec(
-        <<-SQL,
-        INSERT INTO flows
-          (created_at, scheme, host, port, method, target, http_version,
-           sni, alpn, tls_version, request_head, request_body, request_size, state,
-           h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, fts_dirty)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
-        SQL
-        req.created_at, req.scheme, req.host, req.port, req.method, req.target,
-        req.http_version, req.sni, req.alpn, req.tls_version,
-        req.head, req.body,
-        req.head.size.to_i64 + body_size,
-        FlowState::Pending.value, req.h2_conn_id, req.h2_stream_id,
-        req.body_truncated? ? 1 : 0, unsent ? 1 : 0, req.short_circuited? ? 1 : 0, req.advisory)
+        "INSERT INTO flows " \
+        "(created_at, scheme, host, port, method, target, http_version, " \
+        " sni, alpn, tls_version, request_head, request_body, request_size, state, " \
+        " h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, fts_dirty) " \
+        "VALUES (?,?,?,?,?,?,?,?,?,?,#{head_slot},?,?,?,?,?,?,?,?,?,1)", args: args)
       # The INSERT's own result carries the rowid — no separate `SELECT last_insert_rowid()`.
       # No flows_fts write here: `fts_dirty = 1` hands the trigram work to the off-commit
       # indexer, so a capture commit no longer pays for tokenization (see V4 / await_op).
@@ -886,14 +1096,33 @@ module Gori
       # zero-length WS text/binary frame (valid per RFC 6455 — e.g. an empty heartbeat)
       # reaches here with an empty payload, so use the SQL literal X'' for it, mirroring
       # insert_h2_frame_one's empty-DATA handling.
-      empty = op.payload.empty?
       args = [op.flow_id, op.repeater_id, op.created_at, op.direction, op.opcode] of DB::Any
-      args << op.payload unless empty
+      # `Store.blob_slot` — the site that first found this trap, now using the one helper that
+      # owns it, so the rule has a single implementation rather than this copy plus that one.
+      slot = Store.blob_slot(args, op.payload)
       Store.bind_ws_shape(args, op.shape)
       conn.exec(
         "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
         "fin, rsv, masked, mask_key, frames, declared_len) " \
-        "VALUES (?,?,?,?,?,#{empty ? "X''" : "?"},?,?,?,?,?,?)", args: args)
+        "VALUES (?,?,?,?,?,#{slot},?,?,?,?,?,?)", args: args)
+    end
+
+    # Append `value` to `args` and answer the placeholder to write in its slot — `X''` for an
+    # EMPTY slice, `?` otherwise.
+    #
+    # An empty `Bytes` is a NULL POINTER, and the driver binds a null pointer as SQL NULL, so a
+    # zero-length blob handed to a `BLOB NOT NULL` column violates the constraint instead of
+    # storing nothing. `insert_ws_one` and `insert_h2_frame_one` each discovered this and each
+    # wrote their own `X''` branch; the remaining NOT NULL BLOB columns (`flows.request_head`,
+    # `miner_sessions.request`, `sequencer_sessions.request`) did not, and measured, an empty
+    # value there did not merely drop its own row — the violation RAISES inside the writer
+    # transaction, so the whole BATCH rolls back, taking every captured flow the writer had
+    # grouped with it, and (before the teardown guards) poisoned the connection into hanging
+    # `Store#close`. One helper now, so a fourth column cannot rediscover it.
+    def self.blob_slot(args : Array(DB::Any), value : Bytes) : String
+      return "X''" if value.empty?
+      args << value
+      "?"
     end
 
     # The six V7 shape columns, in the order every `ws_messages` INSERT lists them. Shared

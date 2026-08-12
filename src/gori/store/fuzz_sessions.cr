@@ -83,10 +83,34 @@ module Gori
     # this exists to prevent. Matched on ref_kind AND ref_id — session ids collide across
     # kinds (every workbench table starts at 1), so ref_id alone would take a live miner/flow
     # ref with it.
-    def delete_fuzz_session(id : Int64) : Nil
-      exec_task ->(c : DB::Connection) {
+    # Deletes a session AND everything hanging off it: `fuzz_runs.session_id` → `fuzz_results.run_id`.
+    # Without the cascade, closing a Fuzzer tab removed the session row and left every run and
+    # every result behind — and `fuzz_results` holds `request`, `response_head` and `response_body`,
+    # which is the dominant byte cost of a fuzzing project (it is why the compress popup lists
+    # "Fuzzer responses" as its own category). Nothing else could ever reach them: the retention
+    # sweep only walks flows/ws/h2, and every read here filters by `session_id`, so the rows were
+    # invisible in the UI as well as unbounded. Measured on three tiny results — 16.5 kB kept for a
+    # session that no longer existed; a real sweep is thousands of results with real bodies.
+    #
+    # The second pair of statements reaps rows ALREADY stranded by an older build, so a project
+    # heals the next time a tab is closed rather than needing a compact. `fuzz_sessions.id` is
+    # AUTOINCREMENT (V10), so a dangling `session_id` can never be re-pointed at a new session —
+    # this is a space leak, not the evidence-contamination class.
+    #
+    # Returns whether the delete COMMITTED, like `delete_repeater` next door: a rolled-back batch
+    # leaves the row, so the tab the operator closed comes back on the next project open.
+    def delete_fuzz_session(id : Int64) : Bool
+      exec_task_ok ->(c : DB::Connection) {
+        c.exec("DELETE FROM fuzz_results WHERE run_id IN (SELECT id FROM fuzz_runs WHERE session_id = ?)", id)
+        c.exec("DELETE FROM fuzz_runs WHERE session_id = ?", id)
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'fuzz' AND ref_id = ?", id)
         c.exec("DELETE FROM fuzz_sessions WHERE id = ?", id)
+        # Already-stranded rows from before the cascade existed. RUNS FIRST, then results:
+        # a stranded run still exists in `fuzz_runs` (only its session is gone), so reaping
+        # results first would find none orphaned by `run_id` and then the run's removal would
+        # strand them with nothing left to sweep. The spec caught exactly that ordering.
+        c.exec("DELETE FROM fuzz_runs WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM fuzz_sessions)")
+        c.exec("DELETE FROM fuzz_results WHERE run_id NOT IN (SELECT id FROM fuzz_runs)")
         nil
       }
     end

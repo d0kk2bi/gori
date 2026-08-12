@@ -1,6 +1,7 @@
 require "db"
 require "sqlite3"
 require "../capture_lock"
+require "../open_lock"
 require "./schema"
 
 # On-demand project compaction: drop the less-important, space-dominating data
@@ -69,6 +70,11 @@ class Gori::Store
   def self.measure(path : String) : CompactStats
     db_bytes = File.exists?(path) ? File.info(path).size : 0_i64
     return CompactStats.new(db_bytes, 0, 0, 0, 0, 0, 0) unless File.exists?(path)
+    # Same pre-flight `Store.open` runs, and for the same two reasons: this URL carries the
+    # pragmas whose failure leaks the handle inside the driver's constructor, and the picker
+    # RECOVERS from a failed measure ("can't read … to compress") and lets the operator try
+    # again — so each attempt on a corrupt project cost a descriptor.
+    refuse_non_database(path)
     db = DB.open(compact_url(path))
     begin
       # One scan of the (large) flows table for both body sums + the count, instead of three.
@@ -104,6 +110,11 @@ class Gori::Store
   # data is already gone, only the disk reclaim was skipped.
   def self.compact(path : String, plan : CompactPlan) : CompactResult?
     return nil unless File.exists?(path)
+    # Before the lock: there is no point serialising against a capturer for a file we are
+    # about to refuse, and the refusal itself is what keeps the driver from leaking its
+    # handle (see Store.refuse_non_database). Raised, not `nil` — `nil` means "another
+    # instance is capturing", and the caller prints that as a different sentence.
+    refuse_non_database(path)
     dir = File.dirname(path)
     # Probe the SAME capture lock a live session would hold: keyed on the DB file for an
     # arbitrary `--db` database, or the legacy per-directory lock for the canonical registry
@@ -111,6 +122,16 @@ class Gori::Store
     lock_path = File.basename(path) == Project::DB_FILE ? CaptureLock.path(dir) : "#{path}.capture.lock"
     lock = CaptureLock.try_at(lock_path)
     return nil unless lock # another live instance is capturing into this project
+    # And the other half of "in use", for the same reason `ProjectRegistry#delete` asks it: an MCP
+    # server takes no capture lock and still writes into this database. Compaction is the MORE
+    # destructive of the two — it runs `DELETE FROM fuzz_results/h2_frames/...` and rewrites the
+    # whole file — so a peer holding it open must stop it just as a peer capturing does. Held
+    # across the strip and the VACUUM, then released with the capture lock.
+    open_guard = OpenLock.try_exclusive(path)
+    unless open_guard
+      lock.close
+      return nil
+    end
     begin
       before = File.info(path).size
       db = DB.open(compact_url(path))
@@ -139,6 +160,7 @@ class Gori::Store
       harden_permissions(path)
       CompactResult.new(before, File.info(path).size, vacuumed)
     ensure
+      open_guard.close
       lock.close
     end
   end
@@ -236,5 +258,9 @@ class Gori::Store
             "AND id NOT IN (SELECT conn_id FROM h2_frames WHERE created_at >= ?)"
     conn.exec("DELETE FROM h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE #{stale})", oldest)
     conn.exec("DELETE FROM h2_connections WHERE #{stale}", oldest)
+    # Connection-less frames, which neither statement above can select (they go through
+    # `h2_connections`, and that row is the thing these frames lack). Same reap as `Store#prune`
+    # — the two sweeps keep one definition of what is reclaimable.
+    conn.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
   end
 end

@@ -1120,10 +1120,15 @@ module Gori
       # the handshake succeeds, the reason rides on `instructions` and on every NO_PROJECT
       # tool error, and list_projects / switch_project — the very tools that fix it — stay
       # reachable. A dead server can only be repaired by hand; a degraded one repairs itself.
+      # `Error` is rescued alongside the driver's types, not just them: `Store.open` names the
+      # two cases it can diagnose itself — a file that is not a database, and a schema written
+      # by a NEWER gori — as a `Gori::Error`. Both are exactly the "degrade to unbound"
+      # situation below, and leaving them out would let the CLEARER of the two messages be the
+      # one that kills the server before the handshake.
       store =
         begin
           Store.open(resolved, events: nil, retention_flows: Store::RETENTION_UNLIMITED) # never prune the user's history
-        rescue ex : DB::Error | SQLite3::Exception
+        rescue ex : DB::Error | SQLite3::Exception | Error
           reason = "cannot open database #{resolved}: #{ex.message.presence || "not a valid SQLite database (or unreadable)"}"
           Log.error { "mcp: #{reason}; starting unbound" }
           server = MCP::Server.new(nil, allow_actions: !read_only, verify_upstream: !insecure_upstream,

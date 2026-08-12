@@ -776,12 +776,10 @@ module Gori::Tui
       tab = @sessions[@current_idx]
       tab.view.request_stop
       @host.jobs.finish(tab.view.job_id, :stopped, "closed") if tab.view.running?
-      if id = tab.db_id
-        @host.session.store.delete_sequencer_session(id)
-      end
+      orphaned = (id = tab.db_id) ? !@host.session.store.delete_sequencer_session(id) : false
       @sessions.delete_at(@current_idx)
       @current_idx = @sessions.empty? ? -1 : @current_idx.clamp(0, @sessions.size - 1)
-      @host.status(@sessions.empty? ? "closed — none open" : "closed (#{@sessions.size} open)")
+      @host.status(TabClose.message(@sessions.empty? ? "closed — none open" : "closed (#{@sessions.size} open)", orphaned))
     end
 
     # Halt EVERY running collection on a project-level exit (leave project / quit) — the

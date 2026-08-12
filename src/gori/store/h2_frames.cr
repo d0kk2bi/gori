@@ -18,6 +18,22 @@ module Gori
     # relay's forwarding loop. No reply is awaited (the relay never needs the id).
     def insert_h2_frame(conn_id : Int64, direction : String, type : UInt8, flags : UInt8,
                         stream_id : UInt32, payload : Bytes) : Nil
+      # A frame with no connection row to hang off is not a log entry, it is landfill, and it
+      # is the ONE kind of row the retention sweep can never take back: the sweep reaps
+      # `h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE <stale>)`, and there is
+      # no `h2_connections` row with id 0 for it to select. Measured: 6 such frames survived a
+      # sweep that took the flow table from 20 rows to 2, and they stay for the life of the file
+      # (only `compact --h2-frames`, which drops the whole log, gets rid of them).
+      #
+      # 0 arrives two ways, and both mean "do not log": `FlowSink#on_h2_open`'s default returns
+      # it for a sink that keeps no frame log, and `StoreSink#on_h2_open` returns it when
+      # `insert_h2_connection` did not commit. Guarded here rather than in the sink so every
+      # caller is covered by one rule — the sink's two siblings, `on_response` and
+      # `on_ws_message`, already refuse a non-positive parent id for the same reason.
+      #
+      # NOT counted in `h2_frames_dropped`: that number is labelled "the writer was saturated"
+      # where the TUI shows it, and this is not that.
+      return if conn_id <= 0
       op = InsertH2Frame.new(conn_id, now_us, direction, type.to_i32, flags.to_i32,
         stream_id.to_i64, payload)
       select

@@ -4,6 +4,7 @@ require "./durable_file"
 require "./project"
 require "./store"
 require "./capture_lock"
+require "./open_lock"
 
 module Gori
   # Discovers and creates project workspaces under a root directory. Named
@@ -182,16 +183,26 @@ module Gori
       base_slug = slugify(display)
       raise Gori::Error.new("invalid project name") if base_slug.empty?
 
+      # The projects ROOT, not the project dir: the leaf below is claimed with a bare
+      # `Dir.mkdir` for its atomicity, and that fails outright (ENOENT) when the root does
+      # not exist yet. Every other entry point here goes through `Paths.ensure_dir`, which
+      # is mkdir_p, so this was the one that could not run on a fresh `~/.gori` unless the
+      # caller had already made the root — `MCP::ProjectResolver` does (`Paths.ensure_dirs`),
+      # which is exactly why the gap stayed invisible. Making the registry self-sufficient
+      # removes an ordering dependency nothing states.
+      Paths.ensure_dir(@root)
       slug = base_slug
       n = 2
       loop do
         dir = File.join(@root, slug)
         db = File.join(dir, Project::DB_FILE)
         unless Dir.exists?(dir)
+          claimed = false
           begin
             # Unlike mkdir_p, mkdir is an atomic claim. Two different workspaces
             # racing for the same basename cannot both bind this directory.
             Dir.mkdir(dir, Paths::DIR_MODE)
+            claimed = true
             File.chmod(dir, Paths::DIR_MODE) rescue nil
             # The binding itself: a torn write here mis-binds a workspace to a project.
             DurableFile.write(File.join(dir, WORKSPACE_FILE), workspace,
@@ -202,6 +213,15 @@ module Gori
             return Project.new(display, db)
           rescue File::AlreadyExistsError
             # Another process claimed it after the exists? check; inspect below.
+          rescue ex
+            # The claim landed but the binding did not (a full disk, a revoked permission).
+            # Give the directory back: it holds no data, `list` skips it for having no db,
+            # and leaving it would shadow this slug FOREVER — the next attempt sees an
+            # existing dir with no binding, walks past it to `-2`, and nothing ever cleans
+            # up the one it abandoned. Only ever the directory THIS call created, so the
+            # removal cannot touch another project.
+            FileUtils.rm_rf(dir) if claimed
+            raise ex
           end
         end
 
@@ -230,12 +250,32 @@ module Gori
       candidate
     end
 
-    # True when `slug` is an existing project WITH DATA (a real DB) whose stored display name
-    # differs from `display` — i.e. a genuine collision, not a same-name reopen or an empty dir.
+    # True when `slug` is an existing project whose stored display name differs from
+    # `display` — i.e. a genuine collision, not a same-name reopen or a leftover empty dir.
+    #
+    # "Existing" is a real DB **or** a workspace binding. The binding has to count on its own
+    # because `create_for_workspace` deliberately claims the directory and leaves the DB for
+    # its caller to open — the window is what lets a second MCP process see the binding before
+    # SQLite has created anything (spec/mcp_project_resolver_spec.cr states this), and it does
+    # not always close a moment later: the MCP entry point degrades to unbound when its
+    # `Store.open` fails, and a killed process closes it never. Judging by the DB alone, a
+    # differently-named `create` then walked into that directory, overwrote `.name`, and
+    # created the db there — silently inheriting the `.workspace` sidecar, so MCP launched in
+    # that repository afterwards served the project someone else had made. That is precisely
+    # the implicit adoption `create_for_workspace` documents itself as preventing.
     private def collides_with_other?(slug : String, display : String) : Bool
       dir = File.join(@root, slug)
-      return false unless Dir.exists?(dir) && File.exists?(File.join(dir, Project::DB_FILE))
+      return false unless Dir.exists?(dir)
+      return false unless File.exists?(File.join(dir, Project::DB_FILE)) || workspace_bound?(dir)
       display_name(dir, slug).downcase != display.downcase
+    end
+
+    # Does this directory carry a source-workspace binding? The path-taking counterpart of
+    # `workspace_of`, for the checks that have a directory rather than a Project in hand.
+    private def workspace_bound?(dir : String) : Bool
+      !File.read(File.join(dir, WORKSPACE_FILE)).strip.presence.nil?
+    rescue
+      false
     end
 
     # Assign a stable short id to a freshly created project. WRITE-IF-ABSENT: never
@@ -287,7 +327,23 @@ module Gori
     def delete(project : Project) : Nil
       return unless Dir.exists?(project.dir)
       raise Gori::Error.new("project is in use by another gori instance — stop its capture first") if CaptureLock.held?(project.dir)
-      FileUtils.rm_rf(project.dir)
+      # Capturing is not the only way to be writing to a project. An MCP server takes no capture
+      # lock and still writes issues, notes, repeaters and fuzz history, so the guard above saw
+      # nothing while one MCP server deleted the project another was serving — after which the
+      # second kept reporting successful writes into an unlinked inode, which is the exact loss
+      # the capture guard exists to prevent (reproduced with two servers). `OpenLock` answers the
+      # question that was actually being asked: does ANY live process have this database open.
+      # HELD across the rm_rf, not probed and released: a peer that opens the database in the gap
+      # between the answer and the unlink is exactly the writer this refuses to strand.
+      guard = OpenLock.try_exclusive(project.db_path)
+      unless guard
+        raise Gori::Error.new("project is open in another gori instance — close it there first")
+      end
+      begin
+        FileUtils.rm_rf(project.dir)
+      ensure
+        guard.close
+      end
     end
 
     # Rename a project's display name (the `.name` sidecar). The on-disk directory
