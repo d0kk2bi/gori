@@ -340,6 +340,101 @@ describe Gori::Tui::HistoryView do
     end
   end
 
+  # `Proto` is the single source of truth the PROTO column and the QL `proto:` filter both
+  # defer to, and it read only the RESPONSE's content type — so a gRPC call showed as GRPC
+  # exactly when it SUCCEEDED. A still-Pending one, and one answered by a proxy's `text/html`
+  # 502, both printed HTTPS, and those are the rows an operator is scanning for.
+  it "prints GRPCS for a gRPC call the response never confirmed" do
+    tmp_store do |store|
+      store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "api.test", port: 443,
+        method: "POST", target: "/svc/M", http_version: "HTTP/2",
+        head: "POST /svc/M HTTP/2\r\nHost: api.test\r\nContent-Type: application/grpc\r\n\r\n".to_slice,
+        body: nil))
+      view = HistoryView.new
+      view.reload(store)
+
+      backend = MemoryBackend.new(120, 6)
+      view.render_list(Screen.new(backend), Rect.new(0, 0, 120, 6))
+      backend.contains?("GRPCS").should be_true
+    end
+  end
+
+  # Every decode pane is keyed on a request or response BODY, and a 101 flow has neither — its
+  # bytes live in the ws_messages table. So a GraphQL SUBSCRIPTION, which is how every real
+  # GraphQL subscription runs, showed up as raw JSON in MESSAGES with no GRAPHQL pane offered
+  # at all: the same "gori did not notice this is GraphQL" the HTTP side had, one transport over.
+  it "offers the GRAPHQL pane for a subscription carried in WebSocket frames" do
+    tmp_store do |store|
+      id = add_flow(store, "GET", "/graphql", 101)
+      store.insert_ws_message(id, "out", 1, %({"type":"connection_init","payload":{}}).to_slice)
+      store.insert_ws_message(id, "out", 1,
+        (%({"id":"1","type":"subscribe","payload":{"operationName":"OnMessage",) +
+         %("query":"subscription OnMessage { messageAdded { id } }"}})).to_slice)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      2.times { view.toggle_pane } # REQUEST → MESSAGES → GRAPHQL (the pane list gained it)
+
+      backend = MemoryBackend.new(100, 16)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 16))
+      backend.contains?("operation over websocket").should be_true
+      backend.contains?("frame #2 subscribe id=1").should be_true
+      backend.contains?("messageAdded").should be_true
+    end
+  end
+
+  # The WS transcript re-decodes only when its message COUNT grows (a busy socket left open
+  # would otherwise re-parse its whole frame log on every refresh poll). The cache must still
+  # pick up a NEW subscription frame — proving it invalidates on growth, not that it goes stale.
+  it "picks up a new subscription frame on refresh (count-keyed cache invalidates)" do
+    tmp_store do |store|
+      id = add_flow(store, "GET", "/graphql", 101)
+      store.insert_ws_message(id, "out", 1,
+        %({"id":"1","type":"subscribe","payload":{"query":"subscription A { a }"}}).to_slice)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      2.times { view.toggle_pane } # land on GRAPHQL
+
+      backend = MemoryBackend.new(100, 16)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 16))
+      backend.contains?("subscription A").should be_true
+
+      # A second operation arrives; a refresh poke must rebuild the transcript pane.
+      store.insert_ws_message(id, "out", 1,
+        %({"id":"2","type":"subscribe","payload":{"query":"subscription B { b }"}}).to_slice)
+      view.refresh_detail(store)
+
+      backend2 = MemoryBackend.new(100, 16)
+      view.render_detail(Screen.new(backend2), Rect.new(0, 0, 100, 16))
+      backend2.contains?("subscription A").should be_true
+      backend2.contains?("subscription B").should be_true
+      backend2.contains?("2 operations over websocket").should be_true
+    end
+  end
+
+  it "does not offer a GRAPHQL pane for a socket carrying ordinary JSON" do
+    tmp_store do |store|
+      id = add_flow(store, "GET", "/ws", 101)
+      store.insert_ws_message(id, "out", 1, %({"type":"search","payload":{"query":"shoes"}}).to_slice)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      # Only REQUEST and MESSAGES exist, so two toggles come back to REQUEST — a GRAPHQL pane
+      # would have made this land somewhere else and would print its header.
+      3.times do
+        view.toggle_pane
+        backend = MemoryBackend.new(100, 12)
+        view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 12))
+        backend.contains?("operation over websocket").should be_false
+      end
+    end
+  end
+
   it "renders the '‹ list' back marker on the detail's top frame border (framed path)" do
     tmp_store do |store|
       add_flow(store, "GET", "/api", 200)

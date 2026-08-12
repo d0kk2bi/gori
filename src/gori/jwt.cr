@@ -6,6 +6,8 @@ require "./jwt/forge"
 require "./jwt/attacks"
 require "./jwt/present"
 
+require "./entity"
+
 module Gori
   # Finds and decodes the JSON Web Tokens a flow carries. Unlike Pretty's whole-body
   # JWT reflow, this SCANS where tokens actually live — the Authorization / Cookie /
@@ -46,8 +48,16 @@ module Gori
       scan_head(req_head, "request") { |loc, tok| add.call(loc, tok) }
       scan_head(resp_head, "response") { |loc, tok| add.call(loc, tok) }
       scan_query(target) { |loc, tok| add.call(loc, tok) }
-      scan_body("request body", req_body) { |loc, tok| add.call(loc, tok) }
-      scan_body("response body", resp_body) { |loc, tok| add.call(loc, tok) }
+      # The ENTITIES, not the wire bodies. The response side is the point: real API responses
+      # are gzip/br compressed almost always, so scanning the stored bytes meant the pane whose
+      # whole job is finding tokens was off for the majority of responses that carry one.
+      #
+      # Capped at `MAX_SCAN + 1`, NOT the 32 MiB decode default: `scan_body` refuses a body
+      # over `MAX_SCAN` anyway, so decoding further only inflates a bomb into memory to throw
+      # it away. The `+ 1` lets the size guard still see "larger than the cap" rather than a
+      # value clamped to exactly the cap.
+      scan_body("request body", Entity.bytes(req_head, req_body, MAX_SCAN + 1)) { |loc, tok| add.call(loc, tok) }
+      scan_body("response body", Entity.bytes(resp_head, resp_body, MAX_SCAN + 1)) { |loc, tok| add.call(loc, tok) }
       found
     end
 

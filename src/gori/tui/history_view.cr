@@ -121,9 +121,17 @@ module Gori::Tui
       @detail_sse = false # response is a text/event-stream → offer the EVENTS pane
       # Decoded protocol projections, parsed once per opened flow (no DB table) — each
       # drives an optional detail pane like EVENTS. nil/empty ⇒ the pane isn't offered.
-      @detail_saml = nil.as(Saml::Doc?)              # SAMLRequest/Response → SAML pane
-      @detail_jwts = [] of Jwt::Found                # located JWTs → JWT pane
-      @detail_graphql = nil.as(Graphql::Op?)         # GraphQL operation → GRAPHQL pane
+      @detail_saml = nil.as(Saml::Doc?)      # SAMLRequest/Response → SAML pane
+      @detail_jwts = [] of Jwt::Found        # located JWTs → JWT pane
+      @detail_graphql = nil.as(Graphql::Op?) # GraphQL operation → GRAPHQL pane
+      # …and the operations a 101 flow carries in its FRAMES (graphql-transport-ws /
+      # subscriptions-transport-ws). A subscription's document never touches a request body,
+      # so the same pane has to be fed from the transcript for a WebSocket flow.
+      @detail_graphql_ws = [] of GraphqlWs::Frame
+      # The ws message COUNT @detail_graphql_ws was last built from, so a 101 detail left open
+      # during a live socket re-parses the transcript only when it actually GREW, not on every
+      # refresh poke. −1 = never built / a different flow.
+      @graphql_ws_len = -1
       @detail_form = nil.as(Array(FormData::Field)?) # form/multipart params → PARAMS pane
       @decoded_id = nil.as(Int64?)                   # flow the decoded panes above were parsed from (skip re-decode)
       # Scroll anchor: a (logical line, visual sub-row) pair rather than a flat visual-row
@@ -895,6 +903,8 @@ module Gori::Tui
       @detail_saml = nil
       @detail_jwts = [] of Jwt::Found
       @detail_graphql = nil
+      @detail_graphql_ws = [] of GraphqlWs::Frame
+      @graphql_ws_len = -1
       @detail_form = nil
       @decoded_id = nil
       @detail_hex_bytes = nil
@@ -937,24 +947,37 @@ module Gori::Tui
     private def decode_protocols(detail : Store::FlowDetail?) : Nil
       unless detail
         @detail_saml, @detail_jwts, @detail_graphql, @detail_form = nil, [] of Jwt::Found, nil, nil
+        @detail_graphql_ws = [] of GraphqlWs::Frame
+        @graphql_ws_len = -1
         @decoded_id = nil
         return
       end
-      # A Complete, non-101 flow's bytes are immutable, so re-decoding the SAME flow on a
-      # refresh poll (which still re-runs for h2 flows, to pick up frames) just re-scans
-      # unchanged — possibly multi-MiB — bodies. Skip it; a pending/streaming flow's bytes
-      # still grow, so it re-decodes each poll (id stays nil-guarded until Complete).
-      if @decoded_id == detail.row.id && detail.row.state.complete? && detail.row.status != 101
-        return
+      # The HANDSHAKE panes (SAML / JWT / GraphQL body / PARAMS) read the request/response
+      # bytes, which are immutable once captured — INCLUDING a 101 flow, whose handshake never
+      # grows even though its message transcript does. So they re-decode only when the FLOW
+      # changes or its own bytes are still arriving (a pending non-101 flow). Re-scanning a
+      # multi-MiB body on every refresh poke bought nothing; the 101 exclusion that used to sit
+      # here forced exactly that, because it made the whole method re-run for a WebSocket.
+      if @decoded_id != detail.row.id || (!detail.row.state.complete? && detail.row.status != 101)
+        tgt = detail.row.target
+        rh, rb = detail.request_head, detail.request_body
+        sh, sb = detail.response_head, detail.response_body
+        @detail_saml = Saml.from_flow(tgt, rh, rb, sh, sb)
+        @detail_jwts = Jwt.from_flow(tgt, rh, rb, sh, sb)
+        @detail_graphql = Graphql.from_flow(tgt, rh, rb)
+        @detail_form = FormData.from_flow(tgt, rh, rb)
+        @decoded_id = detail.row.state.complete? ? detail.row.id : nil
+        @graphql_ws_len = -1 # the flow changed → force the transcript pane to rebuild below
       end
-      tgt = detail.row.target
-      rh, rb = detail.request_head, detail.request_body
-      sh, sb = detail.response_head, detail.response_body
-      @detail_saml = Saml.from_flow(tgt, rh, rb, sh, sb)
-      @detail_jwts = Jwt.from_flow(tgt, rh, rb, sh, sb)
-      @detail_graphql = Graphql.from_flow(tgt, rh, rb)
-      @detail_form = FormData.from_flow(tgt, rh, rb)
-      @decoded_id = detail.row.state.complete? ? detail.row.id : nil
+      # The WS GraphQL pane is the one derived from a GROWING source, so it alone tracks the
+      # transcript length: a busy socket left open re-parses its frames only when the window
+      # actually gained rows, not on every poll. `load_detail_logs` fills @detail_ws before
+      # this runs, so the count here is the same window the MESSAGES pane shows.
+      ws = @detail_ws || [] of Store::WsMessage
+      if @graphql_ws_len != ws.size
+        @detail_graphql_ws = GraphqlWs.from_messages(ws)
+        @graphql_ws_len = ws.size
+      end
     end
 
     # The synthetic log panes (FRAMES / EVENTS) and the decoded-protocol panes render
@@ -1691,11 +1714,11 @@ module Gori::Tui
     # (sse) → FRAMES (intercepted h2). ←/→ walk this chain; Tab cycles it.
     private def detail_panes : Array(Symbol)
       panes = [:request, :response]
-      panes << :saml if @detail_saml           # decoded SAML XML (request/response)
-      panes << :jwt unless @detail_jwts.empty? # located + decoded JWT(s)
-      panes << :graphql if @detail_graphql     # parsed GraphQL operation
-      panes << :params if @detail_form         # decoded form/multipart params
-      panes << :events if @detail_sse          # parsed SSE events (text/event-stream response)
+      panes << :saml if @detail_saml                                     # decoded SAML XML (request/response)
+      panes << :jwt unless @detail_jwts.empty?                           # located + decoded JWT(s)
+      panes << :graphql if @detail_graphql || !@detail_graphql_ws.empty? # parsed GraphQL operation (body or WS frames)
+      panes << :params if @detail_form                                   # decoded form/multipart params
+      panes << :events if @detail_sse                                    # parsed SSE events (text/event-stream response)
       panes << :frames if @detail_frames
       panes
     end
@@ -1881,7 +1904,7 @@ module Gori::Tui
         marked = @marks.includes?(row.id)
         # PROTO is classified here rather than at its own column below, because Colormarker
         # needs it to build the match subject and classifying twice per row per frame is waste.
-        kind = Proto.classify(row.status, row.content_type)
+        kind = Proto.classify(row.status, row.content_type, row.request_content_type)
         mark = color_for(row, kind)
         base = if selected
                  focused ? Theme.accent_bg : Theme.selection_dim
@@ -2652,7 +2675,7 @@ module Gori::Tui
       if (body && !body.empty?) && grpc_body?(head)
         ls = Highlight.message(head, nil, request)
         ls << Highlight::Line.new
-        ls.concat(wrap(grpc_lines(body)))
+        ls.concat(wrap(grpc_lines(MediaType.of(head), body)))
         return DetailView.new(ls, EMPTY_BODY, :text, trailer, binary: true)
       end
 
@@ -2729,9 +2752,12 @@ module Gori::Tui
       head
     end
 
+    # A gRPC message by its own Content-Type — the same question `Proto`'s PROTO column, the
+    # QL `proto:` filter and the Repeater all ask, asked the same way. The substring search it
+    # replaces missed the (legal) `Content-Type:application/grpc` with no space after the
+    # colon, and could match the text inside another header's value.
     private def grpc_body?(head : Bytes?) : Bool
-      return false unless head
-      String.new(head).downcase.includes?("content-type: application/grpc")
+      Proxy::H2::Grpc.grpc?(MediaType.of(head))
     end
 
     # Renders a gRPC body as framed messages with a hex preview (protobuf is
@@ -2742,8 +2768,10 @@ module Gori::Tui
     # than arrived rendered here as "(no complete gRPC messages)" with no byte count —
     # indistinguishable from a body that simply is not gRPC, while `gori run show
     # --format json` reported it in full.
-    private def grpc_lines(body : Bytes) : Array(String)
-      msgs, residual = Proxy::H2::Grpc.scan(body)
+    private def grpc_lines(content_type : String?, body : Bytes) : Array(String)
+      # `scan_body`: a grpc-web-text body carries its frames base64-encoded, so scanning the
+      # raw bytes finds a length prefix made of base64 characters and reports nothing.
+      msgs, residual = Proxy::H2::Grpc.scan_body(content_type, body)
       note = Proxy::H2::Grpc.framing_error(residual)
       return ["(no complete gRPC messages — streaming or partial)"] if msgs.empty? && note.nil?
       lines = [] of String
@@ -2827,7 +2855,7 @@ module Gori::Tui
         case @detail_pane
         when :saml    then (doc = @detail_saml) ? saml_detail_lines(doc) : nil
         when :jwt     then @detail_jwts.empty? ? nil : jwt_detail_lines(@detail_jwts)
-        when :graphql then (op = @detail_graphql) ? graphql_detail_lines(op) : nil
+        when :graphql then graphql_pane_lines
         when :params  then (f = @detail_form) ? form_detail_lines(f) : nil
         end
       lines ? DetailView.new(lines, EMPTY_BODY, :text, EMPTY_LINES) : nil
@@ -2882,9 +2910,21 @@ module Gori::Tui
       tok.size > 64 ? "#{tok[0, 40]}…#{tok[-12, 12]}" : tok
     end
 
-    private def graphql_detail_lines(op : Graphql::Op) : Array(Highlight::Line)
+    # The GRAPHQL pane: the request body's operation, the transcript's operations, or both —
+    # a 101 flow has no body to decode and an HTTP flow has no frames, so in practice exactly
+    # one of the two is populated. nil only when neither is (the pane was not offered).
+    private def graphql_pane_lines : Array(Highlight::Line)?
+      op = @detail_graphql
+      ws = @detail_graphql_ws
+      return nil if op.nil? && ws.empty?
       lines = [] of Highlight::Line
-      append_styled(lines, Graphql.display(op), :graphql)
+      append_styled(lines, Graphql.display(op), :graphql) if op
+      unless ws.empty?
+        lines << Highlight::Line.new unless lines.empty?
+        lines << derived_header(GraphqlWs.summary(ws))
+        lines << Highlight::Line.new
+        append_styled(lines, GraphqlWs.display(ws), :graphql)
+      end
       lines
     end
 

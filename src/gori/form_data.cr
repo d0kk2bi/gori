@@ -1,5 +1,7 @@
 require "uri"
 require "mime/multipart"
+require "./media_type"
+require "./entity"
 
 module Gori
   # Decodes a request's form parameters — an `application/x-www-form-urlencoded` or
@@ -27,11 +29,15 @@ module Gori
     def from_flow(target : String, req_head : Bytes?, req_body : Bytes?) : Array(Field)?
       fields = [] of Field
       query_fields(target).each { |f| fields << f }
-      if (b = req_body) && !b.empty? && b.size <= MAX_BODY
-        ct = content_type(req_head)
-        if ct && ct.downcase.includes?("x-www-form-urlencoded")
+      # The ENTITY, not the wire body. A chunked form POST did not merely go missing here, it
+      # came back WRONG: `dechunk` never ran, so the chunk-size line fused onto the first key
+      # and `a=1&b=22` was listed as a field named `9\r\na`. This pane re-encodes nothing, so
+      # the decode is unconditional.
+      if (b = Entity.bytes(req_head, req_body, MAX_BODY)) && !b.empty? && b.size <= MAX_BODY
+        ct = MediaType.of(req_head)
+        if MediaType.form_urlencoded?(ct)
           urlencoded(String.new(b), :body).each { |f| fields << f }
-        elsif ct && ct.lstrip.downcase.starts_with?("multipart/")
+        elsif ct && MediaType.multipart?(ct)
           multipart(b, ct).each { |f| fields << f }
         end
       end
@@ -91,16 +97,6 @@ module Gori
       else
         Field.new(name, "", :body, "binary, #{content.bytesize} bytes")
       end
-    end
-
-    private def content_type(head : Bytes?) : String?
-      return nil unless head
-      String.new(head).each_line do |line|
-        l = line.chomp
-        break if l.empty?
-        return l[13..].strip if l.size >= 13 && l[0, 13].downcase == "content-type:"
-      end
-      nil
     end
   end
 end
