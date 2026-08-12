@@ -219,13 +219,90 @@ module Gori
                   probe_events : Channel(FlowEvent)? = nil,
                   retention_flows : Int32 = RETENTION_DEFAULT) : Store
       url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=5000"
+      refuse_non_database(path)
       db = DB.open(url)
-      harden_permissions(path)
-      # Make REGEXP byte-safe on every connection before any query runs (so a binary
-      # body can't crash a `body~`/`header~` scan or a regex scope rule). See SafeRegexp.
-      SafeRegexp.install(db)
-      Schema.migrate!(db)
+      # Everything between DB.open and handing the pool to `new` has to be unwound on
+      # failure, because `db` is a live connection POOL and nothing else has a reference
+      # to it yet: an escaping exception left the sqlite handle (plus its -wal/-shm)
+      # open for the rest of the process. That is not a one-shot cost — every surface
+      # that opens a project RECOVERS from a failed open and keeps running: the TUI
+      # picker falls back to the project list with `open_failure_reason` (app.cr),
+      # MCP `switch_project` answers an error and stays bound to the old project, and
+      # both `delete_project`'s dry run and `gori run project delete`'s preview open a
+      # short-lived handle they report `nil` counts for. Each retry against the same
+      # unopenable project leaked another descriptor, so a session that repeatedly
+      # bumped into one corrupt project ran the process out of fds.
+      #
+      # `compact`/`measure` next door already wrap their own DB.open in begin/ensure;
+      # this was the one sibling without it.
+      begin
+        harden_permissions(path)
+        # Make REGEXP byte-safe on every connection before any query runs (so a binary
+        # body can't crash a `body~`/`header~` scan or a regex scope rule). See SafeRegexp.
+        SafeRegexp.install(db)
+        Schema.migrate!(db)
+      rescue ex
+        db.close rescue nil
+        raise ex
+      end
+      # Past this point the Store owns the pool and closes it in #close.
       new(db, events, probe_events, retention_flows)
+    end
+
+    # The 16-byte header every SQLite database file starts with: 15 ASCII bytes plus the
+    # terminating NUL. Written as an escape — a raw NUL in a source literal is invisible.
+    SQLITE_MAGIC = "SQLite format 3\u0000".to_slice
+
+    # Refuse a path that exists but is not a SQLite database, BEFORE the driver is asked to
+    # open it. Two independent reasons, both about this exact URL:
+    #
+    # 1. The driver LEAKS the fd on this input. `SQLite3::Connection#initialize` calls
+    #    `sqlite3_open_v2` (which succeeds on any file — sqlite reads the header lazily) and
+    #    then execs the pragmas this URL carries; `PRAGMA journal_mode=wal` is what actually
+    #    reads page 1, fails SQLITE_NOTADB, and unwinds the constructor through a bare
+    #    `rescue raise DB::ConnectionRefused` that never closes the handle it opened. Since
+    #    `DB.open` eagerly builds the pool's first connection, the leak happens INSIDE
+    #    DB.open — before `Store.open` holds anything it could close. Measured at exactly
+    #    one descriptor per attempt, and every surface here retries: the TUI picker returns
+    #    to the project list and lets the operator pick again, MCP `switch_project` stays
+    #    bound and answers an error. The same URL WITHOUT pragmas leaks nothing, which is
+    #    what pins the cause on the pragma exec rather than on the open.
+    # 2. It is the only one of the unopenable cases whose real reason is knowable here.
+    #    `DB::ConnectionRefused` carries a nil message, so "this file is not a database",
+    #    "no read permission" and "that is a directory" arrive indistinguishable — which is
+    #    why `Project#open_failure_reason` has to reconstruct a guess from the path. Naming
+    #    it at the source means every surface (TUI picker, `gori run`, MCP bind) reports the
+    #    same true sentence instead of three re-derivations of it.
+    #
+    # Only an EXISTING, NON-EMPTY REGULAR file is judged: a missing path and a zero-byte file
+    # are both how a new project legitimately starts (sqlite creates/initialises them), and
+    # `:memory:` is not a path at all.
+    private def self.refuse_non_database(path : String) : Nil
+      info = File.info?(path)
+      return unless info # missing (a new project) or unstatable — the driver's problem
+      raise Gori::Error.new("cannot open #{path}: that is a directory, not a database file") if info.directory?
+      # Judged from the TYPE, before any open. A pipe/socket/device is not a database, and
+      # deciding that from `stat` rather than from its contents means this never opens one:
+      # a FIFO reports size 0 and yields nothing to read, so a content-based check would
+      # either wave it through to the driver or block on the open waiting for a writer.
+      unless info.file?
+        raise Gori::Error.new("cannot open #{path}: not a regular file (#{info.type.to_s.downcase}), so not a database")
+      end
+      return if info.size.zero? # empty file: sqlite initialises it in place
+      header = begin
+        File.open(path) do |file|
+          buf = Bytes.new(SQLITE_MAGIC.size)
+          file.read_fully?(buf) ? buf : nil
+        end
+      rescue
+        return # unreadable / vanished — let the driver produce the error, it does not leak on those
+      end
+      return if header == SQLITE_MAGIC
+      # Same shape and the same key phrase as the five other surfaces that report an
+      # unopenable db (`Project#open_failure_reason`, `gori run`, `gori run capture`, `gori
+      # mcp`), so one failure keeps being described one way. "wrong file header" rather than
+      # their "(or unreadable)": this path READ the file, so unreadability is ruled out.
+      raise Gori::Error.new("cannot open #{path}: not a valid SQLite database (wrong file header)")
     end
 
     # The db (and its WAL/SHM sidecars) hold captured request/response bytes — cookies,

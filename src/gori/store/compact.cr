@@ -69,6 +69,11 @@ class Gori::Store
   def self.measure(path : String) : CompactStats
     db_bytes = File.exists?(path) ? File.info(path).size : 0_i64
     return CompactStats.new(db_bytes, 0, 0, 0, 0, 0, 0) unless File.exists?(path)
+    # Same pre-flight `Store.open` runs, and for the same two reasons: this URL carries the
+    # pragmas whose failure leaks the handle inside the driver's constructor, and the picker
+    # RECOVERS from a failed measure ("can't read … to compress") and lets the operator try
+    # again — so each attempt on a corrupt project cost a descriptor.
+    refuse_non_database(path)
     db = DB.open(compact_url(path))
     begin
       # One scan of the (large) flows table for both body sums + the count, instead of three.
@@ -104,6 +109,11 @@ class Gori::Store
   # data is already gone, only the disk reclaim was skipped.
   def self.compact(path : String, plan : CompactPlan) : CompactResult?
     return nil unless File.exists?(path)
+    # Before the lock: there is no point serialising against a capturer for a file we are
+    # about to refuse, and the refusal itself is what keeps the driver from leaking its
+    # handle (see Store.refuse_non_database). Raised, not `nil` — `nil` means "another
+    # instance is capturing", and the caller prints that as a different sentence.
+    refuse_non_database(path)
     dir = File.dirname(path)
     # Probe the SAME capture lock a live session would hold: keyed on the DB file for an
     # arbitrary `--db` database, or the legacy per-directory lock for the canonical registry

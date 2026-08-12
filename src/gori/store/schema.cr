@@ -955,6 +955,29 @@ module Gori
           conn.exec("BEGIN IMMEDIATE")
           begin
             current = conn.scalar("PRAGMA user_version").as(Int64).to_i
+            # A db stamped ABOVE what this binary knows was written by a NEWER gori, and
+            # there is nothing to migrate: `MIGRATIONS[current..]?` is nil past the end, so
+            # the runner used to fall straight through to COMMIT and report a clean open.
+            # The store then ran against a schema it does not understand — every read that
+            # touches a column the newer version added or renamed fails as a raw driver
+            # error somewhere far from the cause, and a write can persist rows that the
+            # newer build's own constraints would have refused. This is not hypothetical
+            # here: one `~/.gori` is shared by every gori on the host, so a project opened
+            # once by a newer build (a release, another worktree's binary, a `gori update`
+            # that was rolled back) is then opened by an older one. Refuse it by name, and
+            # say which two versions disagree — the operator can act on "upgrade gori",
+            # not on "no such column: advisory".
+            #
+            # DOWNWARD is still fine (`current < VERSION` migrates as always); only the
+            # direction that cannot be reconciled is refused.
+            # `>`, not `>=`: an up-to-date db has current == VERSION and must open normally
+            # (`MIGRATIONS[VERSION..]?` is an empty slice, not nil, so the loop just no-ops).
+            if current > VERSION
+              raise Gori::Error.new(
+                "database schema v#{current} was written by a newer version of gori " \
+                "(this build understands up to v#{VERSION}) — upgrade gori, or point " \
+                "--db/--project at another database")
+            end
             MIGRATIONS[current..]?.try &.each_with_index(offset: current) do |statements, idx|
               statements.each { |sql| conn.exec(sql) }
               conn.exec("PRAGMA user_version = #{idx + 1}")

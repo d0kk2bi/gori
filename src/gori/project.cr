@@ -38,6 +38,14 @@ module Gori
     # `gori run --db` aborts with, so both surfaces describe one failure one way.
     def open_failure_reason(ex : Exception) : String
       parent = File.dirname(@db_path)
+      # A message that already names this db is a complete sentence — `Store.open` raises one
+      # for the case it diagnoses itself ("cannot open <path>: not a valid SQLite database"),
+      # and re-deriving a guess from the path below would replace a true reason with a weaker
+      # one while printing the path twice. Anything that does NOT name the path still gets
+      # wrapped, so the project name the picker needs is not lost (a bare "disk is full").
+      if (msg = ex.message.presence) && msg.includes?(@db_path)
+        return msg
+      end
       return "cannot open #{@db_path}: no such directory: #{parent}" unless Dir.exists?(parent)
       if File.exists?(@db_path) && (ex.is_a?(DB::Error) || ex.is_a?(SQLite3::Exception))
         return "cannot open #{@db_path}: not a valid SQLite database (or unreadable)"
