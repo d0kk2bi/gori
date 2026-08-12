@@ -613,7 +613,7 @@ module Gori::Tui
       when 2
         # Enter while on Search row: immediately pick the top match if any.
         # (Arrow down into the box if you want to choose a different result.)
-        if filtered_projects.any?
+        if filtered_projects.present?
           return filtered_projects[0]
         end
         nil

@@ -212,7 +212,7 @@ module Gori
         next unless registry[id]?
         next unless labels.any? { |l| (c = Verb::Chord.parse(l)) && CLAIMED_ALT_CHORDS.includes?(c) }
         id
-      end.sort
+      end.sort!
     end
 
     # Effective binding as a status/Help token, or `fallback` when unbound / unknown.

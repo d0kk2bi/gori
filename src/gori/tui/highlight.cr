@@ -419,7 +419,7 @@ module Gori::Tui
       # Special case for width=1: always show the first glyph (even if it is
       # wide, e.g. Hangul), never ellipsis. Matches Screen#fit policy.
       if limit == 1
-        if line.any? && !line[0].text.empty?
+        if line.present? && !line[0].text.empty?
           first = line[0].text.each_grapheme.first.to_s
           # Char path so a leading C0 control becomes the space cell (not rejected).
           if first.size == 1
