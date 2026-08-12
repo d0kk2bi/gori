@@ -116,10 +116,15 @@ module Gori::Tui
       # Time.unix raise "seconds out of range".)
       @created = earliest ? Time.unix(earliest // 1_000_000) : project.created
 
-      @desc_area.set_text(store.setting(DESC_KEY) || "")
-      @desc_mode = InputMode::Read
-      @desc_read.sync_from(@desc_area)
-      @desc_dirty = false
+      # An UNSAVED buffer is not refreshed from the store: `save` only clears `@desc_dirty`
+      # once the write committed, so a still-dirty buffer means the operator's text has not
+      # landed yet, and re-seeding it from the stored value here is precisely the clobber that
+      # loses it. Every other field on the tab still refreshes.
+      unless @desc_dirty
+        @desc_area.set_text(store.setting(DESC_KEY) || "")
+        @desc_mode = InputMode::Read
+        @desc_read.sync_from(@desc_area)
+      end
       load_settings_values
       @env_items = Settings.project_env_vars.dup
       @env_sel = @env_sel.clamp(0, {@env_items.size - 1, 0}.max)
@@ -921,11 +926,18 @@ module Gori::Tui
       @desc_dirty = true
     end
 
-    # Persist description iff edited (called on tab exit paths, like NotesView).
+    # Persist description iff edited (called on tab exit paths, like NotesView). Answers
+    # whether there was nothing to do or the write COMMITTED — `set_setting` is `exec_task_ok`,
+    # so that answer has always been available here and was thrown away. Clearing `@desc_dirty`
+    # on a write that rolled back (project busy — another instance's writer holds the lock) is
+    # what turned a transient failure into LOSS: `reload` then set the buffer from the stored
+    # value on the next tab enter, so prose the operator typed was gone with nothing said. The
+    # flag stays up now, so the next exit path retries, and `reload` leaves a dirty buffer
+    # alone. Two siblings already read this Bool (`RewriterController#persist_sample`,
+    # `DecoderController#restore_sessions`); this was the one that did not.
     def save(store : Store) : Nil
       return unless @desc_dirty
-      store.set_setting(DESC_KEY, @desc_area.text)
-      @desc_dirty = false
+      @desc_dirty = false if store.set_setting(DESC_KEY, @desc_area.text)
     end
 
     # --- live description editing (delegated when Project tab body is focused) ---

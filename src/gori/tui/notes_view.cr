@@ -412,9 +412,15 @@ module Gori::Tui
       return unless @dirty
       mine = @notes.map { |n| Notes::NoteEntry.new(n.id, n.area.text) }
       merged = Notes.merge(Notes.load(store), mine, @deleted_ids, @current, @next_id)
-      store.set_setting(DOCS_KEY, Notes.serialize(merged.cur, merged.notes, merged.next_id))
+      wrote = store.set_setting(DOCS_KEY, Notes.serialize(merged.cur, merged.notes, merged.next_id))
+      # `next_id` advances either way: it only has to stay monotonic, and holding it back would
+      # let a retry reuse an id the merge already handed out.
       @next_id = merged.next_id
-      @dirty = false
+      # …but `@dirty` only comes down on a write that COMMITTED. `set_setting` is `exec_task_ok`,
+      # so it says which happened. Clearing it regardless meant a rolled-back write (project
+      # busy) silently dropped the operator's notes: the flag was the only thing that would have
+      # made a later exit path try again. Same correction as `ProjectView#save`.
+      @dirty = false if wrote
     end
 
     # `focused` = the editor has focus (cursor + bright). The sub-tab strip is now

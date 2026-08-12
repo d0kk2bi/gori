@@ -5736,12 +5736,21 @@ module Gori::Tui
       # value, which is what keeps a one-run flag from being pinned into this project's DB the
       # next time someone saves this pane for an unrelated reason: the mistake
       # `Runner.port_fallback` describes, one layer down.
-      set_or_clear(Settings::PROJECT_BIND_HOST_KEY, bind_host, Settings.bind_host)
-      set_or_clear(Settings::PROJECT_BIND_PORT_KEY, bind_port.to_s, Settings.bind_port.to_s)
-      set_or_clear(Settings::PROJECT_UPSTREAM_KEY, upstream, Settings.upstream_proxy)
-      set_or_clear(Settings::PROJECT_CONNECT_TIMEOUT_KEY, connect_secs.to_s, Settings.connect_timeout_secs.to_s)
-      set_or_clear(Settings::PROJECT_IO_TIMEOUT_KEY, io_secs.to_s, Settings.io_timeout_secs.to_s)
-      set_or_clear(Settings::PROJECT_CAPTURE_MAX_KEY, capture_mib.to_s, Settings.capture_max_mib.to_s)
+      # Both store writes report whether they COMMITTED, and all six are collected: a project
+      # whose writer is held by another instance rolls them back, and this pane used to answer
+      # "project network saved" anyway. The pin then existed only in the process globals set
+      # below — so the operator saw it applied, the proxy really did rebind, and reopening the
+      # project silently reverted every field. That is the same failure `gori run project
+      # sandbox on` refuses to have, in its own words: "the in-memory flag flips either way,
+      # and the next reload reverts it to the disk value".
+      persisted = [
+        set_or_clear(Settings::PROJECT_BIND_HOST_KEY, bind_host, Settings.bind_host),
+        set_or_clear(Settings::PROJECT_BIND_PORT_KEY, bind_port.to_s, Settings.bind_port.to_s),
+        set_or_clear(Settings::PROJECT_UPSTREAM_KEY, upstream, Settings.upstream_proxy),
+        set_or_clear(Settings::PROJECT_CONNECT_TIMEOUT_KEY, connect_secs.to_s, Settings.connect_timeout_secs.to_s),
+        set_or_clear(Settings::PROJECT_IO_TIMEOUT_KEY, io_secs.to_s, Settings.io_timeout_secs.to_s),
+        set_or_clear(Settings::PROJECT_CAPTURE_MAX_KEY, capture_mib.to_s, Settings.capture_max_mib.to_s),
+      ].all?
       Settings.project_bind_host = bind_host == Settings.bind_host ? nil : bind_host
       Settings.project_bind_port = bind_port == Settings.bind_port ? nil : bind_port
       Settings.project_upstream_proxy = upstream == Settings.upstream_proxy ? nil : upstream
@@ -5750,10 +5759,19 @@ module Gori::Tui
       Settings.project_connect_timeout_secs = connect_secs == Settings.connect_timeout_secs ? nil : connect_secs
       Settings.project_io_timeout_secs = io_secs == Settings.io_timeout_secs ? nil : io_secs
       Settings.project_capture_max_mib = capture_mib == Settings.capture_max_mib ? nil : capture_mib
-      apply_settings("project network saved")
+      # The globals above are still assigned and the rebind below still happens even when the
+      # write did not land: the operator asked for this address, and refusing to apply it would
+      # be the worse half of the trade. What must not happen is calling it saved. `apply_settings`
+      # composes the rest of the sentence (rebound / on fallback / unchanged), so the warning
+      # goes in front of whichever it picks.
+      applied = apply_settings(persisted ? "project network saved" : "project network applied")
+      return applied if persisted
+      "#{applied} — but NOT saved (project busy); it reverts when you reopen this project"
     end
 
-    private def set_or_clear(key : String, value : String, global : String) : Nil
+    # Store the per-project value, or drop the key so the project inherits the global.
+    # Returns whether that write COMMITTED (both store calls are `exec_task_ok`).
+    private def set_or_clear(key : String, value : String, global : String) : Bool
       store = @session.store
       value == global ? store.delete_setting(key) : store.set_setting(key, value)
     end
