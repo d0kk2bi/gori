@@ -44,7 +44,7 @@ module Gori::Settings
       kind = clamp_field(o["kind"]?.try(&.as_s?), SCAN_RULE_KINDS, "string")
       severity = clamp_field(o["severity"]?.try(&.as_s?), SCAN_RULE_SEVERITIES, "info")
       desc = o["description"]?.try(&.as_s?) || ""
-      enabled = o["enabled"]?.try { |v| v.as_bool? }
+      enabled = o["enabled"]?.try(&.as_bool?)
       out << ScanRule.new(id, title, desc, side, region, kind, pattern, severity, enabled.nil? ? true : enabled)
     end
     out

@@ -191,7 +191,7 @@ module Gori
       TermAnalysis.new(applied, ignored, invalid_regex_terms(query))
     end
 
-    REGEX_FIELDS = %w(host path url header body)
+    REGEX_FIELDS = %w[host path url header body]
 
     # The field/operator split, shared by compilation and diagnosis so the two can't
     # disagree about what counts as a term. The first ':' (field op) or '~' (regex op)

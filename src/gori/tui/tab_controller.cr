@@ -389,7 +389,7 @@ module Gori::Tui
     # The field names this tab advertises in the filter bar guidance/hint rows (and the
     # only fields Tab-completes). HTTP tabs override to name/host/method; Repeater adds tag.
     def filter_fields : Array(String)
-      %w(name)
+      %w[name]
     end
 
     # The filter bar occupies a body row whenever there are ≥2 sub-tabs to filter (below

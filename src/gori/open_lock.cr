@@ -63,12 +63,10 @@ module Gori
       file = File.open(lock_path, "a") # never "w": truncating races a peer's own open
       begin
         RETRY_ATTEMPTS.times do |attempt|
-          begin
-            file.flock_shared(blocking: false)
-            return new(file)
-          rescue IO::Error
-            sleep RETRY_DELAY if attempt < RETRY_ATTEMPTS - 1
-          end
+          file.flock_shared(blocking: false)
+          return new(file)
+        rescue IO::Error
+          sleep RETRY_DELAY if attempt < RETRY_ATTEMPTS - 1
         end
         # Gave up. Say so: from here the database is open with nothing announcing it, which is
         # the one state a peer's delete cannot see. gori.log, not STDERR (#411).

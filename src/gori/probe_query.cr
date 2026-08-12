@@ -13,7 +13,7 @@ module Gori
     #   category:tech sev:>=high   → tech issues at High or Critical
     #   -status:resolved host:api  → not-resolved AND host contains "api"
     class Filter
-      FIELDS = %w(severity: status: category: host: code:)
+      FIELDS = %w[severity: status: category: host: code:]
 
       private record Term, kind : Symbol, op : Symbol, text : String, negate : Bool
 

@@ -174,7 +174,7 @@ module Gori::Tui
       # The target is held by VIEW identity (not a positional index): the cross-session
       # reconcile can reorder/remove repeater tabs while the prompt is open, so the
       # controller's apply_rename re-finds the tab by its view — never a shifted neighbour.
-      @rename_view = nil.as(RepeaterView | FuzzerView | DecoderView | JwtView | MinerView | SequencerView | ComparerView | Nil)
+      @rename_view = nil.as(RepeaterView | FuzzerView | DecoderView | JwtView | MinerView | SequencerView | ComparerView?)
       # The Repeater sub-tab TAG editor (issue #121) — a bottom prompt mirroring rename,
       # space-separated tags. Held by VIEW identity for the same reconcile-race reason.
       @tag_edit_open = false
@@ -872,7 +872,7 @@ module Gori::Tui
       chars = 0
       nav = 0
       keys = 0
-      while (more = @term.poll_event(0))
+      while more = @term.poll_event(0)
         handle(more)
         keys += 1 if more.is_a?(Termisu::Event::Key)
         if coalesceable_char?(more)
@@ -2039,14 +2039,12 @@ module Gori::Tui
         "certificate in your clients (gori ca / path copied).\n" \
         "New connections use it immediately.",
         confirm_label: "import", danger: true) do
-        begin
-          warning = @session.ca.import!(cert, key)
-          Clipboard.copy(path)
-          note = warning ? " (warning: #{warning})" : ""
-          @toast = "root CA imported#{note} — re-trust it (path copied): #{path}"
-        rescue ex
-          @toast = "CA import failed: #{ex.message}"
-        end
+        warning = @session.ca.import!(cert, key)
+        Clipboard.copy(path)
+        note = warning ? " (warning: #{warning})" : ""
+        @toast = "root CA imported#{note} — re-trust it (path copied): #{path}"
+      rescue ex
+        @toast = "CA import failed: #{ex.message}"
       end
       false
     end
@@ -5304,13 +5302,11 @@ module Gori::Tui
         "certificate in your clients (gori ca / path copied).\n" \
         "New connections use it immediately.",
         confirm_label: "regenerate", danger: true) do
-        begin
-          @session.ca.regenerate!
-          Clipboard.copy(path)
-          @toast = "root CA regenerated — re-trust it (path copied): #{path}"
-        rescue ex
-          @toast = "CA regeneration failed: #{ex.message}"
-        end
+        @session.ca.regenerate!
+        Clipboard.copy(path)
+        @toast = "root CA regenerated — re-trust it (path copied): #{path}"
+      rescue ex
+        @toast = "CA regeneration failed: #{ex.message}"
       end
     end
 
@@ -5346,9 +5342,9 @@ module Gori::Tui
     # detail_copy_selection), so its title stays the static "Copy selection" —
     # flipping it here would be a no-op at best and misleading at worst (no
     # selection ⇒ it still only copies the current line, not "the whole pane").
-    READ_COPY_VERBS = %w(
+    READ_COPY_VERBS = %w[
       notes.copy repeater.copy decoder.copy issue.copy project.copy fuzzer.copy
-    )
+    ]
 
     def space_menu_title(verb_id : String) : String?
       return "Copy selection" if READ_COPY_VERBS.includes?(verb_id) && read_selection_active?

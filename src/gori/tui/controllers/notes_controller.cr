@@ -254,7 +254,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name) # notes have no HTTP context; free-text covers each note's body text
+      %w[name] # notes have no HTTP context; free-text covers each note's body text
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)

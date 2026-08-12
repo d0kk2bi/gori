@@ -40,11 +40,9 @@ module Gori::Tui
       done = Channel(String).new(1)
       output = process.output
       spawn(name: "gori-statusline-read") do
-        begin
-          done.send(read_first_line(output))
-        rescue
-          done.send("")
-        end
+        done.send(read_first_line(output))
+      rescue
+        done.send("")
       end
 
       result =

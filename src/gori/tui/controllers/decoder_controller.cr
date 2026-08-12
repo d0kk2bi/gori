@@ -127,7 +127,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name) # a conversion has no HTTP context; free-text covers the chain + input
+      %w[name] # a conversion has no HTTP context; free-text covers the chain + input
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
@@ -859,7 +859,7 @@ module Gori::Tui
       # passive discovery menu (engaged? = false → Tab keeps navigating the focus ring,
       # ↓ dives in). A typed token filters AND engages it (Tab/↵ accept). set() opens the
       # popup iff the match list is non-empty.
-      matches = registry.match(tok).map(&.name).uniq
+      matches = registry.match(tok).map(&.name).uniq!
       @popup.set(matches.first(64), ts, te)
       @popup_engaged = !tok.empty?
     end

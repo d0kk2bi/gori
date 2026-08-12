@@ -140,11 +140,9 @@ module Gori
         args = build_args(db_path, project, read_only, insecure_upstream, use_active_project,
           no_project, settings_path)
         targets.uniq.map do |target|
-          begin
-            Outcome.new(target, install_argv(target, exe_path, args), nil, args)
-          rescue ex
-            Outcome.new(target, nil, ex.message.presence || ex.class.to_s, args)
-          end
+          Outcome.new(target, install_argv(target, exe_path, args), nil, args)
+        rescue ex
+          Outcome.new(target, nil, ex.message.presence || ex.class.to_s, args)
         end
       end
 

@@ -391,7 +391,7 @@ module Gori::Tui
       scored.sort_by! { |(_, score)| -score }.map { |(p, _)| p }
     end
 
-    private def handle_list(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_list(ev : Termisu::Event::Key) : Project | Symbol?
       key = ev.key
       @preedit = "" # any committed key ends an in-progress IME composition
       @flash = nil  # a fresh keystroke dismisses the last compaction result line
@@ -470,7 +470,7 @@ module Gori::Tui
     # we act on its Outcome — :close pops back to the list, :open (only :theme is allowed
     # here) opens the theme card, a save just persists (no live proxy to re-apply
     # pre-project). ^C still quits the picker.
-    private def handle_preferences(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_preferences(ev : Termisu::Event::Key) : Project | Symbol?
       return :quit if ev.ctrl_c?
       @preedit = "" # a committed key ends any in-progress IME composition (the modal owns its own)
       outcome = @preferences.handle_key(ev)
@@ -501,7 +501,7 @@ module Gori::Tui
 
     # The theme card opened from the modal's Theme row: ↑/↓ preview, ↵ apply + persist,
     # esc reverts. Mirrors the in-app theme editor, minus the proxy/toast.
-    private def handle_theme(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_theme(ev : Termisu::Event::Key) : Project | Symbol?
       key = ev.key
       return :quit if ev.ctrl_c?
       if key.escape?
@@ -541,7 +541,7 @@ module Gori::Tui
     # be shared: the two ladders drifted once already, and the arm that missed the ctrl/alt
     # guard was this one — where "yes" means `rm_rf` on the project directory or a VACUUM,
     # neither of which can be taken back.
-    private def handle_confirm(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_confirm(ev : Termisu::Event::Key) : Project | Symbol?
       @preedit = ""
       dlg = @confirm
       key = ev.key
@@ -550,7 +550,7 @@ module Gori::Tui
       when ConfirmDialog.affirmative?(ev)                 then commit_confirmed
       when key.left?, key.right?, key.tab?, key.back_tab? then dlg.try(&.move)
       when key.enter?
-        (dlg.try(&.confirm_selected?)) ? commit_confirmed : cancel_confirm
+        dlg.try(&.confirm_selected?) ? commit_confirmed : cancel_confirm
       end
       nil
     end
@@ -565,7 +565,7 @@ module Gori::Tui
     end
 
     # Project-row space menu: ↑/↓ move, mnemonic key or ↵ run, esc dismiss.
-    private def handle_space(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_space(ev : Termisu::Event::Key) : Project | Symbol?
       key = ev.key
       entries = space_entries
       @preedit = ""
@@ -586,7 +586,7 @@ module Gori::Tui
     end
 
     # Rename prompt: type a new display name, ↵ commit, esc cancel.
-    private def handle_rename(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_rename(ev : Termisu::Event::Key) : Project | Symbol?
       key = ev.key
       @preedit = ""
       if key.escape?
@@ -613,7 +613,7 @@ module Gori::Tui
       when 2
         # Enter while on Search row: immediately pick the top match if any.
         # (Arrow down into the box if you want to choose a different result.)
-        if filtered_projects.any?
+        if filtered_projects.present?
           return filtered_projects[0]
         end
         nil
@@ -912,7 +912,7 @@ module Gori::Tui
     # opened on, so it is the SAME resolver ctrl-d and the footer button go through. The
     # other three are single-target by design and stay on the cursor project — the menu says
     # so while marks are set (see ProjectPicker.space_entries).
-    private def activate_space_entry(entry : SpaceEntry) : Project | Symbol | Nil
+    private def activate_space_entry(entry : SpaceEntry) : Project | Symbol?
       project = @space_project || selected_project
       close_space_menu
       case entry.action
@@ -1002,7 +1002,7 @@ module Gori::Tui
 
     # Compress popup: ↑/↓ move, ‹/› cycle keep-flows, space toggle, ↵/space on the
     # Compress row opens the confirm (else toggles the focused row), esc dismiss.
-    private def handle_compress(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_compress(ev : Termisu::Event::Key) : Project | Symbol?
       ov = @compact
       return nil unless ov
       key = ev.key
@@ -1085,7 +1085,7 @@ module Gori::Tui
       @flash_ok = ok
     end
 
-    private def handle_new(ev : Termisu::Event::Key) : Project | Symbol | Nil
+    private def handle_new(ev : Termisu::Event::Key) : Project | Symbol?
       key = ev.key
       @preedit = "" # any committed key ends an in-progress IME composition
       if key.escape?
@@ -1141,7 +1141,7 @@ module Gori::Tui
       ri < filtered_projects.size ? ri + 3 : nil
     end
 
-    private def handle_picker_mouse(ev : Termisu::Event::Mouse) : Project | Symbol | Nil
+    private def handle_picker_mouse(ev : Termisu::Event::Mouse) : Project | Symbol?
       return nil unless ev.press? || ev.wheel?
       w, h = @backend.size
       mx, my = ev.x - 1, ev.y - 1
@@ -1165,7 +1165,7 @@ module Gori::Tui
 
     # Click a compress-popup row to focus + toggle it (or open the confirm on the
     # Compress row); a click outside the card dismisses, like the other overlays.
-    private def handle_compress_mouse(w : Int32, h : Int32, mx : Int32, my : Int32) : Project | Symbol | Nil
+    private def handle_compress_mouse(w : Int32, h : Int32, mx : Int32, my : Int32) : Project | Symbol?
       ov = @compact
       return nil if ov.nil?
       box = ov.overlay_box(Rect.new(0, 0, w, h))
@@ -1184,7 +1184,7 @@ module Gori::Tui
     # the already-selected entry activates it (same model as the History/Issues list).
     # The footer hint's buttons are checked first and fire on a SINGLE click: they're
     # commands, not a selection, so select-first would just make them feel broken.
-    private def handle_list_mouse(mx : Int32, my : Int32) : Project | Symbol | Nil
+    private def handle_list_mouse(mx : Int32, my : Int32) : Project | Symbol?
       w, h = @backend.size
       if action = hint_action_at(mx, my, w, h)
         return run_hint_action(action)
@@ -1250,7 +1250,7 @@ module Gori::Tui
       end
     end
 
-    private def handle_space_mouse(w : Int32, h : Int32, mx : Int32, my : Int32) : Project | Symbol | Nil
+    private def handle_space_mouse(w : Int32, h : Int32, mx : Int32, my : Int32) : Project | Symbol?
       entries = space_entries
       box = space_menu_box(w, h)
       return close_space_menu unless box.contains?(mx, my) # click away → dismiss
@@ -1704,7 +1704,7 @@ module Gori::Tui
     # Run a footer button. Each arm mirrors its chord in `handle_list_key` exactly — notably
     # `:new`, which (like ctrl-n) direct-creates when the search box already holds a name
     # rather than opening the form with it retyped.
-    private def run_hint_action(action : Symbol) : Project | Symbol | Nil
+    private def run_hint_action(action : Symbol) : Project | Symbol?
       case action
       # `return`, not a bare call: `activate`'s Project IS how the picker says "open
       # this" (see `run`). Without it the footer button did nothing, and on the Temp row

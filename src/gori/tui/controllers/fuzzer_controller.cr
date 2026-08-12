@@ -91,7 +91,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method) # fuzz sessions carry an HTTP template (target + method)
+      %w[name host method] # fuzz sessions carry an HTTP template (target + method)
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
@@ -899,7 +899,7 @@ module Gori::Tui
     # Re-find by VIEW identity so a closed/reordered tab is a no-op, never a neighbour. Blank
     # clears the custom label (the chip reverts to the template-derived summary).
     def apply_rename(view : FuzzerView, name : String) : Nil
-      return unless tab = @fuzzers.find { |t| t.view.same?(view) }
+      return unless tab = @fuzzers.find(&.view.same?(view))
       clean = name.strip
       view.name = clean.empty? ? nil : clean
       if id = tab.db_id
@@ -1314,7 +1314,7 @@ module Gori::Tui
       @current_idx =
         if cur_db && (idx = @fuzzers.index { |t| t.db_id == cur_db })
           idx
-        elsif (cv = cur_view) && (idx = @fuzzers.index { |t| t.view.same?(cv) })
+        elsif (cv = cur_view) && (idx = @fuzzers.index(&.view.same?(cv)))
           idx
         elsif @fuzzers.empty?
           -1

@@ -59,11 +59,30 @@ jobs:
         # scheduler. Enabling MT here would build a binary those files do not
         # describe.
         run: shards build
-  # No lint job, and no `crystal tool format --check` job: the tree does not
-  # currently pass either (ameba reports ~700 pre-existing findings, and the
-  # formatter rewrites 100+ files). Both are run locally via `just check`. Add
-  # them back as gates once the backlog is cleared, not before — a check that is
-  # always red is a check nobody reads.
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          # Deliberately NOT the build matrix. `crystal tool format` is the formatter
+          # shipped WITH the compiler, so its output is a property of the version that
+          # runs it, not of this repo — gating on two versions would ask the tree to be
+          # a fixed point of two different formatters at once. Pin the one development
+          # happens on; bump this line when that moves.
+          crystal: 1.21.0
+      # No `shards install`, and the paths are explicit rather than a bare `--check`:
+      # the bare form walks the whole working directory, which after an install means
+      # gating on `lib/` — third-party code this repo cannot fix, breaking the build on
+      # a dependency bump for a formatting change nobody here made.
+      - name: Check formatting
+        run: crystal tool format --check src spec bench scripts
+  # Still no ameba job. The backlog is down from 965 findings to 641, but 248 of the
+  # remainder are Metrics/CyclomaticComplexity in the TUI — splitting those methods is a
+  # real refactor, not lint cleanup, and `.ameba.yml` already records the decision to
+  # raise the bar to 12 rather than carve them up. `just check` still runs it locally.
+  # Add the gate when that category is dealt with, not by excluding it — a check that is
+  # always red is a check nobody reads, but one that is green by exclusion is worse.
   tests:
     runs-on: ubuntu-latest
     strategy:

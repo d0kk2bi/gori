@@ -2628,7 +2628,7 @@ module Gori::Tui
       env_sep = @editor.text.index("\n\n")
       return unless env_sep
       head_lines = @editor.text[0, env_sep].split('\n')
-      host_idx = head_lines.index { |l| l.lstrip.downcase.starts_with?("host:") }
+      host_idx = head_lines.index(&.lstrip.downcase.starts_with?("host:"))
       return unless host_idx
       new_line = "Host: #{authority}"
       return if head_lines[host_idx] == new_line

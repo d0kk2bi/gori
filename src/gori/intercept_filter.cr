@@ -90,22 +90,22 @@ module Gori
     # its payload to the gate. It must stay in lockstep with field_symbol below: completing a
     # field this parser doesn't know would silently degrade the whole token to free text (see
     # parse_term).
-    FIELDS = %w(host path method scheme status proto body)
+    FIELDS = %w[host path method scheme status proto body]
 
     # Static value pools for the low-cardinality fields (mirrors History's). `host:`
     # has no static pool — its candidates are injected by the caller (the TUI passes
     # the store's DISTINCT hosts); `path:`/`body:` have none at all, since their values
     # are unbounded.
-    METHOD_VAL = %w(GET POST PUT PATCH DELETE HEAD OPTIONS QUERY)
-    SCHEME_VAL = %w(http https)
-    STATUS_VAL = %w(2xx 3xx 4xx 5xx >=400 >=500 200 301 302 401 403 404 500 502 503)
+    METHOD_VAL = %w[GET POST PUT PATCH DELETE HEAD OPTIONS QUERY]
+    SCHEME_VAL = %w[http https]
+    STATUS_VAL = %w[2xx 3xx 4xx 5xx >=400 >=500 200 301 302 401 403 404 500 502 503]
     # `ws`/`http` ONLY — a strict subset of History's `proto:` pool, for the same reason this
     # whole field list is one. A hold gate knows the protocol from the leg it is standing on
     # (`Subject#proto` is `Ws` for a WebSocket message and `Http` for everything else); `grpc`
     # and `sse` are decided from a captured response's Content-Type, which does not exist yet at
     # a gate. Offering them completed a term that can never match — i.e. a `proto:grpc`
     # condition silently holds NOTHING, which reads as intercept being broken.
-    PROTO_VAL = %w(ws http)
+    PROTO_VAL = %w[ws http]
 
     # Tab-complete candidates for the token under `cx`: field names until a `:` is
     # typed, then that field's values. The grammar's punctuation is carried through by

@@ -30,7 +30,7 @@ module Gori::Tui
     # The QL fields meaningful for the endpoint tree. Mirrors History's set so the same
     # `/` query language applies, plus `tag:` — a Sitemap-local field (handled here, not
     # in the shared QL) that filters the tree by a node's path memo.
-    QL_FIELDS = %w(host path method status scheme proto body header size dur tag)
+    QL_FIELDS = %w[host path method status scheme proto body header size dur tag]
     # Discoverability hints for the filter, kept loosely in sync with QL_FIELDS.
     # FILTER_HINT sits on the idle bar (press `/` to start); QUERY_HINT sits on the
     # suggestion row at a cold start (already editing, nothing to Tab-complete yet) and
@@ -489,7 +489,7 @@ module Gori::Tui
     def apply_tag(text : String) : Nil
       value = text.blank? ? nil : text
       index = node_index
-      @tag_targets.each { |key| index[key]?.try { |node| node.tag = value } }
+      @tag_targets.each { |key| index[key]?.try(&.tag=(value)) }
       cancel_tag
     end
 

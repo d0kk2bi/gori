@@ -63,7 +63,7 @@ module Gori
         change_count = Repeater::Diff.change_count(full_diff)
         folded = if changes_only
                    full_diff.reject { |dl| dl.kind == Repeater::DiffKind::Same }.map { |dl| Repeater::Diff::Folded.new(dl, 0) }
-                 elsif (n = context)
+                 elsif n = context
                    Repeater::Diff.fold(full_diff, n)
                  else
                    full_diff.map { |dl| Repeater::Diff::Folded.new(dl, 0) }

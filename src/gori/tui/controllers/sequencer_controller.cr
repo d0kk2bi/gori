@@ -461,7 +461,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method)
+      %w[name host method]
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
@@ -840,7 +840,7 @@ module Gori::Tui
       @current_idx =
         if cur_db && (idx = @sessions.index { |t| t.db_id == cur_db })
           idx
-        elsif (cv = cur_view) && (idx = @sessions.index { |t| t.view.same?(cv) })
+        elsif (cv = cur_view) && (idx = @sessions.index(&.view.same?(cv)))
           idx
         elsif @sessions.empty?
           -1

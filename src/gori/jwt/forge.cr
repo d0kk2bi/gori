@@ -18,7 +18,7 @@ module Gori
 
     # The algorithms Encode offers, in cycle order. `none` produces an unsigned token
     # (empty third segment) — the classic auth-bypass shape, offered deliberately.
-    ALGS = %w(HS256 HS384 HS512 none)
+    ALGS = %w[HS256 HS384 HS512 none]
 
     # HS name → the OpenSSL digest it signs with. `none` is absent (handled by sign).
     HMAC_DIGEST = {

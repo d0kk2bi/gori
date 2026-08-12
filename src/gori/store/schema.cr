@@ -16,37 +16,37 @@ module Gori
         # OOM the proxy or bloat one row, and the *_body_truncated flags mark the cut.
         # h2_conn_id/h2_stream_id link a decoded h2 projection back to its raw frame log.
         <<-SQL,
-        CREATE TABLE flows (
-          id                      INTEGER PRIMARY KEY,
-          created_at              INTEGER NOT NULL,
-          scheme                  TEXT    NOT NULL,
-          host                    TEXT    NOT NULL,
-          port                    INTEGER NOT NULL,
-          method                  TEXT    NOT NULL,
-          target                  TEXT    NOT NULL,
-          http_version            TEXT    NOT NULL,
-          sni                     TEXT,
-          alpn                    TEXT,
-          tls_version             TEXT,
-          request_head            BLOB    NOT NULL,
-          request_body            BLOB,
-          response_head           BLOB,
-          response_body           BLOB,
-          status                  INTEGER,
-          reason                  TEXT,
-          content_type            TEXT,
-          request_size            INTEGER NOT NULL DEFAULT 0,
-          response_size           INTEGER,
-          state                   INTEGER NOT NULL,
-          ttfb_us                 INTEGER,
-          duration_us             INTEGER,
-          error                   TEXT,
-          h2_conn_id              INTEGER,
-          h2_stream_id            INTEGER,
-          request_body_truncated  INTEGER NOT NULL DEFAULT 0,
-          response_body_truncated INTEGER NOT NULL DEFAULT 0
-        )
-        SQL
+          CREATE TABLE flows (
+            id                      INTEGER PRIMARY KEY,
+            created_at              INTEGER NOT NULL,
+            scheme                  TEXT    NOT NULL,
+            host                    TEXT    NOT NULL,
+            port                    INTEGER NOT NULL,
+            method                  TEXT    NOT NULL,
+            target                  TEXT    NOT NULL,
+            http_version            TEXT    NOT NULL,
+            sni                     TEXT,
+            alpn                    TEXT,
+            tls_version             TEXT,
+            request_head            BLOB    NOT NULL,
+            request_body            BLOB,
+            response_head           BLOB,
+            response_body           BLOB,
+            status                  INTEGER,
+            reason                  TEXT,
+            content_type            TEXT,
+            request_size            INTEGER NOT NULL DEFAULT 0,
+            response_size           INTEGER,
+            state                   INTEGER NOT NULL,
+            ttfb_us                 INTEGER,
+            duration_us             INTEGER,
+            error                   TEXT,
+            h2_conn_id              INTEGER,
+            h2_stream_id            INTEGER,
+            request_body_truncated  INTEGER NOT NULL DEFAULT 0,
+            response_body_truncated INTEGER NOT NULL DEFAULT 0
+          )
+          SQL
         "CREATE INDEX idx_flows_created_at ON flows (created_at)",
         # The one projection filter with useful cardinality + range queries.
         "CREATE INDEX idx_flows_status ON flows (status)",
@@ -83,16 +83,16 @@ module Gori
 
         # WebSocket message log. `repeater_id` is set for messages sent from a WS Repeater tab.
         <<-SQL,
-        CREATE TABLE ws_messages (
-          id          INTEGER PRIMARY KEY,
-          flow_id     INTEGER NOT NULL,
-          created_at  INTEGER NOT NULL,
-          direction   TEXT    NOT NULL,
-          opcode      INTEGER NOT NULL,
-          payload     BLOB    NOT NULL,
-          repeater_id INTEGER
-        )
-        SQL
+          CREATE TABLE ws_messages (
+            id          INTEGER PRIMARY KEY,
+            flow_id     INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            direction   TEXT    NOT NULL,
+            opcode      INTEGER NOT NULL,
+            payload     BLOB    NOT NULL,
+            repeater_id INTEGER
+          )
+          SQL
         "CREATE INDEX idx_ws_messages_flow ON ws_messages (flow_id)",
         "CREATE INDEX idx_ws_messages_repeater ON ws_messages (repeater_id)",
 
@@ -101,27 +101,27 @@ module Gori
         # the frame-log detail view only ever renders the `length` column (see
         # Store#insert_h2_frame_one).
         <<-SQL,
-        CREATE TABLE h2_connections (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          host       TEXT    NOT NULL,
-          port       INTEGER NOT NULL,
-          alpn       TEXT    NOT NULL
-        )
-        SQL
+          CREATE TABLE h2_connections (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            host       TEXT    NOT NULL,
+            port       INTEGER NOT NULL,
+            alpn       TEXT    NOT NULL
+          )
+          SQL
         <<-SQL,
-        CREATE TABLE h2_frames (
-          id         INTEGER PRIMARY KEY,
-          conn_id    INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          direction  TEXT    NOT NULL,
-          stream_id  INTEGER NOT NULL,
-          type       INTEGER NOT NULL,
-          flags      INTEGER NOT NULL,
-          length     INTEGER NOT NULL,
-          payload    BLOB    NOT NULL
-        )
-        SQL
+          CREATE TABLE h2_frames (
+            id         INTEGER PRIMARY KEY,
+            conn_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            direction  TEXT    NOT NULL,
+            stream_id  INTEGER NOT NULL,
+            type       INTEGER NOT NULL,
+            flags      INTEGER NOT NULL,
+            length     INTEGER NOT NULL,
+            payload    BLOB    NOT NULL
+          )
+          SQL
         "CREATE INDEX idx_h2_frames_conn ON h2_frames (conn_id)",
         # So the retention prune's orphan-connection reap (`SELECT conn_id FROM h2_frames
         # WHERE created_at >= ?`) is answered index-only instead of full-scanning the frame
@@ -136,46 +136,46 @@ module Gori
         # UNIQUE sits on the (kind, match_type, pattern) triple, so the same pattern can be
         # both an include and an exclude, or a host rule and a string rule.
         <<-SQL,
-        CREATE TABLE scope_rules (
-          id         INTEGER PRIMARY KEY,
-          kind       TEXT NOT NULL DEFAULT 'include',
-          match_type TEXT NOT NULL DEFAULT 'host',
-          pattern    TEXT NOT NULL,
-          UNIQUE(kind, match_type, pattern)
-        )
-        SQL
+          CREATE TABLE scope_rules (
+            id         INTEGER PRIMARY KEY,
+            kind       TEXT NOT NULL DEFAULT 'include',
+            match_type TEXT NOT NULL DEFAULT 'host',
+            pattern    TEXT NOT NULL,
+            UNIQUE(kind, match_type, pattern)
+          )
+          SQL
 
         # Issues: human-confirmed vuln records, with a triage STATUS axis (open / confirmed /
         # false-positive / resolved) separate from severity, so a false positive is a
         # reversible state instead of a delete. NOTE: distinct from probe_issues below
         # (machine-found scan results).
         <<-SQL,
-        CREATE TABLE issues (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          title      TEXT    NOT NULL,
-          severity   INTEGER NOT NULL,
-          host       TEXT,
-          flow_id    INTEGER,
-          notes      TEXT    NOT NULL DEFAULT '',
-          status     INTEGER NOT NULL DEFAULT 0
-        )
-        SQL
+          CREATE TABLE issues (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            title      TEXT    NOT NULL,
+            severity   INTEGER NOT NULL,
+            host       TEXT,
+            flow_id    INTEGER,
+            notes      TEXT    NOT NULL DEFAULT '',
+            status     INTEGER NOT NULL DEFAULT 0
+          )
+          SQL
         "CREATE INDEX idx_issues_severity ON issues (severity)",
 
         # Cross-entity links: attach History/Repeater/Fuzzer/Miner refs to an Issue or Note.
         <<-SQL,
-        CREATE TABLE entity_links (
-          id         INTEGER PRIMARY KEY,
-          owner_kind TEXT    NOT NULL,
-          owner_id   INTEGER NOT NULL,
-          ref_kind   TEXT    NOT NULL,
-          ref_id     INTEGER NOT NULL,
-          created_at INTEGER NOT NULL,
-          UNIQUE(owner_kind, owner_id, ref_kind, ref_id)
-        )
-        SQL
+          CREATE TABLE entity_links (
+            id         INTEGER PRIMARY KEY,
+            owner_kind TEXT    NOT NULL,
+            owner_id   INTEGER NOT NULL,
+            ref_kind   TEXT    NOT NULL,
+            ref_id     INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(owner_kind, owner_id, ref_kind, ref_id)
+          )
+          SQL
         "CREATE INDEX idx_entity_links_owner ON entity_links (owner_kind, owner_id)",
 
         # Sitemap path tags: a free-text memo pinned to a (host, path) node in the Sitemap
@@ -183,14 +183,14 @@ module Gori
         # sharing the DB (reconciled on the data_version poll like issues). UNIQUE(host, path)
         # makes the write an upsert; an empty tag deletes the row.
         <<-SQL,
-        CREATE TABLE sitemap_tags (
-          id   INTEGER PRIMARY KEY,
-          host TEXT NOT NULL,
-          path TEXT NOT NULL,
-          tag  TEXT NOT NULL,
-          UNIQUE(host, path)
-        )
-        SQL
+          CREATE TABLE sitemap_tags (
+            id   INTEGER PRIMARY KEY,
+            host TEXT NOT NULL,
+            path TEXT NOT NULL,
+            tag  TEXT NOT NULL,
+            UNIQUE(host, path)
+          )
+          SQL
 
         # Project-level hostname overrides (a per-project /etc/hosts): map a host to the IP the
         # proxy should DIAL for it, while SNI/cert/Host header keep the original host. `host` is
@@ -198,12 +198,12 @@ module Gori
         # edit the row to change its IP). Read on the proxy hot path (Upstream.dial) via the
         # Mutex-guarded HostOverrides model.
         <<-SQL,
-        CREATE TABLE host_overrides (
-          id   INTEGER PRIMARY KEY,
-          host TEXT NOT NULL UNIQUE,
-          ip   TEXT NOT NULL
-        )
-        SQL
+          CREATE TABLE host_overrides (
+            id   INTEGER PRIMARY KEY,
+            host TEXT NOT NULL UNIQUE,
+            ip   TEXT NOT NULL
+          )
+          SQL
 
         # ── Rewriter (Match & Replace) ───────────────────────────────────────────
         # A rule rewrites either the message HEAD (request/status line + headers) or its BODY
@@ -211,20 +211,20 @@ module Gori
         # set-header / remove-header), a MATCH KIND (literal / regex, for replace), an optional
         # NAME, and an optional HOST glob ('' = all hosts) that scopes the rule.
         <<-SQL,
-        CREATE TABLE match_rules (
-          id          INTEGER PRIMARY KEY,
-          enabled     INTEGER NOT NULL DEFAULT 1,
-          target      TEXT    NOT NULL,
-          pattern     TEXT    NOT NULL,
-          replacement TEXT    NOT NULL DEFAULT '',
-          position    INTEGER NOT NULL DEFAULT 0,
-          part        TEXT    NOT NULL DEFAULT 'head',
-          op          TEXT    NOT NULL DEFAULT 'replace',
-          match_kind  TEXT    NOT NULL DEFAULT 'literal',
-          name        TEXT    NOT NULL DEFAULT '',
-          host        TEXT    NOT NULL DEFAULT ''
-        )
-        SQL
+          CREATE TABLE match_rules (
+            id          INTEGER PRIMARY KEY,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            target      TEXT    NOT NULL,
+            pattern     TEXT    NOT NULL,
+            replacement TEXT    NOT NULL DEFAULT '',
+            position    INTEGER NOT NULL DEFAULT 0,
+            part        TEXT    NOT NULL DEFAULT 'head',
+            op          TEXT    NOT NULL DEFAULT 'replace',
+            match_kind  TEXT    NOT NULL DEFAULT 'literal',
+            name        TEXT    NOT NULL DEFAULT '',
+            host        TEXT    NOT NULL DEFAULT ''
+          )
+          SQL
 
         # ── Workbenches ──────────────────────────────────────────────────────────
         # Repeater tabs, persisted so they survive a reopen AND sync across sessions sharing
@@ -238,25 +238,25 @@ module Gori
         # restore() can rebuild the Replay::Result faithfully — including an errored send.
         # All NULL until the first send. Scroll/focus/diff-baseline stay transient.
         <<-SQL,
-        CREATE TABLE repeaters (
-          id                   INTEGER PRIMARY KEY,
-          created_at           INTEGER NOT NULL,
-          updated_at           INTEGER NOT NULL,
-          target               TEXT    NOT NULL,
-          request              TEXT    NOT NULL,
-          http2                INTEGER NOT NULL DEFAULT 0,
-          auto_content_length  INTEGER NOT NULL DEFAULT 1,
-          flow_id              INTEGER,
-          position             INTEGER NOT NULL DEFAULT 0,
-          response_head        BLOB,
-          response_body        BLOB,
-          response_error       TEXT,
-          response_duration_us INTEGER,
-          name                 TEXT,
-          sni                  TEXT,
-          tags                 TEXT
-        )
-        SQL
+          CREATE TABLE repeaters (
+            id                   INTEGER PRIMARY KEY,
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            target               TEXT    NOT NULL,
+            request              TEXT    NOT NULL,
+            http2                INTEGER NOT NULL DEFAULT 0,
+            auto_content_length  INTEGER NOT NULL DEFAULT 1,
+            flow_id              INTEGER,
+            position             INTEGER NOT NULL DEFAULT 0,
+            response_head        BLOB,
+            response_body        BLOB,
+            response_error       TEXT,
+            response_duration_us INTEGER,
+            name                 TEXT,
+            sni                  TEXT,
+            tags                 TEXT
+          )
+          SQL
         "CREATE INDEX idx_repeaters_position ON repeaters (position, id)",
 
         # Fuzzer / Intruder persistence:
@@ -268,56 +268,56 @@ module Gori
         #    frontends persist selectively per keep_bodies (a billion-row cluster bomb is
         #    never stored whole).
         <<-SQL,
-        CREATE TABLE fuzz_sessions (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          target     TEXT    NOT NULL,
-          template   TEXT    NOT NULL,
-          http2      INTEGER NOT NULL DEFAULT 0,
-          sni        TEXT,
-          config     TEXT    NOT NULL DEFAULT '',
-          flow_id    INTEGER,
-          position   INTEGER NOT NULL DEFAULT 0,
-          name       TEXT
-        )
-        SQL
+          CREATE TABLE fuzz_sessions (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            target     TEXT    NOT NULL,
+            template   TEXT    NOT NULL,
+            http2      INTEGER NOT NULL DEFAULT 0,
+            sni        TEXT,
+            config     TEXT    NOT NULL DEFAULT '',
+            flow_id    INTEGER,
+            position   INTEGER NOT NULL DEFAULT 0,
+            name       TEXT
+          )
+          SQL
         "CREATE INDEX idx_fuzz_sessions_position ON fuzz_sessions (position, id)",
         <<-SQL,
-        CREATE TABLE fuzz_runs (
-          id          INTEGER PRIMARY KEY,
-          session_id  INTEGER,
-          created_at  INTEGER NOT NULL,
-          finished_at INTEGER,
-          target      TEXT    NOT NULL,
-          mode        TEXT    NOT NULL,
-          total       INTEGER,
-          sent        INTEGER NOT NULL DEFAULT 0,
-          matched     INTEGER NOT NULL DEFAULT 0,
-          errors      INTEGER NOT NULL DEFAULT 0,
-          status      TEXT    NOT NULL DEFAULT 'running'
-        )
-        SQL
+          CREATE TABLE fuzz_runs (
+            id          INTEGER PRIMARY KEY,
+            session_id  INTEGER,
+            created_at  INTEGER NOT NULL,
+            finished_at INTEGER,
+            target      TEXT    NOT NULL,
+            mode        TEXT    NOT NULL,
+            total       INTEGER,
+            sent        INTEGER NOT NULL DEFAULT 0,
+            matched     INTEGER NOT NULL DEFAULT 0,
+            errors      INTEGER NOT NULL DEFAULT 0,
+            status      TEXT    NOT NULL DEFAULT 'running'
+          )
+          SQL
         "CREATE INDEX idx_fuzz_runs_session ON fuzz_runs (session_id, id)",
         <<-SQL,
-        CREATE TABLE fuzz_results (
-          id            INTEGER PRIMARY KEY,
-          run_id        INTEGER NOT NULL,
-          idx           INTEGER NOT NULL,
-          payloads      TEXT    NOT NULL,
-          status        INTEGER,
-          length        INTEGER NOT NULL DEFAULT 0,
-          words         INTEGER NOT NULL DEFAULT 0,
-          lines         INTEGER NOT NULL DEFAULT 0,
-          duration_us   INTEGER NOT NULL DEFAULT 0,
-          error         TEXT,
-          matched       INTEGER NOT NULL DEFAULT 0,
-          extracted     TEXT,
-          request       BLOB,
-          response_head BLOB,
-          response_body BLOB
-        )
-        SQL
+          CREATE TABLE fuzz_results (
+            id            INTEGER PRIMARY KEY,
+            run_id        INTEGER NOT NULL,
+            idx           INTEGER NOT NULL,
+            payloads      TEXT    NOT NULL,
+            status        INTEGER,
+            length        INTEGER NOT NULL DEFAULT 0,
+            words         INTEGER NOT NULL DEFAULT 0,
+            lines         INTEGER NOT NULL DEFAULT 0,
+            duration_us   INTEGER NOT NULL DEFAULT 0,
+            error         TEXT,
+            matched       INTEGER NOT NULL DEFAULT 0,
+            extracted     TEXT,
+            request       BLOB,
+            response_head BLOB,
+            response_body BLOB
+          )
+          SQL
         "CREATE INDEX idx_fuzz_results_run ON fuzz_results (run_id, idx)",
 
         # Param-miner sessions. Mirrors fuzz_sessions, but stores the byte-exact `request`
@@ -325,40 +325,40 @@ module Gori
         # table — mining results stay in-memory per session. `config` is opaque JSON managed
         # by the frontend (locations, bucket sizes, concurrency, …).
         <<-SQL,
-        CREATE TABLE miner_sessions (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          target     TEXT    NOT NULL,
-          request    BLOB    NOT NULL,
-          http2      INTEGER NOT NULL DEFAULT 0,
-          sni        TEXT,
-          config     TEXT    NOT NULL DEFAULT '',
-          flow_id    INTEGER,
-          position   INTEGER NOT NULL DEFAULT 0,
-          name       TEXT
-        )
-        SQL
+          CREATE TABLE miner_sessions (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            target     TEXT    NOT NULL,
+            request    BLOB    NOT NULL,
+            http2      INTEGER NOT NULL DEFAULT 0,
+            sni        TEXT,
+            config     TEXT    NOT NULL DEFAULT '',
+            flow_id    INTEGER,
+            position   INTEGER NOT NULL DEFAULT 0,
+            name       TEXT
+          )
+          SQL
         "CREATE INDEX idx_miner_sessions_position ON miner_sessions (position, id)",
 
         # Sequencer sessions: token-randomness collection. Structurally identical to
         # miner_sessions. Collected tokens are live secrets, so like the miner there is NO
         # results table: samples and the computed report stay in-memory and never hit disk.
         <<-SQL,
-        CREATE TABLE sequencer_sessions (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          target     TEXT    NOT NULL,
-          request    BLOB    NOT NULL,
-          http2      INTEGER NOT NULL DEFAULT 0,
-          sni        TEXT,
-          config     TEXT    NOT NULL DEFAULT '',
-          flow_id    INTEGER,
-          position   INTEGER NOT NULL DEFAULT 0,
-          name       TEXT
-        )
-        SQL
+          CREATE TABLE sequencer_sessions (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            target     TEXT    NOT NULL,
+            request    BLOB    NOT NULL,
+            http2      INTEGER NOT NULL DEFAULT 0,
+            sni        TEXT,
+            config     TEXT    NOT NULL DEFAULT '',
+            flow_id    INTEGER,
+            position   INTEGER NOT NULL DEFAULT 0,
+            name       TEXT
+          )
+          SQL
         "CREATE INDEX idx_sequencer_sessions_position ON sequencer_sessions (position, id)",
 
         # ── Probe (passive/active scanner) ───────────────────────────────────────
@@ -369,24 +369,24 @@ module Gori
         # first-seen Repeater evidence link when there is no parent flow (or as a secondary).
         # The Probe MODE itself lives in the generic `settings` table (key "probe_mode").
         <<-SQL,
-        CREATE TABLE probe_issues (
-          id                 INTEGER PRIMARY KEY,
-          code               TEXT    NOT NULL,
-          category           TEXT    NOT NULL,
-          host               TEXT    NOT NULL,
-          title              TEXT    NOT NULL,
-          severity           INTEGER NOT NULL,
-          status             INTEGER NOT NULL DEFAULT 0,
-          hit_count          INTEGER NOT NULL DEFAULT 1,
-          affected           TEXT    NOT NULL DEFAULT '[]',
-          sample_flow_id     INTEGER,
-          sample_repeater_id INTEGER,
-          evidence           TEXT,
-          first_seen         INTEGER NOT NULL,
-          last_seen          INTEGER NOT NULL,
-          UNIQUE(code, host)
-        )
-        SQL
+          CREATE TABLE probe_issues (
+            id                 INTEGER PRIMARY KEY,
+            code               TEXT    NOT NULL,
+            category           TEXT    NOT NULL,
+            host               TEXT    NOT NULL,
+            title              TEXT    NOT NULL,
+            severity           INTEGER NOT NULL,
+            status             INTEGER NOT NULL DEFAULT 0,
+            hit_count          INTEGER NOT NULL DEFAULT 1,
+            affected           TEXT    NOT NULL DEFAULT '[]',
+            sample_flow_id     INTEGER,
+            sample_repeater_id INTEGER,
+            evidence           TEXT,
+            first_seen         INTEGER NOT NULL,
+            last_seen          INTEGER NOT NULL,
+            UNIQUE(code, host)
+          )
+          SQL
         "CREATE INDEX idx_probe_issues_cat ON probe_issues (category, host)",
 
         # Hard-deleted Probe issues must stay gone across Project leave/re-open: without a
@@ -395,30 +395,30 @@ module Gori
         # analyzer on start. Clear-all removes both issues and suppressions so a full rescan
         # is still possible.
         <<-SQL,
-        CREATE TABLE probe_suppressions (
-          code       TEXT    NOT NULL,
-          host       TEXT    NOT NULL,
-          created_at INTEGER NOT NULL,
-          PRIMARY KEY (code, host)
-        )
-        SQL
+          CREATE TABLE probe_suppressions (
+            code       TEXT    NOT NULL,
+            host       TEXT    NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (code, host)
+          )
+          SQL
 
         # Per-project user-defined Probe match rules (the Rules sub-tab's project-scope custom
         # rules). Global-scope rules live in settings.json instead. `severity` is the lowercase
         # Store::Severity label; side/region/kind are validated in the store layer before insert.
         <<-SQL,
-        CREATE TABLE probe_custom_rules (
-          id          INTEGER PRIMARY KEY,
-          title       TEXT    NOT NULL,
-          description TEXT    NOT NULL DEFAULT '',
-          side        TEXT    NOT NULL,
-          region      TEXT    NOT NULL,
-          kind        TEXT    NOT NULL,
-          pattern     TEXT    NOT NULL,
-          severity    TEXT    NOT NULL,
-          enabled     INTEGER NOT NULL DEFAULT 1
-        )
-        SQL
+          CREATE TABLE probe_custom_rules (
+            id          INTEGER PRIMARY KEY,
+            title       TEXT    NOT NULL,
+            description TEXT    NOT NULL DEFAULT '',
+            side        TEXT    NOT NULL,
+            region      TEXT    NOT NULL,
+            kind        TEXT    NOT NULL,
+            pattern     TEXT    NOT NULL,
+            severity    TEXT    NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1
+          )
+          SQL
 
         # ── AI seam (MCP) ────────────────────────────────────────────────────────
         # The AI-facing event feed: an append-only log of job lifecycle (miner/fuzzer/probe)
@@ -429,19 +429,19 @@ module Gori
         # consumer can't silently skip a row even if a future retention sweep deletes rows.
         # created_at is unix micros for display only — the cursor key is always `id`.
         <<-SQL,
-        CREATE TABLE events (
-          id              INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at      INTEGER NOT NULL,
-          source          TEXT    NOT NULL,
-          kind            TEXT    NOT NULL,
-          level           TEXT    NOT NULL,
-          message         TEXT    NOT NULL,
-          goto_tab        TEXT,
-          goto_session_id INTEGER,
-          flow_id         INTEGER,
-          payload         TEXT
-        )
-        SQL
+          CREATE TABLE events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at      INTEGER NOT NULL,
+            source          TEXT    NOT NULL,
+            kind            TEXT    NOT NULL,
+            level           TEXT    NOT NULL,
+            message         TEXT    NOT NULL,
+            goto_tab        TEXT,
+            goto_session_id INTEGER,
+            flow_id         INTEGER,
+            payload         TEXT
+          )
+          SQL
 
         # The cross-process live-intercept bridge. The MCP process (Store only, no live
         # Interceptor) drives hold/forward/drop/edit through the DB: the capturing TUI
@@ -453,38 +453,38 @@ module Gori
         # the TUI's drain watermark silently skip a row). session_token defeats cross-session
         # reuse of the interceptor's per-session item ids.
         <<-SQL,
-        CREATE TABLE intercept_held (
-          session_token TEXT    NOT NULL,
-          item_id       INTEGER NOT NULL,
-          kind          TEXT    NOT NULL,
-          method        TEXT    NOT NULL,
-          host          TEXT    NOT NULL,
-          port          INTEGER NOT NULL,
-          scheme        TEXT    NOT NULL,
-          target        TEXT    NOT NULL,
-          flow_id       INTEGER,
-          raw           BLOB    NOT NULL,
-          held_at_ms    INTEGER NOT NULL,
-          edited        INTEGER NOT NULL DEFAULT 0,
-          viewed_ms     INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY (session_token, item_id)
-        )
-        SQL
+          CREATE TABLE intercept_held (
+            session_token TEXT    NOT NULL,
+            item_id       INTEGER NOT NULL,
+            kind          TEXT    NOT NULL,
+            method        TEXT    NOT NULL,
+            host          TEXT    NOT NULL,
+            port          INTEGER NOT NULL,
+            scheme        TEXT    NOT NULL,
+            target        TEXT    NOT NULL,
+            flow_id       INTEGER,
+            raw           BLOB    NOT NULL,
+            held_at_ms    INTEGER NOT NULL,
+            edited        INTEGER NOT NULL DEFAULT 0,
+            viewed_ms     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_token, item_id)
+          )
+          SQL
         <<-SQL,
-        CREATE TABLE intercept_commands (
-          id            INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at    INTEGER NOT NULL,
-          session_token TEXT,
-          verb          TEXT    NOT NULL,
-          item_id       INTEGER,
-          bytes         BLOB,
-          arg           TEXT,
-          status        TEXT    NOT NULL DEFAULT 'pending',
-          applied_at    INTEGER,
-          result        TEXT,
-          origin        TEXT
-        )
-        SQL
+          CREATE TABLE intercept_commands (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at    INTEGER NOT NULL,
+            session_token TEXT,
+            verb          TEXT    NOT NULL,
+            item_id       INTEGER,
+            bytes         BLOB,
+            arg           TEXT,
+            status        TEXT    NOT NULL DEFAULT 'pending',
+            applied_at    INTEGER,
+            result        TEXT,
+            origin        TEXT
+          )
+          SQL
 
         # ── OAST (out-of-band) ───────────────────────────────────────────────────
         # Configured providers, listening sessions, and the durable callback history.
@@ -493,47 +493,47 @@ module Gori
         # 0600 and holds captured credentials; never logged). Callbacks are
         # append-only/immutable; UNIQUE(session_id, provider_uid) + INSERT OR IGNORE dedups.
         <<-SQL,
-        CREATE TABLE oast_providers (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          name       TEXT    NOT NULL,
-          kind       TEXT    NOT NULL,
-          host       TEXT    NOT NULL,
-          token      TEXT,
-          enabled    INTEGER NOT NULL DEFAULT 1,
-          position   INTEGER NOT NULL DEFAULT 0
-        )
-        SQL
+          CREATE TABLE oast_providers (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            name       TEXT    NOT NULL,
+            kind       TEXT    NOT NULL,
+            host       TEXT    NOT NULL,
+            token      TEXT,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            position   INTEGER NOT NULL DEFAULT 0
+          )
+          SQL
         <<-SQL,
-        CREATE TABLE oast_sessions (
-          id              INTEGER PRIMARY KEY,
-          created_at      INTEGER NOT NULL,
-          provider_id     INTEGER,
-          kind            TEXT    NOT NULL,
-          server_url      TEXT    NOT NULL,
-          correlation_id  TEXT    NOT NULL,
-          secret          TEXT    NOT NULL DEFAULT '',
-          private_key_pem TEXT,
-          token           TEXT,
-          last_poll_at    INTEGER
-        )
-        SQL
+          CREATE TABLE oast_sessions (
+            id              INTEGER PRIMARY KEY,
+            created_at      INTEGER NOT NULL,
+            provider_id     INTEGER,
+            kind            TEXT    NOT NULL,
+            server_url      TEXT    NOT NULL,
+            correlation_id  TEXT    NOT NULL,
+            secret          TEXT    NOT NULL DEFAULT '',
+            private_key_pem TEXT,
+            token           TEXT,
+            last_poll_at    INTEGER
+          )
+          SQL
         <<-SQL,
-        CREATE TABLE oast_callbacks (
-          id           INTEGER PRIMARY KEY,
-          session_id   INTEGER NOT NULL,
-          created_at   INTEGER NOT NULL,
-          provider_uid TEXT    NOT NULL,
-          protocol     TEXT    NOT NULL,
-          method       TEXT,
-          source_ip    TEXT,
-          full_id      TEXT    NOT NULL,
-          raw_request  BLOB    NOT NULL,
-          raw_response BLOB,
-          UNIQUE(session_id, provider_uid)
-        )
-        SQL
+          CREATE TABLE oast_callbacks (
+            id           INTEGER PRIMARY KEY,
+            session_id   INTEGER NOT NULL,
+            created_at   INTEGER NOT NULL,
+            provider_uid TEXT    NOT NULL,
+            protocol     TEXT    NOT NULL,
+            method       TEXT,
+            source_ip    TEXT,
+            full_id      TEXT    NOT NULL,
+            raw_request  BLOB    NOT NULL,
+            raw_response BLOB,
+            UNIQUE(session_id, provider_uid)
+          )
+          SQL
         "CREATE INDEX idx_oast_callbacks_session ON oast_callbacks (session_id, id)",
       ]
 
@@ -626,18 +626,18 @@ module Gori
       # and have no meaningful order. No column for the VALUE either — see `ExtractRule`.
       V6 = [
         <<-SQL,
-        CREATE TABLE extract_rules (
-          id           INTEGER PRIMARY KEY,
-          enabled      INTEGER NOT NULL DEFAULT 1,
-          name         TEXT    NOT NULL UNIQUE,
-          match_filter TEXT    NOT NULL DEFAULT '',
-          kind         TEXT    NOT NULL,
-          selector     TEXT    NOT NULL DEFAULT '',
-          pos_start    INTEGER NOT NULL DEFAULT 0,
-          pos_end      INTEGER NOT NULL DEFAULT 0,
-          host         TEXT    NOT NULL DEFAULT ''
-        )
-        SQL
+          CREATE TABLE extract_rules (
+            id           INTEGER PRIMARY KEY,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            name         TEXT    NOT NULL UNIQUE,
+            match_filter TEXT    NOT NULL DEFAULT '',
+            kind         TEXT    NOT NULL,
+            selector     TEXT    NOT NULL DEFAULT '',
+            pos_start    INTEGER NOT NULL DEFAULT 0,
+            pos_end      INTEGER NOT NULL DEFAULT 0,
+            host         TEXT    NOT NULL DEFAULT ''
+          )
+          SQL
       ]
 
       # WebSocket frame SHAPE, on both halves of `ws_messages` — the capture rows and the
@@ -770,72 +770,72 @@ module Gori
       # links are already safely `(gone)`.
       V10 = [
         <<-SQL,
-        CREATE TABLE fuzz_sessions_v10 (
-          id         INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          target     TEXT    NOT NULL,
-          template   TEXT    NOT NULL,
-          http2      INTEGER NOT NULL DEFAULT 0,
-          sni        TEXT,
-          config     TEXT    NOT NULL DEFAULT '',
-          flow_id    INTEGER,
-          position   INTEGER NOT NULL DEFAULT 0,
-          name       TEXT
-        )
-        SQL
+          CREATE TABLE fuzz_sessions_v10 (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            target     TEXT    NOT NULL,
+            template   TEXT    NOT NULL,
+            http2      INTEGER NOT NULL DEFAULT 0,
+            sni        TEXT,
+            config     TEXT    NOT NULL DEFAULT '',
+            flow_id    INTEGER,
+            position   INTEGER NOT NULL DEFAULT 0,
+            name       TEXT
+          )
+          SQL
         <<-SQL,
-        INSERT INTO fuzz_sessions_v10
-          (id, created_at, updated_at, target, template, http2, sni, config, flow_id, position, name)
-          SELECT id, created_at, updated_at, target, template, http2, sni, config, flow_id, position, name
-          FROM fuzz_sessions
-        SQL
+          INSERT INTO fuzz_sessions_v10
+            (id, created_at, updated_at, target, template, http2, sni, config, flow_id, position, name)
+            SELECT id, created_at, updated_at, target, template, http2, sni, config, flow_id, position, name
+            FROM fuzz_sessions
+          SQL
         "DROP TABLE fuzz_sessions",
         "ALTER TABLE fuzz_sessions_v10 RENAME TO fuzz_sessions",
         "CREATE INDEX idx_fuzz_sessions_position ON fuzz_sessions (position, id)",
         "DELETE FROM sqlite_sequence WHERE name = 'fuzz_sessions'",
         <<-SQL,
-        INSERT INTO sqlite_sequence (name, seq)
-          SELECT 'fuzz_sessions', COALESCE(MAX(v), 0) FROM (
-            SELECT MAX(id) AS v FROM fuzz_sessions
-            UNION ALL
-            SELECT MAX(ref_id) FROM entity_links WHERE ref_kind = 'fuzz'
-          )
-        SQL
+          INSERT INTO sqlite_sequence (name, seq)
+            SELECT 'fuzz_sessions', COALESCE(MAX(v), 0) FROM (
+              SELECT MAX(id) AS v FROM fuzz_sessions
+              UNION ALL
+              SELECT MAX(ref_id) FROM entity_links WHERE ref_kind = 'fuzz'
+            )
+          SQL
 
         <<-SQL,
-        CREATE TABLE miner_sessions_v10 (
-          id         INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          target     TEXT    NOT NULL,
-          request    BLOB    NOT NULL,
-          http2      INTEGER NOT NULL DEFAULT 0,
-          sni        TEXT,
-          config     TEXT    NOT NULL DEFAULT '',
-          flow_id    INTEGER,
-          position   INTEGER NOT NULL DEFAULT 0,
-          name       TEXT
-        )
-        SQL
+          CREATE TABLE miner_sessions_v10 (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            target     TEXT    NOT NULL,
+            request    BLOB    NOT NULL,
+            http2      INTEGER NOT NULL DEFAULT 0,
+            sni        TEXT,
+            config     TEXT    NOT NULL DEFAULT '',
+            flow_id    INTEGER,
+            position   INTEGER NOT NULL DEFAULT 0,
+            name       TEXT
+          )
+          SQL
         <<-SQL,
-        INSERT INTO miner_sessions_v10
-          (id, created_at, updated_at, target, request, http2, sni, config, flow_id, position, name)
-          SELECT id, created_at, updated_at, target, request, http2, sni, config, flow_id, position, name
-          FROM miner_sessions
-        SQL
+          INSERT INTO miner_sessions_v10
+            (id, created_at, updated_at, target, request, http2, sni, config, flow_id, position, name)
+            SELECT id, created_at, updated_at, target, request, http2, sni, config, flow_id, position, name
+            FROM miner_sessions
+          SQL
         "DROP TABLE miner_sessions",
         "ALTER TABLE miner_sessions_v10 RENAME TO miner_sessions",
         "CREATE INDEX idx_miner_sessions_position ON miner_sessions (position, id)",
         "DELETE FROM sqlite_sequence WHERE name = 'miner_sessions'",
         <<-SQL,
-        INSERT INTO sqlite_sequence (name, seq)
-          SELECT 'miner_sessions', COALESCE(MAX(v), 0) FROM (
-            SELECT MAX(id) AS v FROM miner_sessions
-            UNION ALL
-            SELECT MAX(ref_id) FROM entity_links WHERE ref_kind = 'miner'
-          )
-        SQL
+          INSERT INTO sqlite_sequence (name, seq)
+            SELECT 'miner_sessions', COALESCE(MAX(v), 0) FROM (
+              SELECT MAX(id) AS v FROM miner_sessions
+              UNION ALL
+              SELECT MAX(ref_id) FROM entity_links WHERE ref_kind = 'miner'
+            )
+          SQL
       ]
 
       # `repeaters.ws_http_only` is the operator's override of gori's WebSocket AUTO-DETECTION.
@@ -884,25 +884,25 @@ module Gori
       # unable to say which probe drew it.
       V12 = [
         <<-SQL,
-        CREATE TABLE probe_oast_probes (
-          id         INTEGER PRIMARY KEY,
-          created_at INTEGER NOT NULL,
-          token      TEXT    NOT NULL,
-          payload    TEXT    NOT NULL,
-          session_id INTEGER NOT NULL,
-          rule_id    TEXT    NOT NULL,
-          code       TEXT    NOT NULL,
-          category   TEXT    NOT NULL,
-          title      TEXT    NOT NULL,
-          severity   INTEGER NOT NULL,
-          host       TEXT    NOT NULL,
-          url        TEXT    NOT NULL,
-          evidence   TEXT,
-          flow_id    INTEGER,
-          matched_at INTEGER,
-          UNIQUE(token)
-        )
-        SQL
+          CREATE TABLE probe_oast_probes (
+            id         INTEGER PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            token      TEXT    NOT NULL,
+            payload    TEXT    NOT NULL,
+            session_id INTEGER NOT NULL,
+            rule_id    TEXT    NOT NULL,
+            code       TEXT    NOT NULL,
+            category   TEXT    NOT NULL,
+            title      TEXT    NOT NULL,
+            severity   INTEGER NOT NULL,
+            host       TEXT    NOT NULL,
+            url        TEXT    NOT NULL,
+            evidence   TEXT,
+            flow_id    INTEGER,
+            matched_at INTEGER,
+            UNIQUE(token)
+          )
+          SQL
         "CREATE INDEX idx_probe_oast_pending ON probe_oast_probes (id) WHERE matched_at IS NULL",
       ]
 
@@ -931,16 +931,16 @@ module Gori
       # refuse the workflow the feature exists for.
       V13 = [
         <<-SQL,
-        CREATE TABLE color_rules (
-          id           INTEGER PRIMARY KEY,
-          enabled      INTEGER NOT NULL DEFAULT 1,
-          name         TEXT    NOT NULL DEFAULT '',
-          match_filter TEXT    NOT NULL DEFAULT '',
-          color        TEXT    NOT NULL DEFAULT 'yellow',
-          style        TEXT    NOT NULL DEFAULT 'full',
-          position     INTEGER NOT NULL DEFAULT 0
-        )
-        SQL
+          CREATE TABLE color_rules (
+            id           INTEGER PRIMARY KEY,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            name         TEXT    NOT NULL DEFAULT '',
+            match_filter TEXT    NOT NULL DEFAULT '',
+            color        TEXT    NOT NULL DEFAULT 'yellow',
+            style        TEXT    NOT NULL DEFAULT 'full',
+            position     INTEGER NOT NULL DEFAULT 0
+          )
+          SQL
       ]
 
       MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13]

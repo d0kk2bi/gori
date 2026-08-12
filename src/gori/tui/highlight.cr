@@ -365,13 +365,13 @@ module Gori::Tui
         at = Attribute::None
         case c
         when '`'
-          if (j = text.index('`', i + 1))
+          if j = text.index('`', i + 1)
             e = j + 1
             col = Theme.syn_string
           end
         when '*'
           if i + 1 < n && text[i + 1] == '*'
-            if (k = text.index("**", i + 2))
+            if k = text.index("**", i + 2)
               e = k + 2
               at = Attribute::Bold
             end
@@ -419,7 +419,7 @@ module Gori::Tui
       # Special case for width=1: always show the first glyph (even if it is
       # wide, e.g. Hangul), never ellipsis. Matches Screen#fit policy.
       if limit == 1
-        if line.any? && !line[0].text.empty?
+        if line.present? && !line[0].text.empty?
           first = line[0].text.each_grapheme.first.to_s
           # Char path so a leading C0 control becomes the space cell (not rejected).
           if first.size == 1
@@ -648,7 +648,7 @@ module Gori::Tui
       # unwrapped line, and it must not allocate a copy per row per frame. O(spans), and
       # deliberately NOT "materialise the plain text and compare lengths": that would
       # rebuild a multi-MB body line on the hot render path.
-      total = line.sum { |span| span.text.size }
+      total = line.sum(&.text.size)
       return line if a <= 0 && b >= total
       sliced = Line.new
       return sliced if a >= b
@@ -784,7 +784,7 @@ module Gori::Tui
 
     # Well-known Set-Cookie attribute names (lowercased) — coloured as keywords so the
     # cookie's own name/value pairs stand out from the flags that follow.
-    COOKIE_ATTRS = %w(path domain expires max-age samesite secure httponly partitioned priority)
+    COOKIE_ATTRS = %w[path domain expires max-age samesite secure httponly partitioned priority]
 
     # Colour a header value by header name: cookies and auth get dedicated tokenisers,
     # everything else a light param lexer. `v` keeps the leading space after the colon
@@ -975,7 +975,7 @@ module Gori::Tui
             i += 1
           end
           word = raw.byte_slice(start, i - start)
-          spans << Span.new(word, %w(true false null).includes?(word) ? Theme.syn_literal : Theme.text)
+          spans << Span.new(word, %w[true false null].includes?(word) ? Theme.syn_literal : Theme.text)
         elsif json_struct?(c)
           spans << Span.new(raw.byte_slice(i, 1), Theme.muted)
           i += 1
@@ -1019,7 +1019,7 @@ module Gori::Tui
     end
 
     # GraphQL operation keywords (styled distinctly from `true`/`false`/`null` literals).
-    GRAPHQL_KEYWORDS = %w(query mutation subscription fragment on)
+    GRAPHQL_KEYWORDS = %w[query mutation subscription fragment on]
 
     # GraphQL query language (the Pretty/decoded display form): `#` comments, operation
     # keywords, `$variables`, `@directives`, strings, numbers, and field/type names (an

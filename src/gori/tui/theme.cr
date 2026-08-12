@@ -1032,7 +1032,7 @@ module Gori::Tui
     private def self.merge_palette(base : Palette, root : JSON::Any) : Palette
       {% begin %}
         Palette.new(
-          {% for f in %w(bg panel elevated border border_focus focus_gold accent accent_bg selection_dim text text_bright muted green yellow red orange syn_header syn_string syn_number syn_literal syn_comment syn_keyword) %}
+          {% for f in %w[bg panel elevated border border_focus focus_gold accent accent_bg selection_dim text text_bright muted green yellow red orange syn_header syn_string syn_number syn_literal syn_comment syn_keyword] %}
             {{ f.id }}: color_field(root, {{ f }}, base.{{ f.id }}),
           {% end %}
         )
@@ -1053,7 +1053,7 @@ module Gori::Tui
 
     # Colour accessors generated from the Palette fields. Each reads the active
     # palette, so call sites (`Theme.bg`, `Theme.accent`, …) re-theme automatically.
-    {% for name in %w(bg panel elevated border border_focus focus_gold accent accent_bg selection_dim text text_bright muted green yellow red orange syn_header syn_string syn_number syn_literal syn_comment syn_keyword) %}
+    {% for name in %w[bg panel elevated border border_focus focus_gold accent accent_bg selection_dim text text_bright muted green yellow red orange syn_header syn_string syn_number syn_literal syn_comment syn_keyword] %}
       def self.{{ name.id }} : Color
         @@active.{{ name.id }}
       end
@@ -1110,12 +1110,11 @@ module Gori::Tui
     def self.set_custom_marks(map : Hash(String, String)) : Nil
       marks = {} of String => Color
       map.each do |name, hex|
-        begin
-          marks[name.downcase] = Color.from_hex(hex)
-        rescue
-          # A hex the parser rejects is simply absent, resolving to the fallback below — the
-          # registry's own `normalize_hex` should have caught it, this is belt and braces.
-        end
+        marks[name.downcase] = Color.from_hex(hex)
+      rescue
+        # A hex the parser rejects is simply absent, resolving to the fallback below — the
+        # registry's own `normalize_hex` should have caught it, this is belt and braces.
+
       end
       @@custom_marks = marks
     end

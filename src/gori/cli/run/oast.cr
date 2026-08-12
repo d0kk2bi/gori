@@ -50,13 +50,13 @@ module Gori
 
       private def self.oast_help : Nil
         puts <<-HELP
-        Usage: gori run oast <subcommand>
-          listen      Register an OAST payload and stream incoming callbacks
-          presets     List the built-in public providers
-          providers   Manage SAVED providers (list, add, update, enable/disable, delete)
+          Usage: gori run oast <subcommand>
+            listen      Register an OAST payload and stream incoming callbacks
+            presets     List the built-in public providers
+            providers   Manage SAVED providers (list, add, update, enable/disable, delete)
 
-        Run `gori run oast listen -h` for listen options.
-        HELP
+          Run `gori run oast listen -h` for listen options.
+          HELP
       end
 
       # --- saved providers (the TUI OAST tab's Providers sub-tab) ---------------------------

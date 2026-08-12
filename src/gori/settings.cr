@@ -329,7 +329,7 @@ module Gori
 
     private def self.normalize_os(raw : String?) : String
       down = raw.try(&.downcase)
-      %w(darwin linux windows).includes?(down) ? down.not_nil! : "auto"
+      %w[darwin linux windows].includes?(down) ? down.not_nil! : "auto"
     end
 
     # Read a boolean field, keeping `current` when it's absent or non-bool. A plain
@@ -471,12 +471,12 @@ module Gori
     # produces it without a fully-populated settings object. Add a section → add its key here.
     # The `document_keys - SECTION_KEYS` guard in spec/settings_profile_spec.cr catches a
     # rename, and catches an addition as soon as any example populates the new section.
-    SECTION_KEYS = %w(
+    SECTION_KEYS = %w[
       theme mouse pretty_bodies layout statusline display companion notifications general update
       network upstream_rules outbound_tls retention listeners editor tabs hostname_overrides
       env scan_rules oast_providers hotkeys mine fuzzer probe discover decoder rewriter
       colormarker
-    )
+    ]
 
     # Every top-level key the current settings would write — i.e. which sections this install
     # actually has a value for. NOT the list of valid names (see SECTION_KEYS): a section

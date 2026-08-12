@@ -345,7 +345,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w(name host method) # mining sessions carry an HTTP request (target + method)
+      %w[name host method] # mining sessions carry an HTTP request (target + method)
     end
 
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
@@ -728,7 +728,7 @@ module Gori::Tui
       @current_idx =
         if cur_db && (idx = @miners.index { |t| t.db_id == cur_db })
           idx
-        elsif (cv = cur_view) && (idx = @miners.index { |t| t.view.same?(cv) })
+        elsif (cv = cur_view) && (idx = @miners.index(&.view.same?(cv)))
           idx
         elsif @miners.empty?
           -1

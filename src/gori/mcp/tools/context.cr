@@ -72,15 +72,13 @@ module Gori
       private def get_current_context : Result
         raw = store.setting(Store::UI_STATE_KEY)
         parsed = raw.try do |r|
-          begin
-            obj = JSON.parse(r)
-            # Must decode to a JSON OBJECT: valid-but-wrong-shape JSON (an array,
-            # scalar, or null) would make `parsed["active_tab"]?` below raise a raw
-            # "Expected Hash for #[]?" cast error — treat it as unreadable instead.
-            obj if obj.as_h?
-          rescue
-            nil
-          end
+          obj = JSON.parse(r)
+          # Must decode to a JSON OBJECT: valid-but-wrong-shape JSON (an array,
+          # scalar, or null) would make `parsed["active_tab"]?` below raise a raw
+          # "Expected Hash for #[]?" cast error — treat it as unreadable instead.
+          obj if obj.as_h?
+        rescue
+          nil
         end
         Result.new(JSON.build do |j|
           j.object do
@@ -369,12 +367,10 @@ module Gori
 
       private def parse_ui_state : JSON::Any?
         store.setting(Store::UI_STATE_KEY).try do |r|
-          begin
-            obj = JSON.parse(r)
-            obj if obj.as_h?
-          rescue
-            nil
-          end
+          obj = JSON.parse(r)
+          obj if obj.as_h?
+        rescue
+          nil
         end
       end
 

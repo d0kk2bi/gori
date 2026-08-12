@@ -583,7 +583,7 @@ module Gori
         prefix = Settings.env_prefix
         detail.split(", ").each do |token|
           name = token.starts_with?(prefix) ? token[prefix.size..] : token
-          if (id = ids[name]?)
+          if id = ids[name]?
             hits << {name, id}
           else
             rest << name

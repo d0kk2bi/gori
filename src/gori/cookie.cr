@@ -34,7 +34,7 @@ module Gori
     end
 
     # Supported formats, in detection + display order.
-    FORMATS = %w(flask django rack)
+    FORMATS = %w[flask django rack]
 
     # Which framework minted this cookie, from its punctuation alone (no secret needed):
     #   Rack   — "<base64>--<40-hex sha1>"      (the `--` separator + hex tail)

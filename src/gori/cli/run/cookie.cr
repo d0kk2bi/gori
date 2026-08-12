@@ -39,11 +39,9 @@ module Gori
           p.on("--salt=SALT", "Flask/Django signing salt") { |v| salt = v }
           p.on("--algorithm=ALG", "Django HMAC algorithm: sha256 (default) | sha1") { |v| algorithm = v.downcase }
           p.on("--timestamp=UNIX", "Unix second to stamp (--forge; default: now)") do |v|
-            begin
-              timestamp = parse_forge_timestamp(v)
-            rescue ex : ArgumentError
-              abort "gori run cookie: #{ex.message}"
-            end
+            timestamp = parse_forge_timestamp(v)
+          rescue ex : ArgumentError
+            abort "gori run cookie: #{ex.message}"
           end
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -84,7 +82,7 @@ module Gori
       # The cookie subject: positional argument or STDIN (mirrors jwt_token_input).
       private def self.cookie_input(positional : Array(String)) : String
         s =
-          if (v = positional.first?)
+          if v = positional.first?
             abort "gori run cookie: too many arguments (one cookie)" if positional.size > 1
             v.strip
           elsif !STDIN.tty?

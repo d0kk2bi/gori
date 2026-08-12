@@ -121,17 +121,15 @@ module Gori::Miner
       failure = nil.as(Exception?)
       workers.times do
         spawn(name: "miner-baseline") do
-          begin
-            while i = jobs.receive?
-              begin
-                block.call(i)
-              rescue ex
-                failure ||= ex
-              end
+          while i = jobs.receive?
+            begin
+              block.call(i)
+            rescue ex
+              failure ||= ex
             end
-          ensure
-            done.send(nil)
           end
+        ensure
+          done.send(nil)
         end
       end
       count.times { |i| jobs.send(i) }

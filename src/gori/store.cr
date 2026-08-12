@@ -378,11 +378,10 @@ module Gori
         # loop borrowed, and that teardown is exactly where the escape came from (see the
         # rescue inside `writer_loop`). Making the send unconditional means a writer that dies
         # for any future reason degrades to "writes stop" instead of "gori never exits".
-        begin
-          writer_loop
-        ensure
-          @done.send(nil)
-        end
+
+        writer_loop
+      ensure
+        @done.send(nil)
       end
     end
 
@@ -577,30 +576,29 @@ module Gori
       # shutdown (measured: the process never exits), which in the TUI means gori does not quit
       # and leaves the terminal on the alternate screen. Logged, not raised: the loop is over by
       # then — every op has been answered — and there is nothing left to abort.
-      begin
-        writer_connection_loop
-      rescue ex
-        # gori.log, not STDERR (#411): in TUI mode STDERR is the alternate screen.
-        #
-        # WHICH failure this was decides what is safe to do next, and conflating them was wrong
-        # in both directions. `@writer_loop_exited` is set inside the connection block after the
-        # loop returns, so:
-        #
-        # * set ⇒ the LOOP finished and the RELEASE raised (the constraint-poisoned statement).
-        #   Every op has been answered; the connection is half-closed, so `#close` must not
-        #   re-close the pool (that is a use-after-free — see #close).
-        # * clear ⇒ the loop itself died with `@writes` still OPEN and no reader. A caller that
-        #   sends after this would park forever on its reply channel: the hang this rescue was
-        #   added to prevent, moved from `close` to the next write. Close the channel so every
-        #   caller takes its existing `rescue Channel::ClosedError` path (0 / false / dropped)
-        #   instead, and leave the pool closable.
-        if @writer_loop_exited
-          ::Log.warn { "store writer connection teardown failed: #{ex.message}" }
-          @writer_teardown_failed = true
-        else
-          ::Log.error { "store writer fiber died mid-loop: #{ex.message} — further writes will be refused" }
-          @writes.close rescue nil
-        end
+
+      writer_connection_loop
+    rescue ex
+      # gori.log, not STDERR (#411): in TUI mode STDERR is the alternate screen.
+      #
+      # WHICH failure this was decides what is safe to do next, and conflating them was wrong
+      # in both directions. `@writer_loop_exited` is set inside the connection block after the
+      # loop returns, so:
+      #
+      # * set ⇒ the LOOP finished and the RELEASE raised (the constraint-poisoned statement).
+      #   Every op has been answered; the connection is half-closed, so `#close` must not
+      #   re-close the pool (that is a use-after-free — see #close).
+      # * clear ⇒ the loop itself died with `@writes` still OPEN and no reader. A caller that
+      #   sends after this would park forever on its reply channel: the hang this rescue was
+      #   added to prevent, moved from `close` to the next write. Close the channel so every
+      #   caller takes its existing `rescue Channel::ClosedError` path (0 / false / dropped)
+      #   instead, and leave the pool closable.
+      if @writer_loop_exited
+        ::Log.warn { "store writer connection teardown failed: #{ex.message}" }
+        @writer_teardown_failed = true
+      else
+        ::Log.error { "store writer fiber died mid-loop: #{ex.message} — further writes will be refused" }
+        @writes.close rescue nil
       end
     end
 
@@ -1021,17 +1019,17 @@ module Gori
       response_size = (resp.head.empty? && resp.body.nil?) ? nil : resp.head.size.to_i64 + body_size
       conn.exec(
         <<-SQL,
-        UPDATE flows SET
-          response_head = ?, response_body = ?, status = ?, reason = ?,
-          content_type = ?, response_size = ?, state = ?,
-          ttfb_us = ?, duration_us = ?, error = ?, response_body_truncated = ?,
-          -- nil means "the response side has nothing to add", NOT "clear it": the request
-          -- side may already have written an advisory on this row and a bare `advisory = ?`
-          -- would erase it. COALESCE keeps whatever is stored when the DTO carries nothing.
-          advisory = COALESCE(?, advisory),
-          fts_dirty = 1
-        WHERE id = ?
-        SQL
+          UPDATE flows SET
+            response_head = ?, response_body = ?, status = ?, reason = ?,
+            content_type = ?, response_size = ?, state = ?,
+            ttfb_us = ?, duration_us = ?, error = ?, response_body_truncated = ?,
+            -- nil means "the response side has nothing to add", NOT "clear it": the request
+            -- side may already have written an advisory on this row and a bare `advisory = ?`
+            -- would erase it. COALESCE keeps whatever is stored when the DTO carries nothing.
+            advisory = COALESCE(?, advisory),
+            fts_dirty = 1
+          WHERE id = ?
+          SQL
         resp.head, resp.body, resp.status, resp.reason, resp.content_type,
         response_size,
         resp.state.value, resp.ttfb_us, resp.duration_us, resp.error,

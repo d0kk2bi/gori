@@ -6,7 +6,7 @@ require "./builder"
 module Gori
   module Import
     module Oas
-      HTTP_METHODS = %w(get post put patch delete head options trace)
+      HTTP_METHODS = %w[get post put patch delete head options trace]
 
       def self.parse_file(path : String) : ParseResult
         raw = File.read(path)

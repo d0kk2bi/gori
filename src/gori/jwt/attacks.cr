@@ -44,7 +44,7 @@ module Gori
     # Servers that honour `alg` from the token itself accept an unsigned token; the case
     # variants dodge naive `alg == "none"` denylists. Also the two signature-removal shapes.
     private def none_family(list, header, header_seg : String, payload_seg : String) : Nil
-      %w(none None NONE nOnE).each do |a|
+      %w[none None NONE nOnE].each do |a|
         h = header.dup
         h["alg"] = JSON::Any.new(a)
         list << Attack.new("alg=#{a}", "none",

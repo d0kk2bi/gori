@@ -55,7 +55,7 @@ module Gori
         by_scope.each do |scope, verbs|
           common = verbs.select { |v| v.section == :common }
           check_menu_keys!(scope, :common, common)
-          sections = verbs.map(&.section).uniq.reject { |s| s == :common }
+          sections = verbs.map(&.section).uniq!.reject { |s| s == :common }
           sections.each do |section|
             view = common + verbs.select { |v| v.section == section }
             check_menu_keys!(scope, section, view)

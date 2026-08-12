@@ -63,7 +63,7 @@ module Gori
     record Chord, key : String, ctrl : Bool = false, alt : Bool = false, shift : Bool = false do
       # The named (non-character) keys a chord may carry, matching the names
       # Tui::Keybind.from_event emits. Anything else must be a single ASCII char.
-      NAMED_KEYS = %w(enter escape tab up down left right backspace space)
+      NAMED_KEYS = %w[enter escape tab up down left right backspace space]
 
       # Human-readable label for palette hints, e.g. "ctrl-p", "g", "enter".
       def label : String

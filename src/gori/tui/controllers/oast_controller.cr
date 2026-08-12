@@ -420,12 +420,10 @@ module Gori::Tui
       db_id = prov.project_id
       @registering << key
       spawn(name: "gori-oast-register") do
-        begin
-          session = provider.register(http)
-          reg.send(RegOk.new(session, provider, key, db_id, label, want_payload))
-        rescue ex
-          reg.send(RegErr.new(ex.message || "register failed", label, key))
-        end
+        session = provider.register(http)
+        reg.send(RegOk.new(session, provider, key, db_id, label, want_payload))
+      rescue ex
+        reg.send(RegErr.new(ex.message || "register failed", label, key))
       end
       @host.status("registering with #{label}…")
     end
@@ -489,12 +487,10 @@ module Gori::Tui
       db_id = config.project_id
       @registering << key
       spawn(name: "gori-oast-resume") do
-        begin
-          provider.resume(http, session)
-          reg.send(RegOk.new(session, provider, key, db_id, label, false, resumed: true))
-        rescue ex
-          reg.send(RegErr.new(ex.message || "resume failed", label, key))
-        end
+        provider.resume(http, session)
+        reg.send(RegOk.new(session, provider, key, db_id, label, false, resumed: true))
+      rescue ex
+        reg.send(RegErr.new(ex.message || "resume failed", label, key))
       end
       @host.status("resuming #{label} session ##{session_id}…")
     end

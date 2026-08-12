@@ -45,35 +45,35 @@ module Gori
 
       private def self.print_intercept_help : Nil
         puts <<-HELP
-        gori run intercept — inspect/drive the live intercept queue of a capturing TUI instance
+          gori run intercept — inspect/drive the live intercept queue of a capturing TUI instance
 
-        Usage: gori run intercept [<subcommand>] [options]
+          Usage: gori run intercept [<subcommand>] [options]
 
-        Requires an open TUI on this project with intercept catch on — Interceptor is
-        TUI-only (a headless `gori run capture` never holds requests). Write subcommands
-        round-trip through the project database and bounded-poll for the TUI's ack.
+          Requires an open TUI on this project with intercept catch on — Interceptor is
+          TUI-only (a headless `gori run capture` never holds requests). Write subcommands
+          round-trip through the project database and bounded-poll for the TUI's ack.
 
-        Subcommands:
-          list                                 List held items + intercept state (default)
-          get <item-id>                        Full detail for one held item
-          forward <item-id>                    Forward a held item byte-exact
-          drop <item-id>                       Drop a held item (client gets a canned 502)
-          edit <item-id> (--raw=… | --raw-file=PATH)   Forward with edited bytes
-          enable                               Turn on live intercept catch
-          disable                              Turn off live intercept catch
-          filter <query>                       Set the conditional-intercept filter ("" clears)
-          direction <both|request|response>    Set which leg(s) intercept holds
+          Subcommands:
+            list                                 List held items + intercept state (default)
+            get <item-id>                        Full detail for one held item
+            forward <item-id>                    Forward a held item byte-exact
+            drop <item-id>                       Drop a held item (client gets a canned 502)
+            edit <item-id> (--raw=… | --raw-file=PATH)   Forward with edited bytes
+            enable                               Turn on live intercept catch
+            disable                              Turn off live intercept catch
+            filter <query>                       Set the conditional-intercept filter ("" clears)
+            direction <both|request|response>    Set which leg(s) intercept holds
 
-        Examples:
-          gori run intercept
-          gori run intercept get 3 --format json
-          gori run intercept forward 3
-          gori run intercept edit 3 --raw-file edited.txt
-          gori run intercept edit 3 --raw-file desync.txt --no-update-content-length
-          gori run intercept direction request
+          Examples:
+            gori run intercept
+            gori run intercept get 3 --format json
+            gori run intercept forward 3
+            gori run intercept edit 3 --raw-file edited.txt
+            gori run intercept edit 3 --raw-file desync.txt --no-update-content-length
+            gori run intercept direction request
 
-        See 'gori run intercept <subcommand> --help' for more.
-        HELP
+          See 'gori run intercept <subcommand> --help' for more.
+          HELP
       end
 
       # --- bridge state (read side) -------------------------------------------

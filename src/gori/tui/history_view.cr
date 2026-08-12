@@ -53,8 +53,8 @@ module Gori::Tui
     # nothing, and the empty list reads as "no flows match". `url` is the reverse case —
     # a real, working field that was never suggested. spec/tui/history_view_spec.cr pins
     # this list against ql.cr so the two cannot drift apart again.
-    QL_FIELDS  = %w(host url method status path scheme proto body header size reqsize respsize dur stub)
-    METHOD_VAL = %w(GET POST PUT DELETE PATCH HEAD OPTIONS QUERY)
+    QL_FIELDS  = %w[host url method status path scheme proto body header size reqsize respsize dur stub]
+    METHOD_VAL = %w[GET POST PUT DELETE PATCH HEAD OPTIONS QUERY]
     # Discoverability hints for the QL filter, kept loosely in sync with QL_FIELDS.
     # FILTER_HINT sits on the idle bar (press `/` to start filtering); QUERY_HINT sits
     # on the suggestion row at a cold start (already editing, nothing to Tab-complete
@@ -735,7 +735,7 @@ module Gori::Tui
       if (d = @detail) && d.row.id == id
         return "#{d.row.method} #{Url.origin_path(d.row.target)}"
       end
-      if (row = @rows.find { |r| r.id == id })
+      if row = @rows.find { |r| r.id == id }
         return "#{row.method} #{Url.origin_path(row.target)}"
       end
       "flow ##{id}"
@@ -835,7 +835,7 @@ module Gori::Tui
     def query_suggestions : Array(String)
       cur = FilterAst.token_at(@query, @qcx)
       return [] of String if cur.core.empty?
-      if (colon = cur.core.index(':'))
+      if colon = cur.core.index(':')
         field = cur.core[0...colon].downcase
         prefix = FilterAst.unquote_prefix(cur.core[(colon + 1)..])
         suggest_values(field, prefix).map { |s| "#{cur.prefix}#{s}" }
@@ -1809,11 +1809,11 @@ module Gori::Tui
       # (Each span includes its trailing 1-col gap.) HOST+PATH split the rest.
       cluster_w = 4                                # STA (3-digit code + gap)
       spare = rect.right - host_x - 18 - cluster_w # reserve 18 for HOST+PATH first
-      if (show_type = spare >= 7)
+      if show_type = spare >= 7
         cluster_w += 7
         spare -= 7
       end
-      if (show_size = spare >= 7)
+      if show_size = spare >= 7
         cluster_w += 7
         spare -= 7
       end
@@ -2227,8 +2227,6 @@ module Gori::Tui
       sel_spans = if focused && detail_navigable? && @detail_read.selection?
                     size, line_at = detail_line_source
                     @detail_read.highlight_spans(size, line_at)
-                  else
-                    nil
                   end
       # The wrap is computed on the PLAIN text (`line_text`) and the styled overlay is then
       # sliced to the same char range — Highlight is a 1:1 colour overlay, so one layout

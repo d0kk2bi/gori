@@ -115,15 +115,13 @@ module Gori::Oast
     private def decrypt_interaction(session : Session, aes_key : Bytes, data : Bytes) : String?
       modes = session.aes_mode_cfb? ? {"aes-256-cfb", "aes-256-ctr"} : {"aes-256-ctr", "aes-256-cfb"}
       modes.each do |mode|
-        begin
-          text = String.new(Crypto.aes256_decrypt(data, aes_key, mode))
-          if looks_like_interaction?(text)
-            session.aes_mode_cfb = (mode == "aes-256-cfb")
-            return text
-          end
-        rescue
-          # try the other mode
+        text = String.new(Crypto.aes256_decrypt(data, aes_key, mode))
+        if looks_like_interaction?(text)
+          session.aes_mode_cfb = (mode == "aes-256-cfb")
+          return text
         end
+      rescue
+        # try the other mode
       end
       nil
     end
