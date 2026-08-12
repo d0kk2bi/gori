@@ -77,7 +77,7 @@ jobs:
       # a dependency bump for a formatting change nobody here made.
       - name: Check formatting
         run: crystal tool format --check src spec bench scripts
-  # Still no ameba job. The backlog is down from ~965 findings to ~646, but 248 of the
+  # Still no ameba job. The backlog is down from 965 findings to 641, but 248 of the
   # remainder are Metrics/CyclomaticComplexity in the TUI — splitting those methods is a
   # real refactor, not lint cleanup, and `.ameba.yml` already records the decision to
   # raise the bar to 12 rather than carve them up. `just check` still runs it locally.
