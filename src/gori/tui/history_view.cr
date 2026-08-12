@@ -2227,8 +2227,6 @@ module Gori::Tui
       sel_spans = if focused && detail_navigable? && @detail_read.selection?
                     size, line_at = detail_line_source
                     @detail_read.highlight_spans(size, line_at)
-                  else
-                    nil
                   end
       # The wrap is computed on the PLAIN text (`line_text`) and the styled overlay is then
       # sliced to the same char range — Highlight is a 1:1 colour overlay, so one layout

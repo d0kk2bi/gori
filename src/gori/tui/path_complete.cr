@@ -142,8 +142,6 @@ module Gori::Tui
           {name, 1_000_000}
         elsif s = Gori::Fuzzy.score(pl, dn)
           {name, s}
-        else
-          nil
         end
       end
       scored.sort_by! { |(name, rank)| {-rank, name} }

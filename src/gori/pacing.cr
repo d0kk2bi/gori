@@ -29,8 +29,6 @@ module Gori
         (1.0 / rps).seconds
       elsif (t = @config.throttle_ms) && t > 0
         t.milliseconds
-      else
-        nil
       end
     end
 
