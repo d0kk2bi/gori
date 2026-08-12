@@ -22,11 +22,21 @@ module Gori
       }
     end
 
-    # Returns whether the write committed (false = store busy/locked/closing).
+    # Returns whether the override was actually changed (false = no such id, the store was
+    # busy/locked/closing, or that host already belongs to another override).
+    #
+    # `UPDATE OR IGNORE` for the same reason `update_scope_rule` uses it: colliding with
+    # UNIQUE(host) would RAISE inside the writer's transaction, rolling back everything batched
+    # with it and poisoning the connection's cached statement until the error surfaces at
+    # teardown. A no-op plus `changes()` says the same thing without either cost.
     def update_host_override(id : Int64, host : String, ip : String) : Bool
-      exec_task_ok ->(c : DB::Connection) {
-        c.exec("UPDATE host_overrides SET host = ?, ip = ? WHERE id = ?", host, ip, id); nil
+      changed = 0_i64
+      ok = exec_task_ok ->(c : DB::Connection) {
+        c.exec("UPDATE OR IGNORE host_overrides SET host = ?, ip = ? WHERE id = ?", host, ip, id)
+        changed = c.scalar("SELECT changes()").as(Int64)
+        nil
       }
+      ok && changed > 0
     end
 
     # Returns whether the write committed (false = store busy/locked/closing).

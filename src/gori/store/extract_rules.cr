@@ -33,7 +33,10 @@ module Gori
                             selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
                             host : String = "", enabled : Bool = true) : Int64
       exec_task ->(c : DB::Connection) {
-        c.exec("INSERT INTO extract_rules (enabled, name, match_filter, kind, selector, pos_start, pos_end, host) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        # OR IGNORE: a duplicate `name` is a dropped write by design (see above), and a RAISE
+        # here would roll back the whole writer batch and poison the connection's cached
+        # statement until teardown — see `update_scope_rule` for what that cost.
+        c.exec("INSERT OR IGNORE INTO extract_rules (enabled, name, match_filter, kind, selector, pos_start, pos_end, host) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           enabled ? 1 : 0, name, match_filter, kind.label, selector, pos_start, pos_end, host)
         nil
       }
@@ -43,11 +46,16 @@ module Gori
     def update_extract_rule(id : Int64, name : String, match_filter : String, kind : Gori::ExtractKind,
                             selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
                             host : String = "") : Bool
-      exec_task_ok ->(c : DB::Connection) {
-        c.exec("UPDATE extract_rules SET name = ?, match_filter = ?, kind = ?, selector = ?, pos_start = ?, pos_end = ?, host = ? WHERE id = ?",
+      changed = 0_i64
+      ok = exec_task_ok ->(c : DB::Connection) {
+        # OR IGNORE + changes(), like `update_scope_rule`: renaming onto another rule's UNIQUE
+        # `name` must not raise inside the writer's transaction.
+        c.exec("UPDATE OR IGNORE extract_rules SET name = ?, match_filter = ?, kind = ?, selector = ?, pos_start = ?, pos_end = ?, host = ? WHERE id = ?",
           name, match_filter, kind.label, selector, pos_start, pos_end, host, id)
+        changed = c.scalar("SELECT changes()").as(Int64)
         nil
       }
+      ok && changed > 0
     end
 
     def set_extract_rule_enabled(id : Int64, enabled : Bool) : Bool

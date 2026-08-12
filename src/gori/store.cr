@@ -351,9 +351,23 @@ module Gori
       # The TUI polls this every main-loop tick — more reliable than PRAGMA data_version
       # (same-process writer visibility is flaky) or the droppable Probe event channel.
       @probe_generation = 0_i64
+      # Set only when the writer's connection RELEASE raised (see writer_loop). It is the exact
+      # predicate for "this connection is half-closed", which is what #close must not re-close.
+      @writer_teardown_failed = false
       spawn(name: "gori-store-writer") do
-        writer_loop
-        @done.send(nil)
+        # `ensure`, not a bare sequence. `#close` parks on `@done.receive` for a value this
+        # fiber sends exactly once as it exits, so ANY escape from `writer_loop` leaves that
+        # receive waiting on a sender that no longer exists — and that is a HANG, which no
+        # `store.close rescue nil` guard can catch. `writer_loop` rescues around each batch for
+        # this reason, but the batch rescue cannot cover the teardown of the connection the
+        # loop borrowed, and that teardown is exactly where the escape came from (see the
+        # rescue inside `writer_loop`). Making the send unconditional means a writer that dies
+        # for any future reason degrades to "writes stop" instead of "gori never exits".
+        begin
+          writer_loop
+        ensure
+          @done.send(nil)
+        end
       end
     end
 
@@ -511,12 +525,48 @@ module Gori
       @closed = true
       @writes.close
       @done.receive
+      # LAST-DITCH GUARD, and it is about a segfault rather than an exception. `DB::Disposable`
+      # documents that "if an exception is raised, the resource will not be marked as closed" —
+      # but `SQLite3::Statement#do_close` has ALREADY called `sqlite3_finalize` (freeing the
+      # stmt) before its `check` raises the deferred error, and `SQLite3::Connection#do_close`
+      # aborts mid-cache leaving the connection unmarked and still in the pool. So `@db.close`
+      # walks the pool and finalizes freed statements a second time: use-after-free, SIGSEGV,
+      # measured. Every write gori issues into a UNIQUE-bearing table now goes through OR IGNORE
+      # so nothing should poison a statement in the first place; if something ever does, leaking
+      # one connection pool for the rest of the process beats crashing it, and the log line says
+      # which happened.
+      if @writer_teardown_failed
+        ::Log.warn { "store: leaving the connection pool open — the writer's connection did not tear down cleanly" }
+        return
+      end
       @db.close
     end
 
     # --- internals -----------------------------------------------------------
 
     private def writer_loop : Nil
+      # Wrapped, because the RELEASE of the borrowed connection can raise and the per-batch
+      # rescue below is inside the block, so it cannot see it. When a statement hits a
+      # constraint (`UPDATE scope_rules` colliding with the table's UNIQUE triple is the
+      # reachable one — `gori run project scope update` documents that very collision), sqlite
+      # holds the error until the statement is FINALIZED, and the driver finalizes its cached
+      # statements when `using_connection` gives the connection back. That finalize returns the
+      # error code, `SQLite3::Statement#check` raises it, and it unwound straight out of this
+      # fiber — past the batch rescue, which had already correctly rolled the batch back and
+      # answered the caller `false`. So one colliding edit made `Store#close` hang FOREVER at
+      # shutdown (measured: the process never exits), which in the TUI means gori does not quit
+      # and leaves the terminal on the alternate screen. Logged, not raised: the loop is over by
+      # then — every op has been answered — and there is nothing left to abort.
+      begin
+        writer_connection_loop
+      rescue ex
+        # gori.log, not STDERR (#411): in TUI mode STDERR is the alternate screen.
+        ::Log.warn { "store writer connection teardown failed: #{ex.message}" }
+        @writer_teardown_failed = true
+      end
+    end
+
+    private def writer_connection_loop : Nil
       @db.using_connection do |conn|
         # Bound the WAL file so it doesn't grow without limit under sustained
         # writes (the default is 1000 pages; set it explicitly on the writer).

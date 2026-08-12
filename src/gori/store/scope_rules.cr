@@ -18,11 +18,26 @@ module Gori
       }
     end
 
-    # Returns whether the write committed (false = store busy/locked/closing).
+    # Returns whether the rule was actually changed (false = no such id, the store was
+    # busy/locked/closing, or the new triple is already another rule's).
+    #
+    # `UPDATE OR IGNORE`, and that is not cosmetic. A plain UPDATE colliding with the table's
+    # UNIQUE(kind, match_type, pattern) RAISES inside the writer's transaction, and the cost of
+    # that raise is out of all proportion to the edit: it rolls back the whole BATCH — the
+    # captured flows the writer happened to group with it — and it leaves the driver's cached
+    # prepared statement holding an error that sqlite only reports when the statement is
+    # FINALIZED, which is when the writer hands its connection back at `Store#close`. That
+    # raise, in the teardown, is what used to make gori hang on exit (see writer_loop). OR
+    # IGNORE turns the collision into a no-op, so nothing is poisoned and nothing unrelated is
+    # lost; `changes()` inside the same transaction is what still reports it as not applied.
     def update_scope_rule(id : Int64, kind : String, match_type : String, pattern : String) : Bool
-      exec_task_ok ->(c : DB::Connection) {
-        c.exec("UPDATE scope_rules SET kind = ?, match_type = ?, pattern = ? WHERE id = ?", kind, match_type, pattern, id); nil
+      changed = 0_i64
+      ok = exec_task_ok ->(c : DB::Connection) {
+        c.exec("UPDATE OR IGNORE scope_rules SET kind = ?, match_type = ?, pattern = ? WHERE id = ?", kind, match_type, pattern, id)
+        changed = c.scalar("SELECT changes()").as(Int64)
+        nil
       }
+      ok && changed > 0
     end
 
     # Returns whether the write committed (false = store busy/locked/closing).
