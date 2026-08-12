@@ -87,17 +87,49 @@ module Gori
         expanded = File.expand_path(path)
         parent = File.dirname(expanded)
         raise Error.new("#{source} directory does not exist: #{parent}") unless Dir.exists?(parent)
-        project = registry.list.find { |candidate| candidate.db_path == expanded }
-        Selection.new(expanded, project.try(&.name),
+        project = find_project_for_db(registry, expanded)
+        # When it IS a registry project, carry the REGISTRY's spelling of the path forward, not
+        # the caller's. Everything downstream compares this string: `list_projects` marks the
+        # row whose `db_path` equals it, and `delete_project` refuses the project whose
+        # `db_path` equals it. Handing on a differently-spelled path to the same file left the
+        # served project unmarked in the listing and — the half that matters — outside the
+        # "cannot delete the project this server is currently serving" guard.
+        Selection.new(project.try(&.db_path) || expanded, project.try(&.name),
           project.try { |candidate| registry.slug_of(candidate) }, source,
           project_id: project.try { |candidate| registry.id_of(candidate) })
+      end
+
+      # The registry project whose database IS this path — compared through the filesystem, not
+      # as strings. A registry db_path is built from `Paths.projects_dir`, i.e. from `$GORI_HOME`
+      # exactly as it was spelled, so `--db` given the SAME file by its resolved path matched
+      # nothing: the server correctly served that database while reporting name/slug/id as null
+      # and marking no row `current`. `$GORI_HOME` through a symlink is the ordinary way to hit
+      # this (a dotfiles-managed home, `/tmp` on macOS), and the workspace side of this resolver
+      # already normalizes with `realpath` for the same reason.
+      private def self.find_project_for_db(registry : ProjectRegistry, expanded : String) : Project?
+        wanted = canonical_db(expanded)
+        registry.list.find { |candidate| canonical_db(candidate.db_path) == wanted }
+      end
+
+      # A path canonicalized for identity comparison. `realpath` on the file itself when it
+      # exists; otherwise on its DIRECTORY plus the basename, because a `--db` naming a database
+      # that does not exist yet is legitimate (only the parent has to be there) and `realpath`
+      # raises on a missing leaf.
+      private def self.canonical_db(path : String) : String
+        return File.realpath(path) if File.exists?(path)
+        File.join(File.realpath(File.dirname(path)), File.basename(path))
+      rescue
+        path
       end
 
       private def self.active_fallback(registry : ProjectRegistry) : Selection
         if path = Paths.read_active_project
           if File.file?(path)
-            project_for_path = registry.list.find { |candidate| candidate.db_path == path }
-            return Selection.new(path, project_for_path.try(&.name),
+            # Same filesystem-identity match, and the same reason to prefer the registry's
+            # spelling: the marker is written by whichever gori last opened a project, under
+            # whatever form of `$GORI_HOME` that process was given.
+            project_for_path = find_project_for_db(registry, path)
+            return Selection.new(project_for_path.try(&.db_path) || path, project_for_path.try(&.name),
               project_for_path.try { |candidate| registry.slug_of(candidate) }, "active-tui",
               project_id: project_for_path.try { |candidate| registry.id_of(candidate) })
           end

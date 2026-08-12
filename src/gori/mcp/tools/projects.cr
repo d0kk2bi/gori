@@ -205,14 +205,23 @@ module Gori
           @delete_tokens.delete(token)
           return err("confirmation_token expired; re-run dry_run:true", "INVALID_ARGUMENT", field: "confirmation_token", retryable: true)
         end
+        # Read the sidecars BEFORE the delete — `rm_rf` takes them with the directory, and
+        # `id_of` is a file read (`.id`), so asking after it answered nil and this receipt
+        # reported `"id": null` for the one project whose id an agent can no longer look up
+        # anywhere. The dry run had just named it, so the pair disagreed about what was
+        # deleted. (`slug_of` survived either way — it is `File.basename` on a string — which
+        # is exactly why the loss looked selective.) `gori run project delete` already reads
+        # both up front and says why; this is the same fix at the site that missed it.
+        id = reg.id_of(proj)
+        slug = reg.slug_of(proj)
         reg.delete(proj) # raises Gori::Error if another instance holds the capture lock
         @delete_tokens.delete(token)
         Result.new(JSON.build do |j|
           j.object do
             j.field "deleted", true
             j.field "name", proj.name
-            j.field "id", reg.id_of(proj)
-            j.field "slug", reg.slug_of(proj)
+            j.field "id", id
+            j.field "slug", slug
             j.field "db_path", proj.db_path
           end
         end)
