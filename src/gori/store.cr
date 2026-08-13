@@ -186,6 +186,19 @@ module Gori
     RETENTION_UNLIMITED = 0
     # Inserts between retention sweeps — amortizes the prune cost.
     PRUNE_INTERVAL = 2_000
+
+    # Newest `events` rows kept. This is the ONE table in the schema with no cleanup path at
+    # all: `oast_callbacks` and `fuzz_runs` are deleted with their session, `intercept_commands`
+    # is wiped by `clear_intercept_state!` at every capture start, and `flows` has retention —
+    # events were only ever inserted. Fourteen call sites write them (job lifecycle, agent
+    # actions, binding warnings), so a long-lived project accumulates them for as long as it
+    # is used, and nothing ever gave the rows back.
+    #
+    # A COUNT rather than an age: the reader is a forward cursor
+    # (`events_after(since_id, limit)`), so what an agent tailing the feed needs is that recent
+    # rows are still there, not that any particular day is. 50k is far past what any session
+    # produces — these are lifecycle rows, not per-request — and keeps the table at a few MB.
+    EVENTS_RETENTION = 50_000
     # Ids per statement when a batch write binds an `IN (?,?,…)` list. SQLite caps bound
     # parameters at SQLITE_MAX_VARIABLE_NUMBER, which is 999 on anything built before 3.32 —
     # so a set larger than that does not merely run slower, the statement RAISES and the whole
@@ -220,7 +233,40 @@ module Gori
     def self.open(path : String, events : Channel(FlowEvent)? = nil,
                   probe_events : Channel(FlowEvent)? = nil,
                   retention_flows : Int32 = RETENTION_DEFAULT) : Store
-      url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=5000"
+      # `cache_size` is negative because SQLite reads that as KiB rather than pages: -64000
+      # is 64 MiB. The default is -2000 (2 MiB) PER CONNECTION, which on a long-lived project
+      # means every unindexed History filter re-reads pages off disk with almost no reuse —
+      # and `flows` rows carry the request/response BLOBs inline, so those pages are large
+      # (see the measurement in schema.cr's index comments).
+      #
+      # `max_idle_pool_size` is deliberately LEFT at crystal-db's default of 1, even though
+      # raising it would stop the pool rebuilding connections under concurrent readers (each
+      # new one re-runs this pragma set plus `create_function` for the byte-safe REGEXP).
+      # Measured at 4: a raw pool write alongside the writer fiber's own held connection left
+      # `#close` unable to checkpoint, so the db file stayed at 4096 bytes with a 1 MB `-wal`
+      # beside it — no data lost, SQLite replays it on the next open, but the main file then
+      # understates the project, `Compact` reclaims nothing (spec/store/compact_spec.cr
+      # catches exactly this), and copying just the `.db` loses the tail. gori's close path
+      # depends on the pool closing every connection to get SQLite's last-connection
+      # checkpoint, and that only holds at 1. Raise this only with that fixed first.
+      # MEASURED, so nobody re-proposes it: a COVERING INDEX over every column `SELECT_ROW`
+      # reads was tried on top of this and reverted. It is genuinely used (EXPLAIN QUERY PLAN
+      # says `SCAN flows USING COVERING INDEX`), but on the worst case it exists for — a filter
+      # matching almost nothing, so SQLite cannot stop early — it bought 7.5 ms -> 6.5 ms at
+      # 100k rows with 8 KB bodies, for 3% off sustained INSERT throughput and ~20 MB per 100k
+      # rows. The reason it pays so little is the line below: with a 64 MiB page cache the
+      # table pages are already resident, so the overflow-chain traversal the index was meant
+      # to avoid is not what the query was spending its time on. The two genuinely slow filters
+      # (`header:` 164 ms, `body:` LIKE 452 ms) scan the BLOBs themselves and no projection
+      # index can touch them.
+      #
+      # `max_pool_size` is bounded BECAUSE of `cache_size`: crystal-db's default is unlimited,
+      # and 64 MiB is a per-CONNECTION ceiling, so N concurrent readers (the TUI render fiber,
+      # the writer, the probe passive and catch-up fibers, a second `gori mcp` process) could
+      # each claim one. Eight caps the worst case at ~512 MiB instead of unbounded, and is
+      # well past the handful of readers gori actually runs at once.
+      url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=5000" \
+            "&cache_size=-64000&max_pool_size=8"
       refuse_non_database(path)
       # Announce that this process has the database open, for as long as it is (see OpenLock).
       # Taken BEFORE `DB.open` so the window in which a peer could delete the file out from
@@ -248,9 +294,7 @@ module Gori
       # this was the one sibling without it.
       begin
         harden_permissions(path)
-        # Make REGEXP byte-safe on every connection before any query runs (so a binary
-        # body can't crash a `body~`/`header~` scan or a regex scope rule). See SafeRegexp.
-        SafeRegexp.install(db)
+        configure_connections(db)
         Schema.migrate!(db)
       rescue ex
         db.close rescue nil
@@ -259,6 +303,34 @@ module Gori
       end
       # Past this point the Store owns the pool and closes it in #close.
       new(db, events, probe_events, retention_flows, open_lock: open_lock)
+    end
+
+    # Memory-mapped read window. The default is 0 — every read is a `read()` syscall — and
+    # gori's workload is read-heavy and mostly-append, which is the shape mmap is for. Not a
+    # URL parameter: crystal-sqlite3's `Options` knows only busy_timeout, cache_size,
+    # foreign_keys, journal_mode, synchronous and wal_autocheckpoint, so this one is issued
+    # per connection below.
+    MMAP_SIZE = 256 * 1024 * 1024
+
+    # THE one place a fresh pool connection is configured.
+    #
+    # crystal-db's `setup_connection` ASSIGNS its block (`@setup_connection = proc` in
+    # db/database.cr) rather than appending, so a second caller silently REPLACES the first.
+    # Splitting this in two would therefore have dropped whichever ran earlier — and the
+    # earlier one is what makes REGEXP byte-safe, so a `body~` scan over a binary body would
+    # have started crashing again with nothing to point at. Anything a new connection needs
+    # belongs in this block, not in a second `setup_connection` call.
+    #
+    # `Store::Compact` deliberately does NOT come through here: it opens its own handle
+    # (`compact_url`), which is also why its `VACUUM` never runs against an mmap'd file.
+    private def self.configure_connections(db : DB::Database) : Nil
+      db.setup_connection do |conn|
+        next unless sqlite = conn.as?(SQLite3::Connection)
+        # Byte-safe REGEXP before any query runs, so a binary body can't crash a
+        # `body~`/`header~` scan or a regex scope rule. See SafeRegexp.
+        sqlite.gori_install_safe_regexp
+        sqlite.exec("PRAGMA mmap_size = #{MMAP_SIZE}")
+      end
     end
 
     # The 16-byte header every SQLite database file starts with: 15 ASCII bytes plus the
@@ -346,6 +418,7 @@ module Gori
                    @probe_events : Channel(FlowEvent)? = nil,
                    @retention_flows : Int32 = RETENTION_DEFAULT,
                    @prune_interval : Int32 = PRUNE_INTERVAL,
+                   @events_retention : Int32 = EVENTS_RETENTION,
                    @open_lock : OpenLock? = nil)
       @writes = Channel(WriteOp).new(1024) # widened: h2 frames now queue fire-and-forget
       @done = Channel(Nil).new
@@ -762,6 +835,11 @@ module Gori
       # Still on the prune cadence (once per PRUNE_INTERVAL inserts), so a project that never
       # inserts another flow heals only via `compact` — which reaps the same rows.
       reap_unattributed_h2_frames(conn)
+      # BEFORE the retention early-return, for the reason the reap above is: `events` growth
+      # has nothing to do with the FLOW cap, and the surface that writes the most of them —
+      # the MCP server — opens with RETENTION_UNLIMITED, so gating this on `@retention_flows`
+      # would exempt exactly the case it exists for.
+      trim_events(conn)
       return if @retention_flows <= 0
       # Served by the primary key: a rightmost-leaf descending scan of @retention_flows rows.
       oldest_kept = conn.query_one?(
@@ -825,6 +903,24 @@ module Gori
       conn.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
     rescue ex
       ::Log.warn { "unattributed h2-frame reap failed (will retry): #{ex.message}" } # gori.log (#411)
+    end
+
+    # Keep the newest EVENTS_RETENTION rows. Shaped like the flows sweep — find the oldest
+    # survivor by walking the primary key backwards, then delete strictly below it — so the
+    # common case (already under the cap) costs one indexed lookup and no delete at all.
+    #
+    # `id` is AUTOINCREMENT, so it is monotonic and never reused: deleting below a cutoff can
+    # never take a row a reader's watermark has not already passed.
+    private def trim_events(conn : DB::Connection) : Nil
+      oldest_kept = conn.query_one?(
+        "SELECT MIN(id) FROM (SELECT id FROM events ORDER BY id DESC LIMIT ?)",
+        @events_retention, as: Int64?)
+      return unless oldest_kept
+      cutoff = oldest_kept - 1
+      return if cutoff <= 0
+      conn.exec("DELETE FROM events WHERE id <= ?", cutoff)
+    rescue ex
+      ::Log.warn { "event-log trim failed (will retry): #{ex.message}" } # gori.log (#411)
     end
 
     # One gori.log line per sweep that actually removed history, naming the setting that

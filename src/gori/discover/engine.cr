@@ -226,6 +226,20 @@ module Gori::Discover
       if existing = pools[key]?
         return existing
       end
+      # NOT an LRU. Evicting the least-recently-used pool to make room looks like the obvious
+      # fix for the cliff below, and it was tried and reverted: `close_all` runs SSL_shutdown
+      # on a parked TLS socket, which is a WRITE and so a fiber yield point — landing one
+      # between this lookup and the insert below, which the whole method depends on not
+      # having (see the note above). It also orphans any socket a worker has checked OUT,
+      # since eviction can only drain the idle list, and with several origins interleaved
+      # across up to 80 workers it thrashes: every new-origin send evicts the pool the next
+      # send needs, so origins that used to keep their sockets pay a close plus a redial.
+      # Doing it properly needs ConnPool to report in-flight checkouts.
+      #
+      # So past the cap a new origin dials per send, which is what every origin did before
+      # keep-alive existed. The cost is real (a crawl crossing a host+subdomains or multi-host
+      # boundary loses pooling for the origins past the fourth) and is the price of the fd
+      # bound MAX_POOLS exists to hold.
       return nil if pools.size >= MAX_POOLS
       pool = Repeater::ConnPool.new(scheme, host, port, @verify, @sni, @timeout,
         @overrides, @idle_conns)
