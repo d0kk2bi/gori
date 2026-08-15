@@ -91,20 +91,20 @@ module Gori::Tui
         # the card is not flush against its own bottom border. In flight that is a single sentence
         # and the chord line is gone, so the card shrinks with it — at the old 3 an in-flight card
         # carried two empty rows under one line of text and read as a box that failed to fill.
-      when :fuzzer_results    then running ? 2 : 4
-      when :probe             then scan_on ? 5 + (capturing ? 0 : 1) + 2 : 4
-      when :issues            then 5 + 2
-      when :discover          then 5 + 2
-      when :comparer          then 5 + 2
-      when :miner             then 5 + 2
-      when :miner_results     then running ? 2 : 4
-      when :sequencer         then 5 + 2
-      when :sequencer_samples then running ? 2 : 5
-      when :oast              then 5 + 1 # six, and flat — see render_oast_full
-      when :notes             then 5 + 1
-      when :project_desc      then 5 + 1
+      when :fuzzer_results                                  then running ? 2 : 4
+      when :probe                                           then scan_on ? 5 + (capturing ? 0 : 1) + 2 : 4
+      when :issues                                          then 5 + 2
+      when :discover                                        then 5 + 2
+      when :comparer                                        then 5 + 2
+      when :miner                                           then 5 + 2
+      when :miner_results                                   then running ? 2 : 4
+      when :sequencer                                       then 5 + 2
+      when :sequencer_samples                               then running ? 2 : 5
+      when :oast                                            then 5 + 1 # six, and flat — see render_oast_full
+      when :notes                                           then 5 + 1
+      when :project_desc                                    then 5 + 1
       when :project_scope, :project_overrides, :project_env then 5 + 1
-      else                         0 # unknown variant — render_full draws nothing, as before
+      else                                                       0 # unknown variant — render_full draws nothing, as before
       end
     end
 
