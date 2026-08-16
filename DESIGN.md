@@ -183,17 +183,20 @@ tables, not shared memory.
 
 Core subsystems do not know that a surface exists. `store/`, `proxy/`, `probe/`, `fuzz/`,
 `miner/`, `discover/`, `sequencer/`, and `oast/` must not reference `Tui::`, `CLI::`, or
-`MCP::` in code. Checkable:
+`MCP::` in code. Enforced by `spec/layering_spec.cr`; the same set is checkable by hand:
 
 ```sh
 grep -rnE '\b(Tui|CLI|MCP)::' \
-  src/gori/{store,proxy,probe,fuzz,miner,discover,sequencer,oast}/ \
-  src/gori/{store,probe,fuzz,miner,discover,sequencer,oast}.cr
+  src/gori/{store,proxy,probe,fuzz,miner,discover,sequencer,oast,authorize}/ \
+  src/gori/{store,probe,fuzz,miner,discover,sequencer,oast,authorize}.cr
 ```
 
-(There is no `src/gori/proxy.cr`; the proxy is directory-only.) Today that returns exactly
-one hit: a comment in `src/gori/probe/group.cr` naming the CLI formatter that delegates to
-it. A comment may point at a caller; code may not.
+(There is no `src/gori/proxy.cr`; the proxy is directory-only.) A comment may point at a
+caller; code may not — so the assertion is that **every hit is a comment line**, not that
+there are N of them. The count is not the check precisely because it moves whenever one of
+those comments is reworded: this paragraph claimed "exactly one hit" for long enough that
+the true figure reached twelve across four files, which is the failure mode the spec exists
+to remove.
 
 Dependencies run one way. Surfaces depend on engines, engines depend on `Store` and the
 codecs, and nothing depends on a surface. `src/gori/sitemap.cr` and `src/gori/notes.cr` are
