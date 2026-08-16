@@ -30,6 +30,7 @@ require "./controllers/decoder_controller"
 require "./controllers/jwt_controller"
 require "./controllers/rewriter_controller"
 require "./controllers/colormarker_controller"
+require "./controllers/authorize_controller"
 require "./controllers/statusline_controller"
 require "./history_view"
 require "./repeater_view"
@@ -81,6 +82,8 @@ require "./discover_headers_overlay"
 require "./probe_active_overlay"
 require "./overlay"
 require "./scope_rule_overlay"
+require "./authorize_identities_overlay"
+require "./authorize_identity_overlay"
 require "./custom_rule_overlay"
 require "./oast_provider_overlay"
 require "./oast_provider_picker"
@@ -95,6 +98,7 @@ require "./keybind"
 require "../scope"
 require "../rules"
 require "../import"
+require "./runner/authorize"
 require "./runner/colormarker"
 require "./runner/comparer"
 require "./runner/decoder"
@@ -311,6 +315,7 @@ module Gori::Tui
         JwtController.new(self),
         RewriterController.new(self),
         ColormarkerController.new(self),
+        AuthorizeController.new(self),
       ].each { |c| @tabs[c.tab] = c }
     end
 
@@ -383,6 +388,10 @@ module Gori::Tui
 
     private def comparer_controller : ComparerController
       @tabs[:comparer].as(ComparerController)
+    end
+
+    private def authorize_controller : AuthorizeController
+      @tabs[:authorize].as(AuthorizeController)
     end
 
     private def decoder_controller : DecoderController
@@ -505,6 +514,7 @@ module Gori::Tui
             dirty = true if oast_controller.drain_events
             dirty = true if sequencer_controller.drain_events
             dirty = true if discover_controller.drain_events
+            dirty = true if authorize_controller.drain_events
             if (rev = @session.interceptor.revision) != last_rev
               last_rev = rev
               dirty = true
@@ -1956,7 +1966,8 @@ module Gori::Tui
         sandbox: sandbox_label,
         unread: @notifications.unread, capturing: @session.capturing?,
         write_failures: @session.store.write_failures, bypass: Settings.passthrough_count,
-        listeners: listener_chip_count, listener_errors: @session.listener_errors.size)
+        listeners: listener_chip_count, listener_errors: @session.listener_errors.size,
+        authorize: authorize_chip_label)
       Chrome.render_rule(screen, layout.rule)
       # One reconcile per frame: the menu strip AND the ⋯ hidden count both derive from the
       # same tab reconcile — split_tabs computes both in a single pass (was two per frame).
@@ -2040,6 +2051,12 @@ module Gori::Tui
     # colour off — keep the `probe:<mode>` shape if you change this.
     private def probe_label : String
       "probe:#{@session.probe.mode.label}"
+    end
+
+    # The Authorize tab's passive replay, and ONLY while it is on — an empty string is what
+    # keeps the chip off the bar the rest of the time (see `Chrome.top_bar_chips`).
+    private def authorize_chip_label : String
+      authorize_controller.passive? ? "authz:replay" : ""
     end
 
     # A red top-bar chip whenever the sandbox is on — a hard block gate MUST stay visible
