@@ -66,6 +66,28 @@ private class BodyRewriter < Gori::Proxy::HeadRewriter
   end
 end
 
+# A response-body rewriter that replaces the WHOLE entity unconditionally — the stand-in for a
+# rule whose pattern hits a compressed stream by byte-coincidence (a short or binary-ish needle
+# against a DEFLATE stream needs no more than that). Because it can never "find nothing", any
+# rewrite at all is visible, so a test can tell "the gate refused" from "the rule didn't match".
+private class AlwaysBodyRewriter < Gori::Proxy::HeadRewriter
+  def rewrite_request(head : Bytes, host : String) : Bytes
+    head
+  end
+
+  def rewrite_response(head : Bytes, host : String) : Bytes
+    head
+  end
+
+  def rewrites_response_body? : Bool
+    true
+  end
+
+  def rewrite_response_body(entity : Bytes, host : String) : Bytes
+    "CLOBBERED".to_slice
+  end
+end
+
 # A Match&Replace rewriter that SHRINKS the request head's Content-Length (a footgun rule,
 # or a deliberate one) without touching the body. The body streams untouched (P6), so unless
 # the head is re-synced the wire head declares fewer bytes than gori forwards — the leftover
@@ -155,6 +177,46 @@ private def start_body_origin(resp_body : String, seen_body : Channel(String), c
     end
   end
   port
+end
+
+# An origin whose body is compressed by a TRANSFER coding and carries NO Content-Encoding:
+# `Transfer-Encoding: gzip, chunked` is legal (RFC 9112 §6.1) and frames as chunked, so the
+# response IS buffered for Match&Replace — the shape #740 is about. Returns the port and the
+# exact wire body (chunk framing around the gzip stream) the client must receive back.
+private def start_te_gzip_origin(plain : String, seen : Channel(String)) : {Int32, Bytes}
+  gz = IO::Memory.new
+  Compress::Gzip::Writer.open(gz) { |w| w.print(plain) }
+  compressed = gz.to_slice
+  wire = IO::Memory.new
+  wire << compressed.size.to_s(16) << "\r\n"
+  wire.write(compressed)
+  wire << "\r\n0\r\n\r\n"
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  wire_body = wire.to_slice
+  spawn do
+    while conn = origin.accept?
+      Gori::Proxy::Codec::Http1.read_head(conn)
+      seen.send("hit")
+      conn << "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n"
+      conn.write(wire_body)
+      conn.flush
+      conn.close
+    end
+  end
+  {port, wire_body}
+end
+
+# Read a whole response as BYTES. `gets_to_end` decodes to a String, which mangles a
+# compressed body — and the point of the test below is that those bytes arrive untouched.
+private def read_all_bytes(io : IO) : Bytes
+  buf = IO::Memory.new
+  begin
+    IO.copy(io, buf)
+  rescue
+    # a reset/timeout still yields what arrived, exactly like read_until above
+  end
+  buf.to_slice
 end
 
 describe Gori::Proxy::Server do
@@ -1293,6 +1355,44 @@ describe Gori::Proxy::Server do
     response.should_not contain("Transfer-Encoding")
     response.should_not contain("SECRET")
     String.new(sink.responses.first.body.not_nil!).should eq("a [HIDDEN] here")
+  end
+
+  # #740: the Match&Replace body gate read Content-Encoding ONLY, so a body compressed by a
+  # TRANSFER coding (`Transfer-Encoding: gzip, chunked` — no Content-Encoding anywhere) went
+  # straight to the rule engine as a raw DEFLATE stream. Either the rule silently never fired,
+  # or it matched by byte-coincidence and `reframe_to_length` then DROPPED the Transfer-Encoding,
+  # handing the client compressed bytes advertised as an identity Content-Length body.
+  it "refuses a body rewrite on a TRANSFER-compressed response and forwards it byte-exact (#740)" do
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port, wire_body = start_te_gzip_origin("the SECRET value", seen)
+
+    sink = RecordingSink.new(done)
+    # This rewriter rewrites unconditionally, so reaching it at all is visible: without the
+    # gate the client gets "CLOBBERED" under a Content-Length head.
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: AlwaysBodyRewriter.new)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /gz HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    raw = read_all_bytes(client)
+    client.close
+
+    done.receive
+    proxy.stop
+    seen.receive # drain
+
+    # The client got the compressed wire body byte-exact (P7), still chunk-framed, and the head
+    # still declares the transfer codings it was compressed with.
+    raw.size.should be >= wire_body.size
+    raw[raw.size - wire_body.size, wire_body.size].should eq(wire_body)
+
+    resp = sink.responses.first
+    head = String.new(resp.head)
+    head.should contain("Transfer-Encoding: gzip, chunked")
+    head.should_not contain("Content-Length") # not re-framed → the rewrite was refused
+    resp.body.not_nil!.should eq(wire_body)   # capture keeps the wire form, unrewritten
   end
 
   it "leaves a response body over MAX_REWRITE_BODY byte-exact (rule no-ops, no unbounded buffer)" do

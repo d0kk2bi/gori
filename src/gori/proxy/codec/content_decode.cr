@@ -112,30 +112,56 @@ module Gori::Proxy::Codec
       AsciiBytes.contains_ci?(head, CE_NEEDLE) || AsciiBytes.contains_ci?(head, TE_NEEDLE)
     end
 
-    # Whether `head` declares a real (non-identity) Content-Encoding — gzip/br/deflate/zstd,
-    # as opposed to Transfer-Encoding (chunked), which the caller de-chunks separately.
-    # Content-Encoding is never inflated on the live wire path (only for DISPLAY, above) —
-    # a Match&Replace body rule matching against still-compressed bytes can incidentally hit
-    # inside the compressed stream and corrupt it (a short/common literal pattern needs no
-    # more than a byte-value coincidence), so callers on that path use this to refuse rather
-    # than risk it. See `ClientConn#apply_body_rewrite`.
-    # This is a WIRE gate, not a display read, so it must fail CLOSED where the tolerant parser
-    # below cannot see a value. `encoding_headers` walks whole lines and skips any without a
-    # colon, so an obs-folded header (RFC 7230 §3.2.4, `Content-Encoding:\r\n gzip`) parses as an
-    # EMPTY value and the real `gzip` on the continuation line is never seen — which would hand
-    # a compressed body straight to the rule engine, the one outcome this predicate exists to
-    # prevent. `Http1.obfuscated_header?` is the codebase's single home for "this head is folded
-    # or otherwise not cleanly parseable" (see AGENTS.md §1), so ask it rather than re-deriving
-    # the scan here. Response framing deliberately lets obs-folds through byte-exact (see
-    # `Http1.framing_ambiguous?`), so such a head really does reach this gate.
+    # Whether `head` declares a real (non-identity) COMPRESSION layer over the body, in EITHER
+    # header family: a Content-Encoding (gzip/br/deflate/zstd) or a compressing
+    # Transfer-Encoding. Compression is never inflated on the live wire path (only for DISPLAY,
+    # above) — a Match&Replace body rule matching against still-compressed bytes can
+    # incidentally hit inside the compressed stream and corrupt it (a short/common literal
+    # pattern needs no more than a byte-value coincidence), so callers on that path use this to
+    # refuse rather than risk it. See `ClientConn#apply_body_rewrite`.
+    #
+    # The name is historical: this started as a Content-Encoding-only test, which was the bug.
+    # `Transfer-Encoding: gzip` carries NO Content-Encoding at all, so the CE-only version
+    # returned false on its first line and the gate opened on a compressed body — either the
+    # rule silently never fired (a body rule that "doesn't work" on that host, with nothing
+    # saying why), or it matched by byte-coincidence and `reframe_to_length` then dropped the
+    # Transfer-Encoding, so the client received raw DEFLATE advertised as an identity
+    # Content-Length body. Both halves of `decode_full`'s chain are compression; both belong here.
+    #
+    # A final `chunked` does NOT count. It is framing, not compression (RFC 9112 §6.1), and
+    # `apply_body_rewrite` de-chunks to the entity itself before the rule runs — counting it
+    # would refuse the rewrite on most of the web. `transfer_layers` is the same split
+    # `decode_full` uses, so the gate and the decoder can never disagree about which layer is
+    # framing. A NON-final `chunked` (`chunked, gzip`) is malformed: framing did not read it as
+    # chunked framing either, so it stays in the layer list and refuses here — correctly, since
+    # the bytes reaching the rule would still carry both the chunk framing and the gzip.
+    #
+    # This is a WIRE gate, not a display read, so it must be cheap and it must fail CLOSED where
+    # the tolerant parser below cannot see a value. Cheap: `head_has_encoding?` is the same
+    # zero-alloc byte scan `decode_full` opens with, so a head naming neither family never
+    # builds the head String; a head that does name one pays a single parse on a path that has
+    # already buffered the whole body for the rule engine. Fail closed: `encoding_headers` walks
+    # whole lines and skips any without a colon, so an obs-folded header (RFC 7230 §3.2.4,
+    # `Content-Encoding:\r\n gzip`, and equally `Transfer-Encoding: chunked,\r\n gzip`) parses as
+    # an empty or truncated value and the real `gzip` on the continuation line is never seen —
+    # which would hand a compressed body straight to the rule engine, the one outcome this
+    # predicate exists to prevent. `Http1.obfuscated_header?` is the codebase's single home for
+    # "this head is folded or otherwise not cleanly parseable" (see AGENTS.md §1), so ask it
+    # rather than re-deriving the scan here. Response framing deliberately lets obs-folds
+    # through byte-exact (see `Http1.framing_ambiguous?`), so such a head really does reach this
+    # gate.
     def self.content_encoded?(head : Bytes) : Bool
-      return false unless AsciiBytes.contains_ci?(head, CE_NEEDLE)
-      _, ce_values = encoding_headers(head)
+      return false unless head_has_encoding?(head)
+      te_values, ce_values = encoding_headers(head)
       return true unless content_layers(ce_values).empty?
-      # A Content-Encoding field-name IS present (a bare `Vary: Content-Encoding` yields no
-      # entry here at all, so it still returns false) but no readable token came back: refuse
-      # only when the head is folded/obfuscated, which is the shape that hides one.
-      !ce_values.empty? && Http1.obfuscated_header?(head)
+      return true unless transfer_layers(te_values, transfer_encoding_chunked?(te_values)).empty?
+      # A field-name from one of the two families IS present (a bare `Vary: Content-Encoding`
+      # yields no entry here at all, so it still returns false) but no readable compression token
+      # came back: refuse only when the head is folded/obfuscated, which is the shape that hides
+      # one. This covers the plain `Transfer-Encoding: chunked` head too, and deliberately: an
+      # obs-fold there can hide a coding INSIDE the value list, which leaves the visible token
+      # list looking like ordinary chunked framing.
+      !(ce_values.empty? && te_values.empty?) && Http1.obfuscated_header?(head)
     end
 
     # `chunked` frames the body only when it's the FINAL transfer-coding (RFC 7230

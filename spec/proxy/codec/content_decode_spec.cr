@@ -28,6 +28,10 @@ private def decode(head : Bytes, body : Bytes)
   Gori::Proxy::Codec::ContentDecode.decode(head, body)
 end
 
+private def encoded?(head : Bytes)
+  Gori::Proxy::Codec::ContentDecode.content_encoded?(head)
+end
+
 describe Gori::Proxy::Codec::ContentDecode do
   it "passes an identity body through unchanged (nil => caller uses raw)" do
     decoded, note = decode(head("HTTP/1.1 200 OK", "Content-Type: text/plain"), "hello".to_slice)
@@ -181,6 +185,85 @@ describe Gori::Proxy::Codec::ContentDecode do
     decoded, note = decode(head("HTTP/1.1 200 OK", "Content-Type: application/json", "Server: nginx"), %({"ok":true}).to_slice)
     decoded.should be_nil
     note.should be_nil
+  end
+
+  # The WIRE gate: `ClientConn#apply_body_rewrite` refuses to run a Match&Replace body rule
+  # when this says the body carries a compression layer. Compression is never inflated on that
+  # path, so a rule that matched would be matching opaque compressed bytes — and the re-frame
+  # that follows drops Transfer-Encoding, handing the client a compressed body labelled as an
+  # identity one.
+  describe ".content_encoded?" do
+    it "refuses a Content-Encoding body and allows a plain one" do
+      encoded?(head("HTTP/1.1 200 OK", "Content-Encoding: gzip")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "content-encoding: BR")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "Content-Type: text/html")).should be_false
+      encoded?(head("HTTP/1.1 200 OK", "Content-Encoding: identity")).should be_false
+      # the "-encoding" byte gate's false positives resolve to a real parse, not a refusal
+      encoded?(head("HTTP/1.1 200 OK", "Vary: Accept-Encoding")).should be_false
+      encoded?(head("HTTP/1.1 200 OK", "Vary: Content-Encoding")).should be_false
+    end
+
+    # #740: a `Transfer-Encoding: gzip` response carries NO Content-Encoding at all, so the
+    # Content-Encoding-only gate returned false on its first line and handed the rule engine a
+    # raw DEFLATE stream — silently no-matching, or matching by byte-coincidence and corrupting
+    # the body it then advertised as identity.
+    it "refuses a body compressed by a TRANSFER coding (#740)" do
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: gzip")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "TRANSFER-ENCODING: GZIP")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: gzip, chunked")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: gzip", "Transfer-Encoding: chunked")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: br")).should be_true
+      # an unknown/unsupported transfer coding is still a coding — the bytes beneath it are not
+      # the entity, so the rule must not see them
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: compress, chunked")).should be_true
+    end
+
+    # The regression guard for the obvious over-fix: `chunked` is FRAMING, not compression
+    # (RFC 9112 §6.1), and `apply_body_rewrite` de-chunks to the entity itself before matching.
+    # Counting it here would silently disable body rules across most of the web.
+    it "allows a plain chunked body — chunked is framing, not compression" do
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: chunked")).should be_false
+      encoded?(head("HTTP/1.1 200 OK", "transfer-encoding: CHUNKED")).should be_false
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: identity, chunked")).should be_false
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: chunked", "Content-Type: text/html")).should be_false
+    end
+
+    # A NON-final `chunked` is malformed (RFC 9112 §6.1) and the wire codec rejects it outright,
+    # so this shape should not reach the gate at all — but the layer split keeps it in the list
+    # rather than pretending the bytes beneath it are plain, and the gate agrees: the entity is
+    # under both a gzip layer AND chunk framing nobody removed.
+    it "refuses a non-final chunked (the malformed shape is not framing gori removed)" do
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: chunked, gzip")).should be_true
+    end
+
+    # Fail CLOSED, symmetrically with the Content-Encoding side: `encoding_headers` skips a
+    # continuation line (it has no colon), so an obs-folded header (RFC 7230 §3.2.4) hides the
+    # real coding from this parse while a lenient recipient still reads it. Response framing
+    # deliberately lets obs-folds through byte-exact, so such a head really does arrive here.
+    it "fails closed on an obs-folded encoding header" do
+      encoded?(head("HTTP/1.1 200 OK", "Content-Encoding:", " gzip")).should be_true
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding:", " gzip")).should be_true
+      # the fold hides a coding INSIDE the value list, so the visible tokens look like ordinary
+      # chunked framing — which is why the refusal cannot be narrowed to an empty value
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: chunked,", " gzip")).should be_true
+      # deliberately blunt: a fold ANYWHERE in a head that names either family refuses, because
+      # this parse cannot tell which header the continuation belonged to
+      encoded?(head("HTTP/1.1 200 OK", "Transfer-Encoding: chunked", "X-Note: a", " folded")).should be_true
+      # but a fold in a head naming NEITHER family is not this gate's business
+      encoded?(head("HTTP/1.1 200 OK", "X-Note: a", " folded")).should be_false
+    end
+
+    # A wire gate must never raise: it runs on every rewrite-eligible response, and the head is
+    # remote bytes (not necessarily valid UTF-8, not necessarily well-formed).
+    it "never raises on a hostile or truncated head" do
+      encoded?(Bytes.new(0)).should be_false
+      encoded?("Transfer-Encoding".to_slice).should be_false # no colon, no blank line
+      io = IO::Memory.new
+      io << "HTTP/1.1 200 OK\r\nX-Bin: "
+      io.write(Bytes[0x80, 0xff]) # a header value that is not valid UTF-8
+      io << "\r\nContent-Encoding: gzip\r\n\r\n"
+      encoded?(io.to_slice).should be_true
+    end
   end
 
   # A chunked body's trailer section (RFC 7230 §4.1.2) used to be captured by NEITHER half of
