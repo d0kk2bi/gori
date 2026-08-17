@@ -402,8 +402,10 @@ module Gori
       private def self.session_plan_options(rec : Store::RepeaterRecord, insecure : Bool,
                                             overrides : Gori::HostOverrides?,
                                             verbatim : Bool = false,
-                                            timeout : Time::Span? = nil) : Repeater::PlanOptions
+                                            timeout : Time::Span? = nil,
+                                            reframe_grpc : Bool = false) : Repeater::PlanOptions
         Repeater::PlanOptions.new([rec.request],
+          reframe_grpc: reframe_grpc,
           default_target: rec.target, http2: rec.http2?, sni: rec.sni,
           timeout: timeout,
           expand_request: !verbatim,
@@ -472,6 +474,8 @@ module Gori
         idle_ms : Int64? = nil
         allow_unscoped = false
         verbatim = false
+        slot : String? = nil
+        reframe_grpc = false
         ws_keep_key = false
         # nil = use the session's stored setting; true = this send is plain HTTP whatever it says.
         # There is no `--websocket` counterpart: the stored default IS WebSocket unless the
@@ -490,6 +494,10 @@ module Gori
           p.on("--diff", "Diff the new response against the session's last stored response") { do_diff = true }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--verbatim", "Send the stored bytes EXACTLY: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync, no HTTP/2→1.1 version fix, and on h2 no field-name lowercasing") { verbatim = true }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
+          # Opt-in, and off even under --verbatim's opposite: a stale prefix is the operator's
+          # bytes by default (P7). See `Repeater::PlanOptions#reframe_grpc?`.
+          p.on("--reframe-grpc", "HTTP/2 only: recompute the gRPC 5-byte length prefix over the body actually being sent, for a message an edit changed the length of (default: send it as written)") { reframe_grpc = true }
           p.on("--message=TEXT", "WebSocket: outbound text message (repeatable; replaces the session's stored messages)") { |v| ws_messages << Store::WsOutMessage.text(v) }
           p.on("--message-frame=SPEC", "WebSocket: one outbound frame with an explicit shape (repeatable; mixes with --message in order). SPEC is comma-separated key=value: opcode=text|bin|cont|close|ping|pong|<0-15>, fin=0|1, rsv=0-7, mask=0|1, mask_key=<hex>, len=<declared length>, and one of hex=|b64=|text= (text= runs to the end of SPEC). Example: opcode=close,hex=03ea6279650a") { |v| ws_messages << parse_message_frame(v) }
           p.on("--ws-keep-key", "WebSocket: send the request's own Sec-WebSocket-Key instead of a fresh one (overrides the session's stored setting for this send)") { ws_keep_key = true }
@@ -515,13 +523,16 @@ module Gori
           store.close
         end
         abort "gori run repeater send: no repeater session ##{id}" unless rec
+        # After `open_store` (which installs `Env.layer`) and before the plan: `Repeater::Sender`
+        # reads the active slot at the seam, so this has to be set before anything builds bytes.
+        activate_slot(slot, "gori run repeater send")
         # The scope decision every active send passes through. `gori run repeater` dials
         # Repeater::Engine/H2Engine/WsEngine directly, bypassing the proxy's own gate, so
         # Sandbox mode's "blocks ALL out-of-scope traffic" promise lives here.
         outbound = project_outbound(project_name, db_path, allow_unscoped)
 
         plan = begin
-          Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim, timeout), outbound)
+          Repeater::Plan.build(session_plan_options(rec, insecure, host_overrides, verbatim, timeout, reframe_grpc), outbound)
         rescue ex : Repeater::PlanError
           repeater_plan_abort("gori run repeater send", ex, "session ##{id}")
         end
@@ -1155,6 +1166,7 @@ module Gori
         body_override : String? = nil
         allow_unscoped = false
         keep_request_line = false
+        slot : String? = nil
         timeout : Time::Span? = nil
         positional = [] of String
 
@@ -1180,6 +1192,7 @@ module Gori
           p.on("--rm-header=NAME", "Delete every header with this name (repeatable). Removing Content-Length suppresses the auto-resync; removing Host suppresses the --target sync") { |v| removed_headers << v }
           p.on("-bBODY", "--body=BODY", "Request body override") { |v| body_override = v }
           p.on("--keep-request-line", "Send the stored request line as-is — do not rewrite an absolute-form line (\"GET http://h/p\") to origin-form") { keep_request_line = true }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -1203,6 +1216,9 @@ module Gori
           store.close
         end
         abort "gori run repeater: no flow ##{id}" unless detail
+        # After `open_store` (which installs `Env.layer`) and before the plan: `Repeater::Sender`
+        # reads the active slot at the seam, so this has to be set before anything builds bytes.
+        activate_slot(slot, "gori run repeater")
 
         # `repeater list` prints session ids in the same bare `#N` form as flow ids
         # (separate 1-based counters), so a bare id here is ambiguous — we always mean

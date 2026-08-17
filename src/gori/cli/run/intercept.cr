@@ -186,8 +186,9 @@ module Gori
               # `[no-edit]` marks a message an edit cannot be applied to, so the state is
               # scannable down a queue listing the way `[stub]` is in History. The sentence
               # itself is `intercept get`'s; a list row has no space for it.
-              # `edit_refusal` ONLY, never `head_only`: the gate holds the head of every h2
-              # message, so chipping on that would mark every held HTTP/2 row uneditable.
+              # `edit_refusal` ONLY, never `head_only`: an h2 hold whose body gori could not
+              # buffer is still fully editable in the head, so chipping on that would mark a
+              # row uneditable when only its body is out of reach.
               chip = r.edit_refusal ? "  [no-edit]" : ""
               puts "##{r.item_id}  [#{r.kind}]  #{method} #{CLI::Output.term_safe(intercept_row_where(r))}  (#{body.size}b body)#{chip}"
             end
@@ -468,8 +469,9 @@ module Gori
       # byte-exact for a BINARY WS frame the same way MCP's `raw_base64` is; `--raw` is an argv
       # STRING — already re-encoded as text before this process ever saw it, so a byte over
       # 0x7F is unrecoverable here (the OS/shell owns that re-encoding, not gori). A binary WS
-      # item through `--raw` is refused by name rather than forwarding the wrong bytes,
-      # mirroring the TUI's read-only stance on a binary WS message (`read_only_selection?`).
+      # item through `--raw` is refused by name rather than forwarding the wrong bytes; the TUI
+      # answers the same problem with a byte channel of its own (the hex editor over the held
+      # payload, `InterceptView#hex_editing?`), which is what `--raw-file` is here.
       #
       # Public and pure (no store, no process exit) so a spec can pin the decision without a
       # live capturing instance.

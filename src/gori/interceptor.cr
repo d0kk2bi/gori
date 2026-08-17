@@ -1,3 +1,5 @@
+require "log"
+require "./env"
 require "./scope"
 require "./intercept_filter"
 require "./url"
@@ -74,10 +76,12 @@ module Gori
       # the MCP process can render a correct age that does NOT reset on every republish.
       getter held_at_ms : Int64
       getter reply : Channel(Decision)
-      # A WebSocket BINARY message (opcode 2). Holdable, forwardable and droppable, but
-      # read-only in the editor: the TextArea round trip is `String.new(raw)` → char ops →
-      # `.to_slice`, which is lossy on non-UTF-8 — a pre-existing sharp edge on an HTTP body
-      # that WS makes the DEFAULT case, since opcode 2 is protobuf/msgpack/CBOR.
+      # A WebSocket BINARY message (opcode 2). Which EDITOR a surface opens on it, and whether
+      # a text-only edit channel may carry it at all: the TextArea round trip is
+      # `String.new(raw)` → char ops → `.to_slice`, which is lossy on non-UTF-8 — a pre-existing
+      # sharp edge on an HTTP body that WS makes the DEFAULT case, since opcode 2 is
+      # protobuf/msgpack/CBOR. The TUI answers it with a hex editor over the bytes; MCP `raw`
+      # and CLI `--raw` refuse by name and point at `raw_base64` / `--raw-file`.
       getter? binary : Bool
       # Why an EDIT to this message cannot be applied, or nil when it can.
       #
@@ -90,8 +94,14 @@ module Gori
       # nil on h1, where the decision bytes are forwarded byte-exact.
       getter edit_refusal : String?
       # This hold covers the HEAD only, so a body typed into an edit has nowhere to go: the h2
-      # relay streams DATA past the gate untouched (#492 step 3, D2). h1 holds head+body and
-      # leaves this false.
+      # relay is streaming this message's DATA past the gate untouched.
+      #
+      # NOT every h2 hold, since PR #6: when the message declares a `content-length` the gate
+      # can buffer (`H2::StreamGate::MAX_HOLD_BODY`), or ends at its own head, the hold covers
+      # head+body and this stays false — the operator's body is re-framed into DATA on forward.
+      # It is true for the shapes gori will not buffer: no declared length (a streaming upload,
+      # SSE, a gRPC stream), a length over the ceiling, or a padded body. h1 holds head+body
+      # always and leaves this false.
       getter? head_only : Bool
 
       def initialize(@id, @kind, @method, @host, @target, @port, @scheme, @raw, @held_at,
@@ -116,9 +126,10 @@ module Gori
         end
         return nil unless head_only? && Interceptor.split_edit(bytes)[1]
         "this HTTP/2 hold covers the HEAD only, so the body in this edit has nowhere to go — " \
-        "DATA frames stream past the intercept gate untouched (#492 step 3) and gori will not " \
-        "report having sent bytes it dropped. Edit the head, or replay the whole message from " \
-        "the Repeater"
+        "gori buffers a held h2 body only when the message declares a content-length it can " \
+        "hold, and this one does not (a streaming body, or one over the ceiling), so its DATA " \
+        "frames stream past the intercept gate untouched and gori will not report having sent " \
+        "bytes it dropped. Edit the head, or replay the whole message from the Repeater"
       end
 
       # How this queue row is NAMED to a human or an agent — the ack for an irreversible
@@ -234,6 +245,16 @@ module Gori
 
     def enabled? : Bool
       @mutex.synchronize { @enabled }
+    end
+
+    # Whether a hold offered right now would actually be QUEUED — the condition `enqueue` tests,
+    # and the one `gate_snapshot` reads for the same reason. Distinct from `enabled?` because
+    # shutdown latches `@shutting_down` without flipping `@enabled`, and a caller asking "is
+    # there any point holding this?" needs both. `H2::StreamGate` asks: a hold of its still
+    # buffering a body has no queue row for `toggle`/`release_all` to hand back, so it has to
+    # notice the gate closing on its own.
+    def holding? : Bool
+      @mutex.synchronize { @enabled && !@shutting_down }
     end
 
     # Which leg(s) are currently held (TUI reads it to render the catch chip).
@@ -533,8 +554,40 @@ module Gori
       item = @mutex.synchronize { @items.delete(id) }
       return false unless item
       @revision.add(1)
-      item.reply.send(Decision.new(Action::Forward, bytes || item.raw))
+      item.reply.send(Decision.new(Action::Forward, overlay_slot(item, bytes || item.raw)))
       true
+    end
+
+    # The ACTIVE SESSION SLOT's header overlay, applied to a REQUEST on its way back out.
+    # This is the third send seam (with `Repeater::Sender` and `Fuzz::Sender`): a held request
+    # is one gori is about to put on the wire, and "browse the rest of this flow as the admin
+    # slot" is the same operator instruction those two obey.
+    #
+    # Three gates, and each one is a case that must not be touched:
+    #
+    #   * REQUESTS only. A held RESPONSE is travelling to the operator's own browser and a WS
+    #     frame has no header lines; writing an identity onto either would be gori inventing
+    #     traffic in a direction nobody asked about.
+    #   * `refuse_edit` must accept the result. That predicate is already the one definition
+    #     of "may these bytes replace the held ones" — it refuses an h2 hold whose head has no
+    #     faithful HTTP/1.1 text form, and a body where a head-only hold has nowhere to put
+    #     one. An overlay is an edit; it earns no exemption.
+    #   * Byte-identical output forwards the ORIGINAL slice, so a project with no slot active
+    #     (the default) allocates nothing and P7's "these are the bytes" stays literally true.
+    #
+    # Best-effort: an overlay must never be able to strand a message the client is waiting on,
+    # so a failure forwards what the operator decided on.
+    private def overlay_slot(item : Item, bytes : Bytes) : Bytes
+      return bytes unless item.kind.request?
+      overlaid = Gori::Env.overlay_slot(bytes)
+      # Pointer identity, not `==`: `Env.overlay_slot` returns the ARGUMENT when no slot is
+      # active, and a content compare would walk every byte of every forwarded message to
+      # learn what the pointer already says (P6).
+      return bytes if overlaid.to_unsafe == bytes.to_unsafe && overlaid.size == bytes.size
+      item.refuse_edit(overlaid) ? bytes : overlaid
+    rescue ex
+      ::Log.warn { "session slot overlay skipped for a forwarded request: #{ex.message}" }
+      bytes
     end
 
     # True when THIS call is the one that settled the item — the same claim `forward` makes,
@@ -565,7 +618,7 @@ module Gori
       @revision.add(1) unless items.empty?
       items.each do |it|
         bytes = overrides.try(&.[it.id]?) || it.raw
-        it.reply.send(Decision.new(Action::Forward, bytes))
+        it.reply.send(Decision.new(Action::Forward, overlay_slot(it, bytes)))
       end
       items.size
     end

@@ -108,6 +108,27 @@ module Gori
       # Bumped on every rule edit and every rebind, so a consumer can cache a merged
       # snapshot instead of rebuilding one per message (see `Rules`).
       abstract def rev : UInt64
+
+      # The ACTIVE SESSION SLOT's header overlay, applied to final wire bytes. Defaults to
+      # the identity function; `Bindings` overrides it with the project's slot registry.
+      #
+      # The second half of "a slot is the send context": the first half is `values`, which
+      # already resolves `$NAME` out of the active slot's table. A layer answers both, because
+      # they are one question — WHICH SESSION are these bytes going out as — and splitting
+      # them across two globals is how the overlay and the bindings would come to disagree
+      # about it.
+      def overlay(wire : Bytes) : Bytes
+        wire
+      end
+
+      # WHICH slot `overlay` and `values` are answering as, or nil for as-captured. A
+      # READOUT seam and nothing else: a surface has to be able to print the send context
+      # next to a send button without reaching through `Env.layer` and downcasting to
+      # `Bindings` (which is how three surfaces would each acquire their own idea of it).
+      # Defaults to nil, so a layer with no slot registry reads as as-captured.
+      def active_slot_name : String?
+        nil
+      end
     end
 
     # The open project's binding table, or nil when none is open. Set by `Session.open`
@@ -142,6 +163,33 @@ module Gori
 
     def self.binding_rev : UInt64
       @@layer.try(&.rev) || 0_u64
+    end
+
+    # THE send-seam overlay: the active session slot's header set/remove, applied to wire
+    # bytes that are already `$NAME`-resolved. Returns the same slice when no slot is active,
+    # which is the default and the whole compatibility story — `as-captured` is the
+    # no-overlay baseline, and a project that never selects a slot never sees a changed byte.
+    #
+    # Called AFTER `expand_bindings` at every seam that owns a request going onto the wire
+    # (`Repeater::Sender`, `Fuzz::Sender`, the intercept forward). Order matters and is stated
+    # here because it is the invariant three files depend on: the message's own `$NAME`
+    # references resolve first, against the active slot's table, and the overlay is then
+    # written over the result. A slot header value carrying its OWN `$NAME` is resolved by the
+    # layer as it applies the overlay, so `Authorization: Bearer $SESSION` on the "admin" slot
+    # means admin's `$SESSION` and nobody else's.
+    #
+    # HEADER-ONLY by construction (`SessionSlot.overlay_wire`), so the body is byte-exact and
+    # Content-Length never moves. That is what makes it safe on bytes the operator did not
+    # author — a captured replay, a fuzz template with its payload already spliced.
+    def self.overlay_slot(wire : Bytes) : Bytes
+      (l = @@layer) ? l.overlay(wire) : wire
+    end
+
+    # The active session slot's NAME, or nil for as-captured (the default). What a surface
+    # prints beside a send — the Repeater's `session:` chip, `gori run`'s send banner, MCP's
+    # `active_slot` field — so all three name one answer rather than three.
+    def self.active_slot_name : String?
+      @@layer.try(&.active_slot_name)
     end
 
     # What a DISPLAY path should treat as known: build-time vars plus whatever is bound

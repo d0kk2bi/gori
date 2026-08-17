@@ -31,11 +31,13 @@ module Gori
         follow = false
         keep_alive = true
         update_cl = true
+        reframe_grpc = false
         auto_cal = false
         format = :text
         force = false
         allow_unscoped = false
         bind_from : Int64? = nil
+        slot : String? = nil
         fail_if_no_matches = false
         matcher = Fuzz::Matcher.new(keep_bodies: :none)
         positional = [] of String
@@ -86,6 +88,10 @@ module Gori
           # same name and for the same reason: a CL/CL-TE desync template is the payload, and
           # recomputing its Content-Length swept a different request than the one written.
           p.on("--verbatim", "Send the template's Content-Length as written — no auto-resync after payload substitution (for CL / CL-TE desync payloads)") { update_cl = false }
+          # The mirror image of `--verbatim`, for the OTHER length declaration in the same
+          # request. Default off, and the note below still fires for a run that leaves a
+          # prefix stale — see `Fuzz::Config#reframe_grpc?` for why the default is that way.
+          p.on("--reframe-grpc", "Recompute the gRPC 5-byte length prefix after each payload is spliced into the message (default: leave it as written and report it)") { reframe_grpc = true }
           p.on("--mc=SPEC", "Match status (e.g. 200,302,500-599,2xx)") { |v| matcher.match_status = v }
           p.on("--fc=SPEC", "Filter out status") { |v| matcher.filter_status = v }
           # The h2 `:status` of a gRPC response is 200 by definition, so --mc/--fc cannot tell
@@ -107,6 +113,7 @@ module Gori
           p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
           p.on("--force", "Run even when the request count is huge or unknown") { force = true }
           p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run fuzz") }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--fail-if-no-matches", "Exit 3 when no result matched") { fail_if_no_matches = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -133,7 +140,7 @@ module Gori
           config: Fuzz::Config.new(mode: mode, concurrency: concurrency, rps: rate, throttle_ms: throttle,
             retries: retries, timeout: timeout, follow_redirects: follow, auto_calibrate: auto_cal,
             keep_bodies: :none, keep_alive: keep_alive, max_requests: max_requests,
-            update_content_length: update_cl, race_count: race,
+            update_content_length: update_cl, reframe_grpc: reframe_grpc, race_count: race,
             race_warmup: race_warmup_file.try { |f| read_input_file(f, "gori run fuzz").to_slice }),
           matcher: matcher, verify: !insecure, sni: sni,
           overrides: cli_host_overrides(project_name, db_path, flow_id))
@@ -145,6 +152,10 @@ module Gori
         # Ahead of Plan.build on purpose: the builder's unresolved-env refusal fires on the very
         # template `--bind-from` was passed for, so the flag was being discarded silently. See
         # CLI::Run.preflight_bind_from.
+        # BEFORE the bind-from seed and the plan: the slot decides which binding table the
+        # replay fills and which one `$NAME` resolves out of, so a later activation would
+        # seed one identity and send as another.
+        activate_slot(slot, "gori run fuzz")
         preflight_bind_from(bind_from, "gori run fuzz")
         outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped)
         plan = begin
@@ -178,7 +189,7 @@ module Gori
           (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run fuzz")
           plan.engine.calibrate_baseline if auto_cal
           run_fuzz_stream(plan.engine, mode, race, origin.scheme, origin.host, origin.port, format, force,
-            fail_if_no_matches, plan.pool, max_requests)
+            fail_if_no_matches, plan.pool, max_requests, plan.config.reframe_grpc?)
         ensure
           outbound.close
         end
@@ -286,7 +297,8 @@ module Gori
       private def self.run_fuzz_stream(engine : Fuzz::Engine, mode : Fuzz::Mode, race : Int32?, scheme : String,
                                        host : String, port : Int32, format : Symbol, force : Bool,
                                        fail_if_no_matches : Bool, pool : Fuzz::ConnPool? = nil,
-                                       max_requests : Int64? = nil) : Nil
+                                       max_requests : Int64? = nil,
+                                       reframe_grpc : Bool = false) : Nil
         total = fuzz_preflight(engine, mode, race, scheme, host, port, force)
         matched = 0
         errored = 0
@@ -311,7 +323,7 @@ module Gori
               matched += 1 if r.matched?
               errored += 1 if r.error && !r.matched?
             end
-          when Fuzz::DoneEvent  then fuzz_done(ev, shown, pool, max_requests, race, engine.matcher_constrained?)
+          when Fuzz::DoneEvent  then fuzz_done(ev, shown, pool, max_requests, race, engine.matcher_constrained?, reframe_grpc)
           when Fuzz::ErrorEvent then had_error = true; STDERR.puts "fuzz error: #{ev.message}"
           end
         end
@@ -374,12 +386,23 @@ module Gori
       # under `N sent · 0 errors`. The bytes are NOT changed (P7: the payload is the test case,
       # and `--verbatim` exists because a silent re-frame is the complaint elsewhere); this is
       # the disclosure Content-Length has always had and this declaration never did.
-      private def self.warn_fuzz_grpc_framing(p : Fuzz::Progress) : Nil
+      private def self.warn_fuzz_grpc_framing(p : Fuzz::Progress, reframe_grpc : Bool) : Nil
         return unless p.grpc_stale > 0
         STDERR.puts "gori run fuzz: note: #{p.grpc_stale_reason}" if p.grpc_stale_reason
-        STDERR.puts "gori run fuzz: note: the template's gRPC length prefix is not recomputed " \
-                    "when a payload changes the message length — #{p.grpc_stale} of " \
-                    "#{p.grpc_requests} requests left it stale"
+        # Two different sentences, because the remedy differs. Without the flag the prefix was
+        # left alone by policy and naming the flag is the useful half. WITH it the operator
+        # already asked, and these requests are the ones the reframe could not repair
+        # UNAMBIGUOUSLY (a client-streaming body, a grpc-web-text body) — pointing them at the
+        # flag they just passed would read as gori not having heard them.
+        if reframe_grpc
+          STDERR.puts "gori run fuzz: note: --reframe-grpc could not recompute the gRPC length " \
+                      "prefix unambiguously — #{p.grpc_stale} of #{p.grpc_requests} requests " \
+                      "went out stale (a multi-message body, or grpc-web-text)"
+        else
+          STDERR.puts "gori run fuzz: note: the template's gRPC length prefix is not recomputed " \
+                      "when a payload changes the message length — #{p.grpc_stale} of " \
+                      "#{p.grpc_requests} requests left it stale (pass --reframe-grpc to recompute it)"
+        end
       end
 
       # `matched` is already the race's win signal the moment `--mc`/`--fc` names the success
@@ -398,7 +421,8 @@ module Gori
 
       private def self.fuzz_done(ev : Fuzz::DoneEvent, emitted : Int32, pool : Fuzz::ConnPool?,
                                  max_requests : Int64? = nil, race : Int32? = nil,
-                                 matcher_constrained : Bool = false) : Nil
+                                 matcher_constrained : Bool = false,
+                                 reframe_grpc : Bool = false) : Nil
         STDERR.print "\r" if STDERR.tty? # clear the in-place meter (none was drawn when piped)
         # `requests` only when it DIFFERS from the payload count — retries and redirect hops
         # are the two things that make them diverge, and a run with neither should not grow a
@@ -407,7 +431,7 @@ module Gori
         extra = p.requests > p.sent ? " · #{p.requests} requests on the wire" : ""
         STDERR.puts "done · #{p.sent} sent#{extra} · #{emitted} shown · #{p.errors} errors#{ev.stopped ? " (stopped)" : ""}"
         warn_fuzz_budget(p, max_requests)
-        warn_fuzz_grpc_framing(p)
+        warn_fuzz_grpc_framing(p, reframe_grpc)
         warn_fuzz_race(p, race, matcher_constrained)
         # Sends stopped BEFORE the socket (Sandbox, an exclude rule). They already appear as
         # per-row errors, but a run that is 100% refused reads as "the target is down" unless

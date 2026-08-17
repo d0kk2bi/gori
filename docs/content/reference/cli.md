@@ -73,6 +73,7 @@ gori run <subcommand> [verb] [options]
 | `sitemap [QL]` | Host → path endpoint tree |
 | `sitemap tag` | Pin, clear, or list a free-text memo on a sitemap path |
 | `oast listen` · `presets` | Out-of-band callback listener (interactsh & friends) |
+| `oast list` · `resume` · `release` | List, resume, or release the project's saved OAST listening sessions |
 | `oast providers` | List / add / update / enable / disable / delete saved OAST providers |
 | `jwt [<token>]` | Decode, re-sign, or generate attack payloads for a JWT |
 | `cookie [<cookie>]` | Decode, verify, brute-force, or forge a Flask / Rack / Django session cookie |
@@ -157,11 +158,12 @@ gori run show <flow-id> --format raw
 
 #### HAR export
 
-A HAR gori writes imports back into gori as the same flow (`gori run import --har`), so it round-trips. Three things to know:
+A HAR gori writes imports back into gori as the same flow (`gori run import --har`), so it round-trips. Four things to know:
 
 - **Bodies are the wire bytes**, de-chunked but not decompressed, base64-encoded when they are not valid UTF-8. The `Content-Encoding` header stays in `headers`, so body and head keep describing the same message.
 - **A body capped at the capture limit is marked**, never emitted as if complete: `bodySize` and `content.size` stay the true wire size while the text carries only the captured prefix, and a `comment` on `content`/`postData` says so. The command also reports the count on STDERR.
-- **WebSocket flows and flows with no captured response are skipped**, since HAR cannot represent either. The count and reason go to STDERR; STDOUT stays a pure HAR document.
+- **A WebSocket flow exports with its messages**: the real `101` handshake, plus the captured transcript beside it in Chrome DevTools' `_webSocketMessages` field, and `gori run import --har` restores it. Direction, opcode (control frames included), bytes (base64 when not valid UTF-8) and millisecond timestamps survive; the per-frame shape (`FIN`/`RSV`/mask key) has no field in the format, so use `--format json` or `raw` when you need it.
+- **Flows with no captured response are skipped**, along with a socket whose transcript is empty — the handshake alone is not the exchange. The count and reason go to STDERR; STDOUT stays a pure HAR document.
 
 ### run compare
 
@@ -263,6 +265,7 @@ gori run repeater send 5 --message '{"op":"subscribe"}' --idle-ms 5000
 |--------|-------------|
 | `--diff` | Diff against the session's last stored response |
 | `--verbatim` | Send the stored bytes exactly: no `$VAR` expansion, no bare-LF promotion, no `Content-Length` resync, no HTTP/2→1.1 version fix, no h2 field-name lowercasing |
+| `--reframe-grpc` | HTTP/2 only: recompute the gRPC 5-byte length prefix over the body actually being sent, for a unary message an edit changed the length of. Off by default — a prefix that disagrees with its payload is a standard parser test, so it ships as written |
 | `--message=TEXT` | WebSocket: outbound text message (repeatable; replaces the session's stored messages) |
 | `--message-frame=SPEC` | WebSocket: one frame with an explicit shape. Comma-separated `key=value`: `opcode=text\|bin\|cont\|close\|ping\|pong\|<0-15>`, `fin`, `rsv`, `mask`, `mask_key`, `len`, and one of `hex=`/`b64=`/`text=` |
 | `--idle-ms=N` | WebSocket: server-silence timeout after the first inbound frame (100–60000, default 3000) |
@@ -290,9 +293,10 @@ Sources: `--flow=ID`, `--request=FILE`, or stdin. Positions: `§…§` markers, 
 | Payloads | `-w`/`--wordlist`, `--preset=NAME[:FILE]` (built-in: `sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`), `--payloads=LIST`, `--numbers=FROM-TO[:STEP]`, `--null=N`, `--brute=CHARSET:MIN-MAX` |
 | Processors | `--prefix`, `--suffix`, `--encode` (`url`\|`urlall`\|`base64`\|`hex`), `--case` (`upper`\|`lower`), `--hash` (`md5`\|`sha1`\|`sha256`), `--regex-replace=/pat/rep/` |
 | Rate | `--concurrency` (20), `--rate=RPS`, `--throttle=MS`, `--timeout=SEC`, `--retries=N`, `--max-requests=N` (hard cap, retries and redirect hops count), `--follow-redirects`, `--no-keep-alive` |
-| Framing | `--verbatim` — send the template's `Content-Length` as written, with no resync after payload substitution (for CL / CL-TE desync payloads) |
+| Framing | `--verbatim` — send the template's `Content-Length` as written, with no resync after payload substitution (for CL / CL-TE desync payloads). `--reframe-grpc` — recompute the gRPC 5-byte length prefix after each payload is spliced into a unary message (off by default: a stale prefix is reported, not repaired) |
 | Matchers | `--mc`/`--fc` status, `--mg`/`--fg` gRPC status from the `grpc-status` trailer (`7`, `>0`, `1-16`), `--ms`/`--fs` size, `--mw`/`--fw` words, `--ml`/`--fl` lines, `--mr`/`--fr` body regex, `--extract=REGEX`, `--ac` auto-calibrate |
 | Session bindings | `--bind-from=FLOW-ID` — replay that captured flow first so its response fills the project's `$NAME` bindings for the rest of the run |
+| Session slot | `--slot=NAME` — send as this [session slot](#run-session): its header overlay, and its binding table for `$NAME`. Applied before `--bind-from` |
 | Scope | `--allow-unscoped` — send outside the project scope; Sandbox mode and explicit excludes still refuse each send |
 | Output | `--format` (`text`\|`json`\|`jsonl`), `--force`, `--fail-if-no-matches` (exit `3` when nothing matched) |
 
@@ -310,6 +314,7 @@ gori run mine <flow-id> --locations query,headers --wordlist params.txt
 | `--concurrency` (10), `--rate`, `--throttle`, `--timeout`, `--retries` (1), `--max-requests=N` | Rate control |
 | `--no-keep-alive` | Dial a fresh connection per probe instead of reusing one |
 | `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
+| `--slot=NAME` | Send as this [session slot](#run-session) — its header overlay, and its binding table for `$NAME`. Applied before `--bind-from`, so the seed fills the slot the run then sends as |
 | `--format` | `text`, `json`, or `jsonl` |
 
 Connections are reused by default, so a mine pays one TCP (and on https one TLS) handshake per worker rather than one per probe — the `connections · N dialed · M reused` line at the end of a run is where you see whether the target honoured it. Turn it off with `--no-keep-alive` when the target behaves per-connection.
@@ -332,6 +337,7 @@ gori run sequence --tokens tokens.txt          # '-' reads stdin
 | `--target`, `--http2`, `--sni`, `-k` | Transport (target required for `--request`/stdin) |
 | `--concurrency` (1), `--rate`, `--throttle`, `--timeout`, `--retries`, `--max-requests=N` | Rate control (concurrency stays 1 for stateful tokens) |
 | `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
+| `--slot=NAME` | Send as this [session slot](#run-session) — its header overlay, and its binding table for `$NAME`. Applied before `--bind-from`, so the seed fills the slot the run then sends as |
 | `--format` | `text`, `json`, `jsonl`, or `markdown` (the report the TUI's Export writes) |
 
 ### run authorize
@@ -365,6 +371,34 @@ Identities come from the project — the TUI Authorize tab's list — unless `--
 `set` upserts headers, `remove` strips them, and the request as captured is the baseline unless an entry carries `"baseline": true`. At least one identity besides the baseline is required, or there is nothing to compare.
 
 Flows that cannot be replayed meaningfully are listed on STDERR before anything is sent, each with its reason (`no identity changes them`, `not a safe method to repeat`, `never completed`, `answered by gori`, `outside project scope`, `already queued`). A selection where every flow was skipped is refused rather than run. If every send was refused before the socket, the run exits `1` and says so instead of reporting a clean result — a run that sent nothing is not evidence that access control works.
+
+### run session
+
+The project's **session slots** — named identities, each a header overlay plus the extract rules whose bound values belong to it. The same list the TUI [Authorize tab](/guide/authorize/)'s identities card edits and MCP's `*_session_slot` tools manage: an Authorize run replays under *every* slot, and a send goes out as the *one* named by `--slot`.
+
+```bash
+gori run session                                     # list (values [REDACTED])
+gori run session show admin --show-values
+gori run session add --name admin --set 'Cookie: session=…' --rule SESSION
+gori run session edit admin --clear-set --set 'Cookie: session=new'
+gori run session baseline as-captured
+gori run session rm admin
+```
+
+| Verb | Options |
+|------|---------|
+| `list` (default) | `--show-values` (print header values instead of `[REDACTED]`), `--format text\|json` |
+| `show <name>` | `--show-values`, `--format text\|json` |
+| `add` | `--name`, `--set 'Name: value'` (repeatable), `--remove NAME` (repeatable), `--rule NAME` (repeatable), `--baseline` |
+| `edit <name>` | The same flags, plus `--clear-set` / `--clear-remove` / `--clear-rules`. A collection flag REPLACES that whole collection; one you omit is left alone |
+| `rm`\|`delete <name>` | Any extract rule it claimed goes back to writing the global binding table |
+| `baseline <name>` | Move the Authorize baseline (exactly one slot holds it) |
+
+All verbs take `--project=NAME` / `--db=PATH`.
+
+A `--set` value goes through the same header parser the TUI form uses: a name must be an RFC 7230 token and a value may not contain CR or LF, and a line that fails is refused by name rather than dropped.
+
+**There is no `session activate`.** A `gori run` process sends and exits, so the active pointer has nothing to span — and persisting one would resolve into an empty binding table on the next run, sending an overlay whose `$SESSION` is literal. Name the identity on the send instead: `--slot NAME`, on `repeater`, `fuzz`, `mine`, `sequence` and `discover`. The run prints `slot: sending as NAME` on STDERR before its first request.
 
 ### run probe
 
@@ -419,6 +453,7 @@ gori run discover --target https://target.example --max-depth 3 --extensions php
 | `--no-keep-alive` | Dial a fresh connection per probe instead of reusing one per origin |
 | `-k`, `--insecure-upstream` | Skip upstream TLS verification |
 | `--bind-from=FLOW-ID` | Replay that captured flow first so its response fills the project's `$NAME` session bindings for the rest of the run |
+| `--slot=NAME` | Send as this [session slot](#run-session) — its header overlay, and its binding table for `$NAME`. Applied before `--bind-from`, so the seed fills the slot the run then sends as |
 | `--allow-unscoped` | Run even if the target is outside the project scope. Waives the up-front (Layer 1) check only — Sandbox mode and explicit exclude rules still refuse each send, and the refusal now names which of the two fired. |
 | `--force` | Bypass the unbounded-run safety gate |
 | `--no-store` | Do not write findings into the project |
@@ -483,7 +518,7 @@ gori run sitemap tag --list
 
 ### run oast
 
-Ad-hoc, store-free out-of-band listener: register a payload, print it, then stream callbacks.
+Out-of-band listener. `listen` is ad-hoc and store-free (register a payload, print it, stream callbacks); `list` / `resume` / `release` act on the sessions the project persists — the same rows the TUI's RESUME LISTENER picker shows.
 
 ```bash
 gori run oast presets                          # list built-in public providers
@@ -501,6 +536,26 @@ gori run oast listen --provider webhook.site --once --json
 | `--interval=SEC` | Poll interval (default 5) |
 | `--once` | Poll once and exit |
 | `--json` | Emit each callback as a JSON line (same shape as MCP) |
+
+**`oast list` / `resume` / `release`**: the project's saved listening SESSIONS, as opposed to the providers below (a provider is where you listen; a session is one live registration on it). A registration outlives the process that minted it, which is what makes a payload planted yesterday still worth watching.
+
+```bash
+gori run oast list                                       # id, provider, payload host, hits, last poll
+gori run oast list --format json
+gori run oast resume 7                                   # re-arm session #7, stream its callbacks
+gori run oast resume 7 --once --json                     # one poll, JSON lines, then exit
+gori run oast release 7                                  # deregister it server-side
+```
+
+`resume` and `release` take the session **id** (`7`, or the `#7` `list` prints). `resume` re-arms the server-side state so payloads already planted keep resolving, then polls: every callback is written into the project, so the TUI OAST tab shows the same hits, and `last_poll_at` is stamped like a TUI listener's. Ctrl-C stops polling and **keeps** the registration — `release` is the deliberate teardown, and it keeps the stored callbacks either way. Nothing auto-resumes; these run only when you ask.
+
+| Option | Description |
+|--------|-------------|
+| `--project=NAME` · `--db=PATH` | Which project's sessions (default: most-recently-active) |
+| `--format=FMT` | On `list`: `text` (default) or `json` |
+| `--interval=SEC` | On `resume`: poll interval (default 5) |
+| `--once` | On `resume`: poll once and exit |
+| `--json` | On `resume`: emit the payload and each callback as a JSON line |
 
 **`oast providers`**: the saved providers stored with the project, as opposed to the ad-hoc `listen` above. Verbs: `list` (default), `add`, `update`, `enable`, `disable`, `delete` (`rm`).
 

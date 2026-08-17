@@ -34,6 +34,7 @@ require "./tools/env"
 require "./tools/flows"
 require "./tools/fuzz"
 require "./tools/host_overrides"
+require "./tools/session_slots"
 require "./tools/import"
 require "./tools/intercept"
 require "./tools/issues"
@@ -43,6 +44,7 @@ require "./tools/mine"
 require "./tools/minimize"
 require "./tools/notes"
 require "./tools/oast_providers"
+require "./tools/oast_sessions"
 require "./tools/probe"
 require "./tools/projects"
 require "./tools/ql"
@@ -124,9 +126,10 @@ module Gori
         "create_extract_rule", "update_extract_rule", "delete_extract_rule", "set_extract_rule_enabled",
         "create_note", "update_note", "delete_note",
         "create_repeater", "update_repeater", "delete_repeater",
-        "oast_start", "oast_stop",
+        "oast_start", "oast_stop", "oast_resume", "oast_release",
         "add_scope_rule", "delete_scope_rule", "set_scope_enabled", "set_sandbox",
         "set_env_var", "delete_env_var",
+        "create_session_slot", "update_session_slot", "delete_session_slot", "set_active_session_slot",
         "add_host_override", "update_host_override", "delete_host_override",
         "import_flows",
       }
@@ -164,8 +167,12 @@ module Gori
         getter http : Oast::Http
         getter kind_label : String
         getter seen = Set(String).new
+        # The `oast_sessions` row this handle was RESUMED from (nil for an ad-hoc oast_start).
+        # Set means the handle is a project listener: oast_poll persists what it catches and
+        # stamps last_poll_at, and oast_stop keeps the registration instead of dropping it.
+        getter store_session_id : Int64?
 
-        def initialize(@provider, @session, @http, @kind_label)
+        def initialize(@provider, @session, @http, @kind_label, @store_session_id : Int64? = nil)
         end
       end
 
@@ -314,7 +321,7 @@ module Gori
       # global the TUI's `Session.open` and the CLI's `open_store` install, so `$SESSION`
       # means one thing on all three surfaces.
       private def bind_binding_layer(s : Store) : Nil
-        b = Gori::Bindings.load(s)
+        b = Gori::Bindings.load(s, Gori::SessionSlots.load(s))
         @bindings = b
         Env.layer = b
       end
@@ -386,6 +393,9 @@ module Gori
         property grpc_stale = 0_i64
         property grpc_requests = 0_i64
         property grpc_stale_reason : String? = nil
+        # Whether the run asked for `reframe_grpc` — read only to word `grpc_stale_prefix_reason`,
+        # since the remedy an agent should act on differs by whether it already passed it.
+        property? reframe_grpc = false
         property error_msg : String? = nil
         # How many times the drain / history-record rescues have fired for this job. Those
         # rescues log, and they sit on the per-EVENT path: a persistent failure (a broken
@@ -642,10 +652,12 @@ module Gori
           list_issues_tools j
           list_probe_tools j
           list_oast_providers_tools j
+          list_oast_sessions_tools j
           list_links_tools j
           list_context_tools j
           list_env_tools j
           list_host_overrides_tools j
+          list_session_slots_tools j
           list_notes_tools j
           list_decode_tools j
           list_cookie_tools j
@@ -784,6 +796,13 @@ module Gori
         return Result.new("unknown or expired session_id", is_error: true) unless s
         fresh = s.provider.poll(s.http, s.session).reject { |i| s.seen.includes?(i.unique_id) }
         fresh.each { |i| s.seen << i.unique_id }
+        # A RESUMED handle is a project listener, so its hits are project evidence: persist
+        # them and stamp the liveness signal, exactly as the TUI listener does. An ad-hoc
+        # oast_start handle has no row to file them under and stays ephemeral.
+        if row = s.store_session_id
+          store.touch_oast_session(row)
+          fresh.each { |i| Oast::Sessions.record_callback(store, row, i) }
+        end
         callbacks = fresh.map { |i| Oast::Present.interaction(i, s.kind_label) }
         Result.new({session_id: sid, count: fresh.size, callbacks: callbacks}.to_json)
       rescue ex
@@ -794,6 +813,13 @@ module Gori
         sid = str(h, "session_id")
         s = sid ? @oast_mcp.delete(sid) : nil
         return Result.new("unknown or expired session_id", is_error: true) unless s
+        # A RESUMED session is only stopped, never deregistered — the same split the TUI makes
+        # between `^X` (stop polling, keep it resumable) and RELEASE. Its payloads are planted
+        # out in the world right now, and dropping the server state here would kill them
+        # because a poller was closed. `oast_release` is the deliberate teardown.
+        if row = s.store_session_id
+          return Result.new({stopped: sid, store_session_id: row, registration: "kept"}.to_json)
+        end
         s.provider.deregister(s.http, s.session) rescue nil
         Result.new({stopped: sid}.to_json)
       end
@@ -816,9 +842,11 @@ module Gori
         when "list_sitemap_tags"       then list_sitemap_tags(h)
         when "list_links"              then list_links(h)
         when "list_oast_providers"     then list_oast_providers(h)
+        when "list_oast_sessions"      then list_oast_sessions(h)
         when "list_scope"              then list_scope
         when "list_env"                then list_env(h)
         when "list_host_overrides"     then list_host_overrides
+        when "list_session_slots"      then list_session_slots(h)
         when "project_info"            then project_info
         when "get_current_context"     then get_current_context
         when "get_repeater_context"    then get_repeater_context(h)
@@ -856,6 +884,8 @@ module Gori
         when "send_websocket"            then gated { send_websocket(h) }
         when "oast_start"                then gated { oast_start(h) }
         when "oast_stop"                 then gated { oast_stop(h) }
+        when "oast_resume"               then gated { oast_resume(h) }
+        when "oast_release"              then gated { oast_release(h) }
         when "intercept_forward"         then gated { intercept_forward(h) }
         when "intercept_drop"            then gated { intercept_drop(h) }
         when "intercept_forward_edit"    then gated { intercept_forward_edit(h) }
@@ -868,6 +898,10 @@ module Gori
         when "set_sandbox"               then gated { set_sandbox(h) }
         when "set_env_var"               then gated { set_env_var(h) }
         when "delete_env_var"            then gated { delete_env_var(h) }
+        when "create_session_slot"       then gated { create_session_slot(h) }
+        when "update_session_slot"       then gated { update_session_slot(h) }
+        when "delete_session_slot"       then gated { delete_session_slot(h) }
+        when "set_active_session_slot"   then gated { set_active_session_slot(h) }
         when "add_host_override"         then gated { add_host_override(h) }
         when "update_host_override"      then gated { update_host_override(h) }
         when "delete_host_override"      then gated { delete_host_override(h) }

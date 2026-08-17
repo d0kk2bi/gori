@@ -989,7 +989,261 @@ here because the gap was not noticed until a structure review looked for it: a n
 parity is part of shipping it, not a follow-up, and the seam is the thing that makes the two
 non-TUI surfaces cheap enough for that to be true.
 
+### 2026-08-17: a WebSocket flow exports as its handshake plus `_webSocketMessages`
+
+Refines: [P7](#p7). PR "HAR export/import WebSocket messages".
+
+`Export::Har` skipped every `101` by status, on the stated grounds that HAR "has no
+representation for WebSocket messages". That was true of the 1.2 spec and false of the format
+as it is actually used: Chrome DevTools writes the transcript into an `_webSocketMessages`
+array on the entry, and every reader that renders a captured socket reads it. The cost of the
+skip was that the one artifact an operator hands to a teammate dropped the only evidence a
+WebSocket test produces.
+
+The two obvious repairs were both worse than the skip. Folding the messages into a fabricated
+request/response writes an exchange that never happened and — as `skip_reason`'s own comment
+says about a status-0 entry — imports straight back as a real one. Inventing a gori-native
+field nothing else reads keeps the evidence unreadable to the reader it was exported for.
+
+So the handshake is written as **itself** — it is a real request and a real response — and the
+messages ride beside it in Chrome's field. `Import::Har` reads them back into `ws_messages`,
+which makes the transcript part of the export→import→export fixed point rather than a one-way
+rendering. P7 governs what survives: a message payload keeps its exact bytes, base64 when they
+are not valid UTF-8, because an invalid-UTF-8 TEXT frame is an RFC 6455 §8.1 test case and not
+corruption to repair. Control frames and the relay's own `[gori] …` advisory rows travel too,
+in position, since where an advisory sits is what names the frames it is about.
+
+Two things do not survive, and are stated where they are made rather than left to be
+discovered: the V7 frame **shape** has no field in the format (`Export::Har.ws_messages`), and
+a message time keeps millisecond fidelity, the same commitment `startedDateTime` already makes
+(`Export::Har.epoch_seconds`). `Skip::WebSocket` still exists and now means exactly one thing:
+a socket whose transcript is EMPTY, where the entry would carry the upgrade and stand in for
+frames that were never captured.
+
+### 2026-08-17: a length declaration is repaired only when asked, and only when unambiguous
+
+Refines: [P7](#p7). PR 7 (the gRPC reframe opt-in).
+
+A gRPC message carries a 5-byte length prefix, and an operator's edit — a hex edit in the
+Repeater's gRPC tab, a fuzz payload spliced into the message — changes the payload without
+changing that declaration. A real gRPC server rejects the result, and gori used to report
+`3 sent · 0 errors` over it. That was fixed by *saying so*: `Fuzz::Progress#grpc_stale`
+counts the requests a payload left mis-framed and every surface names it once.
+
+The obvious next step — resync it, the way `Content-Length` is resynced — is the one P7
+forbids by default. A deliberately-wrong length prefix is one of the standard gRPC parser
+tests, and the same argument `--verbatim` makes for Content-Length makes it here: the bytes
+are the test case. So the repair is **opt-in** (`--reframe-grpc`, MCP `reframe_grpc`,
+`Fuzz::Config#reframe_grpc?` / `Repeater::PlanOptions#reframe_grpc?`), default **false**, and
+the two length declarations in one request deliberately carry **opposite** defaults:
+Content-Length is recomputed unless told not to, the gRPC prefix is left alone unless told to.
+
+Even under the opt-in the repair happens only where it is UNAMBIGUOUS. `Proxy::H2::Grpc.reframe`
+answers nil — leave the bytes — for a body that already frames end-to-end, for a
+client-streaming body (where every prefix present is honest and collapsing them would send a
+different message), for a broken streaming body (where "which message grew?" is no longer
+answerable from the bytes), and for `grpc-web-text` (whose frames are base64, so no rewrite
+stays size-preserving). What is left is the unary case, which is the same shape the Repeater's
+gRPC tab has always called reframable. A request the reframe declines is still counted and
+still named, so the opt-in never trades a warning for a corrupt body.
+
+Being size-preserving is what lets it run late: only the four length octets change, so the
+Content-Length framed over the body stays correct and `Fuzz::Generator`'s payload spans do not
+move. It is applied where each tool's bytes become the message — `Generator#emit`, beside the
+Content-Length pass, for fuzz; `H2Engine.parse_request` for the Repeater, so the projection
+`encoded_request` reports the wire through (MCP `effective_request`, `run show --format raw`)
+shows the bytes the send will actually put on it.
+
+### 2026-08-17: Authorize identities are session slots; Bindings is per-slot
+
+Refines: [P4](#p4), [P5](#p5). Extends the 2026-08-16 Authorize entry.
+
+gori had no multi-session primitive. `Env` is one value per key, and `Bindings` (#501) was a
+single process-global name→value table, so a project could carry exactly one `$SESSION` at a
+time. Authorize needed several and grew its own private answer: an `Identity`, which was a
+static header overlay it applied to a captured request before replaying it. That answer was
+right and it was in the wrong place — every *other* send seam needed the same thing, and a
+second copy under a second name would have made "the admin session" mean one thing in the
+Authorize tab and another at a Repeater send.
+
+So there is one type. A **session slot** (`src/gori/session_slot.cr`) is a name, a header
+overlay (`set_headers` upsert / `remove_headers` strip), and the extract rules whose observed
+values belong to it. `Authorize::Identity` is an alias of it, and the two persist as one JSON
+list in one settings row — still keyed `authorize_identities`, because an existing project's
+identities *are* its slots and renaming the row would orphan them on upgrade.
+
+`Bindings` is namespaced by that list (`src/gori/session_slots.cr`). A rule some slot claims
+writes that slot's table; a rule no slot claims keeps writing the one global table it always
+did, which is what makes every playbook written before slots existed keep working unchanged
+(`docs/content/playbooks/carry-a-session.md`). Resolution reads the global table with the
+**active** slot's written over it, so a slot *shadows* a name rather than introducing a second
+syntax to spell — `$SESSION` stays `$SESSION` and the active slot decides whose it is.
+
+The active slot is the send context, and it is applied at the seams that own a request going
+onto the wire — `Repeater::Sender`, `Fuzz::Sender`, the intercept forward, and `--bind-from`
+by way of the first. `Env.overlay_slot` runs *after* `Env.expand_bindings`: the message's own
+references resolve first, then the identity is written over the result, and a `$NAME` inside a
+slot's own header value resolves against that slot's table (so `Authorization: Bearer $SESSION`
+means one thing on the "admin" slot and another on "user", off one persisted string each).
+
+Three lines this deliberately does not cross:
+
+* **The overlay is header-only.** Content-Length never moves and the body is byte-exact, which
+  is what makes it safe to apply to bytes the operator did not author — a captured replay, a
+  fuzz template with its payload already spliced. `as-captured` (and no slot at all, the
+  default) is the no-overlay baseline.
+* **Values still never reach disk.** A slot changes *where* a value lives, never *whether* it
+  persists. The active pointer is memory-only for the same reason: restoring "admin is active"
+  into an empty admin table on reopen would hand the next send an overlay whose `$SESSION` is
+  literal — a 401 with no visible cause.
+* **No cookie jar and no auto-login.** A slot carries headers the operator wrote and bindings
+  gori observed. RFC 6265 storage, path/domain matching and expiry are a different feature with
+  different failure modes, and a macro that decides for itself when to re-authenticate is gori
+  acting behind the operator's back (P4). `--bind-from` already replays one flow the operator
+  named, which is the same job done explicitly.
+
+The surfaces for selecting and editing slots (TUI, `gori run`, MCP) landed next — see the
+2026-08-17 *session slots reach all three surfaces* entry below.
+
+### 2026-08-17: an h2 intercept may buffer a complete body; Match&Replace body still forces h1
+
+Refines: [P4](#p4), [P6](#p6), [P7](#p7). PR #6.
+
+Every HTTP/2 intercept hold used to cover the HEAD only. The reason was structural rather than
+a limit: `H2::StreamGate` defers a stream's opening header block and *parks every frame that
+arrives behind it* — nothing may overtake a deferred head (RFC 9113 §5.1.1) — so the body was
+already in gori's hands, and the hold showed a human the head anyway. A body typed into the
+editor was discarded, and `Interceptor::Item#head_only?` existed to let each surface say so
+before it acked an edit it could not apply.
+
+The hold now covers head+body when the message declares a `content-length` at or under
+`H2::StreamGate::MAX_HOLD_BODY` (1 MiB), or when its head carries END_STREAM and so *is* the
+whole message. The queue row then carries the entity, an edit's body is the operator's, and
+`release_locked` re-frames it into DATA — moving END_STREAM onto the last DATA frame when the
+head had carried it, and leaving it on the trailers when trailers end the message.
+
+Three exclusions keep the head-only hold, each for its own reason rather than by omission:
+
+* **No declared length** — a streaming upload, SSE, a gRPC stream. Buffering means waiting, and
+  a body whose end gori cannot predict is a wait with no end ([P6](#p6)).
+* **Over the ceiling.** 1 MiB is deliberately below h1's own hold ceiling
+  (`ClientConn::MAX_REWRITE_BODY`, 16 MiB), and the asymmetry is the protocol's: an h1
+  connection carries one request, an h2 connection multiplexes ~100 concurrent streams, so the
+  same number would be a per-connection budget 100x larger on a single-threaded scheduler.
+* **A PADDED DATA frame.** Stripping §6.1 padding is `Assembler#data_block`'s job, and a second
+  copy of it on the pump fiber would raise where the assembler projects around the failure.
+
+Two consequences are worth stating because they are behaviour changes, not refinements:
+
+1. **The queue row appears when the message finishes arriving, not when its head does.** That is
+   h1's own timing (`ClientConn` reads the whole entity before `hold_request`), but on h2 the
+   wait also delays later stream opens behind it, because releases follow `@opens` order. It is
+   bounded by the declared-length gate — gori only ever waits for an end it can predict — by
+   `check_ceiling`, which fails the whole run of slots open past `MAX_DEFERRED_BYTES` plus the
+   body it agreed to buffer, and by toggle-off. That last one needed a new seam: a hold still
+   buffering has no queue row, so `Interceptor#toggle`'s release cannot reach it. The gate asks
+   `Interceptor#holding?` when a frame arrives instead, which is sufficient rather than merely
+   cheap — a waiting slot with nothing behind it blocks nobody, and a stream blocked behind one
+   only becomes blocked when its own frames reach the gate.
+2. **`restore_content_length` does not run on a buffered hold.** The R3-F2 rule (#513) reverts a
+   `content-length` an editor computed *for* the operator, because on a head-only hold it
+   described bytes gori was not going to send. When the body is held, the edit's body *is* what
+   gori sends, so a synced value is simply true and a mismatched one is the §8.1.1 probe the
+   operator opened the editor to run. Both go out verbatim — which is what h1 already does with
+   the identical edit ([P7](#p7)).
+
+**Match&Replace over a body still forces the h1 downgrade** (`Tls::Tunnel#h2_candidate?`), along
+with a body-scoped extract rule and a short-circuit stub, and this decision does not weaken that.
+A hold buffers *one* message a human is already waiting on, under a declared length, with the
+operator watching. A body rule rewrites *every* matching message on the connection, unattended,
+including the ones with no declared length at all — the shapes the hold explicitly refuses to
+buffer. They are different bargains, and the downgrade is the honest answer for the second one
+until #492 step 5 makes it unnecessary.
+
+### 2026-08-17: a channel that cannot carry the bytes is not a reason to refuse the edit
+
+Refines: [P7](#p7). The WebSocket half of Intercept and of Repeater.
+
+Two surfaces had, for the same reason, stopped short of what the operator was holding the
+message to do.
+
+The intercept editor refused to open on a WebSocket BINARY message (opcode 2). The refusal
+was correct about its premise — the TextArea round trip is `String.new(raw)` → char ops →
+`.to_slice`, which is lossy on non-UTF-8, and on WebSocket that is the common case rather
+than the exception — but it answered a *channel* problem by removing the *capability*. You
+could hold a protobuf frame, read it, forward it and drop it, and not flip the byte you were
+holding it to flip. The answer is the byte channel gori already had: `Tui::HexEdit`, the
+Repeater's `^X` buffer, an `Array(UInt8)` that never becomes a String
+(`src/gori/tui/intercept_view.cr`, `hex_editing?`). The lossy path is still never taken; it
+is simply no longer the only path offered. Where a surface genuinely has no byte channel the
+refusal stands and is named — MCP `raw` and CLI `--raw` are text, and both point at
+`raw_base64` / `--raw-file` instead.
+
+The WebSocket repeater wrote every recorded client→server message and only then read
+(`src/gori/repeater/ws_engine.cr`). A socket carries a conversation, so a script whose Nth
+message depends on the answer to the (N-1)th replayed as a burst the server was answering out
+of step, and the transcript listed every "out" row ahead of every "in" row whatever the wire
+order had been — a derived view contradicting the bytes, which is what P7 exists to forbid.
+It now sends one message, drains the answer, and sends the next; the caps and the reassembly
+buffer became session state (`DrainState`) so they still bound the whole run and a message
+fragmented across an idle gap is still one message. Draining between messages is also what
+lets the engine learn mid-script that the peer closed or went away, so it stops and reports
+how far it got rather than appending "out" rows for bytes it never wrote. A CLOSE the
+*operator* wrote is not a stop condition: "data frames after a CLOSE" is a §5.5.1 test, and
+this engine deliberately lets them run it, as it already lets them send a lone CONT or an
+unmasked frame.
+
+Not changed, and not by omission: `permessage-deflate` stays unnegotiated and
+`Sec-WebSocket-Extensions` stays stripped, and a WebSocket message is still held only when the
+catch condition names `proto:ws`.
+
 ---
 
 *Keep this document honest against the code. When you change a subsystem it describes, update
 the matching section; when you cite a principle inline, use the labels above.*
+
+### 2026-08-17: session slots reach all three surfaces
+
+Refines: [P1](#p1), [P4](#p4). Extends the 2026-08-17 session-slots entry. PR #10.
+
+The engine landed with no way to reach it: a slot could only be edited from the Authorize
+tab's identities card, and NOTHING could select the active one, so `Env.overlay_slot` was a
+seam every send seam called and no operator could arm. This closes that on all three
+surfaces at once, as thin adapters — no engine was re-derived, and the layering check
+(`spec/layering_spec.cr`) still finds no surface name in `session_slot.cr` /
+`session_slots.cr` / `bindings.cr`.
+
+The split each surface makes is the same, and it is the persistence split: **the list is
+configuration, the active pointer is send state.**
+
+* **List editing** is one method set on `SessionSlots` (`add` / `update` / `remove` /
+  `set_baseline`), so "exactly one baseline" is decided once rather than three times. The
+  TUI's identities card is unchanged as a card — but it now reads and writes through
+  `Session#slots` instead of the settings row underneath it. That was a live bug: the card
+  wrote `Store::AUTHORIZE_IDENTITIES_KEY` directly, so the registry `Bindings` and
+  `Env.overlay_slot` hold kept the pre-edit list, and the Authorize tab and a Repeater send
+  disagreed about what "admin" was until the project was reopened.
+* **Activation** is a picker (`session.slot`, Global/palette, plus a clickable `session:NAME`
+  top-bar chip) in the TUI, `set_active_session_slot` on MCP, and `--slot NAME` on
+  `gori run repeater|fuzz|mine|sequence|discover`. There is deliberately no
+  `gori run session activate`: a `gori run` process sends and exits, so a pointer has nothing
+  to span, and persisting one is the exact failure the engine entry rules out. Typing it
+  anyway is answered with the flag rather than "unknown subcommand".
+
+Two consequences worth stating because they are UX contracts, not details:
+
+1. **The active slot is READ OUT wherever a send is initiated.** An overlay is applied after
+   the editor's bytes, so the Repeater pane shows one request and the wire carries another;
+   the `session:NAME` chip, the Repeater's `sending as NAME → host` line, `gori run`'s
+   `slot: sending as NAME` on stderr, and MCP's `active` field are the four places that
+   reconcile them. The chip is ABSENT while nothing is active — as-captured is the default,
+   and a chip that only appears while an overlay is in force makes its appearance the signal.
+2. **`--slot` is applied before `--bind-from`.** The seed replay fills the tables of whichever
+   slots claim each matched rule, and the run then resolves `$NAME` out of the active one; the
+   other order would seed one identity and send as another.
+
+Header values are `[REDACTED]` by default on both new list surfaces (`gori run session list`,
+MCP `list_session_slots`), matching `list_env` and the identities card's names-only rows: a
+slot's whole job is carrying a credential, and a list is scrollback. `--set` / `set_headers`
+parse through `Discover::Headers.parse_lines` — the same parser the TUI form uses — so a
+CR/LF-carrying value is refused by name on every surface rather than dropped on one.

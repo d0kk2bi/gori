@@ -73,6 +73,7 @@ gori run <subcommand> [verb] [options]
 | `sitemap [QL]` | 호스트 → 경로 엔드포인트 트리 |
 | `sitemap tag` | Sitemap 경로에 자유 텍스트 메모를 고정 / 해제 / 목록 |
 | `oast listen` · `presets` | 아웃오브밴드 콜백 리스너 (interactsh 및 유사 서비스) |
+| `oast list` · `resume` · `release` | 프로젝트에 저장된 OAST 리스닝 세션 목록 / 재개 / 릴리스 |
 | `oast providers` | 저장된 OAST 프로바이더 목록 / 추가 / 수정 / 활성화 / 비활성화 / 삭제 |
 | `jwt [<token>]` | JWT 디코드, 재서명, 또는 공격 페이로드 생성 |
 | `cookie [<cookie>]` | Flask / Rack / Django 세션 쿠키 디코드, 검증, 브루트포스, 위조 |
@@ -156,11 +157,12 @@ gori run show <flow-id> --format raw
 
 #### HAR 내보내기 {#har-export}
 
-gori가 쓴 HAR은 다시 gori로 가져와도(`gori run import --har`) 같은 플로우가 되므로 왕복이 보장됩니다. 세 가지를 알아두세요.
+gori가 쓴 HAR은 다시 gori로 가져와도(`gori run import --har`) 같은 플로우가 되므로 왕복이 보장됩니다. 네 가지를 알아두세요.
 
 - **본문은 와이어 바이트**입니다. chunked만 풀고 압축은 풀지 않으며, 유효한 UTF-8이 아니면 base64로 인코딩합니다. `Content-Encoding` 헤더가 `headers`에 그대로 남아 본문과 헤드가 같은 메시지를 가리킵니다.
 - **캡처 상한에 잘린 본문은 표시**되며, 온전한 것처럼 나가지 않습니다. `bodySize`와 `content.size`는 실제 와이어 크기를 유지하고 텍스트에는 캡처된 앞부분만 담기며, `content`/`postData`의 `comment`가 그 사실을 적습니다. 명령은 해당 개수도 STDERR로 보고합니다.
-- **WebSocket 플로우와 응답이 캡처되지 않은 플로우는 건너뜁니다.** HAR로 표현할 수 없기 때문입니다. 개수와 이유는 STDERR로 나가고 STDOUT은 순수한 HAR 문서로 유지됩니다.
+- **WebSocket 플로우는 메시지와 함께 내보내집니다.** 실제 `101` 핸드셰이크에 캡처된 전송 기록이 Chrome DevTools의 `_webSocketMessages` 필드로 나란히 실리며, `gori run import --har`로 다시 복원됩니다. 방향, opcode(제어 프레임 포함), 바이트(유효한 UTF-8이 아니면 base64), 밀리초 단위 타임스탬프가 유지됩니다. 프레임별 형태(`FIN`/`RSV`/마스크 키)는 이 형식에 담을 필드가 없으므로 필요하면 `--format json` 또는 `raw`를 쓰세요.
+- **응답이 캡처되지 않은 플로우는 건너뜁니다.** 전송 기록이 비어 있는 소켓도 마찬가지입니다 — 핸드셰이크만으로는 교환이 아니기 때문입니다. 개수와 이유는 STDERR로 나가고 STDOUT은 순수한 HAR 문서로 유지됩니다.
 
 ### run compare {#run-compare}
 
@@ -262,6 +264,7 @@ gori run repeater send 5 --message '{"op":"subscribe"}' --idle-ms 5000
 |--------|-------------|
 | `--diff` | 세션에 마지막으로 저장된 응답과 비교 |
 | `--verbatim` | 저장된 바이트를 정확히 그대로 전송: `$VAR` 확장, 단독 LF 승격, `Content-Length` 재계산, HTTP/2→1.1 버전 보정, h2 필드명 소문자화를 모두 하지 않음 |
+| `--reframe-grpc` | HTTP/2 전용: 실제로 전송되는 본문에 맞춰 gRPC 5바이트 길이 접두사를 다시 계산합니다(길이가 바뀐 단항 메시지용). 기본값은 꺼짐 — 페이로드와 어긋나는 접두사는 표준적인 파서 테스트이므로 쓴 그대로 나갑니다 |
 | `--message=TEXT` | WebSocket: 보낼 텍스트 메시지 (반복 가능; 세션에 저장된 메시지를 대체) |
 | `--message-frame=SPEC` | WebSocket: 형태를 명시한 프레임 하나. 쉼표로 구분한 `key=value`: `opcode=text\|bin\|cont\|close\|ping\|pong\|<0-15>`, `fin`, `rsv`, `mask`, `mask_key`, `len`, 그리고 `hex=`/`b64=`/`text=` 중 하나 |
 | `--idle-ms=N` | WebSocket: 첫 수신 프레임 이후 서버 침묵 타임아웃 (100–60000, 기본값 3000) |
@@ -289,7 +292,7 @@ gori run repeater h2 --target https://api.example.com --fields fields.json
 | Payloads | `-w`/`--wordlist`, `--preset=NAME[:FILE]` (내장: `sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`), `--payloads=LIST`, `--numbers=FROM-TO[:STEP]`, `--null=N`, `--brute=CHARSET:MIN-MAX` |
 | Processors | `--prefix`, `--suffix`, `--encode` (`url`\|`urlall`\|`base64`\|`hex`), `--case` (`upper`\|`lower`), `--hash` (`md5`\|`sha1`\|`sha256`), `--regex-replace=/pat/rep/` |
 | Rate | `--concurrency` (20), `--rate=RPS`, `--throttle=MS`, `--timeout=SEC`, `--retries=N`, `--max-requests=N` (총 요청 상한. 재시도와 리다이렉트 홉도 포함), `--follow-redirects`, `--no-keep-alive` |
-| Framing | `--verbatim` — 템플릿의 `Content-Length`를 쓰인 그대로 전송. 페이로드 치환 후에도 재계산하지 않습니다 (CL / CL-TE 디싱크 페이로드용) |
+| Framing | `--verbatim` — 템플릿의 `Content-Length`를 쓰인 그대로 전송. 페이로드 치환 후에도 재계산하지 않습니다 (CL / CL-TE 디싱크 페이로드용). `--reframe-grpc` — 페이로드가 단항 gRPC 메시지에 삽입된 뒤 5바이트 길이 접두사를 다시 계산합니다(기본값은 꺼짐: 오래된 접두사는 고치지 않고 보고만 합니다) |
 | Matchers | `--mc`/`--fc` status, `--mg`/`--fg` `grpc-status` 트레일러의 gRPC 상태 (`7`, `>0`, `1-16`), `--ms`/`--fs` size, `--mw`/`--fw` words, `--ml`/`--fl` lines, `--mr`/`--fr` body regex, `--extract=REGEX`, `--ac` auto-calibrate |
 | Session bindings | `--bind-from=FLOW-ID` — 캡처된 그 플로우를 먼저 재생해, 응답이 남은 실행 동안 쓸 `$NAME` 바인딩을 채우게 합니다 |
 | Scope | `--allow-unscoped` — 프로젝트 스코프 밖으로도 전송. 샌드박스와 명시적 제외 규칙은 매 전송을 여전히 거부합니다 |
@@ -482,7 +485,7 @@ gori run sitemap tag --list
 
 ### run oast {#run-oast}
 
-즉석에서 쓰는, 저장소 없는 아웃오브밴드 리스너입니다. 페이로드를 등록하고 출력한 뒤 콜백을 스트리밍합니다.
+아웃오브밴드 리스너입니다. `listen`은 즉석에서 쓰는 저장소 없는 리스너로 페이로드를 등록하고 출력한 뒤 콜백을 스트리밍합니다. `list` / `resume` / `release`는 프로젝트가 저장한 세션 — TUI의 RESUME LISTENER 피커가 보여주는 것과 같은 행 — 을 다룹니다.
 
 ```bash
 gori run oast presets                          # list built-in public providers
@@ -500,6 +503,26 @@ gori run oast listen --provider webhook.site --once --json
 | `--interval=SEC` | 폴링 간격(기본값 5) |
 | `--once` | 한 번만 폴링하고 종료 |
 | `--json` | 각 콜백을 JSON 라인으로 출력(MCP와 동일한 형태) |
+
+**`oast list` / `resume` / `release`**: 프로젝트에 저장된 리스닝 **세션**입니다(아래의 프로바이더는 어디서 듣는지를, 세션은 그 위의 살아 있는 등록 하나를 뜻합니다). 등록은 그것을 만든 프로세스보다 오래 남고, 그래서 어제 심어둔 페이로드를 오늘도 지켜볼 수 있습니다.
+
+```bash
+gori run oast list                                       # id, provider, payload host, hits, last poll
+gori run oast list --format json
+gori run oast resume 7                                   # 세션 #7 재개 후 콜백 스트리밍
+gori run oast resume 7 --once --json                     # 한 번만 폴링하고 JSON 라인 출력 후 종료
+gori run oast release 7                                  # 서버 측 등록 해제
+```
+
+`resume`과 `release`는 세션 **id**(`7`, 또는 `list`가 출력하는 `#7`)를 받습니다. `resume`은 서버 측 상태를 다시 살려 이미 심어둔 페이로드가 계속 resolve되게 한 뒤 폴링합니다. 받은 콜백은 모두 프로젝트에 기록되므로 TUI OAST 탭에서 같은 hit를 보게 되고, `last_poll_at`도 TUI 리스너처럼 갱신됩니다. Ctrl-C는 폴링만 멈추고 등록은 **유지**합니다. 정리는 `release`로 명시적으로 하며, 어느 쪽이든 저장된 콜백은 남습니다. 자동으로 재개되는 것은 없습니다.
+
+| Option | Description |
+|--------|-------------|
+| `--project=NAME` · `--db=PATH` | 어느 프로젝트의 세션인지(기본값: 가장 최근에 사용한 프로젝트) |
+| `--format=FMT` | `list`에서: `text`(기본) 또는 `json` |
+| `--interval=SEC` | `resume`에서: 폴링 간격(기본값 5) |
+| `--once` | `resume`에서: 한 번만 폴링하고 종료 |
+| `--json` | `resume`에서: 페이로드와 각 콜백을 JSON 라인으로 출력 |
 
 **`oast providers`**: 위의 즉석 `listen`과 달리 프로젝트에 저장되는 프로바이더입니다. 동사: `list`(기본), `add`, `update`, `enable`, `disable`, `delete`(`rm`).
 

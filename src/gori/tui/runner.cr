@@ -124,6 +124,7 @@ require "./runner/rewriter"
 require "./runner/scope"
 require "./runner/search"
 require "./runner/sequencer"
+require "./runner/session_slots"
 require "./runner/sitemap"
 require "./runner/subtabs"
 
@@ -1209,6 +1210,13 @@ module Gori::Tui
           return
         elsif @active_tab == :intercept && intercept_controller.view.editing?
           iv = intercept_controller.view
+          # `$EDITOR` is a TEXT channel — the buffer goes out as characters and comes back as
+          # characters — so a held BINARY payload cannot make the round trip, which is the one
+          # thing its hex editor exists to prevent. Say so instead of silently corrupting it.
+          if reason = iv.external_editor_refusal
+            status(reason)
+            return
+          end
           run_external_editor(iv.editor_text, :intercept) { |t| iv.replace_editor(t) }
           return
         end
@@ -1967,7 +1975,7 @@ module Gori::Tui
         unread: @notifications.unread, capturing: @session.capturing?,
         write_failures: @session.store.write_failures, bypass: Settings.passthrough_count,
         listeners: listener_chip_count, listener_errors: @session.listener_errors.size,
-        authorize: authorize_chip_label)
+        authorize: authorize_chip_label, session: session_slot_chip)
       Chrome.render_rule(screen, layout.rule)
       # One reconcile per frame: the menu strip AND the ⋯ hidden count both derive from the
       # same tab reconcile — split_tabs computes both in a single pass (was two per frame).

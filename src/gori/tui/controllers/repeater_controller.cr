@@ -467,15 +467,16 @@ module Gori::Tui
       doc if doc && doc.location != :response && !doc.projected
     end
 
-    # The GraphQL operation a request carries (POST JSON body or GET ?query=), or nil —
-    # drives the split GraphQL repeater (envelope + readable query/variables).
+    # The GraphQL operation a request carries, or nil — drives the split GraphQL repeater
+    # (envelope + readable query/variables).
     #
-    # EDITABLE ops only. `from_flow` also recognises batched, persisted-query, multipart-
-    # upload and `application/graphql` requests now, and those render but do not round-trip
-    # (`Op#editable?`): opening one in the split editor would offer an edit that `recompose`
-    # can only write back as a DIFFERENT request. They still get the read-only GraphQL pane
-    # everywhere it is a display — History detail, `gori run show`, MCP `decoded` — and here
-    # they open as an ordinary raw-bytes repeater tab, which can send them exactly.
+    # EDITABLE ops only, which is now most shapes: a batch, a persisted query and an
+    # `application/graphql` document each have their own inverse (`Graphql.recompose_batch` /
+    # `_persisted` / `_document`). What is left out is what nothing can write back —
+    # multipart, a parse failure, a decode of a chunked/compressed entity — where opening the
+    # split editor would offer an edit that only lands as a DIFFERENT request. Those still get
+    # the read-only GraphQL pane everywhere it is a display (History detail, `gori run show`,
+    # MCP `decoded`) and here they open as an ordinary raw-bytes tab, which sends them exactly.
     private def graphql_op(detail : Store::FlowDetail) : Graphql::Op?
       op = Graphql.from_flow(detail.row.target, detail.request_head, detail.request_body)
       op if op && op.editable?
@@ -497,6 +498,10 @@ module Gori::Tui
       # no editor for a JSON envelope" — the true reason is that the pane is a decode of a body
       # the envelope still carries compressed or chunked.
       return "graphql #{op.form.to_s.downcase} (decoded from the chunked/compressed body — read-only) · " if op.projected
+      # The same trap one level down, for a batch carrying a persisted element: the FORM is
+      # editable and this op is not, so "graphql batch" alone would read as "gori cannot edit
+      # a batch" when ordinarily it can (`Op#lossy`).
+      return "graphql batch with a persisted operation: no one pane inverts both, sending the bytes as captured · " if op.lossy
       "graphql #{op.form.to_s.downcase}: no faithful re-encode, sending the bytes as captured · "
     end
 
@@ -1552,6 +1557,16 @@ module Gori::Tui
       @refusal_applied = true
     end
 
+    # " as admin" for the send line, or "" while nothing is active.
+    #
+    # The ACTIVE SESSION SLOT is named where the send is initiated, not only on the `session:`
+    # chip. A slot's header overlay is applied at `Repeater::Sender` — AFTER the editor's
+    # bytes — so the pane shows one request and the wire carries another, and this is the one
+    # line that reconciles them. Silent for as-captured, which is the default.
+    private def sending_as : String
+      (name = Gori::Env.active_slot_name) ? " as #{name}" : ""
+    end
+
     def repeater_send : Nil
       return unless (tab = current_repeater_tab) && (view = tab.view).loaded?
       view.commit_chain_pane                        # flush an in-progress CHAIN-pane edit so ^R can't send stale bytes (matches the SEND-chip click)
@@ -1584,7 +1599,7 @@ module Gori::Tui
       end
       view.inflight = true
       sni = plan.sni # custom TLS SNI host (nil → present the dialed host)
-      @host.status("sending → #{plan.host}:#{plan.port}#{sni ? " (SNI #{sni})" : ""}…")
+      @host.status("sending#{sending_as} → #{plan.host}:#{plan.port}#{sni ? " (SNI #{sni})" : ""}…")
       # Off the UI fiber: a round-trip can block up to 30s. The fiber touches only these
       # captured locals + the inflight flag — and hands the Result back through the
       # channel; the run loop applies it (see #drain_results).

@@ -203,6 +203,23 @@ module Gori
                      @response_head, @response_body, @h2_conn_id = nil, @h2_stream_id = nil,
                      @request_body_truncated = false, @response_body_truncated = false, @error = nil, @sni = nil)
       end
+
+      # The TRUE wire request body size (recovered by subtracting head size from request total).
+      def request_wire_body_size : Int64
+        stored = request_body.try(&.size.to_i64) || 0_i64
+        req_total = row.size - (row.response_size || 0_i64)
+        n = req_total - request_head.size
+        n > stored ? n : stored
+      end
+
+      # The TRUE wire response body size (recovered by subtracting head size from response total).
+      def response_wire_body_size : Int64
+        stored = response_body.try(&.size.to_i64) || 0_i64
+        return stored unless resp_total = row.response_size
+        head_size = (response_head.try(&.size) || 0).to_i64
+        n = resp_total - head_size
+        n > stored ? n : stored
+      end
     end
 
     # The frame-shape columns V7 added, shared with the proxy that fills them in. Aliased
@@ -311,6 +328,23 @@ module Gori
         close_reason.try { |r| j.field "close_reason", String.new(r).scrub }
       end
     end
+
+    # One captured WebSocket message being RESTORED onto a flow — the import counterpart of
+    # `WsMessage`, which is what a read hands back.
+    #
+    # It carries its own `created_at` and that is the whole reason it exists: `insert_ws_message`
+    # stamps `now_us` at enqueue, which is right for a frame gori is watching go past and wrong
+    # for one it is reading out of a file. A HAR gori wrote records each message's time, so
+    # re-stamping them at import collapsed a whole transcript onto the import instant and broke
+    # export→import→export as a fixed point (`Export::Har` derives `_webSocketMessages[].time`
+    # from this column).
+    #
+    # No `shape`: HAR's `_webSocketMessages` is Chrome's `{type, time, opcode, data}` and has no
+    # field for FIN/RSV/mask, so an imported message takes `WsShape::DEFAULT` rather than a
+    # fabricated one. `direction` is the stored "out"/"in", not HAR's send/receive — the
+    # translation belongs to the format reader, so every store row means one thing.
+    record ImportedWsMessage, created_at : Int64, direction : String, opcode : Int32,
+      payload : Bytes
 
     # One outbound message to persist on a repeater SESSION. Carries the OPCODE and raw
     # BYTES, because `update_repeater_ws_messages` used to take `Array(String)` and write a
@@ -1176,7 +1210,7 @@ module Gori
       getter edit_refusal : String?
       getter? head_only : Bool
       # Mirrors `Interceptor::Item#binary?` (opcode == OP_BIN) across the bridge — the same
-      # fact the TUI's editor already gates `read_only_selection?` on. Without it here, MCP
+      # fact the TUI's editor gates its hex-vs-text choice on. Without it here, MCP
       # `intercept_forward_edit`/CLI `intercept edit` had no way to tell a text WS message from
       # a binary one before choosing whether the `raw` (JSON-string / argv-string) channel can
       # carry it byte-exact at all.
@@ -1196,15 +1230,17 @@ module Gori
 
       # The head-only CAVEAT, and deliberately NOT folded into `edit_refusal`.
       #
-      # Every h2 hold is head-only (`H2::StreamGate` passes `head_only: true` on both legs),
-      # so treating it as a refusal would mark every held HTTP/2 message uneditable — and head
-      # edits DO apply. Only a body has nowhere to go. Two different statements, so two
-      # accessors: a surface that chips "cannot be edited" must key on `edit_refusal` alone.
-      # nil when the hold covers head+body (h1), where an edit is forwarded byte-exact.
+      # Treating it as a refusal would mark the message uneditable — and head edits DO apply.
+      # Only a body has nowhere to go. Two different statements, so two accessors: a surface
+      # that chips "cannot be edited" must key on `edit_refusal` alone. nil when the hold covers
+      # head+body — every h1 hold, and since PR #6 the h2 holds whose body `H2::StreamGate`
+      # could buffer — where an edit is forwarded with its body.
       def head_only_note : String?
         return nil unless @head_only
-        "this HTTP/2 hold covers the HEAD only — an edit that ADDS A BODY will be refused " \
-        "(DATA frames stream past the intercept gate untouched); a head edit applies normally"
+        "this HTTP/2 hold covers the HEAD only — an edit that ADDS A BODY will be refused. " \
+        "gori buffers a held h2 body only when the message declares a content-length it can " \
+        "hold; this one does not, so its DATA frames stream past the intercept gate untouched " \
+        "and a head edit is the only one that applies"
       end
     end
 
