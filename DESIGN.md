@@ -1197,10 +1197,70 @@ Not changed, and not by omission: `permessage-deflate` stays unnegotiated and
 `Sec-WebSocket-Extensions` stays stripped, and a WebSocket message is still held only when the
 catch condition names `proto:ws`.
 
----
+### 2026-08-17: a declared length is not a deadline
 
-*Keep this document honest against the code. When you change a subsystem it describes, update
-the matching section; when you cite a principle inline, use the labels above.*
+Refines: [P6](#p6). Extends the h2-intercept-buffers-a-body entry above. PR #11.
+
+That entry called the buffering wait bounded, and named its bounds: the declared-length gate
+(`holdable_body`), `check_ceiling`, and toggle-off. Two of those three count **bytes that
+arrived**, and the third needs a human. So the shape none of them saw was the peer that sends
+*nothing*: `POST` with `content-length: 4096` and then silence. No byte arrives, so the ceiling
+has nothing to measure; no queue row exists, so `Interceptor#toggle`'s release has nothing to
+hand back; and in the request direction that slot sits at the head of `@opens` with every later
+stream on the connection parked behind it. A `content-length` promises how big a body is, not
+that it is coming.
+
+The wait now has a clock as well as a ceiling. `Slot#waiting_since` is stamped when the hold
+starts buffering, and `check_waiting_locked` — which already ran on every inbound frame, for
+toggle-off — gives the wait up past `H2::StreamGate::HOLD_WAIT_DEADLINE` (5 seconds) **with
+intercept still on**. The exit is the one that was already there rather than a new refusal:
+`queue_hold_locked(slot, held, nil)`, i.e. the head-only hold every h2 intercept had before
+PR #6. The operator gets a row to forward or drop, the streams behind it move as soon as they
+do, and the DATA that eventually turns up streams past untouched.
+
+Still frame-driven, still no timer fiber, and that is the same argument the toggle-off check
+makes rather than a weaker version of it: a waiting slot with nothing behind it costs nobody
+anything, and the frame that makes a second stream *blocked* — its own HEADERS — is itself an
+arrival at this gate, which checks before it defers. A fiber per buffering hold would buy only
+the case where the wait is free, and would buy it on the pump's own path ([P6](#p6)).
+
+The cost is stated rather than hidden: a genuinely slow upload that takes more than five
+seconds between its head and its last DATA frame is shown to the operator head-only, and its
+body goes out unedited. That is a real regression against "the row carries the entity" for slow
+honest peers, and it is the trade — gori cannot tell a stalled peer from a slow one without
+waiting, and the thing on the other side of the wait is every other stream on the connection.
+Nothing else moves: `MAX_HOLD_BODY`, `check_ceiling`'s blasting-peer disposition, and the
+"the row appears when the message is complete" timing for bodies that arrive in time are all
+unchanged.
+
+### 2026-08-17: a WebSocket drain deadline bounds work, not waiting
+
+Refines: [P6](#p6). Extends the interleaved-WebSocket-repeater entry above. PR #12.
+
+Interleaving made every recorded message wait out an idle gap before the next one left, and
+`DRAIN_DEADLINE` was still charged the whole exchange from one `DrainState#started`. So the
+60s deadline had quietly become a cap on SCRIPT LENGTH: at the TUI's 3s idle a healthy
+30-message subscribe/ack replay was cut off around message 20 — by an origin that had answered
+every single message promptly — and `with_unsent_note` blamed "a capture cap", pointing the
+operator at `MAX_RECV_*` knobs that had nothing to do with it.
+
+Idle waiting is not work, so it is not charged. A read that ends in `IO::TimeoutError` produced
+no frame, and `DrainState#credit_idle` pushes `started` forward by exactly that gap; what the
+deadline measures is time spent READING frames, across the whole exchange. The three capture
+caps (`MAX_RECV_MESSAGES`, `MAX_RECV_BYTES`, `MAX_DRAIN_FRAMES`) are unchanged and stay
+session-wide — they bound how much was captured, which is a different question from how long
+the engine ran.
+
+The deadline still exists and still fires, on exactly the case it was written for: an origin
+that never goes idle (a keepalive cadence under the idle timeout) is credited nothing, stays
+100k frames clear of `MAX_DRAIN_FRAMES`, and would otherwise pin the tab "inflight" for hours.
+That stop is now NAMED as the deadline in the unsent-message note, distinct from a capture cap,
+because the two have different fixes.
+
+`WsEngine.send` takes the deadline as a parameter defaulting to `DRAIN_DEADLINE`, for the
+reason `idle` is already one: the bug is a RATIO (a script longer than `deadline / idle`
+messages), and a spec cannot demonstrate it at 60s-scale in a run anyone will wait for. No
+surface passes it.
 
 ### 2026-08-17: session slots reach all three surfaces
 
@@ -1247,3 +1307,43 @@ MCP `list_session_slots`), matching `list_env` and the identities card's names-o
 slot's whole job is carrying a credential, and a list is scrollback. `--set` / `set_headers`
 parse through `Discover::Headers.parse_lines` — the same parser the TUI form uses — so a
 CR/LF-carrying value is refused by name on every surface rather than dropped on one.
+
+### 2026-08-17: the reframe default splits by surface, and hex-editable is not reframe-on-send
+
+Refines: [P1](#p1), [P4](#p4), [P7](#p7). Extends the 2026-08-17 gRPC-reframe entry. PR 13.
+
+The reframe opt-in landed on two of the three surfaces. `gori run fuzz --reframe-grpc` and MCP
+`reframe_grpc:` set `Fuzz::Config#reframe_grpc?`; the TUI's Fuzzer never did, so a knob that
+exists in the engine was unreachable from the tab most operators actually fuzz from. That is
+now a toggle on the ADVANCED card, sitting directly under `Auto Content-Length` because they
+are the same kind of knob pointed at the two length declarations one gRPC request carries —
+and carrying the opposite default, exactly as the engine entry says they must. The view
+neither reframes nor decides what is reframable: it sets one boolean on the `Fuzz::Config`
+that `build_engine` already hands `Plan.build`, and `Generator#emit` is unchanged.
+
+The Repeater's gRPC tab had the inverse problem: it reframed *always*, because
+`grpc_reframable?` was one flag meaning both "unary, so the payload is hex-editable" and
+"reframe on send". Those are different kinds of fact — the first is a property of the capture,
+the second is a decision — and fusing them meant the tab could not send what
+`gori run repeater send` sends by default. They are split (`grpc_reframe?`, `␣F:FRAME`,
+`repeater.toggle-grpc-reframe`); `^X` still needs the first, and only the second is flippable.
+
+**The two defaults differ on purpose, and that is not a parity gap.** Headless the default is
+off (P7): the operator names bytes and gori sends them, and a deliberately-wrong length prefix
+is a standard gRPC parser test. In the Repeater's gRPC tab the default is **on**, because the
+tab's whole reason to exist is that `^X` produces a well-formed unary message — a stale prefix
+after a hex edit is the trap the tab already avoids, not a test anyone typed. Turning it off is
+how an operator asks for the headless behaviour, and the badge says which one is armed. The
+Fuzzer stays off on every surface: there the payload comes from a wordlist, not from a hand
+edit, and `Fuzz::Progress#grpc_stale` already reports what a stale prefix cost the run.
+
+Neither toggle is persisted anywhere new. The Repeater's is view state with the same lifetime
+as its sibling send knobs (reset to on by `load_grpc`, carried by a tab duplicate); the
+Fuzzer's rides the existing `config_json` blob, read back as `|| false` — the opposite of
+`update_cl`'s `!= false` — so a session saved before the key existed starts OFF rather than
+silently reframing bytes the operator never asked to repair.
+
+---
+
+*Keep this document honest against the code. When you change a subsystem it describes, update
+the matching section; when you cite a principle inline, use the labels above.*
