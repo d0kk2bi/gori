@@ -34,14 +34,16 @@ module Gori::Proxy
   # read a line that did not exist. A refusal that names the wrong reason costs more time than
   # one that names none.
   enum H2Offer
-    # No tunnel made this decision (the plaintext listener, a blind CONNECT). Says nothing
-    # about a cause, on purpose.
+    # The causeless fallback, for a caller with no observation to stamp: it names no reason
+    # rather than guessing one.
     Unknown
     # h2 was offered to the client and the client did not select it at ALPN (curl --http1.1,
     # an old browser). Nothing is wrong; the client chose.
     Offered
-    # A cleartext origin. ALPN lives inside a TLS handshake, so there was nothing to reflect
-    # and gori has no h2c of its own to offer.
+    # No TLS handshake on the leg that would have carried an ALPN offer: a cleartext ORIGIN
+    # inside a tunnel (`tls/tunnel.cr`), or a cleartext LISTENER, where the client itself
+    # arrived without one. ALPN lives inside a TLS handshake, so there was nothing to reflect,
+    # and gori has no h2c of its own to offer instead.
     Cleartext
     # The four `h2_candidate?` downgrades. Each one DID write a `gori.log` line, so each one
     # may point at it.
@@ -62,7 +64,7 @@ module Gori::Proxy
       case self
       in Unknown             then "HTTP/2 was not negotiated on this connection"
       in Offered             then "HTTP/2 was offered to this client and it selected HTTP/1.1 at ALPN, then spoke the HTTP/2 preface anyway"
-      in Cleartext           then "this origin is cleartext, and ALPN — the only way gori offers HTTP/2 — exists inside a TLS handshake; gori does not serve h2c prior-knowledge here"
+      in Cleartext           then "this connection has a cleartext leg that carried no ALPN — and ALPN, inside a TLS handshake, is the only way gori offers HTTP/2; gori does not serve h2c prior-knowledge here"
       in DisabledBySetting   then "HTTP/2 is switched off (settings network.http2; set it back to \"auto\" to keep h2) — gori.log has the matching \"h2 downgrade: <host> ...\" line"
       in BodyRule            then "a Match&Replace BODY rule is live for this host and body rewriting on HTTP/2 is not implemented yet — gori.log has the matching \"h2 downgrade: <host> ...\" line"
       in ShortCircuitRule    then "a Match&Replace short-circuit rule is live for this host and the h2 relay cannot answer a request locally — gori.log has the matching \"h2 downgrade: <host> ...\" line"
@@ -82,6 +84,24 @@ module Gori::Proxy
     # Max consecutive interim 1xx responses to forward before giving up — a guard
     # against a hostile upstream streaming an unbounded run of body-less 103s.
     MAX_INTERIM = 64
+
+    # How long the streaming request path waits for the ORIGIN to answer an
+    # `Expect: 100-continue` before giving up on it and unblocking the client itself (#728).
+    #
+    # It has to be bounded, and short. A great many origins simply ignore the expectation and
+    # wait for the body (RFC 9110 §10.1.1 permits exactly that), so an unbounded wait here
+    # would trade the old three-way deadlock for a new one. 1 s is curl's own
+    # `--expect100-timeout` default, i.e. the interval clients already budget for this — and
+    # it costs nothing next to the status quo, where the client was the one paying it.
+    EXPECT_CONTINUE_WAIT = 1.second
+
+    # The interim gori writes ITSELF when it cannot get one from the origin — either because
+    # the origin did not answer in time, or because this path had to have the whole body in
+    # hand before it could dial at all (intercept hold / body rewrite / short circuit).
+    # HTTP/1.1-only: `expect_continue?` carries the version test for both the buffering and the
+    # streaming path, exactly as `skip_interim_responses` does its own, so a 1.0 client never
+    # sees a 1xx — and never waits on one either.
+    CONTINUE_RESPONSE = "HTTP/1.1 100 Continue\r\n\r\n".to_slice
 
     # `fixed_host`/`fixed_port` pin all requests to one origin (post-CONNECT TLS
     # tunnel); when nil the upstream is resolved per request from the target /
@@ -130,7 +150,13 @@ module Gori::Proxy
                    @origin_dst : {String, Int32}? = nil,
                    @rewrite_fixed_host : Bool = false,
                    @extractor : ResponseExtract? = nil,
-                   @h2_offer : H2Offer = H2Offer::Unknown)
+                   # Defaulted rather than required because the only callers that do not pass it
+                   # are the three CLEARTEXT listeners in `server.cr` (plaintext forward,
+                   # transparent, reverse-cleartext) — every tunnel-built ClientConn stamps what
+                   # it observed. A client leg with no TLS handshake carried no ALPN, so
+                   # `Cleartext` is what those three observed, and the h2-preface refusal names
+                   # the true cause there instead of declining to name one (#731).
+                   @h2_offer : H2Offer = H2Offer::Cleartext)
       # Per-connection upstream reuse (see `acquire_upstream`). One live origin
       # connection kept across this client's keep-alive requests.
       @upstream = nil.as(IO?)
@@ -443,16 +469,50 @@ module Gori::Proxy
       retryable = retryable_request?(sent_req, req_framing.none?)
       req_capture = Codec::CaptureBuffer.new(Settings.capture_max, capture_hint(req_framing, req_len))
       req_complete = true
+      # `Expect: 100-continue` (#728). A client that sends it is WITHHOLDING its body until it
+      # is answered, so writing the head and then blocking on `Codec::Body.stream` — which is
+      # what this path used to do — parked the client, gori and the origin on each other until
+      # a timeout broke the tie. Settle the expectation between the head and the body instead:
+      # see `settle_expectation` for the outcomes.
+      #
+      # Keyed on the CLIENT's `req`, not on `sent_head`: the deadlock is the client holding its
+      # body back, and only the client's own head says whether it is doing that. (A Match&Replace
+      # rule that ADDS `Expect` to the wire head cannot deadlock — the client is not waiting — and
+      # a rule that REMOVES it still leaves the client waiting, which the self-issued 100 covers.)
+      # Also gated on a body actually being declared: an `Expect` on a bodyless request has
+      # nothing to withhold, and — load-bearing for retry safety — `retryable_request?` returns
+      # false for every body-declaring request, so `acquire_and_send` can NOT re-run this block.
+      # That is what guarantees the origin's interim is relayed to the client at most once and no
+      # body is sent twice on a stale-reuse redial.
+      expects_continue = expect_continue?(req) && !req_framing.none?
+      early_head = nil.as(Bytes?)
+      send_body = true
+      client_gone = false
       upstream, reused, sent = acquire_and_send(host, port, retryable) do |up|
         up.write(sent_head)
-        req_complete = Codec::Body.stream(@io, up, req_framing, req_len, req_capture, copy_buf)
-        up.flush
+        if expects_continue
+          up.flush # the head must be ON THE WIRE before there is anything to wait for
+          early_head, send_body, client_gone = settle_expectation(up)
+        end
+        if send_body
+          req_complete = Codec::Body.stream(@io, up, req_framing, req_len, req_capture, copy_buf)
+          up.flush
+        end
         true
       end
       unless upstream && sent
         release_upstream
         record_error(req, scheme, host, port, created_at, upstream_error_message(host, port, upstream))
         write_gateway_error
+        return false
+      end
+      if client_gone
+        # The client vanished while gori was answering its expectation. Nothing was forwarded
+        # and nothing will be; record it rather than leave the flow Pending (mirrors the same
+        # guard inside `skip_interim_responses`).
+        release_upstream
+        record_error(record_req, scheme, host, port, created_at,
+          "connection closed while answering Expect: 100-continue")
         return false
       end
       req_body = req_framing.none? ? nil : req_capture.to_slice
@@ -464,8 +524,20 @@ module Gori::Proxy
         @sink.on_response(FlowMapper.error_response(flow_id, "client truncated request body"))
         return false
       end
-      handle_response(upstream, req, flow_id, started, host, port, scheme,
-        reused: reused, sent_head: sent_head, can_retry: retryable, sent_req: sent_req)
+      keep = handle_response(upstream, req, flow_id, started, host, port, scheme,
+        reused: reused, sent_head: sent_head, can_retry: retryable, sent_req: sent_req,
+        pre_read_head: early_head)
+      # The expectation was settled without the body being pumped, so neither leg is reusable:
+      # the client still owes those bytes, and gori sent the origin a head declaring a body it
+      # never got — either socket's next bytes are ambiguous, which is where a desync starts.
+      # `release_upstream` runs AFTER `handle_response` (which still had to read the response
+      # body off that socket) and is idempotent, so the 101 branch having already detached the
+      # slot is fine.
+      unless send_body
+        release_upstream
+        return false
+      end
+      keep
     end
 
     # Removes the client's `Sec-WebSocket-Extensions` offer from the handshake gori is
@@ -506,6 +578,14 @@ module Gori::Proxy
                                     host : String, port : Int32, scheme : String,
                                     created_at : Int64, started : Time::Instant,
                                     req_framing : Codec::BodyFraming, req_len : Int64) : Bool
+      # #728: a held request must be COMPLETE before the human can see it, so gori answers the
+      # client's `Expect: 100-continue` itself rather than blocking on a body being withheld.
+      # See `elicit_request_body` for why this path cannot ask the origin instead.
+      unless elicit_request_body(req, req_framing)
+        record_error(sent_req, scheme, host, port, created_at,
+          "connection closed while answering Expect: 100-continue")
+        return false
+      end
       buffered, body_complete = Codec::Body.read_complete(@io, req_framing, req_len)
       unless body_complete
         # The client cut its request body short — there's nothing whole to hold/forward, and
@@ -567,6 +647,14 @@ module Gori::Proxy
                                     host : String, port : Int32, scheme : String,
                                     created_at : Int64,
                                     req_framing : Codec::BodyFraming, req_len : Int64) : Bool
+      # #728: draining the body is what lets a stubbed connection survive, and a client holding
+      # its body back for a `100 Continue` never drains. Answer it here too — the stub's own
+      # status still follows, and a 1xx before it is exactly what the client is waiting for.
+      unless elicit_request_body(req, req_framing)
+        record_error(sent_req, scheme, host, port, created_at,
+          "connection closed while answering Expect: 100-continue")
+        return false
+      end
       buffered, body_complete = Codec::Body.read_complete(@io, req_framing, req_len)
       unless body_complete
         # Nothing was answered, so this is not a short-circuited flow — record it as the
@@ -642,6 +730,13 @@ module Gori::Proxy
                                                host : String, port : Int32, scheme : String,
                                                created_at : Int64, started : Time::Instant,
                                                req_framing : Codec::BodyFraming, req_len : Int64) : Bool
+      # #728: a body rule needs the whole entity before the head can be re-framed and sent, so
+      # (as on the hold path) gori answers the client's `Expect: 100-continue` itself.
+      unless elicit_request_body(req, req_framing)
+        record_error(sent_req, scheme, host, port, created_at,
+          "connection closed while answering Expect: 100-continue")
+        return false
+      end
       buffered, body_complete = Codec::Body.read_complete(@io, req_framing, req_len)
       unless body_complete
         # Client cut the body short — forwarding it under the original length would desync
@@ -711,11 +806,22 @@ module Gori::Proxy
     # Reads, (optionally holds), forwards, and captures the response. `req` is the
     # ORIGINAL request (framing/keep-alive/method come from it). Returns true to
     # keep the connection alive.
+    #
+    # `pre_read_head` is a response head the caller has ALREADY taken off the upstream socket
+    # and must not be read again — the `Expect: 100-continue` settlement (#728), which has to
+    # look at the origin's answer before it can decide whether to pump the client's body. It is
+    # deliberately handed back UNPARSED so every gate below (interim handling, framing, M&R,
+    # intercept) runs on it exactly as if `read_response_head` had produced it; the one thing it
+    # skips is the stale-reuse redial, which cannot apply once a head has been read.
     private def handle_response(upstream : IO, req : Codec::RawRequest, flow_id : Int64,
                                 started : Time::Instant, host : String, port : Int32, scheme : String,
                                 *, reused : Bool, sent_head : Bytes, can_retry : Bool,
-                                sent_req : Codec::RawRequest) : Bool
-      resp_head, upstream = read_response_head(upstream, host, port, reused, sent_head, can_retry)
+                                sent_req : Codec::RawRequest, pre_read_head : Bytes? = nil) : Bool
+      if pre_read_head
+        resp_head = pre_read_head
+      else
+        resp_head, upstream = read_response_head(upstream, host, port, reused, sent_head, can_retry)
+      end
       if resp_head.nil?
         @sink.on_response(FlowMapper.error_response(flow_id, "no response from upstream"))
         release_upstream
@@ -836,7 +942,17 @@ module Gori::Proxy
           # frames until close
           WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor, notice: ws_notice)
         else
-          Pump.blind_tunnel(@io, upstream) # non-WS upgrade: raw pipe until close
+          # A 101 that is NOT a WebSocket — kubectl exec/attach/port-forward speaks
+          # `Upgrade: SPDY/3.1` and the Docker Engine API `Upgrade: tcp` — is relayed
+          # byte-exact and deliberately NOT decoded (see `Pump`). That decision used to be
+          # invisible: the WebSocket branch above carries `notice:` and this one said nothing
+          # anywhere, so a `101 / complete / empty transcript` flow could not be told from one
+          # gori simply failed to capture (#736). Recorded AFTER the tunnel returns, because
+          # `blind_tunnel` only comes back when both directions are closed and the byte counts
+          # are what make this a report rather than a guess. Exactly one per connection —
+          # this branch `return false`s immediately below, so there is nothing to rate-limit.
+          moved = Pump.blind_tunnel(@io, upstream) # non-WS upgrade: raw pipe until close
+          record_opaque_upgrade(flow_id, resp, req, host, sent_req.target, moved)
         end
         return false
       end
@@ -919,6 +1035,170 @@ module Gori::Proxy
         resp = Codec::Http1.parse_response_head(resp_head)
       end
       {resp_head, resp}
+    end
+
+    # Does this request withhold its body until it is answered? RFC 9110 §10.1.1: `Expect` is a
+    # comma-separated list of expectations and `100-continue` is the only one anyone defines, so
+    # a case-insensitive containment test is both sufficient and deliberately lenient — the
+    # answer only ever decides whether gori WAITS, never what it forwards (the header itself
+    # goes upstream byte-exact like every other, P7).
+    #
+    # The version test belongs HERE, not at the call sites. RFC 9110 §10.1.1: a 100-continue
+    # expectation on an HTTP/1.0 request MUST be ignored — such a client is not waiting for an
+    # answer and could not parse one — so it is not withholding anything, which is the question
+    # this predicate asks. Both the buffering paths (`elicit_request_body`) and the streaming one
+    # ask it, and they must get the same answer: spelled only at the buffering site, a 1.0 client
+    # on the streaming path paid a full EXPECT_CONTINUE_WAIT against a quiet origin before its
+    # body could move, for an expectation it never made.
+    private def expect_continue?(req : Codec::RawRequest) : Bool
+      return false unless req.version == "HTTP/1.1"
+      value = req.headers.get?("Expect")
+      return false unless value
+      value.downcase.includes?("100-continue")
+    end
+
+    # Settles an `Expect: 100-continue` on the STREAMING path, between the head going upstream
+    # and the client's body being pumped (#728). Reached only through the caller's
+    # `expects_continue` gate, so the client is HTTP/1.1, asked, and declared a body — this takes
+    # no request: every 1xx it relays is one the client is entitled to and waiting for.
+    # Returns `{early_head, send_body, client_gone}`:
+    #
+    #   - the origin sent `100 Continue` → relay it VERBATIM to the client (P6/P7: the origin's
+    #     own bytes, never a reconstruction) and pump the body: `{nil, true, false}`.
+    #   - the origin sent some OTHER well-formed 1xx first — 103 Early Hints, 102 Processing —
+    #     which is relayed the same way but settles NOTHING. RFC 9110 §10.1.1 makes only the 100
+    #     (or a final status) the permission to send a withheld body, so treating a 103 as the
+    #     answer put gori back in the #728 deadlock one 1xx later: blocked reading a client that
+    #     is still waiting, with the origin's real answer unread. So this loops, relaying each
+    #     one and reading on. Bounded twice over — see the two guards in the body.
+    #   - the origin answered something FINAL instead — 417 Expectation Failed, or a 401/403/30x
+    #     it can decide without reading the body, both of which RFC 9110 §10.1.1 explicitly
+    #     allows — then it does NOT want the body, and pumping one at a server that has stopped
+    #     reading is how a request gets smuggled into the next response's framing. Hand the head
+    #     back for relay and send nothing: `{head, false, false}`. A malformed 1xx (one declaring
+    #     a body) takes this branch too, on purpose: `skip_interim_responses` already knows how
+    #     to refuse it, and it gets a flow_id to record against, which this point does not have.
+    #   - the origin closed / reset before answering → `{nil, false, false}`. Uploading a body
+    #     into a dead socket buys nothing; `handle_response` reads the EOF and records
+    #     "no response from upstream".
+    #   - nothing arrived within EXPECT_CONTINUE_WAIT → gori writes the 100 ITSELF and pumps the
+    #     body: `{nil, true, false}`. An origin that ignores the expectation is normal and
+    #     conformant, and it is waiting for exactly the bytes the client is refusing to send, so
+    #     SOMEONE has to move first. If that write fails the client is gone: `{nil, false, true}`.
+    #     (Cost of the self-issued 100: a duplicate is possible when the origin's own 100 lands
+    #     just after the deadline. RFC 9110 §15.2 requires a client to tolerate 1xx it did not
+    #     even ask for, so a second one is harmless.)
+    private def settle_expectation(upstream : IO) : {Bytes?, Bool, Bool}
+      # ONE budget for the whole settlement, not one per read. A per-iteration timeout is no
+      # timeout at all against an origin that emits a 103 every EXPECT_CONTINUE_WAIT - 1ms: it
+      # never technically times out and the exchange never finishes. Each pass gets only what is
+      # left. (The one overrun this cannot bound is the tail of a head already started — see
+      # `read_head_within` for why finishing it is mandatory. It costs at most one HEAD_DEADLINE,
+      # once, because that time is charged to the same budget and ends the loop.)
+      deadline = Time.instant + EXPECT_CONTINUE_WAIT
+      relayed = 0
+      loop do
+        left = deadline - Time.instant
+        break if left <= Time::Span.zero
+        answer = read_head_within(upstream, left)
+        if answer.is_a?(NoAnswer)
+          # Nothing will ever come: don't spend the client's body on a dead socket.
+          return {nil, false, false} if answer.gone?
+          break # Silent — the origin is ignoring the expectation; gori answers it below.
+        end
+        resp = Codec::Http1.parse_response_head(answer)
+        return {answer, false, false} unless interim_response?(resp) && !interim_has_body?(resp)
+        begin
+          @io.write(answer)
+          @io.flush
+        rescue
+          return {nil, false, true}
+        end
+        # THE settlement: only a 100 releases the body.
+        return {nil, true, false} if resp.status == 100
+        # Reuse the run cap `skip_interim_responses` enforces rather than inventing a second
+        # ceiling. A peer that exceeds it gets its body withheld and the connection handed on
+        # as-is: the remaining 1xx are still on the socket, and `skip_interim_responses` — which
+        # holds a flow_id — refuses the run there and records "too many interim 1xx responses".
+        # Across the two stages a hostile origin therefore buys at most 2 × MAX_INTERIM relays.
+        relayed += 1
+        return {nil, false, false} if relayed >= MAX_INTERIM
+      end
+      # The budget ran out, or the wait could not be bounded at all (a non-socket upstream —
+      # specs, a future transport). Either way, blocking is the one thing that must not happen.
+      write_own_continue ? {nil, true, false} : {nil, false, true}
+    end
+
+    # Why `read_head_within` came back without a head. The two are NOT interchangeable: an
+    # origin that merely stayed quiet is still reading and still wants the body, while one that
+    # closed or reset will never answer and there is nothing left to send a body to.
+    enum NoAnswer
+      Silent
+      Gone
+    end
+
+    # Reads ONE response head, giving up if the first byte does not arrive within `wait`.
+    # Returns the head, or which kind of non-answer ended the wait: `Gone` for EOF / reset / a
+    # head that stopped mid-way, `Silent` for the timeout and for a non-socket IO whose read
+    # cannot be bounded at all (the caller must never read `Silent` as "keep waiting").
+    #
+    # Only the FIRST byte is on the short clock. Once the origin has started to speak, the head
+    # is finished under the connection's normal timeout via `safe_read_head` (with the peeked
+    # byte pushed back through a `PrefixIO`, the same handoff `handle_connect` uses) — a short
+    # deadline spanning the whole head would abandon a partially-consumed response on the socket,
+    # which is a desync, not a timeout. That is the one part of `wait` this method cannot honour.
+    private def read_head_within(upstream : IO, wait : Time::Span) : Bytes | NoAnswer
+      sock = SocketTuning.underlying_socket(upstream)
+      return NoAnswer::Silent unless sock
+      saved = sock.read_timeout
+      gone = false
+      first = begin
+        sock.read_timeout = wait
+        byte = upstream.read_byte
+        gone = true if byte.nil? # a clean EOF is knowable, and it is not a timeout
+        byte
+      rescue IO::TimeoutError
+        nil # nothing came — the origin is ignoring the expectation, not dead
+      rescue
+        gone = true # reset, or a broken TLS session: this socket is finished
+        nil
+      ensure
+        sock.read_timeout = saved
+      end
+      return (gone ? NoAnswer::Gone : NoAnswer::Silent) unless first
+      # The origin started to speak and then stopped: a truncated head is no more an answer than
+      # an EOF, and the socket it left behind cannot be written a body either.
+      safe_read_head(PrefixIO.new(Bytes[first], upstream)) || NoAnswer::Gone
+    end
+
+    # gori's own `100 Continue` to the client. False when the client is gone.
+    private def write_own_continue : Bool
+      @io.write(CONTINUE_RESPONSE)
+      @io.flush
+      true
+    rescue
+      false
+    end
+
+    # The BUFFERING request paths — intercept hold, request-body Match&Replace, short circuit —
+    # cannot ask the origin what it thinks of an `Expect: 100-continue`, because all three must
+    # hold the COMPLETE body before anything goes upstream (the human has to see it, the rule has
+    # to rewrite it, the stub has to drain it) and two of them may never dial an origin at all.
+    # There is no one to relay, so gori answers the expectation itself — otherwise these paths
+    # block on `read_complete` for a body the client is deliberately withholding, which is the
+    # #728 deadlock with no origin even involved.
+    #
+    # The cost is stated plainly: gori commits to reading the body, so an origin that would have
+    # answered 417 no longer gets the chance to refuse it before it is sent. That is the price of
+    # buffering, it is paid only when the operator has switched on a hold/rewrite/stub rule for
+    # this request, and it fails SAFE — a 100 promises nothing about the final status.
+    #
+    # A no-op (returns true, writes nothing) unless the client is actually withholding a body —
+    # `expect_continue?` carries the HTTP/1.0 rule, and a declared body is the other half.
+    # Returns false only when the write failed, i.e. the client is gone.
+    private def elicit_request_body(req : Codec::RawRequest, framing : Codec::BodyFraming) : Bool
+      return true unless expect_continue?(req) && !framing.none?
+      write_own_continue
     end
 
     # Computes the response body framing, or records a visible error flow and
@@ -1252,32 +1532,106 @@ module Gori::Proxy
       true
     end
 
-    # Cleartext HTTP/2 (h2c) tunnelled inside a CONNECT: the target is the
-    # CONNECT authority, so we dial it plaintext and run the same h2 relay (no
-    # :authority routing / HPACK coupling needed). The origin must speak h2c.
-    # A rule kind this tunnel cannot serve, or nil. Mirrors `tls/tunnel.cr#h2_candidate?`'s
-    # three rule gates — a body Match&Replace rule, a short-circuit stub, a body-scoped
-    # extract rule — all of which live on `ClientConn`'s h1 path and are unreachable from the
-    # h2 relay. On the TLS path they earn a downgrade to h1; here the client has already sent
-    # the preface, so the only honest answers are refuse or lie.
-    private def h2c_unservable?(host : String) : Bool
-      reason =
-        if @rewriter.try(&.rewrites_body_for_host?(host))
-          "a Match&Replace BODY rule is live and body rewriting on HTTP/2 is not implemented yet"
-        elsif @rewriter.try(&.short_circuits_for_host?(host))
-          "a Match&Replace short-circuit rule is live and the h2 relay cannot answer a request locally"
-        elsif @extractor.try(&.extracts_body_for_host?(host))
-          "a body-scoped session-binding extract rule is live and the h2 relay never holds a body"
-        end
-      return false unless reason
-      ::Log.warn do
-        "h2c CONNECT to #{host}: refused because #{reason}. The client committed to HTTP/2 by " \
-        "sending the preface, so there is nothing to downgrade — disable the rule for this host " \
-        "to allow the tunnel, or reach it over TLS where gori can downgrade the connection"
+    # Why gori will not serve this h2c-in-CONNECT tunnel, or nil for one it will.
+    #
+    # `http2_disabled?` first, then `tls/tunnel.cr#h2_candidate?`'s three rule gates — a body
+    # Match&Replace rule, a short-circuit stub, a body-scoped extract rule — all of which live
+    # on `ClientConn`'s h1 path and are unreachable from the h2 relay. On the TLS path each
+    # earns a downgrade to h1; here the client has already sent the preface, so the only honest
+    # answers are refuse or lie.
+    #
+    # The SANDBOX is deliberately absent from this list (#731). It used to head it, because the
+    # h2c relay really was wired with no gates at all — until #549 threaded `interceptor:` into
+    # `intercept_h2c`'s relay call, which is what builds both `H2::StreamGate`s (`h2/relay.cr`),
+    # and #492 step 4 had already put the per-STREAM blocking gate in them. So the sandbox now
+    # reaches this tunnel exactly as it reaches the TLS h2 one, and the blanket refusal was
+    # short-circuiting ahead of a gate that fails closed.
+    private def h2c_refusal(host : String) : String?
+      if Settings.http2_disabled?
+        # Silently relaying would make "force HTTP/1.1" quietly untrue for this path, which is
+        # worse than a visible refusal.
+        "HTTP/2 is switched off (settings network.http2)"
+      elsif @rewriter.try(&.rewrites_body_for_host?(host))
+        "a Match&Replace BODY rule is live and body rewriting on HTTP/2 is not implemented yet"
+      elsif @rewriter.try(&.short_circuits_for_host?(host))
+        "a Match&Replace short-circuit rule is live and the h2 relay cannot answer a request locally"
+      elsif @extractor.try(&.extracts_body_for_host?(host))
+        "a body-scoped session-binding extract rule is live and the h2 relay never holds a body"
       end
+    end
+
+    # Refuse an h2c-in-CONNECT tunnel, VISIBLY (#731). Two of these refusals used to be a bare
+    # `return false`: the client had already been told `200 Connection Established`, so the
+    # tunnel appeared to open and then died with nothing in History and nothing in `gori.log`.
+    #
+    # ## What is deliverable here, and what is not
+    #
+    # NOT the h1 sandbox path's `403 + X-Gori-Sandbox: blocked`. The client committed to HTTP/2
+    # the moment it sent the preface byte this branch peeked, and an h2 client cannot parse an
+    # HTTP/1.1 response — the same reason the h2-preface-on-the-h1-path refusal above writes
+    # nothing back, and the reason `write_framing_reject`'s precedent stops at record + close.
+    #
+    # Nor a synthesized SETTINGS + GOAWAY, which is the only thing this client COULD parse. gori
+    # is not an h2 producer anywhere: `H2::StreamGate#refuse_locked` turns down exactly that
+    # trade for the per-stream sandbox refusal, and gori has not read this client's preface at
+    # all (one byte was peeked), so answering as an h2 endpoint would mean becoming one on a
+    # path whose whole job is to relay. If that changes, it changes there first.
+    #
+    # So the refusal is delivered where an operator actually looks: a `gori.log` line, and an
+    # error flow for the CONNECT itself. CONNECT is otherwise never a captured flow — the
+    # reserved-host and self-loop refusals above record nothing — but those refuse BEFORE the
+    # 200, where the client still gets an answer it can read. This one cannot, so the record is
+    # the only thing left, and a row saying which rule or setting refused the tunnel is worth
+    # more than a socket that closes for no stated reason.
+    private def refuse_h2c(req : Codec::RawRequest, host : String, port : Int32,
+                           reason : String) : Nil
+      advice = "The client committed to HTTP/2 by sending the preface, so there is nothing to " \
+               "downgrade — clear what refused it for this host, or reach it over TLS where " \
+               "gori can downgrade the connection instead"
+      ::Log.warn { "h2c CONNECT to #{host}: refused because #{reason}. #{advice}" }
+      record_error(req, "http", host, port, now_us,
+        "h2c CONNECT tunnel refused: #{reason}. #{advice}")
+    end
+
+    # A LISTENER's entry into the h2c relay (#737): a prior-knowledge preface that arrived
+    # DIRECTLY on a reverse or transparent listener, with no CONNECT in front of it. Public
+    # because `Proxy::Server` is the only caller; everything it delegates to is private here,
+    # which is why the method lives beside them rather than in `server.cr`.
+    #
+    # It delegates, and that is the point. `intercept_h2c` — the dial, the two
+    # `SocketTuning.relax` calls, the `H2::Relay.run` carrying all four lenses, the `ensure`
+    # that frees the origin fd — already exists, and the wiring is already spelled twice (there
+    # and `tls/tunnel.cr#relay_h2`). A third spelling in `Server` would be worse than the gap
+    # #737 describes.
+    #
+    # The three RULE gates come with it rather than being re-tested by the caller: same
+    # question, same answer, and with the preface already sent the only honest options are
+    # refuse or lie. `http2_disabled?` — which `h2c_refusal` also reports — has already been
+    # answered by `Server#serve_h2c`, which refuses it in the listener's own words before ever
+    # reaching here; a second look costs one `Settings` read and cannot fire.
+    #
+    # Refusal is a log line and nothing else, unlike the CONNECT path's `refuse_h2c`. There is
+    # no request to record against: `record_error` projects a flow from a `RawRequest`, and on
+    # this path the connection opened with 24 preface octets, not a request. The h2 streams
+    # that would have carried one are exactly what is being refused. Returns false so the
+    # caller closes the socket — nothing else will, since ownership never passes to `run` here.
+    def serve_h2c_prior_knowledge(host : String, port : Int32, client : IO) : Bool
+      if reason = h2c_refusal(host)
+        ::Log.warn do
+          "h2c prior knowledge on a listener, for #{host}:#{port}: refused because #{reason}. " \
+          "The client committed to HTTP/2 by sending the preface, so there is nothing to " \
+          "downgrade — clear what refused it for this host, or reach it over TLS where gori " \
+          "can downgrade the connection instead"
+        end
+        return false
+      end
+      intercept_h2c(host, port, client)
       true
     end
 
+    # Cleartext HTTP/2 (h2c) tunnelled inside a CONNECT: the target is the CONNECT authority, so
+    # we dial it plaintext and run the same h2 relay (no :authority routing / HPACK coupling
+    # needed). The origin must speak h2c.
     private def intercept_h2c(host : String, port : Int32, client : IO) : Nil
       upstream = Upstream.dial(host, port, overrides: @host_overrides, pin: dial_pin)
       return unless upstream
@@ -1357,6 +1711,41 @@ module Gori::Proxy
       resp.status == 101 && resp.headers.get?("Upgrade").try(&.downcase) == "websocket"
     end
 
+    # What gori did with a 101 that is NOT a WebSocket, put on the record (#736).
+    #
+    # Same seam the WebSocket branch's handshake advisory uses (`WS::Relay.record_notice`): one
+    # `NOTICE_PREFIX`-marked `ws_messages` row on the flow. That table is read for ANY status-101
+    # flow and not only WebSocket ones — History's MESSAGES pane, `gori run show`, MCP
+    # `get_flow`, a HAR export — so the sentence travels wherever the flow does, and
+    # `NOTICE_PREFIX` is what keeps a repeater seed from replaying gori's own prose as traffic.
+    # The `gori.log` line is the SECOND copy, not the only one: it reaches only an operator who
+    # already knew to tail it.
+    #
+    # The protocol named is the ORIGIN's — a 101 echoes `Upgrade` (RFC 9110 §15.2.2) and that is
+    # what the connection actually became — falling back to what the CLIENT offered when the
+    # origin left it out. `.inspect` for the same reason `settle_ws_extensions` uses it: the
+    # token is unvalidated wire bytes and must not be pasted raw into a stored sentence.
+    # `NOTICE_DIRECTION` is one column that cannot say which way the bytes went, so the sentence
+    # does (see the constant's own doc). Best-effort, like its WebSocket sibling: a capture write
+    # that fails must never take down a connection that has already finished its work.
+    private def record_opaque_upgrade(flow_id : Int64, resp : Codec::RawResponse,
+                                      req : Codec::RawRequest, host : String, target : String,
+                                      moved : {a_to_b: Int64, b_to_a: Int64}) : Nil
+      token = resp.headers.get?("Upgrade").try(&.presence) || req.headers.get?("Upgrade").try(&.presence)
+      named = token ? "protocol #{token.inspect}" : "a protocol neither the request nor the 101 named"
+      note = "101 switched this connection to #{named}; gori does not decode it and relayed it " \
+             "as an opaque byte tunnel, so nothing after this response is captured — " \
+             "#{moved[:a_to_b]} bytes client→server, #{moved[:b_to_a]} bytes server→client"
+      # `Url.location` and not `host + target`: on the plaintext forward-proxy path the target is
+      # absolute-form and already names the authority — the one home for that rule, and the same
+      # one `ws_log_label` exists to route its callers to.
+      ::Log.info { "upgrade #{Gori::Url.location(host, target)}: #{note}" }
+      @sink.on_ws_message(flow_id, WS::Relay::NOTICE_DIRECTION, WS::OP_TEXT.to_i,
+        "#{WS::NOTICE_PREFIX}#{note}".to_slice)
+    rescue
+      nil
+    end
+
     # An interim 1xx informational response (100 Continue / 102 / 103 Early Hints /
     # …) — forwarded to the client, then skipped to read the final status. 101
     # Switching Protocols is terminal (handled as an upgrade), so it is NOT interim.
@@ -1394,22 +1783,17 @@ module Gori::Proxy
         return false if first.nil?
         stream = PrefixIO.new(Bytes[first], @io)
         if first == 0x50_u8
-          # Cleartext h2 (h2c) tunnelled inside CONNECT runs the raw h2 relay, which bypasses
-          # ClientConn's per-request block. Under the sandbox we can't gate it per request, so
-          # (the host having already cleared the coarse gate above) refuse the whole tunnel —
-          # h2c-in-CONNECT is rare, and a blocking mode must not leave an ungated path open.
-          return false if (ic = @interceptor) && ic.sandbox_enabled?
-          # With HTTP/2 switched off, refuse rather than relay. The client has already
-          # committed to h2 by sending the preface, so there is nothing to downgrade — and
-          # silently relaying it would make "force HTTP/1.1" quietly untrue for this path,
-          # which is worse than a visible refusal.
-          return false if Settings.http2_disabled?
-          # The other three gates `tls/tunnel.cr#h2_candidate?` applies, which had no h2c
-          # equivalent. Same reasoning as the line above, and the same disposition: there is
-          # nothing to downgrade here, so a rule the relay structurally cannot apply gets a
-          # VISIBLE refusal rather than a tunnel that looks like it honours the rule table
-          # while a stub rule quietly lets the request reach the origin.
-          return false if h2c_unservable?(host)
+          # Cleartext h2 (h2c) tunnelled inside CONNECT. `h2c_refusal` is the whole gate:
+          # the setting, and the three rule kinds the h2 relay structurally cannot apply — a
+          # tunnel that looked like it honoured the rule table while a stub rule quietly let
+          # the request reach the origin would be worse than a visible refusal. The SANDBOX is
+          # not among them and no longer refuses this tunnel outright (#731): `intercept_h2c`
+          # wires the interceptor into the relay, so `H2::StreamGate` blocks out-of-scope
+          # streams here per stream, exactly as it does on the TLS h2 path.
+          if reason = h2c_refusal(host)
+            refuse_h2c(req, host, port, reason)
+            return false
+          end
           intercept_h2c(host, port, stream)
         else
           tls.intercept(host, port, stream, @sink, dial_addr: dial_pin)
