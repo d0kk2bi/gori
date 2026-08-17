@@ -61,19 +61,22 @@ module Gori
       # exempt from this: there is at most one, and it is the row that matters.
       MAX_CONTROL_MESSAGES = 64
 
-      # A request head declares a WebSocket upgrade. Matches the `Upgrade: websocket`
-      # header case-insensitively (RFC 6455: the token is case-insensitive; browsers
-      # send lowercase, but `Upgrade: WebSocket` and no-space forms are equally valid),
-      # tolerating flexible whitespace after the colon. The single source of truth for
-      # "is this repeater a WebSocket flow?" across the TUI restore paths and MCP tools.
-      UPGRADE_HEADER = /(?:^|\n)upgrade:[ \t]*websocket/i
+      # A request head declares a WebSocket upgrade — the single source of truth for "is this
+      # repeater a WebSocket flow?" across the TUI restore paths, the CLI and MCP.
+      #
+      # The regex itself moved to `Proxy::WS` (#742) so that `Store::FlowDetail#websocket?`
+      # can ask the same question without requiring this file (→ `flow_request.cr` →
+      # `store.cr`, a cycle). Same bytes, same answer; this is where the REPEATER asks it.
+      #
+      # And note what it therefore means: `WsEngine` dials with an HTTP/1.1 `Upgrade:`
+      # handshake and accepts nothing but a 101 (see `send`). So this predicate is not only
+      # "is this a WebSocket" — it is "is this a WebSocket gori can re-establish". An RFC 8441
+      # extended CONNECT captured over h2 (#733) is a real WebSocket and answers FALSE, which
+      # is the correct answer for every seed that asks: there is no h2 WebSocket send path.
+      UPGRADE_HEADER = Proxy::WS::UPGRADE_HEADER
 
       def self.upgrade_request?(request : String) : Bool
-        # scrub: `request` is a captured request head+body kept byte-exact (never scrubbed, P7);
-        # an obs-text byte in a header value would make PCRE matches? raise. This is a read-only
-        # classification (the request is never re-sent from it), so scrub is lossless and fixes
-        # all callers (cli/run.cr's `gori run` path is otherwise unrescued).
-        request.scrub.matches?(UPGRADE_HEADER)
+        Proxy::WS.upgrade_request?(request)
       end
 
       # An outbound message to resend. `opcode` is the RFC 6455 opcode as-is — 0 CONT,

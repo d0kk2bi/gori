@@ -108,23 +108,29 @@ module Gori
           created_at, url, method, req_headers, req_body, http_version,
           status, reason, resp_headers, resp_body, content_type, duration_us,
           req_declared, resp_declared)
-        msgs = ws_messages(entry, status, created_at)
+        msgs = ws_messages(entry, created_at)
         msgs.empty? ? pair : Builder::FlowPair.new(pair.request, pair.response, msgs)
       end
 
       # Chrome's `_webSocketMessages` back into store rows — the inverse of
-      # `Export::Har.ws_messages`, and read only on a 101.
+      # `Export::Har.ws_messages`.
       #
-      # The status gate is deliberate and is the same one every other surface uses to ask "is
-      # this flow a socket": `gori run show`, the TUI's WS pane and MCP's `get_flow` all key off
-      # 101, and `Store#ws_messages` is only ever consulted for such a flow. Attaching a
-      # transcript to a 200 would write rows nothing reads back — including a re-export, which
-      # asks the same question — so an entry that carries messages on a non-101 status loses
-      # them rather than storing evidence that cannot be found again.
-      private def self.ws_messages(entry : JSON::Any, status : Int32,
+      # There is no status gate. There WAS one — `return acc unless status == 101` — and its
+      # comment was the clearest statement in the codebase of the bug #742 fixed: it justified
+      # itself by pointing at the other surfaces ("`gori run show`, the TUI's WS pane and
+      # MCP's `get_flow` all key off 101, and `Store#ws_messages` is only ever consulted for
+      # such a flow"), so when #733 taught the proxy to capture a WebSocket over RFC 8441
+      # extended CONNECT — `CONNECT` answered `200` — this dropped the transcript of every
+      # such entry on the floor, including one gori had just written itself.
+      #
+      # Both halves of that justification are now false: every reader asks the ROWS, and
+      # `Export::Har` writes an h2 socket's entry with its real CONNECT/200 handshake and its
+      # messages beside it. So the entry carrying `_webSocketMessages` is the whole question,
+      # which is also the only one a foreign HAR can answer — a generator that writes the
+      # field means it, and a status is not gori's to second-guess.
+      private def self.ws_messages(entry : JSON::Any,
                                    fallback_time : Int64) : Array(Store::ImportedWsMessage)
         acc = [] of Store::ImportedWsMessage
-        return acc unless status == 101
         arr = entry["_webSocketMessages"]?.try(&.as_a?)
         return acc unless arr
         arr.each do |m|

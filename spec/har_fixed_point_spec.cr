@@ -205,12 +205,17 @@ describe "HAR _webSocketMessages round trip" do
     pair.ws_messages[1].payload.should eq("AP/+".to_slice)
   end
 
-  # The 101 gate is the same question every other surface asks to decide "is this a socket".
-  # A transcript hung on a 200 would write rows nothing reads back — a re-export asks the same
-  # question — so it is not stored at all rather than stored where it cannot be found.
-  it "ignores a transcript on an entry whose status is not 101" do
-    ws_entry([{"type" => "send", "time" => 1_780_000_000.0, "opcode" => 1, "data" => "x"}],
-      status: 200).ws_messages.should be_empty
+  # This used to be "ignores a transcript on an entry whose status is not 101", justified as
+  # "the same question every other surface asks to decide 'is this a socket'" — and that was
+  # the trap. #733 gave gori a socket with no 101 in it (RFC 8441 extended CONNECT, answered
+  # `200`), #742 re-pointed every reader at the ROWS, and `Export::Har` now writes that entry
+  # with its real CONNECT/200 handshake. The gate would have dropped the transcript of a HAR
+  # gori had just written itself. The entry carrying `_webSocketMessages` is the question.
+  it "keeps a transcript on an entry whose status is not 101 (a socket over h2)" do
+    msgs = ws_entry([{"type" => "send", "time" => 1_780_000_000.0, "opcode" => 1, "data" => "x"}],
+      status: 200).ws_messages
+    msgs.map(&.direction).should eq(["out"])
+    msgs.map { |m| String.new(m.payload) }.should eq(["x"])
   end
 
   it "leaves an ordinary entry with no transcript at all" do
