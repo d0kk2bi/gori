@@ -84,6 +84,10 @@ module Gori
         # (`outbound` keeps its OWN connection open on purpose: that is what lets a mid-run
         # scope/Sandbox change stop an in-flight sweep.)
         store.close
+        if query && (plan.targets.size + plan.skipped.size) >= limit
+          STDERR.puts "gori run authorize: --query was capped at --limit #{limit} — " \
+                      "matching flows past that were not replayed (raise --limit to include them)"
+        end
         begin
           run_authorize(plan, format)
         ensure
