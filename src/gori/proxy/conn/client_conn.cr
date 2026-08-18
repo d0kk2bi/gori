@@ -157,13 +157,19 @@ module Gori::Proxy
                    @origin_dst : {String, Int32}? = nil,
                    @rewrite_fixed_host : Bool = false,
                    @extractor : ResponseExtract? = nil,
-                   # Defaulted rather than required because the only callers that do not pass it
-                   # are the three CLEARTEXT listeners in `server.cr` (plaintext forward,
-                   # transparent, reverse-cleartext) — every tunnel-built ClientConn stamps what
-                   # it observed. A client leg with no TLS handshake carried no ALPN, so
-                   # `Cleartext` is what those three observed, and the h2-preface refusal names
-                   # the true cause there instead of declining to name one (#731).
-                   @h2_offer : H2Offer = H2Offer::Cleartext)
+                   # Everything after this marker is named-only, which is how a REQUIRED
+                   # parameter follows defaulted ones at all — and it is the shape that makes
+                   # the requirement useful: `h2_offer:` can only ever be spelled out.
+                   *,
+                   # REQUIRED, and deliberately: this is a claim about the TRANSPORT this
+                   # connection arrived on, and only the caller that built it can make one. It
+                   # was defaulted to `Cleartext` while the only non-stamping callers were the
+                   # cleartext listeners in `server.cr`, which is what those observed — but a
+                   # default means the NEXT caller inherits their claim by saying nothing, and
+                   # the whole point of #731 was that a refusal naming the wrong reason costs
+                   # more time than one naming none. A caller with nothing to observe has
+                   # `H2Offer::Unknown`, which names no reason rather than guessing one.
+                   @h2_offer : H2Offer)
       # Per-connection upstream reuse (see `acquire_upstream`). One live origin
       # connection kept across this client's keep-alive requests.
       @upstream = nil.as(IO?)
