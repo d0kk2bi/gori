@@ -183,7 +183,7 @@ module Gori
         {"decoder <chain>", "Encode/decode/hash via the Decoder engine (base64, hex, url, gzip …)"},
         {"rewriter", "Manage Match & Replace rules (list, add, rm, enable/disable, preview, extract, bindings)"},
         {"colormarker", "Manage History row-colour rules (list, add, rm, enable/disable, move, preview)"},
-        {"project [list]", "List known projects"},
+        {"project [list]", "List projects holding captured traffic (--all for every one)"},
         {"project create", "Create (or reopen) a project by name"},
         {"project delete", "Delete a project and everything captured in it"},
         {"project scope", "Manage scope rules (list, add, update, delete, enable/disable)"},
@@ -238,6 +238,9 @@ module Gori
       # case-insensitive) → else the most-recently-active project. Aborts when
       # nothing resolves. Routing through #find is what lets a read command finally
       # select by slug/id, not display name alone (parity with MCP --project).
+      #
+      # The default branch ANNOUNCES itself (see announce_default_project) — the whole
+      # point of a default nobody typed is that it is invisible until it is wrong.
       private def self.resolve_read_project(project_name : String?, db_path : String?) : Project
         if path = db_path
           abort "gori run: --db is not a readable file: #{path}" unless File.exists?(path) && !File.directory?(path)
@@ -251,9 +254,41 @@ module Gori
           projects = registry.list
           abort "gori run: no project matching '#{name}'#{projects.empty? ? "" : " (have: #{projects.map(&.name).join(", ")})"}"
         end
-        projects = registry.list
-        abort "gori run: no projects yet — capture some traffic first, or pass --db PATH" if projects.empty?
-        projects.first
+        default = ProjectRegistry.default_of(registry.list)
+        abort "gori run: no projects yet — capture some traffic first, or pass --db PATH" unless default
+        announce_default_project(default)
+        default
+      end
+
+      # Whether this process has already said which project it defaulted to.
+      @@said_default_project = false
+
+      # Where that notice goes. STDERR in production; a spec swaps in an `IO::Memory` to
+      # assert on the line, because STDERR is a constant and cannot be replaced. Mirrors
+      # `Settings.warning_io`, for the same reason.
+      class_property default_project_io : IO? = STDERR
+
+      # Say which project a `--project`-less command actually read — ONCE per process.
+      #
+      # Omitting `--project` is the common case and it silently picks the
+      # most-recently-active project, so creating a project anywhere (another worktree, an
+      # MCP `create_project`, a `gori run project create`) quietly re-aims every later
+      # `gori run`. That is how `gori run history` printed "no flows" against a project
+      # made a minute earlier while the one the operator meant still held 1609: the choice
+      # was invisible, so the wrong project looked like an empty database.
+      #
+      # STDERR, so it stays out of a `--format json`/`jsonl`/`har` pipe on stdout — where
+      # HAR already writes its own warnings — and is still seen by an operator watching a
+      # terminal. Once per process because one command resolves its project up to three
+      # times (the read itself, the host-override snapshot, the outbound scope load), and
+      # three identical lines would read like three different projects.
+      private def self.announce_default_project(project : Project) : Nil
+        return if @@said_default_project
+        @@said_default_project = true
+        io = @@default_project_io
+        return unless io
+        io.puts "gori run: using project #{project.name} (most recently active) — " \
+                "name another with --project NAME or --db PATH"
       end
 
       # Capture creates-or-reopens its target (unlike reads, which require an

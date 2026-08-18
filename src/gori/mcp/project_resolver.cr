@@ -130,7 +130,7 @@ module Gori
               project_id: project_for_path.try { |candidate| registry.id_of(candidate) })
           end
         end
-        if mru = registry.list.first?
+        if mru = ProjectRegistry.default_of(registry.list)
           return from_project(mru, registry, "mru")
         end
         Selection.new(Paths.default_db, nil, nil, "default-db")

@@ -44,7 +44,7 @@ gori tui --listen 0.0.0.0 --port 8080
 
 ## gori run {#gori-run}
 
-비대화형 스위트입니다. 각 서브커맨드는 프로젝트 단위로 동작합니다. `--project`와 `--db`가 모두 없으면 가장 최근에 활성화한 프로젝트를 씁니다. 실제 사용 패턴은 [스크립팅 가이드](/ko/guide/scripting/)를 참고하세요.
+비대화형 스위트입니다. 각 서브커맨드는 프로젝트 단위로 동작합니다. `--project`와 `--db`가 모두 없으면 가장 최근에 활성화한 프로젝트를 쓰고, 어느 프로젝트를 골랐는지 stderr에 한 번 알립니다(`gori run: using project demo (most recently active)`). 어디서든 프로젝트를 하나 만들면 이후 모든 명령이 조용히 그쪽을 향하기 때문입니다. 실제 사용 패턴은 [스크립팅 가이드](/ko/guide/scripting/)를 참고하세요.
 
 ```bash
 gori run <subcommand> [verb] [options]
@@ -781,7 +781,15 @@ gori run colormarker add --when 'method:DELETE' --color hotpink
 ```bash
 gori run project --format json
 gori run project list
+gori run project list --all
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--all` | 캡처된 것이 없는 프로젝트까지 모두 출력 |
+| `--format=FMT` | `text`(기본) 또는 `json` |
+
+`list`는 **비어 있는** 프로젝트(캡처된 flow가 0개)를 숨깁니다. 워크트리나 체크아웃마다 프로젝트를 만들다 보면 수백 개가 쌓여, 정작 트래픽이 든 두세 개가 묻히기 때문입니다. 비어 있는지는 파일 크기가 아니라 행 수로 셉니다. 방금 만든 프로젝트도 3월에 남은 찌꺼기와 크기가 같습니다. 다음 두 개는 아무리 비어 있어도 항상 표시하고 표시자를 붙입니다. `◆`는 `--project` 없이 실행한 `gori run`이 읽는 프로젝트, `◇`는 TUI가 마지막으로 연 프로젝트입니다. `--format json`에서는 각각 `current`, `tui_active` 필드이고 `flows` 개수가 함께 나옵니다. 몇 개를 숨겼는지는 stderr로 나가므로 JSON 파이프는 깨끗한 배열로 남습니다.
 
 #### project create {#project-create}
 

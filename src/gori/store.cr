@@ -346,6 +346,56 @@ module Gori
     # terminating NUL. Written as an escape — a raw NUL in a source literal is invisible.
     SQLITE_MAGIC = "SQLite format 3\u0000".to_slice
 
+    # How many flows a project database holds, WITHOUT opening it as a Store.
+    #
+    # `Store.open` migrates (a WRITE), takes the shared open lock and installs the 64 MiB
+    # page cache — none of which a census wants, and the migration alone rewrites the file,
+    # so a census of N projects would rewrite N databases. This is the read-only
+    # counterpart: one connection, one aggregate, and no pragmas but the busy timeout.
+    #
+    # `nil` means "could not tell" — missing, unreadable, not a database, or a schema with
+    # no `flows` table (a project half-created by an older gori). Every caller must treat
+    # that as NOT empty: hiding a project the census failed to measure makes it invisible,
+    # and invisible is a worse failure than noisy.
+    #
+    # The db file's mtime is put back afterwards. It is `Project#last_modified` — the ONE
+    # fact deciding which project every surface defaults to — and closing the LAST
+    # connection to a database whose WAL is dirty checkpoints it, which would stamp a
+    # project as "just active" for no reason but having been listed. Restoring it keeps
+    # reading a project from re-ordering the projects.
+    def self.captured_flows(path : String) : Int64?
+      return nil unless File.exists?(path)
+      # Same pre-flight `Store.open` and `Compact.measure` run, and for the first of their
+      # two reasons: a non-database file leaks the driver's fd inside `DB.open`, and this
+      # is a path that opens hundreds of files in one command.
+      refuse_non_database(path)
+      before = File.info?(path)
+      db = DB.open("sqlite3:#{path}?busy_timeout=2000")
+      begin
+        db.scalar("SELECT COUNT(*) FROM flows").as(Int64)
+      ensure
+        db.close
+        restore_mtime(path, before)
+      end
+    rescue
+      nil
+    end
+
+    # Put a file's modification time back to what it was before a read-only open touched it.
+    # Best-effort in every direction: a project that vanished mid-census, or one owned by
+    # another user, is left alone rather than raising into the caller.
+    #
+    # `utime` takes an access time too, and `File::Info` does not expose the one this file
+    # had, so the mtime stands in for it. atime is not a fact gori reads anywhere; mtime is.
+    private def self.restore_mtime(path : String, before : File::Info?) : Nil
+      return unless before
+      now = File.info?(path)
+      return if now.nil? || now.modification_time == before.modification_time
+      File.utime(before.modification_time, before.modification_time, path)
+    rescue File::Error
+      # best-effort
+    end
+
     # Refuse a path that exists but is not a SQLite database, BEFORE the driver is asked to
     # open it. Two independent reasons, both about this exact URL:
     #

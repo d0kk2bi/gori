@@ -95,6 +95,15 @@ module Gori
       nil
     end
 
+    # The project a surface falls back to when the operator named none: the
+    # most-recently-active one. `list` is MRU-sorted, so it is simply the head — spelled
+    # once here rather than re-derived at each call site, so `gori run`'s omitted
+    # `--project`, MCP's active fallback and `gori run project list`'s "current" marker
+    # cannot drift into naming different projects.
+    def self.default_of(projects : Array(Project)) : Project?
+      projects.first?
+    end
+
     # Existing named projects, most-recently-active first.
     def list : Array(Project)
       return [] of Project unless Dir.exists?(@root)

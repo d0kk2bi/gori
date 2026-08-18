@@ -44,7 +44,7 @@ gori tui --listen 0.0.0.0 --port 8080
 
 ## gori run
 
-The non-interactive suite. Each subcommand operates over a project; with neither `--project` nor `--db` it uses the most-recently-active project. See the [Scripting guide](/guide/scripting/) for the working patterns.
+The non-interactive suite. Each subcommand operates over a project; with neither `--project` nor `--db` it uses the most-recently-active project — and says so once on stderr (`gori run: using project demo (most recently active)`), because creating a project anywhere re-aims every later command. See the [Scripting guide](/guide/scripting/) for the working patterns.
 
 ```bash
 gori run <subcommand> [verb] [options]
@@ -814,7 +814,15 @@ List, create, or delete projects, or manage project-scoped config (scope rules, 
 ```bash
 gori run project --format json
 gori run project list
+gori run project list --all
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Include projects with nothing captured in them |
+| `--format=FMT` | `text` (default) or `json` |
+
+`list` hides the **empty** projects — zero captured flows — because a project per worktree or per checkout accumulates into hundreds of them and buries the two or three holding traffic. Emptiness is counted, not inferred from file size: a project created a second ago is the same size as a leftover from March. Two are always listed however empty they are, and marked: `◆` is the project a `--project`-less `gori run` reads, `◇` the one the TUI last opened. In `--format json` those are the `current` and `tui_active` fields, beside a `flows` count; the count of what was hidden goes to stderr, so a JSON pipe stays a clean array.
 
 #### project create
 

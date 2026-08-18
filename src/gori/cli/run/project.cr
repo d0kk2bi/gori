@@ -43,7 +43,7 @@ module Gori
           Usage: gori run project [<subcommand>] [options]
 
           Subcommands:
-            list               List known projects (default when no subcommand)
+            list               List projects holding captured traffic (default when no subcommand)
             create <name>      Create (or reopen) a project by name
             delete|rm <name>   Delete a project and everything captured in it
             scope              Manage scope rules (list, add, update, delete, enable/disable)
@@ -53,6 +53,7 @@ module Gori
 
           Examples:
             gori run project --format json
+            gori run project list --all
             gori run project create "API test" --description="staging sweep"
             gori run project delete api-test --yes
             gori run project scope add --kind=include --type=host --pattern=api.example.com
@@ -64,11 +65,57 @@ module Gori
           HELP
       end
 
+      # One row of `gori run project list`: the project, what the census found in it, and
+      # the two "this is the one your commands are using" facts that pin it into the
+      # default listing however empty it is.
+      record ProjectListRow,
+        project : Project,
+        flows : Int64?,
+        current : Bool,
+        tui_active : Bool do
+        # Nothing was ever captured here. `flows == nil` is the census failing to read the
+        # db, which is emphatically NOT the same answer — see `Store.captured_flows`.
+        def empty? : Bool
+          flows == 0
+        end
+
+        # Kept in the default listing no matter what: hiding the project a `--project`-less
+        # `gori run` reads, or the one the TUI has open, would answer "which project am I
+        # on?" with silence — which is the confusion this whole listing exists to end.
+        def pinned? : Bool
+          current || tui_active
+        end
+      end
+
+      # Which projects the default listing prints, and why each is marked.
+      #
+      # An operator working across worktrees accumulates a project per checkout — hundreds
+      # of them, each holding nothing but a schema — and `list` dumping all of them buries
+      # the two or three that hold captured traffic. So the default hides the EMPTY ones:
+      # zero captured flows, judged by counting rows and NOT by db_size, because a project
+      # created a second ago is the same 4 kB as a leftover from March and the operator
+      # very much wants to see the one they just made.
+      #
+      # Pure and separately testable: the census and `$GORI_HOME` are the caller's problem.
+      private def self.project_list_rows(counted : Array({Project, Int64?}), active_db : String?,
+                                         all : Bool) : Array(ProjectListRow)
+        default = ProjectRegistry.default_of(counted.map { |project, _| project })
+        wanted = active_db.try { |path| Paths.canonical_file(path) }
+        rows = counted.map do |project, flows|
+          ProjectListRow.new(project, flows,
+            current: !default.nil? && project.db_path == default.db_path,
+            tui_active: !wanted.nil? && Paths.canonical_file(project.db_path) == wanted)
+        end
+        all ? rows : rows.select { |row| row.pinned? || !row.empty? }
+      end
+
       private def self.cmd_project_list(args : Array(String)) : Nil
         format = :text
+        all = false
         leftover = [] of String
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run project [list] [options]"
+          p.on("--all", "Include projects with nothing captured in them (hidden by default)") { all = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| leftover = before + after }
@@ -81,10 +128,14 @@ module Gori
 
         registry = ProjectRegistry.new(Paths.projects_dir)
         projects = registry.list
+        counted = projects.map { |project| {project, Store.captured_flows(project.db_path)} }
+        rows = project_list_rows(counted, Paths.read_active_project, all)
+        hidden = projects.size - rows.size
         if format == :json
           puts(JSON.build do |j|
             j.array do
-              projects.each do |pr|
+              rows.each do |row|
+                pr = row.project
                 j.object do
                   j.field "name", pr.name
                   j.field "id", registry.id_of(pr)
@@ -93,6 +144,9 @@ module Gori
                   j.field "db_size", pr.db_size
                   j.field "last_modified", pr.last_modified.try(&.to_unix)
                   j.field "time", pr.last_modified.try(&.to_local.to_s("%Y-%m-%dT%H:%M:%S%:z"))
+                  j.field "flows", row.flows
+                  j.field "current", row.current
+                  j.field "tui_active", row.tui_active
                 end
               end
             end
@@ -100,12 +154,30 @@ module Gori
         elsif projects.empty?
           STDERR.puts "no projects yet — capture some traffic (gori run capture / the TUI) first"
         else
-          projects.each do |pr|
+          rows.each do |row|
+            pr = row.project
             ts = pr.last_modified.try(&.to_local.to_s("%Y-%m-%d %H:%M")) || "—"
             id = registry.id_of(pr) || "—"
-            puts "#{pr.name.ljust(24)}  #{id.ljust(8)}  #{ts}  #{CLI::Output.human_size(pr.db_size)}"
+            flows = row.flows.try(&.to_s) || "?"
+            puts "#{project_row_marker(row)} #{pr.name.ljust(24)}  #{id.ljust(8)}  #{ts}  " \
+                 "#{CLI::Output.human_size(pr.db_size).rjust(8)}  #{flows.rjust(6)} flows"
           end
         end
+        # On STDERR in BOTH formats, so a `--format json` consumer's pipe stays a clean
+        # array while the operator still learns their project is merely hidden rather than
+        # gone — the one reading of a shortened list that would send them to `create`.
+        return if hidden < 1
+        STDERR.puts "gori run project list: #{hidden} empty project#{hidden == 1 ? "" : "s"} hidden " \
+                    "(nothing captured) — pass --all to list every project"
+      end
+
+      # The leading glyph naming why a row is pinned. `◆` is the project a `gori run` with
+      # no `--project` reads; `◇` is the one the TUI last opened, shown only when the two
+      # have drifted apart (they usually have not — opening a project in the TUI makes it
+      # the most-recently-active one).
+      private def self.project_row_marker(row : ProjectListRow) : String
+        return "◆" if row.current
+        row.tui_active ? "◇" : " "
       end
 
       # `gori run project create` — make a project without capturing into it first.
