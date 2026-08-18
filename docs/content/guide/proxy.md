@@ -95,7 +95,7 @@ The sandbox governs proxied and captured traffic only. Repeater, Fuzzer, Miner, 
 
 ## Sitemap
 
-The **Sitemap** tab collapses History into a deduplicated tree of `host → path` endpoints, with method chips and scope markers. It's a quick way to see the shape of a target's attack surface. Press `g` to fold path-param ids, so `/user/1` and `/user/2` share one node and `/user/<uuid>` collapses into a single `{uuid}`.
+The **Sitemap** tab collapses History into a deduplicated tree of `host → path` endpoints, with method chips and scope markers. It's a quick way to see the shape of a target's attack surface. Press `g` to fold path-param ids, so `/user/1` and `/user/2` share one node and `/user/<uuid>` collapses into a single `{uuid}`. Query strings fold on their own axis: `/search?q=widgets` and `/search?q=<payload>` are one `/search` row, expandable to the variants, and `⇧G` turns that off.
 
 <figure class="tui-shot">
   <img src="/images/tui/sitemap.svg" alt="gori Sitemap tab showing captured hosts expanded into a tree of paths with method chips and per-host path counts">

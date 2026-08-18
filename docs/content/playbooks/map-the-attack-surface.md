@@ -34,6 +34,7 @@ A REST API buries its shape under identifiers: `/user/1`, `/user/2`, `/order/9f3
 
 ```bash
 gori run sitemap            # folds ids by default; --no-group shows every one
+                            # /search?q=1 + /search?q=2 fold onto /search; --no-fold-query splits them
 ```
 
 **Checkpoint.** Numeric and uuid-shaped segments collapse to one node each, and the tree shrinks to distinct endpoints.

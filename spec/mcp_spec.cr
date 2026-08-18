@@ -978,6 +978,60 @@ describe Gori::MCP::Server do
     end
   end
 
+  describe "list_sitemap query folding" do
+    it "folds the query variants of one path into a single entry, summing their counts" do
+      with_store do |store|
+        mk = ->(target : String, status : Int32) do
+          id = store.insert_flow(Gori::Store::CapturedRequest.new(
+            created_at: 1_i64, scheme: "https", host: "shop.demo.test", port: 443,
+            method: "GET", target: target, http_version: "HTTP/1.1",
+            head: "GET #{target} HTTP/1.1\r\nHost: shop.demo.test\r\n\r\n".to_slice, body: nil))
+          store.update_response(Gori::Store::CapturedResponse.new(
+            flow_id: id, status: status, head: "HTTP/1.1 #{status}\r\n\r\n".to_slice, body: nil))
+        end
+        mk.call("/search?q=widgets", 200)
+        mk.call("/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E", 500)
+        mk.call("/login", 200)
+
+        entries = tool_payload(drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sitemap","arguments":{}}}))[0]).as_a
+        entries.size.should eq(2) # /search once, /login once
+        search = entries.find { |e| e["target"].as_s == "/search" }.not_nil!
+        search["query_variants"].as_i.should eq(2)
+        search["query_targets"].as_a.size.should eq(2)
+        search["count"].as_i.should eq(2)         # summed over the variants
+        search["success_count"].as_i.should eq(1) # ...as are the outcome buckets
+        search["error_count"].as_i.should eq(1)
+        search["statuses"].as_s.split(',').sort!.should eq(["200", "500"])
+        # A path with no query is untouched: no fold fields, target verbatim.
+        login = entries.find { |e| e["target"].as_s == "/login" }.not_nil!
+        login.as_h.has_key?("query_variants").should be_false
+
+        # ...and fold_query:false is the twin of the CLI's --no-fold-query.
+        raw = tool_payload(drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sitemap","arguments":{"fold_query":false}}}))[0]).as_a
+        raw.size.should eq(3)
+        raw.map(&.["target"].as_s).should contain("/search?q=widgets")
+      end
+    end
+
+    it "keeps a folded path separate per transport, as the unfolded list does" do
+      with_store do |store|
+        mk = ->(scheme : String, port : Int32, target : String) do
+          store.insert_flow(Gori::Store::CapturedRequest.new(
+            created_at: 1_i64, scheme: scheme, host: "api.test", port: port,
+            method: "GET", target: target, http_version: "HTTP/1.1",
+            head: "GET #{target} HTTP/1.1\r\nHost: api.test\r\n\r\n".to_slice, body: nil))
+        end
+        mk.call("http", 80, "/x?a=1")
+        mk.call("https", 443, "/x?a=2")
+
+        entries = tool_payload(drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sitemap","arguments":{}}}))[0]).as_a
+        entries.size.should eq(2) # http and https did not merge
+        entries.map(&.["target"].as_s).should eq(["/x", "/x"])
+        entries.map(&.["scheme"].as_s).sort!.should eq(["http", "https"])
+      end
+    end
+  end
+
   describe "QL strict mode + ql_explain" do
     it "strict:true rejects a query with a silently-dropped term" do
       with_store do |store|
@@ -3487,8 +3541,18 @@ describe "MCP sitemap tags" do
       tags.size.should eq(1)
       tags.first["path"].as_s.should eq("/login?a=1")
 
+      # list_sitemap folds query variants by default, and the folded row is synthetic: it
+      # holds no tag of its own, but it does report the memo pinned on the variant.
       entry = ok_json(tools, "list_sitemap", "{}").as_a.first
-      entry["tag"].as_s.should eq("auth entry")
+      entry["target"].as_s.should eq("/login")
+      entry["query_variants"].as_i.should eq(1)
+      entry["query_targets"].as_a.map(&.as_s).should eq(["/login?a=1"])
+      entry["variant_tags"].as_a.first["tag"].as_s.should eq("auth entry")
+      entry.as_h.has_key?("tag").should be_false
+
+      unfolded = ok_json(tools, "list_sitemap", %({"fold_query":false})).as_a.first
+      unfolded["target"].as_s.should eq("/login?a=1")
+      unfolded["tag"].as_s.should eq("auth entry")
 
       ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login?a=1"}))["cleared"].as_bool.should be_true
       ok_json(tools, "list_sitemap_tags", "{}").as_a.empty?.should be_true

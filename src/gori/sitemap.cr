@@ -84,6 +84,13 @@ module Gori
       # endpoint, so putting them there would inflate every host's path count, and the
       # flat `paths` output would start emitting synthetic rows.
       property fold_methods : Array(String)
+      # On a fold node, whether it is a QUERY fold from `fold_queries!` — the variants of one
+      # path that differ only by their query string. It is the one fold whose label is a real
+      # path segment rather than a placeholder, so unlike `{uuid}`/`[1, 2, 3 …]` it also
+      # carries a real `path` (see `fold_queries_node!`). Still `grouped`, hence still not
+      # taggable/markable: the tag key is the node path INCLUDING the query, and this row
+      # stands for several of those at once.
+      property query_fold : Bool
       # This node is where a target deeper than `Sitemap::MAX_DEPTH` segments was cut, so
       # its `path` is a PREFIX of the captured target rather than the whole of it, and its
       # methods are those of one or more deeper endpoints folded onto it. Display-only — the
@@ -107,6 +114,7 @@ module Gori
         @grouped = false
         @fold_parent = nil
         @fold_methods = [] of String
+        @query_fold = false
         @truncated = false
       end
 
@@ -136,9 +144,12 @@ module Gori
 
     # Build the host-rooted tree from distinct (host, method, target) endpoints
     # (e.g. Store#sitemap_entries). Every distinct path segment is its own node; the
-    # tree `build` returns is always literal. Folding is separate and opt-in, in two
-    # passes run in this order: `fold_templates!` (opaque ids) then `group_sequences!`
-    # (numeric runs). Both WRAP their children rather than rewriting any node's `path`.
+    # tree `build` returns is always literal. Folding is separate and opt-in, in three
+    # passes run in this order: `fold_templates!` (opaque ids), `group_sequences!` (numeric
+    # runs), then `fold_queries!` (query-string variants). All three WRAP their children
+    # rather than rewriting any node's `path`. The first two are ONE axis (`g` /
+    # `--no-group`); the query fold is its own (`--no-fold-query`), so turning off id
+    # folding does not spill the query variants back into the tree.
     def self.build(entries : Enumerable({String, String, String})) : Array(Node)
       hosts = [] of Node
       host_index = {} of String => Node # O(1) host lookup (a scan can surface thousands of hosts)
@@ -413,6 +424,86 @@ module Gori
       node.children << group
     end
 
+    # Fold a node's query-string variants into ONE node per path: `/search?q=widgets` and
+    # `/search?q=<script>alert(1)</script>` become a single `search` row standing for both.
+    # A tester mapping a surface wants the ENDPOINT once; a fuzzed or paginated listing page
+    # otherwise contributes one tree row per payload, and the payload becomes the row label.
+    #
+    # Same synthetic-wrapper shape as the two id folds — the real children keep their literal
+    # `path` (query included), so a tag on `/search?q=1` still stamps and Repeater/open-flow
+    # still resolve a concrete captured target through the fold (`first_endpoint`).
+    #
+    # A SEPARATE axis from `g`/`--no-group` id folding, and deliberately run LAST: the id
+    # passes then see exactly the literal children they saw before this existed, so
+    # `/items/7?ref=home` still lands in the `[1, 2, 3 …]` run with `/items/7`.
+    #
+    # Unlike a numeric run there is no count threshold. One query string is already enough to
+    # bury the path under a payload, and a query is never route structure — `/search?q=1` is
+    # not a different endpoint from `/search`, where `/v1` and `/v2` genuinely are.
+    def self.fold_queries!(node : Node) : Nil
+      # Iterative post-order (see post_order) for the same stack-depth reason as the id folds.
+      post_order(node) { |n| fold_queries_node!(n) }
+    end
+
+    # Fold ONE node's query variants (see fold_queries!). Like the id passes: descend THROUGH
+    # a fold (its children are real), never re-fold a fold's OWN children — which is what
+    # keeps the pass idempotent and keeps the variants inside a `{uuid}`/numeric fold alone
+    # (they are already collapsed there).
+    private def self.fold_queries_node!(node : Node) : Nil
+      return if node.grouped
+      groups = {} of String => Array(Node)
+      node.children.each do |c|
+        next if c.grouped || !c.label.includes?('?')
+        (groups[query_group_key(c.label)] ||= [] of Node) << c
+      end
+      return if groups.empty?
+      folded = Set(UInt64).new
+      groups.each do |key, kids|
+        kids.each { |k| folded << k.object_id }
+        # The query-LESS sibling joins its own variants, so /search and /search?q=1 are ONE
+        # row. Only when it is a LEAF: a path that is also a directory (/api/users, with
+        # /api/users/5 under it) would take its whole subtree into the collapsed fold with
+        # it — the fold would then HIDE endpoints instead of deduplicating one.
+        if bare = node.children.find { |c| !c.grouped && c.leaf? && c.label == key }
+          kids.unshift(bare)
+          folded << bare.object_id
+        end
+      end
+      rest = node.children.reject { |c| folded.includes?(c.object_id) }
+      node.children.clear
+      node.children.concat(rest)
+      # Sorted so the tree shape is stable regardless of capture order (as in fold_templates!).
+      groups.keys.sort!.each do |key|
+        kids = groups[key]
+        group = Node.new(key)
+        group.grouped = true
+        group.query_fold = true
+        group.expanded = false
+        group.fold_parent = node.path
+        # A query fold's label IS a real path segment, so it also has a real path — the
+        # path-only endpoint every variant under it shares. `grouped` still bars a tag from
+        # stamping on it (stamp_tags!), because the tag key is the path WITH the query.
+        group.path = key == "/" ? "/" : "#{node.path}/#{key}"
+        group.fold_methods = fold_method_union(kids)
+        kids.each { |c| group.children << c }
+        node.children << group
+      end
+    end
+
+    # The path a query-bearing leaf label folds onto. A query on the bare root arrives as the
+    # label "?a=1" (see `add`), whose path part is empty — that folds onto the root's own "/"
+    # node, which is the label the tree already uses for it.
+    private def self.query_group_key(label : String) : String
+      key = path_part(label)
+      key.empty? ? "/" : key
+    end
+
+    # How many of a fold's children carry a query string — what the "(N queries)" chip counts.
+    # The absorbed query-less sibling is a child too, and it is not a query variant.
+    def self.query_variants(node : Node) : Int32
+      node.children.count(&.label.includes?('?'))
+    end
+
     # The path side of a leaf label. `add` appends the query to the LAST segment, so
     # `/items/7?ref=home` arrives here as the label `7?ref=home`. Every classifier has to
     # look past that or an id stops being recognisable the moment it carries a query —
@@ -441,13 +532,29 @@ module Gori
 
     # # of captured endpoints under a node: descendant nodes carrying ≥1 method
     # (= distinct (host, path) pairs, incl. folder-with-methods nodes like /api/users).
+    #
+    # A QUERY fold counts as ONE, and its children are not visited: they are the same
+    # method+path under different query strings, which is precisely what the fold says. An id
+    # fold still counts each child, because /users/<a> and /users/<b> ARE distinct endpoints —
+    # the count would otherwise disagree with the row it sits on ("/search  (1 path)" while
+    # the host claimed three).
     def self.endpoint_count(node : Node) : Int32
-      # Iterative (see post_order): the old recursion spent one frame per tree level and
+      # Iterative (as in post_order): the old recursion spent one frame per tree level and
       # overflowed the native stack on a pathologically deep path — and unlike the fold
       # passes this one runs on EVERY sitemap reload (SitemapView#reload, `gori run sitemap`),
-      # so it was the likeliest of the seven walkers to actually be hit.
+      # so it was the likeliest of the seven walkers to actually be hit. An explicit stack
+      # rather than `post_order` because this walk has to PRUNE a subtree, which post_order's
+      # collect-then-yield shape cannot express.
       n = 0
-      post_order(node) { |x| n += 1 unless x.methods.empty? }
+      stack = [node]
+      while cur = stack.pop?
+        if cur.query_fold
+          n += 1 unless cur.fold_methods.empty?
+          next
+        end
+        n += 1 unless cur.methods.empty?
+        cur.children.each { |c| stack << c }
+      end
       n
     end
 

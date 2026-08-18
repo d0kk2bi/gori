@@ -512,7 +512,7 @@ A malformed entry is skipped rather than aborting the file; the result reports b
 gori run sitemap --in-scope --format paths
 ```
 
-`-q`/`--query=QL` filters endpoints with the same QL as history (also positional), `-n`/`--limit=N` caps the endpoints scanned (default `SITEMAP_MAX`), `--in-scope` limits to in-scope hosts, `--no-group` disables id folding, `--format` is `text` (tree), `json`, or `paths`, and `--lenient` accepts a query that names an unknown field instead of refusing it.
+`-q`/`--query=QL` filters endpoints with the same QL as history (also positional), `-n`/`--limit=N` caps the endpoints scanned (default `SITEMAP_MAX`), `--in-scope` limits to in-scope hosts, `--no-group` disables id folding, `--no-fold-query` disables query-string folding (the two are separate axes), `--format` is `text` (tree), `json`, or `paths`, and `--lenient` accepts a query that names an unknown field instead of refusing it.
 
 **`sitemap tag`**: pin a free-text memo onto one path, the same note the TUI's Sitemap shows.
 

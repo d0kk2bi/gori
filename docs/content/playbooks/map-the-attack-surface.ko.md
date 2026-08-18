@@ -34,6 +34,7 @@ REST API는 식별자 아래에 형태를 파묻습니다. `/user/1`, `/user/2`,
 
 ```bash
 gori run sitemap            # id를 기본으로 접습니다; --no-group은 전부 보여 줍니다
+                            # /search?q=1 + /search?q=2는 /search로 접힙니다; --no-fold-query는 펼칩니다
 ```
 
 **체크포인트.** 숫자와 uuid 모양의 세그먼트가 각각 한 노드로 접히고, 트리가 뚜렷한 엔드포인트만 남도록 줄어듭니다.

@@ -479,7 +479,7 @@ gori run import --postman api.postman_collection.json --db ./assessment.db --for
 gori run sitemap --in-scope --format paths
 ```
 
-`-q`/`--query=QL`는 history와 같은 QL로 엔드포인트를 거릅니다(위치 인자로도 넘길 수 있습니다). `-n`/`--limit=N`은 스캔할 엔드포인트 수를 제한합니다(기본값 `SITEMAP_MAX`). `--in-scope`는 스코프 내 호스트로 한정하고, `--no-group`은 id 접기를 끕니다. `--format`은 `text`(트리), `json`, `paths` 중에서 고릅니다. `--lenient`는 없는 필드 이름을 쓴 쿼리를 거절하지 않고 받아들입니다.
+`-q`/`--query=QL`는 history와 같은 QL로 엔드포인트를 거릅니다(위치 인자로도 넘길 수 있습니다). `-n`/`--limit=N`은 스캔할 엔드포인트 수를 제한합니다(기본값 `SITEMAP_MAX`). `--in-scope`는 스코프 내 호스트로 한정하고, `--no-group`은 id 접기를, `--no-fold-query`는 쿼리 문자열 접기를 끕니다(서로 다른 축입니다). `--format`은 `text`(트리), `json`, `paths` 중에서 고릅니다. `--lenient`는 없는 필드 이름을 쓴 쿼리를 거절하지 않고 받아들입니다.
 
 **`sitemap tag`**: 경로 하나에 자유 텍스트 메모를 고정합니다. TUI Sitemap에 보이는 그 메모입니다.
 

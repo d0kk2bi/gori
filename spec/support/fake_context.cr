@@ -560,6 +560,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     rec(:sitemap_toggle_grouping)
   end
 
+  def sitemap_toggle_query_fold : Nil
+    rec(:sitemap_toggle_query_fold)
+  end
+
   def sitemap_discover : Nil
     rec(:sitemap_discover)
   end

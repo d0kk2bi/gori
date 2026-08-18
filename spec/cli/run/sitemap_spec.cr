@@ -70,6 +70,59 @@ describe "gori run sitemap — text tree" do
   end
 end
 
+describe "gori run sitemap — query folding" do
+  it "collapses two query variants into one /search row" do
+    hosts = Gori::Sitemap.build([
+      {"shop.demo.test", "GET", "/search?q=widgets"},
+      {"shop.demo.test", "GET", "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"},
+    ])
+    hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
+    hosts.each { |h| h.endpoints = Gori::Sitemap.endpoint_count(h) }
+    txt = Gori::CLI::Output.sitemap_text(hosts)
+    txt.should contain("shop.demo.test  (1 path)")
+    txt.should contain("search  (2 queries)  [GET]")
+    txt.should_not contain("script") # the payload is not a tree row
+  end
+
+  it "leaves a path with no query as one plain node" do
+    hosts = Gori::Sitemap.build([{"h", "GET", "/search"}])
+    hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
+    hosts.each { |h| h.endpoints = Gori::Sitemap.endpoint_count(h) }
+    txt = Gori::CLI::Output.sitemap_text(hosts)
+    txt.should contain("search  [GET]")
+    txt.should_not contain("queries")
+    txt.should contain("h  (1 path)")
+  end
+
+  it "prints the literal variants when the fold pass is skipped (--no-fold-query)" do
+    hosts = Gori::Sitemap.build([
+      {"h", "GET", "/search?q=widgets"},
+      {"h", "GET", "/search?q=other"},
+    ])
+    hosts.each { |h| h.endpoints = Gori::Sitemap.endpoint_count(h) }
+    txt = Gori::CLI::Output.sitemap_text(hosts)
+    txt.should contain("search?q=widgets  [GET]")
+    txt.should contain("search?q=other  [GET]")
+    txt.should contain("h  (2 paths)")
+  end
+
+  it "still folds ids on the other axis" do
+    # --no-group and --no-fold-query are separate switches: id folding is unchanged by the
+    # query pass running after it.
+    hosts = Gori::Sitemap.build([
+      {"h", "GET", "/users/3f2a8b1c-1234-5678-9abc-def012345678"},
+      {"h", "GET", "/users/a1b2c3d4-5566-7788-99aa-bbccddeeff00"},
+      {"h", "GET", "/search?q=1"},
+    ])
+    hosts.each { |h| Gori::Sitemap.fold_templates!(h) }
+    hosts.each { |h| Gori::Sitemap.group_sequences!(h) }
+    hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
+    txt = Gori::CLI::Output.sitemap_text(hosts)
+    txt.should contain("{uuid}  (2 values)  [GET]")
+    txt.should contain("search  (1 query)  [GET]")
+  end
+end
+
 describe "gori run sitemap --format paths" do
   it "lists every endpoint flat (numeric folding irrelevant)" do
     hosts = Gori::Sitemap.build([
@@ -77,6 +130,35 @@ describe "gori run sitemap --format paths" do
       {"acme.test", "POST", "/api/users"},
     ])
     Gori::CLI::Output.sitemap_paths(hosts).should eq("GET,POST  acme.test/api/users\n")
+  end
+
+  it "lists a query fold ONCE, at its path" do
+    # Unlike an id fold, whose children are distinct endpoints, the variants here are one
+    # endpoint — and this listing is what a tester pipes into the next tool.
+    hosts = Gori::Sitemap.build([
+      {"h", "GET", "/search?q=widgets"},
+      {"h", "POST", "/search?q=other"},
+      {"h", "GET", "/login"},
+    ])
+    hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
+    Gori::CLI::Output.sitemap_paths(hosts).should eq(
+      "GET  h/login\n" \
+      "GET,POST  h/search\n")
+  end
+
+  it "merges a query fold onto the same path as the real directory node" do
+    # /api/users is both an endpoint and a directory, so the fold sits BESIDE it rather than
+    # swallowing it (that would hide /api/users/5) — and both carry the path /api/users. This
+    # listing promises one line per (host, path).
+    hosts = Gori::Sitemap.build([
+      {"h", "GET", "/api/users"},
+      {"h", "GET", "/api/users/5"},
+      {"h", "POST", "/api/users?page=1"},
+    ])
+    hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
+    Gori::CLI::Output.sitemap_paths(hosts).should eq(
+      "GET,POST  h/api/users\n" \
+      "GET  h/api/users/5\n")
   end
 
   it "still lists every FOLDED endpoint flat" do
@@ -128,6 +210,24 @@ describe "gori run sitemap --format json" do
       "/users/3f2a8b1c-1234-5678-9abc-def012345678",
       "/users/a1b2c3d4-5566-7788-99aa-bbccddeeff00",
     ])
+  end
+
+  it "marks a query fold, and unlike an id fold gives it a path and a query count" do
+    hosts = Gori::Sitemap.build([
+      {"h", "GET", "/search?q=widgets"},
+      {"h", "GET", "/search?q=other"},
+    ])
+    hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
+    json = JSON.parse(Gori::CLI::Output.sitemap_json(hosts)).as_a
+    fold = json[0]["children"].as_a.find! { |c| c["label"].as_s == "search" }
+    fold["grouped"].as_bool.should be_true
+    fold["query_fold"].as_bool.should be_true
+    fold["template"]?.should be_nil
+    fold["path"].as_s.should eq("/search") # its label IS a real path segment
+    fold["queries"].as_i.should eq(2)
+    fold["methods"].as_a.map(&.as_s).should eq(["GET"])
+    # The complete tree is still there: JSON never collapses, so the raw targets remain.
+    fold["children"].as_a.map(&.["path"].as_s).should eq(["/search?q=widgets", "/search?q=other"])
   end
 
   # sitemap_json is emitted by hand rather than through JSON::Builder precisely because the

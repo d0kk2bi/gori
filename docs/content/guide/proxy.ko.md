@@ -92,7 +92,7 @@ Match & Replace는 홀드보다 **먼저** 돌기 때문에, 편집기에서 보
 
 ## Sitemap {#sitemap}
 
-**Sitemap** 탭은 History를 중복 제거된 `host → path` 엔드포인트 트리로 접어, 메서드 칩과 스코프 마커를 함께 보여줍니다. 대상의 공격 표면을 한눈에 파악하기 좋습니다. `g`를 누르면 경로 파라미터의 id를 접습니다. `/user/1`과 `/user/2`가 한 노드를 공유하고, `/user/<uuid>`는 `{uuid}` 하나로 모입니다.
+**Sitemap** 탭은 History를 중복 제거된 `host → path` 엔드포인트 트리로 접어, 메서드 칩과 스코프 마커를 함께 보여줍니다. 대상의 공격 표면을 한눈에 파악하기 좋습니다. `g`를 누르면 경로 파라미터의 id를 접습니다. `/user/1`과 `/user/2`가 한 노드를 공유하고, `/user/<uuid>`는 `{uuid}` 하나로 모입니다. 쿼리 문자열은 별개의 축으로 접힙니다. `/search?q=widgets`와 `/search?q=<payload>`는 `/search` 한 줄이 되고(펼치면 원래 변형이 보입니다), `⇧G`로 끌 수 있습니다.
 
 <figure class="tui-shot">
   <img src="/images/tui/sitemap.svg" alt="캡처된 호스트들이 경로 트리로 펼쳐지고 메서드 칩과 호스트별 경로 개수가 표시된 gori Sitemap 탭">

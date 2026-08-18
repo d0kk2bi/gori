@@ -315,6 +315,101 @@ describe Gori::Tui::SitemapView do
     end
   end
 
+  it "folds query-string variants into one path row; ⇧G unfolds them" do
+    tmp_store do |store|
+      capture(store, "shop.demo.test", "GET", "/search?q=widgets")
+      capture(store, "shop.demo.test", "GET", "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+
+      view = SitemapView.new
+      view.reload(store)
+      b = MemoryBackend.new(90, 24)
+      view.render(Screen.new(b), Rect.new(0, 0, 90, 24))
+      b.contains?("search").should be_true
+      b.contains?("2 queries").should be_true # the folded-count chip, counted as queries
+      b.contains?("GET").should be_true       # the fold's stand-in verbs, while collapsed
+      b.contains?("script").should be_false   # the payload never becomes a row
+      b.contains?("1 path").should be_true    # ...and the endpoint count agrees with the row
+
+      view.fold_query?.should be_true
+      view.toggle_fold_query
+      view.fold_query?.should be_false
+      view.reload(store)
+      b2 = MemoryBackend.new(90, 24)
+      view.render(Screen.new(b2), Rect.new(0, 0, 90, 24))
+      b2.contains?("q=widgets").should be_true
+      b2.contains?("2 paths").should be_true
+    end
+  end
+
+  it "leaves a query-less path as one plain row" do
+    tmp_store do |store|
+      capture(store, "acme.test", "GET", "/search")
+      view = SitemapView.new
+      view.reload(store)
+      b = MemoryBackend.new(70, 20)
+      view.render(Screen.new(b), Rect.new(0, 0, 70, 20))
+      b.contains?("search").should be_true
+      b.contains?("queries").should be_false
+      b.contains?("1 path").should be_true
+    end
+  end
+
+  it "keeps id folding on its own axis: `g` does not explode the query fold" do
+    tmp_store do |store|
+      capture(store, "acme.test", "GET", "/users/3f2a8b1c-1234-5678-9abc-def012345678")
+      capture(store, "acme.test", "GET", "/users/a1b2c3d4-5566-7788-99aa-bbccddeeff00")
+      capture(store, "acme.test", "GET", "/search?q=widgets")
+      capture(store, "acme.test", "GET", "/search?q=other")
+
+      view = SitemapView.new
+      view.reload(store)
+      b = MemoryBackend.new(90, 24)
+      view.render(Screen.new(b), Rect.new(0, 0, 90, 24))
+      b.contains?("{uuid}").should be_true
+      b.contains?("2 queries").should be_true
+
+      view.toggle_grouping # id folding OFF — the query fold is untouched
+      view.reload(store)
+      b2 = MemoryBackend.new(90, 24)
+      view.render(Screen.new(b2), Rect.new(0, 0, 90, 24))
+      b2.contains?("3f2a8b1c").should be_true  # every literal id back
+      b2.contains?("2 queries").should be_true # ...and the queries still folded
+      b2.contains?("q=widgets").should be_false
+    end
+  end
+
+  it "resolves the fold to a concrete captured target for Repeater, and to its path for scope" do
+    tmp_store do |store|
+      capture(store, "shop.demo.test", "GET", "/search?q=widgets")
+      capture(store, "shop.demo.test", "GET", "/search?q=other")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.move(1) # host row → the /search fold
+      # Repeater/open-flow look a flow up by exact equality on flows.target, so the fold has
+      # to hand them a variant, not the path it displays.
+      # ...the first variant under it, in the store's ORDER BY target order.
+      view.selected_endpoint.should eq({host: "shop.demo.test", method: "GET", target: "/search?q=other"})
+      # Scope/Discover instead mean the PATH — a query fold has a real one, unlike {uuid}.
+      view.selected_scope_seed.should eq({match_type: "string", pattern: "shop.demo.test/search"})
+      view.selected_endpoint(:container).should eq({host: "shop.demo.test", method: "GET", target: "/search"})
+    end
+  end
+
+  it "refuses to tag or mark a query fold, as it refuses an id fold" do
+    tmp_store do |store|
+      capture(store, "shop.demo.test", "GET", "/search?q=widgets")
+      capture(store, "shop.demo.test", "GET", "/search?q=other")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.move(1)                     # the fold row
+      view.toggle_mark.should be_false # synthetic: no (host, path) key to mark
+      view.mark_count.should eq(0)
+      view.start_tag.should be_false # ...and nothing taggable, exactly as on a {uuid} fold
+    end
+  end
+
   it "keeps an expanded fold open across reload (live capture poll)" do
     # Regression: apply_expand_depth! force-collapses every fold on every rebuild, and the
     # expand-state walk used to skip synthetic nodes entirely — so a fold the user opened
