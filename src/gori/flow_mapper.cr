@@ -13,7 +13,8 @@ module Gori
                      body : Bytes? = nil, sni : String? = nil,
                      alpn : String? = nil, tls_version : String? = nil,
                      body_truncated : Bool = false, body_size : Int64? = nil,
-                     short_circuited : Bool = false) : Store::CapturedRequest
+                     short_circuited : Bool = false,
+                     advisory : String? = nil) : Store::CapturedRequest
       # A malformed request-line (unencoded space ⇒ >3 tokens, or the h2 preface) makes
       # split(' ') mis-slice target/version — target becomes a truncated fragment and
       # version a garbage token. RawRequest keeps those for the live forwarding/keep-alive
@@ -39,6 +40,7 @@ module Gori
         body_truncated: body_truncated,
         body_size: body_size,
         short_circuited: short_circuited,
+        advisory: advisory,
       )
     end
 
@@ -47,7 +49,8 @@ module Gori
                       duration_us : Int64? = nil,
                       state : Store::FlowState = Store::FlowState::Complete,
                       error : String? = nil,
-                      body_truncated : Bool = false, body_size : Int64? = nil) : Store::CapturedResponse
+                      body_truncated : Bool = false, body_size : Int64? = nil,
+                      advisory : String? = nil) : Store::CapturedResponse
       Store::CapturedResponse.new(
         flow_id: flow_id,
         status: resp.status,
@@ -62,6 +65,7 @@ module Gori
         error: error,
         body_truncated: body_truncated,
         body_size: body_size,
+        advisory: advisory,
       )
     end
 

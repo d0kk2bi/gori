@@ -645,9 +645,9 @@ module Gori::Proxy
         return false
       end
       stored, trunc, size = capped(edited_body)
-      flow_id = @sink.on_request(with_advisory(FlowMapper.request(sent_req,
+      flow_id = @sink.on_request(FlowMapper.request(sent_req,
         scheme: scheme, host: host, port: port, created_at: created_at,
-        body: stored, body_truncated: trunc, body_size: size), advisory))
+        body: stored, body_truncated: trunc, body_size: size, advisory: advisory))
       handle_response(upstream, req, flow_id, started, host, port, scheme,
         reused: reused, sent_head: sent_head, can_retry: retryable, sent_req: sent_req)
     end
@@ -787,9 +787,9 @@ module Gori::Proxy
         return false
       end
       stored, trunc, size = capped(fwd_body)
-      flow_id = @sink.on_request(with_advisory(FlowMapper.request(sent_req,
+      flow_id = @sink.on_request(FlowMapper.request(sent_req,
         scheme: scheme, host: host, port: port, created_at: created_at,
-        body: stored, body_truncated: trunc, body_size: size), advisory))
+        body: stored, body_truncated: trunc, body_size: size, advisory: advisory))
       handle_response(upstream, req, flow_id, started, host, port, scheme,
         reused: reused, sent_head: sent_head, can_retry: false, sent_req: sent_req)
     end
@@ -1388,9 +1388,10 @@ module Gori::Proxy
         resp_complete = false
       end
       duration = (Time.instant - started).total_microseconds.to_i64
-      @sink.on_response(with_advisory(FlowMapper.response(sent_resp,
+      @sink.on_response(FlowMapper.response(sent_resp,
         flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-        body_truncated: trunc, body_size: size, state: state, error: error), advisory))
+        body_truncated: trunc, body_size: size, state: state, error: error,
+        advisory: advisory))
       # Reuse iff the origin kept its side AND we read the whole body; a truncated body
       # was forwarded short, so close the client connection (return false) rather than
       # block its next keep-alive request on the missing bytes.
@@ -1517,14 +1518,14 @@ module Gori::Proxy
         # gori withheld, hence `Bytes.empty` rather than nil.
         observe_delivered(extract_ref_for(sent_req, host, scheme, sent_resp.status, flow_id),
           out_head, out_body || Bytes.empty)
-        @sink.on_response(with_advisory(FlowMapper.response(sent_resp,
+        @sink.on_response(FlowMapper.response(sent_resp,
           flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-          body_truncated: trunc, body_size: size), advisory))
+          body_truncated: trunc, body_size: size, advisory: advisory))
       else
-        @sink.on_response(with_advisory(FlowMapper.response(sent_resp,
+        @sink.on_response(FlowMapper.response(sent_resp,
           flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-          body_truncated: trunc, body_size: size,
-          state: Store::FlowState::Aborted, error: "connection closed while forwarding held response"), advisory))
+          body_truncated: trunc, body_size: size, advisory: advisory,
+          state: Store::FlowState::Aborted, error: "connection closed while forwarding held response"))
       end
       # Reuse the upstream iff we read the WHOLE body cleanly AND the origin kept its
       # side alive. Origin side keys on sent_req (what the origin received); the CLIENT
@@ -2444,33 +2445,6 @@ module Gori::Proxy
         "went through byte-exact. Said once per {direction, host, coding} on this connection; " \
         "every affected flow carries the same statement in History."
       end
-    end
-
-    # `advisory` overlaid onto a projection `FlowMapper` already built. Everything else on the
-    # DTO is EXTRACTED from the wire message, which is `FlowMapper`'s whole job; an advisory is
-    # the one field that comes from gori rather than from the bytes, and it is produced deep
-    # inside the forwarding path rather than at the projection boundary — so it is layered on
-    # here instead of threaded through every `FlowMapper` signature that might one day carry
-    # one. nil returns the DTO untouched, so the ordinary flow allocates nothing extra.
-    private def with_advisory(req : Store::CapturedRequest, advisory : String?) : Store::CapturedRequest
-      return req unless advisory
-      Store::CapturedRequest.new(
-        created_at: req.created_at, scheme: req.scheme, host: req.host, port: req.port,
-        method: req.method, target: req.target, http_version: req.http_version,
-        head: req.head, body: req.body, sni: req.sni, alpn: req.alpn,
-        tls_version: req.tls_version, body_truncated: req.body_truncated?,
-        body_size: req.body_size, h2_conn_id: req.h2_conn_id, h2_stream_id: req.h2_stream_id,
-        short_circuited: req.short_circuited?, advisory: advisory)
-    end
-
-    private def with_advisory(resp : Store::CapturedResponse, advisory : String?) : Store::CapturedResponse
-      return resp unless advisory
-      Store::CapturedResponse.new(
-        flow_id: resp.flow_id, status: resp.status, head: resp.head, body: resp.body,
-        reason: resp.reason, content_type: resp.content_type, ttfb_us: resp.ttfb_us,
-        duration_us: resp.duration_us, state: resp.state, error: resp.error,
-        body_truncated: resp.body_truncated?, body_size: resp.body_size,
-        content_encoding: resp.content_encoding, advisory: advisory)
     end
 
     # Rebuild a message head framed as `Content-Length: len`: drop any Transfer-Encoding
