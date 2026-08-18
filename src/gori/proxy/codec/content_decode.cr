@@ -164,6 +164,23 @@ module Gori::Proxy::Codec
       !(ce_values.empty? && te_values.empty?) && Http1.obfuscated_header?(head)
     end
 
+    # The compression codings this head DECLARES, in wire order: the Content-Encoding layers
+    # first, then the Transfer-Encoding layers that are not the final `chunked` framing. The
+    # same two splits `content_encoded?` refuses on and `decode_full` undoes, so a caller that
+    # names the refusal to a human cannot name a different set than the gate acted on.
+    #
+    # EMPTY is not the same as "not encoded": `content_encoded?` also fails closed on a head
+    # whose encoding header is obs-folded (RFC 7230 §3.2.4), and there the coding is exactly
+    # what could not be read. Ask `content_encoded?` for the decision; ask this only to say
+    # WHICH, and be prepared to have nothing to name. Kept separate rather than folded into the
+    # predicate because that one is asked on every buffered body and must stay a Bool on its
+    # fast path — this runs only where a refusal is about to be explained.
+    def self.declared_codings(head : Bytes) : Array(String)
+      return [] of String unless head_has_encoding?(head)
+      te_values, ce_values = encoding_headers(head)
+      content_layers(ce_values) + transfer_layers(te_values, transfer_encoding_chunked?(te_values))
+    end
+
     # `chunked` frames the body only when it's the FINAL transfer-coding (RFC 7230
     # §3.3.1) — mirror the strict wire codec (Body.chunked?) rather than a loose
     # substring scan, which would wrongly de-chunk a body whose TE merely contains

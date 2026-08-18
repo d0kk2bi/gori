@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "socket"
+require "log/spec" # `Log.capture` — the once-per-connection latch in #745 is a LOG-rate claim
 
 # Records captured flows in memory so the proxy can be tested without a DB.
 private class RecordingSink < Gori::Proxy::FlowSink
@@ -205,6 +206,71 @@ private def start_te_gzip_origin(plain : String, seen : Channel(String)) : {Int3
     end
   end
   {port, wire_body}
+end
+
+# A KEEP-ALIVE origin whose every response is `Content-Encoding: gzip` under a Content-Length
+# — the ordinary compressed response, and (unlike `start_te_gzip_origin`'s `Connection: close`)
+# one that lets several exchanges ride a single client connection, which is what the
+# once-per-connection log latch is keyed on. Returns the port and the exact compressed entity.
+private def start_gzip_origin(plain : String) : {Int32, Bytes}
+  gz = IO::Memory.new
+  Compress::Gzip::Writer.open(gz) { |w| w.print(plain) }
+  compressed = gz.to_slice
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    while conn = origin.accept?
+      # The CALL form, not `spawn do ... end`: a block would capture the loop variable and the
+      # next `accept?` would reassign it under the running fiber (the hazard `TeardownLatch`
+      # documents in client_conn.cr).
+      spawn serve_gzip_keepalive(conn, compressed)
+    end
+  end
+  {port, compressed}
+end
+
+# One keep-alive connection of `start_gzip_origin`: answer every head that arrives until the
+# peer stops sending.
+private def serve_gzip_keepalive(conn : TCPSocket, compressed : Bytes) : Nil
+  while Gori::Proxy::Codec::Http1.read_head(conn)
+    conn << "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip\r\n"
+    conn << "Content-Length: " << compressed.size << "\r\n\r\n"
+    conn.write(compressed)
+    conn.flush
+  end
+rescue
+  # client/proxy gone mid-read — nothing left to answer
+ensure
+  conn.close rescue nil
+end
+
+# The rewriter shape #745's notice needs: a live RESPONSE body rule that also CLAIMS THE HOST.
+# `Rules` derives both answers from one rule table, but the abstract seam has them as separate
+# questions with `rewrites_body_for_host?` defaulting to FALSE — so a stub must say both, and
+# `host_match: false` is a real rule table whose glob points somewhere else.
+private class HostScopedBodyRewriter < Gori::Proxy::HeadRewriter
+  def initialize(@host_match : Bool = true)
+  end
+
+  def rewrite_request(head : Bytes, host : String) : Bytes
+    head
+  end
+
+  def rewrite_response(head : Bytes, host : String) : Bytes
+    head
+  end
+
+  def rewrites_response_body? : Bool
+    true
+  end
+
+  def rewrites_body_for_host?(host : String) : Bool
+    @host_match
+  end
+
+  def rewrite_response_body(entity : Bytes, host : String) : Bytes
+    String.new(entity).gsub("SECRET", "[HIDDEN]").to_slice
+  end
 end
 
 # Read a whole response as BYTES. `gets_to_end` decodes to a String, which mangles a
@@ -1393,6 +1459,114 @@ describe Gori::Proxy::Server do
     head.should contain("Transfer-Encoding: gzip, chunked")
     head.should_not contain("Content-Length") # not re-framed → the rewrite was refused
     resp.body.not_nil!.should eq(wire_body)   # capture keeps the wire form, unrewritten
+  end
+
+  # --- #745: the refusal above used to be MUTE ------------------------------------------
+  #
+  # The gate is right and it is going to stay; what it owed the operator was a sentence. These
+  # four cover the two rates and the two ways it must stay quiet.
+
+  it "annotates the flow when a live body rule is refused on a compressed response (#745)" do
+    done = Channel(Nil).new(1)
+    origin_port, compressed = start_gzip_origin("the SECRET value")
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: HostScopedBodyRewriter.new)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /gz HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    receive_within(done, what: "the captured response")
+    client.close
+    proxy.stop
+
+    resp = sink.responses.first
+    # The refusal itself is unchanged: no re-framing, the compressed bytes captured as they
+    # arrived. What is new is that the flow now SAYS so.
+    resp.body.not_nil!.should eq(compressed)
+    advisory = resp.advisory.should_not be_nil
+    advisory.should contain("Match&Replace was NOT applied to this response body")
+    advisory.should contain("gzip") # the coding that was declared (#745 point 3)
+    advisory.should contain("byte-exact")
+  end
+
+  it "says nothing when the same rule runs — an UNcompressed response (#745 control)" do
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_origin("the SECRET value", seen)
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: HostScopedBodyRewriter.new)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /plain HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    receive_within(done, what: "the captured response")
+    client.close
+    proxy.stop
+    receive_within(seen, what: "the origin hit")
+
+    resp = sink.responses.first
+    String.new(resp.body.not_nil!).should eq("the [HIDDEN] value") # the rule DID fire
+    resp.advisory.should be_nil                                    # so there is nothing to say
+  end
+
+  # #745 point 4: an advisory on a host the operator's rule does not target is noise — and a
+  # false statement, since nothing failed to fire there. Same compressed response, same live
+  # rule, one answer different.
+  it "says nothing when no body rule matches this host (#745)" do
+    done = Channel(Nil).new(1)
+    origin_port, _ = start_gzip_origin("the SECRET value")
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink,
+      rewriter: HostScopedBodyRewriter.new(host_match: false))
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /gz HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    receive_within(done, what: "the captured response")
+    client.close
+    proxy.stop
+
+    sink.responses.first.advisory.should be_nil
+  end
+
+  # The two rates, in one example (#745 point 1). EVERY affected flow is annotated — "did my
+  # rule run on THIS response?" is a per-flow question — while `gori.log` gets ONE line per
+  # {direction, host, coding} on the connection, because a page load takes this branch dozens
+  # of times and dozens of identical lines are worth nothing.
+  it "annotates every affected flow but logs the refusal once per connection (#745)" do
+    done = Channel(Nil).new(1)
+    origin_port, _ = start_gzip_origin("the SECRET value")
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: HostScopedBodyRewriter.new)
+    proxy.start
+
+    logs = Log.capture(level: Log::Severity::Warn) do
+      # ONE client socket, so both requests are served by ONE ClientConn — which is what the
+      # latch is keyed on. Driven off the sink rather than off the client's reads: the
+      # responses are a few dozen bytes and sit in the socket buffer, so nothing here depends
+      # on winning a race with a close (the Linux/macOS trap `receive_within` documents).
+      client = TCPSocket.new("127.0.0.1", proxy.port)
+      client << "GET /one HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+      client.flush
+      receive_within(done, what: "the first captured response")
+      client << "GET /two HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+      client.flush
+      receive_within(done, what: "the second captured response")
+      client.close
+    end
+    proxy.stop
+
+    sink.responses.size.should eq(2)
+    sink.responses.each(&.advisory.should_not be_nil) # per FLOW, every time
+    logs.check(:warn, /a BODY rule matching .* was not applied/)
+    logs.empty # …and only once, for the whole connection
   end
 
   it "leaves a response body over MAX_REWRITE_BODY byte-exact (rule no-ops, no unbounded buffer)" do
