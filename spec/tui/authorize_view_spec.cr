@@ -32,7 +32,76 @@ private def render(v : AuthorizeView, w = 120, h = 30) : Nil
   v.render(Screen.new(MemoryBackend.new(w, h)), Rect.new(0, 0, w, h), true)
 end
 
+# The same render, handing back the backend so a column can be read off the grid.
+private def render_to(v : AuthorizeView, w = 120, h = 30) : MemoryBackend
+  be = MemoryBackend.new(w, h)
+  v.render(Screen.new(be), Rect.new(0, 0, w, h), true)
+  be
+end
+
+# Where a row's VERDICT column starts, by finding the header's own.
+private def verdict_col(be : MemoryBackend, header_row : Int32) : Int32
+  be.row(header_row).index("VERDICT").not_nil!
+end
+
 describe AuthorizeView do
+  # A master row and its detail pane must not contradict each other — the rule `settle_running`
+  # states. The detail pane draws a trials table whenever a target is there, so a state that
+  # means "no result" has to drop the one the run before it left.
+  describe "a row that stops having a result" do
+    it "drops the previous trials when a run declines it" do
+      v = AuthorizeView.new
+      id = v.add(flow)
+      v.apply_result(id, target(false))
+      v.apply_skip(id, :no_effect)
+      e = v.entries.first
+      e.state.should eq(:skipped)
+      e.target.should be_nil
+      v.pending_entries.size.should eq(1) # ^R can still ask again
+      be = render_to(v)
+      (0...30).any? { |y| be.row(y).includes?("IDENTITY") }.should be_false
+      be.contains?("no identity changes them").should be_true
+    end
+
+    it "drops them when a re-run raises" do
+      v = AuthorizeView.new
+      id = v.add(flow)
+      v.apply_result(id, target(true))
+      v.apply_error(id, "connection refused")
+      v.entries.first.target.should be_nil
+      be = render_to(v)
+      (0...30).any? { |y| be.row(y).includes?("IDENTITY") }.should be_false
+      be.contains?("connection refused").should be_true
+    end
+  end
+
+  # Every column here is placed by MEASURING the text before it, and a Hangul or CJK glyph is
+  # one character and TWO display columns. Measured in characters, a name or a path of them
+  # pushed VERDICT off its column and over the text to its left.
+  describe "columns of wide characters" do
+    it "keeps the request row's verdict on the header's column" do
+      v = AuthorizeView.new
+      v.add(flow("GET", "/관리자/설정/사용자목록", "테스트.example"))
+      be = render_to(v)
+      # row 0 = the "N requests · identities:" line, 1 = the column header, 2 = the request.
+      be.row(2).index("pending").should eq(verdict_col(be, 1))
+    end
+
+    it "keeps the trial table's verdict on its header's column" do
+      v = AuthorizeView.new
+      id = v.add(flow)
+      v.apply_result(id, Gori::Authorize::Target.new(1_i64, "GET", "https://h.test/admin", [
+        trial("관리자세션", true, 200, Gori::Authorize::Verdict::Baseline),
+        trial("익명", false, 403, Gori::Authorize::Verdict::Different),
+      ]))
+      be = render_to(v)
+      hdr = (0...30).find { |y| be.row(y).includes?("IDENTITY") }.not_nil!
+      col = verdict_col(be, hdr)
+      be.row(hdr + 1).index("baseline").should eq(col)
+      be.row(hdr + 2).index("different").should eq(col)
+    end
+  end
+
   it "starts empty with the two built-in identities and renders the empty state" do
     v = AuthorizeView.new
     v.any_requests?.should be_false

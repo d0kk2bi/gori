@@ -53,6 +53,8 @@ module Gori::Tui
       @active_gen = nil.as(Int32?) # non-nil while a run fiber is alive
       @batch_ids = Set(Int32).new
       @batch_size = 0
+      @batch_declined = 0
+      @batch_declined_reason = nil.as(Symbol?)
       @identities_loaded = nil.as(Array(Authorize::Identity)?)
       @passive = false
       @passive_started = false
@@ -109,9 +111,14 @@ module Gori::Tui
       list = identities.dup
       if i = index
         return false unless 0 <= i < list.size
-        # Editing must not move the baseline: the flag belongs to the list, and the form does
-        # not carry it (see AuthorizeIdentityOverlay).
-        list[i] = identity.with_baseline(list[i].baseline?)
+        # Editing must not move the baseline, and must not drop the slot's RULE membership:
+        # both belong to the list rather than to the form, and the form carries neither (see
+        # AuthorizeIdentityOverlay). Rules are the half that fails silently — the extract
+        # rules a slot claims decide which binding table `$NAME` resolves out of at EVERY send
+        # seam, so an edit that cleared them re-pointed the operator's `$SESSION` at the global
+        # table while the card went on showing the identity they meant. `gori run session edit`
+        # and MCP `update_session_slot` both keep them; this was the one surface that did not.
+        list[i] = identity.with_baseline(list[i].baseline?).with_rules(list[i].rules)
       else
         list << identity.with_baseline(false)
       end
@@ -315,6 +322,9 @@ module Gori::Tui
     # and "nothing matched" are the same picture, which is how this mode read as broken.
     private def passive_readout : String
       return "passive replay on — add a scope include rule to replay anything" if no_scope?
+      if why = identity_problem(identities)
+        return "passive replay on — #{why}"
+      end
       return "passive replay on — waiting for traffic" if @passive_seen_count.zero?
       queued = @passive_seen.size
       top = @passive_skips.max_by? { |(_, n)| n }
@@ -340,6 +350,10 @@ module Gori::Tui
       # Cleared by the next explicit run, or by switching passive off and on.
       return if @view.stop_requested?
       return if @view.auto_pending_entries.empty?
+      # The set itself, asked here rather than discovered inside `run`: a refusal there marks
+      # nothing, so the rows stay unanswered and this fires again on the very next tick. The
+      # readout carries the reason; the loop does not.
+      return if identity_problem(identities)
       run(:pending)
     end
 
@@ -400,6 +414,8 @@ module Gori::Tui
                 # advertised the same two — the persisted identities were silently ignored on every
                 # manual run of a fresh session.
       idents = identities
+      batch = comparable_batch(batch, idents)
+      return if batch.nil? # comparable_batch already said why
       outbound = Outbound.allowlist(@host.session.scope)
       verify = Settings.verify_upstream?
       # Arm the batch on the MAIN fiber, before anything is spawned: the stop flag has to be
@@ -466,6 +482,96 @@ module Gori::Tui
       nil
     end
 
+    # What this identity set can actually say something about, or nil when the answer is
+    # nothing — in which case this has already said why.
+    #
+    # Two refusals, in the order a `Plan` makes them. FEWER THAN TWO IDENTITIES is not a run at
+    # all: every trial would be the baseline judged against itself, and the summary would read
+    # "no identity matched the baseline" — a clean bill of health for a test that compared
+    # nothing, the failure `nothing_sent` exists to keep apart from `enforced`. `gori run
+    # authorize` and MCP `authorize_start` both refuse it (`PlanError::NoIdentities`); the tab
+    # used to send anyway. Then the per-request question, below.
+    private def comparable_batch(batch : Array(AuthorizeView::Entry),
+                                 idents : Array(Authorize::Identity)) : Array(AuthorizeView::Entry)?
+      if why = identity_problem(idents)
+        @host.status("authorize: #{why}")
+        return nil
+      end
+      decline_unchanged(batch, idents)
+    end
+
+    # Why this identity SET cannot produce a comparison, as the sentence to show, or nil when
+    # it can. A property of the set and not of any request, which is what makes it the wrong
+    # thing to mark rows with — and the reason `maybe_autorun` has to ask it BEFORE it calls
+    # `run`. Without that, passive found the same unanswered rows on every drain tick, called
+    # `run`, was refused, and rewrote the status line with the refusal for as long as the mode
+    # stayed on. `passive_readout` reads it too, because "why is nothing happening" is the one
+    # question an unattended mode must always be able to answer.
+    private def identity_problem(idents : Array(Authorize::Identity)) : String?
+      if idents.size < 2
+        return "#{idents.size} identity compares nothing — press i and add at least one " \
+               "besides the baseline"
+      end
+      # The form refuses a duplicate as you type one, which covers the name an operator adds
+      # HERE and nothing else: a set that arrived already holding two — a hand-edited settings
+      # row, `gori run session add admin` and then `Admin` (`SessionSlots#find` is
+      # case-sensitive, so both take), an older build — reached the results table as two rows
+      # under one label, with no way to say which session produced which verdict. `Plan`
+      # refuses it for the headless surfaces; this is the same rule for the queue.
+      if dup = duplicate_name(idents)
+        return "two identities are called #{dup.inspect} — press i and rename one; the name " \
+               "is what tells the result rows apart"
+      end
+      nil
+    end
+
+    # The first name a second identity repeats, or nil. Case-insensitive, matching the form's
+    # own check: `admin` and `Admin` are two rows a person reads as one.
+    private def duplicate_name(idents : Array(Authorize::Identity)) : String?
+      seen = Set(String).new
+      idents.each { |id| return id.name unless seen.add?(id.name.downcase) }
+      nil
+    end
+
+    # Drop the entries this identity set cannot say anything about, MARKING each one, and
+    # return what is left (nil when nothing is). `Passive.manual_skip_reason` is the shared
+    # rule — the same one `gori run authorize` and MCP apply to a flow a human named — so the
+    # three surfaces decline the same request for the same reason.
+    #
+    # The one this exists for is `:no_effect`. Send a public page (no Cookie, no
+    # Authorization) to the tab and the built-in "anonymous" identity removes headers that are
+    # not there: every trial ships byte-identical bytes, every response matches by
+    # construction, and the row lights up `⚠ 1 same` — a broken-access-control finding
+    # manufactured out of nothing, on a page with no access control to break. The queue is the
+    # only surface that used to run it, because it was the only one that never asked.
+    #
+    # Marked rather than silently dropped, and stamped with the identity revision: the refusal
+    # holds for THIS set, so adding an identity that sets a session makes the row pending again
+    # and ^R picks it straight back up.
+    private def decline_unchanged(batch : Array(AuthorizeView::Entry),
+                                  idents : Array(Authorize::Identity)) : Array(AuthorizeView::Entry)?
+      declined = [] of Symbol
+      kept = batch.reject do |e|
+        reason = Authorize::Passive.manual_skip_reason(e.detail, idents)
+        next false unless reason
+        @view.apply_skip(e.id, reason)
+        declined << reason
+        true
+      end
+      @batch_declined = declined.size
+      @batch_declined_reason = declined.first?
+      return kept unless kept.empty?
+      @host.status("authorize: nothing to send — #{skip_phrase(declined.size, declined.first?)}")
+      nil
+    end
+
+    # "2 requests skipped (no identity changes them)" — the count and the FIRST reason, in the
+    # words every other surface prints for it.
+    private def skip_phrase(count : Int32, reason : Symbol?) : String
+      label = reason ? " (#{Authorize::Passive.reason_label(reason)})" : ""
+      "#{count} request#{count == 1 ? "" : "s"} skipped#{label}"
+    end
+
     # Ask the run to stop. Cooperative: the flag is polled between requests AND between
     # identities, so the request in flight stops at its next identity rather than mid-send.
     def stop : Nil
@@ -495,6 +601,11 @@ module Gori::Tui
       @passive_capped = false
       @passive_seen_count = 0
       @passive_skips.clear
+      # The per-host "outside scope" notice goes with them. It is capped so a browse cannot
+      # take the status line, and a cap that outlives the queue it was counting made the
+      # notice a once-per-session event — silence for every host reached after an operator
+      # cleared the tab and fixed the scope.
+      @passive_unscoped.clear
       @view.passive_note = passive_readout if @passive
       @host.status("authorize: cleared")
     end
@@ -568,18 +679,21 @@ module Gori::Tui
       # EXCLUDE rule stops every send before the socket, and reporting that as "no identity
       # matched the baseline" claims a result for traffic that never left.
       blocked = @view.blocked_in(@batch_ids)
+      # What the batch DECLINED to send rides on every summary. A run that skipped half its
+      # batch and reported only what it replayed is a run whose selection quietly shrank.
+      skips = @batch_declined > 0 ? " · #{skip_phrase(@batch_declined, @batch_declined_reason)}" : ""
       if blocked > 0 && blocked == done
         why = @view.blocked_reason_in(@batch_ids)
-        return "authorize: nothing was sent — #{blocked} request#{blocked == 1 ? "" : "s"} refused before the socket#{why ? " (#{why})" : ""}"
+        return "authorize: nothing was sent — #{blocked} request#{blocked == 1 ? "" : "s"} refused before the socket#{why ? " (#{why})" : ""}#{skips}"
       end
       if stopped
         tail = bypasses > 0 ? " · #{bypasses} bypass#{bypasses == 1 ? "" : "es"}" : ""
-        return "authorize: stopped — #{done} of #{@batch_size} replayed#{tail}"
+        return "authorize: stopped — #{done} of #{@batch_size} replayed#{tail}#{skips}"
       end
       if bypasses > 0
-        "authorize: ran #{done} · #{bypasses} identity result#{bypasses == 1 ? "" : "s"} matched the baseline — review for access-control bypass"
+        "authorize: ran #{done} · #{bypasses} identity result#{bypasses == 1 ? "" : "s"} matched the baseline — review for access-control bypass#{skips}"
       else
-        "authorize: ran #{done} · no identity matched the baseline"
+        "authorize: ran #{done} · no identity matched the baseline#{skips}"
       end
     end
 

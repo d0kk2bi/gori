@@ -33,7 +33,7 @@ Press `i` on the tab to open the identities card. A fresh project starts with tw
 | `b` | Make this one the baseline |
 | `esc` | Close |
 
-The add / edit form has three fields: a **name** (unique — two rows under one label would make the results table unreadable), the headers to **set**, one `Name: value` per line, and the headers to **remove**, comma-separated. `⇥` moves between fields, `↵` saves. A header line whose name is not a valid token, or whose value carries a CR or LF, is refused with the offending line named rather than silently dropped.
+The add / edit form has three fields: a **name** (unique — two rows under one label would make the results table unreadable, and all three surfaces refuse a duplicate; names are compared case-insensitively), the headers to **set**, one `Name: value` per line, and the headers to **remove**, comma-separated. `⇥` moves between fields, `↵` saves. A header line whose name is not a valid token, or whose value carries a CR or LF, is refused with the offending line named rather than silently dropped.
 
 Identities are saved with the project, so `gori run authorize` and the MCP tools default to the same set you configured here. The list shows header *names* only — a session cookie is a credential, and a list that paints it on screen leaks it to anyone glancing at your terminal. The form shows values, because that is what editing means.
 
@@ -56,8 +56,9 @@ What the active slot changes, on `send_request`, a Repeater or Fuzzer send, and 
 - its **header overlay** is applied to the final wire bytes — after `$NAME` substitution, header lines only, so `Content-Length` never moves and the body is byte-exact;
 - `$NAME` resolves against **its** binding table. An extract rule a slot claims writes that slot's table; a rule no slot claims keeps writing the one global table it always did. So `Authorization: Bearer $SESSION` means admin's token on the `admin` slot and the low-priv user's on `low-priv`, off one saved string.
 
-Two things the active slot deliberately does **not** do:
+Three things the active slot deliberately does **not** do:
 
+- **It does not apply to an Authorize run.** This tab supplies the identity itself, once per send, and comparing them *is* the measurement — so a run reads the list across and wears none of it, whichever slot is active. Left to apply, the active slot would write its `Cookie` over the top of every identity, including the one whose whole job is to remove it: every response would match the baseline by construction and every queued row would report a bypass that does not exist.
 - **It is never persisted.** Reopening a project, or a new `gori mcp` connection, starts as-captured. A slot's *values* are memory-only by design, so restoring "admin is active" into an empty admin table would hand the next send an overlay whose `$SESSION` is literal — a `401` with no visible cause. Activation is one keystroke; a stale one is a support ticket.
 - **`as-captured` is the baseline in both senses.** With no slot active nothing changes a byte, which is what makes every project and every playbook written before slots existed behave exactly as it did.
 
@@ -67,7 +68,7 @@ There is no cookie jar and no auto-login macro here. A slot carries the headers 
 
 Exactly one identity in a run is the **baseline** — the response every other identity is judged against. Unless an identity claims it (`b` in the card, `"baseline":true` in JSON), the request **as captured** is the baseline: it goes out with its original session, and everything else is a lens over that same request.
 
-A run needs at least one identity besides the baseline, and gori refuses one that does not have it. With a single identity, every trial would be the baseline judged against itself; the run would finish, report "no identity matched the baseline", and mean nothing at all.
+A run needs at least one identity besides the baseline, and all three surfaces refuse one that does not have it. With a single identity, every trial would be the baseline judged against itself; the run would finish, report "no identity matched the baseline", and mean nothing at all.
 
 ## The Loop
 
@@ -87,10 +88,12 @@ Each identity's response is reduced to three facts — status, decoded body size
 | Verdict | Means |
 |---------|-------|
 | `baseline` | This row *is* the baseline |
-| `different` | A different status **class** (2xx vs 4xx vs 3xx) — the clearest sign access control engaged |
-| `same` | Same status class, and the body matches: within a SimHash distance of 3 **and** within 10% in size |
+| `different` | A different status **class** (2xx vs 4xx vs 3xx) — the clearest sign access control engaged. Or two redirects that point somewhere else |
+| `same` | Same status class, and the body matches: within a SimHash distance of 3 **and** within 10% in size. Or two redirects to the same place |
 | `review` | Same status class, divergent body — or the baseline itself errored, so there was nothing to anchor against |
 | `error` | This identity's send failed (TLS, DNS, timeout, refused); nothing was compared |
+
+Two redirects are judged on their **`Location`**, before the body is looked at. A redirect's body is empty, so on the three facts above every `3xx` matched every other `3xx` — and an authenticated `302 → /dashboard` against an anonymous `302 → /login`, which is the clearest *enforcement* there is, came back `same`. Where the origin steers each identity is the only thing a redirect says, so that is what gets compared: an exact string match, because `/login` and `/login/` are a difference worth showing you rather than one worth deciding for you.
 
 The per-request row aggregates them: **BYPASS** when any non-baseline identity came back `same`, **enforced** when every one clearly differed, **review** otherwise.
 

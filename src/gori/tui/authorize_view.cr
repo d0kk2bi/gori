@@ -5,6 +5,7 @@ require "./fmt"
 require "./url"
 require "./traffic_empty_state"
 require "../authorize/engine"
+require "../authorize/passive"
 require "../repeater/message_lines"
 require "../store/models"
 
@@ -27,8 +28,13 @@ module Gori::Tui
       getter id : Int32
       getter detail : Store::FlowDetail
       property target : Authorize::Target?
-      property state : Symbol # :pending | :running | :done | :error
+      property state : Symbol # :pending | :running | :done | :error | :skipped
       property error : String?
+      # Why a run declined to send this request at all — a `Passive.reason_label` symbol, the
+      # same vocabulary `gori run authorize` and MCP report skips in. Distinct from `error`
+      # because "gori sent nothing for this one" and "the send failed" are opposite facts, and
+      # a row that reads `error` for the first sends the operator hunting a network problem.
+      property skip_reason : Symbol?
       # The identity revision `target` was produced under. A result from an older set is not
       # wrong — it is what those identities saw — but it no longer describes the current ones,
       # so it counts as pending again.
@@ -38,6 +44,7 @@ module Gori::Tui
         @target = nil
         @state = :pending
         @error = nil
+        @skip_reason = nil
         @result_rev = -1
       end
 
@@ -163,20 +170,24 @@ module Gori::Tui
       e.state != :running && !e.current?(@identity_rev)
     end
 
-    # What PASSIVE's unattended re-run may pick up: pending work that has not already blown up
-    # under this identity set.
+    # What PASSIVE's unattended re-run may pick up: pending work that has not already been
+    # answered under this identity set.
     #
     # The split matters because the two callers mean different things by "unfinished". A manual
-    # ^R is the operator asking again, and a request that raised is exactly what they might
-    # want retried. Passive asks on every drain tick with nobody watching, so an entry that
-    # raises — a stored h2 pseudo-header head, say, which raises every time by construction —
-    # would be re-dispatched forever, one fiber and one Jobs row per tick.
+    # ^R is the operator asking again, and a request that raised — or that no identity changes
+    # — is exactly what they might want to try again after a fix. Passive asks on every drain
+    # tick with nobody watching, so an entry that raises (a stored h2 pseudo-header head, say,
+    # which raises every time by construction) or one a run keeps declining would be
+    # re-dispatched forever, one fiber and one Jobs row per tick.
     def auto_pending_entries : Array(Entry)
-      @entries.select { |e| pending?(e) && !errored_this_rev?(e) }
+      @entries.select { |e| pending?(e) && !answered_this_rev?(e) }
     end
 
-    private def errored_this_rev?(e : Entry) : Bool
-      !e.error.nil? && e.result_rev == @identity_rev
+    # A run already gave this entry an answer OTHER than a result — it raised, or it was
+    # declined — under the identity set now configured. Changing that set bumps the revision,
+    # which is exactly when a retry could plausibly go differently.
+    private def answered_this_rev?(e : Entry) : Bool
+      (!e.error.nil? || !e.skip_reason.nil?) && e.result_rev == @identity_rev
     end
 
     # Remove the cursor entry. Returns false (and changes nothing) while that row is mid-run —
@@ -249,6 +260,29 @@ module Gori::Tui
       e.target = target
       e.state = :done
       e.error = nil
+      e.skip_reason = nil
+      e.result_rev = @identity_rev
+    end
+
+    # A run DECLINED to send this request — no identity would change it, the capture never
+    # completed, gori answered it itself. Stamped with `result_rev` for the same reason
+    # `apply_error` is: the refusal holds for THIS identity set, and adding an identity that
+    # sets a session is precisely what makes it worth trying again.
+    #
+    # Not `apply_error`: a skip is a statement about the request, an error is a statement about
+    # the network, and the operator acts on them differently. The master row says `skipped` and
+    # the detail pane names the reason in the same words `gori run authorize` prints.
+    def apply_skip(id : Int32, reason : Symbol) : Nil
+      return unless e = entry_by_id(id)
+      e.state = :skipped
+      e.skip_reason = reason
+      e.error = nil
+      # And the previous run's result GOES. Two reasons, and `settle_running` states the first
+      # one: the detail pane renders a trials table whenever a target is there, so a master row
+      # reading `skipped` over the verdicts of an earlier identity set is the contradiction that
+      # rule exists to prevent. The second is that `current?` is target-based — a declined row
+      # that kept one counted as answered, so ^R stopped offering to retry it.
+      e.target = nil
       e.result_rev = @identity_rev
     end
 
@@ -263,6 +297,11 @@ module Gori::Tui
       return unless e = entry_by_id(id)
       e.state = :error
       e.error = message
+      e.skip_reason = nil
+      # Same rule as `apply_skip`: an `error` row must not paint the trials of the run before
+      # it. ⇧R re-runs a row that already had a result, so this is reachable whenever a retry
+      # raises — and the stale table said the request had been compared when it had not.
+      e.target = nil
       e.result_rev = @identity_rev
     end
 
@@ -380,9 +419,9 @@ module Gori::Tui
         bg = (selected && focused) ? Theme.accent_bg : Theme.bg
         screen.fill(Rect.new(rect.x, y, rect.w, 1), bg) if selected && focused
         screen.text(rect.x, y, selected ? "▎" : " ", Theme.focus_gold, bg)
-        cols = sprintf(" %-3d %-6s %-38s ", i + 1, e.method, truncate(e.host_path, 38))
+        cols = " #{fit((i + 1).to_s, 3)} #{fit(e.method, 6)} #{fit(e.host_path, 38)} "
         screen.text(rect.x + 1, y, cols, Theme.text, bg)
-        vx = rect.x + 1 + cols.size
+        vx = rect.x + 1 + Screen.draw_width(cols)
         v = e.verdict
         screen.text(vx, y, master_verdict_label(e), master_verdict_color(v), bg,
           Attribute::Bold, width: rect.right - vx)
@@ -408,8 +447,7 @@ module Gori::Tui
       return if y >= bottom
       t = e.target
       unless t
-        note = e.state == :running ? "running…" : (e.error || "not run yet — press r")
-        screen.text(x, y, note, Theme.muted, Theme.bg)
+        screen.text(x, y, no_result_note(e), Theme.muted, Theme.bg, width: right - x)
         return
       end
       y = render_trials(screen, x, y, right, bottom, t, focused)
@@ -430,10 +468,10 @@ module Gori::Tui
         screen.fill(Rect.new(x, y, right - x, 1), bg) if sub && focused
         screen.text(x, y, sub ? "▎" : " ", Theme.focus_gold, bg)
         size = trial.meta.size.try { |s| Repeater::ExchangeMeta::Format.bytes(s) } || "—"
-        cols = sprintf(" %-14s %-7s %-9s %-22s ",
-          truncate(trial.identity, 14), trial.meta.status_text, size, truncate(trial.delta || "—", 22))
+        cols = " #{fit(trial.identity, 14)} #{fit(trial.meta.status_text, 7)} " \
+               "#{fit(size, 9)} #{fit(trial.delta || "—", 22)} "
         screen.text(x + 1, y, cols, Theme.text, bg)
-        vx = x + 1 + cols.size
+        vx = x + 1 + Screen.draw_width(cols)
         screen.text(vx, y, trial_verdict_label(trial.verdict), trial_verdict_color(trial.verdict), bg,
           Attribute::Bold, width: right - vx)
         y += 1
@@ -465,6 +503,18 @@ module Gori::Tui
 
     # ── labels / colours ────────────────────────────────────────────────────────
 
+    # Why this request has no result yet, in the words the operator can act on. A skip is
+    # NAMED (`Passive.reason_label`, the same sentence `gori run authorize` prints) rather than
+    # left as a blank row: "gori declined to send this" and "this has not run yet" are
+    # different facts, and the second one is what an unexplained empty pane reads as.
+    private def no_result_note(e : Entry) : String
+      return "running…" if e.state == :running
+      if reason = e.skip_reason
+        return "skipped — #{Authorize::Passive.reason_label(reason)}"
+      end
+      e.error || "not run yet — ^R runs it"
+    end
+
     private def master_verdict_label(e : Entry) : String
       case e.verdict
       when :bypass   then "⚠ #{same_count(e)} same"
@@ -473,6 +523,7 @@ module Gori::Tui
       when :running  then "running…"
       when :pending  then "pending"
       when :error    then "error"
+      when :skipped  then "skipped"
       else                "—"
       end
     end
@@ -511,8 +562,24 @@ module Gori::Tui
       end
     end
 
-    private def truncate(s : String, w : Int32) : String
-      s.size <= w ? s : s[0, w - 1] + "…"
+    # One column, cut and padded to `w` DISPLAY COLUMNS — never characters. The rows here are
+    # laid out by measuring the text before them (`vx = … + draw_width(cols)`), so a name or a
+    # path of Hangul or CJK, which is one char and TWO columns per glyph, used to push VERDICT
+    # off its column and over the text to its left. `column_for` is the exact inverse of
+    # `draw_width` at cluster boundaries, so the cut can never split a wide glyph — the same
+    # idiom `sitemap_view`'s tag stub and `comparer_view#slot_short` use.
+    #
+    # It also PADS, which `sprintf("%-14s")` did in characters and did not do at all when the
+    # value was over budget: a long `Δ vs baseline` or an unexpected status text overflowed its
+    # field and shifted the column after it.
+    private def fit(s : String, w : Int32) : String
+      return "" if w <= 0
+      width = Screen.draw_width(s)
+      if width > w
+        s = "#{s[0, Screen.column_for(s, w - 1)]}…"
+        width = Screen.draw_width(s)
+      end
+      width < w ? s + " " * (w - width) : s
     end
   end
 end

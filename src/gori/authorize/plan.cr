@@ -14,10 +14,12 @@ module Gori::Authorize
   # contract. So `reason` is the machine-readable fact and the `message` here is only a
   # fallback for a caller that has nothing better to say.
   #
-  # EVERY MEMBER ADDED HERE OBLIGATES THREE `case` ARMS — `gori run authorize`, the MCP
-  # `authorize_*` tools, and the TUI tab all switch on this exhaustively. Keep the set as
-  # small as the real failure modes require; a new member is a change to three surfaces,
-  # not to this file.
+  # EVERY MEMBER ADDED HERE OBLIGATES AN ARM IN `gori run authorize` AND ONE IN THE MCP
+  # `authorize_*` TOOLS — both switch on this exhaustively (`case … in`), so a new member is
+  # a compile error until each has an answer and a next thing to type. (The TUI tab does not
+  # appear here: its queue is live view state rather than an options set, so it makes the same
+  # refusals against the view — see `AuthorizeController#comparable_batch`.) Keep the set as
+  # small as the real failure modes require.
   class PlanError < Exception
     enum Reason
       # No selection at all: neither a flow id nor a query. (A usage mistake, not an empty
@@ -37,6 +39,13 @@ module Gori::Authorize
       # about a test that compared nothing. `detail` = where the set came from ("json" /
       # "project"), for a surface that wants to name the file or the tab to fix.
       NoIdentities
+      # Two identities in the resolved set share a name (case-insensitively). Refused rather
+      # than run, because the name is the ONLY thing that tells the rows of the results table
+      # apart: two "admin" rows leave no way to say which session produced which verdict, and
+      # `bypasses[].identities` names a string a caller then cannot resolve back to a slot.
+      # The TUI's identity form has always refused it; this is the same rule for a `--identities`
+      # file, an MCP `identities` array, and a hand-edited settings row. `detail` = the name.
+      DuplicateIdentity
       # Flows were selected, and every one of them was skipped — unsafe method, incomplete,
       # answered by gori, no identity changes it, out of scope, duplicate. `detail` = the
       # per-reason tally; `PlanError#skipped` carries the full per-flow list, because "a run
@@ -174,18 +183,36 @@ module Gori::Authorize
     end
 
     # Replay every target under every identity, yielding each finished `Target` as it lands.
-    # Returns the number of requests actually replayed.
+    # Returns the number of FLOWS replayed (each one is `identities.size` requests).
     #
     # THE send loop, here rather than once per surface: `stop` is polled between requests
     # AND handed to the engine so it is also polled between identities, and a request the
     # stop cut short yields NOTHING — a partial set of trials must not become a Target (see
     # `Engine#run`). A surface that re-implemented this loop is one `if target` away from
     # reporting "enforced" for identities it never sent.
-    def run(stop : Proc(Bool)? = nil, & : Store::FlowDetail, Target ->) : Int32
+    #
+    # `on_error` is how ONE unreplayable flow stops being fatal to the whole selection. A
+    # send failure is already a `Trial` with an error, but a few things RAISE before any send:
+    # a stored h2 pseudo-header head (`FlowRequest::PseudoHeaderHead`) is the reachable one.
+    # Escaping here killed the run at that flow — `gori run authorize` lost every remaining
+    # flow AND its buffered `--format json` array, and an MCP job went `:error` with the
+    # results it already had. The TUI survived it because its own loop rescues per request;
+    # a headless run has no reason to be less robust than the tab. Absent an `on_error` the
+    # raise still escapes, so a surface has to decide rather than inherit silence.
+    def run(stop : Proc(Bool)? = nil,
+            on_error : Proc(Store::FlowDetail, Exception, Nil)? = nil,
+            & : Store::FlowDetail, Target ->) : Int32
       sent = 0
       @targets.each do |detail|
         break if stop.try(&.call)
-        next unless target = @engine.run(detail, @identities, stop)
+        begin
+          target = @engine.run(detail, @identities, stop)
+        rescue ex
+          raise ex unless handler = on_error
+          handler.call(detail, ex)
+          next
+        end
+        next unless target
         sent += 1
         yield detail, target
       end
@@ -226,12 +253,39 @@ module Gori::Authorize
       # `Authorize.parse_json`. That is right on the project-open path and wrong here, so
       # the emptiness is what gets named, with `detail` saying which source produced it.
       list = Authorize.parse_json(raw)
-      list = [Identity.as_captured] + list unless list.any?(&.baseline?)
+      reject_duplicate_names(list)
+      list = [Identity.as_captured(baseline_name(list))] + list unless list.any?(&.baseline?)
       if list.size < 2
         raise PlanError.new(PlanError::Reason::NoIdentities,
           "need at least one identity besides the baseline to compare against", source)
       end
       list
+    end
+
+    # Refuse a set whose rows cannot be told apart. Case-insensitive, matching the TUI form's
+    # own check — `$Session` and `$SESSION` are two binding names everywhere in gori, but two
+    # IDENTITIES called `admin` and `Admin` are two rows a person reads as one.
+    private def self.reject_duplicate_names(list : Array(Identity)) : Nil
+      seen = Set(String).new
+      list.each do |id|
+        next if seen.add?(id.name.downcase)
+        raise PlanError.new(PlanError::Reason::DuplicateIdentity,
+          "two identities are called #{id.name.inspect}", id.name)
+      end
+    end
+
+    # A name for the prepended baseline that the operator's own set has not already used.
+    # Without it, a set containing a non-baseline identity called "as-captured" would collide
+    # with the row gori adds — a duplicate gori created, which the check above would then
+    # report as the operator's mistake.
+    private def self.baseline_name(list : Array(Identity)) : String
+      taken = list.map(&.name.downcase).to_set
+      return "as-captured" unless taken.includes?("as-captured")
+      n = 2
+      while taken.includes?("as-captured #{n}")
+        n += 1
+      end
+      "as-captured #{n}"
     end
 
     # The selection, resolved to flows in the order the operator expressed it: explicit ids
@@ -330,21 +384,13 @@ module Gori::Authorize
     # `Passive.skip_reason`, with the unsafe-method refusal lifted when the surface asked for
     # it. One implementation of "can this flow be replayed at all" rather than a second copy
     # of the rules here: `:incomplete`, `:short_circuited` and `:no_effect` are properties of
-    # the flow and the identity set, and they hold whoever is asking.
+    # the flow and the identity set, and they hold whoever is asking. The lifted form lives in
+    # `Passive.manual_skip_reason` — the TUI's manual queue asks the same question and has to
+    # get the same answer, or one surface refuses a flow another one replays.
     private def self.skip_reason(detail : Store::FlowDetail, identities : Array(Identity),
                                  options : PlanOptions) : Symbol?
-      reason = Passive.skip_reason(detail, identities)
-      # Lifting `:unsafe_method` must not lift what comes AFTER it. `Passive.skip_reason` is
-      # an ordered chain and `:unsafe_method` is the third rung, so returning nil here would
-      # also skip the fourth — `:no_effect` — and replay a flow no identity changes. Every
-      # trial would then send byte-identical bytes, every verdict would come back `Same`, and
-      # the run would report a bypass it manufactured (see the comment above
-      # `Passive.skip_reason`). On an unsafe method that is the expensive version of the
-      # mistake: the POST runs again, once per identity, to prove nothing.
-      if reason == :unsafe_method && options.unsafe_methods?
-        return Passive.any_identity_changes?(detail, identities) ? nil : :no_effect
-      end
-      reason
+      return Passive.manual_skip_reason(detail, identities) if options.unsafe_methods?
+      Passive.skip_reason(detail, identities)
     end
 
     # The per-reason tally: the `NothingToSend` detail AND what `Plan#skip_summary` renders,

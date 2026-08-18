@@ -2,6 +2,7 @@ require "./screen"
 require "./theme"
 require "./frame"
 require "./overlay"
+require "./viewport"
 require "../hotkeys"
 require "../authorize/identity"
 
@@ -35,6 +36,7 @@ module Gori::Tui
       @selected = (cursor || 0).clamp(0, {identities.size - 1, 0}.max)
       @pending = nil.as(Pending?)
       @note = nil.as(String?)
+      @scroll = 0
     end
 
     # --- Overlay contract (see overlay.cr) ---
@@ -137,9 +139,31 @@ module Gori::Tui
       Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
     end
 
+    # How many identity rows the card has room for. The card grows to fit the list, so this
+    # only bites on a short terminal or a long list — which is exactly when a card that
+    # silently stopped drawing at the bottom edge, with the cursor walking on past it into
+    # rows nothing painted, was at its most confusing.
+    private def visible_rows(box : Rect) : Int32
+      {(box.bottom - 2) - (box.y + 2), 0}.max
+    end
+
+    # The window, derived and NOT stored — a hit-test has to invert the same arithmetic the
+    # renderer uses without moving it (`Viewport`'s own note on this pair).
+    private def window(box : Rect) : Int32
+      Viewport.scroll_to_show(@selected, @scroll, visible_rows(box), @identities.size)
+    end
+
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
       return nil unless box.contains?(mx, my)
-      i = my - (box.y + 2)
+      # The ROW BAND, not just the card. An unscrolled window made the chrome harmless — the
+      # border and title rows sat at negative indices and fell out below — but the moment the
+      # window scrolls they map onto real identities: at an offset of 6, a click on the top
+      # border selects row 4 and the title row selects row 5, neither of which is painted
+      # there. `handle_click` moves the cursor, so the next `d` deletes, or `b` re-baselines,
+      # an identity the operator never pointed at.
+      first = box.y + 2
+      return nil unless first <= my < box.bottom - 2
+      i = my - first + window(box)
       (0 <= i < @identities.size) ? i : nil
     end
 
@@ -154,8 +178,10 @@ module Gori::Tui
       if @identities.empty?
         screen.text(box.x + 3, first, "no identities — a adds one", Theme.muted, Theme.panel)
       else
+        @scroll = window(box)
         @identities.each_with_index do |id, i|
-          py = first + i
+          next if i < @scroll
+          py = first + (i - @scroll)
           break if py >= box.bottom - 2
           draw_row(screen, box, id, i, py)
         end
@@ -184,7 +210,11 @@ module Gori::Tui
       # the card no longer has room for. A glyph nobody can look up is not a label.
       tag = id.baseline? ? "baseline" : ""
       tag_x = box.right - 2 - tag.size
-      screen.text(sx, py, id.summary, Theme.muted, bg, width: {tag_x - 1 - sx, 1}.max)
+      # The rule membership rides along with the overlay summary, exactly as the session slot
+      # picker draws it: it is state this card PRESERVES but does not edit, and state a card
+      # keeps without showing is state the operator cannot know they still have.
+      detail = id.rules.empty? ? id.summary : "#{id.summary} · rules #{Gori::Env.token_list(id.rules)}"
+      screen.text(sx, py, detail, Theme.muted, bg, width: {tag_x - 1 - sx, 1}.max)
       screen.text(tag_x, py, tag, Theme.focus_gold, bg) unless tag.empty?
     end
   end
