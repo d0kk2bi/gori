@@ -1,5 +1,6 @@
 require "json"
 require "../store"
+require "../proxy/codec/http1"
 require "../url"
 require "../fuzz"
 require "../miner"
@@ -18,13 +19,24 @@ module Gori
     # colour. The JSON shape here is the stable, documented contract for scripts.
     module Output
       # One JSON object (one line, for JSON-Lines streams) describing a flow row.
-      def self.flow_row_json(row : Store::FlowRow) : String
-        JSON.build { |j| flow_row_fields(j, row) }
+      def self.flow_row_json(row : Store::FlowRow, request_head : Bytes? = nil) : String
+        JSON.build { |j| flow_row_fields(j, row, request_head) }
       end
 
       # Emits the flow-row fields into an open builder (reused by `show`, which
       # nests the row alongside the bodies).
-      def self.flow_row_fields(j : JSON::Builder, row : Store::FlowRow) : Nil
+      #
+      # `request_head`, when given, adds the two LISTING fields: the absolute `url` and a
+      # compact `headers` object for the request. They are opt-in and not part of the shared
+      # row shape for two different reasons. `headers` needs bytes the row projection
+      # deliberately does not carry, and MCP's `list_history` must not grow a per-row header
+      # block — a model reading a 200-row feed would pay for it on every row. `url` rides
+      # along with it because the two answer the same question ("what request was this, in
+      # full?") and a script that wants one wants the other; the plain `flow_row_json(row)`
+      # that `gori run capture`'s live stream and MCP's serializer mirror is byte-identical
+      # to what it always was. See spec/cli/run/history_spec.cr, which pins that key set.
+      def self.flow_row_fields(j : JSON::Builder, row : Store::FlowRow,
+                               request_head : Bytes? = nil) : Nil
         j.object do
           j.field "id", row.id
           j.field "created_at", row.created_at
@@ -61,6 +73,55 @@ module Gori
           advisories = row.advisories
           unless advisories.empty?
             j.field("advisory") { j.array { advisories.each { |l| j.string(term_safe(l)) } } }
+          end
+          if head = request_head
+            # `FlowRow#url` — the ONE definition of a flow's absolute URL (default-port
+            # elision, IPv6 bracketing, an absolute-form target passed through). A script
+            # re-deriving it from scheme/host/port/target gets exactly those three cases
+            # wrong, which is why the field exists at all.
+            json_captured(j, "url", row.url)
+            j.field("headers") { request_headers_json(j, head) }
+          end
+        end
+      end
+
+      # The request's headers as one compact object: name → value, and name → ARRAY of values
+      # where the message repeated a name. Bodies are deliberately absent — `gori run show`
+      # is where a body belongs, and a listing that inlined them would be unreadable and
+      # unbounded.
+      #
+      # Wire NAMES, wire ORDER, original casing — `Codec::Http1.parse_request_head` is the
+      # same parse the HAR writer uses, so the two exports agree about what this message's
+      # header block was. Duplicates become an array rather than last-wins because the
+      # duplicates are frequently the point (two `Set-Cookie`-shaped request headers, a
+      # split `Cookie`, a header a proxy appended), and collapsing them would hide exactly
+      # the traffic an operator greps this feed for.
+      #
+      # A duplicate name that differs only in CASE is one JSON key (`Accept` and `accept` are
+      # the same field, RFC 9110 §5.1) and folds into the same array; the FIRST spelling seen
+      # is the key, so the object reads like the wire it came from.
+      private def self.request_headers_json(j : JSON::Builder, head : Bytes) : Nil
+        # Insertion-ordered, keyed case-insensitively: Hash keeps insertion order in Crystal,
+        # so one pass gives both wire order and the fold.
+        order = [] of String
+        by_key = {} of String => Array(String)
+        Proxy::Codec::Http1.parse_request_head(head).headers.each do |h|
+          key = h.name.downcase
+          if bucket = by_key[key]?
+            bucket << h.value
+          else
+            by_key[key] = [h.value]
+            order << h.name
+          end
+        end
+        j.object do
+          order.each do |name|
+            values = by_key[name.downcase]
+            if values.size == 1
+              json_captured(j, name.scrub, values[0])
+            else
+              j.field(name.scrub) { j.array { values.each { |v| j.string(v.scrub) } } }
+            end
           end
         end
       end

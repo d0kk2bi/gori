@@ -37,6 +37,7 @@ require "../issues_export"
 require "../links"
 require "../import"
 require "../session_from_flow"
+require "../export/curl"
 require "./output"
 require "./run/interrupt"
 require "./run/capture"
@@ -151,9 +152,9 @@ module Gori
       SUBCOMMANDS = [
         {"capture", "Start the proxy and stream captured flows to STDOUT"},
         {"history (ls)", "List / QL-query captured flows"},
-        {"history delete", "Hard-delete one captured flow by id"},
+        {"history delete", "Hard-delete one captured flow by id, or every match of -q QL (needs --yes)"},
         {"history clear", "Delete ALL captured flows in the project (needs --yes)"},
-        {"show <id>", "Print a flow's request/response (text, json, or raw bytes)"},
+        {"show <id>", "Print a flow's request/response (text, json, raw bytes, HAR, or a curl command)"},
         {"repeater", "Re-send a captured flow; list/create/send (replay, incl. WebSocket) repeater sessions"},
         {"repeater minimize", "Strip noise from a saved request, keeping the response the same"},
         {"compare <a> <b>", "Diff two flows' request or response (unified diff)"},
@@ -1004,6 +1005,7 @@ module Gori
               when "jsonl"          then :jsonl
               when "raw"            then :raw
               when "har"            then :har
+              when "curl"           then :curl
               when "paths"          then :paths
               when "markdown", "md" then :markdown
               else                       abort "gori run: unknown --format '#{v}'"

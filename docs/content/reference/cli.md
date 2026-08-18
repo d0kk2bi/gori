@@ -54,7 +54,7 @@ gori run <subcommand> [verb] [options]
 |------------|-------------|
 | `capture` | Run the proxy and stream captured flows to STDOUT |
 | `history` (`ls`) | List / query captured flows |
-| `history delete <id>` · `clear` | Hard-delete one flow, or wipe the project's History (`--yes`) |
+| `history delete <id>` · `delete -q QL` · `clear` | Hard-delete one flow, every flow a query matches (`--yes`), or wipe the project's History (`--yes`) |
 | `show <flow-id>` | Print one flow's request and response |
 | `compare <id-a> <id-b>` | Diff two flows' request or response |
 | `intercept` | Inspect and drive a capturing TUI's live intercept queue |
@@ -143,9 +143,13 @@ gori run history -q 'status:5xx' --limit 100 --format json
 | `-q`, `--query=QL` | Query-language filter (also accepted positionally) |
 | `-n`, `--limit=N` | Max rows (default 50) |
 | `--lenient` | Don't refuse a query naming an unknown field — search that token as text |
-| `--format=FMT` | `text`, `json`, or `har` |
+| `--format=FMT` | `text`, `json` / `jsonl` (both JSON-Lines), or `har` |
 
-Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `history clear --yes`.
+Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `history delete -q QL --yes`, `history clear --yes`.
+
+Each `json`/`jsonl` row carries the flow's absolute `url` and a compact `headers` object for the request (a repeated header name becomes an array). Bodies are not inlined — that is `run show`.
+
+`history delete -q QL` deletes every flow the query matches and needs `--yes`; without it, it prints how many would go and refuses. A query naming a field QL does not know (`methd:`) is refused too, rather than silently matching nothing. With neither an id nor `-q` it refuses — wiping the project is `history clear --yes`.
 
 `--format har` writes the whole result set as one HAR 1.2 log on STDOUT, oldest entry first, so a query can be handed to a teammate or loaded into Burp, Charles, or a browser's network panel. See [HAR export](#har-export).
 
@@ -155,7 +159,7 @@ Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `h
 gori run show <flow-id> --format raw
 ```
 
-`--format` is `text`, `json`, `raw` (exact bytes), or `har` (a one-entry HAR log). `--request-only` / `--response-only` limit the output and do not apply to `har`. Decoded SAML/JWT/GraphQL/params, WebSocket messages, and SSE events are included where present.
+`--format` is `text`, `json`, `raw` (exact bytes), `har` (a one-entry HAR log), or `curl` (a runnable `curl` command reproducing the request — the same text the TUI's `Space → Y` copies). `--request-only` / `--response-only` limit the output and do not apply to `har`; `curl` is the request, so `--response-only` is refused. Decoded SAML/JWT/GraphQL/params, WebSocket messages, and SSE events are included where present.
 
 #### HAR export
 

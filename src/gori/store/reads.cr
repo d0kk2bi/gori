@@ -109,6 +109,18 @@ module Gori
       rows
     end
 
+    # One flow's REQUEST head bytes and nothing else. `get_flow` would materialize both body
+    # BLOBs alongside it — a 40 MB response read and discarded — and the row projection carries
+    # no head at all, so a caller that wants the request's HEADERS for a list of rows
+    # (`gori run history --format json`, one row at a time) had no read between the two.
+    # nil when there is no such flow; the column itself is NOT NULL.
+    def request_head(id : Int64) : Bytes?
+      @db.query("SELECT request_head FROM flows WHERE id = ?", id) do |rs|
+        return rs.read(Bytes) if rs.move_next
+      end
+      nil
+    end
+
     # Single-row projection, e.g. to refresh a row after an :inserted/:updated
     # event without re-reading the whole page.
     def flow_row(id : Int64) : FlowRow?

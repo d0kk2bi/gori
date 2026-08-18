@@ -1,3 +1,4 @@
+require "./export/curl"
 require "./export/har"
 
 module Gori

@@ -54,7 +54,7 @@ gori run <subcommand> [verb] [options]
 |------------|-------------|
 | `capture` | 프록시를 실행하고 캡처한 플로우를 STDOUT으로 스트리밍 |
 | `history` (`ls`) | 캡처한 플로우 목록 / 쿼리 |
-| `history delete <id>` · `clear` | 플로우 하나를 완전 삭제, 또는 프로젝트 History 전체 비우기 (`--yes`) |
+| `history delete <id>` · `delete -q QL` · `clear` | 플로우 하나를 완전 삭제, 쿼리에 매칭되는 플로우 전부 삭제 (`--yes`), 또는 프로젝트 History 전체 비우기 (`--yes`) |
 | `show <flow-id>` | 플로우 하나의 요청과 응답 출력 |
 | `compare <id-a> <id-b>` | 두 플로우의 요청 또는 응답 diff |
 | `intercept` | 캡처 중인 TUI의 라이브 인터셉트 큐 조회 및 조작 |
@@ -142,9 +142,13 @@ gori run history -q 'status:5xx' --limit 100 --format json
 | `-q`, `--query=QL` | 쿼리 언어 필터 (위치 인자로도 허용) |
 | `-n`, `--limit=N` | 최대 행 수 (기본값 50) |
 | `--lenient` | 없는 필드 이름을 쓴 쿼리를 거절하지 않고 그 토큰을 텍스트로 검색 |
-| `--format=FMT` | `text`, `json`, 또는 `har` |
+| `--format=FMT` | `text`, `json` / `jsonl` (둘 다 JSON-Lines), 또는 `har` |
 
-서브커맨드: `history show <id>` (`run show`와 동일), `history delete <id>`, `history clear --yes`.
+서브커맨드: `history show <id>` (`run show`와 동일), `history delete <id>`, `history delete -q QL --yes`, `history clear --yes`.
+
+`json`/`jsonl`의 각 행은 플로우의 절대 `url`과 요청 헤더를 담은 `headers` 객체를 함께 싣습니다 (같은 이름이 반복되면 배열이 됩니다). 본문은 넣지 않습니다 — 그건 `run show`의 몫입니다.
+
+`history delete -q QL`은 쿼리에 매칭되는 플로우를 전부 삭제하며 `--yes`가 필요합니다. `--yes` 없이 실행하면 몇 개가 지워질지 출력하고 거부합니다. QL이 모르는 필드를 쓴 쿼리(`methd:`)도 조용히 아무것도 지우지 않는 대신 거부합니다. id도 `-q`도 없으면 거부합니다 — 프로젝트를 통째로 비우는 건 `history clear --yes`입니다.
 
 `--format har`은 결과 집합 전체를 하나의 HAR 1.2 log로 STDOUT에 씁니다. 오래된 항목이 먼저 오므로, 쿼리 결과를 동료에게 넘기거나 Burp, Charles, 브라우저 네트워크 패널에 그대로 불러올 수 있습니다. [HAR 내보내기](#har-export)를 참고하세요.
 
@@ -154,7 +158,7 @@ gori run history -q 'status:5xx' --limit 100 --format json
 gori run show <flow-id> --format raw
 ```
 
-`--format`은 `text`, `json`, `raw`(정확한 바이트), 또는 `har`(항목 하나짜리 HAR log)입니다. `--request-only` / `--response-only`로 출력을 제한하며, `har`에는 적용되지 않습니다. 디코드된 SAML/JWT/GraphQL/파라미터, WebSocket 메시지, SSE 이벤트가 있으면 함께 포함됩니다.
+`--format`은 `text`, `json`, `raw`(정확한 바이트), `har`(항목 하나짜리 HAR log), 또는 `curl`(요청을 그대로 재현하는 실행 가능한 `curl` 명령 — TUI의 `Space → Y`가 복사하는 것과 같은 텍스트)입니다. `--request-only` / `--response-only`로 출력을 제한하며, `har`에는 적용되지 않습니다. `curl`은 요청이므로 `--response-only`는 거부됩니다. 디코드된 SAML/JWT/GraphQL/파라미터, WebSocket 메시지, SSE 이벤트가 있으면 함께 포함됩니다.
 
 #### HAR 내보내기 {#har-export}
 
