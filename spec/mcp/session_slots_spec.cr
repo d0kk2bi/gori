@@ -218,3 +218,103 @@ describe "MCP set_active_session_slot" do
     end
   end
 end
+
+# `create_session_slot{flow_id}` — the MCP half of "turn a captured login into a slot". The
+# reading is `Gori::SessionFromFlow` (pinned in spec/session_from_flow_spec.cr); what is pinned
+# here is that this surface calls it, exposes the same refusal codes, and refuses the one
+# ambiguous call shape.
+private def seed_login_flow(store, resp_head : String, resp_body : String? = nil,
+                            req_head : String = "POST /login HTTP/1.1\r\nHost: h.test\r\n\r\n") : Int64
+  id = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_i64, scheme: "https", host: "h.test", port: 443,
+    method: "POST", target: "/login", http_version: "HTTP/1.1",
+    head: req_head.to_slice, body: nil))
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: 200, head: resp_head.to_slice, body: resp_body.try(&.to_slice),
+    content_type: "application/json"))
+  id
+end
+
+describe "MCP create_session_slot from a captured flow" do
+  it "builds the overlay from the login response and names its sources" do
+    with_store do |store|
+      t = tools_for(store)
+      id = seed_login_flow(store,
+        "HTTP/1.1 200 OK\r\nSet-Cookie: sessionid=SUPERSECRET; Path=/; HttpOnly\r\n\r\n",
+        %({"access_token":"TOK"}))
+      created = call_json(t, "create_session_slot", %({"name":"admin","flow_id":#{id}}))
+      created["name"].as_s.should eq("admin")
+      created["set_headers"].as_a.map(&.["name"].as_s).should eq(["Cookie", "Authorization"])
+      # Redacted like every other reply on this surface — a slot's whole job is carrying a
+      # credential and this text can flow through a hosted LLM.
+      created["set_headers"][0]["value"].as_s.should eq("[REDACTED]")
+      created["sources"].as_a.size.should eq(2)
+      created["sources"].as_a.join(" ").should_not contain("SUPERSECRET")
+
+      # It reached the same settings row every other surface reads, with real values.
+      slot = Gori::SessionSlots.load(store).find("admin").not_nil!
+      slot.set_headers.to_h["Cookie"].should eq("sessionid=SUPERSECRET")
+      slot.set_headers.to_h["Authorization"].should eq("Bearer TOK")
+      slot.rules.should be_empty
+    end
+  end
+
+  it "refuses a flow that is not a login, deterministically and by name" do
+    with_store do |store|
+      t = tools_for(store)
+      id = seed_login_flow(store, "HTTP/1.1 200 OK\r\n\r\n", "<html>hi</html>")
+      r = t.call("create_session_slot", JSON.parse(%({"name":"admin","flow_id":#{id}})))
+      r.is_error.should be_true
+      r.error_code.should eq(Gori::SessionFromFlow::NO_CREDENTIAL)
+      # Un-retryable: the same flow refuses the same way next time, and an agent that trusts
+      # `retryable` would loop on it (the #414 shape).
+      r.retryable.should be_false
+      Gori::SessionSlots.load(store).slots.should be_empty
+    end
+  end
+
+  it "reports an unknown flow as NOT_FOUND" do
+    with_store do |store|
+      r = tools_for(store).call("create_session_slot", JSON.parse(%({"name":"admin","flow_id":9999})))
+      r.is_error.should be_true
+      r.error_code.should eq("NOT_FOUND")
+    end
+  end
+
+  # An agent that sent both had ONE of them in mind; picking either silently is how it sends a
+  # credential it did not choose.
+  it "refuses flow_id and set_headers together rather than merging them" do
+    with_store do |store|
+      t = tools_for(store)
+      id = seed_login_flow(store, "HTTP/1.1 200 OK\r\nSet-Cookie: sessionid=abc\r\n\r\n")
+      r = t.call("create_session_slot",
+        JSON.parse(%({"name":"admin","flow_id":#{id},"set_headers":["Cookie: mine=1"]})))
+      r.is_error.should be_true
+      r.field.should eq("set_headers")
+      Gori::SessionSlots.load(store).slots.should be_empty
+    end
+  end
+
+  # The integer contract every other MCP argument follows (#724): a value the client SUPPLIED
+  # but gori cannot read is refused BY NAME, never fallen back from.
+  it "refuses an unreadable flow_id instead of ignoring it" do
+    with_store do |store|
+      r = tools_for(store).call("create_session_slot", JSON.parse(%({"name":"admin","flow_id":"latest"})))
+      r.is_error.should be_true
+      r.text.should contain("flow_id")
+      Gori::SessionSlots.load(store).slots.should be_empty
+    end
+  end
+
+  it "declares flow_id in tools/list, with the literal-overlay caveat" do
+    with_store do |store|
+      listed = JSON.parse(JSON.build { |j| tools_for(store).list(j) }).as_a
+      tool = listed.find { |x| x["name"].as_s == "create_session_slot" }.not_nil!
+      tool["inputSchema"]["properties"]["flow_id"]?.should_not be_nil
+      desc = tool["description"].as_s
+      desc.should contain("LITERAL")
+      desc.should contain("ROTATES")
+      desc.should contain("create_extract_rule")
+    end
+  end
+end

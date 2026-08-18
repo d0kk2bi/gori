@@ -2,6 +2,7 @@ require "json"
 require "../../store"
 require "../../session_slots"
 require "../../discover/headers"
+require "../../session_from_flow"
 
 module Gori
   module MCP
@@ -77,8 +78,9 @@ module Gori
           return err("a session slot called '#{name}' already exists (change it with update_session_slot)",
             "INVALID_ARGUMENT", field: "name")
         end
-        set_headers = session_set_headers(h)
-        return set_headers if set_headers.is_a?(Result)
+        built = slot_set_headers_or_flow(h)
+        return built if built.is_a?(Result)
+        set_headers, sources = built
         slot = Gori::SessionSlot.new(name, set_headers, str_list(h, "remove_headers").map(&.strip).reject(&.empty?),
           bool_arg(h, "baseline", false), str_list(h, "rules").map(&.strip).reject(&.empty?))
         unless registry.add(slot)
@@ -87,7 +89,40 @@ module Gori
         # Re-read rather than echo what was built: `SessionSlots` owns the single-baseline
         # rule, so the FIRST slot in a project comes back holding a flag the caller did not
         # ask for — and a reply that denied it would have the agent set it a second time.
-        Result.new(JSON.build { |j| emit_session_slot(j, registry.find(slot.name) || slot, false, registry.active_name) })
+        Result.new(JSON.build { |j| emit_session_slot(j, registry.find(slot.name) || slot, false, registry.active_name, sources) })
+      end
+
+      # The overlay a `create_session_slot` call asked for, plus one line per SOURCE when it
+      # was read off a flow. Two spellings and they are exclusive: `set_headers` is the caller
+      # dictating the overlay, `flow_id` is gori BUILDING it from a captured login exchange
+      # (`Gori::SessionFromFlow` — the same reader `gori run session from-flow` uses, so the
+      # two surfaces cannot build different identities from one flow).
+      #
+      # Passing both is refused rather than merged: an agent that sent both has one of the two
+      # in mind, and silently picking either is how it ends up sending a credential it did not
+      # choose.
+      private def slot_set_headers_or_flow(h) : {Array({String, String}), Array(String)} | Result
+        flow_id = optional_int_arg(h, "flow_id")
+        unless flow_id
+          headers = session_set_headers(h)
+          return headers if headers.is_a?(Result)
+          return {headers, [] of String}
+        end
+        if present?(h, "set_headers")
+          return err("pass either 'flow_id' or 'set_headers', not both — 'flow_id' BUILDS the " \
+                     "overlay from the flow's response",
+            "INVALID_ARGUMENT", field: "set_headers")
+        end
+        detail = store.get_flow(flow_id)
+        return not_found("no flow ##{flow_id} in this project (see list_history)") unless detail
+        drafted = Gori::SessionFromFlow.draft(detail)
+        if refusal = drafted.as?(Gori::SessionFromFlow::Refusal)
+          # Deterministic: the SAME flow will refuse the same way next time, so this must not
+          # be retryable — the #414 shape again.
+          return err("flow ##{flow_id} — #{refusal.message}", refusal.code, field: "flow_id")
+        end
+        draft = drafted.as(Gori::SessionFromFlow::Draft)
+        {draft.set_headers, draft.sources}
       end
 
       # A partial update: an argument left out keeps what the slot already has. That is the
@@ -205,9 +240,13 @@ module Gori
       end
 
       private def emit_session_slot(j : JSON::Builder, slot : Gori::SessionSlot,
-                                    include_sensitive : Bool, active : String?) : Nil
+                                    include_sensitive : Bool, active : String?,
+                                    sources : Array(String) = [] of String) : Nil
         j.object do
           j.field "name", slot.name
+          # Where each header came from, when the overlay was READ off a flow rather than
+          # dictated. Provenance only, never a value — this reply can flow through a hosted LLM.
+          j.field("sources") { j.array { sources.each { |line| j.string line } } } unless sources.empty?
           j.field "baseline", slot.baseline?
           j.field "active", slot.name == active
           # True = this slot changes no byte; it is the `as-captured` baseline by construction
@@ -248,8 +287,15 @@ module Gori
         tool j, "create_session_slot",
           "Create a session slot (a named identity). A slot that sets and strips nothing is " \
           "'as captured' — the no-overlay baseline. Values may reference a binding: " \
-          "\"Bearer $SESSION\" resolves against THIS slot's own table when it claims the rule." do |s|
+          "\"Bearer $SESSION\" resolves against THIS slot's own table when it claims the rule. " \
+          "Pass 'flow_id' instead of 'set_headers' to BUILD the overlay from a captured login " \
+          "exchange: gori copies the response's Set-Cookie pairs into one Cookie header and its " \
+          "Authorization (or a top-level access_token/token/id_token string in a JSON body, as a " \
+          "Bearer token). That overlay is LITERAL — the bytes that login handed back — and does " \
+          "NOT re-authenticate; a token that ROTATES belongs on the extract-rule path " \
+          "(create_extract_rule) instead." do |s|
           s.field "name", strprop("slot name (unique in the project; how every surface refers to it)"), required: true
+          s.field "flow_id", intprop("build the overlay from THIS captured flow's login response (see list_history); mutually exclusive with set_headers")
           s.field "set_headers", session_headers_prop
           s.field "remove_headers", strarrprop("header names to STRIP before sending (e.g. [\"Cookie\",\"Authorization\"] for an anonymous identity)")
           s.field "rules", strarrprop("extract-rule binding NAMES whose observed values belong to this slot instead of the global table (see list_extract_rules)")

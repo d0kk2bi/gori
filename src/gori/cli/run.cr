@@ -36,6 +36,7 @@ require "../notes"
 require "../issues_export"
 require "../links"
 require "../import"
+require "../session_from_flow"
 require "./output"
 require "./run/interrupt"
 require "./run/capture"
@@ -161,7 +162,7 @@ module Gori
         {"mine [<id>]", "Discover hidden parameters (query/form/multipart/json/header/cookie)"},
         {"sequence (seq)", "Analyze token randomness (collect via replay, or --tokens FILE)"},
         {"authorize [<id>…]", "Replay requests under several identities to find broken access control"},
-        {"session", "Manage session slots — named identities a send goes out as (list, show, add, edit, rm, baseline)"},
+        {"session", "Manage session slots — named identities a send goes out as (list, show, add, from-flow, edit, rm, baseline)"},
         {"discover", "Spider + directory brute-force a target; findings feed the Sitemap"},
         {"oast", "Listen for out-of-band callbacks (interactsh & friends); print payload + hits"},
         {"oast providers", "Manage saved OAST providers (list, add, update, enable/disable, delete)"},
