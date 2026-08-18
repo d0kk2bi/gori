@@ -292,9 +292,21 @@ describe Gori::QL do
   # answered with a proxy's `text/html` 502 — or not answered at all — is still a gRPC call.
   # `Proto.classify` makes the same two-sided test, which is the point of this whole module:
   # the label the column prints and the value the filter matches cannot drift.
-  it "compiles proto: with no column of its own (ws=101, grpc either side, sse by response)" do
-    Gori::QL.parse("proto:ws").sql.should eq("(status = 101)")
-    Gori::QL.parse("proto:websocket").sql.should eq("(status = 101)") # alias
+  #
+  # `ws` reads BOTH transports for the same reason (#743): a WebSocket over HTTP/2 is an
+  # RFC 8441 extended CONNECT answered `200`, so `status = 101` alone omitted every h2 socket
+  # from the one filter an operator reaches for to find sockets. The token comes off the V16
+  # `connect_protocol` column, by EQUALITY — `connect-udp`/`connect-ip` are extended CONNECTs
+  # that are not RFC 6455 framing and must not match.
+  it "compiles proto: over BOTH WS transports (grpc either side, sse by response)" do
+    Gori::QL.parse("proto:ws").sql.should eq(
+      "(((status IS NOT NULL AND status = 101) OR " \
+      "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+      "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket')))")
+    Gori::QL.parse("proto:websocket").sql.should eq( # alias
+"(((status IS NOT NULL AND status = 101) OR " \
+"(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+"connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket')))")
     Gori::QL.parse("proto:grpc").sql.should eq(
       "(((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
       "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%')))")
@@ -305,7 +317,9 @@ describe Gori::QL do
 
   it "compiles proto:http as a NULL-safe negation (pending/typeless flows count as http)" do
     Gori::QL.parse("proto:http").sql.should eq(
-      "((status IS NULL OR status <> 101) " \
+      "(NOT ((status IS NOT NULL AND status = 101) OR " \
+      "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+      "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket')) " \
       "AND NOT ((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
       "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%')) " \
       "AND NOT (content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%'))")
@@ -321,7 +335,11 @@ describe Gori::QL do
   # returned the cleartext rows too would drop exactly the signal the column was changed to
   # keep, on the query an operator writes BECAUSE they saw it in the column.
   it "compiles the transport spellings the PROTO column prints as protocol AND scheme" do
-    Gori::QL.parse("proto:wss").sql.should eq("((status = 101) AND scheme = 'https')")
+    Gori::QL.parse("proto:wss").sql.should eq(
+      "((((status IS NOT NULL AND status = 101) OR " \
+      "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+      "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket'))) " \
+      "AND scheme = 'https')")
     Gori::QL.parse("proto:grpcs").sql.should eq(
       "((((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
       "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%'))) " \

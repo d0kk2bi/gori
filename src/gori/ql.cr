@@ -92,7 +92,8 @@ module Gori
 
       Status class shorthand: status:5xx  status:4xx
 
-      Protocol: proto:ws  proto:grpc  proto:sse  proto:http  (ws = 101 upgrade; grpc/sse by Content-Type)
+      Protocol: proto:ws  proto:grpc  proto:sse  proto:http  (ws = the 101 upgrade or an accepted
+      RFC 8441 extended CONNECT; grpc/sse by Content-Type)
 
       Short-circuited: stub:true  stub:false  — flows gori answered ITSELF from a Match&Replace
       short-circuit rule, with NO origin involved. Their response bytes came from the rule, not
@@ -551,9 +552,10 @@ module Gori
       end
     end
 
-    # proto: classifies a flow by application protocol with no column of its OWN —
-    # WS is the 101 upgrade handshake, gRPC is read off EITHER side's Content-Type, SSE off
-    # the response's, and http is everything else. Mirrors Gori::Proto.classify (the
+    # proto: classifies a flow by application protocol —
+    # WS is the h1 101 upgrade handshake OR an accepted RFC 8441 extended CONNECT, gRPC is read
+    # off EITHER side's Content-Type, SSE off the response's, and http is everything else.
+    # Mirrors Gori::Proto.classify (the
     # render-side source of truth). The LIKE patterns are constant literals (no user
     # data), so they are inlined; the gRPC/SSE clauses carry an explicit NOT-NULL
     # guard so `http` can negate them NULL-safely — a pending/typeless flow (NULL
@@ -569,6 +571,18 @@ module Gori
     GRPC_SQL = "((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
                "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%'))"
     SSE_SQL = "(content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%')"
+    # BOTH transports, because a WebSocket is one protocol and used to be two answers here: an
+    # RFC 8441 socket is `CONNECT` answered `200`, so `status = 101` alone silently omitted
+    # every h2 one from the filter an operator reaches for to find sockets. The `connect_protocol`
+    # column (V16) holds the `:protocol` token verbatim, so `= 'websocket'` is an EQUALITY on a
+    # token and not a LIKE over a head — `connect-udp`/`connect-ip` are extended CONNECTs that
+    # are not RFC 6455 framing and must not match. 2xx is required for the same reason the h1
+    # half requires the 101; see `Proto.websocket_connect?`, which this mirrors exactly.
+    # Every leaf carries an IS NOT NULL guard so the whole term is 0/1 rather than NULL on a
+    # pending flow, which is what lets `http` below negate it NULL-safely.
+    WS_SQL = "((status IS NOT NULL AND status = 101) OR " \
+             "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+             "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket'))"
 
     private def self.proto_cond(value : String) : {String, Array(DB::Any)}?
       # The TLS spellings the History PROTO column prints (`WSS`/`GRPCS`/`SSES`/`HTTPS`) are
@@ -578,10 +592,10 @@ module Gori
       base, secure = Proto.split_transport(value)
       no_args = [] of DB::Any
       sql = case Proto::Kind.parse?(base)
-            in Proto::Kind::Ws   then "status = 101"
+            in Proto::Kind::Ws   then WS_SQL
             in Proto::Kind::Grpc then GRPC_SQL
             in Proto::Kind::Sse  then SSE_SQL
-            in Proto::Kind::Http then "(status IS NULL OR status <> 101) AND NOT #{GRPC_SQL} AND NOT #{SSE_SQL}"
+            in Proto::Kind::Http then "NOT #{WS_SQL} AND NOT #{GRPC_SQL} AND NOT #{SSE_SQL}"
             in nil               then return nil
             end
       secure.nil? ? {sql, no_args} : {"(#{sql}) AND scheme = 'https'", no_args}

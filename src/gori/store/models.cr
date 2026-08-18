@@ -42,13 +42,20 @@ module Gori
       getter? short_circuited : Bool
       # What gori has to SAY about this flow that its bytes cannot — see `FlowRow#advisory`.
       getter advisory : String?
+      # The RFC 8441 extended CONNECT's `:protocol` pseudo-header, verbatim (nil = this was not
+      # one, or the capture path cannot know). Carried on the DTO rather than lifted off `head`
+      # by the store the way `request_content_type` is: `:protocol` is a pseudo-header, so it
+      # survives into the stored head only as `HeadCodec`'s synthetic `X-Gori-Protocol` marker
+      # line — and a marker line is forgeable by an IMPORTED flow, where a pseudo-header the h2
+      # decoder read off the wire is not. Only `H2::Assembler` sets this. See V16.
+      getter connect_protocol : String?
 
       def initialize(@created_at, @scheme, @host, @port, @method, @target,
                      @http_version, @head, @body = nil,
                      @sni = nil, @alpn = nil, @tls_version = nil,
                      @body_truncated = false, @body_size = nil,
                      @h2_conn_id = nil, @h2_stream_id = nil, @short_circuited = false,
-                     @advisory = nil)
+                     @advisory = nil, @connect_protocol = nil)
       end
     end
 
@@ -127,11 +134,17 @@ module Gori
       # the column existed — NOT "the request declared none"; `Proto.classify` treats it as
       # unknown and falls back to what it always read. See the V14 migration.
       getter request_content_type : String?
+      # The RFC 8441 extended CONNECT's `:protocol` token — `websocket` for a WebSocket over
+      # HTTP/2, `connect-udp`/`connect-ip`/… for the extended CONNECTs that are not RFC 6455
+      # framing. NULL means "not recorded" — a row captured before the column existed, or any
+      # flow that was not an h2 extended CONNECT — NOT "this is not a WebSocket"; `Proto.classify`
+      # treats it as unknown and falls back to what it always read. See the V16 migration.
+      getter connect_protocol : String?
 
       def initialize(@id, @created_at, @scheme, @method, @host, @port, @target,
                      @status, @size, @state, @response_size = nil, @duration_us = nil,
                      @content_type = nil, @short_circuited = false, @advisory = nil,
-                     @request_content_type = nil)
+                     @request_content_type = nil, @connect_protocol = nil)
       end
 
       # The advisory as a list of statements, empty when there is none.

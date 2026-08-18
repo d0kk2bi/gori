@@ -293,6 +293,36 @@ describe Gori::Proxy::H2::WsCapture do
   end
 
   # An ordinary h2 request on the same connection is untouched: its DATA is still a BODY.
+  # #743 — the write site for the V16 column. `Proto` classified an h2 socket as plain HTTP
+  # because an RFC 8441 handshake is `CONNECT` answered `200` and there is no 101 in it, so the
+  # PROTO column printed `HTTPS` over a full transcript and `proto:ws` missed it. The fact lives
+  # in a pseudo-header, and `QL.proto_cond` compiles `proto:` to SQL — so this decoder, which
+  # already reads the token to decide whether to point a frame codec at the stream, is what has
+  # to hand it to the store.
+  it "records the :protocol token on the captured request, verbatim" do
+    sink = WsSink.new
+    open_socket(sink)
+    sink.requests.first.connect_protocol.should eq("websocket")
+  end
+
+  # Verbatim, and not folded to a WebSocket boolean: the distinction this file already makes
+  # between RFC 6455 framing and the other extended CONNECTs has to survive onto disk.
+  it "records a non-WebSocket :protocol too, rather than discarding it" do
+    sink = WsSink.new
+    a = open_socket(sink, protocol: "connect-udp")
+    a.feed("out", data_frame(1_u32, Frame::END_STREAM, Bytes.empty))
+    sink.requests.first.connect_protocol.should eq("connect-udp")
+  end
+
+  it "leaves an ordinary stream's column NULL" do
+    sink = WsSink.new
+    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    a.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hpack([{":method", "GET"}, {":scheme", "https"}, {":path", "/"},
+             {":authority", "ws.example.com"}])))
+    sink.requests.first.connect_protocol.should be_nil
+  end
+
   it "leaves an ordinary stream's DATA as a body" do
     sink = WsSink.new
     a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)

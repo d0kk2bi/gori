@@ -1219,13 +1219,19 @@ module Gori
       # which is the set an operator is looking through. `QL.proto_cond` compiles `proto:` to
       # SQL against this table, so the fact has to be a COLUMN or the label and the filter drift.
       args << MediaType.of(req.head)
+      # The RFC 8441 `:protocol` token, verbatim, and only from the h2 decoder that read it off
+      # the wire (V16). NULL on every other flow — a WebSocket over HTTP/2 is `CONNECT` answered
+      # `200`, so without this column `Proto` classified it as plain HTTP and `proto:ws` missed
+      # it. Not derived from the head here, unlike `request_content_type` above: a pseudo-header
+      # reaches the stored head only as a synthetic marker line, which an import could forge.
+      args << req.connect_protocol
       res = conn.exec(
         "INSERT INTO flows " \
         "(created_at, scheme, host, port, method, target, http_version, " \
         " sni, alpn, tls_version, request_head, request_body, request_size, state, " \
         " h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, " \
-        " request_content_type, fts_dirty) " \
-        "VALUES (?,?,?,?,?,?,?,?,?,?,#{head_slot},?,?,?,?,?,?,?,?,?,?,1)", args: args)
+        " request_content_type, connect_protocol, fts_dirty) " \
+        "VALUES (?,?,?,?,?,?,?,?,?,?,#{head_slot},?,?,?,?,?,?,?,?,?,?,?,1)", args: args)
       # The INSERT's own result carries the rowid — no separate `SELECT last_insert_rowid()`.
       # No flows_fts write here: `fts_dirty = 1` hands the trigram work to the off-commit
       # indexer, so a capture commit no longer pays for tokenization (see V4 / await_op).
@@ -1473,9 +1479,10 @@ module Gori
       short_circuited = rs.read(Int32) != 0
       advisory = rs.read(String?)
       request_content_type = rs.read(String?)
+      connect_protocol = rs.read(String?)
       FlowRow.new(id, created_at, scheme, method, host, port, target,
         status, req_size + (resp_size || 0_i64), state, resp_size, duration_us, content_type,
-        short_circuited, advisory, request_content_type)
+        short_circuited, advisory, request_content_type, connect_protocol)
     end
 
     # Column order MUST match EVENT_COLS.

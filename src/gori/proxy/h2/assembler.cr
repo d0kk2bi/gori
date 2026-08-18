@@ -489,14 +489,21 @@ module Gori::Proxy::H2
       cap = stream.req.body
       body = cap.total == 0 ? nil : cap.to_slice
 
+      # The RFC 8441 `:protocol` token goes to the store as a COLUMN of its own (V16) as well as
+      # into the synthetic head, because it is what makes a WebSocket over HTTP/2 a WebSocket
+      # and `QL.proto_cond` compiles `proto:` to SQL — a label the query cannot see is the drift
+      # `Proto` exists to prevent. Verbatim, not folded to a boolean: `connect-udp` (RFC 9298)
+      # and `connect-ip` (RFC 9484) are extended CONNECTs that are not RFC 6455 framing, and the
+      # distinction this file already makes has to survive onto disk.
+      protocol = extended_connect_protocol(headers)
       head = synth_request_head(headers, authority, stream.req.trailer_names, stream.pushed_by,
-        pseudo(headers, ":protocol"))
+        protocol)
       captured = Store::CapturedRequest.new(
         created_at: stream.created_at, scheme: scheme, host: host, port: port,
         method: method, target: path, http_version: "HTTP/2", head: head, body: body,
         body_truncated: cap.truncated?, body_size: cap.total,
         h2_conn_id: @conn_id, h2_stream_id: stream_id.to_i64,
-        advisory: advisory_of(stream))
+        advisory: advisory_of(stream), connect_protocol: protocol)
       stream.flow_id = @sink.on_request(captured)
     end
 
