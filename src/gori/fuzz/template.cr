@@ -166,6 +166,88 @@ module Gori::Fuzz
       spans
     end
 
+    # The indices of the positions whose splice point lands in a PERCENT-ENCODED region of
+    # the request: the request-target's query string, or an
+    # `application/x-www-form-urlencoded` body. A path segment, a JSON or otherwise raw
+    # body, a header and a cookie value are NOT in that set — a `%3C` in any of them is a
+    # different test than the operator marked, and cookies have their own quoting rules.
+    #
+    # A structural FACT about this template, not a decision: `Fuzz::AutoEncode` owns the
+    # decision (whether the run encodes for these positions at all) and `Fuzz::Plan.build`
+    # takes it. Computed off the BASELINE rendering — every position spliced with its own
+    # default — rather than off the marked text, so a `§…§` the TUI editor holds, a
+    # `--mark TOKEN` the CLI wrapped and an `--auto` marker all land on the same byte
+    # offsets: the ones the wire will actually carry.
+    def urlencoded_positions : Array(Int32)
+      hits = [] of Int32
+      return hits if @positions.empty?
+      raw, spans = render_spans(default_payloads)
+      query = Template.query_range(raw)
+      form = Template.form_body_range(raw)
+      spans.each_with_index do |(a, _), k|
+        hits << k if Template.in_range?(query, a) || Template.in_range?(form, a)
+      end
+      hits
+    end
+
+    # `[start, end)` byte range of the request-target's query string (the bytes AFTER the
+    # first `?`), or nil when the first line carries none. Bytes, not chars: a body's
+    # non-UTF-8 run must never decide where the request line ends.
+    protected def self.query_range(raw : Bytes) : {Int32, Int32}?
+      eol = byte_index(raw, 0x0A_u8, 0, raw.size) || raw.size
+      eol -= 1 if eol > 0 && raw[eol - 1] == 0x0D_u8
+      sp1 = byte_index(raw, 0x20_u8, 0, eol)
+      return nil unless sp1
+      # No second space (an HTTP/0.9-shaped or truncated line) → the target runs to the end
+      # of the line, which is still the right region to encode into.
+      stop = byte_index(raw, 0x20_u8, sp1 + 1, eol) || eol
+      q = byte_index(raw, 0x3F_u8, sp1 + 1, stop)
+      q ? {q + 1, stop} : nil
+    end
+
+    # `[start, end)` byte range of the body when the body is form-urlencoded, else nil.
+    protected def self.form_body_range(raw : Bytes) : {Int32, Int32}?
+      split = head_body_split(raw)
+      return nil unless split
+      head_len, body_start = split
+      return nil if body_start >= raw.size
+      head = String.new(raw[0, head_len])
+      body = String.new(raw[body_start, raw.size - body_start])
+      urlencoded_body?(head, body) ? {body_start, raw.size} : nil
+    end
+
+    # `{head length, body start}` at the blank line, CRLFCRLF or bare LFLF, or nil for a
+    # head-only request. `head length` excludes the terminator, matching what `auto_mark`
+    # hands `mark_body` so `header_value` reads the same head on both roads.
+    private def self.head_body_split(raw : Bytes) : {Int32, Int32}?
+      i = 0
+      while i + 1 < raw.size
+        if raw[i] == 0x0D_u8 && raw[i + 1] == 0x0A_u8 && raw[i + 2]? == 0x0D_u8 && raw[i + 3]? == 0x0A_u8
+          return {i, i + 4}
+        elsif raw[i] == 0x0A_u8 && raw[i + 1] == 0x0A_u8
+          return {i, i + 2}
+        end
+        i += 1
+      end
+      nil
+    end
+
+    # First `byte` in `raw[from...to]`, or nil. (`Slice#index` has no upper bound, and every
+    # scan here is line- or target-scoped.)
+    private def self.byte_index(raw : Bytes, byte : UInt8, from : Int32, to : Int32) : Int32?
+      i = from
+      while i < to
+        return i if raw[i] == byte
+        i += 1
+      end
+      nil
+    end
+
+    protected def self.in_range?(range : {Int32, Int32}?, offset : Int32) : Bool
+      return false unless range
+      offset >= range[0] && offset <= range[1]
+    end
+
     # The `[start, end)` CHARACTER offsets (into `text`) of every CLOSED `§…§`
     # region, in marker order, INCLUDING both `§` delimiters. 1:1 with
     # `parse(text).positions` — same `§§`-escape and unbalanced-trailing-§ rules — so
@@ -611,13 +693,22 @@ module Gori::Fuzz
     private def self.mark_body(head : String, body : String) : String
       ct = (header_value(head, "content-type") || "").downcase
       trimmed = body.strip
-      if ct.includes?("urlencoded") || (looks_urlencoded?(body) && !ct.includes?("json"))
+      if urlencoded_body?(head, body)
         mark_pairs(body, '&')
       elsif ct.includes?("json") || trimmed.starts_with?('{') || trimmed.starts_with?('[')
         mark_json(body)
       else
         body
       end
+    end
+
+    # Is this body an `application/x-www-form-urlencoded` one? ONE predicate, shared by
+    # `mark_body` (which marks its values) and `form_body_range` (which decides they are
+    # percent-encoded), so "auto-marked as a form value" and "encoded as a form value" can
+    # never answer differently about the same body.
+    private def self.urlencoded_body?(head : String, body : String) : Bool
+      ct = (header_value(head, "content-type") || "").downcase
+      ct.includes?("urlencoded") || (looks_urlencoded?(body) && !ct.includes?("json"))
     end
 
     private def self.looks_urlencoded?(body : String) : Bool

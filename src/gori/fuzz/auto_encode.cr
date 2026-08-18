@@ -1,0 +1,88 @@
+require "./payload"
+require "./template"
+
+module Gori::Fuzz
+  # WHICH marked positions this run percent-encodes for, and the encode itself.
+  #
+  # `--auto` finds the position; it used to leave the encoding to the operator. So
+  # `gori run fuzz --auto --preset xss` spliced `<script>alert(1)</script>` into `?q=` as
+  # raw bytes: the space inside the payload ENDS the request-target, the rest of the
+  # payload becomes the HTTP version token, and the origin answers 400 to a request that
+  # never carried the payload it was testing. Every playbook grew the same footnote — "add
+  # `--encode url`" — which is a default written down in prose instead of in the code, and
+  # a tester arriving from Burp or ffuf does not know to read it.
+  #
+  # So a payload spliced into a QUERY-STRING or FORM-BODY position is percent-encoded by
+  # default. The two other things the run could encode for are deliberately left alone:
+  # a path segment, a JSON/raw body, a header and a cookie value all stay byte-verbatim,
+  # because a `%3C` there is a different test than the one that was marked (and `/`, `.`
+  # and `;` are the payload in a traversal or a cookie-injection probe). `Template
+  # #urlencoded_positions` draws that line; this struct only decides whether to act on it.
+  #
+  # It does NOT act when the operator has already said what the bytes should be:
+  #
+  #   * `--encode` / MCP `processors` — a run-wide pipeline over EVERY payload for EVERY
+  #     position (today's behaviour, kept: it wins, and wrapping it would double-encode
+  #     the very `%3C` it just produced);
+  #   * a per-position `§value¦chain§` — the same statement, aimed at one position;
+  #   * `--no-encode` / MCP `no_encode:true` — the escape hatch, for a run whose payload IS
+  #     the raw byte (HTTP parameter pollution with a bare `&`, a request-line CRLF probe).
+  #     A dedicated flag, not `--verbatim`: that one is the Content-Length knob and means
+  #     "do not resync framing", a different axis in the same command.
+  #
+  # The encoder is `Encode.new(:url)` — the SAME processor `--encode url` builds, not a new
+  # one and not the Decoder catalog's `url-encode` (which is form-style: it turns a space
+  # into `+`). One spelling of "URL-encoded" per surface.
+  struct AutoEncode
+    # `--encode url`'s processor, reused verbatim: percent-encode the reserved bytes,
+    # leaving a space as `%20` rather than `+` (a `+` is legal in a query but not in a path
+    # or a JSON string, and `%20` reads the same everywhere).
+    ENCODER = Encode.new(:url)
+
+    # Positions this run encodes for, by index into `Template#positions`.
+    getter positions : Set(Int32)
+
+    def initialize(@positions : Set(Int32))
+    end
+
+    # The no-op: an explicit pipeline, `--no-encode`, or a template with no query/form
+    # position at all. Every non-fuzz caller of `Generator` gets this.
+    def self.none : AutoEncode
+      new(Set(Int32).new)
+    end
+
+    # The decision, taken once per plan. `enabled` is the operator's escape hatch and
+    # `processors` their run-wide pipeline; a position carrying its own `¦chain` opts out
+    # individually.
+    def self.build(template : Template, processors : Array(Processor), enabled : Bool) : AutoEncode
+      return none unless enabled && processors.empty?
+      set = Set(Int32).new
+      template.urlencoded_positions.each do |k|
+        next unless (pos = template.positions[k]?) && pos.chain.empty?
+        set << k
+      end
+      new(set)
+    end
+
+    def none? : Bool
+      @positions.empty?
+    end
+
+    # Percent-encode the payload at every encoded position that this request actually
+    # SUBSTITUTED. `active` is the `Job#position` discriminator: Sniper injects into ONE
+    # position and leaves the rest at their template defaults, and a default is already the
+    # capture's own bytes — encoding it would turn `?q=a%20b` into `?q=a%2520b` and make
+    # every Sniper request a different base request than the one that was marked. nil (the
+    # battering-ram / pitchfork / cluster-bomb modes) means every position was substituted.
+    #
+    # Returns `payloads` ITSELF when nothing applies, so a run with no encoded position
+    # renders byte-for-byte the request it always did, with no extra allocation.
+    def apply(payloads : Array(String), active : Int32?) : Array(String)
+      return payloads if none?
+      return payloads if active && !@positions.includes?(active)
+      payloads.map_with_index do |v, k|
+        (active.nil? || active == k) && @positions.includes?(k) ? ENCODER.apply(v) : v
+      end
+    end
+  end
+end

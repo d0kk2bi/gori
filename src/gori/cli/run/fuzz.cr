@@ -20,6 +20,7 @@ module Gori
         mode = Fuzz::Mode::Sniper
         sources = [] of Fuzz::PayloadSource
         processors = [] of Fuzz::Processor
+        auto_encode = true
         concurrency = 20
         rate : Float64? = nil
         throttle : Int32? = nil
@@ -67,6 +68,12 @@ module Gori
           p.on("--case=KIND", "Processing: upper | lower") { |v| processors << Fuzz::Case.new(parse_case(v)) }
           p.on("--hash=ALGO", "Processing: md5 | sha1 | sha256") { |v| processors << Fuzz::Hasher.new(parse_hash(v)) }
           p.on("--regex-replace=SPEC", "Processing: /pattern/replacement/") { |v| processors << parse_regex_replace(v) }
+          # A payload spliced into a query-string or form-body position is percent-encoded by
+          # default (see `Fuzz::AutoEncode`); this is the way out, for a run whose payload IS
+          # the raw byte. NOT `--verbatim`, which is the Content-Length knob two lines down —
+          # a different axis in the same command, and overloading it would make "send it as
+          # written" mean two things at once.
+          p.on("--no-encode", "Splice payloads into query / form positions raw — no default URL-encoding (an explicit --encode still applies)") { auto_encode = false }
           p.on("--concurrency=N", "Parallel requests (default 20)") { |v| concurrency = parse_count(v, "--concurrency") }
           p.on("--rate=RPS", "Cap requests/sec (0 = unlimited)") { |v| rate = parse_rate(v) }
           p.on("--throttle=MS", "Fixed delay between requests (ms)") { |v| throttle = parse_nonneg(v, "--throttle") }
@@ -141,7 +148,7 @@ module Gori
           evidence: evidence,
           default_target: default_target, target: target_override,
           auto_mark: auto, marks: marks, http2: http2,
-          sources: sources, processors: processors,
+          sources: sources, processors: processors, auto_encode: auto_encode,
           config: Fuzz::Config.new(mode: mode, concurrency: concurrency, rps: rate, throttle_ms: throttle,
             retries: retries, timeout: timeout, follow_redirects: follow, auto_calibrate: auto_cal,
             keep_bodies: :none, keep_alive: keep_alive, max_requests: max_requests,
@@ -171,6 +178,7 @@ module Gori
         end
         warn_fuzz_marks(plan)
         warn_fuzz_content_length(plan)
+        note_fuzz_auto_encode(plan)
         # Last-byte-sync needs ONE persistent socket per connection to hold back the final byte;
         # h2 frames its own connection per send, so `Backend#send_race` degrades to independent
         # sends and a configured --race-warmup cannot be honored. Say so rather than drop it
@@ -260,6 +268,16 @@ module Gori
         return unless plan.rewrites_content_length?
         STDERR.puts "gori run fuzz: note: the template's Content-Length disagrees with its own body " \
                     "and is being recomputed on every request — pass --verbatim to send it as written"
+      end
+
+      # The run percent-encodes for its query / form positions. Said once, up front, naming
+      # the flag that turns it off — the payloads printed on every row are the RAW ones, so
+      # without this line a `<script>` row and a `%3Cscript%3E` wire look like a contradiction.
+      private def self.note_fuzz_auto_encode(plan : Fuzz::Plan) : Nil
+        n = plan.auto_encode.positions.size
+        return if n == 0
+        STDERR.puts "gori run fuzz: note: URL-encoding payloads for #{n} query/form " \
+                    "position#{n == 1 ? "" : "s"} — pass --no-encode to send them raw"
       end
 
       # {template text, default target (nil for file/stdin), http2, is-evidence} from the

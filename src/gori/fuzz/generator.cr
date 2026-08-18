@@ -20,8 +20,14 @@ module Gori::Fuzz
     # `registry` (when given) applies each marked position's inline Decoder chain to
     # its payload at render time — see Template#apply_chains. nil = no transforms
     # (keeps bare 3-arg callers and specs compiling).
+    #
+    # `auto_encode` percent-encodes the payload of every QUERY-STRING / FORM-BODY position
+    # this request substitutes — see `Fuzz::AutoEncode`, which is where the decision is
+    # taken (`Fuzz::Plan.build`). Defaults to the no-op, so a Generator built directly
+    # renders exactly what it always did.
     def initialize(@template : Template, @sets : Array(PayloadSet), @config : Config,
-                   @registry : Decoder::Registry? = nil)
+                   @registry : Decoder::Registry? = nil,
+                   @auto_encode : AutoEncode = AutoEncode.none)
       # Whether ANY marked position carries an inline `¦chain`. Computed once over the
       # immutable template so the per-request `chained` hot path can skip apply_chains'
       # array allocation entirely on the common no-chain template (auto_mark / bare §v§).
@@ -189,6 +195,11 @@ module Gori::Fuzz
 
     private def emit(idx : Int64, payloads : Array(String), pos : Int32?) : Job
       values, chain_error = chained_reported(payloads)
+      # LAST transform before the splice: whatever a `¦chain` produced is still going into a
+      # query string or a form body, and the bytes that reach the wire are the ones that have
+      # to be legal there. (A position that declares a chain opts OUT of this entirely — see
+      # `AutoEncode.build` — so in practice the two never stack.)
+      values = @auto_encode.apply(values, pos)
       raw, spans = @template.render_spans(values)
       bytes = raw
       if @config.update_content_length?
