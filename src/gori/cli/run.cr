@@ -752,6 +752,54 @@ module Gori
                     "#{dropped.inspect} were ignored"
       end
 
+      # Refuse a query that names a `field:`/`field~` QL does not implement, rather than running
+      # it. `ql.cr`'s `field_cond` else-branch free-texts an unknown field's WHOLE token on
+      # purpose — `methd:GET` becomes a literal substring search over method/host/path — so a
+      # one-shot command answered `no flows match "methd:GET"`, which reads as "the project is
+      # empty" and not as "you spelled `method` wrong". A scripted surface gets a SUCCESS status
+      # and an empty list out of that; nothing anywhere says a field name was not a field name.
+      #
+      # Refusal is the DEFAULT here, and the escape hatch is spelled `--lenient` rather than the
+      # opt-in being spelled `--strict`, because an opt-in leaves the silent answer as what an
+      # operator who has not read this gets. It is also why this is not `warn_query_terms`: that
+      # one shouts about a term QL DROPS, which broadens the result and leaves something to look
+      # at. This one has nothing to look at.
+      #
+      # Deliberately NOT applied to the TUI filter bar (an operator types `meth` on the way to
+      # `method:`, and a live filter re-evaluates every keystroke) nor to MCP, whose `strict`
+      # argument already offers this and defaults false for its own compatibility reasons.
+      def self.refuse_unknown_query_fields(cmd : String, q : String?, lenient : Bool) : Nil
+        return if lenient
+        (msg = unknown_query_field_error(cmd, q)) && abort(msg)
+      end
+
+      # The sentence `refuse_unknown_query_fields` aborts with, or nil to proceed — split out for
+      # the reason `list_leftover_error` is: `abort` is not spec-able, and the DECISION is the
+      # half worth pinning.
+      #
+      # Reports the FIRST unknown field only. A query is usually wrong in one place, and the
+      # operator has to re-run either way; naming one field leaves room in the line for the
+      # suggestion, which is the part that ends the round trip.
+      #
+      # `QL.known_field?`, NOT `QL::FIELDS.includes?`: `FIELDS` is the pool a surface OFFERS and
+      # QL accepts spellings it does not offer (`res.body`, `req.size` — `QL::FIELD_ALIASES`), so
+      # the narrower list would refuse a query QL compiles perfectly.
+      def self.unknown_query_field_error(cmd : String, q : String?) : String?
+        return nil unless q
+        use = QL.fields_used(q).find { |f| !QL.known_field?(f.name) }
+        return nil unless use
+        # Echoed with the operator it was WRITTEN with, so `body~` does not come back as `body:`.
+        bad = "#{use.name}#{use.regex ? '~' : ':'}"
+        tail = "run with --lenient to search it as text instead"
+        if near = QL.suggest_field(use.name)
+          "gori run #{cmd}: unknown query field `#{bad}` — did you mean " \
+          "`#{near}#{use.regex ? '~' : ':'}`? (#{tail})"
+        else
+          "gori run #{cmd}: unknown query field `#{bad}` — QL has no such field. " \
+          "Fields: #{QL::FIELDS.join(' ')} (#{tail})"
+        end
+      end
+
       def self.warn_query_terms(cmd : String, q : String) : Nil
         QL.invalid_regex_terms(q).each do |t|
           STDERR.puts "gori run #{cmd}: warning: invalid regex in #{t.inspect} — that term matches nothing"

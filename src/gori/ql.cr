@@ -1,4 +1,5 @@
 require "db"
+require "levenshtein"
 require "./filter_ast"
 require "./proto" # Proto::Kind, used by the `proto:` term below
 
@@ -282,6 +283,31 @@ module Gori
     # surface OFFERS, which is a strict subset of what it accepts.
     def self.known_field?(name : String) : Bool
       FIELDS.includes?(name) || FIELD_ALIASES.has_key?(name)
+    end
+
+    # The spelling a name QL does NOT implement most likely meant, or nil when nothing is close
+    # enough that printing it would be help rather than a guess. Lives here beside `known_field?`
+    # and for the same reason: the candidate pool is `FIELDS` + `FIELD_ALIASES`, and a surface
+    # that re-derived it would keep suggesting a name QL had since renamed.
+    #
+    # An UNAMBIGUOUS prefix before edit distance, because the two disagree about the commonest
+    # typo there is — a field name typed short. `meth` is two edits from `method` and two from
+    # `path`, so distance alone answers `path`; `method` is the only candidate `meth` prefixes.
+    #
+    # Tolerance 2 (1 under four characters, where two edits is most of the word) is what makes
+    # `hsot` → `host` work at all: a transposition costs two edits and Levenshtein's own default
+    # tolerance refuses it. Wider than that stops being a suggestion — `ext` is within 3 of both
+    # `dur` and `url`, and naming either would be inventing an intent.
+    def self.suggest_field(name : String) : String?
+      return nil if name.empty? || known_field?(name)
+      # `FIELDS` first so a tie resolves to the name completion OFFERS, not to an alias.
+      candidates = FIELDS + FIELD_ALIASES.keys
+      # Exactly one, or none: `s` prefixes `scheme` `status` `size` `stub`, and picking one of
+      # four is a coin flip printed as advice. An ambiguous prefix falls through to distance,
+      # which answers nothing for a stub that short — the honest answer.
+      prefixed = candidates.select(&.starts_with?(name))
+      return prefixed.first if prefixed.size == 1
+      Levenshtein.find(name, candidates, name.size < 4 ? 1 : 2)
     end
 
     # One line per field, for the surfaces that TEACH this language rather than parse it — the

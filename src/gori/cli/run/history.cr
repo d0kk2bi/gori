@@ -100,6 +100,7 @@ module Gori
         query : String? = nil
         limit = 50
         format = :text
+        lenient = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -109,6 +110,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("-qQL", "--query=QL", "Filter with a QL query (host: status:>=500 size:>10000 dur:>500 header: body~rx …)") { |v| query = v }
           p.on("-nN", "--limit=N", "Max rows, newest first (default 50)") { |v| limit = parse_count(v, "--limit") }
+          p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
           p.on("--format=FMT", "Output: text (default) | json | jsonl (both emit JSON-Lines) | har (one HAR 1.2 log)") do |v|
             format = parse_format(v, [:text, :json, :jsonl, :har])
             format = :json if format == :jsonl # this listing's json IS JSON-Lines; accept the standard name too
@@ -133,6 +135,10 @@ module Gori
         # and EVERY flow dumped.
         query, dropped = Run.compose_history_query(query, positional, neg_terms)
         Run.warn_dropped_query_terms("history", dropped)
+        # BEFORE the store is opened: `abort` skips ensure blocks, so a refused query must not
+        # leave a handle behind (the EMPTY-filter abort below has to `store.close` for exactly
+        # that reason, and this one has nothing to close).
+        Run.refuse_unknown_query_fields("history", query, lenient)
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin

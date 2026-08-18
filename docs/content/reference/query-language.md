@@ -87,6 +87,7 @@ header~set-cookie
 - `OR` matches either side. `NOT` and a `-` prefix both negate.
 - Parentheses group. Precedence is `NOT` then `AND` then `OR`.
 - A bare word (no `field:`) is free text over method, host, and target.
+- A `field:` name that does not exist is not free text you meant to write: `gori run history`, `gori run sitemap` and `gori run probe` **refuse** it, name the nearest real field, and exit non-zero. `--lenient` searches the token as text instead (what every surface used to do silently — `methd:GET` matched nothing, which reads as an empty project). The TUI filter bar still accepts a half-typed name as you type it.
 
 ```text
 host:example.com status:5xx           both must match

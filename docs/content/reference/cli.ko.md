@@ -141,6 +141,7 @@ gori run history -q 'status:5xx' --limit 100 --format json
 |--------|-------------|
 | `-q`, `--query=QL` | 쿼리 언어 필터 (위치 인자로도 허용) |
 | `-n`, `--limit=N` | 최대 행 수 (기본값 50) |
+| `--lenient` | 없는 필드 이름을 쓴 쿼리를 거절하지 않고 그 토큰을 텍스트로 검색 |
 | `--format=FMT` | `text`, `json`, 또는 `har` |
 
 서브커맨드: `history show <id>` (`run show`와 동일), `history delete <id>`, `history clear --yes`.
@@ -375,7 +376,7 @@ gori run probe --severity high --category cors
 gori run probe -a
 ```
 
-`--severity`는 `info`\|`low`\|`medium`\|`high`\|`critical` 중 하나입니다. `--category`는 `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`입니다. 기본적으로 패시브 검사를 수행하며, `-a`/`--active` 옵션을 사용하여 액티브 프로브 검사를 포함할 수 있습니다. `-q`/`--query`로 QL 필터를 겁니다.
+`--severity`는 `info`\|`low`\|`medium`\|`high`\|`critical` 중 하나입니다. `--category`는 `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`입니다. 기본적으로 패시브 검사를 수행하며, `-a`/`--active` 옵션을 사용하여 액티브 프로브 검사를 포함할 수 있습니다. `-q`/`--query`로 QL 필터를 겁니다. `--lenient`는 없는 필드 이름을 쓴 쿼리를 거절하지 않고 받아들입니다.
 
 `--active`와 함께: `--unsafe`는 안전하지 않은 메서드(`POST`/`PUT`/`PATCH`/`DELETE`)도 프로브하며, 이 재전송은 서버 데이터를 변경할 수 있습니다. `--aggressive`는 룰별 상한을 높이고 forbidden-bypass 헤더 집합을 넓힙니다(그리고 `--unsafe`를 함의합니다). 둘 다 `--allow-unscoped`를 함께 주지 않는 한 스코프 게이트를 따릅니다. 인가된 대상에만 사용하세요.
 
@@ -473,7 +474,7 @@ gori run import --postman api.postman_collection.json --db ./assessment.db --for
 gori run sitemap --in-scope --format paths
 ```
 
-`-q`/`--query=QL`는 history와 같은 QL로 엔드포인트를 거릅니다(위치 인자로도 넘길 수 있습니다). `-n`/`--limit=N`은 스캔할 엔드포인트 수를 제한합니다(기본값 `SITEMAP_MAX`). `--in-scope`는 스코프 내 호스트로 한정하고, `--no-group`은 id 접기를 끕니다. `--format`은 `text`(트리), `json`, `paths` 중에서 고릅니다.
+`-q`/`--query=QL`는 history와 같은 QL로 엔드포인트를 거릅니다(위치 인자로도 넘길 수 있습니다). `-n`/`--limit=N`은 스캔할 엔드포인트 수를 제한합니다(기본값 `SITEMAP_MAX`). `--in-scope`는 스코프 내 호스트로 한정하고, `--no-group`은 id 접기를 끕니다. `--format`은 `text`(트리), `json`, `paths` 중에서 고릅니다. `--lenient`는 없는 필드 이름을 쓴 쿼리를 거절하지 않고 받아들입니다.
 
 **`sitemap tag`**: 경로 하나에 자유 텍스트 메모를 고정합니다. TUI Sitemap에 보이는 그 메모입니다.
 

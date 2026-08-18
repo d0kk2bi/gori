@@ -128,6 +128,7 @@ module Gori
         in_scope = false
         group = true
         format = :text
+        lenient = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -138,6 +139,7 @@ module Gori
           p.on("-nN", "--limit=N", "Max distinct endpoints to scan (default #{Store::SITEMAP_MAX})") { |v| limit = parse_count(v, "--limit") }
           p.on("--in-scope", "Only hosts in the project's configured scope") { in_scope = true }
           p.on("--no-group", "Don't fold path-param ids (/users/<uuid>, /users/1,2,3…)") { group = false }
+          p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
           p.on("--format=FMT", "Output: text (default tree) | json | paths") { |v| format = parse_format(v, [:text, :json, :paths]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
@@ -158,6 +160,7 @@ module Gori
         if err = Run.reserved_query_verb_error(positional, "sitemap", ["tag"], "tag")
           abort err
         end
+        Run.refuse_unknown_query_fields("sitemap", query, lenient)
 
         # Parse/validate the QL BEFORE opening the store: abort skips ensure blocks, so a
         # bad query must not leave a store handle open.

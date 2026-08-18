@@ -142,6 +142,7 @@ gori run history -q 'status:5xx' --limit 100 --format json
 |--------|-------------|
 | `-q`, `--query=QL` | Query-language filter (also accepted positionally) |
 | `-n`, `--limit=N` | Max rows (default 50) |
+| `--lenient` | Don't refuse a query naming an unknown field — search that token as text |
 | `--format=FMT` | `text`, `json`, or `har` |
 
 Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `history clear --yes`.
@@ -407,7 +408,7 @@ gori run probe --severity high --category cors
 gori run probe -a
 ```
 
-`--severity` is `info`\|`low`\|`medium`\|`high`\|`critical`; `--category` is `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`; `-a`/`--active` includes light-touch active checks; `-q`/`--query` filters with QL.
+`--severity` is `info`\|`low`\|`medium`\|`high`\|`critical`; `--category` is `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`; `-a`/`--active` includes light-touch active checks; `-q`/`--query` filters with QL, and `--lenient` accepts a query that names an unknown field instead of refusing it.
 
 With `--active`: `--unsafe` also probes unsafe methods (`POST`/`PUT`/`PATCH`/`DELETE`), whose re-sends may mutate server data; `--aggressive` raises the per-rule caps and widens the forbidden-bypass header set (and implies `--unsafe`). Both stay scope-gated unless you also pass `--allow-unscoped`. Use them only against authorized targets.
 
@@ -506,7 +507,7 @@ A malformed entry is skipped rather than aborting the file; the result reports b
 gori run sitemap --in-scope --format paths
 ```
 
-`-q`/`--query=QL` filters endpoints with the same QL as history (also positional), `-n`/`--limit=N` caps the endpoints scanned (default `SITEMAP_MAX`), `--in-scope` limits to in-scope hosts, `--no-group` disables id folding, `--format` is `text` (tree), `json`, or `paths`.
+`-q`/`--query=QL` filters endpoints with the same QL as history (also positional), `-n`/`--limit=N` caps the endpoints scanned (default `SITEMAP_MAX`), `--in-scope` limits to in-scope hosts, `--no-group` disables id folding, `--format` is `text` (tree), `json`, or `paths`, and `--lenient` accepts a query that names an unknown field instead of refusing it.
 
 **`sitemap tag`**: pin a free-text memo onto one path, the same note the TUI's Sitemap shows.
 
