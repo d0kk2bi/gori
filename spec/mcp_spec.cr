@@ -595,6 +595,40 @@ describe Gori::MCP::Server do
         page.map(&.["id"].as_i64).should eq([b, a])
       end
     end
+
+    it "in_scope narrows to configured scope even with the display lens off, capture intact" do
+      with_store do |store|
+        a = seed_flow(store, "alpha.test", "GET", "/a", 200)
+        b = seed_flow(store, "beta.test", "GET", "/b", 200)
+        store.add_scope_rule("include", "host", "alpha.test") # rule present, lens never enabled
+
+        all = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{}}})
+        tool_payload(drive(store, all)[0]).as_a.map(&.["id"].as_i64).should eq([b, a]) # everything captured
+
+        scoped = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_history","arguments":{"in_scope":true}}})
+        tool_payload(drive(store, scoped)[0]).as_a.map(&.["id"].as_i64).should eq([a]) # only in-scope
+      end
+    end
+
+    it "in_scope composes with a QL query" do
+      with_store do |store|
+        seed_flow(store, "alpha.test", "GET", "/a", 200)
+        b = seed_flow(store, "alpha.test", "GET", "/b", 500)
+        seed_flow(store, "beta.test", "GET", "/c", 500)
+        store.add_scope_rule("include", "host", "alpha.test")
+
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"in_scope":true,"query":"status:500"}}})
+        tool_payload(drive(store, call)[0]).as_a.map(&.["id"].as_i64).should eq([b])
+      end
+    end
+
+    it "in_scope with no scope rules configured returns empty (not everything)" do
+      with_store do |store|
+        seed_flow(store, "alpha.test", "GET", "/a", 200)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"in_scope":true}}})
+        tool_payload(drive(store, call)[0]).as_a.should be_empty
+      end
+    end
   end
 
   describe "get_flow" do
@@ -4147,6 +4181,24 @@ describe "MCP agent event feed" do
       logged = store.events_after(0_i64, 50).select { |e| e.kind == "agent_action" }.map(&.payload)
       logged.should contain "intercept_forward"
       logged.should contain "intercept_toggle"
+    end
+  end
+
+  it "in_scope narrows the report to in-scope hosts, all flows still scanned" do
+    with_store do |store|
+      # A `?apikey=` value fires the passive secret_in_url rule on each host.
+      seed_flow(store, "alpha.test", "GET", "/x?apikey=longsecretvalue123", 200)
+      seed_flow(store, "beta.test", "GET", "/y?apikey=longsecretvalue123", 200)
+      store.add_scope_rule("include", "host", "alpha.test") # lens never enabled
+      tools = tools_for(store)
+
+      all = ok_json(tools, "probe_scan", "{}")
+      all["flows_scanned"].as_i.should eq(2) # every flow scanned regardless
+      all["issues"].as_a.map(&.["host"].as_s).uniq.sort.should eq(["alpha.test", "beta.test"])
+
+      scoped = ok_json(tools, "probe_scan", %({"in_scope":true}))
+      scoped["flows_scanned"].as_i.should eq(2)                                 # still scanned all
+      scoped["issues"].as_a.map(&.["host"].as_s).uniq.should eq(["alpha.test"]) # report narrowed
     end
   end
 

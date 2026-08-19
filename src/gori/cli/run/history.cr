@@ -287,6 +287,7 @@ module Gori
         limit = 50
         format = :text
         lenient = false
+        in_scope = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -296,6 +297,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("-qQL", "--query=QL", "Filter with a QL query (host: status:>=500 size:>10000 dur:>500 header: body~rx …)") { |v| query = v }
           p.on("-nN", "--limit=N", "Max rows, newest first (default 50)") { |v| limit = parse_count(v, "--limit") }
+          p.on("--in-scope", "Only flows in the project's configured scope (the TUI's ⇧S lens; capture still records everything)") { in_scope = true }
           p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
           p.on("--format=FMT", "Output: text (default) | json | jsonl (both emit JSON-Lines) | har (one HAR 1.2 log)") do |v|
             format = parse_format(v, [:text, :json, :jsonl, :har])
@@ -328,8 +330,25 @@ module Gori
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin
+          # The scope lens, opt-in and independent of the persisted ⇧S flag — the same per-flow
+          # include/exclude filter the TUI History lens applies, so `--in-scope` here shows the
+          # same set. Capture is untouched; this narrows only the VIEW. Empty (nothing in scope)
+          # when no scope rules are configured, matching `sitemap --in-scope`.
+          scope_unconfigured = false
+          scope_filter = QL::EMPTY
+          if in_scope
+            scope = Scope.load(store)
+            if scope.configured?
+              scope_filter = scope.filter(force: true)
+            else
+              STDERR.puts "gori run history: --in-scope, but no scope rules are configured — nothing is in scope"
+              scope_unconfigured = true
+            end
+          end
           rows =
-            if q = query
+            if scope_unconfigured
+              [] of Store::FlowRow
+            elsif q = query
               filter = QL.parse(q)
               Run.warn_query_terms("history", q)
               # A query that fails to compile to ANY clause (e.g. `status:>=foo`)
@@ -339,17 +358,20 @@ module Gori
                 store.close
                 abort "gori run history: query #{q.inspect} did not match any field (check syntax, e.g. status:>=500 host:example.com method:POST)"
               end
+              combined = QL.and(scope_filter, filter)
               # Trigram indexing is off-commit (Store V4), so a `body:`/free-text query run
               # right after a capture — or against a db a killed process left behind — would
               # under-report until the backlog drains. A one-shot answer must be exact, so
               # wait for it here rather than silently returning fewer rows.
-              store.index_pending! if filter.uses_fts?
+              store.index_pending! if combined.uses_fts?
               begin
-                store.search(filter, limit, raise_on_error: true)
+                store.search(combined, limit, raise_on_error: true)
               rescue ex
                 store.close
                 abort "gori run history: query #{q.inspect} failed: #{ex.message}"
               end
+            elsif in_scope
+              store.search(scope_filter, limit, raise_on_error: true)
             else
               store.recent_flows(limit)
             end
@@ -361,7 +383,8 @@ module Gori
             # are small and this streams row by row, so a large `-n` costs queries, not memory.
             rows.each { |r| puts CLI::Output.flow_row_json(r, store.request_head(r.id)) }
           elsif rows.empty?
-            STDERR.puts "no flows#{query ? " match #{query.inspect}" : ""}"
+            scoped = in_scope ? " in scope" : ""
+            STDERR.puts "no flows#{query ? " match #{query.inspect}" : ""}#{scoped}"
           else
             rows.each { |r| puts CLI::Output.flow_row_text(r) }
           end

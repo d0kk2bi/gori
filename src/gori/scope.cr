@@ -349,9 +349,14 @@ module Gori
     # string/regex rules see is `scheme || '://' || host || target` — the same value
     # `in_scope_url?` builds in memory. Combined Burp-style:
     #   ( <includes OR'd, or 1 when none>  [AND NOT (<excludes OR'd>)] )
-    def filter : QL::Filter
+    # `force: true` builds the include/exclude SQL even when the ⇧S display lens is OFF — the
+    # opt-in `gori run history --in-scope` uses it to apply the rules regardless of the persisted
+    # flag, exactly as the TUI History lens applies `filter` when the flag is on. Still EMPTY
+    # (match-all) when no rules exist, so a caller that wants "nothing when unconfigured" must
+    # check `configured?` itself rather than relying on this.
+    def filter(force : Bool = false) : QL::Filter
       @mutex.synchronize do
-        return QL::EMPTY unless active_unlocked?
+        return QL::EMPTY unless force || active_unlocked?
         inc_conds = [] of String
         exc_conds = [] of String
         # Bucket the values with their conditions. The SQL below is assembled

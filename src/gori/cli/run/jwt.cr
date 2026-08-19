@@ -24,7 +24,7 @@ module Gori
           p.on("--alg=ALG", "Signing alg for --encode: HS256 (default) | HS384 | HS512 | none") { |v| alg = v }
           p.on("--secret=SECRET", "HMAC secret for --encode with an HS algorithm") { |v| secret = v }
           p.on("--payload=JSON", "--encode: replace the claims (payload) wholesale before re-signing") { |v| payload_override = v }
-          p.on("--set=KEY=VALUE", "--encode: patch one claim before re-signing (repeatable). VALUE is JSON if it parses (true/3), else a string") { |v| sets << v }
+          p.on("--set=CLAIM", "--encode: patch one claim before re-signing, as key=value (repeatable). value is JSON if it parses (true/3), else a string") { |v| sets << v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }

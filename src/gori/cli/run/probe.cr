@@ -41,6 +41,7 @@ module Gori
         aggressive = false
         insecure = false
         lenient = false
+        in_scope = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -62,6 +63,7 @@ module Gori
           p.on("-qQL", "--query=QL", "Only scan flows matching this QL query (host: status:>=500 size: …)") { |v| query = v }
           p.on("--severity=LEVEL", "Only show issues at/above LEVEL (info|low|medium|high|critical)") { |v| min_sev = parse_severity(v) }
           p.on("--category=CAT", "Only show issues in CAT (#{PROBE_CATEGORIES.join("|")})") { |v| category = parse_probe_category(v) }
+          p.on("--in-scope", "Only show issues on hosts in the project's configured scope (the TUI's ⇧S lens; ALL flows are still scanned)") { in_scope = true }
           p.on("-a", "--active", "Include light-touch active checks (sends probe requests)") { active = true }
           p.on("--allow-unscoped", "With --active, probe flows even when outside the project scope (default: only scope-included hosts)") { allow_unscoped = true }
           p.on("--unsafe", "With --active, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data") { unsafe = true }
@@ -155,12 +157,19 @@ module Gori
         if cat = category
           groups = groups.select { |g| g.category == cat }
         end
-        report_probe(groups, flow_n, repeater_n, format, query, min_sev, category)
+        # `--in-scope` narrows the REPORT to in-scope hosts — the same host-level lens the TUI
+        # Probe tab applies (`ProbeController`), independent of `--active`/`--allow-unscoped`
+        # which gate what gets SENT. Everything was still scanned; this is a view filter.
+        if in_scope
+          STDERR.puts "gori run probe: --in-scope, but no scope rules are configured — nothing is in scope" unless scope.configured?
+          groups = groups.select { |g| scope.host_in_scope?(g.host) }
+        end
+        report_probe(groups, flow_n, repeater_n, format, query, min_sev, category, in_scope)
       end
 
       private def self.report_probe(groups : Array(Probe::Group), flow_n : Int32, repeater_n : Int32,
                                     format : Symbol, query : String?, min_sev : Store::Severity?,
-                                    category : String?) : Nil
+                                    category : String?, in_scope : Bool = false) : Nil
         parts = [] of String
         parts << "#{flow_n} flow#{flow_n == 1 ? "" : "s"}"
         parts << "#{repeater_n} repeater#{repeater_n == 1 ? "" : "s"}" if repeater_n > 0 || query.nil?
@@ -168,10 +177,10 @@ module Gori
         if format == :json
           puts CLI::Output.probe_array_json(groups)
         elsif groups.empty?
-          scope = query ? " in flows matching #{query.inspect}" : ""
+          where = query ? " in flows matching #{query.inspect}" : ""
           # Distinguish "nothing found" from "filters removed everything" — else an empty result
-          # under --severity/--category looks like the QL query itself matched no flows.
-          STDERR.puts((min_sev || category) ? "no issues match the --severity/--category filter#{scope}" : "no issues#{scope}")
+          # under --severity/--category/--in-scope looks like the QL query itself matched no flows.
+          STDERR.puts((min_sev || category || in_scope) ? "no issues match the --severity/--category/--in-scope filter#{where}" : "no issues#{where}")
         else
           groups.each { |g| puts CLI::Output.probe_group_text(g) }
         end

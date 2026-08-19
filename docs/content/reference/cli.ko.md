@@ -568,7 +568,7 @@ gori run jwt eyJhbGci... --attacks
 | `--alg=ALG` | `--encode`용 서명 alg: `HS256`(기본) \| `HS384` \| `HS512` \| `none` |
 | `--secret=SECRET` | HS 알고리즘 `--encode`용 HMAC 시크릿 |
 | `--payload=JSON` | `--encode`: 재서명 전에 클레임을 통째로 교체(`--set`과 상호 배타적) |
-| `--set=KEY=VALUE` | `--encode`: 재서명 전에 클레임 하나를 패치, 반복 가능; `VALUE`가 JSON으로 파싱되면(`true`/`3`) 그 타입, 아니면 문자열 |
+| `--set=CLAIM` | `--encode`: 재서명 전에 클레임 하나를 `key=value`로 패치, 반복 가능; 값이 JSON으로 파싱되면(`true`/`3`) 그 타입, 아니면 문자열 |
 | `--format` | `text`(기본) 또는 `json` |
 
 ### run cookie {#run-cookie}
