@@ -129,6 +129,7 @@ module Gori
         ws_messages_override = nil.as(Array(Store::WsOutMessage)?)
         rewrote_request_line = false
         notice_rows_dropped = 0
+        ws_h2_frames_unseeded = 0
 
         if flow_id
           flow = store.get_flow(flow_id)
@@ -169,7 +170,13 @@ module Gori
           # `built.sni` is deliberately NOT seeded here: `gori run repeater create --flow`
           # takes SNI from the operator's flag alone, and this tool is its MCP twin.
 
-          if flow.row.status == 101 && !present?(h, "ws_out_messages")
+          # The gate is `WsEngine.upgrade_request?` and not `row.status == 101` (#742). A seed
+          # has to produce a session `send_websocket` can actually run, and `WsEngine` opens a
+          # socket exactly one way: an HTTP/1.1 `Upgrade:` handshake answered 101. The status
+          # was that handshake's, standing in for the handshake itself — so a WebSocket
+          # captured over RFC 8441 extended CONNECT (#733: `CONNECT`, answered `200`) took the
+          # ordinary-HTTP path and its frames went nowhere, unmentioned.
+          if Proxy::WS.upgrade_request?(String.new(flow.request_head)) && !present?(h, "ws_out_messages")
             # Opcode and raw bytes, both kept. The `&& m.text?` filter dropped every captured
             # BINARY out-frame with no warning at all (the CLI at least printed one), and the
             # `.scrub` rewrote an invalid-UTF-8 TEXT payload to U+FFFD before it was stored —
@@ -181,6 +188,19 @@ module Gori
             rows, notice_rows_dropped = CLI::Run.ws_seed_rows(store.ws_messages(flow_id))
             ws_messages_override = rows
               .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, CLI::Run.seed_shape(m.shape)) }
+          elsif flow.websocket? && !present?(h, "ws_out_messages")
+            # A WebSocket gori captured over HTTP/2 (RFC 8441 extended CONNECT). The session
+            # is still created — the CONNECT request is a real h2 request and `send_request`
+            # will send it — but the frames are NOT seeded, because there is no h2 WebSocket
+            # send path to replay them over: `WsEngine` writes an h1 upgrade, and the
+            # `ws_http_only` seam moves a session between the WS engine and a plain send of
+            # the same handshake bytes, never onto a different WebSocket transport.
+            #
+            # Fabricating an h1 handshake to make the seed dial would put a request the client
+            # never sent into the operator's session under the flow's provenance. So the agent
+            # is TOLD, in the reply that would otherwise have looked like an ordinary success.
+            # `get_flow` returns the transcript, which is where it is readable.
+            ws_h2_frames_unseeded = store.count_ws_messages(flow_id)
           end
         end
 
@@ -285,6 +305,17 @@ module Gori
             if notice_rows_dropped > 0
               j.field "ws_notice_rows_dropped", notice_rows_dropped
               j.field "note", CLI::Run.ws_notice_dropped_note(notice_rows_dropped)
+            end
+            # A socket captured over HTTP/2. The session was created from a real request, so
+            # this is not an error — but it holds none of the frames, and an agent that asked
+            # for a repeater from a WebSocket flow would otherwise have to infer that from a
+            # missing `ws_out_message_count`.
+            if ws_h2_frames_unseeded > 0
+              j.field "ws_frames_not_seeded", ws_h2_frames_unseeded
+              j.field "note", "flow #{flow_id} is a WebSocket over HTTP/2 (RFC 8441 extended CONNECT): " \
+                              "its #{ws_h2_frames_unseeded} captured frame#{ws_h2_frames_unseeded == 1 ? " was" : "s were"} NOT seeded. " \
+                              "gori re-establishes a socket only from an HTTP/1.1 Upgrade handshake, and this capture " \
+                              "has none, so send_websocket cannot replay it. The transcript is readable with get_flow."
             end
           end
         })

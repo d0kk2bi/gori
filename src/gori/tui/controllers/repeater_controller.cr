@@ -1395,7 +1395,19 @@ module Gori::Tui
     def repeater_flow(id : Int64) : Nil
       return unless detail = @host.session.store.get_flow(id)
       view = RepeaterView.new
-      if detail.row.status == 101
+      # A seed asks a NARROWER question than a display surface does (#742). History's MESSAGES
+      # pane shows a transcript because one was captured; this has to hand the operator a tab
+      # whose `^R` actually re-opens the socket, and `Repeater::WsEngine` opens one exactly one
+      # way — an HTTP/1.1 `Upgrade:` handshake, accepting nothing but a 101 back. So the gate
+      # is "does this capture carry a handshake gori can re-send", which is
+      # `WsEngine.upgrade_request?` — the Repeater's own predicate, the one `Repeater::Plan`
+      # already derives WS-ness from. The `row.status == 101` that used to stand here was the
+      # h1 handshake's status wearing that question's clothes.
+      #
+      # The case that forced the distinction is a WebSocket captured over RFC 8441 extended
+      # CONNECT (#733): real RFC 6455 frames, no `Upgrade:` header, and no h2 WebSocket send
+      # path anywhere in the Repeater to replay them over. See the `websocket?` branch below.
+      if Repeater::WsEngine.upgrade_request?(String.new(detail.request_head))
         # WebSocket: seed the editor with the recorded client→server messages. The tab is
         # session-only (db_id nil) — WS transcripts aren't persisted/synced.
         # A `[gori]` advisory is a diagnostic gori wrote ABOUT the socket, never a frame the
@@ -1414,6 +1426,31 @@ module Gori::Tui
         note = unshown.empty? ? "" : " — #{unshown.size} frame#{unshown.size == 1 ? "" : "s"} not shown (#{unshown.join(", ")}); #{unshown.size == 1 ? "it replays" : "they replay"} unless you edit the list"
         note += " · #{CLI::Run.ws_notice_dropped_note(notice_dropped)}" if notice_dropped > 0
         @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{note} · ^R send · esc back")
+      elsif detail.websocket?
+        # A WebSocket gori captured but cannot re-open: an RFC 8441 extended CONNECT over
+        # HTTP/2 (#733). The frames are real RFC 6455 frames and replaying them is not the
+        # problem — the HANDSHAKE is. This capture holds `CONNECT /path HTTP/2` and a
+        # `:protocol` pseudo-header; `WsEngine` writes an h1 upgrade and waits for a 101, so
+        # seeding a WS tab from it would hand over a `^R` that cannot connect. Making it
+        # connect would mean gori inventing a `GET … Upgrade: websocket` handshake with a
+        # `Sec-WebSocket-Key` the client never sent and presenting it as the capture's — the
+        # fabrication this repo refuses everywhere else it comes up.
+        #
+        # `^V` does not cover this either. That seam (`cycle_ws_transport`) moves a tab
+        # between the WS engine and a plain h1/h2 send of the SAME handshake bytes; it says so
+        # in its own last branch, "h2 is not a WebSocket transport here — RFC 8441 is out of
+        # scope", and `Sender#send_ws` never consults `http2` at all.
+        #
+        # So: the ordinary HTTP tab, which is honest — the CONNECT request really is an h2
+        # request and `^R` really will send it — plus a status line that names the frames it
+        # is NOT carrying and where they can be read. A silent HTTP tab was the bug.
+        view.load(detail)
+        @repeaters << RepeaterTab.new(view, id, persist_new_repeater(view, id))
+        frames = @host.session.store.count_ws_messages(id)
+        @host.status("repeater: #{view.summary} — WebSocket over HTTP/2 (RFC 8441): the #{frames} captured " \
+                     "frame#{frames == 1 ? "" : "s"} #{frames == 1 ? "is" : "are"} NOT seeded — gori replays a socket " \
+                     "only from an HTTP/1.1 Upgrade handshake, and this capture has none. Read them in History's " \
+                     "MESSAGES pane · ^R sends the CONNECT request · esc back")
       elsif grpc_flow?(detail)
         # gRPC: head editable as text; a unary call's message payload is hex-editable (^X)
         # and reframed on send. Session-only (db_id nil) — the binary body can't round-trip

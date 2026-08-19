@@ -289,7 +289,8 @@ describe "h2c prior knowledge on a listener (#737)" do
       spawn do
         if accepted = listener.accept?
           conn = Gori::Proxy::ClientConn.new(accepted, "http", sink,
-            origin_dst: {"127.0.0.1", origin_port})
+            origin_dst: {"127.0.0.1", origin_port},
+            h2_offer: Gori::Proxy::H2Offer::Cleartext)
           conn.serve_h2c_prior_knowledge("::1", origin_port, accepted)
           accepted.close rescue nil
         end
@@ -319,7 +320,8 @@ describe "h2c prior knowledge on a listener (#737)" do
       listener = TCPServer.new("127.0.0.1", 0)
       spawn do
         if accepted = listener.accept?
-          conn = Gori::Proxy::ClientConn.new(accepted, "http", sink)
+          conn = Gori::Proxy::ClientConn.new(accepted, "http", sink,
+            h2_offer: Gori::Proxy::H2Offer::Cleartext)
           conn.serve_h2c_prior_knowledge("::1", origin_port, accepted)
           accepted.close rescue nil
         end

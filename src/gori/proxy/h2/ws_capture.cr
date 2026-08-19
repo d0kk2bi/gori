@@ -26,14 +26,14 @@ module Gori::Proxy::H2
   # that, so neither is offered here. The advisory on the flow says so rather than half-doing
   # it — see `Assembler#extended_connect_sentence`.
   class WsCapture
-    # The `:protocol` token RFC 8441 registers for a WebSocket. An extended CONNECT can carry
-    # other tokens (`connect-udp`, RFC 9298; `connect-ip`, RFC 9484; a private one), and those
-    # are NOT RFC 6455 framing — pointing this codec at them would invent messages out of
-    # somebody else's protocol. Recognition is by the token, and only by the token.
-    PROTOCOL = "websocket"
+    # The `:protocol` token RFC 8441 registers for a WebSocket — see `WS::PROTOCOL_TOKEN`,
+    # where it lives so that `Store::FlowDetail#websocket?` can read the stored marker back
+    # with the same token this writer recognised (#742), without requiring this file (which
+    # pulls in the relay and the sink).
+    PROTOCOL = Gori::Proxy::WS::PROTOCOL_TOKEN
 
     def self.websocket?(protocol : String) : Bool
-      protocol.compare(PROTOCOL, case_insensitive: true) == 0
+      Gori::Proxy::WS.protocol_token?(protocol)
     end
 
     # How many extended CONNECT streams ONE h2 connection may capture concurrently.

@@ -184,9 +184,11 @@ module Gori::Proxy
         elsif @transparent
           serve_transparent(client)
         else
+          # `Cleartext`: the client reached this listener without a TLS handshake, so no ALPN
+          # offer was ever carried and gori has no h2c of its own to offer instead (#731).
           ClientConn.new(client, "http", @sink, @tls, rewriter: @rewriter, interceptor: @interceptor,
             host_overrides: @host_overrides, self_addr: {@host, @port}, local_host: local_host,
-            extractor: @extractor).run
+            extractor: @extractor, h2_offer: H2Offer::Cleartext).run
         end
       rescue
         # Setup (setsockopt) can raise if the peer RST'd between accept and here;
@@ -254,10 +256,15 @@ module Gori::Proxy
         end
         return serve_h2c(client, host, port, origin_dst: nil)
       end
+      # `Cleartext` describes the CLIENT leg, which is this listener's own socket and carried no
+      # TLS handshake. `scheme` here is the declared ORIGIN's, and an https origin does not give
+      # this client an ALPN offer it never received — the TLS-terminating half of the same
+      # listener is `serve_reverse_tls`, and it stamps what its handshake actually observed.
       ClientConn.new(client, scheme, @sink,
         fixed_host: host, fixed_port: port, tls_upstream: scheme == "https",
         rewriter: @rewriter, interceptor: @interceptor, host_overrides: @host_overrides,
-        self_addr: {@host, @port}, rewrite_fixed_host: @rewrite_host, extractor: @extractor).run
+        self_addr: {@host, @port}, rewrite_fixed_host: @rewrite_host, extractor: @extractor,
+        h2_offer: H2Offer::Cleartext).run
     end
 
     # TLS terminated by a reverse listener. The leaf is minted for the CONFIGURED origin host,
@@ -352,8 +359,12 @@ module Gori::Proxy
       # Built for its four lenses and its dial: `origin_dst` is what arms `dial_pin`, so a
       # transparent h2c connection is dialled at the address the kernel named, exactly as the
       # cleartext and TLS branches are (#529).
+      # `Cleartext` for the same reason as the branches above — and the h1 preface refusal that
+      # reads it is unreachable from here anyway (this ClientConn serves h2c prior knowledge and
+      # never enters the HTTP/1.1 loop), so it is the honest observation, not a placeholder.
       conn = ClientConn.new(client, "http", @sink, rewriter: @rewriter, interceptor: @interceptor,
-        host_overrides: @host_overrides, origin_dst: origin_dst, extractor: @extractor)
+        host_overrides: @host_overrides, origin_dst: origin_dst, extractor: @extractor,
+        h2_offer: H2Offer::Cleartext)
       begin
         conn.serve_h2c_prior_knowledge(host, port, client)
       ensure
@@ -383,10 +394,12 @@ module Gori::Proxy
       elsif h2c_preface?(first)
         serve_transparent_h2c(client, dst)
       else
+        # `Cleartext`: the first byte was not a ClientHello, so this transparent connection
+        # arrived with no TLS handshake and therefore no ALPN offer.
         ClientConn.new(client, "http", @sink, rewriter: @rewriter, interceptor: @interceptor,
           host_overrides: @host_overrides,
           default_port: Settings.listener_target_port(@target_port, tls: false),
-          origin_dst: dst, extractor: @extractor).run
+          origin_dst: dst, extractor: @extractor, h2_offer: H2Offer::Cleartext).run
       end
     end
 

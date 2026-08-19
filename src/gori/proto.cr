@@ -1,9 +1,12 @@
+require "./proxy/ws/frame" # WS.protocol_token? — the RFC 8441 `:protocol` token, see below
+
 module Gori
   # Application-protocol classification of a captured flow, derived from the
-  # response status (WS = the 101 upgrade handshake) and the response
-  # Content-Type (gRPC / SSE). This is the single source of truth the History
-  # PROTO column and the QL `proto:` field both defer to, so the label you see
-  # and the value you filter on can never drift. gRPC/SSE have no dedicated
+  # response status (WS over HTTP/1.1 = the 101 upgrade handshake), the RFC 8441
+  # `:protocol` the request declared (WS over HTTP/2, which has no 101 in it) and
+  # the response Content-Type (gRPC / SSE). This is the single source of truth the
+  # History PROTO column and the QL `proto:` field both defer to, so the label you
+  # see and the value you filter on can never drift. gRPC/SSE have no dedicated
   # store column — they are inferred here from bytes gori already keeps.
   module Proto
     enum Kind
@@ -88,10 +91,35 @@ module Gori
       !!content_type.try { |ct| ct.lstrip.downcase.starts_with?("application/grpc") }
     end
 
-    # Classify a flow from its status and the content types of BOTH sides. The 101 handshake
-    # wins first (a WebSocket upgrade carries no content type); otherwise gRPC and SSE are read
-    # off the content type; everything else — including a still-pending flow with no status or
-    # type yet — is plain HTTP. Mirrors QL.proto_cond.
+    # A WebSocket carried by an RFC 8441 extended CONNECT — the HTTP/2 handshake, which has no
+    # 101 in it anywhere (§5.1 replaces the h1 upgrade with `CONNECT` + a `:protocol`
+    # pseudo-header, answered 2xx).
+    #
+    # Two halves, and both are required:
+    #
+    # * the `connect_protocol` column's TOKEN, not merely "it is an extended CONNECT" —
+    #   `connect-udp` (RFC 9298) and `connect-ip` (RFC 9484) are extended CONNECTs that are not
+    #   RFC 6455 framing, and calling them WebSockets would put a label on a flow that has no
+    #   WebSocket transcript and cannot get one. `WS.protocol_token?` is the same test the
+    #   capture side (`H2::WsCapture.websocket?`) and the head reader
+    #   (`Store::FlowDetail#websocket?`) make, so all three agree on what the token means.
+    # * a 2xx status, for the same reason the h1 side requires the 101: before the origin
+    #   answers there is no socket, and a refusal never opens one. This deliberately does NOT
+    #   follow the gRPC rule below (where a failed call is still a gRPC call): a refused h1
+    #   handshake classifies as plain HTTP, so a refused h2 one that classified as `Ws` would
+    #   fix one transport asymmetry by introducing another — and `Store::FlowDetail#websocket?`,
+    #   the sibling predicate every reader of the transcript uses, draws the line here too.
+    def self.websocket_connect?(status : Int32?, connect_protocol : String?) : Bool
+      return false unless status && status >= 200 && status < 300
+      !!connect_protocol.try { |p| Gori::Proxy::WS.protocol_token?(p) }
+    end
+
+    # Classify a flow from its status, the content types of BOTH sides, and the extended
+    # CONNECT protocol it declared. A WebSocket wins first over either transport — the h1
+    # handshake's 101, or an h2 `:protocol: websocket` the origin accepted (a WebSocket
+    # handshake carries no content type on either); otherwise gRPC and SSE are read off the
+    # content type; everything else — including a still-pending flow with no status or type yet
+    # — is plain HTTP. Mirrors QL.proto_cond.
     #
     # ## Why the REQUEST type is read, and only for gRPC
     #
@@ -105,13 +133,16 @@ module Gori
     # SSE deliberately stays response-only: `text/event-stream` on a request would be an
     # `Accept`, not a Content-Type, and a request cannot declare that its RESPONSE is a stream.
     #
-    # `request_content_type` is a REQUIRED parameter, not an optional one with a nil default:
-    # a caller that has a `FlowRow` has this field, and a default would let a surface silently
-    # keep answering the old way — which is the drift this module exists to prevent. NULL is
-    # still allowed and means "not recorded" (a row captured before the V14 column existed), in
-    # which case the answer is exactly what it was before.
-    def self.classify(status : Int32?, content_type : String?, request_content_type : String?) : Kind
-      return Kind::Ws if status == 101
+    # `request_content_type` and `connect_protocol` are REQUIRED parameters, not optional ones
+    # with a nil default: a caller that has a `FlowRow` has both fields, and a default would let
+    # a surface silently keep answering the old way — which is the drift this module exists to
+    # prevent. Adding `connect_protocol` with a default would have left every existing call site
+    # compiling untouched and still labelling h2 sockets `HTTPS`, which is exactly the bug.
+    # NULL is still allowed on both and means "not recorded" (a row captured before the V14 /
+    # V16 column existed), in which case the answer is exactly what it was before.
+    def self.classify(status : Int32?, content_type : String?, request_content_type : String?,
+                      connect_protocol : String?) : Kind
+      return Kind::Ws if status == 101 || websocket_connect?(status, connect_protocol)
       return Kind::Grpc if grpc?(content_type) || grpc?(request_content_type)
       return Kind::Sse if Sse.sse?(content_type)
       Kind::Http

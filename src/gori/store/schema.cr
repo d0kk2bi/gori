@@ -984,7 +984,40 @@ module Gori
         "CREATE INDEX IF NOT EXISTS idx_issues_triage ON issues (severity DESC, created_at DESC)",
       ]
 
-      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15]
+      # The RFC 8441 extended CONNECT's `:protocol` pseudo-header, verbatim — the one fact that
+      # makes a WebSocket over HTTP/2 a WebSocket.
+      #
+      # Same shape of bug V14 fixed, one transport over. An h2 socket's handshake is `CONNECT`
+      # answered `200` (RFC 8441 §5.1 replaces the h1 upgrade and there is no 101 anywhere in
+      # it), and `Gori::Proto` read WS off `status == 101` — so a flow with a full WebSocket
+      # transcript behind it showed `HTTPS` in the History PROTO column and `proto:ws`, the
+      # filter an operator reaches for to find sockets, silently omitted every h2 one.
+      #
+      # A column and not a re-parse of `request_head` at read time, for V14's reason verbatim:
+      # `QL.proto_cond` compiles `proto:` to SQL against this table, so a label derived from
+      # bytes the query cannot see is precisely the drift `Proto` exists to prevent, and a
+      # `LIKE` over the head BLOB would be both unindexable and the substring-matching this
+      # classification was fixed to stop doing. Nor is it derived from the transcript ("has
+      # `ws_messages` rows"), which is SQL-reachable but answers a different question: a socket
+      # that opened and carried no frames would classify as HTTP, and a `[gori] …` advisory row
+      # on a non-WebSocket 101 (#736) would classify as one.
+      #
+      # The `:protocol` TOKEN and not a WebSocket boolean, because an extended CONNECT carries
+      # others — `connect-udp` (RFC 9298) and `connect-ip` (RFC 9484) are extended CONNECTs that
+      # are NOT RFC 6455 framing. `H2::Assembler` already tells them apart to decide whether to
+      # point a frame codec at the stream; storing what the request DECLARED keeps that
+      # distinction on disk instead of collapsing it at the write site.
+      #
+      # NOT written by the HTTP/1.1 path, which needs nothing: `status == 101` is still the
+      # answer there, and per V14's precedent a value no capture produced must not be invented
+      # into a column. Rows written before this migration keep NULL, and NULL means "not
+      # recorded" — not "this was not an extended CONNECT". They classify exactly as they did
+      # before; gori does NOT backfill by guessing at the stored heads.
+      V16 = [
+        "ALTER TABLE flows ADD COLUMN connect_protocol TEXT",
+      ]
+
+      MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16]
 
       def self.migrate!(db : DB::Database) : Nil
         db.using_connection do |conn|

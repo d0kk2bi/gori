@@ -85,6 +85,13 @@ module Gori::Proxy
     # against a hostile upstream streaming an unbounded run of body-less 103s.
     MAX_INTERIM = 64
 
+    # How many DISTINCT compressed-body Match&Replace refusals one connection writes to
+    # `gori.log` before it stops (#745). A tunnel is pinned to one host and can only reach two
+    # or three keys; a cleartext forward-proxy connection carries whatever hosts the client
+    # asks for, so the set is bounded rather than trusted. The FLOW advisory is unaffected —
+    # it is one column on the flow it describes and cannot flood anything.
+    COMPRESSED_SKIP_LOG_CAP = 8
+
     # How long the streaming request path waits for the ORIGIN to answer an
     # `Expect: 100-continue` before giving up on it and unblocking the client itself (#728).
     #
@@ -150,13 +157,19 @@ module Gori::Proxy
                    @origin_dst : {String, Int32}? = nil,
                    @rewrite_fixed_host : Bool = false,
                    @extractor : ResponseExtract? = nil,
-                   # Defaulted rather than required because the only callers that do not pass it
-                   # are the three CLEARTEXT listeners in `server.cr` (plaintext forward,
-                   # transparent, reverse-cleartext) — every tunnel-built ClientConn stamps what
-                   # it observed. A client leg with no TLS handshake carried no ALPN, so
-                   # `Cleartext` is what those three observed, and the h2-preface refusal names
-                   # the true cause there instead of declining to name one (#731).
-                   @h2_offer : H2Offer = H2Offer::Cleartext)
+                   # Everything after this marker is named-only, which is how a REQUIRED
+                   # parameter follows defaulted ones at all — and it is the shape that makes
+                   # the requirement useful: `h2_offer:` can only ever be spelled out.
+                   *,
+                   # REQUIRED, and deliberately: this is a claim about the TRANSPORT this
+                   # connection arrived on, and only the caller that built it can make one. It
+                   # was defaulted to `Cleartext` while the only non-stamping callers were the
+                   # cleartext listeners in `server.cr`, which is what those observed — but a
+                   # default means the NEXT caller inherits their claim by saying nothing, and
+                   # the whole point of #731 was that a refusal naming the wrong reason costs
+                   # more time than one naming none. A caller with nothing to observe has
+                   # `H2Offer::Unknown`, which names no reason rather than guessing one.
+                   @h2_offer : H2Offer)
       # Per-connection upstream reuse (see `acquire_upstream`). One live origin
       # connection kept across this client's keep-alive requests.
       @upstream = nil.as(IO?)
@@ -178,6 +191,9 @@ module Gori::Proxy
       # One-shot: has this connection already logged an intercept hold that failed open because
       # the declared body was over the ceiling? See `warn_hold_oversize`.
       @warned_hold_oversize = false
+      # Which compressed-body Match&Replace refusals this connection has already written to
+      # `gori.log` — see `log_compressed_skip` for the key and the cap.
+      @compressed_skips = Set(String).new
     end
 
     # The address every upstream dial on THIS connection is pinned to, or nil when nothing
@@ -597,8 +613,10 @@ module Gori::Proxy
       # Match&Replace (request body) BEFORE the human sees it — mirroring the head, which is
       # already M&R'd into `sent_head`. A body rule re-frames to Content-Length, so re-parse
       # the (possibly rewritten) head for the hold metadata + capture.
+      advisory = nil.as(String?)
       if (rw = @rewriter) && rw.rewrites_request_body?
-        sent_head, buffered = apply_body_rewrite(sent_head, buffered, req_framing) { |e| rw.rewrite_request_body(e, host) }
+        sent_head, buffered, advisory = apply_body_rewrite(sent_head, buffered, req_framing,
+          host: host, response: false, live: true) { |e| rw.rewrite_request_body(e, host) }
         sent_req = Codec::Http1.parse_request_head(sent_head)
       end
       decision = ic.hold_request(build_message(sent_head, buffered),
@@ -629,7 +647,7 @@ module Gori::Proxy
       stored, trunc, size = capped(edited_body)
       flow_id = @sink.on_request(FlowMapper.request(sent_req,
         scheme: scheme, host: host, port: port, created_at: created_at,
-        body: stored, body_truncated: trunc, body_size: size))
+        body: stored, body_truncated: trunc, body_size: size, advisory: advisory))
       handle_response(upstream, req, flow_id, started, host, port, scheme,
         reused: reused, sent_head: sent_head, can_retry: retryable, sent_req: sent_req)
     end
@@ -758,7 +776,8 @@ module Gori::Proxy
         record_error(sent_req, scheme, host, port, created_at, "client truncated request body")
         return false
       end
-      sent_head, fwd_body = apply_body_rewrite(sent_head, buffered, req_framing) { |e| rw.rewrite_request_body(e, host) }
+      sent_head, fwd_body, advisory = apply_body_rewrite(sent_head, buffered, req_framing,
+        host: host, response: false, live: true) { |e| rw.rewrite_request_body(e, host) }
       sent_req = Codec::Http1.parse_request_head(sent_head) # head may have been re-framed
       upstream, reused, sent = acquire_and_send(host, port, false) { |up| write_request(up, sent_head, fwd_body) }
       unless upstream && sent
@@ -770,7 +789,7 @@ module Gori::Proxy
       stored, trunc, size = capped(fwd_body)
       flow_id = @sink.on_request(FlowMapper.request(sent_req,
         scheme: scheme, host: host, port: port, created_at: created_at,
-        body: stored, body_truncated: trunc, body_size: size))
+        body: stored, body_truncated: trunc, body_size: size, advisory: advisory))
       handle_response(upstream, req, flow_id, started, host, port, scheme,
         reused: reused, sent_head: sent_head, can_retry: false, sent_req: sent_req)
     end
@@ -1345,7 +1364,10 @@ module Gori::Proxy
       buf = IO::Memory.new
       resp_complete = Codec::Body.stream(upstream, buf, resp_framing, resp_len, Codec::DiscardIO.new, copy_buf)
       rw = @rewriter
-      sent_resp_head, fwd_body = apply_body_rewrite(sent_resp_head, buf.to_slice, resp_framing) do |e|
+      # `live` is false when only a body-scoped EXTRACT rule brought this response here: no
+      # rewrite rule lost its chance, so there is nothing to say about one.
+      sent_resp_head, fwd_body, advisory = apply_body_rewrite(sent_resp_head, buf.to_slice, resp_framing,
+        host: host, response: true, live: !!rw.try(&.rewrites_response_body?)) do |e|
         rw && rw.rewrites_response_body? ? rw.rewrite_response_body(e, host) : e
       end
       sent_resp = Codec::Http1.parse_response_head(sent_resp_head) # head may have been re-framed
@@ -1368,7 +1390,8 @@ module Gori::Proxy
       duration = (Time.instant - started).total_microseconds.to_i64
       @sink.on_response(FlowMapper.response(sent_resp,
         flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-        body_truncated: trunc, body_size: size, state: state, error: error))
+        body_truncated: trunc, body_size: size, state: state, error: error,
+        advisory: advisory))
       # Reuse iff the origin kept its side AND we read the whole body; a truncated body
       # was forwarded short, so close the client connection (return false) rather than
       # block its next keep-alive request on the missing bytes.
@@ -1452,8 +1475,10 @@ module Gori::Proxy
       # Match&Replace (response body) BEFORE the human sees it, like the head. A body rule
       # re-frames the head to Content-Length; `resp` (status/version/Connection) is
       # untouched by that, so keep it as the origin's framing/keep-alive truth.
+      advisory = nil.as(String?)
       if (rw = @rewriter) && rw.rewrites_response_body?
-        sent_resp_head, body = apply_body_rewrite(sent_resp_head, body, resp_framing) { |e| rw.rewrite_response_body(e, host) }
+        sent_resp_head, body, advisory = apply_body_rewrite(sent_resp_head, body, resp_framing,
+          host: host, response: true, live: true) { |e| rw.rewrite_response_body(e, host) }
       end
       decision = ic.hold_response(build_message(sent_resp_head, body),
         flow_id: flow_id, method: req.method, target: "#{resp.status} #{resp.reason}",
@@ -1495,11 +1520,11 @@ module Gori::Proxy
           out_head, out_body || Bytes.empty)
         @sink.on_response(FlowMapper.response(sent_resp,
           flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-          body_truncated: trunc, body_size: size))
+          body_truncated: trunc, body_size: size, advisory: advisory))
       else
         @sink.on_response(FlowMapper.response(sent_resp,
           flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-          body_truncated: trunc, body_size: size,
+          body_truncated: trunc, body_size: size, advisory: advisory,
           state: Store::FlowState::Aborted, error: "connection closed while forwarding held response"))
       end
       # Reuse the upstream iff we read the WHOLE body cleanly AND the origin kept its
@@ -2328,19 +2353,98 @@ module Gori::Proxy
     # incidentally match INSIDE the compressed stream purely by chance and corrupt it —
     # silently: no error, no advisory, Content-Length still recalculated to look
     # consistent. Refusing keeps the response byte-exact (P7) instead of guessing wrong.
+    # Since #740 a TRANSFER compression layer is refused on the same terms.
+    #
+    # The refusal is correct and it used to be MUTE, which was not (#745) — hence the third
+    # element: the advisory the caller records on the flow, non-nil only where a body rule
+    # really did lose its chance. See `compressed_skip_advisory`.
+    #
+    # `live` is the caller's own answer to "is a body rule live for this direction" — three of
+    # the four call sites gate on exactly that before entering, and the fourth (a body-scoped
+    # EXTRACT rule brings a response down this path with no rewrite rule at all, #501 slice 2)
+    # knows it inside its block. Asking the rewriter again here would either duplicate that
+    # test or, on that fourth path, get the wrong answer.
     #
     # The two returned halves are always FRAMED CONSISTENTLY with each other, and #501's
     # extract observer depends on that: it is handed the same pair and lets
     # `ContentDecode.decode` do the de-chunk + inflate, so it must never be given a de-chunked
     # body alongside a head that still declares `Transfer-Encoding: chunked`.
-    private def apply_body_rewrite(head : Bytes, wire_body : Bytes?, framing : Codec::BodyFraming,
-                                   & : Bytes -> Bytes) : {Bytes, Bytes?}
-      return {head, wire_body} if wire_body.nil? || wire_body.empty?
-      return {head, wire_body} if Codec::ContentDecode.content_encoded?(head)
+    private def apply_body_rewrite(head : Bytes, wire_body : Bytes?, framing : Codec::BodyFraming, *,
+                                   host : String, response : Bool, live : Bool,
+                                   & : Bytes -> Bytes) : {Bytes, Bytes?, String?}
+      return {head, wire_body, nil} if wire_body.nil? || wire_body.empty?
+      if Codec::ContentDecode.content_encoded?(head)
+        return {head, wire_body, compressed_skip_advisory(head, host, response: response, live: live)}
+      end
       entity = framing.chunked? ? Codec::ContentDecode.dechunk(wire_body) : wire_body
       rewritten = yield entity
-      return {head, wire_body} if rewritten == entity # nothing matched → byte-exact (P7)
-      {reframe_to_length(head, rewritten.size), rewritten}
+      return {head, wire_body, nil} if rewritten == entity # nothing matched → byte-exact (P7)
+      {reframe_to_length(head, rewritten.size), rewritten, nil}
+    end
+
+    # What to record on the flow when the gate above refused a compressed body, or nil when
+    # there is nothing to say (#745).
+    #
+    # NOTHING TO SAY is the common case and the important one. A compressed response is most of
+    # the web; a rule that was never going to touch this message did not lose anything, and an
+    # advisory on every gzip flow would be noise the operator learns to scroll past. So two
+    # conditions, and both are required:
+    #
+    #   - a body rule is LIVE for this direction — the caller's `live`, above;
+    #   - a body rule MATCHES THIS HOST — `rewrites_body_for_host?`, the host-narrowed
+    #     predicate #526 added for the h2 downgrade gate. Without it a rule scoped to
+    #     `alpha.test` would annotate every compressed flow on every other host with a claim
+    #     that it failed to fire there.
+    #
+    # That predicate folds the two directions into one question (it was written for a gate that
+    # downgrades for either), so the pair can be satisfied by a REQUEST-side rule matching this
+    # host while the live RESPONSE-side rule is scoped elsewhere. The sentence stays true under
+    # that reading — a body rule matching this host did not run on this body — and the
+    # alternative is a second host-scoped predicate per direction for a case that needs two
+    # rules pointing in opposite directions to occur at all.
+    #
+    # It takes the rewriter's lock (once per refused body, never on the fast path): reached only
+    # with a body rule live somewhere AND a compressed body in hand, which is the same bargain
+    # `H2::HeadRewrite#notice_live_rule` makes per head.
+    private def compressed_skip_advisory(head : Bytes, host : String, *,
+                                         response : Bool, live : Bool) : String?
+      return nil unless live
+      return nil unless @rewriter.try(&.rewrites_body_for_host?(host))
+      side = response ? "response" : "request"
+      codings = Codec::ContentDecode.declared_codings(head)
+      # `content_encoded?` also fails closed on an obs-folded encoding header, where the coding
+      # is precisely what cannot be read — say that rather than name nothing.
+      named = codings.empty? ? "an encoding header gori could not read (obs-folded)" : codings.join(", ")
+      log_compressed_skip(side, host, named)
+      "Match&Replace was NOT applied to this #{side} body: it arrived compressed (#{named}) and " \
+      "gori never decompresses on the wire path, so a pattern would have run against the " \
+      "compressed bytes and could have matched inside the stream by coincidence. The #{side} " \
+      "was forwarded byte-exact; a Match&Replace BODY rule matching this host did not fire on " \
+      "it. Read the decoded body in History (gori decompresses for DISPLAY), or have the " \
+      "origin answer uncompressed (drop the request's Accept-Encoding with a head rule)."
+    end
+
+    # The same refusal in `gori.log`, LATCHED — the advisory above is per flow, which is the
+    # right rate for "did my rule run on THIS response?", but one line per response would put
+    # dozens of identical entries in the log for one page load.
+    #
+    # Keyed on {direction, host, coding} rather than on the connection alone, because a
+    # connection is not one host: a cleartext forward-proxy `ClientConn` serves whatever hosts
+    # the client's keep-alive requests name, and latching per connection would let the first
+    # host silence every other. The coding is in the key for the same reason it is in the
+    # message — `br` and `gzip` on one host are different facts (an operator may have turned one
+    # off at the origin and not the other). Bounded by `COMPRESSED_SKIP_LOG_CAP`: a hostile
+    # client cycling hosts must not grow this set for the life of the connection.
+    private def log_compressed_skip(side : String, host : String, named : String) : Nil
+      key = "#{side}\t#{host}\t#{named}"
+      return if @compressed_skips.includes?(key) || @compressed_skips.size >= COMPRESSED_SKIP_LOG_CAP
+      @compressed_skips << key
+      ::Log.warn do
+        "Match&Replace: a BODY rule matching #{host.inspect} was not applied to a #{side} body " \
+        "compressed with #{named} — gori does not decompress on the wire path, so the #{side} " \
+        "went through byte-exact. Said once per {direction, host, coding} on this connection; " \
+        "every affected flow carries the same statement in History."
+      end
     end
 
     # Rebuild a message head framed as `Content-Length: len`: drop any Transfer-Encoding

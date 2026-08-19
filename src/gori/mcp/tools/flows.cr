@@ -64,9 +64,17 @@ module Gori
         return Result.new(id_error(h, "id"), is_error: true) unless id
         detail = store.get_flow(id)
         return not_found("no flow with id #{id}") unless detail
-        # A WebSocket flow (101) carries a separate message log; fetch it so get_flow
-        # surfaces the frames (parity with `gori run show`). Non-WS flows skip the query.
-        ws_msgs = detail.row.status == 101 ? store.ws_messages(id) : [] of Store::WsMessage
+        # A WebSocket flow carries a separate message log; fetch it so get_flow surfaces the
+        # frames (parity with `gori run show`).
+        #
+        # Asked of the ROWS and not of the status (#742). This used to be
+        # `row.status == 101 ? … : []`, which is the h1 handshake's status and NOT the h2
+        # one: an RFC 8441 extended CONNECT (#733) is answered `200`, so a socket captured
+        # over h2 had its transcript decoded, written, and then withheld from every agent
+        # that asked for the flow. `ws_messages` already returns an empty array for anything
+        # that is not a socket, so the guard bought one query on non-WS flows and cost the
+        # feature on h2 ones.
+        ws_msgs = store.ws_messages(id)
         include_sensitive = bool_arg(h, "include_sensitive", false)
         cap, omit = body_return_opts(h)
         Result.new(Serialize.flow_detail_json(detail, ws_msgs, include_sensitive, cap, omit))

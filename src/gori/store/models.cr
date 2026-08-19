@@ -3,6 +3,7 @@ require "../ascii_bytes"
 require "../url"
 require "../token_extract"
 require "../proxy/ws/frame"
+require "../proxy/h2/head_codec" # PROTOCOL_MARKER — see FlowDetail#websocket?
 
 module Gori
   class Store
@@ -41,13 +42,20 @@ module Gori
       getter? short_circuited : Bool
       # What gori has to SAY about this flow that its bytes cannot — see `FlowRow#advisory`.
       getter advisory : String?
+      # The RFC 8441 extended CONNECT's `:protocol` pseudo-header, verbatim (nil = this was not
+      # one, or the capture path cannot know). Carried on the DTO rather than lifted off `head`
+      # by the store the way `request_content_type` is: `:protocol` is a pseudo-header, so it
+      # survives into the stored head only as `HeadCodec`'s synthetic `X-Gori-Protocol` marker
+      # line — and a marker line is forgeable by an IMPORTED flow, where a pseudo-header the h2
+      # decoder read off the wire is not. Only `H2::Assembler` sets this. See V16.
+      getter connect_protocol : String?
 
       def initialize(@created_at, @scheme, @host, @port, @method, @target,
                      @http_version, @head, @body = nil,
                      @sni = nil, @alpn = nil, @tls_version = nil,
                      @body_truncated = false, @body_size = nil,
                      @h2_conn_id = nil, @h2_stream_id = nil, @short_circuited = false,
-                     @advisory = nil)
+                     @advisory = nil, @connect_protocol = nil)
       end
     end
 
@@ -126,11 +134,17 @@ module Gori
       # the column existed — NOT "the request declared none"; `Proto.classify` treats it as
       # unknown and falls back to what it always read. See the V14 migration.
       getter request_content_type : String?
+      # The RFC 8441 extended CONNECT's `:protocol` token — `websocket` for a WebSocket over
+      # HTTP/2, `connect-udp`/`connect-ip`/… for the extended CONNECTs that are not RFC 6455
+      # framing. NULL means "not recorded" — a row captured before the column existed, or any
+      # flow that was not an h2 extended CONNECT — NOT "this is not a WebSocket"; `Proto.classify`
+      # treats it as unknown and falls back to what it always read. See the V16 migration.
+      getter connect_protocol : String?
 
       def initialize(@id, @created_at, @scheme, @method, @host, @port, @target,
                      @status, @size, @state, @response_size = nil, @duration_us = nil,
                      @content_type = nil, @short_circuited = false, @advisory = nil,
-                     @request_content_type = nil)
+                     @request_content_type = nil, @connect_protocol = nil)
       end
 
       # The advisory as a list of statements, empty when there is none.
@@ -202,6 +216,69 @@ module Gori
       def initialize(@row, @http_version, @request_head, @request_body,
                      @response_head, @response_body, @h2_conn_id = nil, @h2_stream_id = nil,
                      @request_body_truncated = false, @response_body_truncated = false, @error = nil, @sni = nil)
+      end
+
+      # Did this flow OPEN a WebSocket? The one place that answers it, across both transports
+      # gori captures a socket over (#742).
+      #
+      # ## Why this exists
+      #
+      # Every surface used to ask `row.status == 101` — History's MESSAGES pane, the TUI /
+      # CLI / MCP repeater seeds, `gori run show`, MCP `get_flow`, the HAR writer, and the HAR
+      # reader on the way back in. Nine copies of one rule, and `Export::Har`'s said out loud
+      # that it was copied ("the 101 status is how every other surface asks … so it is asked
+      # the same way here"). Then #733 landed WebSocket capture over RFC 8441 extended CONNECT
+      # — `CONNECT /path HTTP/2` answered `200`, never `101` — and all nine drifted at once:
+      # the frames were decoded and written to `ws_messages`, and not one reader could see
+      # them.
+      #
+      # ## What it is NOT
+      #
+      # It is not "does gori hold a transcript for this flow". That question is answered by
+      # the rows themselves — `Store#ws_messages(id)` returns an empty array for anything that
+      # is not a socket — and every DISPLAY surface asks it that way, holding no predicate at
+      # all. This one is for the two callers that must answer before (or without) reading the
+      # rows: `Export::Har.skip_reason`, which has to tell "a socket whose transcript we do
+      # not have" apart from "an ordinary HTTP flow", and `gori run repeater <flow-id>`, which
+      # refuses a one-shot replay of a socket.
+      #
+      # It is also not "can the Repeater re-establish this socket" — that is
+      # `Repeater::WsEngine.upgrade_request?`, which is narrower on purpose: the engine dials
+      # an HTTP/1.1 `Upgrade:` handshake, so an h2 socket is a WebSocket that it cannot open.
+      #
+      # ## The two shapes
+      #
+      # * HTTP/1.1 (RFC 6455): a request carrying `Upgrade: websocket` that was ANSWERED 101.
+      #   The status is required — a handshake the origin rejected with a 403 is an ordinary
+      #   failed request, and HAR must keep exporting it as one.
+      # * HTTP/2 (RFC 8441 §5.1): an extended CONNECT whose `:protocol` is `websocket`,
+      #   answered 2xx. `HeadCodec` filters every pseudo-header out of the stored head and
+      #   re-adds this one as `X-Gori-Protocol`, so the marker line IS the `:protocol`
+      #   pseudo-header; a peer field of the same name is renamed away by the same codec, and
+      #   the rewrite path passes no protocol at all, so the line cannot be forged from the
+      #   wire on an h2 head. 2xx is required for the same reason 101 is: before the origin
+      #   answers there is no socket, and a refusal never opens one.
+      def websocket? : Bool
+        status = @row.status
+        return true if status == 101 && Gori::Proxy::WS.upgrade_request?(String.new(@request_head))
+        return false unless status && status >= 200 && status < 300
+        # Method and version before the head scan: an extended CONNECT is a CONNECT over h2 by
+        # definition, and those two columns settle every other flow without touching bytes.
+        @row.method == "CONNECT" && @http_version == "HTTP/2" && h2_websocket_protocol?
+      end
+
+      # The `X-Gori-Protocol: websocket` marker `HeadCodec.synth_request` writes for an RFC
+      # 8441 extended CONNECT. Token-only recognition, matching `H2::WsCapture.websocket?`:
+      # `connect-udp` (RFC 9298) and `connect-ip` (RFC 9484) are extended CONNECTs too and are
+      # not RFC 6455 framing.
+      private def h2_websocket_protocol? : Bool
+        marker = Gori::Proxy::H2::HeadCodec::PROTOCOL_MARKER
+        String.new(@request_head).scrub.each_line do |line|
+          name, _, value = line.partition(':')
+          next unless name.compare(marker, case_insensitive: true) == 0
+          return Gori::Proxy::WS.protocol_token?(value.strip)
+        end
+        false
       end
 
       # The TRUE wire request body size (recovered by subtracting head size from request total).

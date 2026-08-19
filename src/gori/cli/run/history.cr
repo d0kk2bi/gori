@@ -384,9 +384,23 @@ module Gori
       private def self.emit_har(store : Store, rows : Array(Store::FlowRow), query : String?,
                                 limit : Int32) : Nil
         details = rows.reverse.each.compact_map { |r| store.get_flow(r.id) }
-        # The transcript lookup, asked only about a 101 (`Export::Har.log`), so an HTTP-only
-        # export pays nothing for it and a captured socket exports with its messages instead of
-        # being skipped.
+        # The transcript lookup. `Export::Har.log` calls this for EVERY flow, including the
+        # ones that are plainly HTTP — deliberately, and it is the point of #742: "does this
+        # flow have a transcript" is a question only the rows can answer, and the status test
+        # that used to gate the call is exactly what went blind to WebSocket-over-h2 (an RFC
+        # 8441 extended CONNECT is answered `200`, so the lookup was never made and #733's
+        # frames never reached a HAR).
+        #
+        # What that costs, measured (5k/20k HTTP-only flows, --release, warm cache): the
+        # lookup is a COVERING-index point read (`idx_ws_messages_flow`), ~1.2–1.6 µs per
+        # flow. On 20k flows the whole export step goes 162 ms → 195 ms; on 5k, 41 ms → 47 ms.
+        # It is linear and it is next to a `get_flow` per flow (the BLOBs, above) that this
+        # command already pays, plus the JSON encoding, which dominates both.
+        #
+        # `count_ws_messages` first and a fetch only when non-zero was the obvious way to buy
+        # it back, and it does not pay: the count is the same index read, 3.6 ms of that 32 ms
+        # on 20k flows, and it costs a SECOND query for every flow that IS a socket. One
+        # unconditional query is both cheaper overall and the shape with no predicate in it.
         report = Export::Har.log(STDOUT, details, ws: ->(id : Int64) { store.ws_messages(id) })
         STDOUT.puts
         report.notes.each { |n| STDERR.puts "gori run history: #{n}" }
@@ -429,13 +443,12 @@ module Gori
         id = take_flow_id(positional, "show")
 
         # Close the store before any abort (abort/exit skip ensure blocks); get_flow
-        # has already loaded the BLOBs we need. A WebSocket flow (101) also carries a
-        # ws_messages log — fetch it now while the store is open.
+        # has already loaded the BLOBs we need. A WebSocket flow also carries a ws_messages
+        # log — fetch it now while the store is open (`show_ws_messages`).
         store = open_store(resolve_read_project(project_name, db_path))
         detail, ws_msgs = begin
           d = store.get_flow(id)
-          msgs = d && d.row.status == 101 ? store.ws_messages(id) : [] of Store::WsMessage
-          {d, msgs}
+          {d, show_ws_messages(store, d)}
         ensure
           store.close
         end
@@ -521,11 +534,25 @@ module Gori
         nil
       end
 
+      # The captured WebSocket transcript `show` renders (text, `--format json` and the HAR
+      # entry's `_webSocketMessages` all read it), fetched while the store is still open.
+      #
+      # UNCONDITIONAL, and that is the whole content of this method (#742). It used to read
+      # `d && d.row.status == 101 ? store.ws_messages(id) : []` — the HTTP/1.1 handshake's
+      # status standing in for "is this a socket". An RFC 8441 extended CONNECT (#733) is
+      # answered `200`, so `gori run show` on a WebSocket captured over h2 printed the CONNECT
+      # exchange and not one of the frames sitting in the table beside it. `ws_messages`
+      # already answers with an empty array for a flow that is not a socket, so the gate only
+      # ever bought one query — and cost the feature.
+      def self.show_ws_messages(store : Store, detail : Store::FlowDetail?) : Array(Store::WsMessage)
+        detail ? store.ws_messages(detail.row.id) : [] of Store::WsMessage
+      end
+
       # One flow as a one-entry HAR 1.2 log. A flow HAR cannot represent is an ERROR here,
       # not an empty log: the listing can skip and count, but `show <id> --format har` named
       # this flow, so silently handing back `entries: []` would answer a different question.
       # `ws_msgs` is already in hand: `cmd_show` fetches it before closing the store, because a
-      # 101's messages are what the entry is mostly FOR.
+      # socket's messages are what the entry is mostly FOR.
       private def self.show_har(detail : Store::FlowDetail,
                                 ws_msgs : Array(Store::WsMessage)) : Nil
         # The refusal names the REAL cause where the store has one: a flow gori itself

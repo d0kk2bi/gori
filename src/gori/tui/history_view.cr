@@ -1022,9 +1022,15 @@ module Gori::Tui
     # Reads @detail (both callers set it first); a frame/message-less flow → nil.
     private def load_detail_logs(store : Store) : Nil
       detail = @detail
-      if detail && detail.row.status == 101
+      # The transcript is offered because gori CAPTURED one, not because the flow was a 101
+      # (#742). `ws_messages` is written for an RFC 8441 extended CONNECT too (#733), which is
+      # answered `200` and never 101 — so the status gate that used to stand here decoded a
+      # WebSocket over h2 and then hid every frame of it. There is no predicate to keep in
+      # step now: the row count IS the question, and it is the count this pane needs anyway.
+      total = detail ? store.count_ws_messages(detail.row.id) : 0
+      if detail && total > 0
         @detail_ws = store.ws_messages(detail.row.id, DETAIL_LOG_CAP)
-        @detail_ws_total = store.count_ws_messages(detail.row.id)
+        @detail_ws_total = total
       else
         @detail_ws = nil
         @detail_ws_total = 0
@@ -2041,7 +2047,7 @@ module Gori::Tui
         marked = @marks.includes?(row.id)
         # PROTO is classified here rather than at its own column below, because Colormarker
         # needs it to build the match subject and classifying twice per row per frame is waste.
-        kind = Proto.classify(row.status, row.content_type, row.request_content_type)
+        kind = Proto.classify(row.status, row.content_type, row.request_content_type, row.connect_protocol)
         mark = color_for(row, kind)
         base = if selected
                  focused ? Theme.accent_bg : Theme.selection_dim

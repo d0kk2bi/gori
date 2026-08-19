@@ -115,7 +115,8 @@ private def with_transparent_conn(sink : FlowSink, default_port : Int32,
   spawn do
     if accepted = listener.accept?
       ClientConn.new(accepted, "http", sink,
-        default_port: default_port, origin_dst: origin_dst).run
+        default_port: default_port, origin_dst: origin_dst,
+        h2_offer: Gori::Proxy::H2Offer::Cleartext).run
     end
   end
   client = TCPSocket.new("127.0.0.1", listener.local_address.port)

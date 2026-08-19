@@ -51,7 +51,8 @@ describe "the request Content-Type column (V14)" do
     tmp_store do |store|
       row = store.get_flow(grpc_call(store)).not_nil!.row
       row.status.should be_nil # nothing came back
-      Gori::Proto.classify(row.status, row.content_type, row.request_content_type)
+      Gori::Proto.classify(row.status, row.content_type, row.request_content_type,
+        row.connect_protocol)
         .should eq(Gori::Proto::Kind::Grpc)
     end
   end
@@ -60,7 +61,8 @@ describe "the request Content-Type column (V14)" do
     tmp_store do |store|
       row = store.get_flow(grpc_call(store, answered: true)).not_nil!.row
       row.content_type.should eq("text/html")
-      Gori::Proto.classify(row.status, row.content_type, row.request_content_type)
+      Gori::Proto.classify(row.status, row.content_type, row.request_content_type,
+        row.connect_protocol)
         .should eq(Gori::Proto::Kind::Grpc)
     end
   end
@@ -70,7 +72,8 @@ describe "the request Content-Type column (V14)" do
       id = grpc_call(store, ct: "application/json", answered: true)
       row = store.get_flow(id).not_nil!.row
       row.request_content_type.should eq("application/json")
-      Gori::Proto.classify(row.status, row.content_type, row.request_content_type)
+      Gori::Proto.classify(row.status, row.content_type, row.request_content_type,
+        row.connect_protocol)
         .should eq(Gori::Proto::Kind::Http)
     end
   end

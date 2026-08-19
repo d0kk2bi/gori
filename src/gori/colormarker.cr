@@ -203,7 +203,7 @@ module Gori
     end
 
     def match(row : Store::FlowRow) : Store::ColorRule?
-      match(row, Proto.classify(row.status, row.content_type, row.request_content_type))
+      match(row, Proto.classify(row.status, row.content_type, row.request_content_type, row.connect_protocol))
     end
 
     # Resolve every store-tier rule for `rows` in ONE query per rule, so the `match` calls that
@@ -622,7 +622,7 @@ module Gori
         subject = InterceptFilter::Subject.new(
           method: row.method, host: row.host, target: row.target,
           scheme: row.scheme, status: row.status,
-          proto: Proto.classify(row.status, row.content_type, row.request_content_type))
+          proto: Proto.classify(row.status, row.content_type, row.request_content_type, row.connect_protocol))
         next unless candidate.hit?(row, subject)
         matched += 1
         painted += 1 unless ahead.any?(&.hit?(row, subject))

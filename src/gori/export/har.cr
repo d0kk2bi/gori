@@ -42,12 +42,25 @@ module Gori
     # string, so a pending / refused / aborted flow is SKIPPED by name and counted
     # (`skip_reason`), never written as a fabricated success.
     #
-    # A WebSocket flow is the one entry that carries more than an HTTP exchange: the 101
-    # handshake is written as itself and the captured messages ride beside it in Chrome's
+    # A WebSocket flow is the one entry that carries more than an HTTP exchange: the handshake
+    # is written as itself and the captured messages ride beside it in Chrome's
     # `_webSocketMessages` (see WS_MESSAGES). Those round-trip too — `Import::Har` reads them
     # back into `ws_messages` — with two named exceptions stated where they are made: the
     # frame SHAPE has no field in the format (`ws_messages`), and a message time keeps
     # millisecond fidelity (`epoch_seconds`), matching `startedDateTime`.
+    #
+    # "The handshake as itself" is load-bearing, and since #733 it is not always a 101. A
+    # WebSocket opened over HTTP/2 (RFC 8441 §5.1) has no `Upgrade:` exchange to write: its
+    # handshake is `CONNECT /path HTTP/2` answered `200`, with the `:protocol: websocket`
+    # pseudo-header on the request. gori writes that entry with the method, the status and the
+    # `X-Gori-Protocol` marker line it really had, plus `_webSocketMessages` and
+    # `_resourceType: "websocket"` beside them. Chrome's extension is defined on the ENTRY and
+    # keys nothing off the status, so this is a legal HAR that says what happened; what it is
+    # NOT is a shape Chrome itself can emit, because DevTools has no h2 WebSocket to export.
+    # The alternative — writing a synthetic `101 Switching Protocols` so the entry looks like
+    # the h1 one — would put a response on the record that no origin ever sent, and
+    # `Import::Har` would read it straight back as a flow that never existed. The honest entry
+    # is the one with a CONNECT in it.
     module Har
       SPEC_VERSION = "1.2"
 
@@ -101,13 +114,15 @@ module Gori
       WS_MESSAGES = "_webSocketMessages"
 
       # Chrome tags a WebSocket entry with this, and DevTools keys its message rendering off it:
-      # without the tag the entry renders as a bare 101 and the transcript beside it is not shown.
-      # Derived from the status, so it costs the fixed point nothing.
+      # without the tag the entry renders as a bare handshake and the transcript beside it is
+      # not shown. Written from the TRANSCRIPT (`ws_fields` returns early on an empty one), not
+      # from the status — so it costs the fixed point nothing and it is right on an h2 socket,
+      # whose handshake is a `200` to an extended CONNECT.
       WS_RESOURCE_TYPE = "websocket"
 
       # Why a flow has no HAR representation at all.
       enum Skip
-        WebSocket  # a 101 flow with NO captured messages — see skip_reason
+        WebSocket  # a socket handshake with NO captured messages — see skip_reason
         NoResponse # nothing came back at all: pending, or a request gori REFUSED to send
         Incomplete # a response head exists but the exchange died mid-flight (aborted/error)
       end
@@ -133,7 +148,7 @@ module Gori
           msgs = [] of String
           if websocket > 0
             msgs << "skipped #{plural(websocket, "WebSocket flow")} with no captured messages: " \
-                    "the entry would carry the upgrade handshake and no traffic"
+                    "the entry would carry the handshake and no traffic"
           end
           if no_response > 0
             msgs << "skipped #{plural(no_response, "flow")} with no captured response: a HAR entry requires a response object"
@@ -160,17 +175,12 @@ module Gori
         end
       end
 
-      # Is this flow a WebSocket — i.e. does a message transcript belong to it at all? The 101
-      # status is how every other surface asks (`gori run show`, the TUI's WS pane, MCP's
-      # `get_flow`), so it is asked the same way here rather than a second way.
-      def self.websocket?(detail : Store::FlowDetail) : Bool
-        detail.row.status == 101
-      end
-
       # Why this flow cannot become a HAR entry, or nil when it can.
       #
       # `ws_messages` is how many captured messages the caller holds for it — 0 for anything
-      # that is not a socket, and the reason a 101 is no longer skipped by its status alone.
+      # that is not a socket, and the reason a socket is no longer skipped by its status
+      # alone. It is a COUNT and not the rows because that is all this needs; `log` has the
+      # rows in hand either way and passes `.size`.
       def self.skip_reason(detail : Store::FlowDetail, ws_messages : Int32 = 0) : Skip?
         # HAR 1.2 makes `response` a required member of an entry, and gives no field for
         # "this exchange did not finish". A pending flow, a request gori REFUSED to send,
@@ -200,7 +210,17 @@ module Gori
         # writes a `[gori] …` row into the transcript for a peer that reset — so the ending
         # travels in the messages this entry carries rather than being inferred from a column
         # whose meaning stops at the upgrade.
-        return ws_messages == 0 ? Skip::WebSocket : nil if websocket?(detail)
+        #
+        # Transcript FIRST, handshake shape second (#742). A flow with captured messages is a
+        # socket whatever its status line says, which is the whole of what an entry needs to
+        # know; `Store::FlowDetail#websocket?` is asked only for the remaining case, where the
+        # rows are absent and "a socket we have no transcript for" has to be told apart from
+        # "an ordinary HTTP flow". This module used to ask `row.status == 101` here and said
+        # so out loud — "the 101 status is how every other surface asks … so it is asked the
+        # same way here" — which is exactly how it, and the eight surfaces it was copying,
+        # all went blind to WebSocket-over-h2 the day #733 landed.
+        return nil if ws_messages > 0
+        return Skip::WebSocket if detail.websocket?
         return Skip::Incomplete unless detail.row.state.complete?
         nil
       end
@@ -216,10 +236,19 @@ module Gori
 
       # A complete `{"log": {...}}` document over `flows`, written to `io`.
       #
-      # `ws` is asked ONLY about a 101 flow (`websocket?`), so an HTTP-only export costs no
-      # extra query per entry. Omitting it means "no transcripts are available", which lands
-      # every socket in the `Skip::WebSocket` count — visible in the report rather than a
-      # silently thinner document.
+      # `ws` is asked about EVERY flow. It used to be asked only about a 101, to save a query
+      # per HTTP entry — and that gate was the ninth copy of the status test #742 removed, so
+      # a WebSocket captured over RFC 8441 extended CONNECT (#733, answered `200`) never had
+      # its transcript looked up at all. A gate that can be wrong about which flows are
+      # sockets is not worth what it saves, and what it saves was measured before this
+      # changed: ~1.2–1.6 µs per flow, a COVERING-index point read, against a `get_flow` per
+      # entry the caller already pays plus the JSON encoding that dominates both. The numbers
+      # and the rejected `count`-first alternative are written out at the caller,
+      # `CLI::Run.emit_har`.
+      #
+      # Omitting `ws` means "no transcripts are available", which lands every socket in the
+      # `Skip::WebSocket` count — visible in the report rather than a silently thinner
+      # document.
       def self.log(io : IO, flows : Enumerable(Store::FlowDetail),
                    creator_version : String = Gori::VERSION,
                    ws : WsLookup? = nil) : Report
@@ -238,7 +267,7 @@ module Gori
                 j.field "entries" do
                   j.array do
                     flows.each do |detail|
-                      msgs = ws && websocket?(detail) ? ws.call(detail.row.id) : NO_WS_MESSAGES
+                      msgs = ws ? ws.call(detail.row.id) : NO_WS_MESSAGES
                       case skip_reason(detail, msgs.size)
                       when Skip::WebSocket  then report.websocket += 1
                       when Skip::NoResponse then report.no_response += 1
