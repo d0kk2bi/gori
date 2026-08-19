@@ -142,6 +142,13 @@ module Gori::Tui
       # not whatever the CONFIG pane says now.
       @run_policy = nil.as({Bool, Bool, Symbol}?)
       @pending_policy = nil.as({Bool, Bool, Symbol}?)
+      # The query/form positions THAT run percent-encoded for, frozen for the same reason
+      # again: `result_request` re-renders a row whose request the retention policy did not
+      # keep, and a reconstruction that skipped the encode would show `<script>` in a query
+      # string that carried `%3Cscript%3E` — the row's payload column already shows the raw
+      # payload, so the pane would be quietly claiming the wire looked like that too.
+      @run_auto_encode = nil.as(Fuzz::AutoEncode?)
+      @pending_auto_encode = nil.as(Fuzz::AutoEncode?)
       # `Fuzz::Plan#rewrites_content_length?` as of the last plan build, plus the
       # `@editor.edits` revision it was computed at — an edit to the template invalidates
       # the answer, and a stale "your CL is being rewritten" is worse than none.
@@ -863,8 +870,9 @@ module Gori::Tui
 
     def begin_run(total : Int64?) : Nil
       @results.clear
-      @run_template = @pending_template # freeze the template these results are rendered against
-      @run_policy = @pending_policy     # ...and the CL knobs + retention its generator ran under
+      @run_template = @pending_template       # freeze the template these results are rendered against
+      @run_policy = @pending_policy           # ...and the CL knobs + retention its generator ran under
+      @run_auto_encode = @pending_auto_encode # ...and the positions it percent-encoded for
       @results_rev += 1
       # A fresh run reuses result indices from 0, so drop the {pane, index}-keyed detail
       # cache — otherwise an old row's lines could survive under a colliding new index.
@@ -1185,6 +1193,7 @@ module Gori::Tui
       # name the retention THIS run used — not what the CONFIG pane says after a post-run edit.
       @pending_policy = {@config.update_content_length?, @config.add_content_length_when_missing?,
                          @matcher.keep_bodies}
+      @pending_auto_encode = plan.auto_encode
       # The template declares a Content-Length that disagrees with its own body BEFORE any
       # payload is substituted — so the auto-resync is about to rewrite framing the operator
       # authored deliberately, on every variation, and the sweep would report a clean
@@ -2933,6 +2942,11 @@ module Gori::Tui
       # Values only — the reason a chain didn't run is already carried on the row
       # (r.chain_error), surfaced by detail_request_lines below.
       payloads = tmpl.apply_chains(r.payloads, Decoder.shared_registry)
+      # The same last transform the generator applied, off the SAME decision object — see
+      # `@run_auto_encode`. `r.position` is the Sniper discriminator the generator used
+      # (`Job#position`): only the substituted position was encoded, the rest kept their
+      # template defaults.
+      payloads = (@run_auto_encode || Fuzz::AutoEncode.none).apply(payloads, r.position)
       raw = tmpl.render(payloads)
       sync, add, _ = run_policy
       raw = Fuzz::ContentLength.sync(raw, add) if sync

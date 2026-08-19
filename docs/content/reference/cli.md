@@ -44,7 +44,7 @@ gori tui --listen 0.0.0.0 --port 8080
 
 ## gori run
 
-The non-interactive suite. Each subcommand operates over a project; with neither `--project` nor `--db` it uses the most-recently-active project. See the [Scripting guide](/guide/scripting/) for the working patterns.
+The non-interactive suite. Each subcommand operates over a project; with neither `--project` nor `--db` it uses the most-recently-active project — and says so once on stderr (`gori run: using project demo (most recently active)`), because creating a project anywhere re-aims every later command. See the [Scripting guide](/guide/scripting/) for the working patterns.
 
 ```bash
 gori run <subcommand> [verb] [options]
@@ -54,7 +54,7 @@ gori run <subcommand> [verb] [options]
 |------------|-------------|
 | `capture` | Run the proxy and stream captured flows to STDOUT |
 | `history` (`ls`) | List / query captured flows |
-| `history delete <id>` · `clear` | Hard-delete one flow, or wipe the project's History (`--yes`) |
+| `history delete <id>` · `delete -q QL` · `clear` | Hard-delete one flow, every flow a query matches (`--yes`), or wipe the project's History (`--yes`) |
 | `show <flow-id>` | Print one flow's request and response |
 | `compare <id-a> <id-b>` | Diff two flows' request or response |
 | `intercept` | Inspect and drive a capturing TUI's live intercept queue |
@@ -142,9 +142,14 @@ gori run history -q 'status:5xx' --limit 100 --format json
 |--------|-------------|
 | `-q`, `--query=QL` | Query-language filter (also accepted positionally) |
 | `-n`, `--limit=N` | Max rows (default 50) |
-| `--format=FMT` | `text`, `json`, or `har` |
+| `--lenient` | Don't refuse a query naming an unknown field — search that token as text |
+| `--format=FMT` | `text`, `json` / `jsonl` (both JSON-Lines), or `har` |
 
-Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `history clear --yes`.
+Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `history delete -q QL --yes`, `history clear --yes`.
+
+Each `json`/`jsonl` row carries the flow's absolute `url` and a compact `headers` object for the request (a repeated header name becomes an array). Bodies are not inlined — that is `run show`.
+
+`history delete -q QL` deletes every flow the query matches and needs `--yes`; without it, it prints how many would go and refuses. A query naming a field QL does not know (`methd:`) is refused too, rather than silently matching nothing. With neither an id nor `-q` it refuses — wiping the project is `history clear --yes`.
 
 `--format har` writes the whole result set as one HAR 1.2 log on STDOUT, oldest entry first, so a query can be handed to a teammate or loaded into Burp, Charles, or a browser's network panel. See [HAR export](#har-export).
 
@@ -154,7 +159,7 @@ Subcommands: `history show <id>` (same as `run show`), `history delete <id>`, `h
 gori run show <flow-id> --format raw
 ```
 
-`--format` is `text`, `json`, `raw` (exact bytes), or `har` (a one-entry HAR log). `--request-only` / `--response-only` limit the output and do not apply to `har`. Decoded SAML/JWT/GraphQL/params, WebSocket messages, and SSE events are included where present.
+`--format` is `text`, `json`, `raw` (exact bytes), `har` (a one-entry HAR log), or `curl` (a runnable `curl` command reproducing the request — the same text the TUI's `Space → Y` copies). `--request-only` / `--response-only` limit the output and do not apply to `har`; `curl` is the request, so `--response-only` is refused. Decoded SAML/JWT/GraphQL/params, WebSocket messages, and SSE events are included where present.
 
 #### HAR export
 
@@ -291,6 +296,7 @@ Sources: `--flow=ID`, `--request=FILE`, or stdin. Positions: `§…§` markers, 
 | Transport | `--target=URL` (required for `--request`/stdin), `--http2`, `--sni=HOST`, `-k`/`--insecure-upstream` |
 | Mode | `--mode=` `sniper` (default), `batteringram`, `pitchfork`, `clusterbomb` |
 | Payloads | `-w`/`--wordlist`, `--preset=NAME[:FILE]` (built-in: `sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`), `--payloads=LIST`, `--numbers=FROM-TO[:STEP]`, `--null=N`, `--brute=CHARSET:MIN-MAX` |
+| Encoding | A payload spliced into a **query-string** or **form-urlencoded body** value is URL-encoded by default; path segments, JSON/raw bodies, headers and cookies stay raw. `--no-encode` sends the query/form ones raw too. Giving an explicit processor pipeline replaces the default — it applies to every position |
 | Processors | `--prefix`, `--suffix`, `--encode` (`url`\|`urlall`\|`base64`\|`hex`), `--case` (`upper`\|`lower`), `--hash` (`md5`\|`sha1`\|`sha256`), `--regex-replace=/pat/rep/` |
 | Rate | `--concurrency` (20), `--rate=RPS`, `--throttle=MS`, `--timeout=SEC`, `--retries=N`, `--max-requests=N` (hard cap, retries and redirect hops count), `--follow-redirects`, `--no-keep-alive` |
 | Framing | `--verbatim` — send the template's `Content-Length` as written, with no resync after payload substitution (for CL / CL-TE desync payloads). `--reframe-grpc` — recompute the gRPC 5-byte length prefix after each payload is spliced into a unary message (off by default: a stale prefix is reported, not repaired) |
@@ -407,7 +413,7 @@ gori run probe --severity high --category cors
 gori run probe -a
 ```
 
-`--severity` is `info`\|`low`\|`medium`\|`high`\|`critical`; `--category` is `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`; `-a`/`--active` includes light-touch active checks; `-q`/`--query` filters with QL.
+`--severity` is `info`\|`low`\|`medium`\|`high`\|`critical`; `--category` is `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`; `-a`/`--active` includes light-touch active checks; `-q`/`--query` filters with QL, and `--lenient` accepts a query that names an unknown field instead of refusing it.
 
 With `--active`: `--unsafe` also probes unsafe methods (`POST`/`PUT`/`PATCH`/`DELETE`), whose re-sends may mutate server data; `--aggressive` raises the per-rule caps and widens the forbidden-bypass header set (and implies `--unsafe`). Both stay scope-gated unless you also pass `--allow-unscoped`. Use them only against authorized targets.
 
@@ -506,7 +512,7 @@ A malformed entry is skipped rather than aborting the file; the result reports b
 gori run sitemap --in-scope --format paths
 ```
 
-`-q`/`--query=QL` filters endpoints with the same QL as history (also positional), `-n`/`--limit=N` caps the endpoints scanned (default `SITEMAP_MAX`), `--in-scope` limits to in-scope hosts, `--no-group` disables id folding, `--format` is `text` (tree), `json`, or `paths`.
+`-q`/`--query=QL` filters endpoints with the same QL as history (also positional), `-n`/`--limit=N` caps the endpoints scanned (default `SITEMAP_MAX`), `--in-scope` limits to in-scope hosts, `--no-group` disables id folding, `--no-fold-query` disables query-string folding (the two are separate axes), `--format` is `text` (tree), `json`, or `paths`, and `--lenient` accepts a query that names an unknown field instead of refusing it.
 
 **`sitemap tag`**: pin a free-text memo onto one path, the same note the TUI's Sitemap shows.
 
@@ -813,7 +819,15 @@ List, create, or delete projects, or manage project-scoped config (scope rules, 
 ```bash
 gori run project --format json
 gori run project list
+gori run project list --all
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Include projects with nothing captured in them |
+| `--format=FMT` | `text` (default) or `json` |
+
+`list` hides the **empty** projects — zero captured flows — because a project per worktree or per checkout accumulates into hundreds of them and buries the two or three holding traffic. Emptiness is counted, not inferred from file size: a project created a second ago is the same size as a leftover from March. Two are always listed however empty they are, and marked: `◆` is the project a `--project`-less `gori run` reads, `◇` the one the TUI last opened. In `--format json` those are the `current` and `tui_active` fields, beside a `flows` count; the count of what was hidden goes to stderr, so a JSON pipe stays a clean array.
 
 #### project create
 

@@ -282,6 +282,157 @@ describe Gori::Sitemap do
     end
   end
 
+  describe ".fold_queries!" do
+    it "folds two query variants of one path into a single node" do
+      # The reason this pass exists: mapping shop.demo.test listed /search twice — once per
+      # payload — and the second row's LABEL was the XSS payload.
+      hosts = Gori::Sitemap.build([
+        {"shop.demo.test", "GET", "/search?q=widgets"},
+        {"shop.demo.test", "GET", "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"},
+      ])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      hosts.first.children.size.should eq(1)
+      fold = hosts.first.children.first
+      fold.label.should eq("search")
+      fold.grouped.should be_true
+      fold.query_fold.should be_true
+      fold.expanded.should be_false # collapsed by default: the payload is not a visible row
+      fold.path.should eq("/search")
+      fold.fold_methods.should eq(["GET"])
+      fold.methods.should be_empty # endpoint_count keys on that; the fold is not its own endpoint
+      Gori::Sitemap.query_variants(fold).should eq(2)
+      # The variants keep their literal paths, so a tag on /search?q=1 still stamps and
+      # Repeater still resolves a concrete captured target through the fold.
+      fold.children.map(&.path).should eq(["/search?q=widgets", "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"])
+    end
+
+    it "counts the folded endpoint once" do
+      hosts = Gori::Sitemap.build([
+        {"h", "GET", "/search?q=1"},
+        {"h", "POST", "/search?q=2"},
+      ])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      # Two captured (method, target) rows, ONE endpoint — which is what the row now says.
+      Gori::Sitemap.endpoint_count(hosts.first).should eq(1)
+      hosts.first.children.first.fold_methods.should eq(["GET", "POST"])
+    end
+
+    it "leaves a path with no query alone" do
+      hosts = Gori::Sitemap.build([{"h", "GET", "/search"}, {"h", "GET", "/login"}])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      hosts.first.children.map(&.label).should eq(["search", "login"])
+      hosts.first.children.none?(&.grouped).should be_true
+      Gori::Sitemap.endpoint_count(hosts.first).should eq(2)
+    end
+
+    it "absorbs the query-LESS leaf sibling, so /search appears exactly once" do
+      hosts = Gori::Sitemap.build([
+        {"h", "GET", "/search"},
+        {"h", "GET", "/search?q=1"},
+      ])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      hosts.first.children.map(&.label).should eq(["search"])
+      fold = hosts.first.children.first
+      fold.children.map(&.path).should eq(["/search", "/search?q=1"])
+      Gori::Sitemap.query_variants(fold).should eq(1) # the bare path is not a variant of itself
+      Gori::Sitemap.endpoint_count(hosts.first).should eq(1)
+    end
+
+    it "leaves a path that is also a DIRECTORY in place, so its subtree stays visible" do
+      # Folding /api/users would take /api/users/5 into the collapsed fold with it — the
+      # fold would then hide endpoints instead of deduplicating one.
+      hosts = Gori::Sitemap.build([
+        {"h", "GET", "/api/users"},
+        {"h", "GET", "/api/users/5"},
+        {"h", "GET", "/api/users?page=1"},
+      ])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      api = hosts.first.children.first
+      api.children.map(&.label).should eq(["users", "users"])
+      real, fold = api.children
+      real.grouped.should be_false
+      real.children.map(&.label).should eq(["5"]) # subtree intact
+      fold.query_fold.should be_true
+      fold.children.map(&.path).should eq(["/api/users?page=1"])
+      Gori::Sitemap.endpoint_count(hosts.first).should eq(3) # /api/users, /api/users/5, the fold
+    end
+
+    it "folds a query on the bare root onto the '/' node" do
+      hosts = Gori::Sitemap.build([{"h", "GET", "/"}, {"h", "GET", "/?utm=x"}])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      hosts.first.children.map(&.label).should eq(["/"])
+      fold = hosts.first.children.first
+      fold.query_fold.should be_true
+      fold.path.should eq("/")
+      fold.children.map(&.path).should eq(["/", "/?utm=x"])
+    end
+
+    it "keeps each path's variants separate" do
+      hosts = Gori::Sitemap.build([
+        {"h", "GET", "/search?q=1"},
+        {"h", "GET", "/login?next=/a"},
+        {"h", "GET", "/search?q=2"},
+      ])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      hosts.first.children.map(&.label).sort.should eq(["login", "search"])
+      hosts.first.children.each { |c| c.query_fold.should be_true }
+    end
+
+    it "is idempotent — a second call does not nest another level" do
+      hosts = Gori::Sitemap.build([{"h", "GET", "/search?q=1"}, {"h", "GET", "/search?q=2"}])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      Gori::Sitemap.fold_queries!(hosts.first)
+      hosts.first.children.size.should eq(1)
+      hosts.first.children.first.children.size.should eq(2)
+    end
+
+    it "runs AFTER the id folds without disturbing them" do
+      # The id passes must still see the literal children: /items/7?ref=home belongs in the
+      # numeric run with /items/7, not in a query fold of its own.
+      rows = (1..12).map { |i| {"h", "GET", "/items/#{i}?ref=home"} }
+      hosts = Gori::Sitemap.build(rows)
+      Gori::Sitemap.group_sequences!(hosts.first)
+      Gori::Sitemap.fold_queries!(hosts.first)
+      items = hosts.first.children.first
+      items.children.size.should eq(1)
+      fold = items.children.first
+      fold.label.should eq("[1, 2, 3 … +9]")
+      fold.query_fold.should be_false # a numeric run, not a query fold
+      fold.children.size.should eq(12)
+    end
+
+    it "leaves the children of an id fold alone (they are already collapsed)" do
+      hosts = Gori::Sitemap.build([
+        {"h", "GET", "/users/3f2a8b1c-1234-5678-9abc-def012345678?x=1"},
+        {"h", "GET", "/users/a1b2c3d4-5566-7788-99aa-bbccddeeff00?x=2"},
+      ])
+      Gori::Sitemap.fold_templates!(hosts.first)
+      Gori::Sitemap.fold_queries!(hosts.first)
+      users = hosts.first.children.first
+      users.children.size.should eq(1)
+      users.children.first.label.should eq("{uuid}")
+      users.children.first.children.size.should eq(2)
+    end
+
+    it "keeps a query fold collapsed under apply_expand_depth!" do
+      hosts = Gori::Sitemap.build([{"h", "GET", "/search?q=1"}, {"h", "GET", "/search?q=2"}])
+      Gori::Sitemap.fold_queries!(hosts.first)
+      Gori::Sitemap.apply_expand_depth!(hosts, -1) # "expand everything"
+      hosts.first.children.first.expanded.should be_false
+    end
+
+    it "does not stamp a tag onto the synthetic fold" do
+      # The tag key is the node path INCLUDING the query, so the variants keep theirs and
+      # the fold — like a {uuid} fold — carries none of its own.
+      hosts = Gori::Sitemap.build([{"h", "GET", "/search?q=1"}, {"h", "GET", "/search?q=2"}])
+      Gori::Sitemap.stamp_tags!(hosts, { {"h", "/search?q=1"} => "sqli here", {"h", "/search"} => "unreachable" })
+      Gori::Sitemap.fold_queries!(hosts.first)
+      fold = hosts.first.children.first
+      fold.tag.should be_nil
+      fold.children.first.tag.should eq("sqli here")
+    end
+  end
+
   describe ".group_sequences!" do
     it "folds numeric ids that carry a query, and labels the group by the path part" do
       # `add` appends the query to the LAST segment, so a listing page's links arrive as

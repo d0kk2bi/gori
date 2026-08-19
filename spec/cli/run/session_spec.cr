@@ -184,3 +184,46 @@ describe "gori run — --slot ordering" do
     end
   end
 end
+
+# `gori run session from-flow` — the CLI half of `Gori::SessionFromFlow`. The reading itself is
+# pinned in spec/session_from_flow_spec.cr; what is pinned here is that this surface calls THAT
+# reader (a second copy is how two surfaces build different identities from one flow) and that
+# its `--help` states the one thing an operator has to know before trusting it: the overlay is
+# LITERAL bytes and does not re-authenticate.
+describe "gori run session from-flow" do
+  it "is a registered subcommand, listed in the usage line" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    src.should contain(%(when "from-flow"    then cmd_session_from_flow))
+    src[/Usage: gori run session \[list\].*/].should contain("from-flow")
+  end
+
+  it "reads the flow through Gori::SessionFromFlow rather than its own copy" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    body = src[/private def self\.cmd_session_from_flow.*?\n      end\n/m]
+    body.should contain("Gori::SessionFromFlow.draft")
+    # The refusal is the engine's sentence, not a re-worded one: MCP prints the same text.
+    body.should contain("refusal.message")
+    # A duplicate --name is refused BEFORE the flow read, so the cheap deterministic answer
+    # never comes back dressed as "that flow is not a login".
+    body.index("already exists").not_nil!.should be < body.index("get_flow").not_nil!
+  end
+
+  it "says in --help that the overlay is literal and points rotating tokens elsewhere" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    banner = src[/Usage: gori run session from-flow.*?"\n          p\.on\("--name/m]
+    banner.should contain("LITERAL")
+    banner.should contain("does NOT")
+    banner.should contain("re-authenticate")
+    banner.should contain("ROTATES")
+    banner.should contain("rewriter extract")
+    banner.should contain("--bind-from")
+  end
+
+  # `--from-flow` on `add` is what an operator who read about the feature will type. It names
+  # the subcommand instead of dying as an unknown option.
+  it "points --from-flow on `session add` at the subcommand" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    src.should contain("--from-flow=ID")
+    src.should contain("--from-flow is its own subcommand")
+  end
+end

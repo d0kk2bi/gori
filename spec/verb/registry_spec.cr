@@ -512,6 +512,10 @@ private class FakeContext < ExecContext
     @calls << :sitemap_toggle_grouping
   end
 
+  def sitemap_toggle_query_fold : Nil
+    @calls << :sitemap_toggle_query_fold
+  end
+
   def sitemap_discover : Nil
     @calls << :sitemap_discover
   end

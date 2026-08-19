@@ -15,24 +15,79 @@ module Gori
         end
       end
 
-      # Hard-delete ONE captured flow. Single and explicit, so no extra confirmation —
-      # unlike `clear`, which needs --yes.
+      # Hard-delete captured flows: ONE by id, or EVERY flow a QL query names.
+      #
+      # The id form is single and explicit, so it needs no extra confirmation. The `-q` form
+      # is not: the operator typed a QUERY and the set it names is whatever the store says it
+      # is, which is why it requires --yes exactly as `clear` does — without it we print the
+      # count and refuse, so the query can be tried before it is run.
+      #
+      # Neither an id nor `-q` is refused rather than treated as "all": that command is
+      # `history clear --yes`, and a delete that quietly widened to the whole project because
+      # an argument went missing from a script is the one failure this file must not have.
       private def self.cmd_history_delete(args : Array(String)) : Nil
         db_path : String? = nil
         project_name : String? = nil
+        query : String? = nil
+        yes = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
-          p.banner = "Usage: gori run history delete <id>\n\nHard-delete one captured flow. This can't be undone."
+          p.banner = "Usage: gori run history delete <id>\n" \
+                     "       gori run history delete -q QL --yes\n\n" \
+                     "Hard-delete one captured flow, or every flow a QL query matches. " \
+                     "This can't be undone."
           p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
+          p.on("-qQL", "--query=QL", "Delete every flow matching this QL query (host: status:>=500 method: …)") { |v| query = v }
+          p.on("--yes", "Actually delete the query's matches (required — there is no interactive prompt here)") { yes = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run history delete: unknown option: #{f}\n#{p}" }
           p.missing_option { |f| abort "gori run history delete: missing value for #{f}" }
         end
-        parser.parse(args)
+        # Same two pre-passes the listing runs, for the same reason: `-q` with a separate
+        # value, and QL negation terms ("-status:200"), which OptionParser would otherwise
+        # abort as unknown options before they could join the query.
+        args = normalize_query_flag(args)
+        neg_terms, opt_args = split_ql_negations(args)
+        parser.parse(opt_args)
+        query, dropped = Run.compose_history_query(query, [] of String, neg_terms)
+        Run.warn_dropped_query_terms("history delete", dropped)
 
+        if err = delete_selector_error(positional, query)
+          abort "gori run history delete: #{err}"
+        end
+        if q = query
+          delete_by_query(q, yes, project_name, db_path)
+        else
+          delete_by_id(positional, project_name, db_path)
+        end
+      end
+
+      # Why this invocation names no deletable set, or nil when it names exactly one.
+      #
+      # "Neither" is a refusal and not a synonym for "all": that command is
+      # `history clear --yes`, and a delete that quietly widened to the whole project because
+      # an argument went missing from a script is the one failure this file must not have.
+      # "Both" is a refusal because the two selectors disagree about scope and there is no
+      # reading of the pair that is obviously what was meant — an id is one flow, a query is
+      # however many match.
+      private def self.delete_selector_error(positional : Array(String), query : String?) : String?
+        if q = query
+          return nil if positional.empty?
+          "name a flow id OR a -q query, not both (got the id#{positional.size == 1 ? "" : "s"} " \
+          "#{positional.join(" ").inspect} beside #{q.inspect})"
+        else
+          return nil unless positional.empty?
+          "nothing selected — give a flow id, or -q QL to delete every match. " \
+          "To delete EVERY flow: `gori run history clear --yes`"
+        end
+      end
+
+      # `history delete <id>` — the single, explicit form.
+      private def self.delete_by_id(positional : Array(String), project_name : String?,
+                                    db_path : String?) : Nil
         # `take_flow_id`, not a hand-rolled `first?`: it supplies the too-many-arguments abort
         # this one path was missing, so `history delete 1 2 3` no longer deletes ONLY flow #1
         # and exits 0 with nothing said about #2 and #3. The TUI has multi-select delete and the
@@ -52,6 +107,137 @@ module Gori
         ensure
           store.close
         end
+      end
+
+      # `history delete -q QL [--yes]` — every flow the query names.
+      private def self.delete_by_query(q : String, yes : Bool, project_name : String?,
+                                       db_path : String?) : Nil
+        # BEFORE the store is opened, so a refusal costs nothing and cannot be confused with
+        # a store error. The listing only WARNS about these; a delete must not.
+        if err = delete_query_error(q)
+          abort "gori run history delete: #{err}"
+        end
+        filter = QL.parse(q)
+
+        store = open_store(resolve_read_project(project_name, db_path))
+        ids = begin
+          # Trigram indexing is off-commit (Store V4), so a `body:`/free-text query run right
+          # after a capture would under-report until the backlog drains — and here that means
+          # SILENTLY SPARING flows the operator asked to delete. Wait for it.
+          store.index_pending! if filter.uses_fts?
+          matching_flow_ids(store, filter)
+        rescue ex
+          store.close
+          abort "gori run history delete: query #{q.inspect} failed: #{ex.message}"
+        end
+
+        begin
+          if ids.empty?
+            STDERR.puts "gori run history delete: no flows match #{q.inspect} — nothing deleted"
+            return
+          end
+          if err = delete_confirmation_error(q, ids.size, yes)
+            abort "gori run history delete: #{err}"
+          end
+          deleted = 0
+          # Batched, not one transaction for the whole match set: a query can name every flow
+          # in the project, and `clear` is the command for that. Each chunk that commits is
+          # counted, so a mid-run failure reports what actually went rather than all-or-nothing.
+          ids.each_slice(DELETE_BATCH) do |chunk|
+            unless store.delete_flows(chunk)
+              abort "gori run history delete: stopped after #{deleted} flow#{deleted == 1 ? "" : "s"} " \
+                    "(project busy) — the rest are still there; re-run to continue"
+            end
+            deleted += chunk.size
+          end
+          puts "Deleted #{deleted} flow#{deleted == 1 ? "" : "s"} matching #{q.inspect}."
+        ensure
+          store.close
+        end
+      end
+
+      # The refusal a `-q` delete owes an operator who did not pass --yes, or nil when they did.
+      # Separate from the delete itself so the COUNT is in the sentence: the whole point of the
+      # gate is that the query can be tried before it is run, and "refusing to delete 4812
+      # flows" is the number that stops a hand from moving. Mirrors `history clear`'s gate,
+      # which is the same decision one scope wider.
+      private def self.delete_confirmation_error(q : String, count : Int32, yes : Bool) : String?
+        return nil if yes
+        "refusing to delete #{count} flow#{count == 1 ? "" : "s"} matching #{q.inspect} without --yes"
+      end
+
+      # Flows per delete transaction. Big enough that a routine cleanup is one or two fsyncs,
+      # small enough that "delete everything on this host" doesn't build one transaction the
+      # size of the project (P6 — never stall the data path; live capture shares this writer).
+      DELETE_BATCH = 500
+
+      # Rows are paged, not fetched with one enormous LIMIT, for the same reason the delete is
+      # batched: the match set is the operator's to choose and can be the whole table. Only the
+      # ids are kept — a `FlowRow` per match would be the projection of every row in the project
+      # held at once, and nothing here reads a field off them.
+      #
+      # `before_id` (not OFFSET) is the cursor: it is stable while live capture appends, and
+      # nothing is deleted until the whole set is known, so no page can shift under the walk.
+      private def self.matching_flow_ids(store : Store, filter : QL::Filter) : Array(Int64)
+        ids = [] of Int64
+        cursor : Int64? = nil
+        loop do
+          page = store.search(filter, DELETE_BATCH, before_id: cursor, raise_on_error: true)
+          break if page.empty?
+          page.each { |r| ids << r.id }
+          break if page.size < DELETE_BATCH
+          cursor = page.last.id
+        end
+        ids
+      end
+
+      # Why a `history delete -q` query must not be run, or nil when it is safe to.
+      #
+      # The listing WARNS about these and carries on, which is right there: a broader or
+      # narrower result set on screen costs a second look. Here the same query is a
+      # destructive SELECTOR, so each one is a refusal instead — and they point in opposite
+      # directions, which is why none of them can be left to the operator to notice:
+      #
+      #   * an unknown field (`methd:GET`, a typo of `method:`) is not dropped and is not an
+      #     error — BOTH compilers free-text the whole token, so it becomes a literal
+      #     substring search over method/host/target. The delete then quietly matches
+      #     NOTHING and exits 0, against a query the operator believes they ran. Nothing in
+      #     `analyze` reports it (the term compiled — to the wrong thing), which is why this
+      #     check is `QL.fields_used` + `QL.known_field?`, the same pair
+      #     `Colormarker.unknown_fields` refuses a colour rule with.
+      #   * an invalid regex compiles to a never-match clause: silently nothing, again.
+      #   * a term QL DROPS (`status:>=foo`, `proto:zzz`) folds out of an AND-chain, so the
+      #     delete is BROADER than what was typed — and a query that is ONLY such a term
+      #     collapses to the match-all filter, i.e. every flow in the project.
+      #
+      # Ordered worst-consequence-first among the ones a single query can trip together, so
+      # the sentence the operator reads names the thing that would actually have happened.
+      private def self.delete_query_error(q : String) : String?
+        return "empty -q query — to delete EVERY flow use `gori run history clear --yes`" if q.strip.empty?
+        # `known_field?`, not `QL::FIELDS.includes?`: FIELDS is the pool the surfaces OFFER,
+        # and QL accepts spellings it does not offer (`res.body`, `req.size` — FIELD_ALIASES).
+        unknown = QL.fields_used(q).map(&.name).uniq!.reject! { |n| QL.known_field?(n) }
+        unless unknown.empty?
+          return "unknown field#{unknown.size == 1 ? "" : "s"} #{unknown.map { |n| "`#{n}:`" }.join(", ")} — " \
+                 "QL free-texts a field it does not know (or drops it, under a `req.`/`resp.` prefix), " \
+                 "so this would delete something other than what the query says " \
+                 "(fields: #{QL::FIELDS.join(" ")})"
+        end
+        unless (bad = QL.invalid_regex_terms(q)).empty?
+          return "invalid regex in #{bad.map(&.inspect).join(", ")} — that term matches nothing, " \
+                 "so this would delete nothing while reporting a query that ran"
+        end
+        # Compiled the way the delete compiles it, so what is judged match-all is what would RUN.
+        # BEFORE the dropped-term check, so a query whose EVERY term was dropped names the worse
+        # consequence: it selects the whole project, not merely one term fewer.
+        if QL.reject_empty?(q, QL.parse(q))
+          return "query #{q.inspect} matches EVERY flow — to delete every flow use `gori run history clear --yes`"
+        end
+        unless (dropped = QL.analyze(q).ignored).empty?
+          return "#{dropped.map(&.inspect).join(", ")} is not a value that field takes — QL drops what " \
+                 "it cannot compile, so this would delete MORE than the query asks for"
+        end
+        nil
       end
 
       # Wipe EVERY captured flow in the project. The TUI puts a danger confirm in front of
@@ -100,6 +286,7 @@ module Gori
         query : String? = nil
         limit = 50
         format = :text
+        lenient = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -109,6 +296,7 @@ module Gori
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("-qQL", "--query=QL", "Filter with a QL query (host: status:>=500 size:>10000 dur:>500 header: body~rx …)") { |v| query = v }
           p.on("-nN", "--limit=N", "Max rows, newest first (default 50)") { |v| limit = parse_count(v, "--limit") }
+          p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
           p.on("--format=FMT", "Output: text (default) | json | jsonl (both emit JSON-Lines) | har (one HAR 1.2 log)") do |v|
             format = parse_format(v, [:text, :json, :jsonl, :har])
             format = :json if format == :jsonl # this listing's json IS JSON-Lines; accept the standard name too
@@ -133,6 +321,10 @@ module Gori
         # and EVERY flow dumped.
         query, dropped = Run.compose_history_query(query, positional, neg_terms)
         Run.warn_dropped_query_terms("history", dropped)
+        # BEFORE the store is opened: `abort` skips ensure blocks, so a refused query must not
+        # leave a handle behind (the EMPTY-filter abort below has to `store.close` for exactly
+        # that reason, and this one has nothing to close).
+        Run.refuse_unknown_query_fields("history", query, lenient)
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin
@@ -164,7 +356,10 @@ module Gori
           if format == :har
             emit_har(store, rows, query, limit)
           elsif format == :json
-            rows.each { |r| puts CLI::Output.flow_row_json(r) }
+            # One extra read per row for the head the projection does not carry — that is what
+            # buys `url` and `headers` on the JSON-Lines row (`Output.flow_row_fields`). Heads
+            # are small and this streams row by row, so a large `-n` costs queries, not memory.
+            rows.each { |r| puts CLI::Output.flow_row_json(r, store.request_head(r.id)) }
           elsif rows.empty?
             STDERR.puts "no flows#{query ? " match #{query.inspect}" : ""}"
           else
@@ -219,7 +414,7 @@ module Gori
           p.banner = "Usage: gori run show <flow-id> [options]"
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
-          p.on("--format=FMT", "Output: text (default) | json | raw (exact bytes) | har (a one-entry HAR 1.2 log)") { |v| format = parse_format(v, [:text, :json, :raw, :har]) }
+          p.on("--format=FMT", "Output: text (default) | json | raw (exact bytes) | har (a one-entry HAR 1.2 log) | curl (a runnable curl command for the request)") { |v| format = parse_format(v, [:text, :json, :raw, :har, :curl]) }
           p.on("--request-only", "Only the request side") { req_only = true }
           p.on("--response-only", "Only the response side") { resp_only = true }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -228,11 +423,8 @@ module Gori
           p.missing_option { |f| abort "gori run show: missing value for #{f}" }
         end
         parser.parse(args)
-        abort "gori run show: --request-only and --response-only are mutually exclusive" if req_only && resp_only
-        # A HAR entry is a request AND its response; there is no half-entry shape to emit,
-        # so the one-sided flags are a usage error here rather than a silently ignored option.
-        if format == :har && (req_only || resp_only)
-          abort "gori run show: --format har writes a whole entry — --request-only/--response-only don't apply"
+        if err = show_side_error(format, req_only, resp_only)
+          abort "gori run show: #{err}"
         end
         id = take_flow_id(positional, "show")
 
@@ -254,9 +446,79 @@ module Gori
         case format
         when :raw  then show_raw(detail, show_request, show_response)
         when :har  then show_har(detail, ws_msgs)
+        when :curl then show_curl(detail)
         when :json then puts show_json(detail, show_request, show_response, ws_msgs)
         else            show_text(detail, show_request, show_response, ws_msgs)
         end
+      end
+
+      # The flow's REQUEST as a runnable `curl` command — headless "Copy as → cURL".
+      #
+      # `Export::Curl`, the very same serializer the TUI copy menu calls: a second curl
+      # writer here would drift from the clipboard's the first time either learned a flag,
+      # and the shell-quoting it does is the part that must not be re-derived (a captured
+      # body is arbitrary bytes, and every naive quoting of those is wrong in a way that
+      # only shows up on the operator's terminal).
+      #
+      # Body included, exactly as captured, so the command reproduces the request rather
+      # than a GET-shaped sketch of it — with the two caveats the bytes themselves impose
+      # reported on STDERR, never mixed into the command on STDOUT: a body cut at the
+      # capture cap would be re-sent SHORT, and a body holding a NUL cannot be a shell
+      # argument at all (`Export::Curl.data_argument` writes that refusal into the command
+      # as a `#` comment, so a paste still runs).
+      private def self.show_curl(detail : Store::FlowDetail, io : IO = STDOUT) : Nil
+        row = detail.row
+        command = curl_command_for(detail)
+        unless command
+          abort "gori run show: flow ##{row.id} has no request line to build a URL from — " \
+                "its captured head is empty (use --format raw to see the bytes)"
+        end
+        io.puts command
+        if detail.request_body_truncated?
+          STDERR.puts "gori run show: flow ##{row.id}'s request body was truncated at the capture cap — " \
+                      "this command sends the SHORT body"
+        end
+      end
+
+      # The curl command for a stored flow, or nil when its head carries no resolvable URL.
+      # Split from `show_curl` so the serialization is reachable without the abort/IO around it.
+      private def self.curl_command_for(detail : Store::FlowDetail) : String?
+        row = detail.row
+        Export::Curl.text(String.new(request_wire_bytes(detail)),
+          Repeater::FlowRequest.build_target(row.scheme, row.host, row.port))
+      end
+
+      # request head + body as one buffer — the "wire" `Export::Curl` parses, and what the
+      # TUI's copy menu feeds it (`HistoryView#request_wire`).
+      private def self.request_wire_bytes(detail : Store::FlowDetail) : Bytes
+        body = detail.request_body
+        return detail.request_head if body.nil? || body.empty?
+        head = detail.request_head
+        buf = Bytes.new(head.size + body.size)
+        head.copy_to(buf)
+        body.copy_to(buf + head.size)
+        buf
+      end
+
+      # Why the one-sided flags and this --format cannot be asked for together, or nil.
+      #
+      # Both formats below write a shape that is not per-side, so a silently ignored flag would
+      # hand back a document the operator did not ask for and has no way to tell apart from the
+      # one they did.
+      private def self.show_side_error(format : Symbol, req_only : Bool, resp_only : Bool) : String?
+        return "--request-only and --response-only are mutually exclusive" if req_only && resp_only
+        # A HAR entry is a request AND its response; there is no half-entry shape to emit.
+        if format == :har && (req_only || resp_only)
+          return "--format har writes a whole entry — --request-only/--response-only don't apply"
+        end
+        # `--format curl` is the REQUEST, always: there is no curl command for a response.
+        # `--request-only` is therefore redundant-but-honest and allowed; `--response-only`
+        # asks for something that does not exist, so say so rather than print the request the
+        # operator explicitly excluded.
+        if format == :curl && resp_only
+          return "--format curl writes the REQUEST as a command — --response-only has nothing to emit"
+        end
+        nil
       end
 
       # One flow as a one-entry HAR 1.2 log. A flow HAR cannot represent is an ERROR here,

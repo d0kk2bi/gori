@@ -44,7 +44,7 @@ gori tui --listen 0.0.0.0 --port 8080
 
 ## gori run {#gori-run}
 
-비대화형 스위트입니다. 각 서브커맨드는 프로젝트 단위로 동작합니다. `--project`와 `--db`가 모두 없으면 가장 최근에 활성화한 프로젝트를 씁니다. 실제 사용 패턴은 [스크립팅 가이드](/ko/guide/scripting/)를 참고하세요.
+비대화형 스위트입니다. 각 서브커맨드는 프로젝트 단위로 동작합니다. `--project`와 `--db`가 모두 없으면 가장 최근에 활성화한 프로젝트를 쓰고, 어느 프로젝트를 골랐는지 stderr에 한 번 알립니다(`gori run: using project demo (most recently active)`). 어디서든 프로젝트를 하나 만들면 이후 모든 명령이 조용히 그쪽을 향하기 때문입니다. 실제 사용 패턴은 [스크립팅 가이드](/ko/guide/scripting/)를 참고하세요.
 
 ```bash
 gori run <subcommand> [verb] [options]
@@ -54,7 +54,7 @@ gori run <subcommand> [verb] [options]
 |------------|-------------|
 | `capture` | 프록시를 실행하고 캡처한 플로우를 STDOUT으로 스트리밍 |
 | `history` (`ls`) | 캡처한 플로우 목록 / 쿼리 |
-| `history delete <id>` · `clear` | 플로우 하나를 완전 삭제, 또는 프로젝트 History 전체 비우기 (`--yes`) |
+| `history delete <id>` · `delete -q QL` · `clear` | 플로우 하나를 완전 삭제, 쿼리에 매칭되는 플로우 전부 삭제 (`--yes`), 또는 프로젝트 History 전체 비우기 (`--yes`) |
 | `show <flow-id>` | 플로우 하나의 요청과 응답 출력 |
 | `compare <id-a> <id-b>` | 두 플로우의 요청 또는 응답 diff |
 | `intercept` | 캡처 중인 TUI의 라이브 인터셉트 큐 조회 및 조작 |
@@ -141,9 +141,14 @@ gori run history -q 'status:5xx' --limit 100 --format json
 |--------|-------------|
 | `-q`, `--query=QL` | 쿼리 언어 필터 (위치 인자로도 허용) |
 | `-n`, `--limit=N` | 최대 행 수 (기본값 50) |
-| `--format=FMT` | `text`, `json`, 또는 `har` |
+| `--lenient` | 없는 필드 이름을 쓴 쿼리를 거절하지 않고 그 토큰을 텍스트로 검색 |
+| `--format=FMT` | `text`, `json` / `jsonl` (둘 다 JSON-Lines), 또는 `har` |
 
-서브커맨드: `history show <id>` (`run show`와 동일), `history delete <id>`, `history clear --yes`.
+서브커맨드: `history show <id>` (`run show`와 동일), `history delete <id>`, `history delete -q QL --yes`, `history clear --yes`.
+
+`json`/`jsonl`의 각 행은 플로우의 절대 `url`과 요청 헤더를 담은 `headers` 객체를 함께 싣습니다 (같은 이름이 반복되면 배열이 됩니다). 본문은 넣지 않습니다 — 그건 `run show`의 몫입니다.
+
+`history delete -q QL`은 쿼리에 매칭되는 플로우를 전부 삭제하며 `--yes`가 필요합니다. `--yes` 없이 실행하면 몇 개가 지워질지 출력하고 거부합니다. QL이 모르는 필드를 쓴 쿼리(`methd:`)도 조용히 아무것도 지우지 않는 대신 거부합니다. id도 `-q`도 없으면 거부합니다 — 프로젝트를 통째로 비우는 건 `history clear --yes`입니다.
 
 `--format har`은 결과 집합 전체를 하나의 HAR 1.2 log로 STDOUT에 씁니다. 오래된 항목이 먼저 오므로, 쿼리 결과를 동료에게 넘기거나 Burp, Charles, 브라우저 네트워크 패널에 그대로 불러올 수 있습니다. [HAR 내보내기](#har-export)를 참고하세요.
 
@@ -153,7 +158,7 @@ gori run history -q 'status:5xx' --limit 100 --format json
 gori run show <flow-id> --format raw
 ```
 
-`--format`은 `text`, `json`, `raw`(정확한 바이트), 또는 `har`(항목 하나짜리 HAR log)입니다. `--request-only` / `--response-only`로 출력을 제한하며, `har`에는 적용되지 않습니다. 디코드된 SAML/JWT/GraphQL/파라미터, WebSocket 메시지, SSE 이벤트가 있으면 함께 포함됩니다.
+`--format`은 `text`, `json`, `raw`(정확한 바이트), `har`(항목 하나짜리 HAR log), 또는 `curl`(요청을 그대로 재현하는 실행 가능한 `curl` 명령 — TUI의 `Space → Y`가 복사하는 것과 같은 텍스트)입니다. `--request-only` / `--response-only`로 출력을 제한하며, `har`에는 적용되지 않습니다. `curl`은 요청이므로 `--response-only`는 거부됩니다. 디코드된 SAML/JWT/GraphQL/파라미터, WebSocket 메시지, SSE 이벤트가 있으면 함께 포함됩니다.
 
 #### HAR 내보내기 {#har-export}
 
@@ -290,6 +295,7 @@ gori run repeater h2 --target https://api.example.com --fields fields.json
 | Transport | `--target=URL` (`--request`/stdin에 필수), `--http2`, `--sni=HOST`, `-k`/`--insecure-upstream` |
 | Mode | `--mode=` `sniper` (기본값), `batteringram`, `pitchfork`, `clusterbomb` |
 | Payloads | `-w`/`--wordlist`, `--preset=NAME[:FILE]` (내장: `sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`), `--payloads=LIST`, `--numbers=FROM-TO[:STEP]`, `--null=N`, `--brute=CHARSET:MIN-MAX` |
+| Encoding | **쿼리 문자열**이나 **form-urlencoded 본문** 값에 치환되는 페이로드는 기본으로 URL 인코딩됩니다. 경로 세그먼트·JSON/원시 본문·헤더·쿠키는 그대로 나갑니다. `--no-encode`는 쿼리/폼 위치도 원시로 보냅니다. 프로세서 파이프라인을 명시하면 기본 인코딩을 대체합니다 — 그 파이프라인이 모든 위치에 적용됩니다 |
 | Processors | `--prefix`, `--suffix`, `--encode` (`url`\|`urlall`\|`base64`\|`hex`), `--case` (`upper`\|`lower`), `--hash` (`md5`\|`sha1`\|`sha256`), `--regex-replace=/pat/rep/` |
 | Rate | `--concurrency` (20), `--rate=RPS`, `--throttle=MS`, `--timeout=SEC`, `--retries=N`, `--max-requests=N` (총 요청 상한. 재시도와 리다이렉트 홉도 포함), `--follow-redirects`, `--no-keep-alive` |
 | Framing | `--verbatim` — 템플릿의 `Content-Length`를 쓰인 그대로 전송. 페이로드 치환 후에도 재계산하지 않습니다 (CL / CL-TE 디싱크 페이로드용). `--reframe-grpc` — 페이로드가 단항 gRPC 메시지에 삽입된 뒤 5바이트 길이 접두사를 다시 계산합니다(기본값은 꺼짐: 오래된 접두사는 고치지 않고 보고만 합니다) |
@@ -375,7 +381,7 @@ gori run probe --severity high --category cors
 gori run probe -a
 ```
 
-`--severity`는 `info`\|`low`\|`medium`\|`high`\|`critical` 중 하나입니다. `--category`는 `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`입니다. 기본적으로 패시브 검사를 수행하며, `-a`/`--active` 옵션을 사용하여 액티브 프로브 검사를 포함할 수 있습니다. `-q`/`--query`로 QL 필터를 겁니다.
+`--severity`는 `info`\|`low`\|`medium`\|`high`\|`critical` 중 하나입니다. `--category`는 `headers`\|`cookies`\|`tech`\|`infoleak`\|`cors`\|`client`\|`active`입니다. 기본적으로 패시브 검사를 수행하며, `-a`/`--active` 옵션을 사용하여 액티브 프로브 검사를 포함할 수 있습니다. `-q`/`--query`로 QL 필터를 겁니다. `--lenient`는 없는 필드 이름을 쓴 쿼리를 거절하지 않고 받아들입니다.
 
 `--active`와 함께: `--unsafe`는 안전하지 않은 메서드(`POST`/`PUT`/`PATCH`/`DELETE`)도 프로브하며, 이 재전송은 서버 데이터를 변경할 수 있습니다. `--aggressive`는 룰별 상한을 높이고 forbidden-bypass 헤더 집합을 넓힙니다(그리고 `--unsafe`를 함의합니다). 둘 다 `--allow-unscoped`를 함께 주지 않는 한 스코프 게이트를 따릅니다. 인가된 대상에만 사용하세요.
 
@@ -473,7 +479,7 @@ gori run import --postman api.postman_collection.json --db ./assessment.db --for
 gori run sitemap --in-scope --format paths
 ```
 
-`-q`/`--query=QL`는 history와 같은 QL로 엔드포인트를 거릅니다(위치 인자로도 넘길 수 있습니다). `-n`/`--limit=N`은 스캔할 엔드포인트 수를 제한합니다(기본값 `SITEMAP_MAX`). `--in-scope`는 스코프 내 호스트로 한정하고, `--no-group`은 id 접기를 끕니다. `--format`은 `text`(트리), `json`, `paths` 중에서 고릅니다.
+`-q`/`--query=QL`는 history와 같은 QL로 엔드포인트를 거릅니다(위치 인자로도 넘길 수 있습니다). `-n`/`--limit=N`은 스캔할 엔드포인트 수를 제한합니다(기본값 `SITEMAP_MAX`). `--in-scope`는 스코프 내 호스트로 한정하고, `--no-group`은 id 접기를, `--no-fold-query`는 쿼리 문자열 접기를 끕니다(서로 다른 축입니다). `--format`은 `text`(트리), `json`, `paths` 중에서 고릅니다. `--lenient`는 없는 필드 이름을 쓴 쿼리를 거절하지 않고 받아들입니다.
 
 **`sitemap tag`**: 경로 하나에 자유 텍스트 메모를 고정합니다. TUI Sitemap에 보이는 그 메모입니다.
 
@@ -780,7 +786,15 @@ gori run colormarker add --when 'method:DELETE' --color hotpink
 ```bash
 gori run project --format json
 gori run project list
+gori run project list --all
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--all` | 캡처된 것이 없는 프로젝트까지 모두 출력 |
+| `--format=FMT` | `text`(기본) 또는 `json` |
+
+`list`는 **비어 있는** 프로젝트(캡처된 flow가 0개)를 숨깁니다. 워크트리나 체크아웃마다 프로젝트를 만들다 보면 수백 개가 쌓여, 정작 트래픽이 든 두세 개가 묻히기 때문입니다. 비어 있는지는 파일 크기가 아니라 행 수로 셉니다. 방금 만든 프로젝트도 3월에 남은 찌꺼기와 크기가 같습니다. 다음 두 개는 아무리 비어 있어도 항상 표시하고 표시자를 붙입니다. `◆`는 `--project` 없이 실행한 `gori run`이 읽는 프로젝트, `◇`는 TUI가 마지막으로 연 프로젝트입니다. `--format json`에서는 각각 `current`, `tui_active` 필드이고 `flows` 개수가 함께 나옵니다. 몇 개를 숨겼는지는 stderr로 나가므로 JSON 파이프는 깨끗한 배열로 남습니다.
 
 #### project create {#project-create}
 

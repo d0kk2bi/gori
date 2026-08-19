@@ -85,6 +85,7 @@ header~set-cookie
 - `OR`는 둘 중 하나를 매칭합니다. `NOT`과 `-` 접두사는 모두 부정입니다.
 - 괄호로 묶을 수 있습니다. 우선순위는 `NOT`, `AND`, `OR` 순입니다.
 - `field:`가 없는 단순 단어는 method, host, target을 대상으로 하는 자유 텍스트 검색입니다.
+- 존재하지 않는 `field:` 이름은 의도한 자유 텍스트가 아닙니다. `gori run history`, `gori run sitemap`, `gori run probe`는 이를 **거절**하고 가장 가까운 실제 필드를 알려준 뒤 0이 아닌 코드로 종료합니다. `--lenient`를 주면 그 토큰을 텍스트로 검색합니다(예전에 모든 표면이 조용히 하던 동작 — `methd:GET`은 아무것도 매칭하지 않아 프로젝트가 비어 보였습니다). TUI 필터 바는 타이핑 중인 이름을 그대로 받습니다.
 
 ```text
 host:example.com status:5xx           둘 다 매칭되어야 함

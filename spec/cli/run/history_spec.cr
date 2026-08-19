@@ -475,3 +475,220 @@ describe "gori run show --format json" do
     end
   end
 end
+
+# --- `gori run history --format json/jsonl`'s listing extras, and `history delete` ----------
+#
+# The private glue below is reached the same whitebox way `show_json_for_spec` is: a bare call
+# from inside the module, which Crystal permits where an explicit-receiver call from outside
+# would not.
+module Gori::CLI::Run
+  def self.curl_command_for_spec(detail : Store::FlowDetail) : String?
+    curl_command_for(detail)
+  end
+
+  def self.delete_selector_error_for_spec(positional : Array(String), query : String?) : String?
+    delete_selector_error(positional, query)
+  end
+
+  def self.delete_confirmation_error_for_spec(q : String, count : Int32, yes : Bool) : String?
+    delete_confirmation_error(q, count, yes)
+  end
+
+  def self.delete_query_error_for_spec(q : String) : String?
+    delete_query_error(q)
+  end
+
+  def self.matching_flow_ids_for_spec(store : Store, filter : QL::Filter) : Array(Int64)
+    matching_flow_ids(store, filter)
+  end
+end
+
+private def history_store(&)
+  path = File.tempname("gori-history-delete", ".db")
+  db = DB.open("sqlite3:#{path}?journal_mode=wal&busy_timeout=5000")
+  Gori::Store::Schema.migrate!(db)
+  store = Gori::Store.new(db, nil)
+  begin
+    yield store
+  ensure
+    store.close
+    File.delete?(path)
+    File.delete?("#{path}-wal")
+    File.delete?("#{path}-shm")
+  end
+end
+
+private def captured(host : String, target : String) : Gori::Store::CapturedRequest
+  Gori::Store::CapturedRequest.new(
+    created_at: 1_000_i64, scheme: "https", host: host, port: 443,
+    method: "GET", target: target, http_version: "HTTP/1.1",
+    head: "GET #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice, body: nil)
+end
+
+describe "gori run history --format json — the listing's url and headers" do
+  # The two fields exist because the metadata-only row could not answer "what request was
+  # this?": a script had to re-derive the URL from four columns (getting the default-port and
+  # IPv6 cases wrong) and could not see a single header at all.
+  head = ("POST /login?next=/home HTTP/1.1\r\nHost: accounts.test\r\n" \
+          "Content-Type: application/json\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n").to_slice
+
+  it "adds the absolute url and a compact request-header object when the head is supplied" do
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "accounts.test",
+      port: 443, target: "/login?next=/home", status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    json = JSON.parse(Gori::CLI::Output.flow_row_json(row, head))
+    json["url"].as_s.should eq("https://accounts.test/login?next=/home")
+    json["headers"]["Host"].as_s.should eq("accounts.test")
+    json["headers"]["Content-Type"].as_s.should eq("application/json")
+  end
+
+  it "keeps a repeated header name as an ARRAY rather than collapsing it to last-wins" do
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "accounts.test",
+      port: 443, target: "/login", status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    json = JSON.parse(Gori::CLI::Output.flow_row_json(row, head))
+    json["headers"]["Cookie"].as_a.map(&.as_s).should eq(["a=1", "b=2"])
+  end
+
+  # `FlowRow#url` is the one definition; these are the two cases a script re-deriving it
+  # from scheme/host/port/target gets wrong.
+  it "carries a non-default port and passes an absolute-form target through untouched" do
+    ported = Gori::Store::FlowRow.new(
+      id: 2_i64, created_at: 0_i64, scheme: "http", method: "GET", host: "acme.test",
+      port: 8080, target: "/a", status: 404, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    JSON.parse(Gori::CLI::Output.flow_row_json(ported, "GET /a HTTP/1.1\r\n\r\n".to_slice))["url"]
+      .as_s.should eq("http://acme.test:8080/a")
+
+    absolute = Gori::Store::FlowRow.new(
+      id: 3_i64, created_at: 0_i64, scheme: "http", method: "GET", host: "plain.test",
+      port: 80, target: "http://plain.test/x", status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    JSON.parse(Gori::CLI::Output.flow_row_json(absolute, "GET http://plain.test/x HTTP/1.1\r\n\r\n".to_slice))["url"]
+      .as_s.should eq("http://plain.test/x")
+  end
+
+  # The listing extras are OPT-IN precisely so the shape `gori run capture`'s live JSON-Lines
+  # stream and MCP's `list_history` mirror is untouched — the key-set pin above depends on it.
+  it "emits neither field when no request head is supplied" do
+    row = flow_row(target: "/a", host: "h", status: 200, state: Gori::Store::FlowState::Complete)
+    keys = JSON.parse(Gori::CLI::Output.flow_row_json(row)).as_h.keys
+    keys.should_not contain("url")
+    keys.should_not contain("headers")
+  end
+end
+
+describe "gori run show --format curl" do
+  it "builds the command from the stored head AND body, through the shared serializer" do
+    head = "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n" \
+           "Content-Length: 14\r\n\r\n"
+    row = Gori::Store::FlowRow.new(
+      id: 9_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "example.com",
+      port: 443, target: "/api/login", status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    detail = Gori::Store::FlowDetail.new(row, "HTTP/1.1", head.to_slice, %({"user":"neo"}).to_slice, nil, nil)
+    cmd = Gori::CLI::Run.curl_command_for_spec(detail).not_nil!
+    cmd.should contain("curl 'https://example.com/api/login'")
+    cmd.should contain("-X POST")
+    cmd.should contain(%q(--data-raw '{"user":"neo"}'))
+    cmd.should_not contain("Content-Length")
+  end
+
+  # The URL comes from the flow's OWN scheme/host/port, not from the Host header — a capture
+  # on a non-default port would otherwise produce a command aimed at the wrong socket.
+  it "targets the flow's scheme and non-default port" do
+    row = Gori::Store::FlowRow.new(
+      id: 10_i64, created_at: 0_i64, scheme: "http", method: "GET", host: "acme.test",
+      port: 8080, target: "/a", status: 404, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    detail = Gori::Store::FlowDetail.new(row, "HTTP/1.1", "GET /a HTTP/1.1\r\nHost: acme.test:8080\r\n\r\n".to_slice,
+      nil, nil, nil)
+    Gori::CLI::Run.curl_command_for_spec(detail).not_nil!.should contain("curl 'http://acme.test:8080/a'")
+  end
+end
+
+describe "gori run history delete — the selector" do
+  it "refuses an empty selector rather than reading it as `every flow`" do
+    err = Gori::CLI::Run.delete_selector_error_for_spec([] of String, nil).not_nil!
+    err.should contain("nothing selected")
+    err.should contain("history clear --yes")
+  end
+
+  it "refuses an id and a query together — the two disagree about scope" do
+    Gori::CLI::Run.delete_selector_error_for_spec(["1"], "host:a").not_nil!.should contain("not both")
+  end
+
+  it "accepts exactly one of the two" do
+    Gori::CLI::Run.delete_selector_error_for_spec(["1"], nil).should be_nil
+    Gori::CLI::Run.delete_selector_error_for_spec([] of String, "host:a").should be_nil
+  end
+end
+
+describe "gori run history delete -q — the refusals" do
+  it "refuses without --yes and puts the COUNT in the sentence" do
+    err = Gori::CLI::Run.delete_confirmation_error_for_spec("host:a", 12, false).not_nil!
+    err.should contain("12 flows")
+    err.should contain("--yes")
+    Gori::CLI::Run.delete_confirmation_error_for_spec("host:a", 12, true).should be_nil
+  end
+
+  # The one this whole gate exists for. QL free-texts a field it does not know, so `methd:GET`
+  # compiles CLEAN (nothing in `QL.analyze` reports it) and the delete quietly matches nothing
+  # — exiting 0 against a query the operator believes they ran.
+  it "aborts on an unrecognized field instead of silently deleting nothing" do
+    err = Gori::CLI::Run.delete_query_error_for_spec("methd:GET").not_nil!
+    err.should contain("unknown field")
+    err.should contain("`methd:`")
+    Gori::QL.analyze("methd:GET").ignored.should be_empty # …which is why `analyze` alone is not enough
+  end
+
+  it "aborts on a `req.`/`resp.` prefixed field QL does not implement" do
+    Gori::CLI::Run.delete_query_error_for_spec("resp.status:200").not_nil!.should contain("unknown field")
+  end
+
+  it "aborts on a query that folds to match-all, which would take the whole project" do
+    err = Gori::CLI::Run.delete_query_error_for_spec("status:>=foo").not_nil!
+    err.should contain("EVERY flow")
+    Gori::CLI::Run.delete_query_error_for_spec("   ").not_nil!.should contain("empty -q query")
+  end
+
+  it "aborts on an invalid regex, which compiles to a never-match clause" do
+    Gori::CLI::Run.delete_query_error_for_spec("host~[").not_nil!.should contain("invalid regex")
+  end
+
+  it "lets an ordinary query through" do
+    Gori::CLI::Run.delete_query_error_for_spec("host:accounts.google.com").should be_nil
+    Gori::CLI::Run.delete_query_error_for_spec("status:>=500 -method:GET").should be_nil
+  end
+end
+
+describe "gori run history delete -q --yes" do
+  it "names every match, not just the first page, and deletes exactly those" do
+    history_store do |store|
+      # More than one DELETE_BATCH page of matches, so the cursor walk is exercised rather
+      # than a single LIMIT that happened to cover the set.
+      600.times { store.insert_flow(captured("accounts.google.com", "/a")) }
+      3.times { store.insert_flow(captured("acme.test", "/b")) }
+      store.flush
+
+      ids = Gori::CLI::Run.matching_flow_ids_for_spec(store, Gori::QL.parse("host:accounts.google.com"))
+      ids.size.should eq(600)
+      store.delete_flows(ids).should be_true
+      store.flush
+
+      remaining = store.recent_flows(100)
+      remaining.size.should eq(3)
+      remaining.map(&.host).uniq!.should eq(["acme.test"])
+    end
+  end
+
+  it "names nothing when nothing matches" do
+    history_store do |store|
+      store.insert_flow(captured("acme.test", "/b"))
+      store.flush
+      Gori::CLI::Run.matching_flow_ids_for_spec(store, Gori::QL.parse("host:nope.test")).should be_empty
+    end
+  end
+end

@@ -86,6 +86,17 @@ module Gori
         "sitemap.toggle-grouping", "Fold ids", "Fold path-param ids into {uuid}/{hex}/{date} and [1, 2, 3 …] groups",
         Verb::Scope::Sitemap, [Verb::Chord.new("g")], group: :view) { |ctx| ctx.sitemap_toggle_grouping; nil }
 
+      # `⇧G` — fold/unfold the query-string variants of one path (/search?q=1 + /search?q=2
+      # → /search). A SEPARATE axis from `g`, and deliberately not folded into it: `g` says
+      # "show me every literal id", which is not the same wish as "show me every fuzz payload
+      # that was ever sent to /search". Spelled Chord.new("g", shift: true), NOT Chord.new("G")
+      # — the latter never fires (see verbs/comparer.cr). A shift chord yields no menu key, so
+      # the action menu gets an explicit mnemonic ('g' is already the id toggle's).
+      r.register Verb::Definition.new(
+        "sitemap.toggle-query-fold", "Fold queries", "Fold the query-string variants of a path into one node (/search?q=1, /search?q=2 → /search)",
+        Verb::Scope::Sitemap, [Verb::Chord.new("g", shift: true)],
+        mnemonic: 'Q', group: :view) { |ctx| ctx.sitemap_toggle_query_fold; nil }
+
       # Toggle the scope lens from the Sitemap too (History has its own ⇧S binding).
       # scope_toggle_lens reloads the active sitemap, and the bar shows the ⇧S chip —
       # so the toggle is reachable where its effect is visible. Mnemonic 's' for the

@@ -1,5 +1,6 @@
 require "json"
 require "../store"
+require "../proxy/codec/http1"
 require "../url"
 require "../fuzz"
 require "../miner"
@@ -18,13 +19,24 @@ module Gori
     # colour. The JSON shape here is the stable, documented contract for scripts.
     module Output
       # One JSON object (one line, for JSON-Lines streams) describing a flow row.
-      def self.flow_row_json(row : Store::FlowRow) : String
-        JSON.build { |j| flow_row_fields(j, row) }
+      def self.flow_row_json(row : Store::FlowRow, request_head : Bytes? = nil) : String
+        JSON.build { |j| flow_row_fields(j, row, request_head) }
       end
 
       # Emits the flow-row fields into an open builder (reused by `show`, which
       # nests the row alongside the bodies).
-      def self.flow_row_fields(j : JSON::Builder, row : Store::FlowRow) : Nil
+      #
+      # `request_head`, when given, adds the two LISTING fields: the absolute `url` and a
+      # compact `headers` object for the request. They are opt-in and not part of the shared
+      # row shape for two different reasons. `headers` needs bytes the row projection
+      # deliberately does not carry, and MCP's `list_history` must not grow a per-row header
+      # block — a model reading a 200-row feed would pay for it on every row. `url` rides
+      # along with it because the two answer the same question ("what request was this, in
+      # full?") and a script that wants one wants the other; the plain `flow_row_json(row)`
+      # that `gori run capture`'s live stream and MCP's serializer mirror is byte-identical
+      # to what it always was. See spec/cli/run/history_spec.cr, which pins that key set.
+      def self.flow_row_fields(j : JSON::Builder, row : Store::FlowRow,
+                               request_head : Bytes? = nil) : Nil
         j.object do
           j.field "id", row.id
           j.field "created_at", row.created_at
@@ -61,6 +73,55 @@ module Gori
           advisories = row.advisories
           unless advisories.empty?
             j.field("advisory") { j.array { advisories.each { |l| j.string(term_safe(l)) } } }
+          end
+          if head = request_head
+            # `FlowRow#url` — the ONE definition of a flow's absolute URL (default-port
+            # elision, IPv6 bracketing, an absolute-form target passed through). A script
+            # re-deriving it from scheme/host/port/target gets exactly those three cases
+            # wrong, which is why the field exists at all.
+            json_captured(j, "url", row.url)
+            j.field("headers") { request_headers_json(j, head) }
+          end
+        end
+      end
+
+      # The request's headers as one compact object: name → value, and name → ARRAY of values
+      # where the message repeated a name. Bodies are deliberately absent — `gori run show`
+      # is where a body belongs, and a listing that inlined them would be unreadable and
+      # unbounded.
+      #
+      # Wire NAMES, wire ORDER, original casing — `Codec::Http1.parse_request_head` is the
+      # same parse the HAR writer uses, so the two exports agree about what this message's
+      # header block was. Duplicates become an array rather than last-wins because the
+      # duplicates are frequently the point (two `Set-Cookie`-shaped request headers, a
+      # split `Cookie`, a header a proxy appended), and collapsing them would hide exactly
+      # the traffic an operator greps this feed for.
+      #
+      # A duplicate name that differs only in CASE is one JSON key (`Accept` and `accept` are
+      # the same field, RFC 9110 §5.1) and folds into the same array; the FIRST spelling seen
+      # is the key, so the object reads like the wire it came from.
+      private def self.request_headers_json(j : JSON::Builder, head : Bytes) : Nil
+        # Insertion-ordered, keyed case-insensitively: Hash keeps insertion order in Crystal,
+        # so one pass gives both wire order and the fold.
+        order = [] of String
+        by_key = {} of String => Array(String)
+        Proxy::Codec::Http1.parse_request_head(head).headers.each do |h|
+          key = h.name.downcase
+          if bucket = by_key[key]?
+            bucket << h.value
+          else
+            by_key[key] = [h.value]
+            order << h.name
+          end
+        end
+        j.object do
+          order.each do |name|
+            values = by_key[name.downcase]
+            if values.size == 1
+              json_captured(j, name.scrub, values[0])
+            else
+              j.field(name.scrub) { j.array { values.each { |v| j.string(v.scrub) } } }
+            end
           end
         end
       end
@@ -744,7 +805,7 @@ module Gori
       private def self.sitemap_node_label(node : Sitemap::Node, io : IO) : Nil
         io << term_safe(node.label)
         if node.grouped
-          io << "  (" << node.children.size << " values)"
+          io << "  (" << sitemap_fold_count(node) << ')'
           # The verbs the fold stands in for, so a collapsed row still reads as an endpoint.
           io << "  [" << term_safe(node.fold_methods.join(' ')) << ']' unless node.fold_methods.empty?
         elsif !node.methods.empty?
@@ -762,9 +823,24 @@ module Gori
         n == 1 ? "1 path" : "#{n} paths"
       end
 
+      # A fold's collapsed-row count. A QUERY fold says "queries", not "values": what it
+      # stands for is one endpoint requested with N different query strings, and the count
+      # is of those query strings — the query-less sibling it may also have absorbed is the
+      # path itself, not a variant of it.
+      private def self.sitemap_fold_count(node : Sitemap::Node) : String
+        return "#{node.children.size} values" unless node.query_fold
+        n = Sitemap.query_variants(node)
+        n == 1 ? "1 query" : "#{n} queries"
+      end
+
       # Flat endpoint listing — one line per (host, path) with its comma-joined method
-      # set, e.g. "GET,POST  acme.test/api/users". Pipe/grep-friendly; numeric folding
-      # is irrelevant here (every endpoint is listed, even folded ones). Empty → "".
+      # set, e.g. "GET,POST  acme.test/api/users". Pipe/grep-friendly; ID folding is
+      # irrelevant here (every endpoint is listed, even folded ones, because /users/<a> and
+      # /users/<b> are distinct endpoints). A QUERY fold is the one exception: it emits ONE
+      # line for the path it stands for and its variants are not descended into, because
+      # they are the same endpoint — which is the whole point of the fold, and this listing
+      # is what a tester pipes into the next tool. `--no-fold-query` lists them all.
+      # Empty → "".
       def self.sitemap_paths(hosts : Array(Sitemap::Node)) : String
         String.build do |io|
           hosts.each { |host| sitemap_host_paths(host, host.label, io) }
@@ -773,23 +849,53 @@ module Gori
 
       # Iterative for the same reason as `sitemap_text_children`. Children are pushed in
       # REVERSE so they pop left-to-right, preserving the recursion's line order.
+      #
+      # Lines are accumulated by PATH rather than emitted per node, because a query fold is
+      # the one node whose path can repeat: `/api/users` and `/api/users?page=1` fold onto a
+      # path that is also a real directory node, and this listing promises one line per
+      # (host, path). The two nodes' verbs merge into that line, first-seen order kept.
       private def self.sitemap_host_paths(root : Sitemap::Node, host : String, io : IO) : Nil
+        order = [] of String
+        verbs = {} of String => Array(String)
         stack = [root]
         while node = stack.pop?
-          io << term_safe(node.methods.join(',')) << "  " << term_safe(host) << term_safe(node.path) << '\n' unless node.methods.empty?
+          if node.query_fold
+            # The fold's own path + the union of its variants' verbs, then STOP: descending
+            # would print the query strings this format is asked to collapse.
+            collect_path_line(order, verbs, node.path, node.fold_methods)
+            next
+          end
+          collect_path_line(order, verbs, node.path, node.methods)
           i = node.children.size - 1
           while i >= 0
             stack << node.children[i]
             i -= 1
           end
         end
+        order.each do |path|
+          io << term_safe(verbs[path].join(',')) << "  " << term_safe(host) << term_safe(path) << '\n'
+        end
+      end
+
+      # One (host, path) line's method set, merged when a path is reached twice (see above).
+      private def self.collect_path_line(order : Array(String), verbs : Hash(String, Array(String)),
+                                         path : String, methods : Array(String)) : Nil
+        return if methods.empty?
+        if have = verbs[path]?
+          methods.each { |m| have << m unless have.includes?(m) }
+        else
+          verbs[path] = methods.dup
+          order << path
+        end
       end
 
       # The endpoint tree as JSON: an array of host objects, each `{host, endpoints,
       # tag?, children}`. A child node is `{label, path, methods?, tag?, children?}`,
-      # or for a synthetic fold `{label, grouped:true, template?, methods?, children}` — a
-      # fold has no path, `template` ("{uuid}"/"{hex}"/"{date}") marks an ID fold as opposed
-      # to a numeric run, and its `methods` are the UNION of its children's verbs. The stable, documented machine contract. Unlike the text tree
+      # or for a synthetic fold `{label, grouped:true, template?, methods?, children}` — an
+      # id fold has no path, `template` ("{uuid}"/"{hex}"/"{date}") marks an ID fold as
+      # opposed to a numeric run, and its `methods` are the UNION of its children's verbs. A
+      # QUERY fold is marked `query_fold:true` and DOES carry `path` (the path-only endpoint)
+      # plus `queries` (how many query strings it stands for). The stable, documented machine contract. Unlike the text tree
       # (which collapses a numeric fold and shows one representative under an ID fold),
       # JSON always keeps every child nested — the complete tree, with `grouped` as the
       # hint so a consumer can collapse it itself.
@@ -843,6 +949,14 @@ module Gori
           if node.template? # one of TEMPLATE_LABELS: always plain ASCII
             io << %(,"template":)
             node.label.to_json(io)
+          elsif node.query_fold
+            # The one fold that DOES carry a path: its label is a real path segment, and
+            # `queries` is how many query strings it stands for (the variants are still
+            # nested as children, each with its own full path).
+            io << %(,"query_fold":true,"path":)
+            term_safe(node.path).to_json(io)
+            io << %(,"queries":)
+            Sitemap.query_variants(node).to_json(io)
           end
         else
           io << %(,"path":)

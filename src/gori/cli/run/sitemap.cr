@@ -24,8 +24,11 @@ module Gori
           p.banner = "Usage: gori run sitemap tag --host=H --path=P --tag=TEXT\n" \
                      "       gori run sitemap tag --list [--host=H]\n\n" \
                      "Pin a free-text memo onto one sitemap path (the same tags the TUI Sitemap\n" \
-                     "tab shows). --path is the node path AS THE TREE SHOWS IT, INCLUDING any\n" \
-                     "query string — /search?q=1 is a different node from /search.\n" \
+                     "tab shows). --path is the node path INCLUDING any query string —\n" \
+                     "/search?q=1 is a different node from /search. The default tree FOLDS the\n" \
+                     "query variants of a path into one row, and that row is synthetic: like a\n" \
+                     "{uuid} fold it carries no tag of its own. Pass --no-fold-query (or expand\n" \
+                     "the row in the TUI) to see the variant a tag is pinned to.\n" \
                      "A tag is keyed by host+path, not by a flow, so it OUTLIVES 'history clear'\n" \
                      "and re-attaches if that path is captured again; --list finds one whose\n" \
                      "node is not currently in the tree."
@@ -127,17 +130,27 @@ module Gori
         limit = Store::SITEMAP_MAX
         in_scope = false
         group = true
+        fold_query = true
         format = :text
+        lenient = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
-          p.banner = "Usage: gori run sitemap [QL query] [options]\n\nPrint the deduplicated host → path endpoint tree built from the captured flows."
+          p.banner = "Usage: gori run sitemap [QL query] [options]\n\n" \
+                     "Print the deduplicated host → path endpoint tree built from the captured flows.\n" \
+                     "By default the query-string variants of one path fold into a single row\n" \
+                     "(/search?q=1 + /search?q=2 → /search); --no-fold-query lists them separately."
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
           p.on("-qQL", "--query=QL", "Filter endpoints with a QL query (host: method: path: status: scheme: …)") { |v| query = v }
           p.on("-nN", "--limit=N", "Max distinct endpoints to scan (default #{Store::SITEMAP_MAX})") { |v| limit = parse_count(v, "--limit") }
           p.on("--in-scope", "Only hosts in the project's configured scope") { in_scope = true }
           p.on("--no-group", "Don't fold path-param ids (/users/<uuid>, /users/1,2,3…)") { group = false }
+          p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
+          # A SEPARATE axis from --no-group: query folding is about one endpoint requested
+          # many ways, id folding about many endpoints sharing a route. Overloading --no-group
+          # to mean both would make "show me every literal id" also dump every fuzz payload.
+          p.on("--no-fold-query", "Don't fold query-string variants (/search?q=1, /search?q=2) onto their path") { fold_query = false }
           p.on("--format=FMT", "Output: text (default tree) | json | paths") { |v| format = parse_format(v, [:text, :json, :paths]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
@@ -158,6 +171,7 @@ module Gori
         if err = Run.reserved_query_verb_error(positional, "sitemap", ["tag"], "tag")
           abort err
         end
+        Run.refuse_unknown_query_fields("sitemap", query, lenient)
 
         # Parse/validate the QL BEFORE opening the store: abort skips ensure blocks, so a
         # bad query must not leave a store handle open.
@@ -165,7 +179,7 @@ module Gori
 
         store = open_store(resolve_read_project(project_name, db_path))
         hosts = begin
-          collect_sitemap(store, filter, limit, in_scope, group)
+          collect_sitemap(store, filter, limit, in_scope, group, fold_query)
         rescue ex
           abort "gori run sitemap: query #{query.inspect} failed: #{ex.message}"
         ensure
@@ -190,13 +204,14 @@ module Gori
       end
 
       # Build + post-process the tree from the open store in the SAME ORDER as
-      # SitemapView#reload (build → tags → scope → fold → counts). The scope step
+      # SitemapView#reload (build → tags → scope → id folds → query fold → counts). The scope step
       # differs by design: --in-scope filters whole hosts via Scope#host_in_scope?,
       # which evaluates the rules regardless of the TUI's persisted ⇧S enabled flag
       # (an explicit --in-scope is the opt-in). That host-level gate is coarser than
       # the TUI lens's per-flow SQL filter and conservative on url-level includes.
       private def self.collect_sitemap(store : Store, filter : QL::Filter, limit : Int32,
-                                       in_scope : Bool, group : Bool) : Array(Sitemap::Node)
+                                       in_scope : Bool, group : Bool,
+                                       fold_query : Bool) : Array(Sitemap::Node)
         # `--query body:…` reads the off-commit trigram index (Store V4); drain it so a
         # one-shot tree can't be missing endpoints that simply weren't indexed yet.
         store.index_pending! if filter.uses_fts?
@@ -212,6 +227,9 @@ module Gori
           hosts.each { |h| Sitemap.fold_templates!(h) }
           hosts.each { |h| Sitemap.group_sequences!(h) }
         end
+        # Queries LAST and on their own switch, so the id passes above see the literal
+        # children they always did (/items/7?ref=home still joins the /items/7 numeric run).
+        hosts.each { |h| Sitemap.fold_queries!(h) } if fold_query
         hosts.each { |h| h.endpoints = Sitemap.endpoint_count(h) }
         hosts
       end

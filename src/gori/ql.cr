@@ -1,4 +1,5 @@
 require "db"
+require "levenshtein"
 require "./filter_ast"
 require "./proto" # Proto::Kind, used by the `proto:` term below
 
@@ -284,6 +285,63 @@ module Gori
       FIELDS.includes?(name) || FIELD_ALIASES.has_key?(name)
     end
 
+    # Is a `name:value` token even SHAPED like a field query — i.e. is reading `name` as a field
+    # name a reading of what the operator wrote at all?
+    #
+    # `split_field` cuts at the first `:`/`~` unconditionally, which is right for COMPILATION: an
+    # unknown name free-texts the whole token, so the SQL is the same either way. It is not right
+    # for DIAGNOSIS. `Run.refuse_unknown_query_fields` turns "names a field QL does not implement"
+    # into a refusal, and under that cut `gori run history http://acme.test/x` is a query naming
+    # the field `http` — so pasting the URL of a request you just watched go by, the commonest
+    # search this tool has, aborted with ``unknown query field `http:` ``. The grammar strips
+    # quotes before any of this runs, so quoting it was no escape either; `--lenient` was.
+    #
+    # A KNOWN field is always a field use, whatever its value holds (`body~https?://x` names
+    # `body`). For an unknown name, two shapes say it was never meant as one — both read off how
+    # QL's own names are spelled rather than guessed:
+    #
+    #   * a value starting `//`: the token is `scheme://…`, a URL;
+    #   * a name that is not an identifier: it must begin with an ASCII letter (so `12:34` — a
+    #     timestamp, a port, an IPv6 run — is free text) and hold only letters, digits and `_`,
+    #     plus `.` ONLY behind a `SIDES` prefix, since every dotted field QL has is a
+    #     `req.`/`resp.`/`res.` one. `acme.test:8443` is an authority; `resp.bdy` is still a typo.
+    #
+    # Every typo of a real field passes all of this — `methd`, `hsot`, `resp.bdy`, `xyzzy` are
+    # field-shaped, unknown, and still refused, which is the whole point of the refusal.
+    def self.field_shaped?(name : String, value : String) : Bool
+      return true if known_field?(name)
+      return false if value.starts_with?("//")
+      return false unless name[0]?.try(&.ascii_letter?)
+      return false unless name.each_char.all? { |c| c.ascii_alphanumeric? || c == '_' || c == '.' }
+      return true unless name.includes?('.')
+      SIDES.each_key.any? { |prefix| name.starts_with?(prefix) }
+    end
+
+    # The spelling a name QL does NOT implement most likely meant, or nil when nothing is close
+    # enough that printing it would be help rather than a guess. Lives here beside `known_field?`
+    # and for the same reason: the candidate pool is `FIELDS` + `FIELD_ALIASES`, and a surface
+    # that re-derived it would keep suggesting a name QL had since renamed.
+    #
+    # An UNAMBIGUOUS prefix before edit distance, because the two disagree about the commonest
+    # typo there is — a field name typed short. `meth` is two edits from `method` and two from
+    # `path`, so distance alone answers `path`; `method` is the only candidate `meth` prefixes.
+    #
+    # Tolerance 2 (1 under four characters, where two edits is most of the word) is what makes
+    # `hsot` → `host` work at all: a transposition costs two edits and Levenshtein's own default
+    # tolerance refuses it. Wider than that stops being a suggestion — `ext` is within 3 of both
+    # `dur` and `url`, and naming either would be inventing an intent.
+    def self.suggest_field(name : String) : String?
+      return nil if name.empty? || known_field?(name)
+      # `FIELDS` first so a tie resolves to the name completion OFFERS, not to an alias.
+      candidates = FIELDS + FIELD_ALIASES.keys
+      # Exactly one, or none: `s` prefixes `scheme` `status` `size` `stub`, and picking one of
+      # four is a coin flip printed as advice. An ambiguous prefix falls through to distance,
+      # which answers nothing for a stub that short — the honest answer.
+      prefixed = candidates.select(&.starts_with?(name))
+      return prefixed.first if prefixed.size == 1
+      Levenshtein.find(name, candidates, name.size < 4 ? 1 : 2)
+    end
+
     # One line per field, for the surfaces that TEACH this language rather than parse it — the
     # completion row's description column and Help's Query page. Both used to be prose written
     # by hand next to the widget, which is why `FILTER_HINT` and `QUERY_HINT` disagreed with each
@@ -387,10 +445,17 @@ module Gori
     # path `parse` compiles through — `FilterAst.terms` + `split_field`, the same pair `analyze`
     # and `invalid_regex_terms` use — so a caller asking "which fields does this need?" is asking
     # about the terms that will really be compiled, not about a second reading of the string.
+    #
+    # A token whose `name` half is not FIELD-SHAPED (`field_shaped?`) contributes nothing, for the
+    # same reason a bare word does not: `http://acme.test/x` and `12:34` compile to free text, so
+    # they name no field, and a caller that read them as one would report a field the query does
+    # not have. Filtered here rather than at each caller so the refusals, the colour-rule tier
+    # split and `unknown_fields` all get the one answer.
     def self.fields_used(query : String) : Array(FieldUse)
       FilterAst.terms(FilterAst.parse(query)).compact_map do |term|
         next nil unless split = split_field(term.text)
         field, value, op = split
+        next nil unless field_shaped?(field, value)
         FieldUse.new(field, op == :regex, value)
       end
     end

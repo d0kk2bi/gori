@@ -41,6 +41,20 @@ private def call_raw(tools, name, args : String) : {String, Bool}
   {r.text, r.is_error}
 end
 
+# Run one fuzz_start to completion and return the recorded request head of its first row —
+# the wire bytes, which is the only place an encoding decision can be checked honestly.
+private def fuzz_request_head(tools, args : String) : String
+  job_id = call_json(tools, "fuzz_start", args)["job_id"].as_s
+  done = false
+  30.times do
+    sleep 0.02.seconds
+    break done = true unless call_json(tools, "fuzz_status", %({"job_id":#{job_id.to_json}}))["status"].as_s == "running"
+  end
+  fail "fuzz job #{job_id} did not finish" unless done
+  fid = call_json(tools, "fuzz_results", %({"job_id":#{job_id.to_json}}))["results"][0]["flow_id"].as_i64
+  call_json(tools, "get_flow", %({"id":#{fid}}))["request_head"].as_s
+end
+
 # Parsed JSON for a successful call (fails loudly if the tool errored).
 private def call_json(tools, name, args : String) : JSON::Any
   text, err = call_raw(tools, name, args)
@@ -243,6 +257,13 @@ describe "MCP fuzz tools" do
          "url"            => "http://127.0.0.1:#{port}",
          "payloads"       => %([{"list_base64":[#{Base64.strict_encode(payload).to_json}]}]),
          "record_history" => "all",
+         # `no_encode` because what is under test is the SET — that these three octets
+         # survive base64 → payload → splice unchanged. A query position is percent-encoded
+         # by default (`Fuzz::AutoEncode`), a LATER and separate stage: it would put
+         # `%C3%28%80` on the wire, which is the same three octets and would prove nothing
+         # about the decoding. A caller who wants the raw octets in a query string passes
+         # this flag for the same reason.
+         "no_encode"      => true,
          "allow_unscoped" => true}.to_json)
       job_id = start["job_id"].as_s
 
@@ -314,6 +335,28 @@ describe "MCP fuzz tools" do
       # Encoded: a well-formed request line the origin actually receives as one field.
       flow["request_head"].as_s.should contain("GET /?q=a%20b HTTP/1.1")
       flow["request_head"].as_s.should_not contain("GET /?q=a b HTTP/1.1")
+    end
+  end
+
+  # `auto:true` finds the position; it used to leave the encoding to the caller, so an
+  # agent sending an XSS payload produced a corrupt request line rather than a test. The
+  # default now encodes for the query/form positions, and `no_encode:true` is the way back
+  # to raw. Pinned at the wire off the recorded flow, like the `processors` case above.
+  it "URL-encodes a query payload by default, and sends it raw under no_encode" do
+    port = start_origin
+    with_store do |store|
+      tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+      base = {"template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+              "url"            => "http://127.0.0.1:#{port}",
+              "payloads"       => %([{"list":["<script>"]}]),
+              "record_history" => "all",
+              "allow_unscoped" => true}
+
+      encoded = fuzz_request_head(tools, base.to_json)
+      encoded.should contain("GET /?q=%3Cscript%3E HTTP/1.1")
+
+      raw = fuzz_request_head(tools, base.merge({"no_encode" => true}).to_json)
+      raw.should contain("GET /?q=<script> HTTP/1.1")
     end
   end
 

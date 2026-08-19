@@ -1,3 +1,5 @@
+require "../export/curl"
+
 module Gori::Tui
   # Pure helpers that turn an HTTP message into the "copy as X" option set the
   # CopyPicker overlay shows — split a request into url/headers/body/cookies/curl
@@ -5,6 +7,13 @@ module Gori::Tui
   # TUI/state deps (Screen/Theme), so
   # the parsing is unit-testable on its own; the Runner wraps the result in a
   # CopyPicker and the controllers feed it the focused pane's bytes.
+  #
+  # The request PARSING and the curl serializer itself live in surface-neutral
+  # `Gori::Export::Curl` — `gori run show --format curl` emits the same command, and the one
+  # way for a CLI to do that without importing `Tui::` (which the layering contract forbids
+  # for core, and which nothing else in `cli/` does) is for the bytes-to-shell-command rule
+  # to have a home outside this file. What stays here is the MENU: which rows to offer, in
+  # what order, under which mnemonic.
   module CopyMenu
     # One offered copy format: the row `label`, its mnemonic `key` (unique within a
     # single option list — the picker dispatches on it), and the `text` placed on
@@ -21,8 +30,8 @@ module Gori::Tui
       lines = split_lines(head)
       request_line = lines.first? || ""
       header_lines = lines.size > 1 ? lines[1..] : [] of String
-      method, req_target, _ = parse_request_line(request_line)
-      url = resolve_url(req_target, target, header_lines)
+      method, req_target, version = Export::Curl.parse_request_line(request_line)
+      url = Export::Curl.resolve_url(req_target, target, header_lines)
 
       opts = [] of Option
       opts << Option.new("URL", 'u', url) unless url.empty?
@@ -32,7 +41,9 @@ module Gori::Tui
       if cookie = cookie_value(header_lines)
         opts << Option.new("Cookies", 'c', cookie)
       end
-      opts << Option.new("cURL", 'l', curl_command(method, url, header_lines, body)) unless url.empty?
+      unless url.empty?
+        opts << Option.new("cURL", 'l', Export::Curl.command(method, url, header_lines, body, version))
+      end
       if messages = websocket_messages
         ws_url = websocket_url(url)
         opts << Option.new("wscat", 'w', wscat_command(ws_url, header_lines, messages)) unless ws_url.empty?
@@ -48,13 +59,7 @@ module Gori::Tui
     # nothing if the option list were ever renumbered. nil when there is no resolvable URL,
     # matching request_options dropping the row in that case.
     def self.curl_text(wire : String, target : String) : String?
-      head, body = split_message(wire)
-      lines = split_lines(head)
-      header_lines = lines.size > 1 ? lines[1..] : [] of String
-      method, req_target, _ = parse_request_line(lines.first? || "")
-      url = resolve_url(req_target, target, header_lines)
-      return nil if url.empty?
-      curl_command(method, url, header_lines, body)
+      Export::Curl.text(wire, target)
     end
 
     # Options for a RESPONSE pane, built from the raw head bytes (with or without a
@@ -73,44 +78,23 @@ module Gori::Tui
       opts
     end
 
-    # Split an HTTP message into {head, body} on the first blank line — CRLF wire
-    # form first, bare-LF (an editor snapshot) as a fallback.
+    # Split an HTTP message into {head, body} on the first blank line. Kept as a name on
+    # CopyMenu (the controllers and the copy specs call it) over the one implementation in
+    # `Export::Curl`.
     def self.split_message(text : String) : {String, String}
-      if idx = text.index("\r\n\r\n")
-        {text[0, idx], text[(idx + 4)..]}
-      elsif idx = text.index("\n\n")
-        {text[0, idx], text[(idx + 2)..]}
-      else
-        {text, ""}
-      end
+      Export::Curl.split_message(text)
     end
 
-    # `head` split into lines on LF, each with one trailing CR dropped — what `split(/\r?\n/)`
-    # spelled. Hand-rolled for two reasons, both about a head that is not valid UTF-8 (a
-    # capture legitimately can be: obs-text in a header value, a latin-1 filename): a Regexp
-    # over those bytes RAISES, which is why this used to `scrub` first — and that scrub then
-    # REWROTE the operator's bytes, so a "Copy as cURL" `-H` came out carrying the three bytes
-    # of U+FFFD where the wire had one. Byte-wise, neither happens.
+    # `head` split into lines on LF, each with one trailing CR dropped — byte-wise, because a
+    # captured head is not guaranteed to be valid UTF-8 and a Regexp over those bytes raises.
+    # See `Export::Curl.split_lines`, the one implementation.
     private def self.split_lines(head : String) : Array(String)
-      bytes = head.to_slice
-      lines = [] of String
-      start = 0
-      i = 0
-      while i < bytes.size
-        if bytes[i] == 0x0a_u8
-          stop = (i > start && bytes[i - 1] == 0x0d_u8) ? i - 1 : i
-          lines << String.new(bytes[start, stop - start])
-          start = i + 1
-        end
-        i += 1
-      end
-      lines << String.new(bytes[start, bytes.size - start])
-      lines
+      Export::Curl.split_lines(head)
     end
 
     # `head` without ONE trailing blank line — what `sub(/\r?\n\r?\n\z/, "")` spelled, byte-wise
-    # for the same two reasons `split_lines` is. Longest suffix first, so a CRLF pair is taken
-    # whole rather than leaving a stray CR behind.
+    # for the same reason `split_lines` is. Longest suffix first, so a CRLF pair is taken
+    # whole rather than leaving a stray CR behind. Response-side only, so it stays here.
     private def self.chomp_blank_line(head : String) : String
       bytes = head.to_slice
       {"\r\n\r\n", "\r\n\n", "\n\r\n", "\n\n"}.each do |suffix|
@@ -121,100 +105,12 @@ module Gori::Tui
       head
     end
 
-    # {method, request-target, version} from a request line, best-effort (missing
-    # tokens come back empty rather than raising on a hand-typed partial request).
-    private def self.parse_request_line(line : String) : {String, String, String}
-      parts = line.strip.split(' ')
-      {parts[0]? || "", parts[1]? || "", parts[2]? || ""}
-    end
-
-    # The full URL for the request: an absolute-form request target as-is, else the
-    # target base joined with the origin-form path (falling back to the Host header
-    # when no target base is set — a hand-authored request). "" when unresolvable.
-    private def self.resolve_url(req_target : String, target : String, header_lines : Array(String)) : String
-      # Case-insensitive via the one home: an `HTTP://acme.test/x` target used to fall
-      # through and get a base prefixed, yielding `https://acme.test/HTTP://acme.test/x`
-      # on the operator's clipboard.
-      return req_target if Gori::Url.absolute_form?(req_target)
-      base = authority_base(target.strip)
-      if base.empty?
-        host = header_value(header_lines, "host")
-        base = host ? "http://#{host}" : ""
-      end
-      return "" if base.empty?
-      base = base.rstrip('/')
-      return base if req_target.empty? || req_target == "*"
-      req_target.starts_with?('/') ? "#{base}#{req_target}" : "#{base}/#{req_target}"
-    end
-
-    # scheme://host[:port] with any path/query the user may have pasted into the target
-    # field stripped — the send path (FlowRequest.parse_target) uses only scheme/host/port,
-    # so the copied URL must too, else it doubles the request-line path onto the target's.
-    private def self.authority_base(target : String) : String
-      sep = target.index("://")
-      return target unless sep
-      slash = target.index('/', sep + 3)
-      slash ? target[0, slash] : target
-    end
-
     # The combined Cookie header value(s), or nil when the request carries none.
     # Multiple Cookie lines are joined with "; " (the wire pair-separator).
     private def self.cookie_value(header_lines : Array(String)) : String?
       cookies = [] of String
-      each_header(header_lines) { |name, value| cookies << value if name.downcase == "cookie" }
+      Export::Curl.each_header(header_lines) { |name, value| cookies << value if name.downcase == "cookie" }
       cookies.empty? ? nil : cookies.join("; ")
-    end
-
-    # The first matching header's value (case-insensitive name), or nil.
-    private def self.header_value(header_lines : Array(String), name : String) : String?
-      want = name.downcase
-      each_header(header_lines) { |hname, value| return value if hname.downcase == want }
-      nil
-    end
-
-    # Yield each well-formed header line as {stripped name, stripped value}; lines
-    # without a colon (blank/continuation) are skipped. ONE parse convention shared by
-    # cookie_value / header_value / curl_command so they can't drift.
-    private def self.each_header(header_lines : Array(String), & : String, String ->) : Nil
-      header_lines.each do |line|
-        name, sep, value = line.partition(":")
-        next if sep.empty?
-        n = name.strip
-        next if n.empty?
-        yield n, value.strip
-      end
-    end
-
-    # A copy-pasteable `curl` invocation reproducing the request. URL first (browser
-    # "Copy as cURL" convention), then -X for the method, each header as -H (dropping
-    # Host/Content-Length — curl derives those), then --data-raw for a body. Every
-    # argument is single-quoted with embedded quotes escaped, so it survives a paste
-    # into any POSIX shell verbatim. Continuation lines keep it readable.
-    private def self.curl_command(method : String, url : String, header_lines : Array(String), body : String) : String
-      parts = ["curl #{shell_quote(url)}"]
-      # Emit -X unless it's a plain bodyless GET (curl's default). A GET *with* a body
-      # still needs -X GET, else curl silently promotes the request to POST.
-      parts << "-X #{method}" unless method.empty? || (method == "GET" && body.empty?)
-      each_header(header_lines) do |name, value|
-        down = name.downcase
-        next if down == "host" || down == "content-length"
-        parts << "-H #{shell_quote("#{name}: #{value}")}"
-      end
-      parts << data_argument(body) unless body.empty?
-      parts.join(" \\\n  ")
-    end
-
-    # The body as a curl argument, or a named refusal. `shell_quote` carries ANY byte verbatim
-    # inside '…' except one: 0x00. A shell command line is a NUL-terminated argv, so no quoting
-    # can put a NUL into it — bash drops the byte and curl would send a body SHORTER than the
-    # one gori captured, with nothing on the line saying so. A captured gRPC/protobuf body has
-    # them routinely. So say it. The note is a `#` comment and `--data-raw` is the last part of
-    # the command, so a paste still runs (sending no body) instead of sending a different one,
-    # and the "Body" row of the same copy menu still hands over the exact bytes.
-    private def self.data_argument(body : String) : String
-      return "--data-raw #{shell_quote(body)}" unless body.to_slice.includes?(0_u8)
-      "# body omitted: #{body.bytesize} bytes holding a NUL, which no shell argument can " \
-      "carry; copy \"Body\" instead and pass it with --data-binary @FILE"
     end
 
     # A copy-pasteable wscat invocation for a WebSocket Repeater. wscat owns the
@@ -225,32 +121,32 @@ module Gori::Tui
     # socket open after sending so subsequent server events remain visible.
     private def self.wscat_command(url : String, header_lines : Array(String),
                                    messages : Array(String)) : String
-      parts = ["wscat -c #{shell_quote(url)}"]
-      if host = header_value(header_lines, "host")
-        parts << "--host #{shell_quote(host)}"
+      parts = ["wscat -c #{Export::Curl.shell_quote(url)}"]
+      if host = Export::Curl.header_value(header_lines, "host")
+        parts << "--host #{Export::Curl.shell_quote(host)}"
       end
-      if origin = header_value(header_lines, "origin")
-        parts << "-o #{shell_quote(origin)}"
+      if origin = Export::Curl.header_value(header_lines, "origin")
+        parts << "-o #{Export::Curl.shell_quote(origin)}"
       end
-      each_header(header_lines) do |name, value|
+      Export::Curl.each_header(header_lines) do |name, value|
         if name.downcase == "sec-websocket-protocol"
           value.split(',').each do |protocol|
             protocol = protocol.strip
-            parts << "-s #{shell_quote(protocol)}" unless protocol.empty?
+            parts << "-s #{Export::Curl.shell_quote(protocol)}" unless protocol.empty?
           end
         end
       end
-      each_header(header_lines) do |name, value|
+      Export::Curl.each_header(header_lines) do |name, value|
         case name.downcase
         when "host", "origin", "connection", "upgrade", "content-length",
              "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
              "sec-websocket-protocol"
           next
         else
-          parts << "-H #{shell_quote("#{name}: #{value}")}"
+          parts << "-H #{Export::Curl.shell_quote("#{name}: #{value}")}"
         end
       end
-      messages.each { |message| parts << "-x #{shell_quote(message)}" }
+      messages.each { |message| parts << "-x #{Export::Curl.shell_quote(message)}" }
       parts << "-w -1" unless messages.empty?
       parts.join(" \\\n  ")
     end
@@ -262,35 +158,6 @@ module Gori::Tui
       return "wss://#{url[8..]}" if url.starts_with?("https://")
       return url if url.starts_with?("ws://") || url.starts_with?("wss://")
       ""
-    end
-
-    # POSIX single-quote: wrap in '…' and rewrite each embedded ' as '\'' so the
-    # result is one safe shell word regardless of what's inside (incl. newlines).
-    #
-    # BYTE SAFETY — this was `s.gsub("'", "'\\''")`. `String#gsub(String, String)` delegates to
-    # the CHAR overload as soon as the needle is ONE BYTE long, and Crystal's char iteration
-    # substitutes the three bytes of U+FFFD for every byte that is not valid UTF-8. `s` here is
-    # a CAPTURE — `--data-raw` gets the request body straight off the wire — so "Copy as cURL"
-    # of a binary body handed the operator a command that did not reproduce the request.
-    # Measured on body `a='x'&bin=<ff fe 01 02>`:
-    #
-    #   before  … 26 62 69 6e 3d ef bf bd ef bf bd 01 02   4 captured bytes → 8
-    #   after   … 26 62 69 6e 3d ff fe 01 02               intact
-    #
-    # Scanning and splicing BYTES is the rule `Fuzz::Plan.wrap_token` already writes down.
-    private def self.shell_quote(s : String) : String
-      bytes = s.to_slice
-      io = IO::Memory.new(bytes.size + 2)
-      io << '\''
-      bytes.each do |b|
-        if b == 0x27_u8 # '
-          io << "'\\''"
-        else
-          io.write_byte(b)
-        end
-      end
-      io << '\''
-      String.new(io.to_slice)
     end
   end
 end

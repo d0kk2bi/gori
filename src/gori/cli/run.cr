@@ -36,6 +36,8 @@ require "../notes"
 require "../issues_export"
 require "../links"
 require "../import"
+require "../session_from_flow"
+require "../export/curl"
 require "./output"
 require "./run/interrupt"
 require "./run/capture"
@@ -150,9 +152,9 @@ module Gori
       SUBCOMMANDS = [
         {"capture", "Start the proxy and stream captured flows to STDOUT"},
         {"history (ls)", "List / QL-query captured flows"},
-        {"history delete", "Hard-delete one captured flow by id"},
+        {"history delete", "Hard-delete one captured flow by id, or every match of -q QL (needs --yes)"},
         {"history clear", "Delete ALL captured flows in the project (needs --yes)"},
-        {"show <id>", "Print a flow's request/response (text, json, or raw bytes)"},
+        {"show <id>", "Print a flow's request/response (text, json, raw bytes, HAR, or a curl command)"},
         {"repeater", "Re-send a captured flow; list/create/send (replay, incl. WebSocket) repeater sessions"},
         {"repeater minimize", "Strip noise from a saved request, keeping the response the same"},
         {"compare <a> <b>", "Diff two flows' request or response (unified diff)"},
@@ -161,7 +163,7 @@ module Gori
         {"mine [<id>]", "Discover hidden parameters (query/form/multipart/json/header/cookie)"},
         {"sequence (seq)", "Analyze token randomness (collect via replay, or --tokens FILE)"},
         {"authorize [<id>…]", "Replay requests under several identities to find broken access control"},
-        {"session", "Manage session slots — named identities a send goes out as (list, show, add, edit, rm, baseline)"},
+        {"session", "Manage session slots — named identities a send goes out as (list, show, add, from-flow, edit, rm, baseline)"},
         {"discover", "Spider + directory brute-force a target; findings feed the Sitemap"},
         {"oast", "Listen for out-of-band callbacks (interactsh & friends); print payload + hits"},
         {"oast providers", "Manage saved OAST providers (list, add, update, enable/disable, delete)"},
@@ -183,7 +185,7 @@ module Gori
         {"decoder <chain>", "Encode/decode/hash via the Decoder engine (base64, hex, url, gzip …)"},
         {"rewriter", "Manage Match & Replace rules (list, add, rm, enable/disable, preview, extract, bindings)"},
         {"colormarker", "Manage History row-colour rules (list, add, rm, enable/disable, move, preview)"},
-        {"project [list]", "List known projects"},
+        {"project [list]", "List projects holding captured traffic (--all for every one)"},
         {"project create", "Create (or reopen) a project by name"},
         {"project delete", "Delete a project and everything captured in it"},
         {"project scope", "Manage scope rules (list, add, update, delete, enable/disable)"},
@@ -238,6 +240,9 @@ module Gori
       # case-insensitive) → else the most-recently-active project. Aborts when
       # nothing resolves. Routing through #find is what lets a read command finally
       # select by slug/id, not display name alone (parity with MCP --project).
+      #
+      # The default branch ANNOUNCES itself (see announce_default_project) — the whole
+      # point of a default nobody typed is that it is invisible until it is wrong.
       private def self.resolve_read_project(project_name : String?, db_path : String?) : Project
         if path = db_path
           abort "gori run: --db is not a readable file: #{path}" unless File.exists?(path) && !File.directory?(path)
@@ -251,9 +256,41 @@ module Gori
           projects = registry.list
           abort "gori run: no project matching '#{name}'#{projects.empty? ? "" : " (have: #{projects.map(&.name).join(", ")})"}"
         end
-        projects = registry.list
-        abort "gori run: no projects yet — capture some traffic first, or pass --db PATH" if projects.empty?
-        projects.first
+        default = ProjectRegistry.default_of(registry.list)
+        abort "gori run: no projects yet — capture some traffic first, or pass --db PATH" unless default
+        announce_default_project(default)
+        default
+      end
+
+      # Whether this process has already said which project it defaulted to.
+      @@said_default_project = false
+
+      # Where that notice goes. STDERR in production; a spec swaps in an `IO::Memory` to
+      # assert on the line, because STDERR is a constant and cannot be replaced. Mirrors
+      # `Settings.warning_io`, for the same reason.
+      class_property default_project_io : IO? = STDERR
+
+      # Say which project a `--project`-less command actually read — ONCE per process.
+      #
+      # Omitting `--project` is the common case and it silently picks the
+      # most-recently-active project, so creating a project anywhere (another worktree, an
+      # MCP `create_project`, a `gori run project create`) quietly re-aims every later
+      # `gori run`. That is how `gori run history` printed "no flows" against a project
+      # made a minute earlier while the one the operator meant still held 1609: the choice
+      # was invisible, so the wrong project looked like an empty database.
+      #
+      # STDERR, so it stays out of a `--format json`/`jsonl`/`har` pipe on stdout — where
+      # HAR already writes its own warnings — and is still seen by an operator watching a
+      # terminal. Once per process because one command resolves its project up to three
+      # times (the read itself, the host-override snapshot, the outbound scope load), and
+      # three identical lines would read like three different projects.
+      private def self.announce_default_project(project : Project) : Nil
+        return if @@said_default_project
+        @@said_default_project = true
+        io = @@default_project_io
+        return unless io
+        io.puts "gori run: using project #{project.name} (most recently active) — " \
+                "name another with --project NAME or --db PATH"
       end
 
       # Capture creates-or-reopens its target (unlike reads, which require an
@@ -752,6 +789,54 @@ module Gori
                     "#{dropped.inspect} were ignored"
       end
 
+      # Refuse a query that names a `field:`/`field~` QL does not implement, rather than running
+      # it. `ql.cr`'s `field_cond` else-branch free-texts an unknown field's WHOLE token on
+      # purpose — `methd:GET` becomes a literal substring search over method/host/path — so a
+      # one-shot command answered `no flows match "methd:GET"`, which reads as "the project is
+      # empty" and not as "you spelled `method` wrong". A scripted surface gets a SUCCESS status
+      # and an empty list out of that; nothing anywhere says a field name was not a field name.
+      #
+      # Refusal is the DEFAULT here, and the escape hatch is spelled `--lenient` rather than the
+      # opt-in being spelled `--strict`, because an opt-in leaves the silent answer as what an
+      # operator who has not read this gets. It is also why this is not `warn_query_terms`: that
+      # one shouts about a term QL DROPS, which broadens the result and leaves something to look
+      # at. This one has nothing to look at.
+      #
+      # Deliberately NOT applied to the TUI filter bar (an operator types `meth` on the way to
+      # `method:`, and a live filter re-evaluates every keystroke) nor to MCP, whose `strict`
+      # argument already offers this and defaults false for its own compatibility reasons.
+      def self.refuse_unknown_query_fields(cmd : String, q : String?, lenient : Bool) : Nil
+        return if lenient
+        (msg = unknown_query_field_error(cmd, q)) && abort(msg)
+      end
+
+      # The sentence `refuse_unknown_query_fields` aborts with, or nil to proceed — split out for
+      # the reason `list_leftover_error` is: `abort` is not spec-able, and the DECISION is the
+      # half worth pinning.
+      #
+      # Reports the FIRST unknown field only. A query is usually wrong in one place, and the
+      # operator has to re-run either way; naming one field leaves room in the line for the
+      # suggestion, which is the part that ends the round trip.
+      #
+      # `QL.known_field?`, NOT `QL::FIELDS.includes?`: `FIELDS` is the pool a surface OFFERS and
+      # QL accepts spellings it does not offer (`res.body`, `req.size` — `QL::FIELD_ALIASES`), so
+      # the narrower list would refuse a query QL compiles perfectly.
+      def self.unknown_query_field_error(cmd : String, q : String?) : String?
+        return nil unless q
+        use = QL.fields_used(q).find { |f| !QL.known_field?(f.name) }
+        return nil unless use
+        # Echoed with the operator it was WRITTEN with, so `body~` does not come back as `body:`.
+        bad = "#{use.name}#{use.regex ? '~' : ':'}"
+        tail = "run with --lenient to search it as text instead"
+        if near = QL.suggest_field(use.name)
+          "gori run #{cmd}: unknown query field `#{bad}` — did you mean " \
+          "`#{near}#{use.regex ? '~' : ':'}`? (#{tail})"
+        else
+          "gori run #{cmd}: unknown query field `#{bad}` — QL has no such field. " \
+          "Fields: #{QL::FIELDS.join(' ')} (#{tail})"
+        end
+      end
+
       def self.warn_query_terms(cmd : String, q : String) : Nil
         QL.invalid_regex_terms(q).each do |t|
           STDERR.puts "gori run #{cmd}: warning: invalid regex in #{t.inspect} — that term matches nothing"
@@ -920,6 +1005,7 @@ module Gori
               when "jsonl"          then :jsonl
               when "raw"            then :raw
               when "har"            then :har
+              when "curl"           then :curl
               when "paths"          then :paths
               when "markdown", "md" then :markdown
               else                       abort "gori run: unknown --format '#{v}'"

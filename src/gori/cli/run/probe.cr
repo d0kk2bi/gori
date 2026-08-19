@@ -40,6 +40,7 @@ module Gori
         unsafe = false
         aggressive = false
         insecure = false
+        lenient = false
         positional = [] of String
 
         parser = OptionParser.new do |p|
@@ -70,6 +71,7 @@ module Gori
           # internal target with a self-signed certificate failed every active probe with no
           # way to say otherwise.
           p.on("-k", "--insecure-upstream", "With --active, do not verify upstream TLS certificates") { insecure = true }
+          p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
@@ -95,6 +97,7 @@ module Gori
              PROBE_SUBCOMMANDS.keys.to_a, "issues, dismiss, promote, delete/rm, rules, mode")
           abort err
         end
+        Run.refuse_unknown_query_fields("probe", query, lenient)
 
         filter : QL::Filter? = nil
         if q = query

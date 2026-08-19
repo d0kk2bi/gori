@@ -29,6 +29,10 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     sitemap_controller.sitemap_toggle_grouping
   end
 
+  def sitemap_toggle_query_fold : Nil
+    sitemap_controller.sitemap_toggle_query_fold
+  end
+
   # --- multi-select marks ---
   def sitemap_mark_toggle : Nil
     sitemap_controller.sitemap_mark_toggle

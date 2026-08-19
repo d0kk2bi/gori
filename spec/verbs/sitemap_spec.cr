@@ -23,14 +23,15 @@ describe "Gori::Verbs.register_sitemap" do
   end
 
   it "routes the tree actions to their own intents" do
-    {"sitemap.query"           => :sitemap_query,
-     "sitemap.tag"             => :sitemap_tag,
-     "sitemap.toggle-grouping" => :sitemap_toggle_grouping,
-     "sitemap.scope-toggle"    => :scope_toggle_lens,
-     "sitemap.discover"        => :sitemap_discover,
-     "sitemap.repeater"        => :sitemap_repeater,
-     "sitemap.open-flow"       => :sitemap_open_flow,
-     "sitemap.scope-add"       => :sitemap_scope_add,
+    {"sitemap.query"             => :sitemap_query,
+     "sitemap.tag"               => :sitemap_tag,
+     "sitemap.toggle-grouping"   => :sitemap_toggle_grouping,
+     "sitemap.toggle-query-fold" => :sitemap_toggle_query_fold,
+     "sitemap.scope-toggle"      => :scope_toggle_lens,
+     "sitemap.discover"          => :sitemap_discover,
+     "sitemap.repeater"          => :sitemap_repeater,
+     "sitemap.open-flow"         => :sitemap_open_flow,
+     "sitemap.scope-add"         => :sitemap_scope_add,
     }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
   end
 
@@ -46,6 +47,21 @@ describe "Gori::Verbs.register_sitemap" do
     # 's' still belongs to the LENS toggle here — adding a rule and filtering by it are
     # distinct actions, and the toast after a save points at 's'.
     r["sitemap.scope-toggle"].menu_key.should eq('s')
+  end
+
+  # Query folding is its OWN axis: `g` hides ids, ⇧G hides the query strings a fuzzed
+  # endpoint fills the tree with. Overloading `g` with both would make "show me every
+  # literal id" also dump every payload ever sent to /search.
+  it "puts query folding on ⇧G, its own chord and its own menu key" do
+    verb = r["sitemap.toggle-query-fold"]
+    verb.chords.should eq([Gori::Verb::Chord.new("g", shift: true)])
+    r["sitemap.toggle-grouping"].chords.should eq([Gori::Verb::Chord.new("g")]) # unchanged
+    verb.hidden?.should be_false                                                # else it reaches neither the space menu nor Help
+    # A shift chord yields no menu key, so the mnemonic is what the action menu renders —
+    # and it must not collide with the id toggle's chord-derived 'g'.
+    verb.menu_key.should eq('Q')
+    keys = r.select(&.scope.sitemap?).compact_map(&.menu_key)
+    keys.size.should eq(keys.uniq.size)
   end
 
   # #539: the action existed nowhere — no chord, no registry entry — so the space menu could

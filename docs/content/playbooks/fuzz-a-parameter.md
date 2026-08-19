@@ -48,13 +48,13 @@ gori run fuzz <flow-id> --auto --mode sniper
 
 A payload set is what gets substituted into the marker. Start with a built-in preset (`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`) for a fast first pass with no file, or point at a wordlist, an explicit list, a numeric range, or a brute-force character set.
 
-One thing to know before you run: **gori does not URL-encode payloads by default.** Raw bytes go on the wire as written, so a payload carrying a raw space in a query string corrupts the request line unless you add a processor. Processors transform each payload on the way out — prefix/suffix, URL/base64/hex encoding, case folding, hashing, or a regex replace. Put the cursor inside a marker and press `Ctrl-Y` to open its processor chain, which previews the value through every step before a single request goes out.
+One thing to know before you run: **a payload spliced into a query-string or form-urlencoded body value is URL-encoded for you.** A raw space or `<` there would end the request-target or break the framing, so gori percent-encodes it — the same thing `--encode url` always did, now without having to remember it. Everywhere else the bytes go on the wire as written: a path segment, a JSON or raw body, a header and a cookie value, because a `%2F` in a traversal probe is a different test than the one you marked. `--no-encode` turns the default off when the raw byte *is* the payload. Processors transform each payload on the way out — prefix/suffix, URL/base64/hex encoding, case folding, hashing, or a regex replace — and giving one replaces the default rather than stacking on top of it. Put the cursor inside a marker and press `Ctrl-Y` to open its processor chain, which previews the value through every step before a single request goes out.
 
 ```bash
-gori run fuzz <flow-id> --auto --mode sniper --wordlist params.txt --encode url
+gori run fuzz <flow-id> --auto --mode sniper --wordlist params.txt
 ```
 
-**Checkpoint.** CONFIG lists your payload set, and `Ctrl-Y` shows each payload as it will actually leave — encoded if you added an encoder, raw if you did not.
+**Checkpoint.** CONFIG lists your payload set, and `Ctrl-Y` shows each payload as it will actually leave. `gori run fuzz` also says once, before the first request, how many query/form positions it is encoding for.
 
 ## 4. Set a matcher and run
 

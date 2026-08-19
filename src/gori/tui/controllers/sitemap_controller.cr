@@ -290,6 +290,15 @@ module Gori::Tui
       @host.status(@sitemap.grouping? ? "id folding on" : "id folding off")
     end
 
+    # ⇧G — fold/unfold query-string variants (/search?q=1 + /search?q=2 → /search), then
+    # rebuild. Its own toggle, not a second meaning for `g`: one hides ids, the other hides
+    # the query strings a fuzzed endpoint fills the tree with.
+    def sitemap_toggle_query_fold : Nil
+      @sitemap.toggle_fold_query
+      reload
+      @host.status(@sitemap.fold_query? ? "query folding on" : "query folding off")
+    end
+
     # --- marks (multi-select, mirrors History #442) ---------------------------
 
     def marked_node_count : Int32

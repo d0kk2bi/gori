@@ -18,32 +18,35 @@ module Gori
       private def self.cmd_session(args : Array(String)) : Nil
         case sub = args.first?
         when "add"          then cmd_session_add(args[1..])
+        when "from-flow"    then cmd_session_from_flow(args[1..])
         when "edit"         then cmd_session_edit(args[1..])
         when "rm", "delete" then cmd_session_rm(args[1..])
         when "baseline"     then cmd_session_baseline(args[1..])
         when "show"         then cmd_session_show(args[1..])
         when "list"         then cmd_session_list(args[1..])
         when nil            then cmd_session_list(args)
-        when "activate"
-          # Named on purpose rather than left to "unknown subcommand": `activate` is the verb
-          # every other surface has (the TUI picker, MCP `set_active_session_slot`), and an
-          # operator who reads the guide will type it here. There is nothing for it to do —
-          # the pointer dies with the process — so this says which flag carries the same
-          # intent instead of writing a setting that a later run would silently ignore.
-          name = args[1]?
-          abort "gori run session: the active slot is per-process and is never persisted " \
-                "(a restored pointer resolves an empty binding table — see `gori run session list`). " \
-                "Name it on the SEND instead: `gori run fuzz … --slot #{name || "NAME"}` " \
-                "(also on repeater/mine/sequence/discover)."
+        when "activate"     then refuse_session_activate(args[1]?)
         else
           if (s = sub) && s.starts_with?('-')
             cmd_session_list(args)
           else
             STDERR.puts "gori run session: unknown subcommand '#{sub}'"
-            STDERR.puts "Usage: gori run session [list] | show <name> | add | edit <name> | rm|delete <name> | baseline <name>"
+            STDERR.puts "Usage: gori run session [list] | show <name> | add | from-flow <id> | edit <name> | rm|delete <name> | baseline <name>"
             exit 1
           end
         end
+      end
+
+      # Named on purpose rather than left to "unknown subcommand": `activate` is the verb every
+      # other surface has (the TUI picker, MCP `set_active_session_slot`), and an operator who
+      # reads the guide will type it here. There is nothing for it to do — the pointer dies with
+      # the process — so this says which flag carries the same intent instead of writing a
+      # setting that a later run would silently ignore.
+      private def self.refuse_session_activate(name : String?) : NoReturn
+        abort "gori run session: the active slot is per-process and is never persisted " \
+              "(a restored pointer resolves an empty binding table — see `gori run session list`). " \
+              "Name it on the SEND instead: `gori run fuzz … --slot #{name || "NAME"}` " \
+              "(also on repeater/mine/sequence/discover)."
       end
 
       # `--set`, `--remove`, `--rule`, `--baseline` — the writable half of a slot, shared by
@@ -143,7 +146,7 @@ module Gori
           p.missing_option { |f| abort "gori run session: missing value for #{f}" }
         end
         parser.parse(args)
-        refuse_list_leftovers(leftover, "session", "add, edit, rm/delete, baseline, show, list")
+        refuse_list_leftovers(leftover, "session", "add, from-flow, edit, rm/delete, baseline, show, list")
 
         store, slots = session_slots(project_name, db_path)
         begin
@@ -216,6 +219,13 @@ module Gori
                      "  gori run session add --name admin --set 'Cookie: session=abc' --rule SESSION\n" \
                      "  gori run session add --name anonymous --remove Cookie --remove Authorization"
           session_edit_flags(p, edit, "gori run session add")
+          # Named here rather than left to `invalid_option`: the feature is real and an
+          # operator reading about it will reach for it as a flag on `add`. It is its own
+          # subcommand because it takes no `--set`/`--clear-*` — it BUILDS the overlay.
+          p.on("--from-flow=ID", "(moved) build the overlay from a captured login flow") do |v|
+            abort "gori run session add: --from-flow is its own subcommand — " \
+                  "`gori run session from-flow #{v} --name NAME`"
+          end
           p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
@@ -238,6 +248,88 @@ module Gori
             edit.baseline == true, edit.rules || [] of String)
           abort "gori run session add: the project could not be written — #{name.inspect} was NOT saved" unless slots.add(slot)
           puts session_slot_row(slot, false)
+        ensure
+          store.close
+        end
+      end
+
+      # `gori run session from-flow <id> --name NAME` — one captured login exchange turned into
+      # a saved slot, so that carrying a session stops being a three-step playbook (an extract
+      # rule + a Match & Replace + `--bind-from` on every sweep).
+      #
+      # The reading lives in `Gori::SessionFromFlow`, not here: MCP `create_session_slot{flow}`
+      # is the same feature, and a second copy of "which header wins" is how two surfaces come
+      # to build different identities from one flow.
+      private def self.cmd_session_from_flow(args : Array(String)) : Nil
+        db_path : String? = nil
+        project_name : String? = nil
+        slot_name : String? = nil
+        baseline = false
+        show_values = false
+        positional = [] of String
+        parser = OptionParser.new do |p|
+          p.banner = "Usage: gori run session from-flow <flow-id> --name NAME [options]\n\n" \
+                     "Build a session slot from a captured LOGIN exchange. gori reads the flow's\n" \
+                     "response and copies what it finds into the slot's header overlay:\n\n" \
+                     "  * every Set-Cookie name=value, folded into one Cookie: header (attributes\n" \
+                     "    dropped; a cookie the response DELETES is skipped);\n" \
+                     "  * the response's own Authorization, else a top-level access_token/token/\n" \
+                     "    id_token string in a JSON body as 'Authorization: Bearer <value>', else\n" \
+                     "    the request's own Authorization.\n\n" \
+                     "The overlay is LITERAL — the bytes that login handed back, saved with the\n" \
+                     "project and applied by `--slot NAME` on every later send. It does NOT\n" \
+                     "re-authenticate. A token that ROTATES (a short-lived JWT, a per-request CSRF\n" \
+                     "value) belongs on the extract-rule path instead: `gori run rewriter extract`\n" \
+                     "plus `--bind-from FLOW`, which re-mints the value once per run.\n\n" \
+                     "  gori run session from-flow 4211 --name admin\n" \
+                     "  gori run repeater send --flow 900 --slot admin"
+          p.on("--name=NAME", "Name for the new slot (required; must not already exist)") { |v| slot_name = v.strip }
+          p.on("--baseline", "Make it the Authorize baseline every other slot is judged against") { baseline = true }
+          p.on("--show-values", "Print the captured header values instead of [REDACTED]") { show_values = true }
+          p.on("--project=NAME", "Project to read and write (default: most-recently-active)") { |v| project_name = v }
+          p.on("--db=PATH", "Explicit SQLite db file to read and write") { |v| db_path = v }
+          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          p.unknown_args { |before, after| positional = before + after }
+          p.invalid_option { |f| abort "gori run session from-flow: unknown option: #{f}\n#{p}" }
+          p.missing_option { |f| abort "gori run session from-flow: missing value for #{f}" }
+        end
+        parser.parse(args)
+        abort "gori run session from-flow: too many arguments (expected one flow id, got: " \
+              "#{positional.join(" ")})" if positional.size > 1
+        raw = positional.first?
+        abort "gori run session from-flow: name the captured flow to read " \
+              "(`gori run history` lists them)" if raw.nil?
+        flow_id = raw.to_i64?
+        abort "gori run session from-flow: #{raw.inspect} is not a flow id" if flow_id.nil?
+        # Copied out of the closured local so the compiler can narrow it; `parser.parse` is
+        # what filled it, and a var a block assigns to stays nilable at every later read.
+        name = slot_name
+        abort "gori run session from-flow: name the slot (--name NAME)" if name.nil? || name.empty?
+
+        store, slots = session_slots(project_name, db_path)
+        begin
+          # Checked BEFORE the flow read so the cheap, deterministic refusal comes first — the
+          # same order `session add` uses, and the one that keeps a duplicate name from being
+          # reported as "that flow is not a login".
+          abort "gori run session from-flow: a slot called #{name.inspect} already exists " \
+                "(change it with `gori run session edit #{name}`, or pick another --name)" if slots.find(name)
+          detail = store.get_flow(flow_id)
+          abort "gori run session from-flow: no flow ##{flow_id} in this project " \
+                "(`gori run history` lists them)" unless detail
+          drafted = Gori::SessionFromFlow.draft(detail)
+          if refusal = drafted.as?(Gori::SessionFromFlow::Refusal)
+            abort "gori run session from-flow: flow ##{flow_id} — #{refusal.message}"
+          end
+          draft = drafted.as(Gori::SessionFromFlow::Draft)
+          slot = draft.slot(name, baseline)
+          abort "gori run session from-flow: the project could not be written — " \
+                "#{name.inspect} was NOT saved" unless slots.add(slot)
+          puts session_slot_row(slot, show_values)
+          # Provenance on stderr, so stdout stays the one row `session add` prints and a script
+          # that pipes it keeps working. Names WHERE each header came from and never a value.
+          draft.sources.each { |line| STDERR.puts "from-flow: #{line}" }
+          STDERR.puts "from-flow: a literal overlay — it does not re-authenticate. Send as it " \
+                      "with `--slot #{name}`; a rotating token wants `rewriter extract` + `--bind-from`."
         ensure
           store.close
         end

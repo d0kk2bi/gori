@@ -93,6 +93,11 @@ module Gori::Tui
       # Numeric-sequence folding (Feature: path-param explosion). On by default; `g`
       # toggles it for the rare case of wanting every literal id.
       @grouping = true
+      # Query-string folding — a SEPARATE axis from `g` (see Sitemap.fold_queries!): the
+      # variants of one path collapse onto it, so a fuzzed /search does not contribute one
+      # row per payload. On by default; ⇧G toggles it for the rare case of wanting to READ
+      # the query strings in the tree instead of expanding the fold.
+      @fold_query = true
       # Tag editor — a one-line text sub-mode (mirrors the QL `/` bar) that edits the
       # selected node's path memo. The controller persists @tag_buffer on commit.
       @tagging = false
@@ -170,6 +175,9 @@ module Gori::Tui
         @hosts.each { |h| Sitemap.fold_templates!(h) }
         @hosts.each { |h| Sitemap.group_sequences!(h) }
       end
+      # Queries LAST and on their own flag: the id passes above then see the literal children
+      # they always did, so `g` keeps meaning exactly what it meant.
+      @hosts.each { |h| Sitemap.fold_queries!(h) } if @fold_query
       # settings:layout Sitemap expand depth seeds NEW nodes; prior session expand
       # overrides are re-applied below for keys that still exist.
       Sitemap.apply_expand_depth!(@hosts, Settings.sitemap_expand_depth)
@@ -420,6 +428,16 @@ module Gori::Tui
     # `g` — toggle id folding (both passes). The caller reloads to rebuild the tree.
     def toggle_grouping : Nil
       @grouping = !@grouping
+    end
+
+    # Whether query-string folding is on (shown in the toast / used by the ⇧G toggle).
+    def fold_query? : Bool
+      @fold_query
+    end
+
+    # ⇧G — toggle query folding. The caller reloads to rebuild the tree.
+    def toggle_fold_query : Nil
+      @fold_query = !@fold_query
     end
 
     # Collapses the selected node; returns false if there was nothing to collapse
@@ -676,7 +694,10 @@ module Gori::Tui
       node = row.node
       if node.grouped
         if prefer == :container
-          parent = node.fold_parent
+          # A QUERY fold's own path IS the container ("/search" — Discover under the path,
+          # not under everything beside it), and unlike an id fold it has one. Every other
+          # fold resolves to its parent.
+          parent = node.query_fold ? node.path : node.fold_parent
           return nil unless parent
           return {host: host, method: "GET", target: parent.empty? ? "/" : parent}
         end
@@ -697,7 +718,9 @@ module Gori::Tui
       return nil unless row = visible_rows[@selected]?
       node = row.node
       return {match_type: "host", pattern: row.host} if row.depth == 0
-      path = node.grouped ? node.fold_parent : node.path
+      # A QUERY fold seeds from its OWN path ("host/search"): it is a real path, unlike a
+      # `{uuid}` row, so scoping it means scoping that endpoint rather than its whole parent.
+      path = node.grouped && !node.query_fold ? node.fold_parent : node.path
       return nil unless path
       # A fold sitting directly under the host root has no container path to prefix with —
       # scoping it is scoping the host.
@@ -1072,7 +1095,7 @@ module Gori::Tui
     # Screen-x where the right cluster (methods/aside) begins; nil when the row has none.
     private def cluster_start(rect : Rect, node : Node, host : Bool) : Int32?
       if node.grouped
-        w = "#{node.children.size} values".size
+        w = fold_aside(node).size
         w += methods_width(node.fold_methods) + COL_GAP unless node.fold_methods.empty?
         return rect.right - w - 1
       elsif host && node.endpoints > 0
@@ -1083,6 +1106,16 @@ module Gori::Tui
         return nil
       end
       rect.right - txt.size - 1
+    end
+
+    # A fold row's right-hand count. A QUERY fold counts the query strings it stands for
+    # (its absorbed query-less sibling is the path itself, not a variant), an id fold its
+    # collapsed values. ONE home: `cluster_start` measures this string and `draw_cluster`
+    # draws it, and a disagreement between the two silently shifts the method chips.
+    private def fold_aside(node : Node) : String
+      return "#{node.children.size} values" unless node.query_fold
+      n = Sitemap.query_variants(node)
+      n == 1 ? "1 query" : "#{n} queries"
     end
 
     # Rendered width of a method-chip run (chips plus their 1-col gaps).
@@ -1131,7 +1164,7 @@ module Gori::Tui
             draw_methods(screen, rect, y, bg, node.fold_methods, label_end)
             methods_width(node.fold_methods) + COL_GAP
           end
-        draw_aside(screen, rect, y, bg, "#{node.children.size} values", label_end, shift)
+        draw_aside(screen, rect, y, bg, fold_aside(node), label_end, shift)
       elsif host
         draw_aside(screen, rect, y, bg, node.endpoints == 1 ? "1 path" : "#{node.endpoints} paths", label_end) if node.endpoints > 0
       elsif !node.methods.empty?

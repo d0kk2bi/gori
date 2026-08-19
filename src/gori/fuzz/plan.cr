@@ -122,6 +122,12 @@ module Gori::Fuzz
     # touched `tui/fuzzer_view.cr` without wiring it. Recorded rather than quietly widened, per
     # DESIGN.md's preamble; closing it is a TUI feature, not a rewording.
     property processors : Array(Processor)
+    # Percent-encode a payload spliced into a QUERY-STRING or FORM-BODY position (the
+    # default). `false` is the operator's escape hatch — `gori run fuzz --no-encode`, MCP
+    # `no_encode:true` — for a run whose payload IS the raw byte. See `Fuzz::AutoEncode`
+    # for what the default covers, what it deliberately leaves raw, and why an explicit
+    # `processors` pipeline or a per-position `¦chain` already turns it off on its own.
+    property? auto_encode : Bool
     # Mode / concurrency / rps / throttle / retries / timeout / follow_redirects /
     # auto_calibrate / keep_bodies (the evidence policy) / max_requests.
     property config : Config
@@ -154,6 +160,7 @@ module Gori::Fuzz
                    @http2 : Bool = false,
                    @sources : Array(PayloadSource) = [] of PayloadSource,
                    @processors : Array(Processor) = [] of Processor,
+                   @auto_encode : Bool = true,
                    @config : Config = Config.new,
                    @matcher : Matcher = Matcher.new,
                    @verify : Bool = true,
@@ -203,6 +210,12 @@ module Gori::Fuzz
     # Reported here for the same reason `rewrites_content_length?` is: a fact about the run
     # that only the builder can see, said ONCE, up front, by whichever surface asked.
     getter shadowed_marks : Array(String)
+    # Which positions this run percent-encodes for, and the encode itself. Exposed so a
+    # surface can SAY so (the CLI notes it once, up front, and names `--no-encode`) and so
+    # the TUI's request RECONSTRUCTION can reproduce the bytes the generator produced —
+    # `AutoEncode.none` when an explicit `--encode`/`processors`, `--no-encode`, or a
+    # template with no query/form position turned it off.
+    getter auto_encode : AutoEncode
     # The `update_content_length` pass will REWRITE a Content-Length the operator authored —
     # i.e. the template's declared CL already disagrees with its own body BEFORE any payload
     # is substituted, which only happens on purpose. Computed here rather than discovered per
@@ -215,7 +228,8 @@ module Gori::Fuzz
                    @http2 : Bool, @request_target : String,
                    @mark_matches : Array({String, Int32}), @pool : ConnPool? = nil,
                    @rewrites_content_length : Bool = false,
-                   @shadowed_marks : Array(String) = [] of String)
+                   @shadowed_marks : Array(String) = [] of String,
+                   @auto_encode : AutoEncode = AutoEncode.none)
     end
 
     # Candidate request count, or nil when unknown / Int64-overflowing. Reads the payload
@@ -301,9 +315,16 @@ module Gori::Fuzz
       # `#total` (the only readers of `@sets`) are never called on that path; `Engine#run_race`
       # calls `Generator#baseline_request` instead, which does not touch `@sets` either.
       gen_sets = sets.empty? ? [] of PayloadSet : (config.mode.per_position? ? sets : [sets.first])
+      # Percent-encoding for the QUERY-STRING / FORM-BODY positions, decided ONCE off the
+      # template's structure. Here rather than in each surface for the reason this whole
+      # builder exists: `--auto`, MCP `auto:true` and the TUI's `^A params` mark the same
+      # positions, so they have to encode for the same ones — and the TUI, which has no
+      # processor UI at all, could not have opted in by itself.
+      auto_encode = AutoEncode.build(template, options.processors, options.auto_encode?)
       # The shared decoder registry applies each position's inline `¦chain` at render time.
       # Wired here so a new surface cannot forget it and silently send un-transformed payloads.
-      generator = Generator.new(template, gen_sets, config, registry: Decoder.shared_registry)
+      generator = Generator.new(template, gen_sets, config, registry: Decoder.shared_registry,
+        auto_encode: auto_encode)
       # gRPC framing, decided ONCE off the seed rendering: a template that declares
       # `content-type: application/grpc` and whose body frames cleanly has a 5-byte length
       # prefix that a payload of a different length will INVALIDATE. gori keeps the operator's
@@ -335,7 +356,7 @@ module Gori::Fuzz
         pool: sender.pool,
         rewrites_content_length: config.update_content_length? &&
                                  generator.baseline_request != generator.baseline_raw,
-        shadowed_marks: shadowed_marks)
+        shadowed_marks: shadowed_marks, auto_encode: auto_encode)
     end
 
     # The explicit target when it has one, else the seeding flow's. Blank counts as absent
