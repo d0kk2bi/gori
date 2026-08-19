@@ -100,7 +100,15 @@ module Gori
         payload = raw_payload || (token ? Jwt.payload_json(token.strip) : "{}")
         alg = str(h, "alg") || "HS256"
         secret = str(h, "secret") || ""
+        # `set` patches individual claims (`role=admin`), the same knob as `gori run jwt --set`.
+        # `payload` replaces the claims wholesale, so the two are mutually exclusive — a `set` on
+        # top of a wholesale `payload` would depend on order.
+        sets = str_list(h, "set")
+        if raw_payload && !sets.empty?
+          return Result.new("'payload' and 'set' are mutually exclusive", is_error: true)
+        end
         begin
+          payload = Jwt.patch_payload(payload, sets) unless sets.empty?
           signed = Jwt.encode(header, payload, alg, secret)
         rescue ex : Jwt::ForgeError
           return Result.new(ex.message || "invalid input", is_error: true)
@@ -150,7 +158,8 @@ module Gori
           "HMAC-signs with `secret` (HS256/384/512) or leaves it unsigned (none). Returns {token, alg}." do |s|
           s.field "token", strprop("a JWT to take the header + payload from (optional if header+payload are given)")
           s.field "header", strprop("header JSON object (overrides the token's header)")
-          s.field "payload", strprop("payload JSON (overrides the token's payload)")
+          s.field "payload", strprop("payload JSON (overrides the token's payload wholesale; mutually exclusive with 'set')")
+          s.field "set", strarrprop("patch individual claims before signing, each \"key=value\" (e.g. \"role=admin\"); value is JSON if it parses (true/3), else a string. Mutually exclusive with 'payload'")
           s.field "alg", strprop("HS256 (default) | HS384 | HS512 | none")
           s.field "secret", strprop("HMAC secret for an HS algorithm")
         end

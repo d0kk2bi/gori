@@ -13,7 +13,7 @@ JWT는 서버가 서명을 검사하는 만큼만 믿을 수 있습니다. 이 �
 
 ## 1. JWT 탭으로 토큰 보내기 {#1-send-a-token-to-the-jwt-tab}
 
-**JWT** 탭은 기본적으로 숨겨져 있습니다. 탭 바 `⋯` 메뉴, 커맨드 팔레트(`Ctrl-P` → **Go to JWT**), 또는 Preferences에서 드러내세요. 그다음 토큰을 찾습니다. 캡처한 플로우를 **History**에서 열고, 요청 상세에서 `Bearer ` 뒤의 토큰 텍스트를 선택한 뒤 `Space` → **Send to JWT**. 그러면 새 JWT 서브탭이 시드되고, Decode 렌즈에서 토큰이 **header**, **payload**, **signature**로 라이브 디코드됩니다.
+**JWT** 탭은 기본 탭 세트에 있습니다(토큰을 다룰 일이 없으면 Preferences에서 숨기고, 탭 바 `⋯` 메뉴나 `Ctrl-P` → **Go to JWT**로 다시 드러낼 수 있습니다). 토큰을 찾습니다. 캡처한 플로우를 **History**에서 열고, 요청 상세에서 `Bearer ` 뒤의 토큰 텍스트를 선택한 뒤 `Space` → **Send to JWT**. 그러면 새 JWT 서브탭이 시드되고, Decode 렌즈에서 토큰이 **header**, **payload**, **signature**로 라이브 디코드됩니다.
 
 디코드는 토큰이 *주장하는* 바를 보여 줄 뿐, 서명을 검사하지는 않습니다. 그래서 깔끔하게 디코드되는 토큰이라고 서버가 반드시 믿는 토큰은 아닙니다. 그것이 이 플레이북의 나머지가 답하는 질문입니다.
 
@@ -28,11 +28,14 @@ JWT는 서버가 서명을 검사하는 만큼만 믿을 수 있습니다. 이 �
 
 `Ctrl-T`로 Encode 렌즈로 전환하거나, `l`을 눌러 디코드된 토큰을 곧장 Encode 편집기로 불러오세요. **PAYLOAD** JSON을 편집합니다 — `role`을 올리고, `sub`를 바꾸고, `exp`를 늘리세요. `Ctrl-A`로 알고리즘을 고르고(`HS256` / `HS384` / `HS512` / `none`을 순환), HMAC 알고리즘으로 서명한다면 **SECRET**을 설정하면, 다시 서명된 토큰이 OUTPUT에 라이브로 나타납니다. `y`로 복사하세요.
 
-같은 재서명이 헤드리스로도 실행되며, 토큰은 인수나 stdin에서 받습니다:
+같은 클레임 편집이 헤드리스로도 실행되며, 토큰은 인수나 stdin에서 받습니다 — `--set KEY=VALUE`는 클레임 하나를 패치하고(반복 가능), `--payload`는 클레임을 통째로 교체합니다:
 
 ```bash
-gori run jwt eyJhbGci... --encode --alg HS256 --secret s3cret
+gori run jwt eyJhbGci... --encode --set role=admin --secret s3cret       # 클레임 하나를 올림
+gori run jwt eyJhbGci... --encode --payload '{"sub":"1","admin":true}' --secret s3cret
 ```
+
+`--set`의 값은 JSON으로 파싱되면 그 타입을 유지하므로 `admin=true`는 불리언, `role=admin`은 문자열입니다. MCP에서도 `jwt_encode`가 같은 `set` / `payload` 편집을 받습니다.
 
 **체크포인트.** OUTPUT에 당신이 편집한 클레임을 담고, 당신이 고른 알고리즘과 비밀키로 다시 서명된 토큰이 있습니다.
 

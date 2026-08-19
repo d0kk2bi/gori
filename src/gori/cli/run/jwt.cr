@@ -11,6 +11,8 @@ module Gori
         alg = "HS256"
         secret = ""
         format = :text
+        payload_override = nil.as(String?)
+        sets = [] of String
         positional = [] of String
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run jwt [<token>] [options]\n\n" \
@@ -21,6 +23,8 @@ module Gori
           p.on("--attacks", "Generate testing payloads (alg:none, weak-secret, header injection)") { action = :attacks }
           p.on("--alg=ALG", "Signing alg for --encode: HS256 (default) | HS384 | HS512 | none") { |v| alg = v }
           p.on("--secret=SECRET", "HMAC secret for --encode with an HS algorithm") { |v| secret = v }
+          p.on("--payload=JSON", "--encode: replace the claims (payload) wholesale before re-signing") { |v| payload_override = v }
+          p.on("--set=KEY=VALUE", "--encode: patch one claim before re-signing (repeatable). VALUE is JSON if it parses (true/3), else a string") { |v| sets << v }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
@@ -29,10 +33,19 @@ module Gori
         end
         parser.parse(args)
 
+        # --payload and --set are two ways to write the same claims object; taking both would
+        # make the result depend on apply order, so refuse it rather than pick one.
+        abort "gori run jwt: --payload and --set are mutually exclusive" if payload_override && !sets.empty?
+        # They only mean anything on the re-sign path. Silently ignoring them on --decode /
+        # --attacks would let a typo'd claim edit look like it applied, so say so.
+        if action != :encode && (payload_override || !sets.empty?)
+          abort "gori run jwt: --payload / --set apply to --encode only"
+        end
+
         token = jwt_token_input(positional)
         abort "gori run jwt: no token — pass it as an argument or pipe it on STDIN" if token.empty?
         case action
-        when :encode  then emit_jwt_encode(token, alg, secret, format)
+        when :encode  then emit_jwt_encode(token, alg, secret, payload_override, sets, format)
         when :attacks then emit_jwt_attacks(token, format)
         else               emit_jwt_decode(token, format)
         end
@@ -62,10 +75,18 @@ module Gori
         abort "gori run jwt: #{ex.message}"
       end
 
-      private def self.emit_jwt_encode(token : String, alg : String, secret : String, format : Symbol) : Nil
+      private def self.emit_jwt_encode(token : String, alg : String, secret : String,
+                                       payload_override : String?, sets : Array(String), format : Symbol) : Nil
         header = Jwt.header_json(token)
-        payload = Jwt.payload_json(token)
-        abort "gori run jwt: not a decodable JWT (need header.payload)" if header.empty? && payload.empty?
+        base_payload = Jwt.payload_json(token)
+        abort "gori run jwt: not a decodable JWT (need header.payload)" if header.empty? && base_payload.empty?
+        payload = if po = payload_override
+                    po
+                  elsif !sets.empty?
+                    Jwt.patch_payload(base_payload, sets)
+                  else
+                    base_payload
+                  end
         signed = Jwt.encode(header, payload, alg, secret)
         if format == :json
           puts JSON.build { |j| j.object { j.field "token", signed; j.field "alg", alg } }

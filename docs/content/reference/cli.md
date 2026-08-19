@@ -589,6 +589,7 @@ Decode, re-sign, or generate attack payloads for a JWT. Store-free compute; the 
 ```bash
 gori run jwt eyJhbGci...                        # decode (default)
 gori run jwt eyJhbGci... --encode --alg HS256 --secret s3cret
+gori run jwt eyJhbGci... --encode --set role=admin --secret s3cret
 gori run jwt eyJhbGci... --attacks
 ```
 
@@ -599,6 +600,8 @@ gori run jwt eyJhbGci... --attacks
 | `--attacks` | Generate testing payloads (alg:none, weak-secret, header injection) |
 | `--alg=ALG` | Signing alg for `--encode`: `HS256` (default) \| `HS384` \| `HS512` \| `none` |
 | `--secret=SECRET` | HMAC secret for `--encode` with an HS algorithm |
+| `--payload=JSON` | `--encode`: replace the claims wholesale before re-signing (mutually exclusive with `--set`) |
+| `--set=KEY=VALUE` | `--encode`: patch one claim before re-signing, repeatable; `VALUE` is JSON if it parses (`true`/`3`), else a string |
 | `--format` | `text` (default) or `json` |
 
 ### run cookie

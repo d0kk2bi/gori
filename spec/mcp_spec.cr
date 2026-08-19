@@ -1155,6 +1155,25 @@ describe Gori::MCP::Server do
       end
     end
 
+    it "jwt_encode patches a claim with set= before signing" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"token":"#{jwt}","set":["role=admin","admin=true"],"secret":"k"}}})
+        token = tool_payload(drive(store, call)[0])["token"].as_s
+        header, body, sig = token.split('.')
+        payload = JSON.parse(String.new(Base64.decode(body)))
+        payload["role"].as_s.should eq("admin")
+        payload["admin"].as_bool.should be_true # a bare true keeps its JSON type
+        Gori::Jwt.sign("#{header}.#{body}", "HS256", "k").should eq(sig)
+      end
+    end
+
+    it "jwt_encode refuses payload and set together" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"payload":"{}","set":["role=admin"],"secret":"k"}}})
+        drive(store, call)[0]["result"]["isError"].as_bool.should be_true
+      end
+    end
+
     it "jwt_attacks lists none/weak-secret/header-inject payloads" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_attacks","arguments":{"token":"#{jwt}"}}})

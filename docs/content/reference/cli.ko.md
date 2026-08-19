@@ -556,6 +556,7 @@ JWT를 디코드, 재서명, 또는 공격 페이로드를 생성합니다. 저�
 ```bash
 gori run jwt eyJhbGci...                        # decode (default)
 gori run jwt eyJhbGci... --encode --alg HS256 --secret s3cret
+gori run jwt eyJhbGci... --encode --set role=admin --secret s3cret
 gori run jwt eyJhbGci... --attacks
 ```
 
@@ -566,6 +567,8 @@ gori run jwt eyJhbGci... --attacks
 | `--attacks` | 테스트 페이로드 생성(alg:none, weak-secret, header injection) |
 | `--alg=ALG` | `--encode`용 서명 alg: `HS256`(기본) \| `HS384` \| `HS512` \| `none` |
 | `--secret=SECRET` | HS 알고리즘 `--encode`용 HMAC 시크릿 |
+| `--payload=JSON` | `--encode`: 재서명 전에 클레임을 통째로 교체(`--set`과 상호 배타적) |
+| `--set=KEY=VALUE` | `--encode`: 재서명 전에 클레임 하나를 패치, 반복 가능; `VALUE`가 JSON으로 파싱되면(`true`/`3`) 그 타입, 아니면 문자열 |
 | `--format` | `text`(기본) 또는 `json` |
 
 ### run cookie {#run-cookie}
