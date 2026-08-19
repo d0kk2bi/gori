@@ -82,12 +82,12 @@ end
 # A store carrying one repeater session (#749's `--repeater` / `repeater_id` seed), yielded as
 # {db path, repeater id}. `request` is the stored wire request; a WS handshake makes it a
 # WebSocket session the fuzz seed must refuse.
-private def with_repeater_store(target : String, request : String, &)
+private def with_repeater_store(target : String, request : String, sni : String? = nil, &)
   path = File.tempname("gori-repseed", ".db")
   store = Gori::Store.open(path)
   prev_layer = Gori::Env.layer
   begin
-    id = store.insert_repeater(target, request.to_slice, false, true, nil, 0)
+    id = store.insert_repeater(target, request.to_slice, false, true, nil, 0, sni: sni)
     store.close
     yield({path, id})
   ensure
@@ -201,6 +201,16 @@ describe "a captured fuzz seed is evidence, not a template the site wrote" do
       end
     end
 
+    # A session pinned to a specific SNI (vhost routing, a cert-pinned origin) must be SWEPT
+    # against that name — dropping it sends `fuzz --repeater N` to a different vhost, or fails
+    # the handshake, where `repeater send N` succeeds.
+    it "carries the session's stored SNI into the seed" do
+      with_repeater_store("https://r.test", "GET /s HTTP/1.1\r\nHost: r.test\r\n\r\n", sni: "pinned.example") do |(path, id)|
+        _, _, _, _, sni = Gori::CLI::Run.fuzz_source_repeater_for_spec(id, path)
+        sni.should eq("pinned.example")
+      end
+    end
+
     # The WS-refusal path aborts (calls exit) on the CLI, so it is asserted on the MCP surface
     # below, where the same guard raises a catchable FuzzArgError.
   end
@@ -265,6 +275,35 @@ describe "a captured fuzz seed is evidence, not a template the site wrote" do
           evidence.should be_false
           target.should eq("http://r.test")
           http2.should be_false
+        ensure
+          store.close
+        end
+      end
+    end
+
+    it "carries the session's stored SNI into the seed" do
+      with_repeater_store("https://r.test", "GET /s HTTP/1.1\r\nHost: r.test\r\n\r\n", sni: "pinned.example") do |(path, id)|
+        store = Gori::Store.open(path)
+        begin
+          tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+          _, _, _, _, sni = tools.fuzz_template_source_for_spec(%({"repeater_id":#{id}}))
+          sni.should eq("pinned.example")
+        ensure
+          store.close
+        end
+      end
+    end
+
+    # The CLI refuses every seed pair; MCP used to return on the FIRST match in order, so
+    # `{flow_id, repeater_id}` swept the flow and dropped the repeater seed without a word.
+    it "refuses two template sources instead of silently ignoring one" do
+      with_repeater_store("http://r.test", "GET /r HTTP/1.1\r\nHost: r.test\r\n\r\n") do |(path, id)|
+        store = Gori::Store.open(path)
+        begin
+          tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+          expect_raises(Gori::MCP::Tools::FuzzArgError, /ONE template source/) do
+            tools.fuzz_template_source_for_spec(%({"template":"GET / HTTP/1.1\\r\\n\\r\\n","repeater_id":#{id}}))
+          end
         ensure
           store.close
         end

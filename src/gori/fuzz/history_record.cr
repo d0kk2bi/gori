@@ -17,14 +17,19 @@ module Gori
       extend self
 
       # Cap on flows written per run, so `record_history: all` on a huge sweep cannot grow the
-      # DB without bound. Shared with MCP's own recorder.
+      # DB without bound. THE cap — `MCP::Tools::FUZZ_HISTORY_MAX` is an alias of this constant,
+      # not a second copy, so the two surfaces cannot drift to different ceilings.
       MAX = 5_000
 
       # Record `r`'s rendered request + response as one flow and return the new id, or nil when
       # there is nothing to record (no retained request bytes) or the write did not commit.
-      # Never raises: recording must not break a sweep — a failure just yields nil.
+      #
+      # Never raises: recording must not break a sweep — a failure yields nil. But it must not be
+      # SILENT either, or a locked/read-only DB reports as a clean "recorded 0 flows" with no
+      # reason (#749 review). The caller supplies the reporting, because the two surfaces rate-
+      # limit differently: MCP counts against its per-job drain budget, the CLI says it once.
       def record(store : Store, r : Result, *, scheme : String, host : String, port : Int32,
-                 http2 : Bool) : Int64?
+                 http2 : Bool, &on_error : Exception -> _) : Int64?
         request = r.request
         return nil unless request
         head, body = split_head_body(request)
@@ -35,7 +40,13 @@ module Gori
           method: method, target: target,
           http_version: http2 ? "HTTP/2" : version,
           head: head, body: body, body_size: body.try(&.size.to_i64)))
-        return nil if fid <= 0
+        # A store that ROLLED BACK reports 0, it does not raise — the commonest failure here
+        # (busy/locked/closed) and, until this was reported, the silent one: every result
+        # yielded nil and the run printed "recorded 0 flows" with no reason anywhere.
+        if fid <= 0
+          on_error.call(Gori::Error.new("the flow insert did not commit (project busy or read-only)"))
+          return nil
+        end
         rhead = r.head
         if rhead && !rhead.empty? && (resp = (Proxy::Codec::Http1.parse_response_head(rhead) rescue nil))
           store.update_response(FlowMapper.response(resp, flow_id: fid, body: r.body,
@@ -46,7 +57,8 @@ module Gori
           store.update_response(FlowMapper.error_response(fid, r.error || "no response recorded"))
         end
         fid
-      rescue
+      rescue ex
+        on_error.call(ex)
         nil
       end
 

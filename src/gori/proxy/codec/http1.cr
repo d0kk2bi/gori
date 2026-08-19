@@ -59,14 +59,13 @@ module Gori::Proxy::Codec::Http1
     buf = IO::Memory.new(512)
     saved_timeout = sock.read_timeout
     head_started = nil.as(Time::Instant?)
-    # Non-HTTP detection (#729) runs only until the first line resolves: a non-HTTP protocol
-    # (MQTT/SSH/TLS-in-TLS…) never sends CRLFCRLF, so waiting for one blocks to the deadline
-    # with nothing recorded. Once the first line is a valid HTTP request line the connection is
-    # committed to HTTP and the check stops — the rest is ordinary header assembly. Gated on
-    # `detect_non_http` because this same deadline path also reads RESPONSE heads (safe_read_head),
-    # whose `HTTP/1.1 200 OK` status line is not a request line and must NOT trip the detector.
-    first_line_settled = !detect_non_http
-    saw_token = false # the first non-EOL byte has arrived (past any leading blank line)
+    # Non-HTTP detection (#729): a binary-preface protocol (MQTT/AMQP/TLS-in-TLS) never sends
+    # CRLFCRLF, so waiting for one blocks to the deadline with nothing recorded. The decision is
+    # made on the FIRST non-blank byte and never revisited — see `looks_like_http_request?` for
+    # why it is only that byte — so the per-byte cost is one comparison until it fires, and zero
+    # after. Gated on `detect_non_http` because this same deadline path also reads RESPONSE heads
+    # (`safe_read_head`), where the first byte is the caller's business and not a request line.
+    settled = !detect_non_http
     begin
       while buf.bytesize < max_bytes
         if hs = head_started
@@ -78,19 +77,12 @@ module Gori::Proxy::Codec::Http1
         break if byte.nil?            # EOF
         head_started ||= Time.instant # start the head clock at the first received byte
         buf.write_byte(byte)
-        unless first_line_settled
-          # Checked at exactly two points so the per-byte cost stays O(1): the first TOKEN byte
-          # (a non-token byte there is a binary preface — MQTT/AMQP/TLS), and the terminator of
-          # the first non-empty line (whose last token must be `HTTP/x.y`, else it is a text
-          # protocol — SSH/SMTP). A leading blank line (RFC 7230 §3.5) is neither, so it is
-          # skipped. A false answer at either point stops the read; the caller records a flow.
-          eol = byte == 0x0a_u8 || byte == 0x0d_u8
-          if !saw_token && !eol
-            saw_token = true
+        unless settled
+          # A leading CR/LF is a permitted empty line (RFC 7230 §3.5), not a verdict: keep
+          # reading until a real first byte arrives, then decide once.
+          unless byte == 0x0a_u8 || byte == 0x0d_u8
+            settled = true
             break if !Http1.looks_like_http_request?(buf.to_slice)
-          elsif saw_token && eol
-            break if !Http1.looks_like_http_request?(buf.to_slice)
-            first_line_settled = true
           end
         end
         break if byte == 0x0a_u8 && buf.bytesize >= 4 && ends_with_crlf_crlf?(buf)
@@ -180,58 +172,38 @@ module Gori::Proxy::Codec::Http1
     req.method == "PRI" && req.target == "*" && req.version == "HTTP/2.0"
   end
 
-  # Whether these bytes plausibly begin an HTTP/1.x request, judged from the FIRST LINE alone —
-  # the gate that tells a real (possibly still-arriving) HTTP request from a non-HTTP protocol
-  # (MQTT, SSH, AMQP, a raw TLS ClientHello) that would otherwise block the client head read to
-  # its deadline with no flow, no log, and nothing naming `network.tls_passthrough` (#729).
+  # Whether these bytes could begin an HTTP/1.x request — the gate that tells a real (possibly
+  # still-arriving, possibly MALFORMED) HTTP request from a non-HTTP protocol that would
+  # otherwise block the client head read to its deadline with no flow, no log, and nothing
+  # naming `network.tls_passthrough` (#729).
   #
-  # Two definitive negatives, both false-positive-free on real HTTP and requiring no wait:
+  # ONE negative, and deliberately only one: the first byte of the request line is not a
+  # method-token char (a CTL, SP or DEL — `request_token_safe?`'s rule, applied to one byte).
+  # That catches the binary prefaces this exists for — MQTT `0x10`, AMQP `0x00`, a TLS
+  # ClientHello `0x16`, a binary RPC — on byte one, with no wait and nothing to misread.
   #
-  #   - the FIRST byte is not a method-token char (`request_token_safe?` on one byte: no CTL, SP
-  #     or DEL) — catches the binary prefaces (MQTT `0x10`, AMQP `0x00`, TLS `0x16`) on byte one;
-  #   - the first line is COMPLETE (its CR/LF is present) but its last SP-token is not an
-  #     `HTTP/<d>.<d>` version — catches the text protocols (SSH `SSH-2.0-…`, SMTP, FTP).
+  # EVERYTHING ELSE IS HTTP AS FAR AS THIS PREDICATE IS CONCERNED, and that is the point (P7).
+  # An earlier version also rejected a completed first line whose last token was not a literal
+  # `HTTP/<d>.<d>`, to catch SSH/SMTP banners. That is a false-positive machine on exactly the
+  # input this codebase exists to carry: `HTTP/1.10`, a lowercase `http/1.1`, an HTTP/0.9
+  # two-token line and a bare `GET` are all version-fuzzing / parser-differential payloads an
+  # operator sends ON PURPOSE, and `parse_request_head` keeps every one of them (`malformed?`
+  # plus the verbatim octets) precisely so they reach the origin unaltered. Refusing them here
+  # would have closed the connection and blamed a TLS-passthrough setting for the operator's own
+  # test. A text banner is indistinguishable from such a payload on the first line, so gori does
+  # not guess: SSH/SMTP-through-the-HTTP-port still waits out the head deadline, exactly as
+  # before this change. That is a known gap, not an oversight — see #729.
   #
-  # UNDECIDED (returns true) while the first byte is a tchar and no line terminator has arrived
-  # yet: that is a valid HTTP request still being drip-fed, and the head read's own deadline is
-  # what bounds a stall there. The read loop calls this per byte so it can STOP the instant a
-  # negative is certain rather than waiting for a CRLFCRLF that will never come.
+  # UNDECIDED (returns true) while nothing but blank lines has arrived: RFC 7230 §3.5 lets a
+  # request line be preceded by an empty line, so a leading CR/LF is not a non-HTTP signal.
   def self.looks_like_http_request?(raw : Bytes) : Bool
-    # RFC 7230 §3.5: a robust server ignores at least one empty line before the request line,
-    # so a leading CR/LF is NOT a non-HTTP signal — skip it before judging the first token byte.
     start = 0
     while start < raw.size && (raw.unsafe_fetch(start) == 0x0d_u8 || raw.unsafe_fetch(start) == 0x0a_u8)
       start += 1
     end
     return true if start >= raw.size # only blank line(s) so far — undecided, keep reading
-    return false if raw.unsafe_fetch(start) <= 0x20_u8 || raw.unsafe_fetch(start) == 0x7f_u8
-    eol = first_line_end(raw, start)
-    return true if eol.nil? # first request line not complete yet — undecided, keep reading
-                   # `rstrip` first: a request line with trailing SP/HTAB after the version ("GET / HTTP/1.1 ")
-                   # is unusual but real, and its "last space-token" would otherwise be empty and read as
-                   # non-HTTP. The version is the last WHITESPACE-separated token of the trimmed line.
-    line = String.new(raw[start, eol - start]).rstrip
-    last = [line.rindex(' '), line.rindex('\t')].compact.max?
-    return false if last.nil? # a single-token first line is never a request line
-    http_version_token?(line[(last + 1)..])
-  end
-
-  # Index of the first CR or LF at or after `from` (the end of the first line), or nil if none.
-  private def self.first_line_end(raw : Bytes, from : Int32 = 0) : Int32?
-    i = from
-    while i < raw.size
-      b = raw.unsafe_fetch(i)
-      return i if b == 0x0d_u8 || b == 0x0a_u8
-      i += 1
-    end
-    nil
-  end
-
-  # `HTTP/1.0`, `HTTP/1.1`, `HTTP/2.0` — an `HTTP/` prefix, one digit, `.`, one digit, nothing
-  # after. Deliberately strict: the point is to separate a real version token from `SSH-2.0`.
-  private def self.http_version_token?(tok : String) : Bool
-    return false unless tok.size == 8 && tok.starts_with?("HTTP/")
-    tok[5].ascii_number? && tok[6] == '.' && tok[7].ascii_number?
+    b = raw.unsafe_fetch(start)
+    !(b <= 0x20_u8 || b == 0x7f_u8)
   end
 
   # The request start-line's {method, target, malformed} WITHOUT parsing/allocating the header

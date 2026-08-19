@@ -378,14 +378,14 @@ describe Gori::Proxy::Server do
     msg.should contain("tls_passthrough") # the remedy the operator would never find
   end
 
-  it "names the full first line of a non-HTTP TEXT protocol (SSH) in the recorded flow (#729)" do
+  it "records a raw TLS ClientHello sent to the cleartext port as a non-HTTP flow (#729)" do
     done = Channel(Nil).new(1)
     sink = RecordingSink.new(done)
     proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
     proxy.start
 
     client = TCPSocket.new("127.0.0.1", proxy.port)
-    client << "SSH-2.0-OpenSSH_9.6\r\n" # a text protocol: read to the first line, then reject
+    client.write(Bytes[0x16, 0x03, 0x01, 0x02, 0x00, 0x01]) # TLS handshake record
     client.flush
     client.gets_to_end
     client.close
@@ -395,9 +395,31 @@ describe Gori::Proxy::Server do
 
     resp = sink.responses.first
     resp.state.should eq(Gori::Store::FlowState::Error)
-    # A text protocol is read up to its first line, so the whole line is on the flow's target.
-    sink.requests.first.target.should contain("SSH-2.0-OpenSSH_9.6")
     resp.error.not_nil!.should contain("not an HTTP request")
+    resp.error.not_nil!.should contain("bytes 16")
+  end
+
+  # The counterpart to the detector's narrowness (P7): a deliberately malformed request line —
+  # version fuzzing, a parser differential — must still be FORWARDED, never refused as non-HTTP.
+  it "still forwards a request whose version token is malformed, instead of calling it non-HTTP (#729)" do
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_origin("ok", seen)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /fuzzed HTTP/1.10\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+
+    seen.receive.should eq("GET /fuzzed HTTP/1.10") # reached the origin byte-exact
+    sink.responses.first.state.should eq(Gori::Store::FlowState::Complete)
   end
 
   it "still serves a normal HTTP request whose head arrives one byte at a time (non-HTTP guard is first-line only)" do

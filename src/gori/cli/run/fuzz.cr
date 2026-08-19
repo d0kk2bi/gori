@@ -139,6 +139,14 @@ module Gori
         # exclusive seed — every pair is refused so a caller cannot silently get one ignored.
         sources_given = [request_file != nil, flow_id != nil, repeater_id != nil].count(true)
         abort "gori run fuzz: pick ONE template source — --flow, --repeater, --request (or a <flow-id>)" if sources_given > 1
+        # A project-less run (--request/stdin with no --project/--db) is DELIBERATELY outside any
+        # project: `optional_project_outbound` says so on STDERR and skips the scope gate. Writing
+        # its results into the ambient default project anyway would put a sweep the operator kept
+        # out of a project straight into that project's History. Name the project to record.
+        if record_policy != :none && !(flow_id || repeater_id || project_name || db_path)
+          abort "gori run fuzz: --record-history needs a project — this run has none (--request/stdin " \
+                "without --project/--db). Pass --project NAME or --db PATH to say where the flows go."
+        end
         abort "gori run fuzz: <flow-id> and --flow/--repeater/--request cannot be combined" if positional.size == 1 && sources_given > 0
         flow_id ||= positional.first?.try { |s| parse_flow_id(s, "gori run fuzz") }
 
@@ -146,12 +154,23 @@ module Gori
         # `--flow` used to skip this and `--request` then skipped `open_store`, so
         # `--slot` / `--bind-from` lied with SLOT_NO_PROJECT despite `--project`.
         hydrate_project_env(project_name, db_path) if project_name || db_path
-        text, default_target, src_h2, evidence = fuzz_source(flow_id, repeater_id, request_file, project_name, db_path)
+        text, default_target, src_h2, evidence, src_sni = fuzz_source(flow_id, repeater_id, request_file, project_name, db_path)
+        # An explicit --sni wins; otherwise the source's own (a repeater session's stored SNI).
+        sni ||= src_sni
         http2 = force_h2 || src_h2
 
         # `--record-history` retains each Result's rendered request/response bytes so they can be
         # written as flows — the retention axis both the matcher and the run config gate on.
         matcher.keep_bodies = record_policy
+        # …and retention meets `--format json`'s end-of-run buffer: that path holds every SHOWN
+        # row until the sweep finishes, and those rows now carry their request + response bytes
+        # (up to `Body::CAPTURE_READ_MAX` each) instead of just metadata. `jsonl` streams row by
+        # row and pays nothing, so name it rather than silently growing the heap.
+        if record_policy != :none && format == :json
+          STDERR.puts "gori run fuzz: note: --format json buffers every row until the run ends, and " \
+                      "--record-history makes each row carry its request/response bytes — use " \
+                      "--format jsonl to stream instead"
+        end
 
         options = Fuzz::PlanOptions.new(text,
           # A `--flow` template is a CAPTURED request; --request/stdin is a draft the operator
@@ -307,14 +326,15 @@ module Gori
                     "position#{n == 1 ? "" : "s"} — pass --no-encode to send them raw"
       end
 
-      # {template text, default target (nil for file/stdin), http2, is-evidence} from the
-      # chosen source. The last element is PROVENANCE, not a knob: only the `--flow` branch
+      # {template text, default target (nil for file/stdin), http2, is-evidence, sni} from the
+      # chosen source. `is-evidence` is PROVENANCE, not a knob: only the `--flow` branch
       # hands back captured bytes, and only that branch may therefore skip the draft-time
-      # passes (see `Fuzz::PlanOptions#evidence?`).
+      # passes (see `Fuzz::PlanOptions#evidence?`). `sni` is the SOURCE's stored SNI (only a
+      # repeater session carries one) and is a DEFAULT — an explicit `--sni` still wins.
       private def self.fuzz_source(flow_id : Int64?, repeater_id : Int64?, request_file : String?,
-                                   project_name : String?, db_path : String?) : {String, String?, Bool, Bool}
+                                   project_name : String?, db_path : String?) : {String, String?, Bool, Bool, String?}
         if file = request_file
-          {read_input_file(file, "gori run fuzz"), nil, false, false}
+          {read_input_file(file, "gori run fuzz"), nil, false, false, nil}
         elsif rid = repeater_id
           fuzz_source_repeater(rid, project_name, db_path)
         elsif id = flow_id
@@ -348,9 +368,9 @@ module Gori
           #     then resynced Content-Length to the corruption — measured, `ff fe 01 02` went
           #     out as `ef bf bd ef bf bd 01 02`. `Template.parse`/`render` are byte-oriented,
           #     so nothing downstream needed the scrub in the first place.
-          {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true}
+          {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true, nil}
         elsif !STDIN.tty?
-          {STDIN.gets_to_end, nil, false, false}
+          {STDIN.gets_to_end, nil, false, false, nil}
         else
           abort "gori run fuzz: no source — give a <flow-id>, --flow/--repeater/--request, or pipe a request on stdin"
         end
@@ -360,7 +380,7 @@ module Gori
       # refused with a named reason: `Fuzz::Engine` sweeps HTTP requests, and a WS session's
       # bytes are an `Upgrade:` handshake for a framed exchange the fuzzer cannot drive.
       private def self.fuzz_source_repeater(id : Int64, project_name : String?,
-                                            db_path : String?) : {String, String?, Bool, Bool}
+                                            db_path : String?) : {String, String?, Bool, Bool, String?}
         store = open_store(resolve_read_project(project_name, db_path))
         rec = begin
           store.get_repeater(id)
@@ -376,7 +396,10 @@ module Gori
         # here — an un-escaped `§` in the session would become a live position nobody marked.
         # But evidence is FALSE (unlike `--flow`): a repeater session is the operator's authored
         # draft, and its `$NAME` bindings are meant to expand, the same as `repeater send`.
-        {String.new(Fuzz::Template.escape_literal_markers(rec.request)), rec.target, rec.http2?, false}
+        # `rec.sni` rides along: a session pinned to a specific SNI (vhost routing, a cert-pinned
+        # origin) must be swept against THAT name, or `fuzz --repeater N` reaches a different
+        # vhost — or fails the handshake — where `repeater send N` succeeds.
+        {String.new(Fuzz::Template.escape_literal_markers(rec.request)), rec.target, rec.http2?, false, rec.sni}
       end
 
       private def self.run_fuzz_stream(engine : Fuzz::Engine, mode : Fuzz::Mode, race : Int32?, scheme : String,
@@ -391,6 +414,7 @@ module Gori
         errored = 0
         recorded = 0
         record_truncated = false
+        record_failed = false
         # Rows printed. Kept apart from `matched + errored` because a row can now be shown for
         # a THIRD reason — it was re-sent — and folding that into `errored` would both
         # over-report the error count and flip the exit code of a clean run.
@@ -413,8 +437,18 @@ module Gori
             if (rs = record_store) && Fuzz::HistoryRecord.records?(record_policy, r)
               if recorded >= Fuzz::HistoryRecord::MAX
                 record_truncated = true
-              elsif Fuzz::HistoryRecord.record(rs, r, scheme: scheme, host: host, port: port, http2: http2)
-                recorded += 1
+              else
+                # The failure is REPORTED, once. A silent `rescue nil` here would print
+                # "recorded 0 flows" at the end of a run whose every write hit a locked or
+                # read-only DB, and an operator who asked for evidence would get neither the
+                # evidence nor a reason.
+                fid = Fuzz::HistoryRecord.record(rs, r, scheme: scheme, host: host, port: port, http2: http2) do |ex|
+                  unless record_failed
+                    record_failed = true
+                    STDERR.puts "gori run fuzz: could not record to History: #{ex.message} (further record errors suppressed)"
+                  end
+                end
+                recorded += 1 if fid
               end
             end
             if emit_fuzz_result(r, format, buffer)

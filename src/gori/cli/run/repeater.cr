@@ -615,37 +615,36 @@ module Gori
           diff_capped = Repeater::Diff.truncated?(orig, fresh)
           diff = Repeater::Diff.lines(orig, fresh)
         end
-        emit_repeater_result(result, new_body, diff, format, diff_capped)
+        # BEFORE the emit, so the flow id can go INSIDE the one result object `--format json`
+        # has always printed. Printing a second top-level object after it broke every consumer
+        # doing `… --format json | jq .status` (trailing content), and in text mode appended a
+        # bare integer line to the response dump.
+        #
+        # Recorded regardless of ok?: an error flow is evidence too (and matches MCP
+        # send_request, which records the attempt).
+        recorded_flow_id = record_history ? record_repeater_send_to_history(plan, result, sent_at, project_name, db_path) : nil
+        emit_repeater_result(result, new_body, diff, format, diff_capped, recorded_flow_id)
         persist_repeater_response(id, result.head, result.body, result.error, result.duration_us, project_name, db_path) if result.ok?
-        # Recorded regardless of ok?: an error flow is evidence too (and matches MCP send_request,
-        # which records the attempt). The flow id is printed to STDOUT so a script can pipe it
-        # into the next tool; the "recorded as" note goes to STDERR to keep STDOUT the id alone.
-        record_repeater_send_to_history(plan, result, sent_at, project_name, db_path, format) if record_history
         exit 1 unless result.ok?
       end
 
-      # Write one repeater HTTP send to History and report the new flow id — the CLI half of
+      # Write one repeater HTTP send to History and return the new flow id — the CLI half of
       # #749's opt-in punch-through. Re-opens the store (closed before the send, like
-      # `persist_repeater_response`). A write failure is a WARNING, not an abort: the send
-      # already happened and its result is already printed, so aborting here would misreport a
-      # completed send as a failure.
+      # `persist_repeater_response`). A write failure is a WARNING and nil, not an abort: the
+      # send already happened, so aborting here would misreport a completed send as a failure.
+      # The caller puts the id on the OUTPUT (a `recorded_flow_id` field in JSON, a STDERR note
+      # in text) rather than this method printing — see the call site.
       private def self.record_repeater_send_to_history(plan : Repeater::Plan, result : Repeater::Result,
                                                        created_at : Int64, project_name : String?,
-                                                       db_path : String?, format : Symbol) : Nil
+                                                       db_path : String?) : Int64?
         store = open_store(resolve_read_project(project_name, db_path))
-        flow_id = begin
+        begin
           Repeater::HistoryRecord.record(store, plan, result, created_at)
         rescue ex : Gori::Error
           STDERR.puts "gori run repeater send: #{ex.message}"
-          return
+          nil
         ensure
           store.close
-        end
-        if format == :json
-          STDOUT.puts JSON.build { |j| j.object { j.field "recorded_flow_id", flow_id } }
-        else
-          STDERR.puts "recorded to History as flow ##{flow_id}"
-          STDOUT.puts flow_id
         end
       end
 
@@ -891,9 +890,13 @@ module Gori
       # path); caller owns the exit code.
       private def self.emit_repeater_result(result : Repeater::Result, new_body : Bytes?,
                                             diff : Array(Repeater::DiffLine)?, format : Symbol,
-                                            diff_capped : Bool = false) : Nil
+                                            diff_capped : Bool = false,
+                                            recorded_flow_id : Int64? = nil) : Nil
+        # Text mode: the id goes to STDERR beside the other status lines, so a `> resp.txt`
+        # redirect still captures exactly the response and nothing else.
+        STDERR.puts "recorded to History as flow ##{recorded_flow_id}" if recorded_flow_id && format != :json
         if format == :json
-          puts repeater_json(result, diff, diff_capped)
+          puts repeater_json(result, diff, diff_capped, recorded_flow_id)
         elsif result.ok?
           STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result, result.timed_out?)})" : ""}"
           if d = diff
@@ -1432,10 +1435,14 @@ module Gori
       end
 
       private def self.repeater_json(result : Repeater::Result, diff : Array(Repeater::DiffLine)?,
-                                     diff_capped : Bool = false) : String
+                                     diff_capped : Bool = false, recorded_flow_id : Int64? = nil) : String
         JSON.build do |j|
           j.object do
             j.field "ok", result.ok?
+            # `--record-history` only. Present ⇒ the send is on the record under this id; absent
+            # ⇒ it was not recorded. Inside THIS object, never a second one: `--format json` has
+            # always emitted exactly one, and a trailing object breaks every `jq` consumer.
+            j.field("recorded_flow_id", recorded_flow_id) if recorded_flow_id
             j.field "status", result.response.try(&.status)
             j.field "duration_us", result.duration_us
             # A send failure quotes origin bytes — see `Output.json_captured`. The WS sibling

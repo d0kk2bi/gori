@@ -41,7 +41,7 @@ describe Gori::Fuzz::HistoryRecord do
       with_store do |store|
         r = result_with("GET /hit?q=1 HTTP/1.1\r\nHost: t.test\r\n\r\n",
           "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", matched: true)
-        id = Gori::Fuzz::HistoryRecord.record(store, r, scheme: "https", host: "t.test", port: 443, http2: false).not_nil!
+        id = Gori::Fuzz::HistoryRecord.record(store, r, scheme: "https", host: "t.test", port: 443, http2: false) { }.not_nil!
         detail = store.get_flow(id).not_nil!
         detail.row.method.should eq("GET")
         detail.row.target.should eq("/hit?q=1")
@@ -53,8 +53,25 @@ describe Gori::Fuzz::HistoryRecord do
     it "returns nil when the result kept no request bytes (keep_bodies was :none)" do
       with_store do |store|
         r = result_with(nil, "HTTP/1.1 200 OK\r\n\r\n", matched: true)
-        Gori::Fuzz::HistoryRecord.record(store, r, scheme: "http", host: "t.test", port: 80, http2: false).should be_nil
+        Gori::Fuzz::HistoryRecord.record(store, r, scheme: "http", host: "t.test", port: 80, http2: false) { }.should be_nil
       end
+    end
+
+    # A write that raises must REPORT, not vanish: a silent rescue printed "recorded 0 flows"
+    # for a run whose every insert hit a closed/locked DB, with no reason anywhere.
+    it "hands a failing write to the on_error block instead of swallowing it" do
+      path = File.tempname("gori-fuzzhist-closed", ".db")
+      store = Gori::Store.open(path)
+      store.close # every write from here raises
+      seen = [] of Exception
+      r = result_with("GET / HTTP/1.1\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n", matched: true)
+      id = Gori::Fuzz::HistoryRecord.record(store, r, scheme: "http", host: "t.test", port: 80, http2: false) { |ex| seen << ex }
+      id.should be_nil
+      seen.size.should eq(1) # the caller gets the reason, once
+    ensure
+      File.delete?(path.not_nil!)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
     end
   end
 end

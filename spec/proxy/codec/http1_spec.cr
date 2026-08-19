@@ -128,8 +128,9 @@ describe Gori::Proxy::Codec::Http1 do
     end
   end
 
-  # The non-HTTP detector (#729): a real HTTP request is HTTP whether whole or still arriving; a
-  # non-HTTP protocol is caught on byte one (binary preface) or the first completed line (text).
+  # The non-HTTP detector (#729). ONE signal: a binary first byte. Everything a tchar can start
+  # is HTTP as far as this predicate goes — the malformed-request-line payloads below are the
+  # reason (P7), and getting any of them wrong closes the connection on the operator's own test.
   describe ".looks_like_http_request?" do
     it "accepts complete HTTP requests and the h2 preface" do
       ["GET / HTTP/1.1\r\nHost: a\r\n\r\n", "POST /x HTTP/1.0\r\n\r\n",
@@ -139,34 +140,43 @@ describe Gori::Proxy::Codec::Http1 do
       end
     end
 
+    # These are DELIBERATE payloads (version fuzzing, parser differentials, HTTP/0.9), and
+    # `parse_request_head` keeps every one verbatim. The detector must not refuse them — an
+    # earlier draft did, and closed the connection blaming `network.tls_passthrough`.
+    it "accepts a malformed or unusual request line rather than calling it non-HTTP (P7)" do
+      ["GET /x HTTP/1.10\r\n\r\n",                 # two-digit minor — version fuzzing
+       "GET /x http/1.1\r\n\r\n",                  # lowercase version token
+       "GET /index.html\r\n\r\n",                  # HTTP/0.9, two tokens, no version at all
+       "GET\r\nHost: a\r\n\r\n",                   # single-token start line (specced elsewhere as malformed-but-kept)
+       "GET  /a  HTTP/1.1\r\n\r\n",                # doubled spaces
+       "GET\t/a HTTP/1.1\r\n\r\n",                 # tab instead of space
+       "GET /a b HTTP/1.1\r\n\r\n",                # unencoded space in the target (R1-4)
+       "GET / HTTP/1.1 \r\n\r\n",                  # trailing space after the version
+       "\r\nGET / HTTP/1.1\r\n\r\n"].each do |raw| # leading empty line (RFC 7230 §3.5)
+        Http1.looks_like_http_request?(bytes(raw)).should be_true
+      end
+    end
+
     it "treats an empty or still-arriving first line as undecided (true)" do
       Http1.looks_like_http_request?(Bytes.new(0)).should be_true            # nothing yet
       Http1.looks_like_http_request?(bytes("GET / HTTP/1.1")).should be_true # no CRLF yet
       Http1.looks_like_http_request?(bytes("GE")).should be_true             # first byte is a token char
-    end
-
-    it "tolerates a leading blank line before the request line (RFC 7230 §3.5)" do
-      Http1.looks_like_http_request?(bytes("\r\nGET / HTTP/1.1\r\n\r\n")).should be_true
-      Http1.looks_like_http_request?(bytes("\r\n")).should be_true               # only a blank line so far
-      Http1.looks_like_http_request?(bytes("\r\nSSH-2.0-x\r\n")).should be_false # still catches non-HTTP after it
+      Http1.looks_like_http_request?(bytes("\r\n")).should be_true           # only a blank line so far
     end
 
     it "rejects a binary preface on the first byte" do
       Http1.looks_like_http_request?(Bytes[0x10, 0x0c, 0x00, 0x04, 0x4d, 0x51]).should be_false # MQTT CONNECT
       Http1.looks_like_http_request?(Bytes[0x16, 0x03, 0x01, 0x00]).should be_false             # TLS ClientHello
       Http1.looks_like_http_request?(Bytes[0x00, 0x01, 0x02]).should be_false                   # AMQP / NUL
+      Http1.looks_like_http_request?(Bytes[0x0d, 0x0a, 0x10, 0x0c]).should be_false             # after a blank line
     end
 
-    it "accepts a request line with trailing whitespace after the version" do
-      Http1.looks_like_http_request?(bytes("GET / HTTP/1.1 \r\n")).should be_true
-      Http1.looks_like_http_request?(bytes("GET /a b HTTP/1.1\r\n")).should be_true # space in target, version still last
-    end
-
-    it "rejects a completed non-HTTP text line (last token is not HTTP/x.y)" do
-      Http1.looks_like_http_request?(bytes("SSH-2.0-OpenSSH_9.6\r\n")).should be_false
-      Http1.looks_like_http_request?(bytes("EHLO mail.example.com\r\n")).should be_false
-      Http1.looks_like_http_request?(bytes("220 smtp ready\r\n")).should be_false
-      Http1.looks_like_http_request?(bytes("SSH-2.0-x y HTTP/9\r\n")).should be_false # not a real version token
+    # The stated gap: a TEXT banner is indistinguishable from a malformed request line on the
+    # first line, so gori does not guess. SSH/SMTP through the HTTP port still wait out the head
+    # deadline, exactly as before #729 — pinned so a future "improvement" has to argue with P7.
+    it "does NOT try to classify a text banner (SSH/SMTP) — the known gap" do
+      Http1.looks_like_http_request?(bytes("SSH-2.0-OpenSSH_9.6\r\n")).should be_true
+      Http1.looks_like_http_request?(bytes("EHLO mail.example.com\r\n")).should be_true
     end
   end
 
