@@ -3,6 +3,7 @@ require "base64"
 require "time"
 require "uri"
 require "./builder"
+require "../proxy/h2/head_codec" # PROTOCOL_MARKER — the `:protocol` line Export::Har writes
 
 module Gori
   module Import
@@ -107,9 +108,35 @@ module Gori
         pair = Builder.complete_flow(
           created_at, url, method, req_headers, req_body, http_version,
           status, reason, resp_headers, resp_body, content_type, duration_us,
-          req_declared, resp_declared)
+          req_declared, resp_declared, connect_protocol(req_headers))
         msgs = ws_messages(entry, created_at)
         msgs.empty? ? pair : Builder::FlowPair.new(pair.request, pair.response, msgs)
+      end
+
+      # The RFC 8441 `:protocol` this entry's handshake declared, or nil — the inverse of the
+      # `X-Gori-Protocol` marker line `Export::Har` writes for a WebSocket captured over HTTP/2.
+      #
+      # Without this the export→import round trip was not a fixed point on the one fact that
+      # makes such a flow a WebSocket. `Store#insert_request` derives `request_content_type`
+      # (V14) from the head, so an import gets it for free; `connect_protocol` (V16) is a
+      # COLUMN the store takes verbatim from its caller instead, because a `:protocol` is a
+      # pseudo-header that survives into a stored head only as this synthetic line. So gori
+      # could export an h2 socket, read it straight back, print its whole transcript — and
+      # still show `HTTPS` in the PROTO column and miss it with `proto:ws`, the filter #743
+      # added the column for.
+      #
+      # Believing the marker on the way in is not a new trust decision: `Store::FlowDetail
+      # #websocket?` already classifies off this same line, so the column was the only reader
+      # that disagreed. Nor is it a `websocket` boolean — the token is stored as written, per
+      # V16, since `connect-udp`/`connect-ip` are extended CONNECTs that are NOT RFC 6455
+      # framing and `Proto.websocket_connect?` is what tells them apart.
+      #
+      # Response-less entries do not carry it: `Proto` and `websocket?` both require a 2xx
+      # before there is a socket at all, so a pending import's column could change no answer.
+      private def self.connect_protocol(req_headers : Builder::Headers) : String?
+        marker = Proxy::H2::HeadCodec::PROTOCOL_MARKER
+        req_headers.find { |(name, _)| name.compare(marker, case_insensitive: true) == 0 }
+          .try(&.[1].strip.presence)
       end
 
       # Chrome's `_webSocketMessages` back into store rows — the inverse of

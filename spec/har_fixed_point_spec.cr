@@ -240,3 +240,58 @@ describe "HAR _webSocketMessages round trip" do
     parse_har(har).flows.first.ws_messages.should be_empty
   end
 end
+
+# One RFC 8441 extended CONNECT entry — the shape `Export::Har` writes for a WebSocket
+# captured over HTTP/2: `CONNECT` answered `200`, with the `:protocol` carried as the
+# `X-Gori-Protocol` marker line and no 101 anywhere.
+private def h2_connect_entry(protocol : String?) : Gori::Import::Builder::FlowPair
+  headers = protocol ? [{"name" => "X-Gori-Protocol", "value" => protocol}] : [] of Hash(String, String)
+  entry = {
+    "startedDateTime" => "2026-01-01T00:00:00.000Z",
+    "time"            => 1,
+    "request"         => {
+      "method" => "CONNECT", "url" => "https://acme.test/ws", "httpVersion" => "HTTP/2",
+      "headers" => headers, "queryString" => [] of Hash(String, String),
+      "cookies" => [] of Hash(String, String), "headersSize" => -1, "bodySize" => 0,
+    },
+    "response" => {
+      "status" => 200, "statusText" => "", "httpVersion" => "HTTP/2",
+      "headers" => [] of Hash(String, String), "cookies" => [] of Hash(String, String),
+      "content" => {"size" => 0, "mimeType" => ""},
+      "redirectURL" => "", "headersSize" => -1, "bodySize" => 0,
+    },
+    "cache"   => {} of String => String,
+    "timings" => {"send" => 0, "wait" => 1, "receive" => 0},
+  }
+  parse_har({"log" => {"version" => "1.2", "entries" => [entry]}}.to_json).flows.first
+end
+
+# The `connect_protocol` COLUMN (V16) is what `Proto.classify` and `QL`'s `proto:ws` read, and
+# the store takes it from its caller rather than deriving it off the head the way it derives
+# `request_content_type`. So an import that did not carry it made the export→import round trip
+# lossy on the ONE fact that makes an h2 socket a socket: gori could write the HAR, read it
+# straight back, print the whole transcript — and still show `HTTPS` in the PROTO column and
+# miss the flow with `proto:ws`.
+describe "HAR extended-CONNECT round trip" do
+  it "recovers the :protocol from the marker line gori itself wrote" do
+    req = h2_connect_entry("websocket").request
+    req.connect_protocol.should eq("websocket")
+    Gori::Proto.websocket_connect?(200, req.connect_protocol).should be_true
+  end
+
+  # Verbatim, not folded to a boolean (V16): `connect-udp` (RFC 9298) and `connect-ip`
+  # (RFC 9484) are extended CONNECTs that are NOT RFC 6455 framing, and the column is what
+  # keeps that distinction on disk.
+  it "keeps a non-WebSocket extended CONNECT's token, and does not call it a socket" do
+    req = h2_connect_entry("connect-udp").request
+    req.connect_protocol.should eq("connect-udp")
+    Gori::Proto.websocket_connect?(200, req.connect_protocol).should be_false
+    Gori::Proto.classify(200, nil, nil, req.connect_protocol).should eq(Gori::Proto::Kind::Http)
+  end
+
+  # NULL means "not recorded", never "this was not one" — an ordinary entry must not acquire
+  # a column value it never had.
+  it "leaves an entry with no marker line alone" do
+    h2_connect_entry(nil).request.connect_protocol.should be_nil
+  end
+end

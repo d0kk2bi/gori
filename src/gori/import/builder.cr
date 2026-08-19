@@ -449,15 +449,20 @@ module Gori
                              resp_body : Bytes?, content_type : String?,
                              duration_us : Int64?,
                              declared_req_body_size : Int64? = nil,
-                             declared_resp_body_size : Int64? = nil) : FlowPair
+                             declared_resp_body_size : Int64? = nil,
+                             connect_protocol : String? = nil) : FlowPair
         scheme, host, port, target = endpoint(url)
         req_stored, req_trunc, req_size = capped(req_body, declared_req_body_size)
         req_head = request_head(method, target, http_version, scheme, host, port, req_headers, req_body,
           req_trunc ? req_size : nil, req_trunc)
+        # The RFC 8441 `:protocol` the importer recovered, when it could (V16). Threaded rather
+        # than lifted off `req_head` here, so the decision about whether a given format's bytes
+        # may be believed stays with the importer that read them — see `Import::Har`.
         req = Store::CapturedRequest.new(
           created_at: created_at, scheme: scheme, host: host, port: port,
           method: method.upcase, target: target, http_version: http_version,
-          head: req_head, body: req_stored, body_truncated: req_trunc, body_size: req_size)
+          head: req_head, body: req_stored, body_truncated: req_trunc, body_size: req_size,
+          connect_protocol: connect_protocol)
         # `response_head` keeps an incoming Content-Length verbatim, so a truncated response
         # already re-serializes with the origin's true length — no override needed on this side.
         # It does need to KNOW the body was cut short, though, or a capped chunked response
