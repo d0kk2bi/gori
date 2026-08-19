@@ -73,6 +73,8 @@ A CONNECT whose host matches is answered `200` and then relayed as an opaque byt
 
 This is the escape hatch for a client that pins certificates — a mobile app, an auto-updater, a desktop agent — sharing the proxy with your actual target. Without it, that traffic breaks. Scope does not help here: scope decides what is *recorded* and acted on, never whether TLS is intercepted, so an out-of-scope host is still decrypted.
 
+It is also the answer for a **non-HTTP protocol** on the same path — MQTT, SSH, SMTP/IMAP, a database wire protocol. gori's proxy speaks HTTP; point one of those at it and, without passthrough, gori terminates TLS and then finds bytes that are not an HTTP request. It no longer hangs silently on that: the connection is recorded as a `not an HTTP request` flow naming the observed bytes, so you can see what arrived and reach for passthrough. List the host here and gori tunnels it byte-exact instead.
+
 ```json
 {
   "network": {
