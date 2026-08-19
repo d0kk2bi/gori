@@ -438,7 +438,18 @@ module Gori
           # `render` puts the single `§` back, so the request still replays byte-exact.
           return {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true}
         end
-        raise FuzzArgError.new("provide a 'template' (raw request with §…§) or a 'flow_id'")
+        if rid = optional_int_arg(h, "repeater_id")
+          rec = store.get_repeater(rid)
+          raise FuzzArgError.new("no repeater session #{rid}") unless rec
+          if Repeater::WsEngine.upgrade_request?(String.new(rec.request))
+            raise FuzzArgError.new("repeater #{rid} is a WebSocket session — the Fuzzer sweeps HTTP requests, not a framed WebSocket exchange (use send_websocket, or seed from an HTTP repeater)")
+          end
+          # Markers escaped like the flow_id seed (a stored `§` is literal text, not a position),
+          # but evidence is FALSE: a repeater session is the operator's authored draft and its
+          # `$NAME` bindings expand, the same as send_request from a repeater.
+          return {String.new(Fuzz::Template.escape_literal_markers(rec.request)), rec.target, rec.http2?, false}
+        end
+        raise FuzzArgError.new("provide a 'template' (raw request with §…§), a 'flow_id', or a 'repeater_id'")
       end
 
       private def fuzz_mode(h) : Fuzz::Mode
@@ -860,6 +871,7 @@ module Gori
           "at #{FUZZ_MAX_REQUESTS} requests / #{FUZZ_MAX_CONCURRENCY} concurrency." do |s|
           s.field "template", strprop("raw HTTP request with §…§ position markers")
           s.field "flow_id", intprop("seed the template from a captured flow id (instead of template)")
+          s.field "repeater_id", intprop("seed the template from a saved HTTP repeater session id (instead of template/flow_id); a WebSocket session is refused")
           s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
           s.field "auto", boolprop("auto-mark every query/cookie/body param when the template has no § markers")
           s.field "marks", strarrprop("literal tokens to mark as §…§ positions (each occurrence, mirrors CLI --mark); alternative to embedding §…§ in template. An occurrence already inside a §…§ (or flush against one) is skipped — re-wrapping it would merge the two positions — and a token left with none of its own is named in `marks_warning`")

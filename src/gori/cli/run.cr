@@ -375,8 +375,9 @@ module Gori
       # a project is in play — a flow-id reads from one, or --project/--db names one. Returns
       # nil for --request/stdin with no project (nothing to load; global Settings overrides
       # still apply inside Upstream.dial). Snapshots into memory, so the store can close.
-      private def self.cli_host_overrides(project_name : String?, db_path : String?, flow_id : Int64?) : Gori::HostOverrides?
-        return nil unless flow_id || project_name || db_path
+      private def self.cli_host_overrides(project_name : String?, db_path : String?, flow_id : Int64?,
+                                          repeater_id : Int64? = nil) : Gori::HostOverrides?
+        return nil unless flow_id || repeater_id || project_name || db_path
         store = open_store(resolve_read_project(project_name, db_path))
         begin
           Gori::HostOverrides.load(store)
@@ -405,11 +406,12 @@ module Gori
       # rescue-to-nil): a raise here becomes a clean fail-CLOSED abort — never a raw
       # backtrace, never a silently-unscoped run. (open_store already aborts on a bad DB.)
       private def self.optional_project_outbound(project_name : String?, db_path : String?, flow_id : Int64?,
-                                                 allow_unscoped : Bool) : Gori::Outbound
+                                                 allow_unscoped : Bool, repeater_id : Int64? = nil) : Gori::Outbound
         # ONLY fuzz/mine/sequence can genuinely run project-less (--request/stdin). Every
         # other caller reads its subject (a repeater session, a flow) out of a project and
         # must use project_outbound, or an omitted --project would silently drop the gate.
-        return project_outbound(project_name, db_path, allow_unscoped) if flow_id || project_name || db_path
+        # `repeater_id` is such a subject too (`fuzz --repeater`), so it forces the scoped path.
+        return project_outbound(project_name, db_path, allow_unscoped) if flow_id || repeater_id || project_name || db_path
         # Standalone run: no project context at all, the same condition on which
         # cli_host_overrides skips loading overrides. `resolve_read_project` WOULD still
         # resolve a default project here, so this is the one `gori run` active path where the

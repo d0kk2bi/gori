@@ -10,6 +10,7 @@ module Gori
         db_path : String? = nil
         project_name : String? = nil
         flow_id : Int64? = nil
+        repeater_id : Int64? = nil
         request_file : String? = nil
         target_override : String? = nil
         sni : String? = nil
@@ -40,12 +41,14 @@ module Gori
         bind_from : Int64? = nil
         slot : String? = nil
         fail_if_no_matches = false
+        record_policy = :none
         matcher = Fuzz::Matcher.new(keep_bodies: :none)
         positional = [] of String
 
         parser = OptionParser.new do |p|
           p.banner = "Usage: gori run fuzz [<flow-id>] [options]   (mark positions with §…§)"
           p.on("--flow=ID", "Seed the template from a captured flow") { |v| flow_id = parse_flow_id(v, "gori run fuzz") }
+          p.on("--repeater=ID", "Seed the template from a saved HTTP repeater session (ids from `gori run repeater list`; WebSocket sessions are refused)") { |v| repeater_id = parse_flow_id(v, "gori run fuzz --repeater") }
           p.on("--request=FILE", "Read a raw HTTP request (may contain §…§) as the template") { |v| request_file = v }
           p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
@@ -123,6 +126,7 @@ module Gori
           p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--fail-if-no-matches", "Exit 3 when no result matched") { fail_if_no_matches = true }
+          p.on("--record-history=POLICY", "Also record sent request+response as History flows: none (default) | matched | all. Matched rows carry the flow_id; 'all' is capped at #{Fuzz::HistoryRecord::MAX} flows") { |v| record_policy = parse_record_history(v) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
           p.invalid_option { |f| abort "gori run fuzz: unknown option: #{f}\n#{p}" }
@@ -131,16 +135,23 @@ module Gori
         parser.parse(args)
 
         abort "gori run fuzz: too many arguments (expected at most one <flow-id>)" if positional.size > 1
-        abort "gori run fuzz: --request and --flow cannot be combined — pick one template source" if request_file && flow_id
-        abort "gori run fuzz: <flow-id> and --flow/--request cannot be combined" if positional.size == 1 && (flow_id || request_file)
+        # One template source only. `--repeater` joins `--flow`/`--request` as a third mutually
+        # exclusive seed — every pair is refused so a caller cannot silently get one ignored.
+        sources_given = [request_file != nil, flow_id != nil, repeater_id != nil].count(true)
+        abort "gori run fuzz: pick ONE template source — --flow, --repeater, --request (or a <flow-id>)" if sources_given > 1
+        abort "gori run fuzz: <flow-id> and --flow/--repeater/--request cannot be combined" if positional.size == 1 && sources_given > 0
         flow_id ||= positional.first?.try { |s| parse_flow_id(s, "gori run fuzz") }
 
         # Named project / --db always hydrates, even when `--request` is the template:
         # `--flow` used to skip this and `--request` then skipped `open_store`, so
         # `--slot` / `--bind-from` lied with SLOT_NO_PROJECT despite `--project`.
         hydrate_project_env(project_name, db_path) if project_name || db_path
-        text, default_target, src_h2, evidence = fuzz_source(flow_id, request_file, project_name, db_path)
+        text, default_target, src_h2, evidence = fuzz_source(flow_id, repeater_id, request_file, project_name, db_path)
         http2 = force_h2 || src_h2
+
+        # `--record-history` retains each Result's rendered request/response bytes so they can be
+        # written as flows — the retention axis both the matcher and the run config gate on.
+        matcher.keep_bodies = record_policy
 
         options = Fuzz::PlanOptions.new(text,
           # A `--flow` template is a CAPTURED request; --request/stdin is a draft the operator
@@ -151,11 +162,11 @@ module Gori
           sources: sources, processors: processors, auto_encode: auto_encode,
           config: Fuzz::Config.new(mode: mode, concurrency: concurrency, rps: rate, throttle_ms: throttle,
             retries: retries, timeout: timeout, follow_redirects: follow, auto_calibrate: auto_cal,
-            keep_bodies: :none, keep_alive: keep_alive, max_requests: max_requests,
+            keep_bodies: record_policy, keep_alive: keep_alive, max_requests: max_requests,
             update_content_length: update_cl, reframe_grpc: reframe_grpc, race_count: race,
             race_warmup: race_warmup_file.try { |f| read_input_file(f, "gori run fuzz").to_slice }),
           matcher: matcher, verify: !insecure, sni: sni,
-          overrides: cli_host_overrides(project_name, db_path, flow_id))
+          overrides: cli_host_overrides(project_name, db_path, flow_id, repeater_id))
         # Gate outbound traffic through the ONE seam every surface shares (Gori::Outbound):
         # the up-front check refuses an out-of-scope host unless --allow-unscoped, and the
         # sender enforces Sandbox mode + explicit exclude rules on EVERY send regardless of
@@ -169,7 +180,7 @@ module Gori
         # seed one identity and send as another.
         activate_slot(slot, "gori run fuzz")
         preflight_bind_from(bind_from, "gori run fuzz")
-        outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped)
+        outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped, repeater_id)
         plan = begin
           Fuzz::Plan.build(options, outbound)
         rescue ex : Fuzz::PlanError
@@ -193,6 +204,10 @@ module Gori
           abort "gori run fuzz: unsupported target scheme #{origin.scheme.inspect} (use http:// or https://)"
         end
         guard_outbound(outbound, origin.scheme, origin.host, plan.request_target, "gori run fuzz")
+        # A store held open across the sweep ONLY when recording — each matched/all Result is
+        # written as a flow as it arrives (#749). Opened here, after the plan proved the target
+        # is valid, so a refused run never touches the DB.
+        record_store = record_policy == :none ? nil : open_store(resolve_read_project(project_name, db_path))
         # Calibration SENDS, so it belongs inside the block that releases the read
         # connection — a raise in there would otherwise leak it.
         begin
@@ -202,9 +217,21 @@ module Gori
           (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run fuzz")
           plan.engine.calibrate_baseline if auto_cal
           run_fuzz_stream(plan.engine, mode, race, origin.scheme, origin.host, origin.port, format, force,
-            fail_if_no_matches, plan.pool, max_requests, plan.config.reframe_grpc?)
+            fail_if_no_matches, plan.pool, max_requests, plan.config.reframe_grpc?,
+            record_store: record_store, record_policy: record_policy, http2: http2)
         ensure
           outbound.close
+          record_store.try(&.close)
+        end
+      end
+
+      # `--record-history` value → the retention policy symbol.
+      private def self.parse_record_history(v : String) : Symbol
+        case v.strip.downcase
+        when "none"    then :none
+        when "matched" then :matched
+        when "all"     then :all
+        else                abort "gori run fuzz: invalid --record-history #{v.inspect} (use none|matched|all)"
         end
       end
 
@@ -284,10 +311,12 @@ module Gori
       # chosen source. The last element is PROVENANCE, not a knob: only the `--flow` branch
       # hands back captured bytes, and only that branch may therefore skip the draft-time
       # passes (see `Fuzz::PlanOptions#evidence?`).
-      private def self.fuzz_source(flow_id : Int64?, request_file : String?,
+      private def self.fuzz_source(flow_id : Int64?, repeater_id : Int64?, request_file : String?,
                                    project_name : String?, db_path : String?) : {String, String?, Bool, Bool}
         if file = request_file
           {read_input_file(file, "gori run fuzz"), nil, false, false}
+        elsif rid = repeater_id
+          fuzz_source_repeater(rid, project_name, db_path)
         elsif id = flow_id
           store = open_store(resolve_read_project(project_name, db_path))
           detail = begin
@@ -323,18 +352,45 @@ module Gori
         elsif !STDIN.tty?
           {STDIN.gets_to_end, nil, false, false}
         else
-          abort "gori run fuzz: no source — give a <flow-id>, --request FILE, or pipe a request on stdin"
+          abort "gori run fuzz: no source — give a <flow-id>, --flow/--repeater/--request, or pipe a request on stdin"
         end
+      end
+
+      # Seed the template from a saved HTTP repeater session (#749). A WebSocket session is
+      # refused with a named reason: `Fuzz::Engine` sweeps HTTP requests, and a WS session's
+      # bytes are an `Upgrade:` handshake for a framed exchange the fuzzer cannot drive.
+      private def self.fuzz_source_repeater(id : Int64, project_name : String?,
+                                            db_path : String?) : {String, String?, Bool, Bool}
+        store = open_store(resolve_read_project(project_name, db_path))
+        rec = begin
+          store.get_repeater(id)
+        ensure
+          store.close
+        end
+        abort "gori run fuzz: no repeater session ##{id}" unless rec
+        if Repeater::WsEngine.upgrade_request?(String.new(rec.request))
+          abort "gori run fuzz: repeater ##{id} is a WebSocket session — the Fuzzer sweeps HTTP requests, not a framed WebSocket exchange. Seed from an HTTP repeater, or send it with `gori run repeater send`"
+        end
+        # Markers are escaped, exactly as the `--flow` seed does: `§` is U+00A7 ordinary text a
+        # stored request may carry, and the fuzz POSITIONS are what `--auto`/`--mark` define
+        # here — an un-escaped `§` in the session would become a live position nobody marked.
+        # But evidence is FALSE (unlike `--flow`): a repeater session is the operator's authored
+        # draft, and its `$NAME` bindings are meant to expand, the same as `repeater send`.
+        {String.new(Fuzz::Template.escape_literal_markers(rec.request)), rec.target, rec.http2?, false}
       end
 
       private def self.run_fuzz_stream(engine : Fuzz::Engine, mode : Fuzz::Mode, race : Int32?, scheme : String,
                                        host : String, port : Int32, format : Symbol, force : Bool,
                                        fail_if_no_matches : Bool, pool : Fuzz::ConnPool? = nil,
                                        max_requests : Int64? = nil,
-                                       reframe_grpc : Bool = false) : Nil
+                                       reframe_grpc : Bool = false,
+                                       record_store : Store? = nil, record_policy : Symbol = :none,
+                                       http2 : Bool = false) : Nil
         total = fuzz_preflight(engine, mode, race, scheme, host, port, force)
         matched = 0
         errored = 0
+        recorded = 0
+        record_truncated = false
         # Rows printed. Kept apart from `matched + errored` because a row can now be shown for
         # a THIRD reason — it was re-sent — and folding that into `errored` would both
         # over-report the error count and flip the exit code of a clean run.
@@ -351,6 +407,16 @@ module Gori
           when Fuzz::ProgressEvent then fuzz_progress(ev, total)
           when Fuzz::ResultEvent
             r = ev.result
+            # Record BEFORE the emit gate: a recorded flow is evidence whether or not this row
+            # is printed (a matched-only listing still records `all`). Bounded by MAX so an
+            # `all` sweep of a huge set cannot grow the DB without end — the drop is announced.
+            if (rs = record_store) && Fuzz::HistoryRecord.records?(record_policy, r)
+              if recorded >= Fuzz::HistoryRecord::MAX
+                record_truncated = true
+              elsif Fuzz::HistoryRecord.record(rs, r, scheme: scheme, host: host, port: port, http2: http2)
+                recorded += 1
+              end
+            end
             if emit_fuzz_result(r, format, buffer)
               shown += 1
               matched += 1 if r.matched?
@@ -361,6 +427,13 @@ module Gori
           end
         end
         puts CLI::Output.fuzz_array_json(buffer) if format == :json
+        # STDERR so STDOUT stays the result rows/JSON alone. `get_flow <id>` (History) reads the
+        # recorded flows; `record_history: matched` pairs the flow set with the shown rows.
+        if record_store
+          note = "recorded #{recorded} flow#{recorded == 1 ? "" : "s"} to History (--record-history #{record_policy})"
+          note += " — capped at #{Fuzz::HistoryRecord::MAX}, later sends not recorded" if record_truncated
+          STDERR.puts note
+        end
         # Before the exit rules below, which would otherwise report a cut-short run as a plain
         # "no matches". See `Run.report_interrupted`.
         Run.report_interrupted(shown, "row", "emitted") if interrupted.call

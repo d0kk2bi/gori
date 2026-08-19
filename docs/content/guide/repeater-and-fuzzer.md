@@ -117,7 +117,9 @@ gori run fuzz <flow-id> \
   --fs 0
 ```
 
-Sources can be a captured flow (`--flow`), a raw request file (`--request`), or stdin. Output is `text`, `json`, or `jsonl`.
+Sources can be a captured flow (`--flow`), a saved HTTP repeater session (`--repeater`), a raw request file (`--request`), or stdin. Output is `text`, `json`, or `jsonl`.
+
+The workbench and the evidence store stay separate: a Repeater or Fuzzer send leaves no History flow by default. When you want one — a `flow_id` for `get_flow`, `compare`, or the next tool — punch through explicitly. `gori run repeater send --record-history` writes the send as a flow and prints its id; `gori run fuzz --record-history=none|matched|all` records each sent request+response (`matched` only the rows that matched, `all` every send, capped at 5000). The default stays workbench-only.
 
 ## Next Steps
 
