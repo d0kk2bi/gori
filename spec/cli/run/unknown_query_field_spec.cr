@@ -65,6 +65,38 @@ describe Gori::CLI::Run do
       Gori::CLI::Run.unknown_query_field_error("history", ":leading-colon").should be_nil
     end
 
+    # A pasted URL is a VALUE that happens to hold a colon, not a field named `http`. This is the
+    # commonest search there is — the request you just watched go by — and `split_field` cuts at
+    # the first ':' either way, so without `QL.field_shaped?` the refusal fired on it. The grammar
+    # strips quotes before any of this runs, so quoting was no escape: `--lenient` was the only
+    # spelling that worked, for a token the operator never meant as a field.
+    it "leaves a pasted URL alone" do
+      Gori::CLI::Run.unknown_query_field_error("history", "http://acme.test/x").should be_nil
+      Gori::CLI::Run.unknown_query_field_error("history", "https://acme.test/a?b=1").should be_nil
+      Gori::CLI::Run.unknown_query_field_error("history", "ws://acme.test/sock").should be_nil
+      # Still refused with a REAL field beside it — the URL is free text, the typo is not.
+      Gori::CLI::Run.unknown_query_field_error("history", "http://acme.test methd:GET")
+        .not_nil!.should contain("`methd:`")
+    end
+
+    # The other two shapes a ':' arrives in by accident. A name QL could never be spelled with is
+    # not a field name: a leading digit (a timestamp, a port, an IPv6 run), and a dot that is not
+    # a `req.`/`resp.`/`res.` side prefix (an authority).
+    it "leaves a non-identifier name alone" do
+      Gori::CLI::Run.unknown_query_field_error("history", "12:34").should be_nil
+      Gori::CLI::Run.unknown_query_field_error("history", "acme.test:8443").should be_nil
+      Gori::CLI::Run.unknown_query_field_error("history", "2026-08-19T01:37:50").should be_nil
+    end
+
+    # ...and the dotted names that ARE fields keep their typo refused, or the exemption above
+    # would have bought the URL paste at the price of the feature.
+    it "still refuses a typo of a side-prefixed field" do
+      Gori::CLI::Run.unknown_query_field_error("history", "resp.bdy:secret")
+        .not_nil!.should contain("did you mean `resp.body:`?")
+      Gori::CLI::Run.unknown_query_field_error("history", "req.headr:x")
+        .not_nil!.should contain("`req.headr:`")
+    end
+
     # One field per line: the operator re-runs either way, and the suggestion is the half that
     # ends the round trip.
     it "names the first unknown field when a query has several" do
@@ -94,6 +126,39 @@ end
 # The suggestion itself lives in QL, beside `known_field?`, so the candidate pool cannot drift
 # from the pool that decides what is known in the first place.
 describe Gori::QL do
+  # The predicate that keeps DIAGNOSIS from reading a value's colon as a field name. Compilation
+  # is unaffected on purpose: an unknown name free-texts the whole token, so the SQL is identical
+  # either way — this only decides what `fields_used` REPORTS.
+  describe ".field_shaped?" do
+    it "reports a real field however its value is spelled" do
+      Gori::QL.field_shaped?("body", "https?://x").should be_true
+      Gori::QL.field_shaped?("url", "http://acme.test/x").should be_true
+      Gori::QL.field_shaped?("resp.body", "//x").should be_true
+    end
+
+    it "reports a field-shaped unknown name — every typo of a real field is one" do
+      Gori::QL.field_shaped?("methd", "GET").should be_true
+      Gori::QL.field_shaped?("hsot", "acme").should be_true
+      Gori::QL.field_shaped?("resp.bdy", "secret").should be_true
+      Gori::QL.field_shaped?("xyzzy", "1").should be_true
+    end
+
+    it "reads a scheme, a non-letter start and a bare authority as free text" do
+      Gori::QL.field_shaped?("http", "//acme.test/x").should be_false
+      Gori::QL.field_shaped?("12", "34").should be_false
+      Gori::QL.field_shaped?("acme.test", "8443").should be_false
+    end
+  end
+
+  # `fields_used` is where the filter is applied, so the colour-rule tier split and
+  # `unknown_fields` inherit it — a free-text URL rule is not a rule naming a field `http`.
+  describe ".fields_used" do
+    it "names no field for a pasted URL, and the real one beside it" do
+      Gori::QL.fields_used("http://acme.test/x").should be_empty
+      Gori::QL.fields_used("status:500 http://acme.test/x").map(&.name).should eq(["status"])
+    end
+  end
+
   describe ".suggest_field" do
     it "has nothing to suggest for a name QL already implements" do
       Gori::QL.suggest_field("method").should be_nil
