@@ -13,7 +13,7 @@ A JWT is only as trustworthy as the server's check of its signature. This playbo
 
 ## 1. Send a token to the JWT tab
 
-The **JWT** tab is hidden by default; reveal it from the tab-bar `⋯` menu, the command palette (`Ctrl-P` → **Go to JWT**), or Preferences. Then find the token: open the captured flow in **History**, select the token text after `Bearer ` in the request detail, and `Space` → **Send to JWT**. That seeds a new JWT sub-tab and decodes the token live into its **header**, **payload**, and **signature** on the Decode lens.
+The **JWT** tab is in the default tab set (hide it from Preferences if you never touch tokens, and reveal it again from the tab-bar `⋯` menu or `Ctrl-P` → **Go to JWT**). Find the token: open the captured flow in **History**, select the token text after `Bearer ` in the request detail, and `Space` → **Send to JWT**. That seeds a new JWT sub-tab and decodes the token live into its **header**, **payload**, and **signature** on the Decode lens.
 
 The decode shows what the token *claims*; it never checks the signature, so a token that decodes cleanly is not necessarily one the server trusts. That is the question the rest of this playbook answers.
 
@@ -28,11 +28,14 @@ The decode shows what the token *claims*; it never checks the signature, so a to
 
 Switch to the Encode lens with `Ctrl-T`, or press `l` to load the decoded token straight into the Encode editors. Edit the **PAYLOAD** JSON — escalate a `role`, swap a `sub`, extend an `exp`. Pick the algorithm with `Ctrl-A` (it cycles `HS256` / `HS384` / `HS512` / `none`), set a **SECRET** when you're signing with an HMAC algorithm, and the re-signed token appears live in OUTPUT. Copy it with `y`.
 
-The same re-sign runs headless, taking the token from the argument or stdin:
+The same claim edit runs headless, taking the token from the argument or stdin — `--set KEY=VALUE` patches one claim (repeatable), or `--payload` replaces the claims wholesale:
 
 ```bash
-gori run jwt eyJhbGci... --encode --alg HS256 --secret s3cret
+gori run jwt eyJhbGci... --encode --set role=admin --secret s3cret       # escalate one claim
+gori run jwt eyJhbGci... --encode --payload '{"sub":"1","admin":true}' --secret s3cret
 ```
+
+`--set`'s value is JSON when it parses, so `admin=true` is a boolean and `role=admin` a string. Over MCP, `jwt_encode` takes the same `set` / `payload` edits.
 
 **Checkpoint.** OUTPUT holds a token carrying your edited claim, re-signed with the algorithm and secret you chose.
 

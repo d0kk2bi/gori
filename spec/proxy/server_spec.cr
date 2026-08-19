@@ -353,6 +353,99 @@ describe Gori::Proxy::Server do
     req.http_version.should eq("")                                # not the garbage 'proxy' token
   end
 
+  it "records a non-HTTP connection as a visible error flow naming tls_passthrough, without hanging (#729)" do
+    done = Channel(Nil).new(1)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.write(Bytes[0x10, 0x0c, 0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x04]) # MQTT CONNECT preface
+    client.flush
+    client.gets_to_end # no HTTP response is written; the connection closes
+    client.close
+
+    done.receive # the non-HTTP flow was recorded rather than a 30s silent hang
+    proxy.stop
+
+    sink.requests.size.should eq(1)
+    sink.responses.size.should eq(1)
+    resp = sink.responses.first
+    resp.state.should eq(Gori::Store::FlowState::Error)
+    msg = resp.error.not_nil!
+    msg.should contain("not an HTTP request")
+    msg.should contain("bytes 10")        # the observed prefix, hex (the read stops on the first non-token byte)
+    msg.should contain("tls_passthrough") # the remedy the operator would never find
+  end
+
+  it "records a raw TLS ClientHello sent to the cleartext port as a non-HTTP flow (#729)" do
+    done = Channel(Nil).new(1)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.write(Bytes[0x16, 0x03, 0x01, 0x02, 0x00, 0x01]) # TLS handshake record
+    client.flush
+    client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+
+    resp = sink.responses.first
+    resp.state.should eq(Gori::Store::FlowState::Error)
+    resp.error.not_nil!.should contain("not an HTTP request")
+    resp.error.not_nil!.should contain("bytes 16")
+  end
+
+  # The counterpart to the detector's narrowness (P7): a deliberately malformed request line —
+  # version fuzzing, a parser differential — must still be FORWARDED, never refused as non-HTTP.
+  it "still forwards a request whose version token is malformed, instead of calling it non-HTTP (#729)" do
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_origin("ok", seen)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /fuzzed HTTP/1.10\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+
+    seen.receive.should eq("GET /fuzzed HTTP/1.10") # reached the origin byte-exact
+    sink.responses.first.state.should eq(Gori::Store::FlowState::Complete)
+  end
+
+  it "still serves a normal HTTP request whose head arrives one byte at a time (non-HTTP guard is first-line only)" do
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_origin("Drip!", seen)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    "GET /drip HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n".each_byte do |b|
+      client.write_byte(b)
+      client.flush
+    end
+    client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+
+    sink.requests.size.should eq(1)
+    sink.requests.first.target.should eq("/drip") # classified HTTP, forwarded normally
+    sink.responses.first.state.should eq(Gori::Store::FlowState::Complete)
+  end
+
   it "start(fallback: true) binds a different port when the requested one is taken" do
     blocker = TCPServer.new("127.0.0.1", 0)
     taken = blocker.local_address.port

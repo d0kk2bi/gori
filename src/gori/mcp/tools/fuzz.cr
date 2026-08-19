@@ -124,34 +124,20 @@ module Gori
         fid
       end
 
-      # Reconstruct a History flow (request head/body + response head/body) from a
-      # fuzz Result. Stored raw; get_flow redacts sensitive headers on read.
+      # Reconstruct a History flow (request head/body + response head/body) from a fuzz Result.
+      # Stored raw; get_flow redacts sensitive headers on read.
+      #
+      # The projection itself lives in `Fuzz::HistoryRecord` and is shared with
+      # `gori run fuzz --record-history` — it used to be a byte-identical second copy here, which
+      # is how the two would have drifted on the next fix. What stays MCP's is the REPORTING:
+      # recording runs per result, so a store that fails every insert must not log once per
+      # request — the failure is counted against this job's drain budget instead.
       private def record_fuzz_flow(fjob : FuzzJob, request : Bytes, origin : Fuzz::Origin, http2 : Bool, r : Fuzz::Result) : Int64?
-        head, body = split_wire_request(request)
-        method, target, version = Proxy::Codec::Http1.authored_start_line(head)
-        fid = store.insert_flow(Store::CapturedRequest.new(
-          created_at: Time.utc.to_unix_ms * 1000_i64,
-          scheme: origin.scheme, host: origin.host, port: origin.port,
-          method: method, target: target,
-          http_version: http2 ? "HTTP/2" : version,
-          head: head, body: body, body_size: body.try(&.size.to_i64)))
-        return nil if fid <= 0
-        rhead = r.head
-        if rhead && !rhead.empty? && (resp = (Proxy::Codec::Http1.parse_response_head(rhead) rescue nil))
-          store.update_response(FlowMapper.response(resp, flow_id: fid, body: r.body,
-            duration_us: r.duration_us,
-            state: r.error ? Store::FlowState::Error : Store::FlowState::Complete,
-            error: r.error, body_size: r.body.try(&.size.to_i64)))
-        else
-          store.update_response(FlowMapper.error_response(fid, r.error || "no response recorded"))
+        Fuzz::HistoryRecord.record(store, r,
+          scheme: origin.scheme, host: origin.host, port: origin.port, http2: http2) do |ex|
+          fjob.drain_errors += 1
+          Log.warn(exception: ex) { "fuzz history record failed" } if fjob.drain_errors <= DRAIN_LOG_CAP
         end
-        fid
-      rescue ex
-        # Bounded for the same reason as the drain rescue: history recording runs per
-        # result, so a store that fails every insert would log once per request.
-        fjob.drain_errors += 1
-        Log.warn(exception: ex) { "fuzz history record failed" } if fjob.drain_errors <= DRAIN_LOG_CAP
-        nil
       end
 
       # Up-front warning when a caller's max_requests can't cover the known
@@ -314,7 +300,7 @@ module Gori
       # `fuzz_start`) from the tool args. Raises FuzzArgError (clean message) on any malformed
       # input.
       private def build_fuzz_job(h, ob : Outbound) : {Fuzz::Engine, Fuzz::Origin, Int64?, Bool, Array(String)}
-        text, default_target, src_h2, evidence = fuzz_template_source(h)
+        text, default_target, src_h2, evidence, src_sni = fuzz_template_source(h)
         use_h2 = bool_arg(h, "http2", false) || src_h2
         mode = fuzz_mode(h)
         options = Fuzz::PlanOptions.new(text,
@@ -337,7 +323,8 @@ module Gori
           # SNI independent of the Host header is the vhost-confusion / domain-fronting test.
           # `Fuzz::PlanOptions` and the CLI have always carried it; MCP's only route to it was
           # create_repeater{sni} → send_request{repeater_id}, i.e. not a sweep at all.
-          sni: str(h, "sni"),
+          # An explicit `sni` wins; otherwise the source's own (a repeater session's stored SNI).
+          sni: str(h, "sni") || src_sni,
           overrides: HostOverrides.load(store))
         plan = Fuzz::Plan.build(options, ob)
         {plan.engine, plan.origin, plan.total, use_h2, plan.shadowed_marks}
@@ -420,9 +407,19 @@ module Gori
       # an OData capture (`$filter`, `$top`) had the run REFUSED for an unbound variable
       # nobody typed, and a captured bare-LF head was silently promoted to CRLF — the one
       # thing that makes every desync result from the sweep unreadable.
-      private def fuzz_template_source(h) : {String, String?, Bool, Bool}
+      private def fuzz_template_source(h) : {String, String?, Bool, Bool, String?}
+        # One seed only. This used to return on the FIRST of template → flow_id → repeater_id,
+        # so `{flow_id: 10, repeater_id: 3}` swept flow 10 and never said the repeater seed was
+        # dropped. The CLI refuses every such pair for exactly that reason; so does this.
+        given = [] of String
+        given << "template" if str(h, "template").try(&.presence)
+        given << "flow_id" if optional_int_arg(h, "flow_id")
+        given << "repeater_id" if optional_int_arg(h, "repeater_id")
+        if given.size > 1
+          raise FuzzArgError.new("pass ONE template source, got #{given.join(" + ")} — they describe different requests and only one can be swept")
+        end
         if t = str(h, "template")
-          return {t, nil, false, false} unless t.strip.empty?
+          return {t, nil, false, false, nil} unless t.strip.empty?
         end
         if id = optional_int_arg(h, "flow_id")
           detail = store.get_flow(id)
@@ -436,9 +433,23 @@ module Gori
           # capture that is legitimately not valid UTF-8 had every such byte rewritten to
           # U+FFFD, with Content-Length resynced to the corruption, before the sweep ran.
           # `render` puts the single `§` back, so the request still replays byte-exact.
-          return {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true}
+          return {String.new(Fuzz::Template.escape_literal_markers(built.bytes)), built.target, built.http2, true, nil}
         end
-        raise FuzzArgError.new("provide a 'template' (raw request with §…§) or a 'flow_id'")
+        if rid = optional_int_arg(h, "repeater_id")
+          rec = store.get_repeater(rid)
+          raise FuzzArgError.new("no repeater session #{rid}") unless rec
+          if Repeater::WsEngine.upgrade_request?(String.new(rec.request))
+            raise FuzzArgError.new("repeater #{rid} is a WebSocket session — the Fuzzer sweeps HTTP requests, not a framed WebSocket exchange (use send_websocket, or seed from an HTTP repeater)")
+          end
+          # Markers escaped like the flow_id seed (a stored `§` is literal text, not a position),
+          # but evidence is FALSE: a repeater session is the operator's authored draft and its
+          # `$NAME` bindings expand, the same as send_request from a repeater.
+          # `rec.sni` rides along: a session pinned to a specific SNI (vhost routing, a cert-pinned
+          # origin) must be swept against THAT name, or this reaches a different vhost — or fails
+          # the handshake — where `send_request{repeater_id}` succeeds.
+          return {String.new(Fuzz::Template.escape_literal_markers(rec.request)), rec.target, rec.http2?, false, rec.sni}
+        end
+        raise FuzzArgError.new("provide a 'template' (raw request with §…§), a 'flow_id', or a 'repeater_id'")
       end
 
       private def fuzz_mode(h) : Fuzz::Mode
@@ -860,6 +871,7 @@ module Gori
           "at #{FUZZ_MAX_REQUESTS} requests / #{FUZZ_MAX_CONCURRENCY} concurrency." do |s|
           s.field "template", strprop("raw HTTP request with §…§ position markers")
           s.field "flow_id", intprop("seed the template from a captured flow id (instead of template)")
+          s.field "repeater_id", intprop("seed the template from a saved HTTP repeater session id (instead of template/flow_id); a WebSocket session is refused")
           s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
           s.field "auto", boolprop("auto-mark every query/cookie/body param when the template has no § markers")
           s.field "marks", strarrprop("literal tokens to mark as §…§ positions (each occurrence, mirrors CLI --mark); alternative to embedding §…§ in template. An occurrence already inside a §…§ (or flush against one) is skipped — re-wrapping it would merge the two positions — and a token left with none of its own is named in `marks_warning`")

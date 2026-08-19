@@ -14,7 +14,7 @@ group = "워크벤치"
   <figcaption><strong>JWT</strong> 탭은 토큰을 실시간으로 디코드하고(header, payload, signature), 바로 보낼 수 있는 공격 페이로드(alg:none, weak-secret, header injection)를 나열합니다.</figcaption>
 </figure>
 
-이 탭은 기본적으로 숨겨져 있습니다. 탭 바의 `⋯` 메뉴나 커맨드 팔레트(`Ctrl-P` → **Go to JWT**)에서 드러내세요. 어디서든(예: **History** 상세 패널, **Notes** 등) 토큰을 선택하고 `Space` → **Send to JWT**를 누르면 그 토큰으로 새 워크벤치 서브탭을 채웁니다. 세션은 휘발성이라 디스크에는 아무것도 기록되지 않습니다.
+어디서든(예: **History** 상세 패널, **Notes** 등) 토큰을 선택하고 `Space` → **Send to JWT**를 누르면 그 토큰으로 새 워크벤치 서브탭을 채웁니다. 세션은 휘발성이라 디스크에는 아무것도 기록되지 않습니다. 탭을 숨겼다면 탭 바의 `⋯` 메뉴, 커맨드 팔레트(`Ctrl-P` → **Go to JWT**), 또는 Preferences에서 다시 드러내세요.
 
 ## 두 개의 렌즈 {#two-lenses}
 
@@ -44,13 +44,15 @@ group = "워크벤치"
 ```bash
 gori run jwt eyJhbGci...                       # decode (default)
 gori run jwt eyJhbGci... --encode --alg HS256 --secret s3cret
+gori run jwt eyJhbGci... --encode --set role=admin --secret s3cret   # claim 하나를 패치해 재서명
+gori run jwt eyJhbGci... --encode --payload '{"sub":"1","admin":true}' --secret s3cret   # claim 전체를 교체
 gori run jwt eyJhbGci... --attacks             # print the attack payloads
 cat token.txt | gori run jwt --attacks         # token from stdin
 ```
 
-토큰은 인자나 stdin에서 옵니다. 프로젝트나 캡처는 관여하지 않습니다(순수한 로컬 연산입니다). `--format`은 `text` 또는 `json`입니다. [CLI Reference](/ko/reference/cli/#run-jwt)를 참고하세요.
+토큰은 인자나 stdin에서 옵니다. 프로젝트나 캡처는 관여하지 않습니다(순수한 로컬 연산입니다). `--format`은 `text` 또는 `json`입니다. `--encode`에서 `--set KEY=VALUE`는 claim 하나를 패치하고(반복 가능 — 값이 JSON으로 파싱되면 그 타입을 유지하므로 `admin=true`는 불리언, `role=admin`은 문자열입니다), `--payload JSON`은 claim 객체 전체를 교체합니다. 둘은 상호 배타적입니다. [CLI Reference](/ko/reference/cli/#run-jwt)를 참고하세요.
 
-MCP에서는 `jwt_decode` / `jwt_encode` / `jwt_attacks`가 네트워크나 상태를 건드리지 않으므로 `--read-only`에서도 사용할 수 있는 read 도구입니다.
+MCP에서는 `jwt_decode` / `jwt_encode` / `jwt_attacks`가 네트워크나 상태를 건드리지 않으므로 `--read-only`에서도 사용할 수 있는 read 도구입니다. `jwt_encode`도 같은 `set` / `payload` claim 편집을 받습니다.
 
 ## 다음 단계 {#next-steps}
 

@@ -14,7 +14,7 @@ The **JWT** tab is a workbench for JSON Web Tokens: decode one, edit its claims 
   <figcaption>The <strong>JWT</strong> tab decodes a token live (header, payload, signature) and lists ready-to-send attack payloads: alg:none, weak-secret, and header injection.</figcaption>
 </figure>
 
-The tab is hidden by default. Reveal it from the tab-bar `⋯` menu or the command palette (`Ctrl-P` → **Go to JWT**). Select a token anywhere (a **History** detail pane, **Notes**, …) and `Space` → **Send to JWT** to seed a new workbench sub-tab with it. Sessions are ephemeral: nothing is written to disk.
+Select a token anywhere (a **History** detail pane, **Notes**, …) and `Space` → **Send to JWT** to seed a new workbench sub-tab with it. Sessions are ephemeral: nothing is written to disk. If you have hidden the tab, reveal it again from the tab-bar `⋯` menu, the command palette (`Ctrl-P` → **Go to JWT**), or Preferences.
 
 ## Two Lenses
 
@@ -44,13 +44,15 @@ Send a candidate to **Repeater** to try it against the target, or straight into 
 ```bash
 gori run jwt eyJhbGci...                       # decode (default)
 gori run jwt eyJhbGci... --encode --alg HS256 --secret s3cret
+gori run jwt eyJhbGci... --encode --set role=admin --secret s3cret   # patch one claim, re-sign
+gori run jwt eyJhbGci... --encode --payload '{"sub":"1","admin":true}' --secret s3cret   # replace the claims wholesale
 gori run jwt eyJhbGci... --attacks             # print the attack payloads
 cat token.txt | gori run jwt --attacks         # token from stdin
 ```
 
-The token comes from the argument or stdin; there is no project or capture involved (it is pure local compute). `--format` is `text` or `json`. See the [CLI Reference](/reference/cli/#run-jwt).
+The token comes from the argument or stdin; there is no project or capture involved (it is pure local compute). `--format` is `text` or `json`. On `--encode`, `--set KEY=VALUE` patches one claim (repeatable — the value is JSON when it parses, so `admin=true` is a boolean and `role=admin` a string) and `--payload JSON` replaces the whole claims object; the two are mutually exclusive. See the [CLI Reference](/reference/cli/#run-jwt).
 
-Over MCP, `jwt_decode` / `jwt_encode` / `jwt_attacks` are read tools available even under `--read-only`, since they touch no network or state.
+Over MCP, `jwt_decode` / `jwt_encode` / `jwt_attacks` are read tools available even under `--read-only`, since they touch no network or state. `jwt_encode` takes the same `set` / `payload` claim edits.
 
 ## Next Steps
 

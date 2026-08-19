@@ -31,11 +31,12 @@ module Gori::Proxy::Codec::Http1
   # follows sees the caller's baseline, not the leftover head budget. With `deadline`/`timeout_sock`
   # nil (every caller but the client request-head read) the loop is byte-for-byte the original.
   def self.read_head(io : IO, max_bytes : Int32 = 1024 * 256, *,
-                     deadline : Time::Span? = nil, timeout_sock : ::Socket? = nil) : Bytes?
+                     deadline : Time::Span? = nil, timeout_sock : ::Socket? = nil,
+                     detect_non_http : Bool = false) : Bytes?
     # Deadline path only when BOTH are provided (the client request-head read); every other
     # caller takes the byte-for-byte original fast path.
     if (sock = timeout_sock) && (dl = deadline)
-      return read_head_deadlined(io, sock, dl, max_bytes)
+      return read_head_deadlined(io, sock, dl, max_bytes, detect_non_http)
     end
     buf = IO::Memory.new(512) # presized: covers a typical head without regrowing
     while buf.bytesize < max_bytes
@@ -53,10 +54,18 @@ module Gori::Proxy::Codec::Http1
   # drip-feed slowloris defense a per-read timeout can't provide (a byte-at-a-time trickle keeps
   # resetting a per-read timer). `sock`'s read_timeout is shrunk toward `deadline` before each
   # read and RESTORED on exit, so the body read that follows sees the caller's baseline.
-  private def self.read_head_deadlined(io : IO, sock : ::Socket, deadline : Time::Span, max_bytes : Int32) : Bytes?
+  private def self.read_head_deadlined(io : IO, sock : ::Socket, deadline : Time::Span, max_bytes : Int32,
+                                       detect_non_http : Bool = false) : Bytes?
     buf = IO::Memory.new(512)
     saved_timeout = sock.read_timeout
     head_started = nil.as(Time::Instant?)
+    # Non-HTTP detection (#729): a binary-preface protocol (MQTT/AMQP/TLS-in-TLS) never sends
+    # CRLFCRLF, so waiting for one blocks to the deadline with nothing recorded. The decision is
+    # made on the FIRST non-blank byte and never revisited — see `looks_like_http_request?` for
+    # why it is only that byte — so the per-byte cost is one comparison until it fires, and zero
+    # after. Gated on `detect_non_http` because this same deadline path also reads RESPONSE heads
+    # (`safe_read_head`), where the first byte is the caller's business and not a request line.
+    settled = !detect_non_http
     begin
       while buf.bytesize < max_bytes
         if hs = head_started
@@ -68,6 +77,14 @@ module Gori::Proxy::Codec::Http1
         break if byte.nil?            # EOF
         head_started ||= Time.instant # start the head clock at the first received byte
         buf.write_byte(byte)
+        unless settled
+          # A leading CR/LF is a permitted empty line (RFC 7230 §3.5), not a verdict: keep
+          # reading until a real first byte arrives, then decide once.
+          unless byte == 0x0a_u8 || byte == 0x0d_u8
+            settled = true
+            break if !Http1.looks_like_http_request?(buf.to_slice)
+          end
+        end
         break if byte == 0x0a_u8 && buf.bytesize >= 4 && ends_with_crlf_crlf?(buf)
       end
     ensure
@@ -153,6 +170,40 @@ module Gori::Proxy::Codec::Http1
   # caller (ClientConn) can reject it outright instead of treating it as a real request.
   def self.h2_preface?(req : RawRequest) : Bool
     req.method == "PRI" && req.target == "*" && req.version == "HTTP/2.0"
+  end
+
+  # Whether these bytes could begin an HTTP/1.x request — the gate that tells a real (possibly
+  # still-arriving, possibly MALFORMED) HTTP request from a non-HTTP protocol that would
+  # otherwise block the client head read to its deadline with no flow, no log, and nothing
+  # naming `network.tls_passthrough` (#729).
+  #
+  # ONE negative, and deliberately only one: the first byte of the request line is not a
+  # method-token char (a CTL, SP or DEL — `request_token_safe?`'s rule, applied to one byte).
+  # That catches the binary prefaces this exists for — MQTT `0x10`, AMQP `0x00`, a TLS
+  # ClientHello `0x16`, a binary RPC — on byte one, with no wait and nothing to misread.
+  #
+  # EVERYTHING ELSE IS HTTP AS FAR AS THIS PREDICATE IS CONCERNED, and that is the point (P7).
+  # An earlier version also rejected a completed first line whose last token was not a literal
+  # `HTTP/<d>.<d>`, to catch SSH/SMTP banners. That is a false-positive machine on exactly the
+  # input this codebase exists to carry: `HTTP/1.10`, a lowercase `http/1.1`, an HTTP/0.9
+  # two-token line and a bare `GET` are all version-fuzzing / parser-differential payloads an
+  # operator sends ON PURPOSE, and `parse_request_head` keeps every one of them (`malformed?`
+  # plus the verbatim octets) precisely so they reach the origin unaltered. Refusing them here
+  # would have closed the connection and blamed a TLS-passthrough setting for the operator's own
+  # test. A text banner is indistinguishable from such a payload on the first line, so gori does
+  # not guess: SSH/SMTP-through-the-HTTP-port still waits out the head deadline, exactly as
+  # before this change. That is a known gap, not an oversight — see #729.
+  #
+  # UNDECIDED (returns true) while nothing but blank lines has arrived: RFC 7230 §3.5 lets a
+  # request line be preceded by an empty line, so a leading CR/LF is not a non-HTTP signal.
+  def self.looks_like_http_request?(raw : Bytes) : Bool
+    start = 0
+    while start < raw.size && (raw.unsafe_fetch(start) == 0x0d_u8 || raw.unsafe_fetch(start) == 0x0a_u8)
+      start += 1
+    end
+    return true if start >= raw.size # only blank line(s) so far — undecided, keep reading
+    b = raw.unsafe_fetch(start)
+    !(b <= 0x20_u8 || b == 0x7f_u8)
   end
 
   # The request start-line's {method, target, malformed} WITHOUT parsing/allocating the header

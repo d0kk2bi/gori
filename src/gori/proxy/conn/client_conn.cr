@@ -286,8 +286,18 @@ module Gori::Proxy
       # its first byte (a drip-feed that a per-read timeout can't catch). The first-byte (idle
       # keep-alive) wait stays bounded by the baseline timeout armed in `run`.
       head = Codec::Http1.read_head(@io,
-        deadline: SocketTuning::HEAD_DEADLINE, timeout_sock: SocketTuning.underlying_socket(@io))
+        deadline: SocketTuning::HEAD_DEADLINE, timeout_sock: SocketTuning.underlying_socket(@io),
+        detect_non_http: true)  # this is a client REQUEST head — a non-HTTP protocol lands here (#729)
       return false if head.nil? # client closed / keep-alive idle end
+
+                      # A non-HTTP protocol reached the HTTP parser (MQTT, SSH, a raw TLS ClientHello, a binary
+                      # RPC). `read_head` stopped early instead of blocking to the deadline (#729); record a
+                      # VISIBLE flow that names the observed shape and the remedy — `network.tls_passthrough` —
+                      # instead of closing in silence, the same way an h2-downgrade rejection names its gate.
+      unless Codec::Http1.looks_like_http_request?(head)
+        record_non_http(head, now_us)
+        return false
+      end
 
       req = Codec::Http1.parse_request_head(head)
       return handle_connect(req) if req.method.compare("CONNECT", case_insensitive: true) == 0
@@ -2138,6 +2148,42 @@ module Gori::Proxy
       flow_id = @sink.on_request(FlowMapper.request(req,
         scheme: scheme, host: host, port: port, created_at: created_at, body: nil))
       @sink.on_response(FlowMapper.error_response(flow_id, message))
+    end
+
+    # A connection whose bytes are not HTTP (MQTT, SSH, a raw TLS ClientHello, a binary RPC),
+    # recorded as a visible error flow instead of the 30 s silent hang it used to be (#729). The
+    # captured bytes ARE the head (P7) — `parse_request_head` keeps them verbatim and stores the
+    # first line as the target — so History shows exactly what arrived, and the message names the
+    # observed prefix plus the remedy the operator would otherwise never find.
+    private def record_non_http(head : Bytes, created_at : Int64) : Nil
+      req = Codec::Http1.parse_request_head(head)
+      host = @fixed_host || ""
+      # On a TLS-terminated path passthrough is the exact remedy: it leaves the connection
+      # byte-exact for its real protocol. On a cleartext listener there is no TLS leg to bypass,
+      # so the honest advice is to keep gori off this host's port.
+      remedy =
+        if @tls
+          "gori terminated TLS on this connection and speaks HTTP to it — if #{host.empty? ? "this host" : host.inspect} " \
+          "speaks a non-HTTP protocol, add it to `network.tls_passthrough` so gori tunnels it byte-exact instead of decoding it"
+        else
+          "this listener expects HTTP — a non-HTTP service should not be routed through gori's " \
+          "HTTP proxy (use `network.tls_passthrough` for a TLS service, or keep gori off this port)"
+        end
+      record_error(req, @scheme, host, @fixed_port, created_at,
+        "not an HTTP request: the connection opened with #{non_http_prefix(head)}, which is not an HTTP request line. #{remedy}")
+    end
+
+    # A short, terminal-safe preview of the non-HTTP prefix for the flow's error message:
+    # hex of the first bytes, plus their ASCII where printable (so `SSH-2.0` / `MQTT` read
+    # plainly and a binary preface reads as hex). Never emits raw control bytes.
+    private def non_http_prefix(head : Bytes, limit : Int32 = 12) : String
+      slice = head[0, {head.size, limit}.min]
+      hex = slice.map { |b| b.to_s(16).rjust(2, '0') }.join(' ')
+      ascii = String.build do |s|
+        slice.each { |b| s << (b >= 0x20_u8 && b < 0x7f_u8 ? b.unsafe_chr : '.') }
+      end
+      more = head.size > limit ? " …" : ""
+      "bytes #{hex}#{more} (#{ascii.inspect})"
     end
 
     # A dropped request never reaches upstream; record it as an Aborted flow so

@@ -39,6 +39,21 @@ describe Gori::Scope do
     end
   end
 
+  it "filter(force: true) builds the include/exclude SQL even with the display lens OFF" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+      scope.active?.should be_false                    # never enabled — the ⇧S lens is off
+      scope.filter.sql.should eq("1")                  # so the ordinary filter is match-all
+      scope.filter(force: true).sql.should_not eq("1") # …but the opt-in --in-scope filter is real
+
+      capture(store, "acme.test", "/x")
+      capture(store, "other.test", "/y")
+      hosts = store.search(scope.filter(force: true), 50).map(&.host).sort
+      hosts.should eq(["acme.test"])
+    end
+  end
+
   it "active? counts ANY rule and excludes-only emits (1 AND NOT (...)), never NOT ()" do
     with_store do |store|
       scope = Gori::Scope.load(store)

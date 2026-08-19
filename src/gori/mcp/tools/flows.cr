@@ -30,10 +30,31 @@ module Gori
         query = str(h, "query")
         filter = ql_filter_or_error(h, query)
         return filter if filter.is_a?(Result)
+        # `in_scope` opt-in: the same per-flow scope lens the TUI History ⇧S toggle and
+        # `gori run history --in-scope` apply, independent of the persisted flag. Capture is
+        # untouched — this narrows only the rows returned. Empty (nothing in scope) when no
+        # scope rules are configured, matching the other surfaces.
+        in_scope = bool_arg(h, "in_scope", false)
+        scope_unconfigured = false
+        if in_scope
+          scope = Scope.load(store)
+          if scope.configured?
+            filter = QL.and(scope.filter(force: true), filter)
+          else
+            scope_unconfigured = true
+          end
+        end
         # An agent gets one shot at this answer and cannot tell "no match" from "not indexed
         # yet", so drain the off-commit FTS backlog (Store V4) before a query that reads it.
         store.index_pending! if filter.uses_fts?
-        rows = (query && !query.strip.empty?) ? store.search(filter, limit, before_id, since_id) : store.recent_flows(limit, before_id, since_id)
+        rows =
+          if scope_unconfigured
+            [] of Store::FlowRow
+          elsif (query && !query.strip.empty?) || in_scope
+            store.search(filter, limit, before_id, since_id)
+          else
+            store.recent_flows(limit, before_id, since_id)
+          end
         Result.new(JSON.build { |j| j.array { rows.each { |r| Serialize.flow_row(j, r) } } })
       end
 
@@ -238,6 +259,7 @@ module Gori
           s.field "limit", intprop("max rows (default 50, max 500)")
           s.field "before_id", intprop("cursor: page OLDER — only flows with id < this (newest-first; works with query too)")
           s.field "since", intprop("forward cursor: tail NEWER — only flows with id > this, oldest-first (mutually exclusive with before_id)")
+          s.field "in_scope", boolprop("only flows in the project's configured scope (the TUI ⇧S lens; capture still records everything). Empty result when no scope rules exist. Default false")
           s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false; use ql_explain to see which terms would drop)")
         end
 

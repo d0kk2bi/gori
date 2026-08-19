@@ -117,7 +117,9 @@ gori run fuzz <flow-id> \
   --fs 0
 ```
 
-소스는 캡처된 플로우(`--flow`), 원시 요청 파일(`--request`), 또는 stdin이 될 수 있습니다. 출력은 `text`, `json`, `jsonl`입니다.
+소스는 캡처된 플로우(`--flow`), 저장된 HTTP 리피터 세션(`--repeater`), 원시 요청 파일(`--request`), 또는 stdin이 될 수 있습니다. 출력은 `text`, `json`, `jsonl`입니다.
+
+워크벤치와 증거 저장소는 분리되어 있습니다. Repeater나 Fuzzer 전송은 기본적으로 History 플로우를 남기지 않습니다. `get_flow`·`compare`·다음 도구에 넘길 `flow_id`가 필요할 때는 명시적으로 뚫으세요. `gori run repeater send --record-history`는 전송을 플로우로 기록하고 그 id를 출력하며, `gori run fuzz --record-history=none|matched|all`은 전송한 각 요청+응답을 기록합니다(`matched`는 매칭된 행만, `all`은 매 전송, 5000개 상한). 기본값은 워크벤치 전용으로 유지됩니다.
 
 ## 다음 단계 {#next-steps}
 

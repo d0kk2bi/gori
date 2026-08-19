@@ -66,6 +66,66 @@ describe Gori::Jwt do
     end
   end
 
+  describe ".patch_payload" do
+    it "sets a string claim when the value is not valid JSON" do
+      out = JSON.parse(Gori::Jwt.patch_payload(%({"sub":"1"}), ["role=admin"]))
+      out["role"].as_s.should eq("admin")
+      out["sub"].as_s.should eq("1") # existing claims are kept
+    end
+
+    it "keeps JSON types: a bare true/number stays boolean/number" do
+      out = JSON.parse(Gori::Jwt.patch_payload(%({"admin":false}), ["admin=true", "n=3"]))
+      out["admin"].as_bool.should be_true
+      out["n"].as_i.should eq(3)
+    end
+
+    it "a quoted value forces a numeric-looking string" do
+      out = JSON.parse(Gori::Jwt.patch_payload(%({}), [%(s="1")]))
+      out["s"].as_s.should eq("1")
+    end
+
+    it "applies patches in order (last write wins)" do
+      out = JSON.parse(Gori::Jwt.patch_payload(%({}), ["x=1", "x=2"]))
+      out["x"].as_i.should eq(2)
+    end
+
+    it "sets the empty string for key= with no value" do
+      out = JSON.parse(Gori::Jwt.patch_payload(%({}), ["k="]))
+      out["k"].as_s.should eq("")
+    end
+
+    it "starts from {} when the base payload is blank" do
+      out = JSON.parse(Gori::Jwt.patch_payload("", ["a=1"]))
+      out["a"].as_i.should eq(1)
+    end
+
+    it "raises ForgeError on a patch with no '='" do
+      expect_raises(Gori::Jwt::ForgeError, /key=value/) do
+        Gori::Jwt.patch_payload(%({}), ["role"])
+      end
+    end
+
+    it "raises ForgeError on an empty key" do
+      expect_raises(Gori::Jwt::ForgeError, /empty key/) do
+        Gori::Jwt.patch_payload(%({}), ["=admin"])
+      end
+    end
+
+    it "raises ForgeError when the base payload is not a JSON object" do
+      expect_raises(Gori::Jwt::ForgeError, /object/) do
+        Gori::Jwt.patch_payload(%(["a"]), ["role=admin"])
+      end
+    end
+
+    it "re-signs cleanly: patch then encode verifies" do
+      patched = Gori::Jwt.patch_payload(%({"sub":"1"}), ["role=admin"])
+      tok = Gori::Jwt.encode(%({"typ":"JWT"}), patched, "HS256", "s3cr3t")
+      header, payload, sig = tok.split('.')
+      JSON.parse(String.new(Base64.decode(payload)))["role"].should eq("admin")
+      Gori::Jwt.sign("#{header}.#{payload}", "HS256", "s3cr3t").should eq(sig)
+    end
+  end
+
   describe ".attacks" do
     it "returns an empty list for a non-JWT string" do
       Gori::Jwt.attacks("plainstring").should be_empty       # 1 segment

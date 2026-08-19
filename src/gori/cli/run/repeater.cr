@@ -514,6 +514,7 @@ module Gori
         slot : String? = nil
         reframe_grpc = false
         ws_keep_key = false
+        record_history = false
         # nil = use the session's stored setting; true = this send is plain HTTP whatever it says.
         # There is no `--websocket` counterpart: the stored default IS WebSocket unless the
         # operator turned it off, so the only direction that needs a per-send override is this one.
@@ -540,6 +541,7 @@ module Gori
           p.on("--ws-keep-key", "WebSocket: send the request's own Sec-WebSocket-Key instead of a fresh one (overrides the session's stored setting for this send)") { ws_keep_key = true }
           p.on("--idle-ms=N", "WebSocket: server-silence timeout after the first inbound frame (100-60000, default 3000)") { |v| idle_ms = parse_count(v, "--idle-ms").to_i64 }
           p.on("--http", "WebSocket: send the upgrade handshake as an ordinary HTTP request and print the response, instead of performing the framed exchange (overrides the session's stored setting for this send). The bytes are unchanged — this selects the engine, not a rewrite") { http_only = true }
+          p.on("--record-history", "Also write the outbound request + response to History as a captured flow, and print its flow id (default: off — a Repeater send leaves no flow). HTTP only") { record_history = true }
           p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
           p.on("-h", "--help", "Show this help") { puts p; exit 0 }
           p.unknown_args { |before, after| positional = before + after }
@@ -587,6 +589,9 @@ module Gori
           abort "gori run repeater send: --message / --message-frame / --idle-ms apply to a WebSocket exchange — session ##{id} is being sent as HTTP"
         end
         if use_ws
+          # `--record-history` records an HTTP request+response flow; a WebSocket send is a
+          # framed transcript, a different shape History does not take from a repeater send yet.
+          STDERR.puts "gori run repeater send: --record-history is HTTP-only — session ##{id} is a WebSocket exchange, not recorded" if record_history
           # `rec.flow_id` IS the provenance test, the same one the engine tabs and the h1
           # flow-replay path make: only a `--flow` / MCP `flow_id` seed sets it, and only a
           # seed puts CAPTURED frames in `ws_messages`. A session built from `--request-raw`
@@ -597,6 +602,7 @@ module Gori
         end
 
         abort_if_blocked!(plan, "gori run repeater send")
+        sent_at = Time.utc.to_unix_ms * 1000_i64
         result = plan.send
         outbound.close
 
@@ -609,9 +615,37 @@ module Gori
           diff_capped = Repeater::Diff.truncated?(orig, fresh)
           diff = Repeater::Diff.lines(orig, fresh)
         end
-        emit_repeater_result(result, new_body, diff, format, diff_capped)
+        # BEFORE the emit, so the flow id can go INSIDE the one result object `--format json`
+        # has always printed. Printing a second top-level object after it broke every consumer
+        # doing `… --format json | jq .status` (trailing content), and in text mode appended a
+        # bare integer line to the response dump.
+        #
+        # Recorded regardless of ok?: an error flow is evidence too (and matches MCP
+        # send_request, which records the attempt).
+        recorded_flow_id = record_history ? record_repeater_send_to_history(plan, result, sent_at, project_name, db_path) : nil
+        emit_repeater_result(result, new_body, diff, format, diff_capped, recorded_flow_id)
         persist_repeater_response(id, result.head, result.body, result.error, result.duration_us, project_name, db_path) if result.ok?
         exit 1 unless result.ok?
+      end
+
+      # Write one repeater HTTP send to History and return the new flow id — the CLI half of
+      # #749's opt-in punch-through. Re-opens the store (closed before the send, like
+      # `persist_repeater_response`). A write failure is a WARNING and nil, not an abort: the
+      # send already happened, so aborting here would misreport a completed send as a failure.
+      # The caller puts the id on the OUTPUT (a `recorded_flow_id` field in JSON, a STDERR note
+      # in text) rather than this method printing — see the call site.
+      private def self.record_repeater_send_to_history(plan : Repeater::Plan, result : Repeater::Result,
+                                                       created_at : Int64, project_name : String?,
+                                                       db_path : String?) : Int64?
+        store = open_store(resolve_read_project(project_name, db_path))
+        begin
+          Repeater::HistoryRecord.record(store, plan, result, created_at)
+        rescue ex : Gori::Error
+          STDERR.puts "gori run repeater send: #{ex.message}"
+          nil
+        ensure
+          store.close
+        end
       end
 
       # Execute a WebSocket repeater SESSION: a fresh RFC 6455 handshake, the
@@ -856,9 +890,13 @@ module Gori
       # path); caller owns the exit code.
       private def self.emit_repeater_result(result : Repeater::Result, new_body : Bytes?,
                                             diff : Array(Repeater::DiffLine)?, format : Symbol,
-                                            diff_capped : Bool = false) : Nil
+                                            diff_capped : Bool = false,
+                                            recorded_flow_id : Int64? = nil) : Nil
+        # Text mode: the id goes to STDERR beside the other status lines, so a `> resp.txt`
+        # redirect still captures exactly the response and nothing else.
+        STDERR.puts "recorded to History as flow ##{recorded_flow_id}" if recorded_flow_id && format != :json
         if format == :json
-          puts repeater_json(result, diff, diff_capped)
+          puts repeater_json(result, diff, diff_capped, recorded_flow_id)
         elsif result.ok?
           STDERR.puts "→ #{result.response.try(&.status) || "?"} in #{CLI::Output.human_us(result.duration_us)}#{result.incomplete? ? " (#{incomplete_reason(result, result.timed_out?)})" : ""}"
           if d = diff
@@ -1397,10 +1435,14 @@ module Gori
       end
 
       private def self.repeater_json(result : Repeater::Result, diff : Array(Repeater::DiffLine)?,
-                                     diff_capped : Bool = false) : String
+                                     diff_capped : Bool = false, recorded_flow_id : Int64? = nil) : String
         JSON.build do |j|
           j.object do
             j.field "ok", result.ok?
+            # `--record-history` only. Present ⇒ the send is on the record under this id; absent
+            # ⇒ it was not recorded. Inside THIS object, never a second one: `--format json` has
+            # always emitted exactly one, and a trailing object breaks every `jq` consumer.
+            j.field("recorded_flow_id", recorded_flow_id) if recorded_flow_id
             j.field "status", result.response.try(&.status)
             j.field "duration_us", result.duration_us
             # A send failure quotes origin bytes — see `Output.json_captured`. The WS sibling

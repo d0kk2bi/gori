@@ -62,6 +62,14 @@ module Gori
         capped = budget.exhausted?
 
         groups = probe_filter_groups(Probe.group(dets), severity_from(str(h, "severity")), category.as(String?))
+        # `in_scope` narrows the REPORT to in-scope hosts — the same host-level lens the TUI
+        # Probe tab applies, independent of `active`/`allow_unscoped` which gate what gets SENT.
+        # Everything was still scanned. `scope` from the gate is nil on a passive scan, so load
+        # it here when needed. Empty result when no scope rules are configured.
+        if bool_arg(h, "in_scope", false)
+          lens = scope || Scope.load(store)
+          groups = groups.select { |g| lens.host_in_scope?(g.host) }
+        end
         Result.new(probe_scan_json(groups, ids.size, repeater_n, active, allow_unscoped,
           scope_configured, capped, unsafe, aggressive, limit, scan_errors))
       end
@@ -461,6 +469,7 @@ module Gori
           s.field "active", boolprop("also run active checks that SEND probe requests (default false = passive, request-free); requires write access + a configured scope")
           s.field "severity", strprop("only return issues at/above this level (info|low|medium|high|critical)")
           s.field "category", strprop("only return issues in this category (#{Probe::FILTER_CATEGORIES.join("|")})")
+          s.field "in_scope", boolprop("only return issues on hosts in the project's configured scope (the TUI ⇧S lens; ALL flows are still scanned). Empty result when no scope rules exist. Independent of active/allow_unscoped. Default false")
           s.field "allow_unscoped", boolprop("with active:true, run even when a target host is outside — or without — a configured scope (default false)")
           s.field "unsafe", boolprop("with active:true, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data (default false)")
           s.field "aggressive", boolprop("with active:true, raise per-rule caps + use wider bypass sets (implies unsafe) — authorized targets only (default false)")

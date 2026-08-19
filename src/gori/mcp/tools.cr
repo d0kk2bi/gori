@@ -182,8 +182,10 @@ module Gori
       FUZZ_MAX_CONCURRENCY =         100
       FUZZ_MAX_STORED      =      10_000
       # Ceiling on History flows recorded per run (record_history), so `all` on a
-      # huge run can't unboundedly grow the project database.
-      FUZZ_HISTORY_MAX = 5_000
+      # huge run can't unboundedly grow the project database. An ALIAS of the engine constant,
+      # not a second 5_000: `gori run fuzz --record-history` reads the same one, and two copies
+      # of a cap that the comments call shared is how they end up different.
+      FUZZ_HISTORY_MAX = Fuzz::HistoryRecord::MAX
       # Ceiling on how many times ONE job may log from its per-event rescues. Those sit on
       # the per-result path, so a persistent failure logs once per request sent; a client
       # that does not drain stderr then fills the pipe and parks the job fiber, wedging the

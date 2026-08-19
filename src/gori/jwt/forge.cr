@@ -51,6 +51,33 @@ module Gori
       "#{signing_input}.#{sign(signing_input, alg, secret)}"
     end
 
+    # Apply `key=value` patches to a payload's claims, in order, and return the compact JSON.
+    # Shared by `gori run jwt --set` and MCP `jwt_encode.set` so the two surfaces cannot disagree
+    # on how a claim is typed. Each value is parsed as JSON when it parses — so `admin=true` and
+    # `exp=9999999999` keep their boolean/number type — and taken as a string literal otherwise
+    # (`role=admin`). A `key=` with an empty value sets the empty string. `base_payload` blank →
+    # start from `{}`. Raises ForgeError when the payload isn't a JSON object (nothing to key
+    # into) or a patch carries no `=`.
+    def patch_payload(base_payload : String, sets : Array(String)) : String
+      obj = parse_object(base_payload.presence || "{}", "payload")
+      sets.each do |kv|
+        key, sep, val = kv.partition('=')
+        raise ForgeError.new("invalid claim patch #{kv.inspect} (expected key=value)") if sep.empty?
+        raise ForgeError.new("invalid claim patch #{kv.inspect} (empty key)") if key.empty?
+        obj[key] = parse_claim_value(val)
+      end
+      obj.to_json
+    end
+
+    # `admin=true` → the boolean, `n=3` → the number, `role=admin` → the string. A value that
+    # parses as JSON keeps its type; anything else is a string literal (quote it — `s="1"` — to
+    # force a numeric-looking string).
+    private def parse_claim_value(val : String) : JSON::Any
+      JSON.parse(val)
+    rescue JSON::ParseException
+      JSON::Any.new(val)
+    end
+
     # The pretty-printed JSON of a token's header / payload segment, for seeding the
     # editable Encode panes from a decoded input. "" when the segment is absent/unreadable.
     def header_json(token : String) : String
