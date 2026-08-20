@@ -54,6 +54,54 @@ describe Gori::Scope do
     end
   end
 
+  # `ql_lens` is what a QL `scope:` term compiles against, and the whole value of threading it
+  # (rather than respelling the predicate inside QL) is that it IS `filter(force: true)` — so the
+  # SQL⇄in-memory parity audited in PR #688 is inherited. Pinned as an equality, not as a shape.
+  it "ql_lens is filter(force: true), lens flag or no lens flag" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+      scope.add("exclude", "host", "cdn.acme.test")
+
+      scope.active?.should be_false # ⇧S off — a filter TERM is a question, not a mode
+      lens = scope.ql_lens
+      lens.configured?.should be_true
+      lens.predicate.should eq(scope.filter(force: true))
+
+      scope.enable # …and switching the lens on changes nothing about the term
+      scope.ql_lens.predicate.should eq(scope.filter(force: true))
+    end
+  end
+
+  # Nothing is in scope, so a `scope:` term has no answer — and `QL.scope_cond` turns that into a
+  # never-match rather than into `filter`'s MATCH-ALL. `filter(force: true)` deliberately keeps
+  # answering match-all here (its own comment says a caller wanting "nothing" must check
+  # `configured?`), which is exactly the check this method exists to have already made.
+  it "ql_lens is UNCONFIGURED with no rules, where filter(force: true) is still match-all" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.configured?.should be_false
+      scope.filter(force: true).sql.should eq("(1)") # every flow — the opposite of the term
+
+      lens = scope.ql_lens
+      lens.configured?.should be_false
+      lens.predicate.should be_nil
+      Gori::QL.parse("scope:in", scope: lens).sql.should eq("(0)")
+      Gori::QL.parse("scope:out", scope: lens).sql.should eq("(0)")
+    end
+  end
+
+  # The class form, for a caller holding only a store (`Colormarker`, the one-shot CLI/MCP
+  # surfaces). Reads the rules where they LIVE, so it cannot answer about a stale snapshot.
+  it "Scope.ql_lens(store) reads the rules out of the store" do
+    with_store do |store|
+      Gori::Scope.ql_lens(store).configured?.should be_false
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+      Gori::Scope.ql_lens(store).predicate.should eq(scope.filter(force: true))
+    end
+  end
+
   it "active? counts ANY rule and excludes-only emits (1 AND NOT (...)), never NOT ()" do
     with_store do |store|
       scope = Gori::Scope.load(store)

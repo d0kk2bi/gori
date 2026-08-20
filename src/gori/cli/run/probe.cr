@@ -103,7 +103,10 @@ module Gori
 
         filter : QL::Filter? = nil
         if q = query
-          parsed = QL.parse(q)
+          # Shape-only: the store is not open yet (a bad query must not leave a handle behind),
+          # and a `scope:` term compiles to a real clause under either lens. The filter is
+          # recompiled with the project's lens below, once there is one.
+          parsed = QL.parse(q, scope: QL::SCOPE_SHAPE_ONLY)
           # Both halves, not just invalid-regex: an UNRECOGNIZED field is dropped by QL and
           # broadens the scan, which is the direction that matters here — see Run.warn_query_terms.
           Run.warn_query_terms("probe", q)
@@ -117,6 +120,17 @@ module Gori
 
         store = open_store(resolve_read_project(project_name, db_path))
         scope = Scope.load(store)
+        # The one term that could not be compiled before the store opened. Off `scope`, which is
+        # loaded here anyway, so a `scope:` query costs no extra read — and only when the query
+        # names the field, since nothing else depends on the lens.
+        if (q = query) && QL.uses_scope?(q)
+          lens = scope.ql_lens
+          filter = QL.parse(q, scope: lens)
+          # An empty scan reads as CLEAN here — the same misreading the `--active` warning below
+          # exists to prevent — so the state a `scope:` query is silently empty in gets named,
+          # in the words `gori run history` uses.
+          Run.scope_query_notes(q, lens, in_scope).each { |n| STDERR.puts "gori run probe: #{n}" }
+        end
         # --active with no scope include rule (and no --allow-unscoped) probes NOTHING
         # (matches_url? requires ≥1 include) — warn so an empty active result isn't mistaken
         # for "clean".

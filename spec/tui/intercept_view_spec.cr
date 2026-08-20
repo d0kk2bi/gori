@@ -57,6 +57,29 @@ describe Gori::Tui::InterceptView do
     end
   end
 
+  # `scope:` is a field QL has and this gate refuses (#754): a hold gate evaluates a live
+  # message, and a project's scope rules are not part of one. The refusal compiles to a
+  # never-match, which un-negated holds nothing and NEGATED holds everything — so the bar has to
+  # say so while the condition is still being typed, which is the only place it can be fixed.
+  it "says so when the catch condition names a field the gate cannot answer" do
+    tmp_interceptor do |ic|
+      view = InterceptView.new
+      view.reload(ic)
+      view.start_query
+      "scope:in".each_char { |c| view.query_insert(c) }
+      backend = MemoryBackend.new(100, 12)
+      view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
+      backend.contains?("`scope:` is not available here").should be_true
+
+      # An ordinary condition gets the standing hint back — the note is not a permanent row.
+      view.cancel_query
+      view.start_query
+      backend2 = MemoryBackend.new(100, 12)
+      view.render(Screen.new(backend2), Rect.new(0, 0, 100, 12))
+      backend2.contains?("`scope:` is not available here").should be_false
+    end
+  end
+
   it "syntax-highlights the held request bytes in the detail pane" do
     tmp_interceptor do |ic|
       hold_req(ic, "acme.test", "/login", "GET /login HTTP/1.1\r\nHost: acme.test\r\n\r\n")

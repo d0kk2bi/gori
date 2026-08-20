@@ -562,6 +562,114 @@ describe "Gori::Store#search (QL)" do
     end
   end
 
+  # --- scope: (#754) -------------------------------------------------------------------------
+  # The field QL cannot answer on its own: the rules are the PROJECT's, so a surface has to hand
+  # the predicate in (`QL::ScopeLens`). Every property below is one an operator would be misled
+  # by if it silently went the other way.
+  describe "scope:" do
+    it "compiles scope:in to the lens predicate and scope:out to its negation" do
+      lens = Gori::QL::ScopeLens.new(Gori::QL::Filter.new("(host = ?)", ["acme.test"] of DB::Any))
+      Gori::QL.parse("scope:in", scope: lens).sql.should eq("((host = ?))")
+      Gori::QL.parse("scope:in", scope: lens).args.should eq(["acme.test"])
+      Gori::QL.parse("scope:out", scope: lens).sql.should eq("(NOT ((host = ?)))")
+      Gori::QL.parse("scope:out", scope: lens).args.should eq(["acme.test"])
+      # `-scope:in` and `scope:out` are the same question spelled two ways — WITH a lens.
+      Gori::QL.parse("-scope:in", scope: lens).sql.should eq(Gori::QL.parse("scope:out", scope: lens).sql)
+    end
+
+    # The lens contributes its OWN bound values, in the middle of the query's. `tree_sql`
+    # appends args depth-first to match the `?` order it emits; a scope term is the first term
+    # to carry more than one, so this is where that discipline is worth pinning.
+    it "keeps the lens's args in placeholder order among the other terms'" do
+      lens = Gori::QL::ScopeLens.new(
+        Gori::QL::Filter.new("(host = ? OR host = ?)", ["a.test", "b.test"] of DB::Any))
+      f = Gori::QL.parse("method:POST scope:in status:404", scope: lens)
+      f.args.should eq(["POST", "a.test", "b.test", 404])
+    end
+
+    # Nothing is in scope, so the question has no answer. NOT the complement: `NOT (0)` is every
+    # flow, and `history delete -q scope:out --yes` would then empty an unconfigured project past
+    # every guard there is (`reject_empty?` compares the SQL against `1`, not `NOT (0)`).
+    it "matches NOTHING — both spellings — when the project has no scope rules" do
+      unconf = Gori::QL::ScopeLens.new(nil)
+      Gori::QL.parse("scope:in", scope: unconf).sql.should eq("(0)")
+      Gori::QL.parse("scope:out", scope: unconf).sql.should eq("(0)")
+      # …and the term is APPLIED, not dropped: it compiled to a real clause, so nothing here is
+      # broader than what was asked and `strict:` has nothing to refuse.
+      a = Gori::QL.analyze("scope:in", scope: unconf)
+      a.applied.should eq(["scope:in"])
+      a.clean?.should be_true
+    end
+
+    # No lens at all is a different answer from an unconfigured one: this surface cannot answer
+    # the field, so the term is DROPPED — and every existing diagnostic then names it, which is
+    # the loud direction. (`side_prefixed?` above takes the same road for the same reason.)
+    it "DROPS the term, reported, on a surface that threads no lens" do
+      %w[scope:in scope:out].each do |q|
+        a = Gori::QL.analyze(q)
+        a.ignored.should eq([q]), "#{q} should be reported as dropped with no lens"
+        a.applied.should be_empty
+        a.clean?.should be_false
+        Gori::QL.reject_empty?(q, Gori::QL.parse(q)).should be_true # never match-all
+      end
+    end
+
+    # A value the field does not take is dropped rather than guessed — `proto:zzz`'s rule. Under
+    # a lens, so the drop is about the VALUE and not about the missing predicate.
+    it "drops a value that is not in/out" do
+      lens = Gori::QL::ScopeLens.new(Gori::QL::Filter.new("(1)", [] of DB::Any))
+      %w[scope:true scope:yes scope:].each do |q|
+        Gori::QL.analyze(q, scope: lens).applied.should be_empty, "#{q} should not compile"
+      end
+      Gori::QL.analyze("scope:IN", scope: lens).applied.should eq(["scope:IN"]) # case-folded
+    end
+
+    it "is offered, known, and answers uses_scope? through the compilers' own tokenizer" do
+      Gori::QL::FIELDS.should contain("scope")
+      Gori::QL.known_field?("scope").should be_true
+      Gori::QL.uses_scope?("host:a scope:out").should be_true
+      Gori::QL.uses_scope?("-scope:in").should be_true
+      Gori::QL.uses_scope?("host:acme").should be_false
+      # `scope` is not a REGEX field, so `scope~in` free-texts the whole token (the road
+      # `size~1` takes) and names no scope predicate — every surface that WARNS about a scope
+      # term must not speak about this one, or it warns about a term that is not there.
+      Gori::QL.uses_scope?("scope~in").should be_false
+      Gori::QL.parse("scope~in", scope: Gori::QL::ScopeLens.new(nil)).sql
+        .should eq(Gori::QL.parse("zzz~in", scope: Gori::QL::ScopeLens.new(nil)).sql)
+      # Quoting is NOT an escape: the grammar strips quotes before the field/value split, so
+      # `"scope:in"` is still a scope term — the same reading `host:"x"` gets, and the reason
+      # `field_shaped?` says a KNOWN field is a field use whatever its value holds.
+      Gori::QL.uses_scope?(%q("scope:in")).should be_true
+    end
+
+    # The claim the whole design rests on: `scope:in` IS the `--in-scope` predicate, not a
+    # respelling of it. Run against a real store, both ways, and compared row for row.
+    it "selects exactly what Scope#filter(force: true) selects" do
+      tmp_store do |store|
+        scope = Gori::Scope.load(store)
+        scope.add("include", "host", "acme.test")
+        scope.add("exclude", "host", "cdn.acme.test")
+        capture(store, "acme.test", "GET", "/x")
+        capture(store, "cdn.acme.test", "GET", "/y")
+        capture(store, "other.test", "GET", "/z")
+
+        lens = scope.ql_lens
+        by_term = store.search(Gori::QL.parse("scope:in", scope: lens), 50).map(&.host).sort
+        by_flag = store.search(scope.filter(force: true), 50).map(&.host).sort
+        by_term.should eq(by_flag)
+        by_term.should eq(["acme.test"])
+
+        out = store.search(Gori::QL.parse("scope:out", scope: lens), 50).map(&.host).sort
+        out.should eq(["cdn.acme.test", "other.test"])
+        # …and it composes: the term is a clause, not a lens the caller ANDs on.
+        store.search(Gori::QL.parse("scope:out host:cdn", scope: lens), 50)
+          .map(&.host).should eq(["cdn.acme.test"])
+        store.search(Gori::QL.parse("NOT (scope:in OR host:other)", scope: lens), 50)
+          .map(&.host).should eq(["cdn.acme.test"])
+      end
+    end
+  end
+
   it "accepts req./resp. size synonyms and reports namespaced fields as known" do
     Gori::QL.parse("req.size:>100").sql.should eq(Gori::QL.parse("reqsize:>100").sql)
     Gori::QL.parse("resp.size:>100").sql.should eq(Gori::QL.parse("respsize:>100").sql)

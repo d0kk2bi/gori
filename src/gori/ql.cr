@@ -16,6 +16,7 @@ module Gori
   #   size:>10000 dur:>=500 dur:<2s     # total bytes (req+resp) / latency (ms; ms|s)
   #   reqsize:>1000 respsize:<500       # request-only / response-only byte size
   #   header:set-cookie                 # substring over request/response head bytes
+  #   scope:in  scope:out               # the project's scope rules, ⇧S lens off or on
   #   body~secret\d+  host~^api\.       # `~` = regex (host path url header body)
   module QL
     # `:` fields:  see FIELDS below (the list every surface reads).
@@ -49,6 +50,33 @@ module Gori
 
     EMPTY = Filter.new("1", [] of DB::Any)
 
+    # The project's in-scope predicate, as a `scope:` term sees it. `predicate` is the
+    # include/exclude fragment `Scope#filter(force: true)` builds — the SAME fragment
+    # `gori run history --in-scope` and the TUI's ⇧S lens apply, threaded in rather than
+    # respelled, so `scope:in` IS that predicate and inherits its SQL⇄in-memory parity
+    # (PR #688) instead of re-earning it.
+    #
+    # nil `predicate` means the project has NO scope rules — nothing is in scope, so NEITHER
+    # spelling matches (see `scope_cond`). The wrapper exists because that state has to be
+    # distinguishable from "this surface cannot answer scope at all", which is `scope: nil` at
+    # `parse` and DROPS the term; `Filter??` is not a type Crystal has.
+    record ScopeLens, predicate : Filter? do
+      # Does the project have scope rules at all? The one question a surface asks to decide
+      # whether to say "nothing is in scope" out loud (`ql_explain`, the delete refusal).
+      def configured? : Bool
+        !@predicate.nil?
+      end
+    end
+
+    # The lens for a caller checking only a query's SHAPE — does a term drop, does the whole
+    # thing fold to match-all — with no project in hand: `Colormarker.unusable_reason`, the
+    # `history delete` pre-store guard, `Run.warn_query_terms`. It answers as an unconfigured
+    # project, and the shape is identical either way (`scope:in` compiles to a never-match
+    # clause, not to nothing), where the honest-looking alternative — passing nil — would
+    # report every `scope:` term as DROPPED at exactly the surfaces whose job is to refuse a
+    # dropped term.
+    SCOPE_SHAPE_ONLY = ScopeLens.new(nil)
+
     # The scope/QL-matching URL for a STORED flow: `scheme://host` + `target`, UNLESS
     # `target` is already ABSOLUTE-FORM (case-insensitive `http://`/`https://` — the wire
     # shape a plain-HTTP forward-proxy request arrives in), in which case it already
@@ -79,7 +107,7 @@ module Gori
       NOT > AND > OR. `-term` and `NOT term` are equivalent.
 
       Fields (use : for value match, ~ for regex):
-        host path method scheme proto status size reqsize respsize dur header body url stub
+        host path method scheme proto status size reqsize respsize dur header body url stub scope
 
       Sides: header: and body: search the REQUEST AND THE RESPONSE. Prefix either with `req.` or
       `resp.` to search one side — req.body:token resp.header:set-cookie resp.body~secret\\d+ —
@@ -98,6 +126,16 @@ module Gori
       Short-circuited: stub:true  stub:false  — flows gori answered ITSELF from a Match&Replace
       short-circuit rule, with NO origin involved. Their response bytes came from the rule, not
       from the server, so `stub:false` is what you want before treating History as evidence.
+
+      Scope: scope:in  scope:out  — the project's scope rules (the include/exclude boundary the
+      TUI's ⇧S lens and `--in-scope` apply), as an ordinary term: it negates and it groups.
+      INDEPENDENT of whether that lens is switched on, because a filter term is a question, not
+      a mode. With NO scope rules configured nothing is in scope, so `scope:in` AND `scope:out`
+      both match nothing — the question is not asked rather than answered "everything". Note
+      that makes `-scope:in` (which matches everything, like any negated never-match) different
+      from `scope:out` in that one state; ql_explain says when a project has no scope rules. On
+      a surface with no project scope at all the term is DROPPED like a bad numeric, and
+      ql_explain / strict:true name it.
 
       Regex (~): host~^api\\.  body~secret\\d+  path~/admin
 
@@ -168,8 +206,17 @@ module Gori
     # a proxy scrolls all day. `Rules::RULE_PREVIEW_BODY_MAX` made the identical trade for the
     # Rewriter's preview, and states the identical consequence: a match past the cap is missed.
     # Heads are NOT capped — a head is bounded by the codec long before it reaches here.
-    def self.parse(query : String, *, fts : Bool = true, body_max : Int32? = nil) : Filter
-      tree = FilterAst.build(FilterAst.parse(query)) { |t| term_to_sql(t, fts, body_max) }
+    # `scope` is the project's in-scope predicate (see `ScopeLens`), and it is what makes the
+    # `scope:` field answerable: QL compiles SQL over the `flows` projection and has no way to
+    # reach a project's scope rules, so a surface that wants the term has to hand the predicate
+    # in. nil — the default — means this surface cannot answer scope, and a `scope:` term is
+    # DROPPED and reported (`analyze`, `ql_explain`, `strict:`, `Colormarker.unusable_reason`)
+    # rather than silently compiled to something. Threaded through `parse` rather than ANDed
+    # onto the result by the caller so `scope:` is an ordinary term: it negates (`-scope:in`),
+    # it groups (`NOT (scope:in OR host:cdn)`), and it can sit inside an OR.
+    def self.parse(query : String, *, fts : Bool = true, body_max : Int32? = nil,
+                   scope : ScopeLens? = nil) : Filter
+      tree = FilterAst.build(FilterAst.parse(query)) { |t| term_to_sql(t, fts, body_max, scope) }
       return EMPTY unless tree
       args = [] of DB::Any
       Filter.new(wrap_sql(tree, args), args)
@@ -225,11 +272,14 @@ module Gori
       end
     end
 
-    def self.analyze(query : String) : TermAnalysis
+    # `scope` must be the SAME lens the query will be `parse`d with, or the diagnosis disagrees
+    # with the compilation about one field: with no lens a `scope:` term is dropped, so a
+    # surface that threads one and analyses without it reports a term it in fact applied.
+    def self.analyze(query : String, *, scope : ScopeLens? = nil) : TermAnalysis
       applied = [] of String
       ignored = [] of String
       FilterAst.terms(FilterAst.parse(query)).each do |term|
-        (term_to_sql(term) ? applied : ignored) << term.source
+        (term_to_sql(term, scope: scope) ? applied : ignored) << term.source
       end
       TermAnalysis.new(applied, ignored, invalid_regex_terms(query))
     end
@@ -238,7 +288,7 @@ module Gori
     # History's and Colormarker's completion pools, Colormarker's unknown-field refusal and the
     # docs all read it, so a field added to `field_cond` becomes offerable everywhere at once
     # instead of in the four hand-kept copies that used to drift.
-    FIELDS = %w[host path url method scheme proto status size reqsize respsize dur header body stub
+    FIELDS = %w[host path url method scheme proto status size reqsize respsize dur header body stub scope
       req.header resp.header req.body resp.body]
 
     REGEX_FIELDS = %w[host path url header body req.header resp.header req.body resp.body]
@@ -368,11 +418,20 @@ module Gori
       "header"      => "head bytes, BOTH sides — see req./resp.",
       "body"        => "body via index: 8 KiB/side, no compressed",
       "stub"        => "true = gori answered it, origin never saw it",
+      "scope"       => "in / out — the project's scope rules",
       "req.header"  => "request head bytes only",
       "resp.header" => "response head bytes only",
       "req.body"    => "request body only",
       "resp.body"   => "response body only",
     }
+
+    # `scope:`'s WHOLE value vocabulary, not a sample — the field has exactly two spellings and
+    # neither is guessable from its name (`scope:true` is the natural first try, and QL drops it).
+    # It lives beside the field's own help rather than in a surface's pool because BOTH completion
+    # backends need it: History's own value table and `InterceptFilter.suggest_values`, which is
+    # what the colour-rule overlay completes QL's wider field list through. Written out twice, it
+    # would silently keep offering two spellings the day the field learns a third.
+    SCOPE_VALUES = %w[in out]
 
     # The fields the one-line hints SAMPLE, in the order that reads best on a bar. A hint gets one
     # terminal row and `FIELDS` has eighteen entries, so something has to choose; choosing once
@@ -406,6 +465,7 @@ module Gori
       {"-status: -dur: -respsize:", "a pending flow has NULL there and falls out of both"},
       {"a dropped term broadens", "status:>=foo is ignored, not refused — use ql_explain"},
       {"a bad regex matches nothing", "body~[ is a HARD error, never silently dropped"},
+      {"scope: with no scope rules", "nothing is in scope, so in AND out match nothing"},
     ]
 
     # The grammar itself — everything that is NOT a field name, as {what you type, what it does}.
@@ -476,14 +536,14 @@ module Gori
     # `term.text` arrives already stripped of its quotes and `-` prefix by the grammar;
     # the negation rides on `term.negate?` and wraps whatever the field compiled to.
     private def self.term_to_sql(term : FilterAst::Term, fts : Bool = true,
-                                 body_max : Int32? = nil) : SqlTerm?
+                                 body_max : Int32? = nil, scope : ScopeLens? = nil) : SqlTerm?
       text = term.text
       return nil if text.empty?
 
       result =
         if split = split_field(text)
           field, value, op = split
-          op == :regex ? regex_cond(field, value, text, body_max) : field_cond(field, value, text, fts, body_max)
+          op == :regex ? regex_cond(field, value, text, body_max) : field_cond(field, value, text, fts, body_max, scope)
         else
           free_text(text)
         end
@@ -494,7 +554,8 @@ module Gori
     end
 
     private def self.field_cond(field : String, value : String, term : String,
-                                fts : Bool = true, body_max : Int32? = nil) : {String, Array(DB::Any)}?
+                                fts : Bool = true, body_max : Int32? = nil,
+                                scope : ScopeLens? = nil) : {String, Array(DB::Any)}?
       return nil if value.empty?
       # Resolve an accepted-but-not-offered spelling to its canonical name FIRST, so every arm
       # below (and `size_cond`'s own three-way switch) sees one name per concept.
@@ -512,6 +573,7 @@ module Gori
       when "header", "req.header", "resp.header" then header_cond(value, side_of(field))
       when "body", "req.body", "resp.body"       then body_cond(value, fts, body_max, side_of(field))
       when "stub"                                then stub_cond(value)
+      when "scope"                               then scope_cond(value, scope)
       else
         # A side prefix we OWN, on a field that has no side. `resp.status:200` is not a typo the
         # way `hosst:x` is — it is a correct guess at a namespace this module advertises, made by
@@ -550,6 +612,56 @@ module Gori
       when "true", "yes", "on", "1"  then {"short_circuited = 1", no_args}
       when "false", "no", "off", "0" then {"short_circuited = 0", no_args}
       end
+    end
+
+    # scope: selects flows by the project's SCOPE rules — `scope:in` for the include/exclude
+    # boundary, `scope:out` for everything outside it. The same predicate the ⇧S History lens
+    # and `--in-scope` apply, and DELIBERATELY independent of the persisted ⇧S flag: a filter
+    # term is the operator asking a question, not a mode, so `scope:in` must mean the same
+    # thing whether the lens happens to be on (see `ScopeLens`, which is built with
+    # `Scope#filter(force: true)`).
+    #
+    # Three ways this term does not compile, and each is a different answer on purpose:
+    #
+    #   no lens         the surface cannot answer scope at all — DROPPED, and reported
+    #                   (`analyze`/`ql_explain`/`strict:`) like a bad numeric.
+    #   no scope rules  the project has no scope, so nothing is in scope: BOTH spellings
+    #                   compile to the never-match clause. Not the complement — `scope:out`
+    #                   as `NOT (0)` would mean EVERY flow, which is how
+    #                   `history delete -q scope:out --yes` would empty an unconfigured
+    #                   project past every guard (`reject_empty?` sees `NOT (0)`, not `1`).
+    #                   A question about a scope that does not exist is not asked.
+    #   another value   `scope:yes` is dropped rather than guessed, like `proto:zzz`.
+    #
+    # The never-match is a LEAF, so `-scope:in` on an unconfigured project still matches
+    # everything — the same asymmetry a dropped term has (`REFERENCE` states it), and the
+    # reason `ql_explain` and the delete guard say "no scope rules are configured" out loud
+    # instead of leaving it to be inferred from an empty result.
+    private def self.scope_cond(value : String, scope : ScopeLens?) : {String, Array(DB::Any)}?
+      return nil unless scope
+      never = {"0", [] of DB::Any}
+      case value.downcase
+      when "in"  then (pred = scope.predicate) ? {pred.sql, pred.args} : never
+      when "out" then (pred = scope.predicate) ? {"NOT (#{pred.sql})", pred.args} : never
+      end
+    end
+
+    # Does `query` name the `scope:` field — as a field this module will really COMPILE? Asked by
+    # every surface that must say something about a scope term it cannot fully honour:
+    # `ql_explain`'s warning, the `history delete` refusal, `Colormarker`'s decision to re-read
+    # the lens and its author note, HistoryView's empty-list note.
+    #
+    # `!u.regex` is load-bearing. `scope` is not in `REGEX_FIELDS`, so `scope~in` takes
+    # `regex_cond`'s free-text fallback (the same road `size~1` takes) and names no scope
+    # predicate at all — counting it would make every one of those surfaces speak about a term
+    # that is not there: a note claiming a dead rule follows the scope rules, a warning about a
+    # project's missing scope on a query that never asked, a refused delete, and a poll tick
+    # re-reading `scope_rules` for a rule that never consults the lens.
+    #
+    # `InterceptFilter.unsupported_fields` deliberately does NOT filter that way: that backend
+    # refuses the NAME, before the operator split, so `scope~in` is a refused term there.
+    def self.uses_scope?(query : String) : Bool
+      fields_used(query).any? { |u| u.name == "scope" && !u.regex }
     end
 
     # proto: classifies a flow by application protocol —

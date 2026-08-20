@@ -1,6 +1,7 @@
 require "./store"
 require "./settings"
 require "./intercept_filter"
+require "./scope"
 require "./filter_ast"
 require "./ql"
 require "./proto"
@@ -40,6 +41,14 @@ module Gori
   #     `InterceptFilter`, exactly as before, with no store access at all.
   #   STORE tier — anything else. Compiled by `QL.parse(…, fts: false)` and answered by one
   #     `Store#ids_matching` over the ids being painted.
+  #
+  # `scope:` belongs to the STORE tier for a reason one step removed from the others: the rules
+  # are not in the row OR in the bytes, they are the PROJECT's. The tier split gets that right for
+  # free — `ROW_FIELDS` subtracts from `InterceptFilter::FIELDS`, and this backend refuses `scope:`
+  # by name (it has no scope to consult, see there) — so a `scope:` condition falls to the store,
+  # where `compile` threads the project's lens (`Scope.ql_lens`) into `QL.parse`. The lens is
+  # re-read on every `refresh` that a scope-naming rule is live for, so adding a scope rule
+  # repaints the list on the next poll rather than leaving a stale boundary painted.
   #
   # The tiers cover DISJOINT rule sets, so the two matchers can never disagree about one rule;
   # for the fields they both implement (`host` `path` `method` `scheme` `status` `proto`, and
@@ -106,6 +115,12 @@ module Gori
     # Whether any enabled rule landed in the STORE tier. Read per FRAME (not per row) to decide
     # whether `prefetch` has anything to do, so it is cached here rather than scanned.
     @needs_store : Bool
+    # Whether any enabled rule names `scope:`, and the lens those rules compiled against. Both
+    # are `refresh`'s state and nothing else's: they exist so a scope-rule edit repaints a
+    # `scope:` colour rule (the lens is part of what its SQL says) WITHOUT costing a store read
+    # per poll tick on the overwhelmingly common project where no colour rule mentions scope.
+    @needs_scope_lens : Bool
+    @scope_lens : QL::ScopeLens?
     # Store-tier answers: flow id → {rule index in `@compiled` → matched?}. Dropped wholesale by
     # `refresh` (the compiled list those indices refer to is gone) and per id by `forget` (the
     # row's own bytes changed). Bounded by `SQL_CACHE_MAX` flows, so a session that scrolls a
@@ -125,7 +140,9 @@ module Gori
       @sql_hits = {} of Int64 => Hash(Int32, Bool)
       @rules = rules
       @custom_colors = Settings.colormarker_colors
-      @compiled = compile(rules)
+      @needs_scope_lens = Colormarker.needs_scope_lens?(rules)
+      @scope_lens = @needs_scope_lens ? Scope.ql_lens(@store) : nil
+      @compiled = compile(rules, @scope_lens)
       @active = !@compiled.empty?
       @needs_store = @compiled.any?(&.sql)
       @strip_active = @compiled.any?(&.rule.style.strip?)
@@ -491,6 +508,13 @@ module Gori
     # literal list this would silently go stale the next time `InterceptFilter` learns a field.
     # It already did once — `header:` was added to that list and instantly became "row-answerable",
     # so a `header:` rule compiled into the ROW tier and matched a Subject whose `head` is nil.
+    #
+    # `scope:` is out of it the same way, one indirection along: it is not in
+    # `InterceptFilter::FIELDS` because that backend has no project scope to consult (it refuses
+    # the name outright — see `InterceptFilter::UNSUPPORTED_FIELDS`), so the subtraction leaves it
+    # out and a `scope:` rule lands on the store tier, which threads the real lens. That is the
+    # same indirection the paragraph above says already broke once, so `colormarker_spec` pins the
+    # tier a `scope:` rule compiles into rather than trusting the derivation to stay true.
     ROW_FIELDS = InterceptFilter::FIELDS - QL::CONTENT_FIELDS
 
     # Can `match` answer this condition from the row projection alone? Drives the tier split in
@@ -545,8 +569,16 @@ module Gori
       # Compiled the way `compile` compiles it, so what is judged match-all is what would RUN.
       # BEFORE the dropped-term check below, so a condition whose EVERY term was dropped keeps
       # naming the worse consequence: it paints every row, not merely one term fewer.
-      return "this condition matches every flow" if QL.reject_empty?(match_filter, QL.parse(match_filter, fts: false))
-      if bad = QL.analyze(match_filter).ignored.first?
+      #
+      # `SCOPE_SHAPE_ONLY` is the lens both compiles below run under, and it is not a shortcut:
+      # whether the project HAS scope rules is not a property of the rule being validated (it
+      # changes while the rule stands), and the two things asked here — does a term drop, does
+      # the whole condition fold to match-all — answer identically under either lens. Passing
+      # nothing instead would report `scope:in` as a DROPPED term and refuse, at every surface,
+      # the one field `compile` goes out of its way to answer.
+      shape = QL.parse(match_filter, fts: false, scope: QL::SCOPE_SHAPE_ONLY)
+      return "this condition matches every flow" if QL.reject_empty?(match_filter, shape)
+      if bad = QL.analyze(match_filter, scope: QL::SCOPE_SHAPE_ONLY).ignored.first?
         return "`#{bad}` is not a value that field takes — it would be dropped, and the rule would paint more"
       end
       nil
@@ -591,6 +623,15 @@ module Gori
       if lower.includes?("status:")
         notes << "a flow with no response yet has no status; the row is painted once the response lands."
       end
+      # Said unconditionally rather than only when the project has no scope rules: this runs
+      # where a rule is WRITTEN, the rule outlives that state, and the surprising half — that
+      # `scope:` ignores the ⇧S lens on purpose — is true either way.
+      if QL.uses_scope?(match_filter)
+        notes << "`scope:` applies the project's include/exclude rules whether or not the ⇧S " \
+                 "lens is on, and follows them as they change. With NO scope rules configured " \
+                 "nothing is in scope, so `scope:in` and `scope:out` both paint nothing — while a " \
+                 "NEGATED one (`-scope:in`) paints EVERY row in that state, so prefer `scope:out`."
+      end
       notes
     end
 
@@ -612,8 +653,12 @@ module Gori
                      limit : Int32 = PREVIEW_SCAN) : Preview
       rows = store.recent_flows(limit, nil)
       ids = rows.map(&.id)
-      candidate = resolve_over(store, match_filter, ids)
-      ahead = existing.select(&.enabled?).map { |r| resolve_over(store, r.match_filter, ids) }
+      # Read ONCE for the candidate and every rule ahead of it, so a `scope:` term previews
+      # against the same boundary `compile` would paint with — and so this keystroke-path scan
+      # adds one small `scope_rules` read, not one per rule.
+      lens = Scope.ql_lens(store)
+      candidate = resolve_over(store, match_filter, ids, lens)
+      ahead = existing.select(&.enabled?).map { |r| resolve_over(store, r.match_filter, ids, lens) }
       scanned = 0
       matched = 0
       painted = 0
@@ -644,9 +689,11 @@ module Gori
       end
     end
 
-    private def self.resolve_over(store : Store, match_filter : String, ids : Array(Int64)) : Resolved
+    private def self.resolve_over(store : Store, match_filter : String, ids : Array(Int64),
+                                  lens : QL::ScopeLens) : Resolved
       return Resolved.new(InterceptFilter.new(match_filter), nil) if row_answerable?(match_filter)
-      Resolved.new(nil, store.ids_matching(QL.parse(match_filter, fts: false, body_max: BODY_SCAN_MAX), ids))
+      Resolved.new(nil, store.ids_matching(
+        QL.parse(match_filter, fts: false, body_max: BODY_SCAN_MAX, scope: lens), ids))
     end
 
     # --- one-line rule formatting (shared) -------------------------------------------------
@@ -666,11 +713,22 @@ module Gori
       # would recompile every filter AND bump `revision`, throwing away History's per-row memo on
       # a frame where nothing moved. The custom-colour half is what makes a hex edit — which
       # touches no rule, since a rule names its colour — still repaint the list.
-      return if fresh == @rules && fresh_custom == @custom_colors
-      compiled = compile(fresh)
+      # A `scope:` rule's SQL CONTAINS the project's scope predicate, so the rules being
+      # unchanged is no longer enough to bail out: adding a scope rule changes what an unchanged
+      # colour rule paints. `needs_scope_lens?` is recomputed only when the rule list itself
+      # moved — it tokenizes every enabled condition, and this runs on the ~1 s data_version
+      # poll — so a project with no scope-naming rule pays nothing here, and one with a
+      # scope-naming rule pays one small `scope_rules` read per tick.
+      unchanged = fresh == @rules && fresh_custom == @custom_colors
+      needs_scope_lens = unchanged ? @needs_scope_lens : Colormarker.needs_scope_lens?(fresh)
+      fresh_lens = needs_scope_lens ? Scope.ql_lens(@store) : nil
+      return if unchanged && fresh_lens == @scope_lens
+      compiled = compile(fresh, fresh_lens)
       @mutex.synchronize do
         @rules = fresh
         @custom_colors = fresh_custom
+        @needs_scope_lens = needs_scope_lens
+        @scope_lens = fresh_lens
         @compiled = compiled
         @active = !compiled.empty?
         @needs_store = compiled.any?(&.sql)
@@ -690,14 +748,20 @@ module Gori
     # This is where a rule is sorted into its tier (see the class header). `row_answerable?`
     # decides, and it decides from the same tokenization the compilers use, so a rule cannot
     # land in the ROW tier carrying a term `InterceptFilter` would silently free-text.
-    private def compile(list : Array(Store::ColorRule)) : Array(Compiled)
+    private def compile(list : Array(Store::ColorRule), lens : QL::ScopeLens?) : Array(Compiled)
       list.select(&.enabled?).map do |r|
         if Colormarker.row_answerable?(r.match_filter)
           Compiled.new(r, InterceptFilter.new(r.match_filter), nil)
         else
-          Compiled.new(r, nil, QL.parse(r.match_filter, fts: false, body_max: BODY_SCAN_MAX))
+          Compiled.new(r, nil, QL.parse(r.match_filter, fts: false, body_max: BODY_SCAN_MAX, scope: lens))
         end
       end
+    end
+
+    # Does any ENABLED rule name `scope:`? Enabled only, because `compile` compiles nothing else,
+    # and a disabled rule must not make every poll tick re-read the scope rules.
+    protected def self.needs_scope_lens?(list : Array(Store::ColorRule)) : Bool
+      list.any? { |r| r.enabled? && QL.uses_scope?(r.match_filter) }
     end
   end
 end

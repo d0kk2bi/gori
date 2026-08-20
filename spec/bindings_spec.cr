@@ -103,6 +103,27 @@ describe Gori::Bindings do
       end
     end
 
+    # A `when:` condition naming a field this backend REFUSES (`scope:` — its rules are the
+    # project's, not the message's) compiles to a never-match, so a saved rule never fires, and a
+    # NEGATED one fires on every response. Refused at this chokepoint rather than in one surface's
+    # argument parsing, for the reason the range refusal below states: the CLI and MCP both write
+    # through `Bindings`, so a check that lives in a form is a check two surfaces do not have.
+    it "refuses a when: condition naming a field a hold gate cannot answer" do
+      with_store do |store|
+        b = Gori::Bindings.load(store)
+        b.add("SESSION", "scope:in", Gori::ExtractKind::Cookie, "sid").not_nil!
+          .should contain("`scope:` is not available")
+        b.rules.should be_empty
+
+        # …on an edit as well as a create, or the term arrives by the other door.
+        b.add("SESSION", "path:/login", Gori::ExtractKind::Cookie, "sid").should be_nil
+        id = b.rules.first.id
+        b.update(id, "SESSION", "-scope:out", Gori::ExtractKind::Cookie, "sid").not_nil!
+          .should contain("`scope:` is not available")
+        b.rules.first.match_filter.should eq("path:/login")
+      end
+    end
+
     it "lets a rule keep its own name when edited" do
       with_store do |store|
         b = Gori::Bindings.load(store)

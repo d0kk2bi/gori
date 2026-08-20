@@ -79,6 +79,31 @@ describe Gori::Tui::ExtractRuleOverlay do
     ov.selector.should eq("token=(\\w+)")
   end
 
+  # A `when:` condition is an `InterceptFilter` source, and that backend refuses `scope:` by
+  # compiling it to a never-match — it evaluates a live message, and a project's scope rules are
+  # not part of one. Refused HERE, unlike the transient intercept bar, because an extract rule
+  # PERSISTS: saved, it is a rule that never fires (or, negated, one that fires on every
+  # response) with nothing anywhere to say why.
+  it "refuses a when: condition naming a field the hold-gate backend cannot answer" do
+    rule = Gori::Store::ExtractRule.new(7_i64, true, "SESSION", "scope:in",
+      Gori::ExtractKind::Regex, "token=(\\w+)", 0, 0, "")
+    ov = ExtractRuleOverlay.editing(rule)
+    reason = ov.invalid_reason.not_nil!
+    reason.should contain("`scope:`")
+    reason.should contain("colour rules")
+    ov.valid?.should be_false
+
+    # …and an ordinary condition on the same form is untouched.
+    ok = Gori::Store::ExtractRule.new(7_i64, true, "SESSION", "path:/login",
+      Gori::ExtractKind::Regex, "token=(\\w+)", 0, 0, "")
+    ExtractRuleOverlay.editing(ok).invalid_reason.should be_nil
+    # The `~` spelling takes the same road — whether a name was meant as a field is not an
+    # operator's business (`parse_term` refuses before the operator split).
+    scoped_rx = Gori::Store::ExtractRule.new(7_i64, true, "SESSION", "scope~in",
+      Gori::ExtractKind::Regex, "token=(\\w+)", 0, 0, "")
+    ExtractRuleOverlay.editing(scoped_rx).invalid_reason.not_nil!.should contain("`scope:`")
+  end
+
   it "reports the INJECTED refusal on the Save row rather than deciding for itself" do
     ov = ExtractRuleOverlay.adding
     "SESSION".each_char { |c| ov.handle_key(skey(Termisu::Input::Key::LowerA, c)) }

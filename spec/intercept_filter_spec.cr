@@ -169,6 +169,59 @@ describe Gori::InterceptFilter do
     Gori::InterceptFilter.new("host:").matches?(req).should be_true
   end
 
+  # A field QL implements and this backend cannot answer (#754). The two things that must be
+  # true, and the one consequence that must be stated rather than fixed:
+  #   * it does NOT free-text. `scope:in` searching method/host/target for the literal string
+  #     would match nothing and read as "no traffic is in scope" — the silent answer.
+  #   * negated, a never-match holds EVERYTHING. That is why the surfaces where such a condition
+  #     can be typed or saved refuse it (`ExtractRuleOverlay#invalid_reason`, the intercept bar's
+  #     note), and it is pinned here so the refusals are not quietly deleted as belt-and-braces.
+  describe "a field this backend refuses (scope:)" do
+    it "compiles to a never-match instead of free-texting the token" do
+      Gori::InterceptFilter.new("scope:in").matches?(req).should be_false
+      Gori::InterceptFilter.new("scope:out").matches?(req).should be_false
+      Gori::InterceptFilter.new("scope~in").matches?(req).should be_false
+      # …and it is not free text: a subject whose target CONTAINS the token still fails, where
+      # the unknown-field fallback would have matched it.
+      Gori::InterceptFilter.new("scope:in").matches?(req(target: "/x?q=scope:in")).should be_false
+      # An unknown field is UNCHANGED — it still free-texts the whole token.
+      Gori::InterceptFilter.new("hsot:acme").matches?(req(target: "/hsot:acme")).should be_true
+    end
+
+    it "holds everything when negated — the consequence the save/type surfaces refuse" do
+      Gori::InterceptFilter.new("-scope:in").matches?(req).should be_true
+    end
+
+    # The mid-type contract `parse_term`'s header states, and this bar applies its condition on
+    # EVERY keystroke: an empty value DROPS, like `host:` does, so the `:` in `scope:` cannot stop
+    # the gate holding (or, under `-`, make it hold everything) before the value that makes the
+    # term refusable has been typed.
+    it "drops an empty value while it is being typed, like every other field" do
+      Gori::InterceptFilter.new("scope:").blank?.should be_true
+      Gori::InterceptFilter.new("scope:").matches?(req).should be_true
+      Gori::InterceptFilter.new("-scope:").matches?(req).should be_true
+      Gori::InterceptFilter.new("scope~").blank?.should be_true
+      # …and the refusal is back the moment there IS a value.
+      Gori::InterceptFilter.new("scope:i").matches?(req).should be_false
+    end
+
+    it "names itself for the surfaces that have to say so" do
+      Gori::InterceptFilter.unsupported_fields("host:acme scope:in").should eq(["scope"])
+      Gori::InterceptFilter.unsupported_fields("scope~in").should eq(["scope"])
+      Gori::InterceptFilter.unsupported_fields("host:acme").should be_empty
+      # Not offered, not described, not completed — the three lists a completion row reads.
+      Gori::InterceptFilter::FIELDS.should_not contain("scope")
+      Gori::InterceptFilter::FIELD_HELP.has_key?("scope").should be_false
+      Gori::InterceptFilter.suggestions("scope:i", 7).should be_empty
+      # …but the SAME value table serves the colour-rule overlay, which passes QL's wider pool.
+      Gori::InterceptFilter.suggestions("scope:i", 7, fields: Gori::QL::FIELDS)
+        .should contain("scope:in")
+      # One pool for the field, read by both completion backends (History has its own value
+      # table) — not two literal copies that drift the day the field learns a third spelling.
+      Gori::QL::SCOPE_VALUES.should eq(["in", "out"])
+    end
+  end
+
   describe ".suggestions" do
     it "completes field names, then that field's values" do
       Gori::InterceptFilter.suggestions("me", 2).should eq(["method:"])

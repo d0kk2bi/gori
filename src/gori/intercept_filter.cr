@@ -41,6 +41,12 @@ module Gori
   # at all, so `Colormarker` compiles those conditions to QL and asks the store instead. See its
   # class header for the tier split.
   #
+  # The same rule decides `scope:`, one level up: what is in hand here is a MESSAGE, and a
+  # project's scope rules are not part of one. Two of this filter's three callers hold no Scope
+  # at all, so the field is refused by name rather than answered at one surface and silently
+  # false at the others — `UNSUPPORTED_FIELDS` has the whole argument, including what a NEGATED
+  # refusal does to a hold gate.
+  #
   # And in every row of that table the bytes are WIRE bytes, which is worth stating because the
   # extract case makes it easy to assume otherwise: `Bindings#observe_response` evaluates the
   # condition BEFORE any decode (deliberately — see `candidates` there, it is what keeps a rule
@@ -79,7 +85,8 @@ module Gori
     end
 
     # One parsed predicate. `field` is :host/:path/:url/:method/:scheme/:status/:proto/:header/
-    # :body, :text for a bare free-text word, or :never for a `~` whose pattern would not compile.
+    # :body, :text for a bare free-text word, or :never for a `~` whose pattern would not compile
+    # — or for a field QL implements and this backend refuses (`UNSUPPORTED_FIELDS`).
     # `pattern` is non-nil exactly when the term was written with `~`. Negation flips the result
     # (mirrors QL's `-term`).
     private record Term, field : Symbol, value : String, negate : Bool, pattern : Regex? = nil do
@@ -121,7 +128,7 @@ module Gori
         when :proto  then InterceptFilter.proto_name(s.proto) == value
         when :header then (h = s.head) ? InterceptFilter.bytes_include?(h, value) : false
         when :body   then (p = s.payload) ? InterceptFilter.bytes_include?(p, value) : false
-        when :never  then false # a `~` whose pattern would not compile — see `parse_term`
+        when :never  then false # an uncompilable `~`, or a refused field — see `parse_term`
         else                    # :text — free-text substring over method/host/target
           s.method.downcase.includes?(value) || s.host.downcase.includes?(value) ||
             s.target.downcase.includes?(value)
@@ -139,6 +146,48 @@ module Gori
     # Must stay in lockstep with `field_symbol` below: completing a field this parser doesn't
     # know would silently degrade the whole token to free text (see `parse_term`).
     FIELDS = %w[host path url method scheme status proto header body]
+
+    # Fields QL implements that this backend REFUSES BY NAME, and the whole of that list.
+    #
+    # `scope:` is one because a hold gate has no project scope to consult and cannot be given one
+    # honestly: the interceptor could compute it (it already evaluates `Scope#in_scope_url?` per
+    # message), but the other two callers of this filter cannot — `Bindings#observe_response`
+    # (extract-rule conditions) holds no Scope at all, and neither does the repeater's sender. A
+    # field that answers correctly at one of three surfaces and silently FALSE at the other two is
+    # the failure this backend's "what is in hand" table exists to prevent, so the term is refused
+    # everywhere instead. History, colour rules and MCP answer it via `QL::ScopeLens`.
+    #
+    # Refused means `:never`, NOT free text. An unknown field free-texts the whole token, which
+    # for `scope:in` would search method/host/target for the literal string, match nothing, and
+    # read as "no traffic is in scope" — the silent answer this file refuses to give. `:never` is
+    # the same clause an uncompilable `~` gets, and it carries the same caveat: NEGATED
+    # (`-scope:in`) it holds EVERYTHING, which on a hold gate is the proxy path and not a display
+    # list. That is why the surfaces where such a condition can be TYPED or SAVED name it —
+    # `ExtractRuleOverlay#invalid_reason` refuses it outright (an extract rule persists), and the
+    # intercept bar paints the field muted (`GATE_KNOWN`) and notes it beside the condition.
+    UNSUPPORTED_FIELDS = %w[scope]
+
+    # Does `source` name a field this backend refuses? For a surface that has to SAY so; reads
+    # `QL.fields_used`, the tokenizer both backends compile through, so it reports exactly the
+    # tokens that would act as fields (a quoted `"scope:in"` free-texts and is not one).
+    def self.unsupported_fields(source : String) : Array(String)
+      QL.fields_used(source).map(&.name).uniq!.select! { |n| UNSUPPORTED_FIELDS.includes?(n) }
+    end
+
+    # The refusal a condition naming one of those fields earns, or nil. ONE sentence, here rather
+    # than at each surface, because five of them refuse it: `Bindings#validate` (so MCP
+    # `create_extract_rule` and `gori run rewriter extract add` refuse an extract rule's `when:`),
+    # the TUI form that says the same thing a keystroke earlier without a store, and the two doors
+    # that submit a COMPLETE intercept condition (MCP `intercept_set_filter`, `gori run intercept
+    # filter`). Naming what the condition IS rather than which row it was typed in — the same
+    # sentence has to read correctly as an extract rule's `when:` and as a catch condition.
+    def self.unsupported_field_reason(source : String) : String?
+      bad = unsupported_fields(source).first?
+      return nil unless bad
+      "`#{bad}:` is not available in a live-message condition (an intercept catch condition or " \
+      "an extract rule's when:) — the project's scope rules are not part of a message. " \
+      "History, colour rules and MCP `query` answer it."
+    end
 
     # Static value pools for the low-cardinality fields (mirrors History's). `host:`
     # has no static pool — its candidates are injected by the caller (the TUI passes
@@ -171,7 +220,10 @@ module Gori
     # so editing QL's `path` line would have updated History, Sitemap and the colour-rule band and
     # silently left this bar saying the old thing — the exact drift the generated hints were built
     # to end. What is written out is precisely the DELTA, which is also the documentation.
-    FIELD_HELP = QL::FIELD_HELP.merge({
+    # `reject` first: `QL::FIELD_HELP` now carries a line for `scope:`, and a help table that
+    # describes a field the parser refuses is how a completion row teaches a term that can never
+    # match. The refusal and the help stay derived from the one list.
+    FIELD_HELP = QL::FIELD_HELP.reject { |name, _| UNSUPPORTED_FIELDS.includes?(name) }.merge({
       "status" => "code/class — and scopes to RESPONSES only",
       "proto"  => "http, or ws to opt WebSocket messages IN",
       "header" => "head of the message in hand (this leg only)",
@@ -209,13 +261,22 @@ module Gori
       if (colon = cur.core.index(':')) && colon > 0
         field = cur.core[0...colon].downcase
         prefix = FilterAst.unquote_prefix(cur.core[(colon + 1)..])
-        suggest_values(field, prefix, hosts).map { |v| "#{cur.prefix}#{field}:#{FilterAst.quote(v)}" }
+        suggest_values(field, prefix, hosts, fields).map { |v| "#{cur.prefix}#{field}:#{FilterAst.quote(v)}" }
       else
         fields.select(&.starts_with?(cur.core.downcase)).map { |f| "#{cur.prefix}#{f}:" }
       end
     end
 
-    private def self.suggest_values(field : String, prefix : String, hosts : Array(String)) : Array(String)
+    # `fields` is the CALLER's name pool, and it decides one thing here: whether a field THIS
+    # backend refuses may still be completed. A colour rule answers `scope:` and passes QL's
+    # wider list (`Colormarker::USEFUL_FIELDS`); a hold gate refuses the field, and completing
+    # its values there would teach a term that compiles to a never-match — the trap `FIELDS`'s
+    # own comment names, arriving from the value side instead of the name side. Derived from
+    # `UNSUPPORTED_FIELDS` rather than written as an arm per field, so the next refused field
+    # needs no second copy of the rule.
+    private def self.suggest_values(field : String, prefix : String, hosts : Array(String),
+                                    fields : Array(String)) : Array(String)
+      return [] of String if UNSUPPORTED_FIELDS.includes?(field) && !fields.includes?(field)
       p = prefix.downcase
       values = case field
                when "host"   then hosts
@@ -223,6 +284,7 @@ module Gori
                when "scheme" then SCHEME_VAL
                when "status" then STATUS_VAL
                when "proto"  then PROTO_VAL
+               when "scope"  then QL::SCOPE_VALUES
                else               return [] of String
                end
       values.select(&.downcase.starts_with?(p))
@@ -329,6 +391,19 @@ module Gori
 
       field = field_symbol(text[0...sep].downcase)
       value = text[(sep + 1)..]
+      # A field QL implements and this backend refuses (`UNSUPPORTED_FIELDS`) — a never-match
+      # term, and BEFORE the operator split so `scope~in` cannot free-text where `scope:in` does
+      # not. Whether a name was meant as a field is not an operator's business.
+      #
+      # An EMPTY value still DROPS, like every other field's: this method's header promises a
+      # mid-typed `host:` folds to match-all so the queue does not blank out, and the intercept
+      # bar applies the condition on EVERY keystroke (`InterceptController`). Without this guard
+      # the `:` in `scope:` stopped the gate holding anything — or, under `-`, made it hold every
+      # in-flight message — before the value that makes the term refusable had been typed.
+      if field == :never
+        return nil if value.empty?
+        return Term.new(:never, text.downcase, term.negate?)
+      end
       if sep == ti
         # An unknown field, or one QL does not offer `~` on, free-texts the whole token — the
         # same fallback `QL.regex_cond` takes, so `size~1` means the same thing in both.
@@ -445,7 +520,10 @@ module Gori
       when "proto"  then :proto
       when "header" then :header
       when "body"   then :body
-      else               :text
+      else
+        # A refused name is NOT an unknown one: it must not degrade to free text (see
+        # `UNSUPPORTED_FIELDS`). Everything else still does.
+        UNSUPPORTED_FIELDS.includes?(field) ? :never : :text
       end
     end
 

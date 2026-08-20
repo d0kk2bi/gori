@@ -387,8 +387,13 @@ module Gori::Tui
       @suggest_store = store
       invalidate_host_suggest_cache
       prev_id = @rows[@selected]?.try(&.id) # anchor the highlight to the flow, not the index
-      query_filter = QL.parse(@query)
-      @query_note = query_note_for(query_filter, store)
+      # The `scope:` lens: this view already holds the Scope it applies for ⇧S, and a `scope:`
+      # TERM is that same predicate asked as a question rather than switched on — `ql_lens` reads
+      # the rules regardless of the flag (see there), so `scope:in` means the same thing with the
+      # lens off. nil only before `set_scope` has run.
+      lens = @scope.try(&.ql_lens)
+      query_filter = QL.parse(@query, scope: lens)
+      @query_note = query_note_for(query_filter, store, lens)
       # A non-blank query that compiles to EMPTY (every term invalid — a typo'd field,
       # a bad numeric like dur:>2sec, an unterminated value) must NOT fall through to a
       # match-all search: that would show EVERY flow while the bar claims a filter is
@@ -428,12 +433,30 @@ module Gori::Tui
     # A short note explaining a filter that matches nothing because it is INVALID (vs a
     # valid filter that genuinely has no matches) — surfaced in the empty-state hint so a
     # typo'd status:/dur:/size: or a broken body~[regex isn't misread as "no traffic".
-    private def query_note_for(filter : QL::Filter, store : Store) : String?
+    private def query_note_for(filter : QL::Filter, store : Store,
+                               lens : QL::ScopeLens?) : String?
       return nil if @query.blank?
       return "invalid filter — no valid terms" if QL.reject_empty?(@query, filter)
       bad = QL.invalid_regex_terms(@query)
       return "invalid regex in #{bad.first}" unless bad.empty?
-      fts_backlog_note(filter, store)
+      # The index-lag note comes FIRST, and that order is the point: it is the one note here that
+      # is TRUE ONLY RIGHT NOW (the backlog drains), it explains an empty list on its own, and a
+      # scope note returning ahead of it made it unreachable for every query naming `scope:` —
+      # sending an operator to the lens for a list that was merely still indexing.
+      if note = fts_backlog_note(filter, store)
+        return note
+      end
+      # A `scope:` term that runs cleanly and returns NOTHING is indistinguishable on this list
+      # from "no traffic matched", and there are two states where that happens for a reason the
+      # operator can act on — so name the state rather than leave an empty list to explain it.
+      # The second is not a claim about this query: the ⇧S lens ANDs the in-scope predicate over
+      # whatever is typed, so it makes `scope:in` redundant and `scope:out` (un-negated) empty,
+      # and saying that costs no analysis of where the term sits in the tree.
+      if QL.uses_scope?(@query)
+        return "no scope rules — nothing is in scope" unless lens.try(&.configured?)
+        return "⇧S lens also narrows to in-scope" if @scope.try(&.active?)
+      end
+      nil
     end
 
     # `body:`/free-text read the trigram index, which is written OFF the capture commit
@@ -2623,6 +2646,9 @@ module Gori::Tui
 
     # Static pools for low-cardinality fields; `host:` is DISTINCT from the store
     # (capped + prefix-filtered) so a large History stays cheap to complete.
+    #
+    # `scope:` completes from `QL::SCOPE_VALUES` — the field's whole vocabulary, kept beside the
+    # field rather than copied here, because the colour-rule overlay's pool reads the same list.
     private def suggest_values(field : String, prefix : String) : Array(String)
       p = prefix.downcase
       values = case field
@@ -2632,6 +2658,7 @@ module Gori::Tui
                when "status" then ["2xx", "3xx", "4xx", "5xx", ">=400", ">=500", "200", "301", "302", "401", "403", "404", "500", "502", "503"]
                when "host"   then host_values_for(prefix)
                when "size"   then [">10000", ">100000", "<1000"]
+               when "scope"  then QL::SCOPE_VALUES
                when "dur"    then [">500", ">1s", ">=200", "<100"]
                else               return [] of String
                end

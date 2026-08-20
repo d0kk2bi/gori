@@ -1,5 +1,6 @@
 require "../outbound"
 require "../ql"
+require "../scope"
 require "../store"
 require "./engine"
 require "./identity"
@@ -323,7 +324,21 @@ module Gori::Authorize
     #     which here is indistinguishable from "nothing matched" — and the two need opposite
     #     responses.
     private def self.search(options : PlanOptions, query : String) : Array(Store::FlowRow)
-      filter = QL.parse(query)
+      # A `scope:` term needs the project's rules; `Authorize` always has a project in play, so
+      # the lens is always available (see `PlanOptions#store`).
+      lens = Scope.ql_lens(options.store)
+      # …and when that project has NO scope rules, a scope question is refused rather than run.
+      # This is `gori run history delete`'s guard, on the surface with the other kind of teeth:
+      # `scope:in` compiles to a never-match and would select nothing, but `-scope:in` is that
+      # never-match NEGATED — every flow — and it clears `reject_empty?` below, which compares
+      # the compiled SQL against `1` and not against `NOT (0)`. Every selected row here becomes
+      # `identities.size` real requests against a live target.
+      if QL.uses_scope?(query) && !lens.configured?
+        raise PlanError.new(PlanError::Reason::BadQuery,
+          "query #{query.inspect} asks about scope, but this project has NO scope rules — nothing " \
+          "is in scope, so a scope term selects nothing and a NEGATED one selects EVERY flow", query)
+      end
+      filter = QL.parse(query, scope: lens)
       if QL.reject_empty?(query, filter)
         raise PlanError.new(PlanError::Reason::BadQuery,
           "query #{query.inspect} did not match any field", query)

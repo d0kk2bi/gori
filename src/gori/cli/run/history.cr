@@ -117,9 +117,18 @@ module Gori
         if err = delete_query_error(q)
           abort "gori run history delete: #{err}"
         end
-        filter = QL.parse(q)
 
         store = open_store(resolve_read_project(project_name, db_path))
+        # Compiled only now, because a `scope:` term needs the project's scope rules and they
+        # live in the store this just opened. The shape checks above stay where they are: they
+        # answer identically under either lens (see `QL::SCOPE_SHAPE_ONLY`), and a refusal that
+        # costs no store open is worth keeping.
+        lens = Scope.ql_lens(store)
+        if err = delete_scope_error(q, lens)
+          store.close
+          abort "gori run history delete: #{err}"
+        end
+        filter = QL.parse(q, scope: lens)
         ids = begin
           # Trigram indexing is off-commit (Store V4), so a `body:`/free-text query run right
           # after a capture would under-report until the backlog drains — and here that means
@@ -154,6 +163,23 @@ module Gori
         ensure
           store.close
         end
+      end
+
+      # The refusal a `-q` delete owes an operator whose query asks about a scope the project does
+      # not have — the one guard that cannot be part of `delete_query_error`, because it needs the
+      # store that guard deliberately runs before opening.
+      #
+      # `scope:in` there compiles to a never-match and would delete nothing, which is harmless.
+      # `-scope:in` is that never-match NEGATED, which is EVERY flow, and it passes every other
+      # guard: the match-all test compares the compiled SQL against `1`, and `NOT (0)` is not
+      # that string. So a project's whole history could go over a term that had nothing to answer
+      # with. Refused rather than narrowed, because which of the two the operator meant is not
+      # knowable from here — and this is the command that cannot be undone.
+      private def self.delete_scope_error(q : String, lens : QL::ScopeLens) : String?
+        return nil unless QL.uses_scope?(q) && !lens.configured?
+        "query #{q.inspect} asks about scope, but this project has NO scope rules — nothing is in " \
+        "scope, so a scope term matches nothing and a NEGATED one matches every flow. " \
+        "Add scope rules (`gori run project scope add`) or drop the term."
       end
 
       # The refusal a `-q` delete owes an operator who did not pass --yes, or nil when they did.
@@ -230,10 +256,17 @@ module Gori
         # Compiled the way the delete compiles it, so what is judged match-all is what would RUN.
         # BEFORE the dropped-term check, so a query whose EVERY term was dropped names the worse
         # consequence: it selects the whole project, not merely one term fewer.
-        if QL.reject_empty?(q, QL.parse(q))
+        #
+        # `SCOPE_SHAPE_ONLY` because the real lens lives in a store this guard runs before
+        # opening, and the two answer identically for every question asked here. Without it a
+        # `scope:` term reads as DROPPED, so `scope:in` folded to match-all and this refused
+        # `delete -q scope:in` — on a project whose scope rules would have answered it perfectly
+        # — with "matches EVERY flow". What no lens can catch is `-scope:in` on a project with no
+        # rules, which really IS every flow; `delete_scope_error` has it, once there is a store.
+        if QL.reject_empty?(q, QL.parse(q, scope: QL::SCOPE_SHAPE_ONLY))
           return "query #{q.inspect} matches EVERY flow — to delete every flow use `gori run history clear --yes`"
         end
-        unless (dropped = QL.analyze(q).ignored).empty?
+        unless (dropped = QL.analyze(q, scope: QL::SCOPE_SHAPE_ONLY).ignored).empty?
           return "#{dropped.map(&.inspect).join(", ")} is not a value that field takes — QL drops what " \
                  "it cannot compile, so this would delete MORE than the query asks for"
         end
@@ -349,8 +382,16 @@ module Gori
             if scope_unconfigured
               [] of Store::FlowRow
             elsif q = query
-              filter = QL.parse(q)
+              # The `scope:` lens is read whether or not `--in-scope` was passed: the flag is a
+              # lens over the whole listing, the term is one clause of the query, and an
+              # operator can ask for either or both.
+              lens = Scope.ql_lens(store)
+              filter = QL.parse(q, scope: lens)
               Run.warn_query_terms("history", q)
+              # Two states where a `scope:` query runs CLEAN and lists nothing; an empty listing
+              # cannot say which. Worded once, in `Run`, so the next surface to want them cannot
+              # word them differently.
+              Run.scope_query_notes(q, lens, in_scope).each { |n| STDERR.puts "gori run history: #{n}" }
               # A query that fails to compile to ANY clause (e.g. `status:>=foo`)
               # yields the match-all EMPTY filter — silently dumping every flow,
               # the opposite of what the user asked. Refuse it instead.

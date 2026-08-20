@@ -327,6 +327,65 @@ describe Gori::Colormarker do
       end
     end
 
+    # --- scope: (#754) ------------------------------------------------------------------------
+    # A `scope:` condition MUST land on the store tier, and it does so through an indirection the
+    # `ROW_FIELDS` comment says has broken once already: `scope` is absent from
+    # `InterceptFilter::FIELDS`, so the subtraction leaves it out. Pinned here so adding it to
+    # that list — where it would compile to a never-match Term — cannot silently move a `scope:`
+    # rule into a tier that answers false for every row.
+    it "routes a scope: condition to the store tier, never the row tier" do
+      Gori::Colormarker.row_answerable?("scope:in").should be_false
+      Gori::Colormarker.row_answerable?("scope:out").should be_false
+      Gori::Colormarker.row_answerable?("host:acme -scope:in").should be_false
+      with_globals do
+        with_store do |store|
+          cm = Gori::Colormarker.load(store)
+          cm.add("scope:out", RED, FULL, "leaked")
+          cm.needs_store?.should be_true
+        end
+      end
+    end
+
+    # End to end: the lens `compile` threads comes from the STORE, so a rule written before any
+    # scope rule exists paints nothing, and starts painting the right rows once the scope is
+    # configured and the engine reloads. That reload is what `refresh`'s scope-lens comparison
+    # buys — without it an unchanged rule set bails out and the boundary stays whatever it was
+    # when the rule was written.
+    it "paints by the project's scope, and follows it when the scope rules change" do
+      with_globals do
+        with_store do |store|
+          inside = captured(store, "acme.test", "/x")
+          outside = captured(store, "evil.test", "/y")
+          cm = Gori::Colormarker.load(store)
+          cm.add("scope:out", RED, FULL, "leaked")
+          # No scope rules yet: nothing is in scope, so NOTHING is out of it either — the
+          # question has no answer, and the alternative (paint every row) is the broaden this
+          # engine refuses everywhere else.
+          cm.match(inside).should be_nil
+          cm.match(outside).should be_nil
+
+          scope = Gori::Scope.load(store)
+          # A STRING rule on purpose, not a host one: a string/regex scope rule compiles to the
+          # `gori_ci_contains` / REGEXP user function, and the store tier answers through
+          # `Store#ids_matching` — a path no scope filter ran on before. A connection without
+          # those functions registered fails the QUERY ("no such function"), which
+          # `ids_matching` turns into nil, which reads here as "paints nothing".
+          scope.add("include", "string", "acme.test/")
+          cm.reload
+          cm.match(outside).not_nil!.name.should eq("leaked")
+          cm.match(inside).should be_nil
+
+          # …and the other direction of the same follow: widening the scope un-paints a row.
+          # No `forget` here on purpose: `refresh` drops the whole store-tier memo when it
+          # recompiles, and a lens change IS a recompile — so a moved boundary cannot be answered
+          # out of the cache the old boundary filled.
+          scope.add("include", "regex", "^https://evil\\.test/")
+          cm.reload
+          cm.match(outside).should be_nil
+        end
+      end
+    end
+
     # A `proto:` value naming a TRANSPORT is the one spelling the tier split has to refuse. QL
     # accepts `proto:wss` and compiles it, but the ROW tier's one-field-per-leaf
     # `InterceptFilter` cannot express a transport at all — routed there, `proto:wss` painted
@@ -416,6 +475,7 @@ describe Gori::Colormarker do
                 when "status", "size", "reqsize", "respsize", "dur" then "1"
                 when "proto"                                        then "ws"
                 when "stub"                                         then "true"
+                when "scope"                                        then "in"
                 else                                                     "x"
                 end
         Gori::Colormarker.unusable_reason("#{field}:#{value}").should be_nil
@@ -442,6 +502,26 @@ describe Gori::Colormarker do
     it "refuses a regex that cannot compile" do
       Gori::Colormarker.unusable_reason("body~[bad").not_nil!.should contain("not a valid regex")
       Gori::Colormarker.unusable_reason("body~[a-z]+").should be_nil
+    end
+
+    # `unusable_reason` has no project — and must not need one: whether scope rules EXIST is not
+    # a property of the rule (it changes while the rule stands), so the shape is checked under
+    # `QL::SCOPE_SHAPE_ONLY`. Passing nothing instead would report `scope:in` as a dropped term
+    # and refuse, at every surface, the one field `compile` goes out of its way to answer.
+    it "accepts a scope: condition and still refuses a value that field does not take" do
+      Gori::Colormarker.unusable_reason("scope:in").should be_nil
+      Gori::Colormarker.unusable_reason("scope:out").should be_nil
+      Gori::Colormarker.unusable_reason("host:acme -scope:in").should be_nil
+      Gori::Colormarker.unknown_fields("scope:in").should be_empty
+      # A dropped term BROADENS a standing rule, which is why a query gets to survive this and a
+      # rule does not.
+      Gori::Colormarker.unusable_reason("host:acme scope:true").not_nil!
+        .should contain("not a value that field takes")
+      # …and the note an author needs, because both surprising halves are invisible otherwise.
+      note = Gori::Colormarker.advise("scope:in").find { |n| n.includes?("scope:") }.not_nil!
+      note.should contain("⇧S")
+      note.should contain("nothing is in scope")
+      Gori::Colormarker.advise("host:acme").any?(&.includes?("`scope:`")).should be_false
     end
 
     it "refuses to create a rule with an unusable condition" do

@@ -1096,6 +1096,79 @@ describe Gori::MCP::Server do
         p["warnings"].as_a.size.should be > 0
       end
     end
+
+    # A condition the hold gate REFUSES (`InterceptFilter::UNSUPPORTED_FIELDS`) compiles to a
+    # never-match: `scope:in` holds nothing and `-scope:in` holds EVERY in-flight message until
+    # each is forwarded by hand. An agent has no note row to read, so the tool refuses it.
+    it "intercept_set_filter refuses a field the hold gate cannot answer" do
+      with_store do |store|
+        %w[scope:in -scope:in scope~in].each do |q|
+          resp = drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"intercept_set_filter","arguments":{"query":#{q.to_json}}}}))[0]["result"]
+          resp["isError"].as_bool.should be_true, "#{q} should be refused"
+          resp["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+          resp["structuredContent"]["field"].as_s.should eq("query")
+        end
+      end
+    end
+
+    # A `scope:` term on a project with no scope rules compiles to a never-match and the query
+    # runs CLEAN — so an agent sees zero rows and cannot tell that from "no flow matched". This
+    # is the surface that has to say which it is (#754).
+    it "ql_explain names an unconfigured scope, and stops warning once rules exist" do
+      with_store do |store|
+        seed_flow(store, "ex.test", "GET", "/", 200)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ql_explain","arguments":{"query":"scope:in"}}})
+        p = tool_payload(drive(store, call)[0])
+        p["scope_rules_configured"].as_bool.should be_false
+        p["applied_terms"].as_a.map(&.as_s).should eq(["scope:in"]) # applied, not dropped
+        p["ignored_terms"].as_a.should be_empty
+        p["warnings"].as_a.map(&.as_s).join(" ").should contain("no scope rules are configured")
+
+        Gori::Scope.load(store).add("include", "host", "ex.test")
+        p2 = tool_payload(drive(store, call)[0])
+        p2["scope_rules_configured"].as_bool.should be_true
+        p2["warnings"].as_a.should be_empty
+        p2["sql"].as_s.should_not eq("(0)")
+      end
+    end
+
+    # An extract rule PERSISTS, so a `when:` condition naming a refused field is refused at the
+    # write — and the error names the argument it is about, or an agent that edits the field it is
+    # told about rewrites `name` and resubmits the same condition.
+    it "create/update_extract_rule refuse a when: condition and name the `when` argument" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_extract_rule","arguments":{"name":"SESSION","when":"scope:in","kind":"cookie","selector":"sid"}}})
+        resp = drive(store, call)[0]["result"]
+        resp["isError"].as_bool.should be_true
+        resp["structuredContent"]["field"].as_s.should eq("when")
+        resp["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+        store.extract_rules.should be_empty
+
+        ok = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_extract_rule","arguments":{"name":"SESSION","when":"path:/login","kind":"cookie","selector":"sid"}}})
+        drive(store, ok)[0]["result"]["isError"].as_bool.should be_false
+        id = store.extract_rules.first.id
+        upd = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_extract_rule","arguments":{"id":#{id},"when":"-scope:out"}}})
+        bad = drive(store, upd)[0]["result"]
+        bad["isError"].as_bool.should be_true
+        bad["structuredContent"]["field"].as_s.should eq("when")
+        store.extract_rules.first.match_filter.should eq("path:/login")
+      end
+    end
+
+    # The term has to reach the query itself, or `scope:in` would be dropped and the listing
+    # would be BROADER than asked while reporting nothing.
+    it "list_history applies scope:in/scope:out from the query" do
+      with_store do |store|
+        seed_flow(store, "ex.test", "GET", "/", 200)
+        seed_flow(store, "other.test", "GET", "/", 200)
+        Gori::Scope.load(store).add("include", "host", "ex.test")
+        %w[in out].each do |side|
+          call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"query":"scope:#{side}","strict":true}}})
+          rows = tool_payload(drive(store, call)[0]).as_a
+          rows.map { |r| r["host"].as_s }.should eq([side == "in" ? "ex.test" : "other.test"])
+        end
+      end
+    end
   end
 
   describe "decoder" do
@@ -3342,6 +3415,20 @@ describe "Gori::MCP::Tools unbound mode" do
       # pure tools work unbound
       dec = tools.call("decode", JSON.parse(%({"input":"aGVsbG8=","spec":"base64-decode"})))
       dec.is_error.should be_false
+
+      # `ql_explain` is a GRAMMAR tool and is listed in UNBOUND_SAFE, so it must not reach for a
+      # project — including for the `scope:` lens, whose `store` raises here. It answers about the
+      # query and says the project question could not be asked, rather than "no scope rules".
+      ex = tools.call("ql_explain", JSON.parse(%({"query":"host:acme"})))
+      ex.is_error.should be_false
+      JSON.parse(ex.text)["scope_rules_configured"].raw.should be_nil
+
+      scoped = tools.call("ql_explain", JSON.parse(%({"query":"scope:in"})))
+      scoped.is_error.should be_false
+      p_scoped = JSON.parse(scoped.text)
+      p_scoped["applied_terms"].as_a.map(&.as_s).should eq(["scope:in"]) # compiled, not dropped
+      p_scoped["scope_rules_configured"].raw.should be_nil
+      p_scoped["warnings"].as_a.map(&.as_s).join(" ").should contain("no project is selected")
 
       # create auto-binds when unbound
       created = JSON.parse(tools.call("create_project", JSON.parse(%({"name":"First"}))).text)
