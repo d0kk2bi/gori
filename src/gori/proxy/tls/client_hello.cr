@@ -14,11 +14,28 @@ module Gori::Proxy::Tls
     # A ClientHello must fit one TLS record, and a record body is capped at 2^14 by RFC 8446.
     # Reading past that is a malformed peer, not a big handshake — and an unbounded read here
     # would be a memory-DoS on an unauthenticated connection.
-    MAX_RECORD             =  16_384
-    RECORD_HANDSHAKE       = 0x16_u8
+    MAX_RECORD       =  16_384
+    RECORD_HANDSHAKE = 0x16_u8
+    # The record header's legacy major version. SSL3, TLS1.0-1.2 and TLS1.3's compatibility
+    # record all carry 3 here, so this plus RECORD_HANDSHAKE is the two-byte "is this TLS" test
+    # (see record_start?).
+    RECORD_VERSION_MAJOR   = 0x03_u8
     HANDSHAKE_CLIENT_HELLO = 0x01_u8
     EXT_SERVER_NAME        =  0x0000
     SNI_HOST_NAME          = 0x00_u8
+
+    # Do these bytes begin a TLS handshake record — `0x16` then a major version of `3`, which
+    # every version from SSL3 to TLS1.3 carries in the record header?
+    #
+    # TWO bytes, and that is the point (#755). `RECORD_HANDSHAKE` alone was the test at four
+    # sites, and on the CONNECT path "not the h2c preface, so TLS" fed SSH banners into an
+    # OpenSSL SERVER handshake. The second octet costs one more read on the only path that
+    # commits to TLS and rules out every text protocol and binary preface that happens to open
+    # with `0x16`. Fewer than two bytes is not a yes — the caller must read the second before it
+    # can route on it.
+    def self.record_start?(peeked : Bytes) : Bool
+      peeked.size >= 2 && peeked[0] == RECORD_HANDSHAKE && peeked[1] == RECORD_VERSION_MAJOR
+    end
 
     # Peek a ClientHello off `io` and return {sni, consumed}. `consumed` is every byte read, so
     # the caller can replay them into a PrefixIO and hand the stream on untouched — this must

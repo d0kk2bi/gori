@@ -1411,3 +1411,82 @@ Two things this accepts, recorded rather than hidden:
 2. **Two rules for one shape**, which is normally the thing to avoid. The split is the point here:
    `request_token_safe?` governs what gori WRITES, `looks_like_http_request?` what it READS, and
    a future reader tempted to unify them should re-read P7 first.
+
+<a id="d-2026-08-20-connect-peek"></a>
+
+### 2026-08-20: a CONNECT gori cannot decode is refused in the open, not relayed in the dark
+
+Refines: [P4](#p4), [P7](#p7). Extends the entry above and #729. PR: #755.
+
+#729 closed the case with bytes to judge. The two it left are both on the TLS path, and both were
+silence rather than misclassification: a client that sends **nothing** (SMTP/IMAP/POP3/MySQL — the
+SERVER greets first) timed out into `ClientConn#run`'s blanket rescue, and `handle_connect`'s peek
+routed `0x50` to the h2c relay and **everything else to a TLS server handshake**, so SSH-over-
+CONNECT died in OpenSSL — after `reflect_origin_h2` had already fired a real ALPN-`h2` ClientHello
+at the SSH server's port.
+
+Two decisions worth writing down, because both had a tempting alternative.
+
+**The timeout stays; what is RECORDED gets narrower.** "Not HTTP" cannot be separated from "slow
+HTTP" by clock (#729), and shortening the wait weakens the slowloris bound `HEAD_DEADLINE` exists
+for. So the fix is a predicate, not a duration: a flow is recorded only for a connection that sent
+**zero** bytes (`Http1::HeadTimeout#received`) and had **never carried a request**
+(`@saw_request`). Drop either term and the normal end of a healthy keep-alive connection starts
+writing flows, which is the noise that makes the signal worthless. One innocent shape survives
+both terms — a browser's speculative preconnect — and is named in the message rather than filtered
+out, because on the wire it is not distinguishable from the case being reported.
+
+**Both halves of the peek widened, not just the TLS one.** `0x50` is `POST`, `PUT`, `PATCH` and
+`PROPFIND` as well as `PRI`, so the same one-byte assumption sent a plaintext request tunnelled to
+port 80 into the HTTP/2 relay — which dials the origin and then dies at `Frame.read_preface` —
+while the identical request spelled `GET` took the refusal arm. Behaviour split on the first letter
+of the method. `Server` had already solved this for its listeners with a four-octet floor and a
+comment stating that a CONNECT tunnel carries only a ClientHello or a preface; that premise is what
+this entry refutes, so the predicate moved to `H2::Frame.preface_prefix?` and the TLS twin to
+`Tls::ClientHello.record_start?`. Both callers now share one home, and only the two arms that
+COMMIT to a protocol read past the first byte — every refusal still decides on one octet.
+
+**A non-TLS CONNECT is refused, not blind-tunnelled**, though the code to relay it sits in the
+next branch and doing so would make `ssh -o ProxyCommand='nc -X connect …'` work with no operator
+action. #729 turned that trade down on its own terms and it still holds: a silent uncaptured relay
+is the anti-pattern `settings/network.cr` names ("a bypassed host is otherwise INVISIBLE"), and
+gori already HAS an explicit per-host spelling of exactly that relay. `Settings.tls_passthrough?`
+is consulted one branch ABOVE the peek, so the refusal's advice is a one-step fix rather than a
+description of some other mode — and the operator, not the first byte on the wire, decides which
+hosts leave the capture path (P4).
+
+**The listener peek needed the record too, not just `ClientConn`.** `Server#serve_reverse` and
+`#serve_transparent` route on `client.peek`, which blocks *before* any `ClientConn` exists — and
+those two listeners are the only ones a plaintext server-speaks-first protocol can reach, since
+SMTP/IMAP cannot traverse a forward proxy without a CONNECT. Recording only in the request loop
+would therefore have put the fix everywhere except where #729 says it matters most. Hence
+`ClientConn.record_silent_client` in class form: one sentence, reachable without an instance. Those
+two sites re-raise after recording, so the accept path still closes the fd and frees the slot — the
+change is the silence, not the teardown.
+
+Four things this accepts:
+
+1. **`handle_connect`'s peek read staying silent when IT times out.** A client that opens a tunnel
+   and then holds it without a ClientHello is a speculative preconnect, and it is not the shape
+   above either — that one sent zero bytes, this one sent a CONNECT. A client that genuinely must
+   let the far side speak first is served by listing the host, which skips the peek entirely.
+2. **`Tunnel#intercept`'s handshake failure is a `gori.log` line, not a flow**, unlike the
+   refusals beside it. There is no `RawRequest` to project one from — the request is exactly what
+   the failed handshake prevented, the same reasoning `serve_h2c_prior_knowledge` already applies
+   to its own refusal — and the dominant member of that population is a client that does not trust
+   the CA yet, which retries. Threading a reason back out through the `TlsMitm#intercept` seam so
+   `handle_connect` could record against the CONNECT it holds is the alternative, declined on
+   seam-churn grounds for a diagnostic that says the same sentence every time.
+   `intercept_self_page` keeps its bare rescue: a client reaches the CA-download page *because*
+   it does not trust the CA, so a failure there is the expected first step, not a fault to report.
+3. **One flow per silent connection, uncapped** — and the same for `refuse_non_tls_connect`. The
+   bounded form (`notice_downgrade`'s once-per-{host, reason} set) is not reachable from a
+   per-connection object, and both new records match the discipline of the sibling they sit
+   beside: `record_non_http` (#729) and `refuse_h2c` (#731) each write one flow per occurrence for
+   an equally retry-prone population. `Server`'s `MAX_CONNECTIONS` slot cap bounds the rate. If
+   this floods, the four should get a shared bound together, not one of them alone.
+4. **A text banner that speaks and then waits is still silent** — an SSH client that sends its
+   banner and blocks for the server's has `received > 0`, so the zero-byte term excludes it. That
+   is the term that keeps a slowloris drip from writing a flow per connection, and the banner is
+   indistinguishable from a version-fuzzing payload on the first line anyway (the entry above).
+   #729 left three shapes; this closes the two that can be told apart from a payload.

@@ -11,6 +11,8 @@ require "../../outbound"
 require "../prefix_io"
 require "../socket_tuning"
 require "../h2/relay"
+require "../h2/frame"
+require "../tls/client_hello"
 require "../connect"
 require "../upstream"
 require "../pump"
@@ -159,7 +161,7 @@ module Gori::Proxy
                    @extractor : ResponseExtract? = nil,
                    # Everything after this marker is named-only, which is how a REQUIRED
                    # parameter follows defaulted ones at all — and it is the shape that makes
-                   # the requirement useful: `h2_offer:` can only ever be spelled out.
+                   # the requirement useful: they can only ever be spelled out.
                    *,
                    # REQUIRED, and deliberately: this is a claim about the TRANSPORT this
                    # connection arrived on, and only the caller that built it can make one. It
@@ -169,7 +171,24 @@ module Gori::Proxy
                    # the whole point of #731 was that a refusal naming the wrong reason costs
                    # more time than one naming none. A caller with nothing to observe has
                    # `H2Offer::Unknown`, which names no reason rather than guessing one.
-                   @h2_offer : H2Offer)
+                   @h2_offer : H2Offer,
+                   # REQUIRED for the same reason, and it is a DIFFERENT claim than `h2_offer`
+                   # above: did gori terminate TLS on the leg this connection arrived on? True
+                   # only from `Tls::Tunnel#intercept` — the post-CONNECT tunnel and the
+                   # transparent/reverse TLS listeners — false on every cleartext listener.
+                   #
+                   # `H2Offer::Cleartext` cannot answer it: that member covers "no TLS handshake
+                   # on the leg that would have carried an ALPN offer", which is TRUE both for a
+                   # cleartext listener AND for a cleartext ORIGIN inside a TLS tunnel, where the
+                   # client leg is very much encrypted. Nor can `@tls`, which is what
+                   # `record_non_http` used to ask (#755): `@tls` is the CONNECT MITM seam and is
+                   # passed only by the cleartext forward-proxy listener, so it answered this
+                   # question exactly backwards — "gori terminated TLS on this connection" for a
+                   # plaintext :8080 client, and "this listener expects HTTP" inside the
+                   # decrypted tunnel where `network.tls_passthrough` is the actual remedy.
+                   #
+                   # Read only by `non_http_remedy`, i.e. only to word an error flow's advice.
+                   @client_tls : Bool)
       # Per-connection upstream reuse (see `acquire_upstream`). One live origin
       # connection kept across this client's keep-alive requests.
       @upstream = nil.as(IO?)
@@ -194,6 +213,12 @@ module Gori::Proxy
       # Which compressed-body Match&Replace refusals this connection has already written to
       # `gori.log` — see `log_compressed_skip` for the key and the cap.
       @compressed_skips = Set(String).new
+      # Has `read_client_head` ever come back with bytes on this connection? The narrow half of
+      # the server-speaks-first signal (#755): a zero-byte read timeout is only worth recording on
+      # a connection that never carried anything. On one that did, the same timeout is an idle
+      # keep-alive reaching its end, which is how a healthy connection dies — see
+      # `record_silent_client`.
+      @saw_request = false
     end
 
     # The address every upstream dial on THIS connection is pinned to, or nil when nothing
@@ -280,20 +305,38 @@ module Gori::Proxy
       @up_port = 0
     end
 
-    # Returns true to keep the connection alive for another request.
-    private def handle_request : Bool
-      # The client request head is the slowloris surface: bound total head-assembly time after
-      # its first byte (a drip-feed that a per-read timeout can't catch). The first-byte (idle
-      # keep-alive) wait stays bounded by the baseline timeout armed in `run`.
-      # `detect_non_http`: this is a client REQUEST head, so a non-HTTP protocol lands here (#729).
-      head = Codec::Http1.read_head(@io,
+    # One client request head, or nil for every way this connection is finished with: a clean
+    # close, a keep-alive connection idling to its end, an oversized head, or a read that ran
+    # out of time.
+    #
+    # The head read is the slowloris surface, so total head-assembly time after the first byte
+    # is bounded (a drip-feed that a per-read timeout can't catch). The first-byte (idle
+    # keep-alive) wait stays bounded by the baseline `CLIENT_IO_TIMEOUT` armed in `run`.
+    # `detect_non_http`: this is a client REQUEST head, so a non-HTTP protocol lands here (#729).
+    #
+    # A timeout used to unwind to `run`'s blanket rescue, which is the silence #755 is about.
+    # It is answered HERE rather than there because only this call site knows the read was the
+    # CLIENT head — `run`'s rescue also covers every response-head and body read on the way
+    # through — and because `HeadTimeout#received` is only meaningful for this one.
+    private def read_client_head : Bytes?
+      Codec::Http1.read_head(@io,
         deadline: SocketTuning::HEAD_DEADLINE, timeout_sock: SocketTuning.underlying_socket(@io),
         detect_non_http: true)
-      # nil = the client closed, or a keep-alive connection went idle to its end. Standalone,
-      # not trailing this line: `crystal tool format` re-indents a comment BLOCK that follows a
-      # trailing comment to that comment's column, `--check`-clean — which is how the block
-      # below sat at column 22 in main.
+    rescue ex : Codec::Http1::HeadTimeout
+      record_silent_client if ex.received.zero? && !@saw_request
+      nil
+    end
+
+    # Returns true to keep the connection alive for another request.
+    private def handle_request : Bool
+      head = read_client_head
+      # nil = the client closed, a keep-alive connection went idle to its end, or the read timed
+      # out (`read_client_head` has already recorded the one shape of that worth recording).
+      # Standalone, not trailing this line: `crystal tool format` re-indents a comment BLOCK that
+      # follows a trailing comment to that comment's column, `--check`-clean — which is how the
+      # block below sat at column 22 in main.
       return false if head.nil?
+      @saw_request = true
 
       # A non-HTTP protocol reached the HTTP parser on a BINARY preface (MQTT, a raw TLS
       # ClientHello, a binary RPC). `read_head` stopped on that first octet instead of blocking
@@ -1650,6 +1693,53 @@ module Gori::Proxy
         "h2c CONNECT tunnel refused: #{reason}. #{advice}")
     end
 
+    # Refuse a CONNECT tunnel whose first bytes are neither a TLS ClientHello nor the h2c
+    # preface (#755) — `ssh -o ProxyCommand='nc -X connect …'` and every other non-TLS payload
+    # a client tunnels through a proxy.
+    #
+    # NOT a blind tunnel, though the code to do one sits in `handle_connect`'s other branch (the
+    # one a passthrough host or a CA-less proxy takes). #729 turned that
+    # trade down on its own terms: a silent uncaptured relay is the anti-pattern
+    # `settings/network.cr` names ("a bypassed host is otherwise INVISIBLE … so 'why is this
+    # host missing from History?' has no answer anywhere"), and gori already HAS an explicit,
+    # per-host spelling of exactly that relay. So the refusal names it. `Settings.tls_passthrough?`
+    # is consulted one branch up, ahead of this peek, which is what makes the advice a
+    # one-step fix rather than a description of some other mode.
+    #
+    # Nothing has been dialed at the point this is called, and that is the second half of the
+    # fix: routing these bytes to `tls.intercept` meant `reflect_origin_h2` had already
+    # completed a real TLS handshake against the target port before the client handshake failed.
+    #
+    # Written back to the client: nothing, for `refuse_h2c`'s reason — a peer speaking SSH (or
+    # MQTT, or a database wire protocol) cannot parse an HTTP/1.1 response, so the record and
+    # the log line are the whole delivery.
+    #
+    # A plaintext HTTP request tunnelled to port 80 lands here too, and is NOT served in the
+    # clear even though `serve_self_page_connect` takes exactly that fallback and `ClientConn`
+    # could be constructed over the stream. The difference is that this route has an ORIGIN.
+    # `SSH-2.0-OpenSSH_9.6` is a well-formed-looking request line — `S` is a method-token char,
+    # which is precisely why the #729 detector cannot judge it (`looks_like_http_request?`) —
+    # so an h1 loop here would forward an SSH banner to port 22 AS A REQUEST. That trades a
+    # clean refusal for a bogus forward, and it is the same reasoning that keeps text-banner
+    # classification out of scope on the cleartext path. The self-page route has no origin to
+    # forward to, so serving is a real answer there and not here.
+    #
+    # Uncapped, one log line and one flow per occurrence — deliberately the same discipline as
+    # `refuse_h2c` directly above, whose population (a client that retries a refused tunnel) is
+    # identical. If that becomes a flood the two should get a shared bound, not this one alone.
+    private def refuse_non_tls_connect(req : Codec::RawRequest, host : String, port : Int32,
+                                       peeked : Bytes) : Nil
+      advice = "To carry this protocol, add #{host.inspect} to `network.tls_passthrough` — a " \
+               "listed host skips this peek and gets an opaque byte-exact relay, which is how a " \
+               "non-TLS tunnel (`ssh -o ProxyCommand='nc -X connect …'`) reaches its origin " \
+               "through gori. Nothing was dialed for this connection"
+      ::Log.warn { "CONNECT to #{host}:#{port}: refused, the tunnel opened with #{non_http_prefix(peeked)}, not TLS. #{advice}" }
+      record_error(req, "http", host, port, now_us,
+        "CONNECT tunnel refused: it opened with #{non_http_prefix(peeked)}, which can begin " \
+        "neither a TLS handshake record (`0x16 0x03`) nor the HTTP/2 cleartext preface " \
+        "(`PRI * HTTP/2.0`) — the only two things gori can decode here. #{advice}")
+    end
+
     # A LISTENER's entry into the h2c relay (#737): a prior-knowledge preface that arrived
     # DIRECTLY on a reverse or transparent listener, with no CONNECT in front of it. Public
     # because `Proxy::Server` is the only caller; everything it delegates to is private here,
@@ -1832,29 +1922,7 @@ module Gori::Proxy
       return false if connect_answered_locally?(host, port)
 
       if (tls = @tls) && !Settings.tls_passthrough?(host)
-        @io.write("HTTP/1.1 200 Connection Established\r\n\r\n".to_slice)
-        @io.flush
-        # Peek one byte to route the tunnel: a TLS ClientHello starts with 0x16
-        # (handshake), the HTTP/2 cleartext preface with 'P' (0x50, "PRI ...").
-        first = @io.read_byte
-        return false if first.nil?
-        stream = PrefixIO.new(Bytes[first], @io)
-        if first == 0x50_u8
-          # Cleartext h2 (h2c) tunnelled inside CONNECT. `h2c_refusal` is the whole gate:
-          # the setting, and the three rule kinds the h2 relay structurally cannot apply — a
-          # tunnel that looked like it honoured the rule table while a stub rule quietly let
-          # the request reach the origin would be worse than a visible refusal. The SANDBOX is
-          # not among them and no longer refuses this tunnel outright (#731): `intercept_h2c`
-          # wires the interceptor into the relay, so `H2::StreamGate` blocks out-of-scope
-          # streams here per stream, exactly as it does on the TLS h2 path.
-          if reason = h2c_refusal(host)
-            refuse_h2c(req, host, port, reason)
-            return false
-          end
-          intercept_h2c(host, port, stream)
-        else
-          tls.intercept(host, port, stream, @sink, dial_addr: dial_pin)
-        end
+        intercept_tunnel(req, host, port, tls)
       else
         upstream = Upstream.dial(host, port, overrides: @host_overrides, pin: dial_pin)
         unless upstream
@@ -1877,6 +1945,100 @@ module Gori::Proxy
         end
       end
       false # the connection has been consumed by the tunnel
+    end
+
+    # The MITM half of a CONNECT: answer 200, then peek to decide which of the three protocols
+    # gori can carry is inside, and hand the stream to it. Every path here ENDS the connection —
+    # the tunnel consumes it — which is why this returns Nil and `handle_connect` falls through
+    # to its own `false`.
+    private def intercept_tunnel(req : Codec::RawRequest, host : String, port : Int32,
+                                 tls : TlsMitm) : Nil
+      @io.write("HTTP/1.1 200 Connection Established\r\n\r\n".to_slice)
+      @io.flush
+      # Peek to route the tunnel. THREE outcomes, not two, and each one decided on enough
+      # bytes to actually mean it: a TLS handshake record (`Tls::ClientHello.record_start?` —
+      # `0x16` and a major version of 3), the HTTP/2 cleartext preface
+      # (`H2::Frame.preface_prefix?` — four octets of `"PRI "`), and neither.
+      #
+      # That third arm is #755, and BOTH tests widened for it. This used to route `0x50` to
+      # h2c and everything else to `tls.intercept`, on the stated assumption that the only two
+      # things a client sends inside a tunnel are a ClientHello or a preface:
+      #
+      #   * `ssh -o ProxyCommand='nc -X connect …'` — a routine corporate-proxy pattern — fed
+      #     `SSH-2.0-OpenSSH…` into an OpenSSL SERVER handshake, which raised into
+      #     `Tunnel#intercept`'s rescue and closed with no flow and no log. And it closed having
+      #     already touched the origin: `reflect_origin_h2` runs BEFORE the client handshake, so
+      #     a real ClientHello advertising ALPN `h2` had been fired at the SSH server's port 22.
+      #   * `0x50` is also `POST`, `PUT`, `PATCH` and `PROPFIND`. A plaintext request tunnelled
+      #     to port 80 (`curl --proxytunnel -X POST`) was diverted into the h2 relay, which
+      #     dials the origin and then dies at `Frame.read_preface` — while the same request
+      #     spelled `GET` took the other branch. Behaviour split on the first letter of the
+      #     method, which is why the floor lives in `H2::Frame` now and both callers share it.
+      #
+      # Only the two arms that COMMIT read past the first byte, so the common refusals (`S`,
+      # `G`, `0x10`) still decide on one octet with nothing extra to wait for.
+      #
+      # The `read_byte`s themselves stay silent when they time out, and deliberately: a client
+      # that opens a CONNECT and then holds the tunnel without sending a ClientHello is a
+      # browser's speculative preconnect, which is ordinary and must not write a flow per
+      # occurrence. It is not the #755 shape either — that one is a connection that sent ZERO
+      # bytes, and this client sent a CONNECT (see `record_silent_client`). A client that
+      # genuinely needs to speak first on the far side is served by listing the host in
+      # `network.tls_passthrough`, which skips this peek entirely.
+      first = @io.read_byte
+      return false if first.nil?
+      if first == 0x50_u8
+        peeked = read_peek(first, H2::Frame::PREFACE_FLOOR)
+        return false if peeked.nil?
+        unless H2::Frame.preface_prefix?(peeked)
+          refuse_non_tls_connect(req, host, port, peeked)
+          return
+        end
+        # Cleartext h2 (h2c) tunnelled inside CONNECT. `h2c_refusal` is the whole gate:
+        # the setting, and the three rule kinds the h2 relay structurally cannot apply — a
+        # tunnel that looked like it honoured the rule table while a stub rule quietly let
+        # the request reach the origin would be worse than a visible refusal. The SANDBOX is
+        # not among them and no longer refuses this tunnel outright (#731): `intercept_h2c`
+        # wires the interceptor into the relay, so `H2::StreamGate` blocks out-of-scope
+        # streams here per stream, exactly as it does on the TLS h2 path.
+        if reason = h2c_refusal(host)
+          refuse_h2c(req, host, port, reason)
+          return
+        end
+        intercept_h2c(host, port, PrefixIO.new(peeked, @io))
+      elsif first == Tls::ClientHello::RECORD_HANDSHAKE
+        peeked = read_peek(first, 2)
+        return false if peeked.nil?
+        unless Tls::ClientHello.record_start?(peeked)
+          refuse_non_tls_connect(req, host, port, peeked)
+          return
+        end
+        tls.intercept(host, port, PrefixIO.new(peeked, @io), @sink, dial_addr: dial_pin)
+      else
+        refuse_non_tls_connect(req, host, port, Bytes[first])
+        return
+      end
+    end
+
+    # `first` plus however many more bytes the routing decision needs, as one slice to compare
+    # and then to hand back through a `PrefixIO` (P7: the tunnel's handler must see the complete
+    # stream). nil when the client closed before `want` arrived — the caller's `return false`
+    # then ends the connection, which is all there was to do with a half-sent preface anyway.
+    #
+    # Called only from the two arms that have already COMMITTED to a protocol, so the blocking
+    # read is bounded by a client that has said it is about to send 24 (h2c) or 5+ (TLS record)
+    # octets. A refusal never reaches here.
+    private def read_peek(first : UInt8, want : Int32) : Bytes?
+      buf = Bytes.new(want)
+      buf[0] = first
+      i = 1
+      while i < want
+        byte = @io.read_byte
+        return nil if byte.nil?
+        buf[i] = byte
+        i += 1
+      end
+      buf
     end
 
     # Everything decided BEFORE answering 200 to a CONNECT: cases gori handles or refuses
@@ -1948,10 +2110,15 @@ module Gori::Proxy
       true
     end
 
-    # The CONNECT half of the reserved-host route (see handle_connect). Answers 200, then
-    # peeks one byte exactly as handle_connect does: a TLS ClientHello (0x16) goes to the
-    # TlsMitm seam, anything else is a plaintext CONNECT tunnel (`curl --proxytunnel` at
-    # port 80) and is served in the clear rather than forced into a doomed handshake.
+    # The CONNECT half of the reserved-host route (see handle_connect). Answers 200, then peeks
+    # ONE byte: a TLS ClientHello (0x16) goes to the TlsMitm seam, anything else is a plaintext
+    # CONNECT tunnel (`curl --proxytunnel` at port 80) and is served in the clear rather than
+    # forced into a doomed handshake.
+    #
+    # Deliberately NOT `handle_connect`'s three-way peek (#755). The question here is different
+    # and the fallback answers it: there is no origin on this route — it is gori's own page — so
+    # "not TLS" means "serve the page in the clear", which is a real answer rather than a
+    # refusal, and a second byte could block on a client that sent only the first.
     private def serve_self_page_connect(host : String) : Nil
       sa = @self_addr
       tls = @tls
@@ -2172,19 +2339,88 @@ module Gori::Proxy
     private def record_non_http(head : Bytes, created_at : Int64) : Nil
       req = Codec::Http1.parse_request_head(head)
       host = @fixed_host || ""
-      # On a TLS-terminated path passthrough is the exact remedy: it leaves the connection
-      # byte-exact for its real protocol. On a cleartext listener there is no TLS leg to bypass,
-      # so the honest advice is to keep gori off this host's port.
-      remedy =
-        if @tls
-          "gori terminated TLS on this connection and speaks HTTP to it — if #{host.empty? ? "this host" : host.inspect} " \
-          "speaks a non-HTTP protocol, add it to `network.tls_passthrough` so gori tunnels it byte-exact instead of decoding it"
-        else
-          "this listener expects HTTP — a non-HTTP service should not be routed through gori's " \
-          "HTTP proxy (use `network.tls_passthrough` for a TLS service, or keep gori off this port)"
-        end
       record_error(req, @scheme, host, @fixed_port, created_at,
-        "not an HTTP request: the connection opened with #{non_http_prefix(head)}, which cannot begin an HTTP request line. #{remedy}")
+        "not an HTTP request: the connection opened with #{non_http_prefix(head)}, which cannot begin an HTTP request line. #{non_http_remedy(host)}")
+    end
+
+    # A connection that was accepted, sent ZERO bytes, and was closed when the read timed out
+    # (#755). The server-speaks-first case #729 left open: SMTP, IMAP, POP3, MySQL and friends
+    # have the SERVER greet, so their client connects and waits for a banner gori's HTTP proxy
+    # never sends. There is nothing to classify — `record_non_http` needs a byte and this
+    # connection produced none — so the SILENCE is the whole defect: the `IO::TimeoutError`
+    # unwound to `run`'s blanket rescue and no flow, no log and no chip said a connection had
+    # opened at all.
+    #
+    # ## Why this predicate and not the timeout
+    #
+    # The timeout stays. A legitimately slow client is indistinguishable from a silent one, and
+    # shortening the wait weakens the slowloris bound it exists for. What is narrowed instead is
+    # what gets RECORDED, along two axes, because "a head read timed out" on its own is the
+    # normal end of a healthy connection and a flow for each would be noise:
+    #
+    #   - ZERO bytes (`HeadTimeout#received`). A partial head that stalled is a slow or
+    #     slowloris HTTP client; a flow per connection there would amplify the attack.
+    #   - on a connection that never carried a request (`@saw_request`). After one has been
+    #     served, the same zero-byte timeout is an idle keep-alive reaching its end.
+    #
+    # One shape does survive both filters innocently, and it is named in the message rather than
+    # filtered out because it cannot be: a speculative preconnect — a browser opening a
+    # connection ahead of a request it never makes — is byte-for-byte this. `tls/tunnel.cr`
+    # already names it as an ordinary trigger of the same shape one layer down.
+    #
+    # Like `record_non_http`, THE ERROR STRING IS THE WHOLE ROW: there is no request, so
+    # `parse_request_head` over zero bytes gives empty method/target/version. Inside a tunnel
+    # `@fixed_host`/`@fixed_port` still name the origin the client asked for, which is the case
+    # that matters — on a cleartext listener not even the host is known.
+    private def record_silent_client : Nil
+      ClientConn.record_silent_client(@sink, @scheme, @fixed_host || "", @fixed_port,
+        client_tls: @client_tls)
+    end
+
+    # The same record, addressable WITHOUT a ClientConn — because on two listeners there isn't
+    # one yet when this shape happens. `Server#serve_reverse` and `#serve_transparent` route on
+    # `client.peek`, which blocks BEFORE any `ClientConn` is constructed, so a peer that connects
+    # and says nothing times out there and never reaches `read_client_head`. Those are also the
+    # only listeners a plaintext server-speaks-first protocol can arrive on at all — SMTP/IMAP
+    # cannot traverse a forward proxy without CONNECT — so leaving them out would have put the
+    # fix everywhere except where it is needed (#729 says the transparent listener "matters more
+    # here than anywhere else"). One method, so the sentence cannot fork.
+    def self.record_silent_client(sink : FlowSink, scheme : String, host : String, port : Int32,
+                                  *, client_tls : Bool) : Nil
+      flow_id = sink.on_request(FlowMapper.request(Codec::Http1.parse_request_head(Bytes.new(0)),
+        scheme: scheme, host: host, port: port, created_at: now_us, body: nil))
+      sink.on_response(FlowMapper.error_response(flow_id,
+        "no request: the client opened this connection, sent zero bytes, and was closed when the " \
+        "#{SocketTuning::CLIENT_IO_TIMEOUT.total_seconds.to_i} s client read timeout expired. A " \
+        "SERVER-SPEAKS-FIRST protocol makes exactly this shape — SMTP, IMAP, POP3, MySQL and " \
+        "friends have the SERVER greet first, so the client is waiting for a banner an HTTP proxy " \
+        "never sends. #{non_http_remedy(host, client_tls)}. Harmless alternative: a speculative " \
+        "preconnect, a connection a browser opened ahead of a request it never made, looks " \
+        "identical and needs nothing done about it"))
+    end
+
+    # The remedy sentence shared by the two ways a connection can turn out not to be HTTP — bytes
+    # that cannot start a request line (#729) and no bytes at all (#755).
+    #
+    # Keyed on `@client_tls`, the caller's claim about THIS connection's transport, and not on
+    # `@tls`, which is what this used to ask and got exactly backwards: `@tls` is the CONNECT MITM
+    # seam, passed only by the cleartext forward-proxy listener, so the "gori terminated TLS on
+    # this connection" wording went to plaintext :8080 clients while the decrypted tunnel — the
+    # one path where `network.tls_passthrough` really is the remedy — was told "this listener
+    # expects HTTP". See the constructor.
+    private def non_http_remedy(host : String) : String
+      ClientConn.non_http_remedy(host, @client_tls)
+    end
+
+    # :ditto: — the form a LISTENER can reach, for `self.record_silent_client` above.
+    def self.non_http_remedy(host : String, client_tls : Bool) : String
+      if client_tls
+        "gori terminated TLS on this connection and speaks HTTP to it — if #{host.empty? ? "this host" : host.inspect} " \
+        "speaks a non-HTTP protocol, add it to `network.tls_passthrough` so gori tunnels it byte-exact instead of decoding it"
+      else
+        "this listener expects HTTP — a non-HTTP service should not be routed through gori's " \
+        "HTTP proxy (use `network.tls_passthrough` for a TLS service, or keep gori off this port)"
+      end
     end
 
     # A short, terminal-safe rendering of what gori actually saw, for the flow's error message.
@@ -2193,26 +2429,36 @@ module Gori::Proxy
     #
     # ONE BYTE is the normal case, and the message has to read well for it. `read_head`'s
     # detector decides on the FIRST non-blank octet and breaks THERE — not waiting for more is
-    # the whole point of #729 — so `head` is any permitted empty line(s) plus that one octet,
-    # and by construction it is a CTL/SP/DEL (`looks_like_http_request?`). There is no `MQTT` or
-    # `SSH-2.0` string to show: those live at bytes 4-8 and 0-7 of a message this never reads,
-    # and an SSH banner is not even detected here (`S` is a method-token char — the known gap
-    # #729 records). A gloss of `"."` for the byte that decided would say nothing, so it is
-    # dropped and the octet is named instead.
+    # the whole point of #729 — so from THAT caller `head` is any permitted empty line(s) plus
+    # that one octet, and by construction it is a CTL/SP/DEL (`looks_like_http_request?`). There
+    # is no `MQTT` or `SSH-2.0` string to show: those live at bytes 4-8 and 0-7 of a message it
+    # never reads, and an SSH banner is not detected on the cleartext path at all (`S` is a
+    # method-token char — the known gap #729 records). A gloss of `"."` would say nothing there.
     #
-    # More than one byte reaches this only on the deadline-less fast path
+    # But `refuse_non_tls_connect` DOES hand over a printable single byte — that same `S`, or the
+    # `G` of a `curl --proxytunnel` GET — so the gloss is decided by whether the bytes are
+    # printable, never by how many there are. See the printable test below.
+    #
+    # More than one byte reaches this from two callers: the deadline-less fast path
     # (`SocketTuning.underlying_socket` nil ⇒ no detector), where `head` is whatever the client
-    # finished sending — hence the cap and the ASCII half are kept rather than deleted.
+    # finished sending, and `refuse_non_tls_connect`, which hands over the two bytes a TLS
+    # ClientHello is judged on — hence the cap and the ASCII half are kept rather than deleted.
     private def non_http_prefix(head : Bytes, limit : Int32 = 12) : String
       slice = head[0, {head.size, limit}.min]
       hex = slice.map { |b| "0x#{b.to_s(16).rjust(2, '0')}" }.join(' ')
       more = head.size > limit ? " …" : ""
-      return "the byte #{hex}" if slice.size == 1
-      return "the bytes #{hex}#{more}" if slice.none? { |b| b >= 0x20_u8 && b < 0x7f_u8 }
+      noun = slice.size == 1 ? "the byte" : "the bytes"
+      # The PRINTABLE test decides the gloss, and the arity only picks the noun. It used to be the
+      # other way round, which was right for the one caller that existed: `record_non_http`'s byte
+      # is a CTL/SP/DEL by construction, so a one-byte gloss would have read `"."` and said
+      # nothing. `refuse_non_tls_connect` broke that invariant — `0x53` for SSH, `0x47` for
+      # `curl --proxytunnel` — and those are exactly the bytes an operator should not have to
+      # look up in an ASCII table (#755).
+      return "#{noun} #{hex}#{more}" if slice.none? { |b| b >= 0x20_u8 && b < 0x7f_u8 }
       ascii = String.build do |s|
         slice.each { |b| s << (b >= 0x20_u8 && b < 0x7f_u8 ? b.unsafe_chr : '.') }
       end
-      "the bytes #{hex}#{more} (#{ascii.inspect})"
+      "#{noun} #{hex}#{more} (#{ascii.inspect})"
     end
 
     # A dropped request never reaches upstream; record it as an Aborted flow so
@@ -2684,6 +2930,11 @@ module Gori::Proxy
     end
 
     private def now_us : Int64
+      ClientConn.now_us
+    end
+
+    # :ditto: — reachable from `self.record_silent_client`, which has no instance.
+    def self.now_us : Int64
       (Time.utc - Time::UNIX_EPOCH).total_microseconds.to_i64
     end
   end

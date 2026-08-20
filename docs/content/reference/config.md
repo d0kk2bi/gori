@@ -77,6 +77,12 @@ It is also the answer for a **non-HTTP protocol** on the same path — MQTT, AMQ
 
 A protocol that opens with a *text* line (SSH's `SSH-2.0-…` banner, an SMTP greeting) is **not** detected, on purpose: on the first line it is indistinguishable from a deliberately malformed request line, and gori forwards those verbatim rather than second-guessing your payload. Such a connection still waits out the head timeout. Reach for passthrough there too.
 
+It also covers the two shapes with no bytes to judge. A **server-speaks-first** protocol — SMTP, IMAP, POP3, MySQL, where the *server* greets first — has its client connect and send nothing at all, so there is nothing to classify; the connection is now recorded as a `no request` flow naming that shape once the read times out, instead of dying in silence. On a reverse or transparent listener that flow names the origin the client was dialling — declared for the reverse one, read from the kernel's redirect for the transparent one where the platform answers — which for a redirected `:25` or `:143` is the whole diagnosis and the host to list here. On the forward-proxy listener there is no name to record — nothing arrived to carry one — so there the flow's advice is to keep gori off that port instead.
+
+A **non-TLS payload inside `CONNECT`** — `ssh -o ProxyCommand='nc -X connect proxy:8080 %h %p'`, the ordinary corporate-proxy pattern — is refused with a flow that names the byte it opened with, rather than being fed to a TLS handshake it can never complete. Listing the host makes it work: a listed host is relayed byte-exact, with no peek at what it speaks. The same peek now identifies an `h2c` tunnel by its full `PRI * HTTP/2.0` preface rather than by its first byte, so a plaintext `POST` or `PROPFIND` tunnelled to port 80 is refused like any other undecodable payload instead of being handed to the HTTP/2 relay.
+
+If gori cannot complete a TLS handshake with a client reaching a tunnelled origin — most often because the client does not trust the CA yet, and always for a client that pins a certificate — that is written to `gori.log` once per host, port and reason. The CA-download page at `gori.proxy` is excluded: a client arrives there precisely because it does not trust the CA yet, so a failure is the expected first step, not a fault to report.
+
 ```json
 {
   "network": {

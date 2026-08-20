@@ -88,6 +88,42 @@ describe "Http1.read_head with a head-completion deadline (drip-feed slowloris b
     end
   end
 
+  # #755: the SAME exception has to answer two different questions, so it carries the byte
+  # count. `ClientConn` records a flow for one of these shapes and stays silent for the other.
+  describe "Http1::HeadTimeout#received" do
+    it "is 0 when the peer connected and sent nothing at all (server-speaks-first)" do
+      a, b = UNIXSocket.pair
+      begin
+        # The PRODUCTION shape: the deadline is the full HEAD_DEADLINE and never arms, because
+        # `head_started` needs a first byte. What fires is the caller's own baseline read_timeout
+        # — `SocketTuning::CLIENT_IO_TIMEOUT`, armed by `ClientConn#run`, 100ms here so the
+        # example does not take 30 seconds.
+        b.read_timeout = 100.milliseconds
+        ex = expect_raises(Gori::Proxy::Codec::Http1::HeadTimeout) do
+          Gori::Proxy::Codec::Http1.read_head(b, deadline: 30.seconds, timeout_sock: b)
+        end
+        ex.received.should eq(0)
+        ex.should be_a(IO::TimeoutError) # every existing rescue keys on this, and must keep working
+      ensure
+        a.close; b.close
+      end
+    end
+
+    it "counts the bytes that DID arrive when a partial head stalls (slowloris, not silence)" do
+      a, b = UNIXSocket.pair
+      begin
+        a.write("GET ".to_slice)
+        a.flush
+        ex = expect_raises(Gori::Proxy::Codec::Http1::HeadTimeout) do
+          Gori::Proxy::Codec::Http1.read_head(b, deadline: 100.milliseconds, timeout_sock: b)
+        end
+        ex.received.should eq(4) # non-zero is the whole point: this connection SPOKE
+      ensure
+        a.close; b.close
+      end
+    end
+  end
+
   it "returns a complete head and RESTORES the baseline timeout for the body read" do
     a, b = UNIXSocket.pair
     begin

@@ -16,6 +16,31 @@ module Gori::Proxy::Codec::Http1
   CRLF      = "\r\n"
   CRLF_CRLF = "\r\n\r\n".to_slice
 
+  # A head read that ran out of time, carrying HOW MANY head bytes had arrived when it did.
+  #
+  # The count is the whole reason this type exists. `ClientConn` has to tell apart two timeouts
+  # that are otherwise the same exception: a client that connected and sent NOTHING — the
+  # server-speaks-first shape, where SMTP/IMAP/POP3/MySQL have the SERVER greet first so the
+  # client's first write never comes (#755) — from one that sent a partial head and then
+  # stalled, which is a slow or slowloris HTTP client and must stay silent (a flow per
+  # connection would amplify the very attack `deadline` is the defense against). Both surface
+  # as the socket's own `IO::TimeoutError`, because after the first byte the deadline is
+  # enforced by SHRINKING `read_timeout` rather than by a clock of its own — so the raise site
+  # cannot be read as the answer either.
+  #
+  # Subclasses `IO::TimeoutError` deliberately, so every existing caller keeps working
+  # unchanged: `ClientConn#safe_read_head` (bare rescue), `TlsMitm#serve_self_page_once` (bare),
+  # `Repeater::Engine` and `Repeater::WsEngine` (both rescue `IO::TimeoutError` by name), and
+  # `spec/proxy/socket_tuning_spec.cr`'s `expect_raises(IO::TimeoutError)`.
+  class HeadTimeout < IO::TimeoutError
+    # Head bytes buffered when the clock ran out. 0 means the peer sent nothing at all.
+    getter received : Int32
+
+    def initialize(message : String, @received : Int32)
+      super(message)
+    end
+  end
+
   # Reads one message head from `io`, returning the exact bytes including the
   # terminating CRLFCRLF. Returns nil on clean EOF before any byte arrives, OR
   # when the head exceeds `max_bytes` without ever reaching CRLFCRLF. Returning a
@@ -39,13 +64,21 @@ module Gori::Proxy::Codec::Http1
       return read_head_deadlined(io, sock, dl, max_bytes, detect_non_http)
     end
     buf = IO::Memory.new(512) # presized: covers a typical head without regrowing
-    while buf.bytesize < max_bytes
-      byte = io.read_byte
-      break if byte.nil? # EOF
-      buf.write_byte(byte)
-      # CRLFCRLF ends in LF, so only a just-written LF can complete the terminator
-      # — skip the 4-byte tail compare on every other byte.
-      break if byte == 0x0a_u8 && buf.bytesize >= 4 && ends_with_crlf_crlf?(buf)
+    begin
+      while buf.bytesize < max_bytes
+        byte = io.read_byte
+        break if byte.nil? # EOF
+        buf.write_byte(byte)
+        break if head_complete?(buf, byte)
+      end
+    rescue ex : IO::TimeoutError
+      # `read_head` raises `HeadTimeout` and nothing else, from EITHER path. That uniformity is
+      # what lets `ClientConn#read_client_head` rescue the narrow type without depending on an
+      # unstated invariant about which path it took — and `SocketTuning.underlying_socket`
+      # returning nil for a future client-leg wrapper would otherwise silently disable the #755
+      # record. No deadline is armed on this path, so a timeout here is the caller's own baseline
+      # and `buf.bytesize` is still the honest count.
+      raise HeadTimeout.new(ex.message || "head read timed out", buf.bytesize)
     end
     finalize_head(buf, max_bytes)
   end
@@ -69,9 +102,7 @@ module Gori::Proxy::Codec::Http1
     begin
       while buf.bytesize < max_bytes
         if hs = head_started
-          remaining = deadline - (Time.instant - hs)
-          raise IO::TimeoutError.new("request head incomplete before deadline") if remaining <= Time::Span.zero
-          sock.read_timeout = remaining
+          arm_remaining(sock, deadline - (Time.instant - hs))
         end
         byte = io.read_byte
         break if byte.nil?            # EOF
@@ -85,12 +116,29 @@ module Gori::Proxy::Codec::Http1
             break if !Http1.looks_like_http_request?(buf.to_slice)
           end
         end
-        break if byte == 0x0a_u8 && buf.bytesize >= 4 && ends_with_crlf_crlf?(buf)
+        break if head_complete?(buf, byte)
       end
+    rescue ex : IO::TimeoutError
+      # One conversion point for BOTH clocks that can fire in here, because the caller cannot
+      # tell them apart from the exception alone (#755): with zero bytes in hand the wait was
+      # the caller's own baseline `read_timeout` (`SocketTuning::CLIENT_IO_TIMEOUT`, armed by
+      # `ClientConn#run`) and the peer said nothing at all; after the first byte it was the
+      # shrunk remainder of `deadline`, i.e. a partial head that stalled. `received` is that
+      # distinction. Rebuilding the exception costs one allocation on a path that has just
+      # spent 30 s waiting.
+      raise HeadTimeout.new(ex.message || "head read timed out", buf.bytesize)
     ensure
       sock.read_timeout = saved_timeout # restore the baseline for the following body read
     end
     finalize_head(buf, max_bytes)
+  end
+
+  # Shrink `sock`'s read_timeout toward what is LEFT of the head deadline, raising when it is
+  # spent — the drip-feed bound, re-armed before every read so a trickle cannot keep resetting it.
+  # One caller; a method rather than inline so the loop above reads as the four steps it is.
+  private def self.arm_remaining(sock : ::Socket, remaining : Time::Span) : Nil
+    raise IO::TimeoutError.new("request head incomplete before deadline") if remaining <= Time::Span.zero
+    sock.read_timeout = remaining
   end
 
   # Turn a read head buffer into the returned bytes (or nil). A `buf` that hit the cap without a
@@ -101,6 +149,13 @@ module Gori::Proxy::Codec::Http1
     return nil if buf.bytesize == 0
     return nil if buf.bytesize >= max_bytes && !ends_with_crlf_crlf?(buf)
     buf.to_slice
+  end
+
+  # Did the byte just written to `buf` complete the head? CRLFCRLF ends in LF, so only a
+  # just-written LF can complete the terminator — which is what makes the 4-byte tail compare
+  # skippable on every other byte. One home for the test both read loops run per byte.
+  private def self.head_complete?(buf : IO::Memory, byte : UInt8) : Bool
+    byte == 0x0a_u8 && buf.bytesize >= 4 && ends_with_crlf_crlf?(buf)
   end
 
   private def self.ends_with_crlf_crlf?(buf : IO::Memory) : Bool

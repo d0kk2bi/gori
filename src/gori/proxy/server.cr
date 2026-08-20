@@ -188,7 +188,7 @@ module Gori::Proxy
           # offer was ever carried and gori has no h2c of its own to offer instead (#731).
           ClientConn.new(client, "http", @sink, @tls, rewriter: @rewriter, interceptor: @interceptor,
             host_overrides: @host_overrides, self_addr: {@host, @port}, local_host: local_host,
-            extractor: @extractor, h2_offer: H2Offer::Cleartext).run
+            extractor: @extractor, h2_offer: H2Offer::Cleartext, client_tls: false).run
         end
       rescue
         # Setup (setsockopt) can raise if the peer RST'd between accept and here;
@@ -235,8 +235,8 @@ module Gori::Proxy
     # it arrived through.
     private def serve_reverse(client : TCPSocket, origin : {String, String, Int32}) : Nil
       scheme, host, port = origin
-      first = client.peek
-      if first && !first.empty? && first[0] == 0x16_u8
+      first = peek_first(client, scheme, host, port)
+      if first && !first.empty? && first[0] == Tls::ClientHello::RECORD_HANDSHAKE
         return serve_reverse_tls(client, origin)
       end
       # h2c prior knowledge (#737). A reverse listener IS the origin — the authority is
@@ -264,7 +264,7 @@ module Gori::Proxy
         fixed_host: host, fixed_port: port, tls_upstream: scheme == "https",
         rewriter: @rewriter, interceptor: @interceptor, host_overrides: @host_overrides,
         self_addr: {@host, @port}, rewrite_fixed_host: @rewrite_host, extractor: @extractor,
-        h2_offer: H2Offer::Cleartext).run
+        h2_offer: H2Offer::Cleartext, client_tls: false).run
     end
 
     # TLS terminated by a reverse listener. The leaf is minted for the CONFIGURED origin host,
@@ -293,29 +293,17 @@ module Gori::Proxy
         rewrite_host: @rewrite_host)
     end
 
-    # How few bytes of the preface are still enough to decide. Four is `"PRI "` — the method,
-    # which is the discriminating part; below that a segment holding only `"P"` decides nothing.
-    H2C_PREFACE_FLOOR = 4
-
-    # Does this connection open with the HTTP/2 client preface (RFC 9113 §3.4)?
+    # Does this connection open with the HTTP/2 client preface? `H2::Frame.preface_prefix?` is
+    # the one home for the test and carries the reasoning; #755 moved it there because the
+    # CONNECT path needs the same answer and used to guess it from one byte.
     #
-    # Deliberately NOT the single-byte test the CONNECT path uses. After a CONNECT's `200`
-    # reply, `0x50` IS the preface: the only two things a client sends there are a TLS
-    # ClientHello or `PRI * HTTP/2.0`. On a LISTENER the same byte opens `POST`, `PUT` and
-    # `PATCH`, so a first-byte branch would divert every form submission into the h2 relay, and
-    # each one would die at `Frame.read_preface` with the connection already committed. So as
-    # much of the real preface as the peek holds is compared, with a floor.
-    #
-    # `peek` CONSUMES NOTHING, which is what keeps the existing routing byte-exact: a false
-    # answer leaves the socket untouched for `ClientConn`, and a true one leaves the whole
-    # 24-octet preface in the buffer for `Frame.read_preface` to read. That is why neither
-    # listener needs a `PrefixIO` here, and it is the one way this differs from the CONNECT
-    # site, which peeks by READING a byte and therefore has to push it back.
+    # What belongs to the LISTENER is that `peek` CONSUMES NOTHING, which is what keeps this
+    # routing byte-exact: a false answer leaves the socket untouched for `ClientConn`, and a true
+    # one leaves the whole 24-octet preface in the buffer for `Frame.read_preface` to read. That
+    # is why neither listener needs a `PrefixIO` here, and it is the one way this differs from
+    # the CONNECT site, which peeks by READING and therefore has to push what it read back.
     private def h2c_preface?(peeked : Bytes?) : Bool
-      return false unless peeked
-      n = Math.min(peeked.size, H2::Frame::PREFACE.size)
-      return false if n < H2C_PREFACE_FLOOR
-      peeked[0, n] == H2::Frame::PREFACE[0, n]
+      H2::Frame.preface_prefix?(peeked)
     end
 
     # Serve an h2c prior-knowledge connection that arrived DIRECTLY on a listener (#737).
@@ -364,7 +352,7 @@ module Gori::Proxy
       # never enters the HTTP/1.1 loop), so it is the honest observation, not a placeholder.
       conn = ClientConn.new(client, "http", @sink, rewriter: @rewriter, interceptor: @interceptor,
         host_overrides: @host_overrides, origin_dst: origin_dst, extractor: @extractor,
-        h2_offer: H2Offer::Cleartext)
+        h2_offer: H2Offer::Cleartext, client_tls: false)
       begin
         conn.serve_h2c_prior_knowledge(host, port, client)
       ensure
@@ -382,8 +370,8 @@ module Gori::Proxy
     # `resolve_forward` already resolves origin-form from the Host header, which IS transparent
     # forwarding; nothing further is needed for cleartext.
     private def serve_transparent(client : TCPSocket) : Nil
-      first = client.peek
-      tls = !!(first && !first.empty? && first[0] == 0x16_u8)
+      first = peek_transparent_first(client)
+      tls = !!(first && !first.empty? && first[0] == Tls::ClientHello::RECORD_HANDSHAKE)
       # Read the original destination ONCE, before the branch, and hand the same answer to both
       # halves. That is the property `Settings::Listener#effective_target_port(tls)` existed to
       # hold — the cleartext and TLS branches cannot disagree about the destination — now
@@ -399,8 +387,42 @@ module Gori::Proxy
         ClientConn.new(client, "http", @sink, rewriter: @rewriter, interceptor: @interceptor,
           host_overrides: @host_overrides,
           default_port: Settings.listener_target_port(@target_port, tls: false),
-          origin_dst: dst, extractor: @extractor, h2_offer: H2Offer::Cleartext).run
+          origin_dst: dst, extractor: @extractor, h2_offer: H2Offer::Cleartext, client_tls: false).run
       end
+    end
+
+    # `client.peek` — the first-byte discriminator the reverse and transparent listeners route
+    # on — with the #755 record attached to the one way it can time out: a peer that connected
+    # and sent NOTHING. Server-speaks-first (SMTP/IMAP/POP3/MySQL, where the SERVER greets) makes
+    # exactly that shape, and these two listeners are the only ones it can reach — a forward
+    # proxy needs a CONNECT, which is bytes. Without this the timeout raised here, was swallowed
+    # by `serve_connection`'s rescue and the fd closed with nothing recorded anywhere, so the fix
+    # in `ClientConn#read_client_head` was unreachable on the paths that need it most.
+    #
+    # RE-RAISES after recording, deliberately: every existing control path is unchanged — the
+    # accept-path rescue still closes the fd and the `ensure` still frees the slot. Only the
+    # silence is gone. A drip-feed that stalls mid-head is NOT this: it never reaches here,
+    # because `peek` returns as soon as one byte lands.
+    private def peek_first(client : TCPSocket, scheme : String, host : String, port : Int32) : Bytes?
+      client.peek
+    rescue ex : IO::TimeoutError
+      ClientConn.record_silent_client(@sink, scheme, host, port, client_tls: false)
+      raise ex
+    end
+
+    # `peek_first` for the transparent listener, which learns its target from the KERNEL rather
+    # than from a declaration — so the flow can still name the origin the client was dialling
+    # when it went silent, which for a redirected :25 or :143 is the whole diagnosis. `tls: false`
+    # is the honest guess for the port default: nothing arrived, so nothing suggested TLS.
+    private def peek_transparent_first(client : TCPSocket) : Bytes?
+      client.peek
+    rescue ex : IO::TimeoutError
+      dst = OrigDst.lookup(client)
+      ClientConn.record_silent_client(@sink, "http",
+        dst ? OrigDst.dial_host(dst) : "",
+        dst ? dst.port : Settings.listener_target_port(@target_port, tls: false),
+        client_tls: false)
+      raise ex
     end
 
     # The kernel's original destination for this connection as {host, port}, or nil when there
