@@ -144,15 +144,17 @@ describe Gori::Proxy::Codec::Http1 do
     # `parse_request_head` keeps every one verbatim. The detector must not refuse them — an
     # earlier draft did, and closed the connection blaming `network.tls_passthrough`.
     it "accepts a malformed or unusual request line rather than calling it non-HTTP (P7)" do
-      ["GET /x HTTP/1.10\r\n\r\n",                 # two-digit minor — version fuzzing
-       "GET /x http/1.1\r\n\r\n",                  # lowercase version token
-       "GET /index.html\r\n\r\n",                  # HTTP/0.9, two tokens, no version at all
-       "GET\r\nHost: a\r\n\r\n",                   # single-token start line (specced elsewhere as malformed-but-kept)
-       "GET  /a  HTTP/1.1\r\n\r\n",                # doubled spaces
-       "GET\t/a HTTP/1.1\r\n\r\n",                 # tab instead of space
-       "GET /a b HTTP/1.1\r\n\r\n",                # unencoded space in the target (R1-4)
-       "GET / HTTP/1.1 \r\n\r\n",                  # trailing space after the version
-       "\r\nGET / HTTP/1.1\r\n\r\n"].each do |raw| # leading empty line (RFC 7230 §3.5)
+      ["GET /x HTTP/1.10\r\n\r\n",                    # two-digit minor — version fuzzing
+       "GET /x http/1.1\r\n\r\n",                     # lowercase version token
+       "GET /index.html\r\n\r\n",                     # HTTP/0.9, two tokens, no version at all
+       "GET\r\nHost: a\r\n\r\n",                      # single-token start line (specced elsewhere as malformed-but-kept)
+       "GET  /a  HTTP/1.1\r\n\r\n",                   # doubled spaces
+       "GET\t/a HTTP/1.1\r\n\r\n",                    # tab instead of space
+       "GET /a b HTTP/1.1\r\n\r\n",                   # unencoded space in the target (R1-4)
+       "GET / HTTP/1.1 \r\n\r\n",                     # trailing space after the version
+       "\r\nGET / HTTP/1.1\r\n\r\n",                  # leading empty line (RFC 7230 §3.5)
+       " GET /admin HTTP/1.1\r\n\r\n",                # leading SP — whitespace-before-request-line
+       "\tGET /admin HTTP/1.1\r\n\r\n"].each do |raw| # leading HTAB, same probe
         Http1.looks_like_http_request?(bytes(raw)).should be_true
       end
     end

@@ -63,14 +63,40 @@ module Gori::Tui
         on_palette.try(&.call)
       elsif k.escape?
         return :cancel
-      elsif k.up? || k.lower_k?
+      else
+        handle_nav(ev)
+      end
+      :stay
+    end
+
+    # ↑/↓ and their bare-letter twins, plus the bare `r`. Split out of `handle_key` for the same
+    # reason `HotkeysOverlay#bare_char` is a method — to keep the dispatcher under the ameba
+    # complexity bar — and the guard in the middle is the whole point of the split.
+    #
+    # BOTH halves of every letter arm need it, which is why guarding the `ev.char` arm alone was
+    # not enough. `Event::Key#char` is `@char || key.to_char`, so ^R folds back to 'r'; and the
+    # termisu parser emits ^K as `Key::LowerK + Ctrl` (parser.cr maps 0x01..0x1A through
+    # `Key.from_char`), so `k.lower_k?` is TRUE on a chord too — no `ev.char` involved. The
+    # shell pre-filters only ^C/^D/^G/^F/^B (`Runner#handle_key`), so every other chord lands
+    # here. ARROWS stay outside the guard deliberately: ⌃↑/⌃↓ are a scroll gesture elsewhere in
+    # gori and nothing folds them into a letter, so there is no bug to fix on that arm.
+    private def handle_nav(ev : Termisu::Event::Key) : Nil
+      k = ev.key
+      if k.up?
         move(-1)
-      elsif k.down? || k.lower_j?
+      elsif k.down?
+        move(1)
+      elsif ev.ctrl? || ev.alt?
+        # A chord is not a mnemonic. Claimed and dropped rather than fallen through: this
+        # overlay returns :stay for everything, so the chord was consumed either way — the
+        # only question was whether it also DID something, and it should not.
+      elsif k.lower_k?
+        move(-1)
+      elsif k.lower_j?
         move(1)
       elsif (ev.char || k.to_char) == 'r'
         reload
       end
-      :stay
     end
 
     # A click inside the card selects a row (there is nothing to open); outside dismisses.

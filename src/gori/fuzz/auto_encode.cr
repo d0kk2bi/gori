@@ -30,6 +30,16 @@ module Gori::Fuzz
   #     A dedicated flag, not `--verbatim`: that one is the Content-Length knob and means
   #     "do not resync framing", a different axis in the same command.
   #
+  # AND FOR A PAYLOAD THAT IS ITSELF A PERCENT-ESCAPE, which is the case this default does not
+  # serve. `%` is a reserved byte like any other, so `%00` goes out as `%2500` and reaches the
+  # app as three characters rather than a NUL; `..%c0%af..` (the overlong-UTF-8 `/`) arrives as
+  # text no normalizer folds. Where the probe's TARGET is the origin's own decoder, that is not
+  # a shifted test but no test. The `%2e%2e%2f` family merely SHIFTS — single-decode becomes
+  # double-decode, still a real bypass — but not the one that was marked. Deliberately NOT
+  # fixed by sniffing for `%`: a wordlist holding `100%` or `50%off` would then silently skip
+  # the encoding it needs. The surfaces say so instead (`gori run fuzz`'s up-front note, the
+  # `--no-encode` help, MCP `no_encode`, the CLI reference and the fuzz playbook).
+  #
   # The encoder is `Encode.new(:url)` — the SAME processor `--encode url` builds, not a new
   # one and not the Decoder catalog's `url-encode` (which is form-style: it turns a space
   # into `+`). One spelling of "URL-encoded" per surface.

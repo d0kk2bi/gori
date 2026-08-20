@@ -55,7 +55,13 @@ module Gori::Tui
         ev.shift? ? move_selected(-1) : select_move(-1)
       elsif key.down?
         ev.shift? ? move_selected(1) : select_move(1)
-      elsif c = ev.char
+      elsif (c = ev.char) && !ev.ctrl? && !ev.alt?
+        # Guarded, and not for tidiness: `Event::Key#char` is `@char || key.to_char`, so ^R
+        # reports 'r' and lands on the reset arm below — the shell's pre-filter claims only
+        # ^C/^D (and it YIELDS both over a modal), ^G, ^F and ^B, so every other Ctrl+letter
+        # reaches this overlay as its bare letter. ^K/^J moved the selection and ^R raised the
+        # "back to the factory tab bar" confirm. Same guard, same reason, as
+        # `NotificationsOverlay`'s `c` arm and the `picker`/`env`/`hosts`/`links` overlays.
         handle_char(c)
       end
       :stay

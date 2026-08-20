@@ -48,7 +48,7 @@ describe Gori::Tui::CopyMenu do
     it "builds a shell-safe curl dropping Host/Content-Length, with method + body" do
       curl = opt(CopyMenu.request_options(wire, target), 'l').not_nil!.text
       curl.should contain("curl 'https://example.com/api/login?next=/home'")
-      curl.should contain("-X POST")
+      curl.should contain("-X 'POST'")
       curl.should contain("-H 'Content-Type: application/json'")
       curl.should_not contain("-H 'Host:")
       curl.should_not contain("-H 'Content-Length:")
@@ -124,7 +124,7 @@ describe Gori::Tui::CopyMenu do
     it "keeps -X GET on a GET that carries a body (curl would else promote it to POST)" do
       req = "GET /q HTTP/1.1\r\nHost: h\r\n\r\nbodydata"
       curl = opt(CopyMenu.request_options(req, "http://h"), 'l').not_nil!.text
-      curl.should contain("-X GET")
+      curl.should contain("-X 'GET'")
       curl.should contain("--data-raw 'bodydata'")
     end
 

@@ -591,7 +591,7 @@ describe "gori run show --format curl" do
     detail = Gori::Store::FlowDetail.new(row, "HTTP/1.1", head.to_slice, %({"user":"neo"}).to_slice, nil, nil)
     cmd = Gori::CLI::Run.curl_command_for_spec(detail).not_nil!
     cmd.should contain("curl 'https://example.com/api/login'")
-    cmd.should contain("-X POST")
+    cmd.should contain("-X 'POST'")
     cmd.should contain(%q(--data-raw '{"user":"neo"}'))
     cmd.should_not contain("Content-Length")
   end

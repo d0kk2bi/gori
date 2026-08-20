@@ -1380,3 +1380,34 @@ Two things this deliberately accepts, recorded rather than hidden:
    because `host`, `method` and `target` are all `NOT NULL`: a NULL haystack would make the arms
    disagree under `NOT` (`NOT (NULL)` drops the row, `NOT (0)` keeps it). A nullable column added
    to this set must re-derive that, not inherit it.
+
+### 2026-08-20: the received request-line is judged by a different rule than the one gori writes
+
+Refines: [P7](#p7). PR: recent-merge audit.
+
+`Codec::Http1.request_token_safe?` is the one home for "may this text go on a request line as one
+token" — CR/LF/NUL/SP/HTAB/DEL all refused — and AGENTS.md lists re-deriving it next to a new
+caller as a trap. #729's non-HTTP detector (`looks_like_http_request?`) cited that rule and applied
+it to the first received byte. Doing so was the trap in the other direction.
+
+The rule is correct for a line gori **synthesizes** (Discover's crawled `href`, the MCP request
+builder, the fuzzer's redirect follower): there, an SP is gori forging a request the operator did
+not write. It is wrong for a line gori **receives**, where an SP is the operator's payload.
+` GET /admin HTTP/1.1` — whitespace before the request-line — is a standard smuggling / WAF
+parser-differential probe, and it was being killed at the connection with the flow blaming
+`network.tls_passthrough` for the tester's own request. That is exactly the false-positive class
+the predicate's own comment swears off, and it sat one row from the `\r\n`-prefixed case
+`spec/proxy/codec/http1_spec.cr` already protected.
+
+**So SP and HTAB are carved out of the detector's reject set** (C0-minus-whitespace, plus DEL). No
+binary preface begins with SP or HTAB — MQTT `0x10`, AMQP `0x00`, a TLS ClientHello `0x16` are all
+caught unchanged — so the carve-out costs nothing the detector exists to buy.
+
+Two things this accepts, recorded rather than hidden:
+
+1. **A whitespace-prefixed non-HTTP protocol waits out the head deadline** again, exactly like the
+   SSH/SMTP text banners #729 already documented as a known gap. Same trade, same reason: on the
+   first byte a banner and a payload are indistinguishable, and gori does not guess.
+2. **Two rules for one shape**, which is normally the thing to avoid. The split is the point here:
+   `request_token_safe?` governs what gori WRITES, `looks_like_http_request?` what it READS, and
+   a future reader tempted to unify them should re-read P7 first.

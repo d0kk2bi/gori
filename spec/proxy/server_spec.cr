@@ -374,7 +374,14 @@ describe Gori::Proxy::Server do
     resp.state.should eq(Gori::Store::FlowState::Error)
     msg = resp.error.not_nil!
     msg.should contain("not an HTTP request")
-    msg.should contain("bytes 10")        # the observed prefix, hex (the read stops on the first non-token byte)
+    # ONE byte, named as one. The detector stops ON the first non-token octet — that is the
+    # point of #729 — so the nine bytes the client wrote are not what gori read, and the `MQTT`
+    # at offset 4 never arrives here. The message used to say `bytes 10` for exactly this
+    # single octet: a plural over a one-item hex list, where `10` also reads as decimal ten.
+    msg.should contain("the byte 0x10")
+    # Narrow on purpose: a bare `should_not contain("bytes ")` also pinned the REMEDY sentence,
+    # so rewording that unrelated half would fail this example for the wrong reason.
+    msg.should_not contain("bytes 0x10")
     msg.should contain("tls_passthrough") # the remedy the operator would never find
   end
 
@@ -396,7 +403,7 @@ describe Gori::Proxy::Server do
     resp = sink.responses.first
     resp.state.should eq(Gori::Store::FlowState::Error)
     resp.error.not_nil!.should contain("not an HTTP request")
-    resp.error.not_nil!.should contain("bytes 16")
+    resp.error.not_nil!.should contain("the byte 0x16") # the ClientHello's type byte, alone
   end
 
   # The counterpart to the detector's narrowness (P7): a deliberately malformed request line —
