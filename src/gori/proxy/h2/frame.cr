@@ -12,6 +12,32 @@ module Gori::Proxy::H2
     # right after the h2 ALPN handshake. A SETTINGS frame follows it.
     PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_slice # 24 octets
 
+    # How few bytes of PREFACE are still enough to decide. Four is `"PRI "` — the method plus its
+    # delimiter, which is the discriminating part; below that a buffer holding only `"P"` decides
+    # nothing, and `"PR"` still admits `PROPFIND`.
+    PREFACE_FLOOR = 4
+
+    # Does this connection open with the HTTP/2 client preface (RFC 9113 §3.4)? nil, or fewer
+    # than PREFACE_FLOOR bytes, is not a yes.
+    #
+    # The FLOOR is the whole point, and it is why this is not a first-byte test. `0x50` also
+    # opens `POST`, `PUT`, `PATCH` and `PROPFIND`, so a first-byte branch diverts every form
+    # submission into the h2 relay, where it dies at `read_preface` with the connection already
+    # committed and the origin already dialled. That was true of the LISTENER routing this was
+    # written for (`Server#serve_reverse`, `#serve_transparent`) and it is equally true inside a
+    # CONNECT tunnel (`ClientConn#handle_connect`) — the assumption that a tunnel carries only a
+    # ClientHello or a preface is exactly what #755 refutes. One home, so the two cannot drift.
+    #
+    # Compares only what the caller HAS: a listener passes the whole `peek` buffer, the CONNECT
+    # path passes the four octets it read back. Either way a true answer means the rest of the
+    # preface is still ahead of `read_preface`.
+    def self.preface_prefix?(peeked : Bytes?) : Bool
+      return false unless peeked
+      n = Math.min(peeked.size, PREFACE.size)
+      return false if n < PREFACE_FLOOR
+      peeked[0, n] == PREFACE[0, n]
+    end
+
     HEADER_SIZE = 9
 
     # The largest value the 24-bit frame length field can hold (RFC 7540 §4.1) — the

@@ -35,6 +35,12 @@ module Gori::Proxy::Tls
     # input, without a log line per reconnect from a chatty client.
     DOWNGRADE_NOTICE_MAX = 1024
 
+    # Cap on the once-per-{host, reason} client-handshake failure notice (see
+    # notice_handshake_failure). Same number and same reason as the two above, and it matters
+    # more here: the commonest member of that population is a client that does not trust gori's
+    # CA, i.e. something that retries.
+    HANDSHAKE_NOTICE_MAX = 1024
+
     # Live-mutable so the TUI's settings:network toggle (Session#set_verify_upstream) can
     # flip upstream TLS verification without a restart; read per-CONNECT in `intercept`, so
     # the next tunnelled connection picks up the change.
@@ -59,6 +65,8 @@ module Gori::Proxy::Tls
       # {host, reason} pairs already announced by notice_downgrade. Same no-mutex argument as
       # above: the read and the add happen together with no yield between them.
       @downgrade_noticed = Set({String, String}).new
+      # The same, for notice_handshake_failure.
+      @handshake_noticed = Set({String, String}).new
     end
 
     # TlsMitm seam: hand the connection loop the root CA (for the self-serve download
@@ -165,7 +173,18 @@ module Gori::Proxy::Tls
       # read. `client` (a PrefixIO over the raw socket) is then closed here; the
       # ClientConn/​server close paths are all `rescue`-guarded, so the double close
       # is a safe no-op.
-      client_tls = OpenSSL::SSL::Socket::Server.new(client, server_ctx, sync_close: true, accept: true)
+      # Scoped to the handshake ITSELF rather than folded into the method rescue below, because
+      # that one also covers the ALPN probe and both relays: blaming the handshake for a failure
+      # that happened after it would be a wrong answer, which costs more than none (the `H2Offer`
+      # lesson). `return` runs the `ensure`, and leaves `client_tls` unassigned exactly as an
+      # uncaught raise would — see `close_client_transport`.
+      client_tls =
+        begin
+          OpenSSL::SSL::Socket::Server.new(client, server_ctx, sync_close: true, accept: true)
+        rescue ex
+          notice_handshake_failure(host, port, ex)
+          return
+        end
       client_tls.sync = true
 
       # ALPN routing: if the client negotiated h2 with us, run the h2 relay (end-to-end h2,
@@ -198,14 +217,75 @@ module Gori::Proxy::Tls
           # the client happened to speak TLS, which is not a distinction the operator made.
           rewrite_fixed_host: rewrite_host,
           h2_offer: offer,
+          # The one caller that terminates TLS with the client — the post-CONNECT tunnel and,
+          # through `Server`, the transparent and reverse TLS listeners. It decides how a
+          # not-HTTP-after-all connection words its remedy: passthrough is only meaningful where
+          # there IS a TLS leg to leave alone. See `ClientConn#non_http_remedy`.
+          client_tls: true,
         ).run
       end
     rescue
-      # Client refused our cert (CA not trusted) or handshake failed: there's
-      # nothing decrypted to capture. The outer connection is torn down.
+      # Everything BUT the client handshake, which reports itself above (#755): the ALPN probe,
+      # the relay, and a teardown race on the way out. Nothing decrypted survives any of them and
+      # the outer connection is torn down.
     ensure
       upstream.try(&.close) rescue nil # a probe orphaned by a failed client handshake
       close_client_transport(client, client_tls)
+    end
+
+    # One `gori.log` line per {host, reason} for a client handshake that never completed.
+    #
+    # ## Why a log line and not a flow
+    #
+    # #755 asked this rescue to "record why it closed, the way the h1 sandbox path records a
+    # refusal", and the h1 refusals record FLOWS. This one does not, for the reason
+    # `ClientConn#serve_h2c_prior_knowledge` already gives for its own refusal: a flow is
+    # projected from a `RawRequest`, and there is none here — the connection got as far as a
+    # ClientHello, and the request that would have been captured is exactly what the failed
+    # handshake prevented. (The CONNECT's own `RawRequest` does exist, one frame up in
+    # `ClientConn#handle_connect`, and threading a reason back out through the `TlsMitm#intercept`
+    # seam so that frame could record a flow is the alternative. It was declined: the seam is
+    # implemented by two classes and called from four sites for a diagnostic whose population is
+    # dominated by the case below.)
+    #
+    # That population is why the volume has to be bounded either way. A client that does not
+    # trust gori's CA is the ORDINARY member of it, and it retries — so is a browser's
+    # speculative preconnect that RSTs mid-handshake (see `close_client_transport`, which names
+    # both). A flow per attempt from a polling pinned app would bury History in identical rows;
+    # a line per {host, reason} says the same thing once.
+    private def notice_handshake_failure(host : String, port : Int32, ex : Exception) : Nil
+      # Keyed on the exception CLASS, not on the sentence below: an OpenSSL message carries the
+      # alert that varies between attempts, so keying on the text would let one retrying client
+      # write a line per distinct alert. The class is the answer the operator acts on.
+      #
+      # The PORT is in the key because the message names it. Keyed on host alone, a second
+      # failing port on the same host was silent and the one line that HAD been written pointed
+      # the operator at the wrong one.
+      key = {"#{host}:#{port}", ex.class.to_s}
+      return if @handshake_noticed.includes?(key) || @handshake_noticed.size >= HANDSHAKE_NOTICE_MAX
+      @handshake_noticed << key
+      ::Log.warn { "client TLS handshake failed for #{host}:#{port}: #{handshake_failure_reason(ex)} Nothing was captured for this connection." }
+    end
+
+    # What to blame, from the exception the handshake raised. Keyed on the class rather than on
+    # the message, because the message is OpenSSL's and it is the part that varies; the class is
+    # what separates "your client rejected our certificate" (the setup problem, with two
+    # different remedies depending on whether the client CAN be made to trust a CA) from "your
+    # client went away" (nothing to fix).
+    private def handshake_failure_reason(ex : Exception) : String
+      case ex
+      when IO::TimeoutError
+        "the client sent a partial ClientHello and then stopped, so the read timed out."
+      when OpenSSL::SSL::Error
+        "OpenSSL refused it (#{ex.message}). Usually the client does not trust gori's CA yet — " \
+        "install it from `http://gori.proxy/`. A client that PINS a certificate can never be made " \
+        "to trust it, so list this host in `network.tls_passthrough` and gori will relay it " \
+        "byte-exact to the origin's own certificate instead."
+      when IO::Error
+        "the client went away mid-handshake (reset or closed)."
+      else
+        "#{ex.class}: #{ex.message}."
+      end
     end
 
     # ALPN reflection probe (#323). When this host is an h2 candidate, pre-dial the origin
