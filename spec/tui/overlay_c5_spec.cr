@@ -125,6 +125,44 @@ describe "C5 · TabsOverlay on the Overlay seam" do
     h.commits.should eq(0)
   end
 
+  # `Event::Key#char` is `@char || key.to_char`, so a Ctrl chord reports its bare letter, and
+  # `Runner#handle_key` pre-filters only ^C/^D (yielded over a modal), ^G, ^F and ^B — every
+  # other Ctrl+letter reaches this overlay and landed in `handle_char`.
+  #
+  # Three chords, each chosen because it is BOTH producible by the parser and observable here:
+  #   * ^R → 'r' → the back-to-factory confirm. Observed through the injected `on_reset`.
+  #   * ^Space → 0x00 → `Key::Space + Ctrl`, whose `to_char` is ' ' → toggle show/hide.
+  #     Observed directly: `to_prefs` carries visibility.
+  #   * ^K → 'k' → `select_move(-1)`. `to_prefs` holds name+visible and NO selection, so this
+  #     is observed INDIRECTLY, the way the neighbouring click example does it: move the
+  #     selection with the chord, then reorder with a bare `K` and see which row moved. A
+  #     `to_prefs.should eq(before)` after a bare `select_move` would be vacuous.
+  #
+  # ^J and ⇧^J are deliberately absent: 0x0A is mapped to `Key::Enter` by the parser
+  # (parser.cr:273), so a `LowerJ + Ctrl` event never comes off a terminal and asserting it
+  # would prove nothing.
+  it "ignores a Ctrl chord that reports a mnemonic letter (^R, ^Space, ^K)" do
+    ov = TabsOverlay.new
+    before = ov.to_prefs
+    resets = 0
+    ov.on_reset = -> { resets += 1; nil }
+
+    ov.handle_key(ctrl_chord(Termisu::Input::Key::LowerR)).should eq(:stay)
+    resets.should eq(0)
+
+    ov.handle_key(ctrl_chord(Termisu::Input::Key::Space)).should eq(:stay)
+    ov.to_prefs.should eq(before) # visibility untouched — ^Space did not toggle row 0
+
+    # ^K must leave the selection on row 0, so the bare ⇧K that follows swaps rows 0↔1 (it is
+    # clamped at the top). Had ^K moved it, the selection would be elsewhere and a different
+    # pair would swap — which is exactly what this assertion distinguishes.
+    ov.handle_key(ctrl_chord(Termisu::Input::Key::LowerK)).should eq(:stay)
+    h = OverlayHarness.new(ov)
+    mnemonic(h, 'J') # reorder DOWN from wherever the selection actually is
+    ov.to_prefs[0].should eq(before[1])
+    ov.to_prefs[1].should eq(before[0])
+  end
+
   it "selects the clicked row, so a reorder after it moves that row and not row 0" do
     ov = TabsOverlay.new
     before = ov.to_prefs

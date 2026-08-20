@@ -285,15 +285,23 @@ module Gori::Proxy
       # The client request head is the slowloris surface: bound total head-assembly time after
       # its first byte (a drip-feed that a per-read timeout can't catch). The first-byte (idle
       # keep-alive) wait stays bounded by the baseline timeout armed in `run`.
+      # `detect_non_http`: this is a client REQUEST head, so a non-HTTP protocol lands here (#729).
       head = Codec::Http1.read_head(@io,
         deadline: SocketTuning::HEAD_DEADLINE, timeout_sock: SocketTuning.underlying_socket(@io),
-        detect_non_http: true)  # this is a client REQUEST head — a non-HTTP protocol lands here (#729)
-      return false if head.nil? # client closed / keep-alive idle end
+        detect_non_http: true)
+      # nil = the client closed, or a keep-alive connection went idle to its end. Standalone,
+      # not trailing this line: `crystal tool format` re-indents a comment BLOCK that follows a
+      # trailing comment to that comment's column, `--check`-clean — which is how the block
+      # below sat at column 22 in main.
+      return false if head.nil?
 
-                      # A non-HTTP protocol reached the HTTP parser (MQTT, SSH, a raw TLS ClientHello, a binary
-                      # RPC). `read_head` stopped early instead of blocking to the deadline (#729); record a
-                      # VISIBLE flow that names the observed shape and the remedy — `network.tls_passthrough` —
-                      # instead of closing in silence, the same way an h2-downgrade rejection names its gate.
+      # A non-HTTP protocol reached the HTTP parser on a BINARY preface (MQTT, a raw TLS
+      # ClientHello, a binary RPC). `read_head` stopped on that first octet instead of blocking
+      # to the deadline (#729); record a VISIBLE flow that names the octet and the remedy —
+      # `network.tls_passthrough` — instead of closing in silence, the same way an h2-downgrade
+      # rejection names its gate. A TEXT banner (SSH, SMTP) is not caught here and is not meant
+      # to be: its first byte is a method-token char, indistinguishable from the version-fuzzing
+      # payloads an operator sends on purpose. See `looks_like_http_request?`.
       unless Codec::Http1.looks_like_http_request?(head)
         record_non_http(head, now_us)
         return false
@@ -2150,11 +2158,17 @@ module Gori::Proxy
       @sink.on_response(FlowMapper.error_response(flow_id, message))
     end
 
-    # A connection whose bytes are not HTTP (MQTT, SSH, a raw TLS ClientHello, a binary RPC),
-    # recorded as a visible error flow instead of the 30 s silent hang it used to be (#729). The
-    # captured bytes ARE the head (P7) — `parse_request_head` keeps them verbatim and stores the
-    # first line as the target — so History shows exactly what arrived, and the message names the
-    # observed prefix plus the remedy the operator would otherwise never find.
+    # A connection whose bytes are not HTTP (MQTT, AMQP, a raw TLS ClientHello, a binary RPC),
+    # recorded as a visible error flow instead of the 30 s silent hang it used to be (#729).
+    #
+    # THE ERROR STRING IS THE WHOLE ROW. The detector stops on the first non-token octet, so
+    # `head` is that one byte (see `non_http_prefix`), and `parse_request_head` over one byte
+    # yields `target == ""` and `http_version == ""`; on a cleartext listener `@fixed_host` is
+    # nil, so `host` is `""` too. History therefore shows a flow whose columns are empty and
+    # whose message carries everything: the octet and the remedy. That is a deliberate trade —
+    # reading further to populate the columns is the blocking wait #729 exists to remove — but
+    # it is NOT what this comment used to claim ("stores the first line as the target … History
+    # shows exactly what arrived"), which was written for a detector that read a whole head.
     private def record_non_http(head : Bytes, created_at : Int64) : Nil
       req = Codec::Http1.parse_request_head(head)
       host = @fixed_host || ""
@@ -2170,20 +2184,35 @@ module Gori::Proxy
           "HTTP proxy (use `network.tls_passthrough` for a TLS service, or keep gori off this port)"
         end
       record_error(req, @scheme, host, @fixed_port, created_at,
-        "not an HTTP request: the connection opened with #{non_http_prefix(head)}, which is not an HTTP request line. #{remedy}")
+        "not an HTTP request: the connection opened with #{non_http_prefix(head)}, which cannot begin an HTTP request line. #{remedy}")
     end
 
-    # A short, terminal-safe preview of the non-HTTP prefix for the flow's error message:
-    # hex of the first bytes, plus their ASCII where printable (so `SSH-2.0` / `MQTT` read
-    # plainly and a binary preface reads as hex). Never emits raw control bytes.
+    # A short, terminal-safe rendering of what gori actually saw, for the flow's error message.
+    # Hex always; the ASCII gloss only when there is text in it to read. Never emits a raw
+    # control byte.
+    #
+    # ONE BYTE is the normal case, and the message has to read well for it. `read_head`'s
+    # detector decides on the FIRST non-blank octet and breaks THERE — not waiting for more is
+    # the whole point of #729 — so `head` is any permitted empty line(s) plus that one octet,
+    # and by construction it is a CTL/SP/DEL (`looks_like_http_request?`). There is no `MQTT` or
+    # `SSH-2.0` string to show: those live at bytes 4-8 and 0-7 of a message this never reads,
+    # and an SSH banner is not even detected here (`S` is a method-token char — the known gap
+    # #729 records). A gloss of `"."` for the byte that decided would say nothing, so it is
+    # dropped and the octet is named instead.
+    #
+    # More than one byte reaches this only on the deadline-less fast path
+    # (`SocketTuning.underlying_socket` nil ⇒ no detector), where `head` is whatever the client
+    # finished sending — hence the cap and the ASCII half are kept rather than deleted.
     private def non_http_prefix(head : Bytes, limit : Int32 = 12) : String
       slice = head[0, {head.size, limit}.min]
-      hex = slice.map { |b| b.to_s(16).rjust(2, '0') }.join(' ')
+      hex = slice.map { |b| "0x#{b.to_s(16).rjust(2, '0')}" }.join(' ')
+      more = head.size > limit ? " …" : ""
+      return "the byte #{hex}" if slice.size == 1
+      return "the bytes #{hex}#{more}" if slice.none? { |b| b >= 0x20_u8 && b < 0x7f_u8 }
       ascii = String.build do |s|
         slice.each { |b| s << (b >= 0x20_u8 && b < 0x7f_u8 ? b.unsafe_chr : '.') }
       end
-      more = head.size > limit ? " …" : ""
-      "bytes #{hex}#{more} (#{ascii.inspect})"
+      "the bytes #{hex}#{more} (#{ascii.inspect})"
     end
 
     # A dropped request never reaches upstream; record it as an Aborted flow so

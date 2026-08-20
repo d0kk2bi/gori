@@ -28,12 +28,50 @@ describe Gori::Export::Curl do
 
     it "omits -X for a plain bodyless GET (curl's default) and emits it for anything else" do
       curl_of("GET /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should_not contain("-X")
-      curl_of("DELETE /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should contain("-X DELETE")
+      curl_of("DELETE /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should contain("-X 'DELETE'")
+    end
+
+    # The METHOD is a captured token, not gori's text: `parse_request_head` refuses only
+    # SP/CTL/DEL on the request line and `Import::Builder.reject_inject!` only CR/LF/NUL, so
+    # every shell metacharacter reaches this serializer from a client on the wire or from an
+    # imported HAR. Unquoted, `-X GET;curl|sh` ran a second command in the operator's shell on
+    # paste. Pinned per metacharacter rather than as one example: this is the ONE argument that
+    # was ever spliced raw, and a future "shell-safe method names are fine, skip the quotes"
+    # shortcut has to fail on each of them, not just on the one that got written down.
+    it "quotes a captured method, so a shell metacharacter in it cannot end the command" do
+      {";curl|sh", "`id`", "$(id)", "&&id", ">out"}.each do |tail|
+        cmd = curl_of("GET#{tail} /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h")
+        cmd.should contain("-X 'GET#{tail}'")
+        # …and nothing outside the quotes for a shell to read as syntax.
+        cmd.lines.last.should eq("  -X 'GET#{tail}'")
+      end
+    end
+
+    # The one byte quoting cannot rescue, on the same command `data_argument` already refuses it
+    # for. bash truncates an argv element at a NUL, so `-X 'GET<NUL>x'` would have LOOKED right
+    # on screen and sent `GET`. Nothing validates the method (see `command`); the proxy path can
+    # carry a NUL through, the import path refuses it.
+    it "refuses -X for a method holding a NUL instead of emitting one bash would truncate" do
+      cmd = curl_of("GET\u0000x /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h")
+      # Not `should_not contain("-X ")` — the note itself says "-X omitted". What must be
+      # absent is the ARGUMENT: no line whose own first token is -X.
+      cmd.lines.any? { |l| l.lstrip.starts_with?("-X ") }.should be_false
+      cmd.should contain("# -X omitted")
+      # LAST line: a `#` comment swallows the ` \` that continues the command, so the note has
+      # to sit where there is nothing left for it to truncate.
+      cmd.lines.last.should start_with("  # -X omitted")
+    end
+
+    # A `'` cannot be carried inside '…' — `shell_quote` closes, escapes, reopens. The method
+    # goes through the same rewrite as every other argument, so the token stays one word.
+    it "escapes a single quote in a captured method instead of breaking out of the quoting" do
+      curl_of("GE'T /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h")
+        .should contain(%q(-X 'GE'\''T'))
     end
 
     it "keeps -X GET when a GET carries a body, which curl would otherwise promote to POST" do
       cmd = curl_of("GET /a HTTP/1.1\r\nHost: h\r\n\r\nq=1", "http://h")
-      cmd.should contain("-X GET")
+      cmd.should contain("-X 'GET'")
       cmd.should contain("--data-raw 'q=1'")
     end
 

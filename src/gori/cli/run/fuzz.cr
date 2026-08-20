@@ -76,7 +76,7 @@ module Gori
           # the raw byte. NOT `--verbatim`, which is the Content-Length knob two lines down —
           # a different axis in the same command, and overloading it would make "send it as
           # written" mean two things at once.
-          p.on("--no-encode", "Splice payloads into query / form positions raw — no default URL-encoding (an explicit --encode still applies)") { auto_encode = false }
+          p.on("--no-encode", "Splice payloads into query / form positions raw — no default URL-encoding (an explicit --encode still applies). Also the flag for an ALREADY-encoded payload: %00 would otherwise go out as %2500") { auto_encode = false }
           p.on("--concurrency=N", "Parallel requests (default 20)") { |v| concurrency = parse_count(v, "--concurrency") }
           p.on("--rate=RPS", "Cap requests/sec (0 = unlimited)") { |v| rate = parse_rate(v) }
           p.on("--throttle=MS", "Fixed delay between requests (ms)") { |v| throttle = parse_nonneg(v, "--throttle") }
@@ -319,11 +319,27 @@ module Gori
       # The run percent-encodes for its query / form positions. Said once, up front, naming
       # the flag that turns it off — the payloads printed on every row are the RAW ones, so
       # without this line a `<script>` row and a `%3Cscript%3E` wire look like a contradiction.
+      #
+      # The `%25` clause is the half that costs a finding if it goes unsaid: a payload that is
+      # ITSELF a percent-escape gets encoded like any other byte, and where the probe's TARGET is
+      # the origin's own decoder that is not a shifted test, it is no test. `%00` (bad-strings,
+      # the null-byte truncation probe) goes out as `%2500` and arrives as the three characters
+      # `%00`, never a NUL; `..%c0%af..` (traversal, the overlong-UTF-8 `/`) arrives as text no
+      # normalizer folds. The `%2e%2e%2f` family only SHIFTS — single-decode becomes
+      # double-decode, still a real bypass — but not the one that was asked for.
+      #
+      # ONE line, not two: this fires on every `--auto` run, and a second line the run cannot
+      # know is relevant (the payload sets stream lazily — there is nothing to scan for a `%`
+      # here) is the noise an operator learns to scroll past. Deliberately not fixed by sniffing
+      # for `%` either: a wordlist holding `100%` or `50%off` would then silently skip the
+      # encoding it needs.
       private def self.note_fuzz_auto_encode(plan : Fuzz::Plan) : Nil
         n = plan.auto_encode.positions.size
         return if n == 0
         STDERR.puts "gori run fuzz: note: URL-encoding payloads for #{n} query/form " \
-                    "position#{n == 1 ? "" : "s"} — pass --no-encode to send them raw"
+                    "position#{n == 1 ? "" : "s"} — pass --no-encode to send them raw " \
+                    "(that includes an already-encoded payload: %00 → %2500, so the %00 / " \
+                    "%c0%af / %2e%2e%2f probes aimed at the origin's own decoder arrive as text)"
       end
 
       # {template text, default target (nil for file/stdin), http2, is-evidence, sni} from the

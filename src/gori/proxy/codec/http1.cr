@@ -177,10 +177,19 @@ module Gori::Proxy::Codec::Http1
   # otherwise block the client head read to its deadline with no flow, no log, and nothing
   # naming `network.tls_passthrough` (#729).
   #
-  # ONE negative, and deliberately only one: the first byte of the request line is not a
-  # method-token char (a CTL, SP or DEL — `request_token_safe?`'s rule, applied to one byte).
-  # That catches the binary prefaces this exists for — MQTT `0x10`, AMQP `0x00`, a TLS
+  # ONE negative, and deliberately only one: the first byte of the request line is a C0 control
+  # or DEL. That catches the binary prefaces this exists for — MQTT `0x10`, AMQP `0x00`, a TLS
   # ClientHello `0x16`, a binary RPC — on byte one, with no wait and nothing to misread.
+  #
+  # SP and HTAB are CARVED OUT of that, and the carve-out is load-bearing. This used to apply
+  # `request_token_safe?`'s rule (`b <= 0x20 || b == 0x7f`), which rejects SP and HTAB along
+  # with the controls — so ` GET /admin HTTP/1.1` (whitespace before the request-line: a
+  # standard smuggling / WAF parser-differential probe, and one an origin may well accept) was
+  # killed at the connection and the flow blamed `network.tls_passthrough` for the operator's
+  # own payload. That is precisely the false-positive class the paragraph below swears off, and
+  # it sat one row above the `\r\n`-prefixed case the spec already protected. `request_token_safe?`
+  # is the right rule for a line gori SYNTHESIZES; it is the wrong one for a line gori RECEIVES.
+  # No binary preface begins with SP or HTAB, so nothing this exists to catch gets through.
   #
   # EVERYTHING ELSE IS HTTP AS FAR AS THIS PREDICATE IS CONCERNED, and that is the point (P7).
   # An earlier version also rejected a completed first line whose last token was not a literal
@@ -203,7 +212,8 @@ module Gori::Proxy::Codec::Http1
     end
     return true if start >= raw.size # only blank line(s) so far — undecided, keep reading
     b = raw.unsafe_fetch(start)
-    !(b <= 0x20_u8 || b == 0x7f_u8)
+    return true if b == 0x20_u8 || b == 0x09_u8 # whitespace before the request-line: a payload
+    !(b < 0x20_u8 || b == 0x7f_u8)
   end
 
   # The request start-line's {method, target, malformed} WITHOUT parsing/allocating the header

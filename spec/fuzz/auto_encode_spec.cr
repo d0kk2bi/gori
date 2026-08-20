@@ -150,6 +150,26 @@ describe "fuzz auto URL-encoding" do
     wire.should contain("n=%3Cb%3E")
     wire.should contain("Content-Length: #{"n=%3Cb%3E".bytesize}\r\n")
   end
+  # The documented cost of the default, pinned so a future "skip encoding when the payload
+  # already looks encoded" shortcut has to come and delete this example on purpose.
+  #
+  # `%` is a reserved byte like any other, so an ALREADY-encoded payload is encoded again. For a
+  # probe whose target is the origin's own decoder that is destructive rather than merely
+  # different: `%00` reaches the app as three characters, never a NUL, and `%c0%af` (the
+  # overlong-UTF-8 `/`) as text no normalizer folds. `%2e%2e%2f` only shifts single-decode to
+  # double-decode. Six surfaces say so — see `AutoEncode`'s header for the list — and this is
+  # the one that fails if the behaviour moves without them.
+  it "encodes an ALREADY-encoded payload again, which is why --no-encode exists" do
+    ae = F::AutoEncode.build(F::Template.parse(QUERY), [] of F::Processor, true)
+    ae.apply(["%00"], nil).should eq ["%2500"]
+    ae.apply(["%c0%af"], nil).should eq ["%25c0%25af"]
+    ae.apply(["..%2f..%2fetc%2fpasswd"], nil).should eq ["..%252f..%252fetc%252fpasswd"]
+    # …and `no_encode` / `--no-encode` is the documented way out: the payload passes through
+    # byte-for-byte, as the SAME array object.
+    raw = ["%00"]
+    off = F::AutoEncode.build(F::Template.parse(QUERY), [] of F::Processor, false)
+    off.apply(raw, nil).should be(raw)
+  end
 end
 
 describe Gori::Fuzz::Template do

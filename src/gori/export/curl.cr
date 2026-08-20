@@ -48,6 +48,17 @@ module Gori
       # then --data-raw for a body. Every argument is single-quoted with embedded quotes
       # escaped, so it survives a paste into any POSIX shell verbatim. Continuation lines keep
       # it readable.
+      #
+      # EVERY argument means the METHOD too, and that one is not decoration. The method is
+      # UNVALIDATED bytes off the wire — `parse_request_head` is `start.split(' ')` with no
+      # check at all (`request_token_safe?` exists but is called only by discover / the MCP
+      # request builder / the fuzzer's redirect guard, never on the capture path), and the one
+      # byte gori does judge is the FIRST, via `looks_like_http_request?`. So every shell
+      # metacharacter reaches this line: `` ` ``, `$`, `|`, `&`, `;`, `'`, and CTL/DEL too.
+      # (`Import::Builder.reject_inject!` narrows the HAR path to "no CR/LF/NUL" — narrower,
+      # still wide open.) Spliced raw, `-X GET;curl|sh` ended the curl command and started a
+      # second one IN THE OPERATOR'S SHELL the moment they pasted what gori handed them, which
+      # is the one place a hostile capture could aim this command. Quoted like the rest now.
       def self.command(method : String, url : String, header_lines : Array(String),
                        body : String, version : String = "") : String
         parts = ["curl #{shell_quote(url)}"]
@@ -56,7 +67,14 @@ module Gori
         end
         # Emit -X unless it's a plain bodyless GET (curl's default). A GET *with* a body
         # still needs -X GET, else curl silently promotes the request to POST.
-        parts << "-X #{method}" unless method.empty? || (method == "GET" && body.empty?)
+        method_note = nil
+        unless method.empty? || (method == "GET" && body.empty?)
+          if note = nul_method_note(method, body)
+            method_note = note
+          else
+            parts << "-X #{shell_quote(method)}"
+          end
+        end
         each_header(header_lines) do |name, value|
           down = name.downcase
           next if down == "host" || down == "content-length"
@@ -64,7 +82,26 @@ module Gori
           parts << "-H #{shell_quote("#{name}: #{value}")}"
         end
         parts << data_argument(body) unless body.empty?
+        # LAST, like `data_argument`'s refusal and for the same reason: a `#` comment swallows
+        # the ` \` that continues the line, so a note anywhere earlier would truncate the
+        # command it is annotating.
+        parts << method_note if method_note
         parts.join(" \\\n  ")
+      end
+
+      # The refusal for a method holding a NUL, or nil when there is none. Same hole
+      # `data_argument` names for the body, on the other end of the same command: `shell_quote`
+      # carries every byte inside '…' except 0x00, and an argv is NUL-terminated, so bash
+      # TRUNCATES the method there and curl sends a different one than the capture — silently,
+      # with `-X 'GET'` on screen looking correct. Reachable on the proxy path only (import
+      # refuses NUL); nothing validates it, see `command`.
+      #
+      # No `-X` is emitted, so curl falls back to its own default, and the note says which.
+      private def self.nul_method_note(method : String, body : String) : String?
+        return nil unless method.to_slice.includes?(0_u8)
+        "# -X omitted: the captured method holds a NUL, which no shell argument can carry — " \
+        "bash would truncate it and curl would send #{body.empty? ? "GET" : "POST"} instead. " \
+        "Read the request line with --format raw"
       end
 
       # The protocol flag for a capture whose request line says HTTP/2, else nil. curl

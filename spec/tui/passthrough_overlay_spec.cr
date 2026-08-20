@@ -111,6 +111,36 @@ describe PassthroughOverlay do
     end
   end
 
+  # Two INDEPENDENT ways a Ctrl chord reached the bare-letter arms, and only one of them is
+  # observable from outside:
+  #   * `Event::Key#char` is `@char || key.to_char`, so ^R folds back to 'r' — and 'r' is
+  #     RELOAD. That is the one with an effect, and it is what this example pins.
+  #   * the termisu parser emits ^K as `Key::LowerK + Ctrl` (parser.cr routes 0x01..0x1A
+  #     through `Key.from_char`), so `k.lower_k?` was true on a chord with no `ev.char`
+  #     involved. `move` only shifts `@selected`, which this overlay exposes no reader for and
+  #     acts on nowhere — the cursor is purely visual here. So that half is guarded (it is free
+  #     and it is the same bug) but deliberately NOT asserted: an example that cannot fail is
+  #     worse than an absent one. Do not "strengthen" this by adding a `selected` getter.
+  #
+  # ^K, not ^J, is the chord to reason about either way: 0x0A is mapped to `Key::Enter`, so a
+  # `LowerJ + Ctrl` event cannot come off a terminal at all.
+  #
+  # Driven through OverlayHarness, per this file's header: `press` dispatches via the
+  # base-typed `overlay` reference, so a subclass that shadowed `handle_key` would fail here
+  # instead of quietly asserting the shadow.
+  it "ignores ^R — a Ctrl chord folding to 'r' must not re-snapshot the inventory" do
+    seed([{"a.push.acme.test", ""}]) do
+      ov = PassthroughOverlay.new
+      h = OverlayHarness.new(ov)
+      ov.hosts.size.should eq(1)
+      Gori::Settings.tls_passthrough?("b.push.acme.test") # a second host is now bypassing
+      h.press(Termisu::Input::Key::LowerR, 'r', ctrl: true).should eq(:open)
+      ov.hosts.size.should eq(1) # ^R did NOT re-snapshot
+      h.press(Termisu::Input::Key::LowerR, 'r').should eq(:open)
+      ov.hosts.size.should eq(2) # the BARE mnemonic still works
+    end
+  end
+
   it "a row click selects but never commits; a click outside dismisses" do
     # Read-only: closing on a row click would read as "that did something". Assert the RAW
     # vocabulary through the base-typed reference, because :stay vs a truthy :commit both
