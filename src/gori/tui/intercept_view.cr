@@ -1020,6 +1020,18 @@ module Gori::Tui
         QuerySuggest.render(screen, rect.x + 1, y, {rect.w - 2, 0}.max, sugg, GATE_HELP)
         return
       end
+      # A field QL implements and this gate REFUSES (`InterceptFilter::UNSUPPORTED_FIELDS`)
+      # compiles to a never-match, so an un-negated one holds nothing and a negated one holds
+      # EVERYTHING. The highlighter already paints the name muted; this row is where the reason
+      # fits. Said while the condition is being TYPED, which for a filter nobody saves is where
+      # it can still be fixed — the same term on a rule that PERSISTS is refused outright by
+      # `ExtractRuleOverlay#invalid_reason`. Below the completion row, above the standing hint:
+      # completion is what the caret is asking for, the hint is what it already knows.
+      if bad = InterceptFilter.unsupported_fields(@query).first?
+        screen.text(rect.x + 1, y, "`#{bad}:` is not available here — History and colour rules answer it",
+          Theme.orange, width: {rect.w - 2, 0}.max)
+        return
+      end
       return unless QuerySuggest.hint_slot?(FilterAst.token_at(@query, @qcx).core)
       screen.text(rect.x + 1, y, QUERY_HINT, Theme.muted, width: {rect.w - 2, 0}.max)
     end

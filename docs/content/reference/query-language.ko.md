@@ -24,6 +24,7 @@ gori에는 플로우를 걸러내는 작은 쿼리 언어(QL)가 있습니다. �
 | `dur` | 응답 시간(밀리초) |
 | `header` | 헤드(요청 + 응답 헤더) 부분 문자열 |
 | `body` | 본문 전문 검색(trigram FTS 인덱스) |
+| `scope` | `in` / `out` — 프로젝트 스코프 규칙([아래](#scope-in-scope-out)) |
 
 ```text
 host:example.com
@@ -49,6 +50,36 @@ NOT (req.body:token OR resp.body:token)
 ```
 
 `res.`는 `resp.`의 동의어이고, `req.size` / `resp.size`는 `reqsize` / `respsize`와 같습니다. 방향이 하나뿐인 필드(`host`, `method`, `status` 등)에는 접두사를 붙이지 않습니다.
+
+## 스코프: `scope:in` / `scope:out` {#scope-in-scope-out}
+
+`scope:in`은 프로젝트 스코프 안쪽의 플로를 고릅니다 — TUI의 `⇧S` 렌즈와
+`gori run history --in-scope`가 적용하는 그 include/exclude 경계와 완전히 같은 것입니다.
+`scope:out`은 그 바깥을 고릅니다. 보통 항목이므로 부정할 수도, 괄호로 묶을 수도 있습니다:
+
+```text
+scope:in status:5xx                   타깃에서 난 서버 에러
+scope:out -host:cdn                   스코프 밖으로 새어 나간 트래픽, CDN 제외
+(scope:in OR host:staging.example.com) method:POST
+```
+
+의도된 성질이 세 가지 있습니다.
+
+- **`⇧S` 렌즈가 켜졌는지와 무관합니다.** 필터 항목은 모드가 아니라 질문이므로 `scope:in`은 어느
+  쪽이든 같은 뜻입니다. (렌즈가 켜져 있으면 렌즈가 이미 같은 조건을 AND로 걸기 때문에
+  `scope:in`은 중복이 되고, `scope:out`은 아무것도 매치하지 않습니다.)
+- **스코프 규칙이 하나도 없으면 두 표기 모두 아무것도 매치하지 않습니다.** 스코프 안에 든 것이
+  없으니 질문에 답이 없고, 그래서 묻지 않습니다. 특히 그 상태에서 `scope:out`은 "전체"를 뜻하지
+  **않습니다** — 같은 이유로, never-match를 부정한 `-scope:in`은 그 상태에서 `scope:out`과 같지
+  않습니다. `ql_explain`은 `scope_rules_configured: false`와 경고를 함께 돌려주고,
+  `gori run history delete`는 답할 스코프가 없는 항목 하나로 프로젝트 히스토리를 지우지 않도록
+  스코프 쿼리를 아예 거부합니다.
+- **`scope:`는 플로 단위입니다.** 그래서 Sitemap에서는 `gori run sitemap --in-scope`와 다릅니다.
+  그쪽은 호스트 단위(트래픽 중 하나라도 스코프 안이면 그 호스트를 남김)이므로, `scope:in` 쿼리는
+  호스트는 남기면서 그 호스트의 일부 엔드포인트만 떨어뜨릴 수 있습니다.
+
+캡처는 어느 쪽으로도 영향을 받지 않습니다. gori는 언제나 전부 기록하고, 이것은 쿼리가 돌려주는
+범위만 좁힙니다.
 
 ## 상태 클래스 {#status-classes}
 
@@ -120,9 +151,13 @@ host:"my host"                        공백까지 포함한 하나의 host 값
 | History, `gori run history`, MCP | 위 표 전체 |
 | Sitemap | 위와 동일, 여기에 노드별 경로 메모용 `tag:` 추가 |
 | 컬러 규칙(Colormarker) | 위와 동일 — History 필터 바에 쓰는 그 쿼리를 그대로 받습니다 |
-| Intercept 캐치 조건, Extract 규칙 조건 | `host`, `path`, `url`, `method`, `scheme`, `status`, `proto`, `header`, `body` |
+| Intercept 캐치 조건, Extract 규칙 조건 | `host`, `path`, `url`, `method`, `scheme`, `status`, `proto`, `header`, `body` — **`scope:` 없음** |
 | Probe | `severity`(`sev`), `status`(`st`), `category`(`cat`), `host`, `code` |
 | Issues | `severity`(`sev`), `status`(`st`), `host`, `title` |
+
+`scope:`는 홀드 게이트와 Extract 규칙 조건이 답하지 않고 거부하는 유일한 필드입니다. 두 곳은
+흐르는 중인 메시지를 평가하는데, 프로젝트의 스코프 규칙은 메시지의 일부가 아닙니다. 입력하는
+자리에서 그렇게 알려주고, `scope:`를 담은 Extract 규칙은 저장되지 않습니다.
 
 Probe와 Issues는 심각도 이름(`info`, `low`, `medium`/`med`, `high`, `critical`/`crit`)과 트리아지 상태(`open`, `confirmed`/`conf`, `false-positive`/`fp`, `resolved`/`done`, 그리고 open이 아닌 모든 상태를 뜻하는 `closed`)를 받습니다. 심각도는 비교를 지원하므로 `sev:>=high`도 동작합니다.
 

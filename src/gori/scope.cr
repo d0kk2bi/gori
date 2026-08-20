@@ -357,29 +357,61 @@ module Gori
     def filter(force : Bool = false) : QL::Filter
       @mutex.synchronize do
         return QL::EMPTY unless force || active_unlocked?
-        inc_conds = [] of String
-        exc_conds = [] of String
-        # Bucket the values with their conditions. The SQL below is assembled
-        # includes-then-excludes, but @rules is in rule-id order, so a single flat array
-        # bound an exclude's pattern to an include's `?` (and vice versa) whenever an
-        # exclude rule was stored first — the filter then silently described a different
-        # set than `in_scope_url?`. Same placeholder/value discipline QL.tree_sql documents.
-        inc_args = [] of DB::Any
-        exc_args = [] of DB::Any
-        @rules.each do |rule|
-          cond, cargs = rule_cond(rule)
-          if rule.include?
-            inc_conds << cond
-            inc_args.concat(cargs)
-          else
-            exc_conds << cond
-            exc_args.concat(cargs)
-          end
-        end
-        inc_sql = inc_conds.empty? ? "1" : "(#{inc_conds.join(" OR ")})"
-        exc_sql = exc_conds.empty? ? "" : " AND NOT (#{exc_conds.join(" OR ")})"
-        QL::Filter.new("(#{inc_sql}#{exc_sql})", inc_args + exc_args)
+        Scope.filter_sql(@rules)
       end
+    end
+
+    # The include/exclude SQL for a rule set, with no flag and no lock of its own. Split out of
+    # `filter` so the same assembly answers a QL `scope:` term (`ql_lens`, which must build it
+    # under the mutex it is already holding) — one predicate, one spelling, not a second copy
+    # that drifts the way the SQL and in-memory halves did before PR #688.
+    def self.filter_sql(rules : Array(Rule)) : QL::Filter
+      inc_conds = [] of String
+      exc_conds = [] of String
+      # Bucket the values with their conditions. The SQL below is assembled
+      # includes-then-excludes, but the rules are in rule-id order, so a single flat array
+      # bound an exclude's pattern to an include's `?` (and vice versa) whenever an
+      # exclude rule was stored first — the filter then silently described a different
+      # set than `in_scope_url?`. Same placeholder/value discipline QL.tree_sql documents.
+      inc_args = [] of DB::Any
+      exc_args = [] of DB::Any
+      rules.each do |rule|
+        cond, cargs = rule_cond(rule)
+        if rule.include?
+          inc_conds << cond
+          inc_args.concat(cargs)
+        else
+          exc_conds << cond
+          exc_args.concat(cargs)
+        end
+      end
+      inc_sql = inc_conds.empty? ? "1" : "(#{inc_conds.join(" OR ")})"
+      exc_sql = exc_conds.empty? ? "" : " AND NOT (#{exc_conds.join(" OR ")})"
+      QL::Filter.new("(#{inc_sql}#{exc_sql})", inc_args + exc_args)
+    end
+
+    # This project's scope as a QL `scope:in` / `scope:out` term sees it (see `QL::ScopeLens`):
+    # the include/exclude predicate REGARDLESS of the persisted ⇧S flag — same `force: true`
+    # reading `gori run history --in-scope` takes, because a filter term is the operator asking
+    # a question and not a mode — or the UNCONFIGURED lens when there are no rules, which makes
+    # both spellings match nothing rather than one of them matching every flow.
+    #
+    # Built inline under the ONE lock rather than by calling `configured?` and
+    # `filter(force: true)`: @mutex is not reentrant (see `active_unlocked?`), so the obvious
+    # spelling of this method deadlocks — and reading the two through separate acquisitions
+    # would let a rule land between them and answer about two different rule sets.
+    def ql_lens : QL::ScopeLens
+      @mutex.synchronize do
+        QL::ScopeLens.new(@rules.empty? ? nil : Scope.filter_sql(@rules))
+      end
+    end
+
+    # `ql_lens` for a caller holding only a STORE — `Colormarker` (whose rules are compiled off
+    # a store, not off the TUI's Scope object) and the one-shot CLI/MCP surfaces. Reads the
+    # rules where they live, so it cannot serve a snapshot a peer process has already changed.
+    def self.ql_lens(store : Store) : QL::ScopeLens
+      rules = load_rules(store)
+      QL::ScopeLens.new(rules.empty? ? nil : filter_sql(rules))
     end
 
     # Add a rule (validates regex, dedupes on the kind/type/pattern triple). Returns
@@ -724,7 +756,9 @@ module Gori
       Gori::Url.request_url(scheme, host, target)
     end
 
-    private def rule_cond(rule : Rule) : {String, Array(DB::Any)}
+    # Class methods: they read the rule and nothing else, and `filter_sql` above is a class
+    # method so the same assembly can run without an instance.
+    private def self.rule_cond(rule : Rule) : {String, Array(DB::Any)}
       case rule.match_type
       when "host"
         host_cond(rule.pattern)
@@ -746,7 +780,7 @@ module Gori
       end
     end
 
-    private def host_cond(pattern : String) : {String, Array(DB::Any)}
+    private def self.host_cond(pattern : String) : {String, Array(DB::Any)}
       # A pattern the native spelling below cannot express faithfully is matched by the very
       # object Rule#host_match? uses (Store::ScopeMatch), so the two can't drift.
       return {"gori_host_match(host, ?)", [pattern] of DB::Any} unless Scope.sql_native_host?(pattern)

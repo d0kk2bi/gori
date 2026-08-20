@@ -214,6 +214,15 @@ module Gori
       private def intercept_set_filter(h) : Result
         q = str(h, "query")
         return err("missing required 'query' (empty string to clear)", "INVALID_ARGUMENT", field: "query") if q.nil?
+        # A field the hold gate refuses (`InterceptFilter::UNSUPPORTED_FIELDS`) compiles to a
+        # never-match, so `scope:in` here holds NOTHING and `-scope:in` holds EVERY in-flight
+        # message until each is forwarded by hand — and an agent has no note row to read. Refused
+        # at the two surfaces that submit a COMPLETE condition (here and `gori run intercept
+        # filter`), never in `Interceptor#set_filter`: the TUI bar applies the condition on every
+        # keystroke, so a refusal there would reject conditions mid-word.
+        if bad = Gori::InterceptFilter.unsupported_field_reason(q)
+          return err(bad, "INVALID_ARGUMENT", field: "query")
+        end
         enqueue_intercept("set_filter", arg: q)
       end
 

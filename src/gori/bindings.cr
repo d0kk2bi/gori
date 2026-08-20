@@ -393,14 +393,28 @@ module Gori
     # `kind=position` rule with no range saved happily from the TUI and the CLI and could
     # never bind (`TokenExtract.position` returns nil for `hi <= lo`), so it logged a miss
     # forever and nothing said why.
+    # `match_filter` is checked for one thing only, and it is the one thing this backend cannot
+    # answer: a field `InterceptFilter` refuses by name (`UNSUPPORTED_FIELDS` — `scope:`, whose
+    # rules are the project's and not the message's). Everything else about a condition is
+    # deliberately unvalidated, because `InterceptFilter` is total and a half-typed condition is
+    # a legal one. This is not: the refused term compiles to a never-match, so a SAVED rule with
+    # one never fires — or, negated, fires on every response — with nothing anywhere to say why.
+    # Checked here rather than at each surface so `gori run rewriter extract add`, MCP
+    # `create_extract_rule` and the TUI form refuse it in the same words.
     def validate(name : String, kind : Gori::ExtractKind, selector : String,
-                 except_id : Int64? = nil, pos_start : Int32 = 0, pos_end : Int32 = 0) : String?
+                 except_id : Int64? = nil, pos_start : Int32 = 0, pos_end : Int32 = 0,
+                 match_filter : String = "") : String?
       return "a binding needs a name" if name.empty?
       unless Env.valid_key?(name)
         return "#{name.inspect} is not a valid binding name (letters, digits and _ only, not starting with a digit)"
       end
       if @mutex.synchronize { @rules.any? { |r| r.name == name && r.id != except_id } }
         return "$#{name} is already written by another extract rule — one name, one writer"
+      end
+      # AFTER the name checks: an unusable name is the more fundamental complaint, and reporting
+      # the condition first made a form with both errors send its author to the wrong row.
+      if bad = InterceptFilter.unsupported_field_reason(match_filter)
+        return bad
       end
       return "a #{kind.label} descriptor needs a selector" if kind_needs_selector?(kind) && selector.empty?
       if kind.position? && pos_end <= pos_start
@@ -433,7 +447,8 @@ module Gori
     def add(name : String, match_filter : String, kind : Gori::ExtractKind,
             selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
             host : String = "") : String?
-      if err = validate(name, kind, selector, pos_start: pos_start, pos_end: pos_end)
+      if err = validate(name, kind, selector, pos_start: pos_start, pos_end: pos_end,
+           match_filter: match_filter)
         return err
       end
       # 0 is `insert_extract_rule`'s "the write was dropped" (its own comment says so), and it
@@ -447,7 +462,8 @@ module Gori
     def update(id : Int64, name : String, match_filter : String, kind : Gori::ExtractKind,
                selector : String = "", pos_start : Int32 = 0, pos_end : Int32 = 0,
                host : String = "") : String?
-      if err = validate(name, kind, selector, except_id: id, pos_start: pos_start, pos_end: pos_end)
+      if err = validate(name, kind, selector, except_id: id, pos_start: pos_start,
+           pos_end: pos_end, match_filter: match_filter)
         return err
       end
       previous = @mutex.synchronize { @rules.find(&.id.==(id)) }

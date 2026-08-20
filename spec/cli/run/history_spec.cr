@@ -498,6 +498,10 @@ module Gori::CLI::Run
     delete_query_error(q)
   end
 
+  def self.delete_scope_error_for_spec(q : String, lens : QL::ScopeLens) : String?
+    delete_scope_error(q, lens)
+  end
+
   def self.matching_flow_ids_for_spec(store : Store, filter : QL::Filter) : Array(Int64)
     matching_flow_ids(store, filter)
   end
@@ -661,6 +665,48 @@ describe "gori run history delete -q — the refusals" do
   it "lets an ordinary query through" do
     Gori::CLI::Run.delete_query_error_for_spec("host:accounts.google.com").should be_nil
     Gori::CLI::Run.delete_query_error_for_spec("status:>=500 -method:GET").should be_nil
+  end
+
+  # The two states a `scope:` query is silently empty in. Pinned as text because the fix differs
+  # per state (add scope rules; drop one of the two lenses) and the TUI carries the same pair.
+  it "notes the two states a scope: query comes back empty in" do
+    none = Gori::QL::ScopeLens.new(nil)
+    configured = Gori::QL::ScopeLens.new(Gori::QL::Filter.new("(1)", [] of DB::Any))
+    Gori::CLI::Run.scope_query_notes("scope:in", none).join(" ").should contain("no scope rules are configured")
+    Gori::CLI::Run.scope_query_notes("scope:in", configured).should be_empty
+    # Says what COMPOSES, not which spelling empties: `--in-scope` narrows flows on `history` and
+    # whole HOSTS on `sitemap`/`probe`, and it is the un-negated `scope:out` that goes empty.
+    Gori::CLI::Run.scope_query_notes("scope:out", configured, in_scope: true)
+      .join(" ").should contain("already narrowing to what is in scope")
+    # Both at once, and neither for a query that never asked — including `scope~in`, which QL
+    # free-texts (so it names no scope term at all).
+    Gori::CLI::Run.scope_query_notes("scope:out", none, in_scope: true).size.should eq(2)
+    Gori::CLI::Run.scope_query_notes("host:acme", none, in_scope: true).should be_empty
+    Gori::CLI::Run.scope_query_notes("scope~in", none, in_scope: true).should be_empty
+  end
+
+  # `scope:` on a project with no scope rules. `scope:out` compiles to a never-match, so the
+  # positive spelling would delete nothing — but a NEGATED one is that never-match inverted, i.e.
+  # every flow, and it clears every other guard here: the match-all test compares the compiled
+  # SQL against `1`, and `NOT (0)` is not that string.
+  it "aborts a scope query on a project that has no scope rules" do
+    none = Gori::QL::ScopeLens.new(nil)
+    err = Gori::CLI::Run.delete_scope_error_for_spec("-scope:in", none).not_nil!
+    err.should contain("NO scope rules")
+    err.should contain("NEGATED")
+    Gori::CLI::Run.delete_scope_error_for_spec("scope:out", none).should_not be_nil
+    # The guard it is NOT: the pre-store checks read the query's SHAPE under a lens that has no
+    # rules, and `NOT (0)` is a real clause under it — so they pass this, and must, or a scope
+    # query would be refused on every project including the ones that can answer it.
+    Gori::CLI::Run.delete_query_error_for_spec("-scope:in").should be_nil
+    Gori::CLI::Run.delete_query_error_for_spec("scope:in").should be_nil
+    Gori::CLI::Run.delete_query_error_for_spec("host:acme scope:in").should be_nil
+    Gori::QL.parse("-scope:in", scope: none).sql.should eq("(NOT (0))") # …which is every flow
+
+    # With rules configured the term answers, and the delete proceeds like any other query.
+    configured = Gori::QL::ScopeLens.new(Gori::QL::Filter.new("(1)", [] of DB::Any))
+    Gori::CLI::Run.delete_scope_error_for_spec("-scope:in", configured).should be_nil
+    Gori::CLI::Run.delete_scope_error_for_spec("host:acme", none).should be_nil
   end
 end
 

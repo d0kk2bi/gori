@@ -1,5 +1,6 @@
 require "json"
 require "../../ql"
+require "../../scope"
 
 module Gori
   module MCP
@@ -11,12 +12,18 @@ module Gori
       # query yields EMPTY (match all).
       private def ql_filter_or_error(h, query : String?) : QL::Filter | Result
         return QL::EMPTY if query.nil? || query.strip.empty?
-        filter = QL.parse(query)
+        # The project's scope, so a `scope:in`/`scope:out` term compiles instead of being
+        # dropped. Read per call rather than cached: an agent (or a peer process) can add a
+        # scope rule between two list_history calls, and a cached lens would answer the first
+        # rule set forever. `strict:` reads the same lens, or it would report a term the query
+        # in fact applied.
+        lens = Scope.ql_lens(store)
+        filter = QL.parse(query, scope: lens)
         return ql_error(query) if QL.reject_empty?(query, filter)
         bad = QL.invalid_regex_terms(query)
         return ql_invalid_regex_error(query, bad) unless bad.empty?
         if bool_arg(h, "strict", false)
-          analysis = QL.analyze(query)
+          analysis = QL.analyze(query, scope: lens)
           return ql_strict_error(analysis) unless analysis.clean?
         end
         filter
@@ -48,8 +55,17 @@ module Gori
       private def ql_explain(h) : Result
         query = str(h, "query")
         return err("missing required 'query'", "INVALID_ARGUMENT", field: "query") if query.nil? || query.strip.empty?
-        a = QL.analyze(query)
-        filter = QL.parse(query)
+        # `ql_explain` is in `Tools::UNBOUND_SAFE` — it is a GRAMMAR tool, callable with no
+        # project selected (an agent checking a query before it switches). `store` raises there,
+        # so the lens is read only when there is one, and shape-only otherwise: a `scope:` term
+        # still compiles (it is not reported as dropped), and the answer below says the project
+        # question could not be asked instead of asserting it has no rules.
+        bound = !unbound?
+        lens = bound ? Scope.ql_lens(store) : QL::SCOPE_SHAPE_ONLY
+        a = QL.analyze(query, scope: lens)
+        filter = QL.parse(query, scope: lens)
+        scope_unconfigured = bound && QL.uses_scope?(query) && !lens.configured?
+        scope_unbound = !bound && QL.uses_scope?(query)
         Result.new(JSON.build do |j|
           j.object do
             j.field "query", query
@@ -58,10 +74,27 @@ module Gori
             j.field("invalid_regex_terms") { j.array { a.invalid_regex.each { |t| j.string t } } }
             j.field "matches_nothing", QL.reject_empty?(query, filter)
             j.field "sql", filter.sql
+            # Named, not inferred from an empty result: a `scope:` term on a project with no
+            # scope rules compiles to a never-match clause, so the query runs clean and returns
+            # nothing — and an agent has no way to tell that from "no flow matched". The
+            # negation half is stated too, because it is the one direction that BROADENS.
+            # nil, not false, with no project bound: "this project has no scope rules" and "there
+            # is no project to ask" are different answers and the recovery differs.
+            j.field "scope_rules_configured", bound ? lens.configured? : nil
             j.field("warnings") do
               j.array do
                 j.string "dropped (broadens results): #{a.ignored.join(", ")}" unless a.ignored.empty?
                 j.string "invalid regex, matches nothing: #{a.invalid_regex.join(", ")}" unless a.invalid_regex.empty?
+                if scope_unconfigured
+                  j.string "no scope rules are configured, so nothing is in scope: `scope:in` and " \
+                           "`scope:out` both match NOTHING here (and a negated `-scope:in` matches " \
+                           "every flow) — add scope rules with add_scope_rule, or drop the term"
+                end
+                if scope_unbound
+                  j.string "no project is selected, so the `scope:` term was compiled without one: " \
+                           "call switch_project (or list_projects) and explain again to learn whether " \
+                           "that project has scope rules at all"
+                end
               end
             end
           end

@@ -559,6 +559,12 @@ module Gori
         parser.parse(args)
         abort "gori run intercept filter: missing <query> (pass \"\" to clear)" if positional.empty?
         abort "gori run intercept filter: too many arguments (expected one <query>)" if positional.size > 1
+        # Same refusal MCP's `intercept_set_filter` makes, in the same words: a field the gate
+        # refuses compiles to a never-match, so this condition would hold nothing — or, negated,
+        # hold every in-flight message — with nothing on any surface to say why.
+        if bad = Gori::InterceptFilter.unsupported_field_reason(positional[0])
+          abort "gori run intercept filter: #{bad}"
+        end
 
         status, detail = enqueue_intercept(project_name, db_path, "set_filter", arg: positional[0])
         emit_intercept_ack(status, detail, format)

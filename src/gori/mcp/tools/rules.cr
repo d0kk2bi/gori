@@ -473,7 +473,19 @@ module Gori
       end
 
       # kind=position needs a real range; every other kind ignores the two ints.
-      private def extract_range_error(kind : Gori::ExtractKind, pos_start : Int32, pos_end : Int32) : Result?
+      # The two shape refusals a create/update owes BEFORE it writes, each naming the argument it
+      # is about. `Bindings#validate` refuses both again — it is the chokepoint the CLI and the TUI
+      # write through as well — but its answer is one String where this layer reports one `field`,
+      # so a `when:` refusal arriving through that door came back labelled `field: "name"` and an
+      # agent that edits the field it is told about would rewrite the name and resubmit the same
+      # condition. Merged into ONE helper rather than a second `if` at each caller: both callers
+      # are already at the cyclomatic limit, and these are one question — "are the arguments
+      # usable" — asked of two of them.
+      private def extract_shape_error(kind : Gori::ExtractKind, pos_start : Int32, pos_end : Int32,
+                                      match_filter : String) : Result?
+        if bad = Gori::InterceptFilter.unsupported_field_reason(match_filter)
+          return err(bad, "INVALID_ARGUMENT", field: "when")
+        end
         return nil unless kind.position? && pos_end <= pos_start
         err("'pos_end' must be greater than 'pos_start' for kind=position", "INVALID_ARGUMENT", field: "pos_end")
       end
@@ -487,7 +499,8 @@ module Gori
         # Bounded in Int64 before the narrowing, for the reason spelled out at `keep_int`.
         pos_start = bounded_int_arg(h, "pos_start", 0_i64, min: Int32::MIN.to_i64, max: Int32::MAX.to_i64).to_i
         pos_end = bounded_int_arg(h, "pos_end", 0_i64, min: Int32::MIN.to_i64, max: Int32::MAX.to_i64).to_i
-        if bad = extract_range_error(kind, pos_start, pos_end)
+        when_s = str(h, "when") || ""
+        if bad = extract_shape_error(kind, pos_start, pos_end, when_s)
           return bad
         end
         # Read BEFORE the insert, exactly as `create_rule` does: `bool_arg` RAISES on a
@@ -499,7 +512,7 @@ module Gori
         return enabled if enabled.is_a?(Result)
         enabled = enabled.nil? ? true : enabled
         bindings = extract_bindings
-        if bad = bindings.add(name, str(h, "when") || "", kind, selector, pos_start, pos_end, str(h, "host") || "")
+        if bad = bindings.add(name, when_s, kind, selector, pos_start, pos_end, str(h, "host") || "")
           return bad == Gori::Bindings::STORE_REFUSED ? busy(bad) : err(bad, "INVALID_ARGUMENT", field: "name")
         end
         row = store.extract_rules.find { |r| r.name == name }
@@ -537,10 +550,10 @@ module Gori
         selector = keep(h, "selector", existing.selector)
         pos_start = keep_int(h, "pos_start", existing.pos_start)
         pos_end = keep_int(h, "pos_end", existing.pos_end)
-        if bad = extract_range_error(kind, pos_start, pos_end)
+        filter = keep(h, "when", existing.match_filter)
+        if bad = extract_shape_error(kind, pos_start, pos_end, filter)
           return bad
         end
-        filter = keep(h, "when", existing.match_filter)
         host = keep(h, "host", existing.host)
         en = enabled_arg(h, existing.enabled?)
         return en if en.is_a?(Result)

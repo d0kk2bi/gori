@@ -24,6 +24,7 @@ Match a field with `field:value` (substring or exact, depending on the field):
 | `dur` | Response time in milliseconds |
 | `header` | Substring over the head (request + response headers) |
 | `body` | Full-text match over bodies (trigram FTS index) |
+| `scope` | `in` / `out` — the project's scope rules ([below](#scope-in-scope-out)) |
 
 ```text
 host:example.com
@@ -51,6 +52,37 @@ NOT (req.body:token OR resp.body:token)
 
 `res.` is a synonym of `resp.`, and `req.size` / `resp.size` are synonyms of `reqsize` /
 `respsize`. Fields that only ever have one side (`host`, `method`, `status`, …) take no prefix.
+
+## Scope: `scope:in` / `scope:out` {#scope-in-scope-out}
+
+`scope:in` matches the flows inside the project's scope — the same include/exclude boundary the
+TUI's `⇧S` lens and `gori run history --in-scope` apply — and `scope:out` matches the ones
+outside it. It is an ordinary term, so it negates and it groups:
+
+```text
+scope:in status:5xx                   server errors on the target
+scope:out -host:cdn                   traffic that leaked out of scope, minus the CDN
+(scope:in OR host:staging.example.com) method:POST
+```
+
+Three things about it are deliberate:
+
+- **It ignores whether the `⇧S` lens is switched on.** A filter term is a question, not a mode,
+  so `scope:in` means the same thing either way. (With the lens ON, it is redundant — the lens
+  already ANDs the same predicate over your query — and `scope:out` then matches nothing, since
+  the lens has already dropped every out-of-scope row.)
+- **With no scope rules configured, both spellings match nothing.** Nothing is in scope, so the
+  question has no answer and is not asked. In particular `scope:out` does *not* mean "everything"
+  in that state — which is also why `-scope:in`, a negated never-match, is *not* the same as
+  `scope:out` on a project with no scope rules. `ql_explain` reports
+  `scope_rules_configured: false` and warns, and `gori run history delete` refuses a scope query
+  outright rather than risk deleting a project's history over a term that had nothing to answer.
+- **`scope:` is per-FLOW.** On the Sitemap that makes it different from `gori run sitemap
+  --in-scope`, which selects whole HOSTS (a host is kept if any of its traffic is in scope), so a
+  `scope:in` query can keep a host and drop some of its endpoints.
+
+Capture is untouched by any of this: gori records everything either way, and this only narrows
+what a query returns.
 
 ## Status Classes
 
@@ -122,9 +154,13 @@ Every filter bar shares the grammar above (fields, comparisons, `~` regex, `AND`
 | History, `gori run history`, MCP | The full table above |
 | Sitemap | The same, plus `tag:` for per-node path memos |
 | Colour rules (Colormarker) | The same — a colour rule takes the query the History bar takes |
-| Intercept catch condition, extract-rule condition | `host`, `path`, `url`, `method`, `scheme`, `status`, `proto`, `header`, `body` |
+| Intercept catch condition, extract-rule condition | `host`, `path`, `url`, `method`, `scheme`, `status`, `proto`, `header`, `body` — **no `scope:`** |
 | Probe | `severity` (`sev`), `status` (`st`), `category` (`cat`), `host`, `code` |
 | Issues | `severity` (`sev`), `status` (`st`), `host`, `title` |
+
+`scope:` is the one field a hold gate and an extract-rule condition refuse rather than answer:
+they evaluate a live message, and a project's scope rules are not part of one. The condition rows
+say so where you type them, and an extract rule carrying `scope:` will not save.
 
 Probe and Issues take severity names (`info`, `low`, `medium`/`med`, `high`, `critical`/`crit`) and triage states (`open`, `confirmed`/`conf`, `false-positive`/`fp`, `resolved`/`done`, plus `closed` for any non-open state). Severity supports comparisons, so `sev:>=high` works.
 

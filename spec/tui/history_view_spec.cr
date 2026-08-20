@@ -105,6 +105,80 @@ describe Gori::Tui::HistoryView do
     end
   end
 
+  # `scope:` in the filter bar (#754). The view already holds the Scope it applies for ⇧S, so a
+  # scope TERM is that same predicate asked as a question — including with the lens OFF, which is
+  # the state that makes the term worth having at all.
+  it "filters by scope: with the ⇧S lens off, and says when there is no scope to ask about" do
+    tmp_store do |store|
+      add_flow(store, "GET", "/a", 200, host: "acme.test")
+      add_flow(store, "GET", "/b", 200, host: "evil.test")
+      scope = Gori::Scope.load(store)
+      view = HistoryView.new
+      view.set_scope(scope)
+      view.start_query
+      "scope:out".each_char { |c| view.query_insert(c) }
+
+      # No scope rules yet: the query is VALID and matches nothing, which on a list is
+      # indistinguishable from "no traffic" — so the note names the state instead. (The
+      # index-lag note takes precedence over both of these; see the `body:` case below.)
+      view.reload(store)
+      view.@rows.should be_empty
+      view.@query_note.not_nil!.should contain("no scope rules")
+
+      scope.add("include", "host", "acme.test")
+      scope.active?.should be_false # ⇧S still OFF — the term does not need the lens
+      view.reload(store)
+      view.@rows.map(&.host).should eq(["evil.test"])
+      view.@query_note.should be_nil
+
+      # With the lens ON the two compose (in-scope AND out-of-scope = nothing), which is correct
+      # and baffling — so that gets a note of its own rather than an unexplained empty list.
+      scope.enable
+      view.reload(store)
+      view.@rows.should be_empty
+      view.@query_note.not_nil!.should contain("⇧S lens")
+    end
+  end
+
+  # The index-lag note is the one note here that is true only RIGHT NOW, and it explains an empty
+  # list on its own — a scope note returning ahead of it made it unreachable for every query
+  # naming `scope:`, sending an operator to the lens for a list that was merely still indexing.
+  it "lets the index-backlog note win over a scope note" do
+    tmp_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "acme.test", port: 80,
+        method: "POST", target: "/x", http_version: "HTTP/1.1",
+        head: "POST /x HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        body: "lagindexbodytoken".to_slice))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice,
+        body: "lagindexbodytoken".to_slice))
+      scope = Gori::Scope.load(store)
+      view = HistoryView.new
+      view.set_scope(scope)
+      view.start_query
+      # A `body:` term (so the filter reads flows_fts) AND a scope term, with the backlog undrained
+      # and no scope rules — both notes are live, and the transient one has to be the one shown.
+      "body:lagindexbodytoken scope:in".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+      view.@query_note.not_nil!.should contain("body search")
+
+      # Drain the index: now the scope state is what is left to explain the empty list.
+      store.flush
+      view.reload(store)
+      view.@query_note.not_nil!.should contain("no scope rules")
+    end
+  end
+
+  it "completes the two values scope: takes, which the field name cannot suggest" do
+    view = HistoryView.new
+    view.start_query
+    "scope:".each_char { |c| view.query_insert(c) }
+    view.query_suggestions.should eq(["scope:in", "scope:out"])
+    view.query_insert('o')
+    view.query_suggestions.should eq(["scope:out"])
+  end
+
   # A filter that never touches flows_fts must not pay for (or display) the backlog probe:
   # its answer is complete the moment the row commits.
   it "does not note the index backlog for a filter that doesn't read it" do

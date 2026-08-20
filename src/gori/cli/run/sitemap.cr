@@ -178,6 +178,20 @@ module Gori
         filter = sitemap_filter(query)
 
         store = open_store(resolve_read_project(project_name, db_path))
+        # A `scope:` term needs the project's scope rules, which are in the store that just
+        # opened — so the one term this command cannot compile before the open is recompiled
+        # after it. Only when the query actually names the field: nothing else about the filter
+        # depends on the lens, so a query without it must not pay a read or a second parse. The
+        # validation above already refused everything a query can be refused for, under
+        # `QL::SCOPE_SHAPE_ONLY`, which classifies `scope:` terms identically.
+        if (q = query) && QL.uses_scope?(q)
+          lens = Scope.ql_lens(store)
+          filter = QL.parse(q, scope: lens)
+          # `--in-scope` on THIS command is host-level and the term is per-flow, so the second
+          # note is about two different questions composing rather than one repeated — which is
+          # exactly what an operator looking at an empty tree needs to hear.
+          Run.scope_query_notes(q, lens, in_scope).each { |n| STDERR.puts "gori run sitemap: #{n}" }
+        end
         hosts = begin
           collect_sitemap(store, filter, limit, in_scope, group, fold_query)
         rescue ex
@@ -193,7 +207,11 @@ module Gori
       # collapsing to EMPTY would silently dump every endpoint).
       private def self.sitemap_filter(query : String?) : QL::Filter
         return QL::EMPTY unless q = query
-        filter = QL.parse(q)
+        # Shape-only: this runs before the store is open (see the caller), and a `scope:` term
+        # compiles to a real clause under either lens. `scope:` on this command is per-FLOW,
+        # which is NOT what `--in-scope` asks here (whole hosts, via `host_in_scope?` — see
+        # `collect_sitemap`); both are available and they are different questions.
+        filter = QL.parse(q, scope: QL::SCOPE_SHAPE_ONLY)
         # Both halves — an unrecognized field is dropped and BROADENS the tree. See
         # Run.warn_query_terms.
         Run.warn_query_terms("sitemap", q)

@@ -135,6 +135,15 @@ module Gori::Tui
     # injection), then the table's own refusal.
     def invalid_reason : String?
       return "enter a binding name" if name.empty?
+      # A `when:` condition is an `InterceptFilter` source, and that backend refuses a field it
+      # cannot answer by compiling it to a never-match (`UNSUPPORTED_FIELDS`) — for `scope:`,
+      # because `Bindings#observe_response` holds no project scope. Said HERE as well as at the
+      # table (`Bindings#validate` refuses the same write, so MCP and the CLI refuse too) because
+      # this form greys out its Save row from local shape checks, a keystroke before any commit —
+      # and read from the ONE sentence there, so the two can never disagree about what is legal.
+      if bad = Gori::InterceptFilter.unsupported_field_reason(match_filter)
+        return bad
+      end
       if position?
         a, b = parse_range
         return "enter a byte range like 0:32" if b <= a

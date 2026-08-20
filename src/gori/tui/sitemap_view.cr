@@ -151,8 +151,15 @@ module Gori::Tui
       # `tag:`/`-tag:` are Sitemap-local (the shared QL has no tag column): split them
       # out, hand the residual to QL.parse, and apply the tag filter to the built tree.
       positives, negatives, residual = split_tag_terms(@query)
-      residual_filter = QL.parse(residual)
-      @query_note = query_note_for(residual, residual_filter)
+      # `scope:` compiles here exactly as it does in History — this is the same QL over the same
+      # flows, and the tree is built from what it returns. NOT the same question `--in-scope`
+      # asks on this surface, which selects whole HOSTS via `host_in_scope?` (see
+      # `cli/run/sitemap.cr`); a `scope:` term is per-FLOW, so a host can survive it with only
+      # some of its endpoints. That is why the field is not in `QL_FIELDS` above — it compiles,
+      # it just is not what Tab offers against a tree.
+      lens = @scope.try(&.ql_lens)
+      residual_filter = QL.parse(residual, scope: lens)
+      @query_note = query_note_for(residual, residual_filter, lens)
       # A non-blank QL residual that compiles to EMPTY means every QL term was invalid
       # (typo'd field, bad numeric, unterminated value). Mirror HistoryView / MCP / CLI:
       # reject it (empty tree + a note) rather than fall through to a match-all search
@@ -283,11 +290,15 @@ module Gori::Tui
     # INVALID (vs a valid filter that genuinely has no matches) — surfaced in the
     # empty-state so a typo'd status:/dur:/size: or a broken body~[regex isn't misread
     # as "no endpoints". Operates on the residual (tag: terms are handled separately).
-    private def query_note_for(residual : String, filter : QL::Filter) : String?
+    private def query_note_for(residual : String, filter : QL::Filter,
+                               lens : QL::ScopeLens?) : String?
       return nil if residual.blank?
       return "invalid filter — no valid terms" if residual_has_terms?(residual) && QL.reject_empty?(residual, filter)
       bad = QL.invalid_regex_terms(residual)
-      bad.empty? ? nil : "invalid regex in #{bad.first}"
+      return "invalid regex in #{bad.first}" unless bad.empty?
+      # Same note History carries, for the same reason: an empty tree cannot say WHY it is empty.
+      return "no scope rules — nothing is in scope" if QL.uses_scope?(residual) && !lens.try(&.configured?)
+      nil
     end
 
     # Split `tag:` terms out of the query. Cut with the SHARED lexer, not `String#split`:

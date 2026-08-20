@@ -839,11 +839,42 @@ module Gori
         end
       end
 
+      # The notes a `scope:` query owes an operator on a surface that prints its rows and exits.
+      # Both name a state in which the query runs CLEAN and returns NOTHING, which an empty
+      # listing cannot distinguish from "no traffic matched" — and the two have different fixes
+      # (add scope rules; drop one of the two lenses). Returned rather than printed so the
+      # wording is pinned by a spec and a second surface cannot come to word it differently;
+      # the TUI's filter bar carries the same two sentences in its one-line form.
+      def self.scope_query_notes(q : String, lens : QL::ScopeLens, in_scope : Bool = false) : Array(String)
+        return [] of String unless QL.uses_scope?(q)
+        notes = [] of String
+        unless lens.configured?
+          notes << "the query asks about scope, but no scope rules are configured — nothing is " \
+                   "in scope, so `scope:in` and `scope:out` match nothing"
+        end
+        if in_scope
+          # Deliberately does not name WHICH spelling goes empty: `--in-scope` narrows flows on
+          # `history` and whole HOSTS on `sitemap`/`probe`, and an un-negated `scope:out` is the
+          # empty one while `-scope:out` is merely redundant. State the composition, let the
+          # spelling follow from it.
+          notes << "--in-scope is already narrowing to what is in scope, and the query's `scope:` " \
+                   "term applies on top of it (an un-negated `scope:out` is then empty)"
+        end
+        notes
+      end
+
       def self.warn_query_terms(cmd : String, q : String) : Nil
         QL.invalid_regex_terms(q).each do |t|
           STDERR.puts "gori run #{cmd}: warning: invalid regex in #{t.inspect} — that term matches nothing"
         end
-        ignored = QL.analyze(q).ignored
+        # `SCOPE_SHAPE_ONLY`, not the project's real lens: this runs BEFORE the store is opened
+        # at every caller (deliberately — `authorize` says out loud that hearing about a bad
+        # query should not cost a project open), and the two lenses classify every `scope:` term
+        # identically, so the shape-only reading is the same answer without the store. It does
+        # assume the caller COMPILES with a lens — every one of them does; a surface that parses
+        # without one would drop a `scope:` term and this warning would be the thing that named
+        # it, so thread a lens there rather than relaxing this.
+        ignored = QL.analyze(q, scope: QL::SCOPE_SHAPE_ONLY).ignored
         return if ignored.empty?
         STDERR.puts "gori run #{cmd}: warning: ignored #{ignored.map(&.inspect).join(", ")} " \
                     "— unrecognized or invalid, so the result is BROADER than the query asks for"

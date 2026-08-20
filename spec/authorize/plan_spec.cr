@@ -137,6 +137,32 @@ describe Gori::Authorize::Plan do
       end
     end
 
+    # `scope:` selects by the project's scope rules (#754), and on a project that HAS none a
+    # negated scope term is a negated never-match — every flow — which `Plan.search`'s
+    # `reject_empty?` cannot catch (it compares the compiled SQL against `1`, and `NOT (0)` is not
+    # that string). Every row selected here becomes `identities.size` real requests against a live
+    # target, so the query is refused rather than run — the same guard `gori run history delete`
+    # takes for the same reason.
+    it "refuses a scope: query on a project with no scope rules" do
+      with_store do |store|
+        seed(store, host: "acme.test", target: "/admin")
+        %w[-scope:in scope:out].each do |q|
+          ex = expect_raises(PlanError) { Plan.build(options(store, query: q), ungated_outbound) }
+          ex.reason.should eq(PlanError::Reason::BadQuery)
+          ex.message.not_nil!.should contain("NO scope rules")
+        end
+
+        # Configured, it is an ordinary term: the boundary selects, and nothing is refused.
+        Gori::Scope.load(store).add("include", "host", "acme.test")
+        Plan.build(options(store, query: "scope:in"), ungated_outbound)
+          .targets.map(&.row.host).should eq(["acme.test"])
+        # …and a term that legitimately selects nothing is `NoFlows` — an empty RESULT, not a
+        # refused query. The two reasons send an operator to different places.
+        empty = expect_raises(PlanError) { Plan.build(options(store, query: "scope:out"), ungated_outbound) }
+        empty.reason.should eq(PlanError::Reason::NoFlows)
+      end
+    end
+
     it "caps how many rows a query may contribute" do
       with_store do |store|
         3.times { |i| seed(store, target: "/p#{i}") }
